@@ -114,6 +114,10 @@ def pr_body(url: str) -> str:
     return (gh_json(["pr", "view", url, "--json", "body"]) or {}).get("body") or ""
 
 
+def pr_diff(url: str) -> str:
+    return gh(["pr", "diff", url])
+
+
 def pr_edit_body(url: str, body: str) -> None:
     gh(["pr", "edit", url, "--body-file", "-"], input=body)
 

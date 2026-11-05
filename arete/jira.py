@@ -227,6 +227,7 @@ def adf(markdown: str) -> dict:
     content: list[dict] = []
     para: list[str] = []
     bullets: list[str] = []
+    numbered: list[str] = []
     code: list[str] | None = None
 
     def flush() -> None:
@@ -238,11 +239,12 @@ def adf(markdown: str) -> dict:
                 nodes += _inline(ln)
             content.append({"type": "paragraph", "content": nodes})
             para.clear()
-        if bullets:
-            content.append({"type": "bulletList", "content": [
-                {"type": "listItem", "content": [{"type": "paragraph", "content": _inline(b)}]} for b in bullets
-            ]})
-            bullets.clear()
+        for kind, items in (("bulletList", bullets), ("orderedList", numbered)):
+            if items:
+                content.append({"type": kind, "content": [
+                    {"type": "listItem", "content": [{"type": "paragraph", "content": _inline(i)}]} for i in items
+                ]})
+                items.clear()
 
     def code_block(lines: list[str]) -> dict:
         text = "\n".join(lines)
@@ -266,11 +268,15 @@ def adf(markdown: str) -> dict:
             flush()
             content.append({"type": "heading", "attrs": {"level": len(m.group(1))}, "content": _inline(m.group(2))})
         elif m := re.match(r"^\s*[-*]\s+(.*)$", line):
-            if para:
+            if para or numbered:
                 flush()
             bullets.append(m.group(1))
+        elif m := re.match(r"^\s*\d+[.)]\s+(.*)$", line):
+            if para or bullets:
+                flush()
+            numbered.append(m.group(1))
         else:
-            if bullets:
+            if bullets or numbered:
                 flush()
             para.append(line)
     if code is not None:

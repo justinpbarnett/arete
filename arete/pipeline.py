@@ -65,6 +65,14 @@ LEARN_SCHEMA = {
     "properties": {"lessons": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
     "required": ["lessons"],
 }
+UAT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "before": {"type": "string"},
+        "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10},
+    },
+    "required": ["before", "steps"],
+}
 READ_TOOLS = ["Read", "Glob", "Grep"]
 EDIT_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "TodoWrite"]
 NO_GIT_WRITES = [
@@ -167,11 +175,12 @@ class Run(AgentRun):
             if err:
                 self.log(f"tracker: {util.first_line(err, 300)}")
 
-    def say(self, body: str) -> None:
+    def say(self, body: str) -> str:
         if self.dry_run:
-            return
+            return ""
         if err := self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}"):
             self.log(f"tracker: {util.first_line(err, 300)}")
+        return err
 
     def give_up(self, why: str) -> None:
         self.enter("failed")
@@ -765,12 +774,51 @@ def sync_landings(cfg: config.Config) -> None:
             if reached is None or branches.index(reached) <= already:
                 continue
             target = cfg.jira.landed[reached]
-            err = tracker.for_repo(cfg, repo).move_to(str(r["issue"]), target)
+            tk = tracker.for_repo(cfg, repo)
+            err = tk.move_to(str(r["issue"]), target)
+            if reached != branches[-1]:
+                run = Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=str(r["issue"]))
+                moved = "" if err else f" and moved to {target}"
+                if say_err := run.say(f"This reached `{reached}`{moved}. To test it there:\n\n"
+                                      + uat_steps(cfg, run, r, reached)):
+                    raise jira.JiraError(say_err)
         except (gh.GhError, jira.JiraError) as e:
             print(f"{util.iso()} {tracker.run_ticket_name(r)}: landing check failed, trying next poll: {util.first_line(str(e), 300)}")
             continue
         state.update_run(r["id"], landed=reached)
         print(f"{util.iso()} {tracker.run_ticket_name(r)}: landed on {reached}, " + (err or f"moved to {target}"))
+
+
+def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
+    saved = run.dir / f"uat-{branch}.md"
+    if saved.exists():
+        return saved.read_text()
+    run.dir.mkdir(parents=True, exist_ok=True)
+    t = run.tracker.get(run.tid)
+    urls = row["pr_url"].split()
+    share = MAX_DIFF_IN_PROMPT // len(urls)
+    prs = "\n\n".join(f"### {url}\n\n{gh.pr_body(url).strip()}\n\n```diff\n{cut(gh.pr_diff(url), share)}\n```"
+                       for url in urls)
+    res = run.agent("uat", prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
+                                  prs=prs, branch=branch),
+                    run.repo.path, model=cfg.model("uat"), allowed_tools=READ_TOOLS, json_schema=UAT_SCHEMA,
+                    timeout=600, persist=False)
+    state.update_run(run.id, cost_usd=(row.get("cost_usd") or 0) + run.cost)
+    found = res.structured if res.ok and isinstance(res.structured, dict) else {}
+    steps = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
+    if steps:
+        before = found.get("before", "").strip()
+        text = (f"**Before you start:** {before}\n\n" if before else "") + "\n".join(
+            f"{i}. {s}" for i, s in enumerate(steps, 1))
+    else:
+        text = (f"I could not write the steps ({util.first_line(res.error or 'none came back')}); "
+                f"the PR shows what changed: {' '.join(urls)}")
+    saved.write_text(text)
+    return text
+
+
+def cut(text: str, n: int) -> str:
+    return text if len(text) <= n else text[:n] + "\n... (cut)"
 
 
 def furthest_branch(branches: list[str], pr_urls: list[str], key: str) -> str | None:
