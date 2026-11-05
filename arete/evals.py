@@ -16,12 +16,12 @@ from .pipeline import (
     PLAN_SCHEMA,
     READ_TOOLS,
     AgentRun,
-    Build,
     Checkout,
     RunFailed,
+    TicketWork,
     bash_rules,
     check_list,
-    command_list,
+    code_list,
     prompt,
     run_checks,
     use_product,
@@ -74,7 +74,7 @@ class Prompts:
     def missing(self) -> list[str]:
         return [f"{name}.md" for name in BUILDER_PROMPTS if not (self.dir / f"{name}.md").is_file()]
 
-    def on(self, harness: str) -> str:
+    def applied_to(self, harness: str) -> str:
         return f"{harness} with prompts {self.label}" if self.label else harness
 
 
@@ -95,7 +95,7 @@ class Arm:
 class Source:
     def __init__(self, repo: config.Repo, ref: str = ""):
         self.repo, self.ref = repo, ref
-        self.label = ref or "worktree"
+        self.label = ref or state.BASELINE_SOURCE
         self._modes: dict[str, str] | None = None
 
     def modes(self) -> dict[str, str]:
@@ -253,9 +253,9 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: AgentRun) -> config.R
 def grade(cfg: config.Config, run: EvalRun, layer: config.RepoLayer, wt: Path, title: str, ask: str, steps: str,
           timeout: float, step: str = "grade") -> verify.Verified:
     ticket = tracker.Ticket(id=run.task, ref=run.task, title=title, body=ask)
-    b = Build(cfg, run, ticket, wt, [Checkout("", run.repo.github, run.repo.path, wt, "")], layer, tools=[], deny=[],
-              timeout=timeout, workspace="You are in a checkout of its code.", attachments="", expertise="")
-    return use_product(b, step, "grade", goal=steps)
+    work = TicketWork(cfg, run, ticket, wt, [Checkout("", run.repo.github, run.repo.path, wt, "")], layer, timeout,
+                      workspace="You are in a checkout of its code.")
+    return use_product(work, step, "grade", goal=steps)
 
 
 def grade_failure(graded: verify.Verified) -> str:
@@ -289,7 +289,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
         checks = check_list(layer)
         timeout = task.timeout_minutes * 60
-        commands = command_list(layer.builder_bash)
+        commands = code_list(layer.builder_bash)
         workspace = workspace_note("eval", [Checkout("", repo.github, repo.path, wt, base)])
         res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
                                         body=task.prompt, comments="", attachments="", expertise=expertise,
@@ -388,7 +388,7 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False, pr
 
 def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Task], run_id: str,
               prompts: Prompts) -> Arm:
-    label = prompts.on(src.label)
+    label = prompts.applied_to(src.label)
     state.start_run(run_id, "eval", repo=repo.name)
     results = []
     for t in tasks:
@@ -440,7 +440,7 @@ def compare(repo_name: str, ref: str) -> str:
     before = {h["run_id"]: h for h in state.eval_history(repo.name, 50)}
     run(repo_name, ref=ref)
     after = [h for h in state.eval_history(repo.name, 50) if h["run_id"] not in before]
-    base = next((h for h in before.values() if h["source"] == "worktree"), None)
+    base = next((h for h in before.values() if h["source"] == state.BASELINE_SOURCE), None)
     if not after:
         return ""
     a = after[0]
@@ -492,10 +492,6 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
                                               f"{state.new_run_id('eval')}-{repo.name}-{arm}", prompts)
                                for arm, prompts in arms.items()}))
     return prompt_comparison(arete, arms, changed, unmeasured, ran, skipped)
-
-
-def code_list(names: list[str]) -> str:
-    return ", ".join(f"`{n}`" for n in names)
 
 
 def flipped_tasks(main: Arm, pr: Arm, private: bool) -> str:

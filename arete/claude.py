@@ -34,6 +34,7 @@ def run(
     cwd: Path | str,
     *,
     model: str = "",
+    tools: list[str] | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     permission_mode: str = "dontAsk",
@@ -49,6 +50,8 @@ def run(
     cmd = [binary(), "-p", "--output-format", "json", "--permission-mode", permission_mode]
     if model:
         cmd += ["--model", model]
+    if tools is not None:
+        cmd += ["--tools", ",".join(tools)]
     if allowed_tools:
         cmd += ["--allowedTools", *allowed_tools]
     if disallowed_tools:

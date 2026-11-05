@@ -19,7 +19,7 @@ def marked(body: str) -> str:
     return f"{body.rstrip()}\n\n{ARETE_MARK}"
 
 
-def from_arete(body: str | None) -> bool:
+def has_arete_mark(body: str | None) -> bool:
     return ARETE_MARK in (body or "")
 
 
@@ -89,13 +89,6 @@ def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] 
 
 
 def issue_state(repo: str, number: int) -> str:
-    try:
-        return (gh_json(["issue", "view", str(number), "--repo", repo, "--json", "state"]) or {}).get("state", "")
-    except GhError:
-        return ""
-
-
-def existing_issue_state(repo: str, number: int) -> str:
     try:
         return (gh_json(["issue", "view", str(number), "--repo", repo, "--json", "state"]) or {}).get("state", "")
     except GhError as e:

@@ -12,7 +12,7 @@ from pathlib import Path
 from string import Template
 
 from . import claude, config, gh, jira, paths, state, tracker, util, verify
-from .heartbeat import mark_loop
+from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
 ALWAYS_DENY = [".agents/config.toml", ".github/workflows/**", ".env", ".env.*", "**/.env", "**/.env.*"]
@@ -102,6 +102,8 @@ FEEDBACK_QUIET_MINUTES = 10
 HUNK_LINES = 6
 PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
 PR_SEEN_SETTLE = timedelta(minutes=1)
+REJECTED_PR_LISTEN = timedelta(days=7)
+UAT_TRIES = 3
 READ_TOOLS = ["Read", "Glob", "Grep"]
 EDIT_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "TodoWrite"]
 NO_GIT_WRITES = [
@@ -119,8 +121,8 @@ def bash_rules(patterns: list[str]) -> list[str]:
     return [f"Bash({p})" for p in patterns]
 
 
-def command_list(patterns: list[str]) -> str:
-    return ", ".join(f"`{p}`" for p in patterns)
+def code_list(names: list[str]) -> str:
+    return ", ".join(f"`{n}`" for n in names)
 
 
 def slug(text: str, n: int = 40) -> str:
@@ -168,17 +170,14 @@ class AgentRun:
     def agent(self, step: str, text: str, cwd: Path, **kw) -> claude.Result:
         self.log(f"{step}: starting")
         res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
-        for _ in range(util.NETWORK_RETRIES - 1):
-            if not res.connection_failed:
-                break
-            self.cost += res.cost_usd
+        if res.connection_failed:
             self.log(f"{step}: lost the connection after {res.turns} turns, waiting for the network")
-            if not util.wait_for_network():
-                break
-            if res.session_id and res.turns > 1 and kw.get("persist", True):
-                res = claude.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, **{**kw, "resume": res.session_id})
-            else:
-                res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
+            if util.wait_for_network():
+                self.cost += res.cost_usd
+                if res.session_id and res.turns > 1 and kw.get("persist", True):
+                    res = claude.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, **{**kw, "resume": res.session_id})
+                else:
+                    res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
         self.cost += res.cost_usd
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session_id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
@@ -225,6 +224,10 @@ class Run(AgentRun):
         for err in (self.tracker.label(self.tid, add=[status], remove=others), self.tracker.move(self.tid, status)):
             if err:
                 self.log(f"tracker: {util.first_line(err, 300)}")
+
+    def leave(self, status: str) -> None:
+        if not self.dry_run and (err := self.tracker.label(self.tid, remove=[status])):
+            self.log(f"tracker: {util.first_line(err, 300)}")
 
     def say(self, body: str) -> str:
         if self.dry_run:
@@ -404,6 +407,14 @@ def untracked_files(wt: Path) -> set[str]:
     return set(git(["ls-files", "--others", "--exclude-standard", "-z"], wt).split("\0")) - {""}
 
 
+def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
+    return {d: untracked_files(d) for d in dirs}
+
+
+def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]]:
+    return [(d, name) for d, names in before.items() for name in sorted(untracked_files(d) - names)]
+
+
 def remove_untracked(wt: Path, name: str) -> None:
     f = wt / name
     f.unlink(missing_ok=True)
@@ -423,7 +434,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                timeout: float) -> tuple[bool, str]:
     if not layer.checks:
         return True, "no checks configured"
-    untracked_before = {d: untracked_files(d) for d in git_dirs}
+    untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
     for name, cmd in layer.checks.items():
         res = util.sh(cmd, cwd=cwd, timeout=timeout)
@@ -434,10 +445,13 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{util.tail(res.stdout + res.stderr, 6000)}\n```")
         else:
             report.append(f"### {name} passed: `{cmd}`")
-    for d, before in untracked_before.items():
-        for name in untracked_files(d) - before:
-            remove_untracked(d, name)
+    for d, name in untracked_added_since(untracked_before):
+        remove_untracked(d, name)
     return ok, "\n\n".join(report)
+
+
+class RetryNextPoll(Exception):
+    pass
 
 
 class RunFailed(Exception):
@@ -447,22 +461,16 @@ class RunFailed(Exception):
 
 
 @dataclass
-class Build:
+class TicketWork:
     cfg: config.Config
     run: AgentRun
     ticket: tracker.Ticket
     ws: Path
     checkouts: list[Checkout]
     layer: config.RepoLayer
-    tools: list[str]
-    deny: list[str]
     timeout: float
     workspace: str
-    attachments: str
-    expertise: str
-    session: str = ""
-    report: str = ""
-    staged: Staged = field(default_factory=Staged)
+    attachments: str = ""
     steps: Counter = field(default_factory=Counter)
 
     @property
@@ -476,6 +484,16 @@ class Build:
     def next_step(self, name: str) -> str:
         self.steps[name] += 1
         return name if self.steps[name] == 1 else f"{name}{self.steps[name]}"
+
+
+@dataclass(kw_only=True)
+class Build(TicketWork):
+    tools: list[str]
+    deny: list[str]
+    expertise: str
+    session: str = ""
+    report: str = ""
+    staged: Staged = field(default_factory=Staged)
 
     def resume(self, step: str, text: str) -> claude.Result:
         res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
@@ -491,18 +509,21 @@ class Build:
         self.staged = stage(self.checkouts, self.deny)
         return self.staged
 
-    def recheck(self, after: str) -> None:
-        ok = self.check()
+    def require_valid_diff(self, after: str, planned: str = "") -> None:
         staged = self.restage()
         limit = self.layer.max_diff_lines
-        if not ok:
-            raise RunFailed(f"the checks failed after {after}", self.report)
         if not staged.files:
             raise RunFailed(f"{after} undid every change")
         if staged.denied:
             raise RunFailed(f"{after} touched denied paths: {', '.join(staged.denied[:5])}")
         if staged.lines > limit:
-            raise RunFailed(f"after {after} the diff is {staged.lines} lines, over the {limit} line limit")
+            raise RunFailed(f"after {after} the diff is {staged.lines} lines, over the {limit} line limit{planned}; "
+                            "split the work", f"### Lines changed by file\n\n{lines_by_file(self.checkouts)}")
+
+    def recheck(self, after: str) -> None:
+        if not self.check():
+            raise RunFailed(f"the checks failed after {after}", self.report)
+        self.require_valid_diff(after)
 
 
 def split_comment(estimate: int, limit: int, split: list[dict], queue_hint: str, info_label: str,
@@ -535,18 +556,19 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
-        live = live_pipeline_runs()
-        if not dry_run and len(live) >= cfg.max_parallel:
-            print(f"{name} was not started: {len(live)} of {cfg.max_parallel} runs going. Wait for one to finish "
-                  f"or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
-            return 1
-        earlier = state.ticket_runs(repo.name, tid, limit=1)
-        restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
-        run_id = state.new_run_id("pipeline") + f"-{repo.name}-{tid}"
-        run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                  feedback=pending_feedback(repo.name, tid))
-        run.dir.mkdir(parents=True, exist_ok=True)
-        state.start_run(run_id, "pipeline", repo.name, tid)
+        with util.lock("run-slots", wait=True):
+            live = live_pipeline_runs()
+            if not dry_run and len(live) >= cfg.max_parallel:
+                print(f"{name} was not started: {len(live)} of {cfg.max_parallel} runs going. Wait for one to finish "
+                      f"or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
+                return 1
+            earlier = state.ticket_runs(repo.name, tid, limit=1)
+            restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
+            run_id = state.new_run_id("pipeline") + f"-{repo.name}-{tid}"
+            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
+                      feedback=pending_feedback(repo.name, tid))
+            run.dir.mkdir(parents=True, exist_ok=True)
+            state.start_run(run_id, "pipeline", repo.name, tid)
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
         if run.feedback:
@@ -656,7 +678,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     checks = check_list(layer)
     reads = git_reads(checkouts)
     builder_bash = layer.builder_bash + reads
-    commands = command_list(builder_bash)
+    commands = code_list(builder_bash)
     workspace = workspace_note(branch, checkouts)
     step_timeout = layer.timeout_minutes * 60
     read_tools = READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
@@ -721,7 +743,8 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         build_summary = res.text
         if not stage(checkouts, deny).files:
             return _fail(run, "the builder stopped without changing anything", build_summary)
-    b = Build(cfg, run, t, ws, checkouts, layer, build_tools, deny, step_timeout, workspace, attachments, expertise,
+    b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=step_timeout,
+              workspace=workspace, attachments=attachments, tools=build_tools, deny=deny, expertise=expertise,
               session=res.session_id)
 
     attempts = 1
@@ -738,15 +761,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=False)
         return _fail(run, f"checks still failing after {attempts} attempts")
 
-    staged = b.restage()
-    if not staged.files:
-        return _fail(run, "the fix attempts undid every change", build_summary)
-    if staged.denied:
-        return _fail(run, f"the change touched denied paths: {', '.join(staged.denied[:5])}")
-    if staged.lines > limit:
-        planned = f" (the plan estimated {estimate})" if estimate else ""
-        return _fail(run, f"the diff is {staged.lines} lines, over the {limit} line limit{planned}; split the work",
-                     detail=f"### Lines changed by file\n\n{lines_by_file(checkouts)}")
+    b.require_valid_diff("the build and its fixes", f" (the plan estimated {estimate})" if estimate else "")
 
     verified = verify_in_use(b, goal, build_summary)
     review = _review(b, plan_text, verified)
@@ -964,7 +979,7 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
                        diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT))
 
 
-def use_product(b: Build, step_name: str, prompt_name: str, **values) -> verify.Verified:
+def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> verify.Verified:
     run, v, t = b.run, b.layer.verify, b.ticket
     step = b.next_step(step_name)
     evidence = run.dir / "evidence"
@@ -972,7 +987,7 @@ def use_product(b: Build, step_name: str, prompt_name: str, **values) -> verify.
     if evidence not in run.add_dirs:
         run.add_dirs.append(evidence)
     bash = b.read_bash + v.bash
-    untracked_before = {d: untracked_files(d) for d in b.git_dirs}
+    untracked_before = untracked_by_dir(b.git_dirs)
     try:
         with verify.serving(v, b.ws, run.dir / f"{step}-server.log") as url:
             if url:
@@ -980,7 +995,7 @@ def use_product(b: Build, step_name: str, prompt_name: str, **values) -> verify.
             res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
-                                         commands=command_list(bash), checks=check_list(b.layer), **values),
+                                         commands=code_list(bash), checks=check_list(b.layer), **values),
                             b.ws, model=b.cfg.model("verify"),
                             allowed_tools=READ_TOOLS + bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=NO_GIT_WRITES, json_schema=verify.SCHEMA, timeout=b.timeout,
@@ -1013,13 +1028,13 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
-    for d, before in untracked_before.items():
-        for name in untracked_files(d) - before:
-            f = d / name
-            if f.suffix == ".png" and not (evidence / f.name).exists():
-                shutil.move(f, evidence / f.name)
-            else:
-                remove_untracked(d, name)
+    for d, name in untracked_added_since(untracked_before):
+        f = d / name
+        if f.suffix == ".png" and not (evidence / f.name).exists():
+            shutil.move(f, evidence / f.name)
+        else:
+            remove_untracked(d, name)
+    for d in untracked_before:
         git(["checkout", "-q", "--", "."], d)
 
 
@@ -1101,7 +1116,7 @@ def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[
     talk = gh.pr_discussion(url)
 
     def from_owner(item: dict) -> bool:
-        return (item.get("user") or {}).get("login") == owner and not gh.from_arete(item.get("body"))
+        return (item.get("user") or {}).get("login") == owner and not gh.has_arete_mark(item.get("body"))
 
     reviews = {r["id"]: r for r in talk.reviews}
     lines_in_review = Counter(c.get("pull_request_review_id") for c in talk.line_comments)
@@ -1140,10 +1155,17 @@ def record_feedback(r: dict, urls: list[str], prs: list[dict], seen: dict, fresh
             print(f"{util.iso()} {url}: {util.count(added, 'new comment')} from you")
 
 
+def reads_pr_comments(r: dict) -> bool:
+    if not r.get("pr_url"):
+        return False
+    rejected_lately = r["status"] == "rejected" and (r.get("finished") or "") >= util.iso(util.now() - REJECTED_PR_LISTEN)
+    return r["status"] == "pr" or rejected_lately
+
+
 def sync_outcomes(cfg: config.Config) -> None:
     seen, fresh = util.read_json(PR_SEEN_FILE, {}), {}
     for r in state.runs(kind="pipeline", limit=200):
-        if r["status"] != "pr" or not r.get("pr_url"):
+        if not reads_pr_comments(r):
             continue
         urls = r["pr_url"].split()
         try:
@@ -1151,14 +1173,18 @@ def sync_outcomes(cfg: config.Config) -> None:
         except gh.GhError:
             continue
         record_feedback(r, urls, prs, seen, fresh)
-        if not all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs):
+        closed = all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs)
+        if r["status"] == "rejected":
+            if not closed:
+                state.update_run(r["id"], status="pr")
+            continue
+        if not closed:
             continue
         for url, pr in zip(urls, prs):
             state.close_feedback(url, pr["state"])
-        if all(pr.get("mergedAt") for pr in prs):
-            state.update_run(r["id"], status="merged")
-        else:
-            state.update_run(r["id"], status="rejected")
+        merged = all(pr.get("mergedAt") for pr in prs)
+        closed_at = max(pr.get("closedAt") or "" for pr in prs) or util.iso()
+        state.update_run(r["id"], status="merged" if merged else "rejected", finished=closed_at)
     util.write_json(PR_SEEN_FILE, fresh)
     for repo in cfg.repos:
         if repo.pipeline and repo.github and not repo.layer:
@@ -1194,8 +1220,8 @@ def sync_landings(cfg: config.Config) -> None:
                 moved = "" if err else f" and moved to {target}"
                 if say_err := run.say(f"This reached `{reached}`{moved}. To test it there:\n\n"
                                       + uat_steps(cfg, run, r, reached)):
-                    raise jira.JiraError(say_err)
-        except (gh.GhError, jira.JiraError) as e:
+                    raise RetryNextPoll(say_err)
+        except (gh.GhError, jira.JiraError, RetryNextPoll) as e:
             print(f"{util.iso()} {tracker.run_ticket_name(r)}: landing check failed, trying next poll: {util.first_line(str(e), 300)}")
             continue
         state.update_run(r["id"], landed=reached)
@@ -1207,6 +1233,8 @@ def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
     if saved.exists():
         return saved.read_text()
     run.dir.mkdir(parents=True, exist_ok=True)
+    tries_file = run.dir / f"uat-{branch}.tries"
+    tries = int(tries_file.read_text() or 0) + 1 if tries_file.exists() else 1
     t = run.tracker.get(run.tid)
     urls = row["pr_url"].split()
     share = MAX_DIFF_IN_PROMPT // len(urls)
@@ -1219,12 +1247,16 @@ def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
     state.update_run(run.id, cost_usd=(row.get("cost_usd") or 0) + run.cost)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     steps = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
+    failure = util.first_line(res.error or "none came back")
     if steps:
         before = found.get("before", "").strip()
         text = (f"**Before you start:** {before}\n\n" if before else "") + "\n".join(
             f"{i}. {s}" for i, s in enumerate(steps, 1))
+    elif tries < UAT_TRIES:
+        tries_file.write_text(str(tries))
+        raise RetryNextPoll(f"no test steps came back, try {tries} of {UAT_TRIES}: {failure}")
     else:
-        text = (f"I could not write the steps ({util.first_line(res.error or 'none came back')}); "
+        text = (f"I could not write the steps ({failure}); "
                 f"the PR shows what changed: {' '.join(urls)}")
     saved.write_text(text)
     return text
@@ -1346,6 +1378,7 @@ def settle_abandoned_runs(cfg: config.Config) -> None:
             else:
                 state.finish_run(row["id"], "interrupted", summary=INTERRUPTED)
                 run.log(INTERRUPTED)
+                run.leave("running")
                 run.say(f"Run `{run.id}` {INTERRUPTED}.")
 
 
@@ -1412,13 +1445,8 @@ def poll(dry_run: bool = False) -> int:
         if not got:
             print(f"{util.iso()} poll already running")
             return 0
-        if not util.online():
-            print(f"{util.iso()} offline, waiting up to {util.WAKE_NETWORK_WAIT_MINUTES} minutes for the network", flush=True)
-            if not util.wait_for_network(util.WAKE_NETWORK_WAIT_MINUTES):
-                print(f"{util.iso()} still offline, skipped this poll")
-                if not dry_run:
-                    mark_loop("poll", True, "offline")
-                return 0
+        if not network_up_or_skip("poll", dry_run):
+            return 0
         errors: list[str] = []
 
         def failed(where: str, e: Exception) -> None:

@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import alerts, claude, config, gh, jira, paths, state, tracker, util
-from .heartbeat import mark_loop
+from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import READ_TOOLS, prompt
 
 ISSUE_TITLE = "[arete] triage"
@@ -21,7 +21,8 @@ TIMEOUT_SECONDS = 300
 MAX_PLAN_STEPS = 6
 MAX_ISSUE_CHARS = 60000
 META_FILE = paths.STATE_DIR / "triage.json"
-PROMPTS_DIR = paths.STATE_DIR / "triage"
+TICKET_RECORDS_DIR = paths.STATE_DIR / "triage"
+NO_MCP_SERVERS = json.dumps({"mcpServers": {}})
 SEARCH_FIELDS = ["summary", "updated", "labels"]
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent"]
 SIZES = ("S", "M", "L")
@@ -41,23 +42,8 @@ SCHEMA = {
 }
 WAITING = f"waiting: more than {MAX_CALLS} tickets were due in one refresh"
 EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
-
-
-@dataclass
-class Source:
-    tracker: str
-    key: str
-    repos: list[config.Repo]
-
-    @property
-    def name(self) -> str:
-        return f"Jira {self.key or '(no project)'}" if self.tracker == "jira" else f"GitHub {self.key}"
-
-    def jira(self, cfg: config.Config) -> tracker.JiraTracker:
-        return tracker.JiraTracker(self.repos[0], cfg.jira)
-
-    def github(self) -> tracker.GitHubTracker:
-        return tracker.GitHubTracker(self.repos[0])
+READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED = "Ready", "With questions", "Not code work", "Not triaged"
+STANDINGS = (READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED)
 
 
 @dataclass
@@ -69,13 +55,136 @@ class Candidate:
     updated: str
 
 
-def sources(cfg: config.Config) -> list[Source]:
-    found: dict[tuple[str, str], Source] = {}
+@dataclass
+class Source:
+    key: str
+    repos: list[config.Repo] = field(default_factory=list)
+
+    def repos_text(self) -> str:
+        lines = []
+        for r in self.repos:
+            limit = config.load_layer(r.layer_dir).max_diff_lines
+            lines.append(f"- `{r.name}` at {r.path}{self.route_note(r)}; one run changes at most {limit} lines")
+        return "\n".join(lines)
+
+    def by_name(self) -> dict[str, config.Repo]:
+        return {r.name: r for r in self.repos}
+
+
+@dataclass
+class JiraSource(Source):
+    jira_cfg: config.JiraConfig = field(default_factory=config.JiraConfig)
+    tracker = "jira"
+
+    @property
+    def name(self) -> str:
+        return f"Jira {self.key or '(no project)'}"
+
+    @property
+    def client(self) -> jira.Client:
+        return tracker.JiraTracker(self.repos[0], self.jira_cfg).client
+
+    def candidates(self) -> list[Candidate]:
+        if not self.key:
+            raise jira.JiraError("no Jira project; set [jira] project or jira_project on the repo")
+        client = self.client
+        jql = (f'project = "{self.key}" AND assignee = currentUser() AND statusCategory != Done '
+               f'AND (labels is EMPTY OR labels not in ("{tracker.LABEL}")) ORDER BY updated DESC')
+        out = []
+        for i in client.search(jql, SEARCH_FIELDS, limit=PER_SOURCE):
+            f = i.get("fields") or {}
+            if tracker.LABEL not in (f.get("labels") or []):
+                out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
+                                     f.get("updated") or ""))
+        return out
+
+    def ticket_text(self, c: Candidate) -> str:
+        client = self.client
+        f = client.issue(c.id, JIRA_FIELDS).get("fields") or {}
+        facts = [f"Type: {(f.get('issuetype') or {}).get('name', '')}",
+                 f"Status: {(f.get('status') or {}).get('name', '')}",
+                 f"Labels: {', '.join(f.get('labels') or []) or 'none'}"]
+        parent = f.get("parent") or {}
+        if parent.get("key"):
+            facts.append(f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}")
+        comments = [((cm.get("author") or {}).get("displayName", "someone"), cm.get("created", ""), cm.get("body") or "")
+                    for cm in client.comments(c.id)]
+        parts = ["\n".join(facts), f.get("description") or "(no description)", tracker.comments_text(comments)]
+        return "\n\n".join(p for p in parts if p)
+
+    def route_note(self, r: config.Repo) -> str:
+        return f", route label `{tracker.route_label(r)}`"
+
+    def repo_rule(self) -> str:
+        names = ", ".join(f"`{r.name}`" for r in self.repos)
+        return (f"the one repository the change belongs in, one of {names}, or an empty string when the ticket and the "
+                "code do not settle it. A ticket that already carries a route label belongs to that label's "
+                "repository.")
+
+    def chosen_repo(self, answer: dict) -> str:
+        repo = str(answer.get("repo") or "").strip().strip("`")
+        return repo if repo in self.by_name() else ""
+
+    def route(self, repo: str) -> str:
+        return tracker.route_label(self.by_name()[repo]) if repo else ""
+
+
+@dataclass
+class GitHubSource(Source):
+    tracker = "github"
+
+    @property
+    def name(self) -> str:
+        return f"GitHub {self.key}"
+
+    @property
+    def issues(self) -> tracker.GitHubTracker:
+        return tracker.GitHubTracker(self.repos[0])
+
+    def candidates(self) -> list[Candidate]:
+        if not self.key:
+            raise gh.GhError(f"{self.repos[0].name} has no github repo set")
+        tk = self.issues
+        out = []
+        for i in gh.issues(self.key, author=tk.owner, limit=PER_SOURCE):
+            names = {lb["name"] for lb in i.get("labels", [])}
+            if names & SKIP_LABELS or not tk.by_owner(i):
+                continue
+            out.append(Candidate(f"{tk.repo.name}#{i['number']}", str(i["number"]), i["title"].strip(),
+                                 i.get("url", ""), i.get("updatedAt") or ""))
+        return out
+
+    def ticket_text(self, c: Candidate) -> str:
+        t = self.issues.get(c.id)
+        return "\n\n".join(p for p in (f"Labels: {', '.join(t.labels) or 'none'}", t.body, t.comments) if p)
+
+    def route_note(self, r: config.Repo) -> str:
+        return ""
+
+    def repo_rule(self) -> str:
+        return f"always `{self.repos[0].name}`."
+
+    def chosen_repo(self, answer: dict) -> str:
+        return self.repos[0].name
+
+    def route(self, repo: str) -> str:
+        return ""
+
+
+TriageSource = JiraSource | GitHubSource
+
+
+def sources(cfg: config.Config) -> list[TriageSource]:
+    found: dict[tuple[str, str], TriageSource] = {}
     for r in cfg.repos:
         if not (r.pipeline and r.parts):
             continue
-        key = ("jira", r.jira_project or cfg.jira.project) if r.tracker == "jira" else ("github", r.github)
-        found.setdefault(key, Source(*key, [])).repos.append(r)
+        if r.tracker == "jira":
+            project = r.jira_project or cfg.jira.project
+            src = found.setdefault(("jira", project), JiraSource(project, jira_cfg=cfg.jira))
+        else:
+            src = found.setdefault(("github", r.github), GitHubSource(r.github))
+        src.repos.append(r)
     return list(found.values())
 
 
@@ -91,101 +200,34 @@ def natural(ref: str) -> list:
     return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", ref)]
 
 
-def read_candidates(cfg: config.Config, src: Source) -> list[Candidate]:
-    found = jira_candidates(cfg, src) if src.tracker == "jira" else github_candidates(src)
-    return sorted(found, key=lambda c: moment(c.updated), reverse=True)
+def read_candidates(src: TriageSource) -> list[Candidate]:
+    return sorted(src.candidates(), key=lambda c: moment(c.updated), reverse=True)
 
 
-def jira_candidates(cfg: config.Config, src: Source) -> list[Candidate]:
-    if not src.key:
-        raise jira.JiraError("no Jira project; set [jira] project or jira_project on the repo")
-    client = src.jira(cfg).client
-    jql = (f'project = "{src.key}" AND assignee = currentUser() AND statusCategory != Done '
-           f'AND (labels is EMPTY OR labels not in ("{tracker.LABEL}")) ORDER BY updated DESC')
-    out = []
-    for i in client.search(jql, SEARCH_FIELDS, limit=PER_SOURCE):
-        f = i.get("fields") or {}
-        if tracker.LABEL not in (f.get("labels") or []):
-            out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
-                                 f.get("updated") or ""))
-    return out
-
-
-def github_candidates(src: Source) -> list[Candidate]:
-    if not src.key:
-        raise gh.GhError(f"{src.repos[0].name} has no github repo set")
-    tk = src.github()
-    out = []
-    for i in gh.issues(src.key, author=tk.owner, limit=PER_SOURCE):
-        names = {lb["name"] for lb in i.get("labels", [])}
-        if names & SKIP_LABELS or not tk.by_owner(i):
-            continue
-        out.append(Candidate(f"{tk.repo.name}#{i['number']}", str(i["number"]), i["title"].strip(), i.get("url", ""),
-                             i.get("updatedAt") or ""))
-    return out
-
-
-def ticket_text(cfg: config.Config, src: Source, c: Candidate) -> str:
-    if src.tracker == "github":
-        t = src.github().get(c.id)
-        return "\n\n".join(p for p in (f"Labels: {', '.join(t.labels) or 'none'}", t.body, t.comments) if p)
-    client = src.jira(cfg).client
-    f = client.issue(c.id, JIRA_FIELDS).get("fields") or {}
-    facts = [f"Type: {(f.get('issuetype') or {}).get('name', '')}",
-             f"Status: {(f.get('status') or {}).get('name', '')}",
-             f"Labels: {', '.join(f.get('labels') or []) or 'none'}"]
-    parent = f.get("parent") or {}
-    if parent.get("key"):
-        facts.append(f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}")
-    comments = [((cm.get("author") or {}).get("displayName", "someone"), cm.get("created", ""), cm.get("body") or "")
-                for cm in client.comments(c.id)]
-    parts = ["\n".join(facts), f.get("description") or "(no description)", tracker.comments_text(comments)]
-    return "\n\n".join(p for p in parts if p)
-
-
-def repos_text(src: Source) -> str:
-    lines = []
-    for r in src.repos:
-        route = f", route label `{tracker.route_label(r)}`" if src.tracker == "jira" else ""
-        limit = config.load_layer(r.layer_dir).max_diff_lines
-        lines.append(f"- `{r.name}` at {r.path}{route}; one run changes at most {limit} lines")
-    return "\n".join(lines)
-
-
-def repo_rule(src: Source) -> str:
-    if src.tracker == "github":
-        return f"always `{src.repos[0].name}`."
-    names = ", ".join(f"`{r.name}`" for r in src.repos)
-    return (f"the one repository the change belongs in, one of {names}, or an empty string when the ticket and the "
-            "code do not settle it. A ticket that already carries a route label belongs to that label's repository.")
-
-
-def prompt_file(ref: str) -> Path:
-    return PROMPTS_DIR / f"{tracker.safe_filename(ref)}.md"
+def record_file(ref: str) -> Path:
+    return TICKET_RECORDS_DIR / f"{tracker.safe_filename(ref)}.md"
 
 
 def read_rules(dirs: list[Path]) -> list[str]:
     return [f"{tool}(/{d}/**)" for d in dict.fromkeys(p for d in dirs for p in (d, d.resolve())) for tool in READ_TOOLS]
 
 
-def triage_one(cfg: config.Config, src: Source, c: Candidate) -> tuple[dict | None, float, str]:
-    text = prompt("triage", repos=repos_text(src), ref=c.ref, title=c.title, ticket=ticket_text(cfg, src, c),
-                  repo_rule=repo_rule(src))
+def triage_one(cfg: config.Config, src: TriageSource, c: Candidate) -> tuple[dict | None, float, str]:
+    text = prompt("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=src.ticket_text(c),
+                  repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
-    PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-    res = claude.run(text, dirs[0] if dirs else PROMPTS_DIR, model=cfg.model("triage") or "haiku",
-                     allowed_tools=read_rules(dirs), json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
+    TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+    res = claude.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage") or "haiku",
+                     tools=READ_TOOLS, allowed_tools=read_rules(dirs), mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
                      timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:])
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None
-    prompt_file(c.ref).write_text(f"{text}\n\n## Triage result (${res.cost_usd:.3f})\n\n```json\n"
+    record_file(c.ref).write_text(f"{text}\n\n## Triage result (${res.cost_usd:.3f})\n\n```json\n"
                                   f"{json.dumps(answer or {'error': res.error}, indent=2)}\n```\n")
     return answer, res.cost_usd, "" if answer else util.first_line(res.error or "no answer")
 
 
-def settle(src: Source, c: Candidate, answer: dict, cost: float) -> dict:
-    by_name = {r.name: r for r in src.repos}
-    repo = src.repos[0].name if src.tracker == "github" else str(answer.get("repo") or "").strip().strip("`")
-    repo = repo if repo in by_name else ""
+def settle(src: TriageSource, c: Candidate, answer: dict, cost: float) -> dict:
+    repo = src.chosen_repo(answer)
     why = str(answer.get("why") or "").strip()
     questions = [q.strip() for q in answer.get("questions") or [] if q.strip()]
     plan = [re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", step).strip() for step in answer.get("plan") or []]
@@ -194,22 +236,21 @@ def settle(src: Source, c: Candidate, answer: dict, cost: float) -> dict:
         return row(src, c, updated=c.updated, ready=0, code=0, repo=repo, why=why, cost=cost)
     size = answer.get("size") if answer.get("size") in SIZES else "M"
     if not repo:
-        questions.append(f"Which repo is it for: {', '.join(by_name)}?")
+        questions.append(f"Which repo is it for: {', '.join(src.by_name())}?")
     if size == "L":
         questions.append("It is too big for one pull request. Can you split it into smaller tickets?")
-    route = tracker.route_label(by_name[repo]) if src.tracker == "jira" and repo else ""
     return row(src, c, updated=c.updated, ready=int(bool(answer.get("ready")) and not questions), code=1, repo=repo,
-               route=route, size=size, questions=questions, plan=plan, why=why, cost=cost)
+               route=src.route(repo), size=size, questions=questions, plan=plan, why=why, cost=cost)
 
 
-def row(src: Source, c: Candidate, **fields) -> dict:
+def row(src: TriageSource, c: Candidate, **fields) -> dict:
     base = {"ref": c.ref, "source": src.name, "tracker": src.tracker, "repo": "", "route": "", "title": c.title,
             "url": c.url, "updated": "", "ready": None, "code": None, "size": "", "questions": [], "plan": [], "why": "",
             "cost": 0.0, "ts": util.iso()}
     return {**base, **fields}
 
 
-def kept(src: Source, c: Candidate, prev: dict | None, reason: str) -> dict:
+def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dict:
     if prev and prev["ready"] is not None:
         return {**prev, "source": src.name, "title": c.title, "url": c.url}
     return row(src, c, why=reason)
@@ -230,13 +271,8 @@ def run(dry_run: bool = False) -> int:
         if not got:
             print(f"{util.iso()} triage already running")
             return 0
-        if not util.online():
-            print(f"{util.iso()} offline, waiting up to {util.WAKE_NETWORK_WAIT_MINUTES} minutes for the network", flush=True)
-            if not util.wait_for_network(util.WAKE_NETWORK_WAIT_MINUTES):
-                print(f"{util.iso()} still offline, skipped this triage")
-                if not dry_run:
-                    mark_loop("triage", True, "offline")
-                return 0
+        if not network_up_or_skip("triage", dry_run):
+            return 0
         return refresh(cfg, dry_run)
 
 
@@ -247,7 +283,7 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
     errors: list[str] = []
     for src in srcs:
         try:
-            read[src.name] = read_candidates(cfg, src)
+            read[src.name] = read_candidates(src)
         except tracker.ERRORS as e:
             errors.append(f"{src.name}: {e}")
             print(f"{util.iso()} {errors[-1]}")
@@ -282,8 +318,8 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
                                             f"triage failed: {failed[c.ref]}" if c.ref in failed else WAITING)
                 for c in read[src.name]])
     state.triage_prune([s.name for s in srcs])
-    keep = {prompt_file(r["ref"]).name for r in state.triage_rows()}
-    for f in PROMPTS_DIR.glob("*.md"):
+    keep = {record_file(r["ref"]).name for r in state.triage_rows()}
+    for f in TICKET_RECORDS_DIR.glob("*.md"):
         if f.name not in keep:
             f.unlink()
 
@@ -295,7 +331,7 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
     except (gh.GhError, BoardRefused) as e:
         problems.append(f"posting the board: {e}")
         posted = f"not posted: {e}"
-    meta.update(errors=errors, posted=posted)
+    meta.update(posted=posted)
     util.write_json(META_FILE, meta)
     print(f"{util.iso()} triage: {util.count(len(now), 'model call')} (${spent:.3f}), "
           f"{len(failed)} failed, {len(waiting)} waiting; board {posted}")
@@ -305,8 +341,8 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
     return 1 if problems else 0
 
 
-def preview(srcs: list[Source], read: dict[str, list[Candidate]], old: dict[str, dict],
-            now: list[tuple[Source, Candidate]], later: list[tuple[Source, Candidate]]) -> None:
+def preview(srcs: list[TriageSource], read: dict[str, list[Candidate]], old: dict[str, dict],
+            now: list[tuple[TriageSource, Candidate]], later: list[tuple[TriageSource, Candidate]]) -> None:
     for src in srcs:
         if src.name not in read:
             continue
@@ -322,17 +358,16 @@ def preview(srcs: list[Source], read: dict[str, list[Candidate]], old: dict[str,
     print("dry run: no model calls, nothing written")
 
 
-@dataclass
-class Groups:
-    ready: list[dict]
-    with_questions: list[dict]
-    not_code: list[dict]
-    not_triaged: list[dict]
+def standing(r: dict) -> str:
+    if r["ready"] is None:
+        return NOT_TRIAGED
+    if r["code"] == 0:
+        return NOT_CODE_WORK
+    return READY if r["ready"] else WITH_QUESTIONS
 
 
-def groups(rows: list[dict]) -> Groups:
-    return Groups([r for r in rows if r["ready"] == 1], [r for r in rows if r["ready"] == 0 and r["code"] != 0],
-                  [r for r in rows if r["code"] == 0], [r for r in rows if r["ready"] is None])
+def groups(rows: list[dict]) -> dict[str, list[dict]]:
+    return {s: [r for r in rows if standing(r) == s] for s in STANDINGS}
 
 
 def labels_to_add(r: dict) -> list[str]:
@@ -340,19 +375,17 @@ def labels_to_add(r: dict) -> list[str]:
 
 
 def verdict(r: dict) -> str:
-    if r["ready"] is None:
-        return "not triaged"
-    if r["code"] == 0:
-        return "not code work"
-    if r["ready"]:
+    kind = standing(r)
+    if kind == READY:
         return f"ready, {r['size']}, add {' '.join(labels_to_add(r))}"
-    return f"not ready, {r['size']}, {util.count(len(r['questions']), 'question')}"
+    if kind == WITH_QUESTIONS:
+        return f"not ready, {r['size']}, {util.count(len(r['questions']), 'question')}"
+    return kind.lower()
 
 
 def summary(rows: list[dict]) -> str:
     g = groups(rows)
-    return (f"{util.count(len(rows), 'ticket')}: {len(g.ready)} ready, {len(g.with_questions)} with questions, "
-            f"{len(g.not_code)} not code work, {len(g.not_triaged)} not triaged")
+    return f"{util.count(len(rows), 'ticket')}: " + ", ".join(f"{len(g[s])} {s.lower()}" for s in STANDINGS)
 
 
 def status_line() -> str:
@@ -375,22 +408,22 @@ def board() -> str:
     g = groups(rows)
     width = max(len(r["ref"]) for r in rows) if rows else 0
     repo_width = max((len(r["repo"]) for r in rows), default=0)
-    if g.ready:
+    if g[READY]:
         lines += ["", "Ready: add the labels to approve"]
         lines += [f"  {r['ref']:<{width}}  {r['size']}  {r['repo']:<{repo_width}}  {' '.join(labels_to_add(r)):<16}  "
-                  f"{r['title']}" for r in g.ready]
-    if g.with_questions:
+                  f"{r['title']}" for r in g[READY]]
+    if g[WITH_QUESTIONS]:
         lines += ["", "With questions"]
-        for r in g.with_questions:
+        for r in g[WITH_QUESTIONS]:
             lines.append(f"  {r['ref']:<{width}}  {r['size']}  {r['repo'] or '?':<{repo_width}}  {r['title']}")
             lines += [f"      - {q}" for q in r["questions"]] or [f"      {r['why']}"]
-    if g.not_code:
+    if g[NOT_CODE_WORK]:
         lines += ["", "Not code work: nothing for the pipeline to build"]
-        for r in g.not_code:
+        for r in g[NOT_CODE_WORK]:
             lines += [f"  {r['ref']:<{width}}  {r['title']}", f"      {r['why']}"]
-    if g.not_triaged:
+    if g[NOT_TRIAGED]:
         lines += ["", "Not triaged"]
-        lines += [f"  {r['ref']:<{width}}  {r['title']}  ({r['why']})" for r in g.not_triaged]
+        lines += [f"  {r['ref']:<{width}}  {r['title']}  ({r['why']})" for r in g[NOT_TRIAGED]]
     lines += ["", "`arete triage REF` shows one ticket in full."]
     return "\n".join(lines)
 
@@ -400,12 +433,13 @@ def ticket(ref: str) -> str | None:
     if not r:
         return None
     lines = [f"{r['ref']}: {r['title']}", r["url"], f"{r['source']}, updated {r['updated'] or 'unknown'}"]
-    if r["ready"] is None:
+    kind = standing(r)
+    if kind == NOT_TRIAGED:
         return "\n".join(lines + [f"Not triaged: {r['why']}"])
     lines[-1] += f", triaged {r['ts']} for ${r['cost'] or 0:.3f}"
-    if r["code"] == 0:
+    if kind == NOT_CODE_WORK:
         return "\n".join(lines + ["Not code work: nothing for the pipeline to build.", f"Why: {r['why']}"])
-    lines.append(f"Ready. Approve it: add {' and '.join(f'`{lb}`' for lb in labels_to_add(r))}." if r["ready"]
+    lines.append(f"Ready. Approve it: add {' and '.join(f'`{lb}`' for lb in labels_to_add(r))}." if kind == READY
                  else "Not ready.")
     lines += [f"Size {r['size']}, repo {r['repo'] or 'not settled'}", f"Why: {r['why']}"]
     if r["questions"]:
@@ -431,10 +465,11 @@ def issue_link(r: dict) -> str:
 
 def issue_block(r: dict, with_plan: bool) -> str:
     title = quiet(r["title"])
-    if r["ready"] is None or r["code"] == 0:
+    kind = standing(r)
+    if kind in (NOT_TRIAGED, NOT_CODE_WORK):
         return f"- {issue_link(r)}: {title} ({quiet(r['why'])})"
     lines = [f"- {issue_link(r)} **{r['size']}** in `{r['repo'] or '?'}`: {title}"]
-    if r["ready"]:
+    if kind == READY:
         lines.append(f"  Add {' and '.join(f'`{lb}`' for lb in labels_to_add(r))}.")
     else:
         lines += [f"  - {quiet(q)}" for q in r["questions"]] or [f"  {quiet(r['why'])}"]
@@ -448,8 +483,7 @@ def issue_sections(rows: list[dict], with_plan: bool = True, limit: int | None =
     g = groups(rows)
     shown = 0
     out = []
-    for heading, part in (("Ready", g.ready), ("With questions", g.with_questions), ("Not code work", g.not_code),
-                          ("Not triaged", g.not_triaged)):
+    for heading, part in g.items():
         blocks = [issue_block(r, with_plan) for r in part]
         if limit is not None:
             blocks = blocks[:max(0, limit - shown)]
@@ -494,7 +528,7 @@ def publish(cfg: config.Config, rows: list[dict], meta: dict) -> str:
         meta["changed"] = util.iso()
     body = f"{issue_header(meta['changed'])}\n\n{sections}\n"
     number = meta.get("issue") or find_issue(repo)
-    issue_state = gh.existing_issue_state(repo, number) if number else ""
+    issue_state = gh.issue_state(repo, number) if number else ""
     if not issue_state:
         gh.ensure_label(repo, ISSUE_LABEL, "c5def5", "Arete triage board")
         number = gh.issue_create(repo, ISSUE_TITLE, body, [ISSUE_LABEL])

@@ -67,7 +67,6 @@ NETWORK_ERROR = re.compile(
     re.IGNORECASE,
 )
 NETWORK_PROBE_HOSTS = (("api.github.com", 443), ("1.1.1.1", 53))
-NETWORK_RETRIES = 3
 WAKE_NETWORK_WAIT_MINUTES = 3
 
 
@@ -109,16 +108,11 @@ def hours_awake_since(timestamp: float) -> float:
 
 
 def sh_with_network(cmd: list[str] | str, **kw) -> subprocess.CompletedProcess:
-    for attempt in range(NETWORK_RETRIES):
-        res = sh(cmd, **kw)
-        if res.returncode == 0 or not is_network_error(res.stdout + res.stderr):
-            return res
-        if attempt + 1 < NETWORK_RETRIES:
-            print(f"{iso()} network error, waiting for the network: {first_line(res.stderr or res.stdout)}", flush=True)
-            if not wait_for_network():
-                return res
-            time.sleep(5 * 2**attempt)
-    return res
+    res = sh(cmd, **kw)
+    if res.returncode == 0 or not is_network_error(res.stdout + res.stderr):
+        return res
+    print(f"{iso()} network error, waiting for the network: {first_line(res.stderr or res.stdout)}", flush=True)
+    return sh(cmd, **kw) if wait_for_network() else res
 
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None) -> str:
@@ -185,11 +179,11 @@ def matches_any(path: str, globs: list[str]) -> bool:
 
 
 @contextmanager
-def lock(name: str):
+def lock(name: str, wait: bool = False):
     paths.ensure_dirs()
     with open(paths.LOCKS_DIR / f"{name}.lock", "a") as f:
         try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             yield False
             return

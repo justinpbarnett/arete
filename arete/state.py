@@ -9,10 +9,11 @@ from . import paths, util
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,            -- pipeline | miner | audit | eval
+    kind TEXT NOT NULL,            -- pipeline | miner | eval
     repo TEXT,
     issue INTEGER,
-    status TEXT NOT NULL,          -- running | pr | merged | failed | rejected | noop
+    status TEXT NOT NULL,          -- running | pr | needs-info | skipped | noop | dry-run | failed | interrupted
+                                   -- | superseded | merged | rejected | done
     started TEXT NOT NULL,
     finished TEXT,
     attempts INTEGER DEFAULT 0,
@@ -295,7 +296,10 @@ def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, co
         )
 
 
-def task_history(repo: str, task: str, limit: int = 5, source: str = "worktree") -> list[bool]:
+BASELINE_SOURCE = "worktree"
+
+
+def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[bool]:
     with db() as c:
         rows = c.execute("SELECT passed FROM evals WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
                          (repo, task, source, limit))

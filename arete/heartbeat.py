@@ -138,11 +138,22 @@ def mark_loop(name: str, ok: bool, detail: str = "") -> None:
     util.write_json(f, beats)
 
 
+def network_up_or_skip(loop: str, dry_run: bool) -> bool:
+    if util.online():
+        return True
+    print(f"{util.iso()} offline, waiting up to {util.WAKE_NETWORK_WAIT_MINUTES} minutes for the network", flush=True)
+    if util.wait_for_network(util.WAKE_NETWORK_WAIT_MINUTES):
+        return True
+    print(f"{util.iso()} still offline, skipped this {loop}")
+    if not dry_run:
+        mark_loop(loop, True, "offline")
+    return False
+
+
 def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) -> int:
     paths.ensure_dirs()
     install.rotate_logs()
-    if not util.online() and not util.wait_for_network(util.WAKE_NETWORK_WAIT_MINUTES):
-        print(f"{util.iso()} heartbeat offline, skipped")
+    if not network_up_or_skip("heartbeat", dry_run):
         return 0
     cfg = config.load()
     checks: list[Check] = []
