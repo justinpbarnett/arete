@@ -108,7 +108,8 @@ CREATE TABLE IF NOT EXISTS triage (
 );
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
-              ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT")]
+              ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
+              ("triage", "code", "ALTER TABLE triage ADD COLUMN code INTEGER")]
 
 
 @contextmanager
