@@ -39,7 +39,6 @@ class Repo:
 
 
 STATES = ("running", "pr", "failed", "needs-info")
-JIRA_MOVES = (*STATES, "merged")
 
 
 @dataclass
@@ -47,6 +46,7 @@ class JiraConfig:
     env_file: Path | None = None
     project: str = ""
     transitions: dict[str, str] = field(default_factory=dict)
+    landed: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,12 +112,14 @@ def load(path: Path | None = None) -> Config:
     )
     j = data.get("jira", {})
     transitions = {k: str(v) for k, v in (j.get("transitions") or {}).items() if v}
-    if bad := sorted(set(transitions) - set(JIRA_MOVES)):
-        raise ValueError(f"[jira.transitions]: unknown state {', '.join(bad)}; use {', '.join(JIRA_MOVES)}")
+    if bad := sorted(set(transitions) - set(STATES)):
+        raise ValueError(f"[jira.transitions]: unknown state {', '.join(bad)}; use {', '.join(STATES)}"
+                         + ("; merges move tickets through [jira.landed]" if "merged" in bad else ""))
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
         project=j.get("project", ""),
         transitions=transitions,
+        landed={str(branch): str(target) for branch, target in (j.get("landed") or {}).items() if target},
     )
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")

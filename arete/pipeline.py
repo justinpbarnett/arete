@@ -709,7 +709,6 @@ def sync_outcomes(cfg: config.Config) -> None:
             continue
         if all(pr.get("mergedAt") for pr in prs):
             state.update_run(r["id"], status="merged")
-            _move_merged(cfg, r)
         else:
             state.update_run(r["id"], status="rejected")
     for repo in cfg.repos:
@@ -720,13 +719,43 @@ def sync_outcomes(cfg: config.Config) -> None:
                 print(f"{util.iso()} {repo.name}: trust proposal failed: {util.first_line(str(e), 300)}")
 
 
-def _move_merged(cfg: config.Config, r: dict) -> None:
-    try:
-        repo = cfg.repo(r["repo"])
-    except KeyError:
+def sync_landings(cfg: config.Config) -> None:
+    branches = list(cfg.jira.landed)
+    if not branches:
         return
-    if err := tracker.for_repo(cfg, repo).move(str(r["issue"]), "merged"):
-        print(f"{util.iso()} {tracker.run_ticket_name(r)}: {err}")
+    for r in state.runs(kind="pipeline", limit=200):
+        if r["status"] != "merged" or not r.get("pr_url") or r.get("landed") == branches[-1]:
+            continue
+        try:
+            repo = cfg.repo(r["repo"])
+        except KeyError:
+            continue
+        if repo.tracker != "jira":
+            continue
+        try:
+            reached = furthest_branch(branches, r["pr_url"].split(), str(r["issue"]))
+            already = branches.index(r["landed"]) if r.get("landed") in branches else -1
+            if reached is None or branches.index(reached) <= already:
+                continue
+            target = cfg.jira.landed[reached]
+            err = tracker.for_repo(cfg, repo).move_to(str(r["issue"]), target)
+        except (gh.GhError, jira.JiraError) as e:
+            print(f"{util.iso()} {tracker.run_ticket_name(r)}: landing check failed, trying next poll: {util.first_line(str(e), 300)}")
+            continue
+        state.update_run(r["id"], landed=reached)
+        print(f"{util.iso()} {tracker.run_ticket_name(r)}: landed on {reached}, " + (err or f"moved to {target}"))
+
+
+def furthest_branch(branches: list[str], pr_urls: list[str], key: str) -> str | None:
+    merges = [(gh.pr_repo(url), (gh.pr_view(url).get("mergeCommit") or {}).get("oid", "")) for url in pr_urls]
+    for branch in reversed(branches):
+        if all(branch_holds_work(repo, branch, sha, key) for repo, sha in merges):
+            return branch
+    return None
+
+
+def branch_holds_work(repo: str, branch: str, merge_sha: str, key: str) -> bool:
+    return bool(merge_sha) and gh.branch_contains(repo, branch, merge_sha) or gh.merged_pr_names(repo, branch, key)
 
 
 def streak(repo_name: str) -> int:
@@ -885,6 +914,7 @@ def poll(dry_run: bool = False) -> int:
             try:
                 util.write_json(SKIPPED_FILE, skips.current)
                 sync_outcomes(cfg)
+                sync_landings(cfg)
                 cleanup_worktrees()
             except Exception as e:
                 failed("poll", e)

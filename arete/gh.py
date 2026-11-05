@@ -127,10 +127,31 @@ def pr_number(url: str) -> int:
 
 
 def pr_view(url_or_number: str, repo: str = "") -> dict:
-    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,closedAt,url,reviews,comments,headRefName"]
+    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,mergeCommit,closedAt,url,reviews,comments,headRefName"]
     if repo:
         args += ["--repo", repo]
     return gh_json(args) or {}
+
+
+def pr_repo(url: str) -> str:
+    return "/".join(url.split("/")[3:5])
+
+
+def branch_contains(repo: str, branch: str, sha: str) -> bool:
+    try:
+        status = gh(["api", f"repos/{repo}/compare/{branch}...{sha}", "--jq", ".status"]).strip()
+    except GhError:
+        return False
+    return status in ("identical", "behind")
+
+
+def merged_pr_names(repo: str, branch: str, text: str) -> bool:
+    try:
+        found = gh_json(["pr", "list", "--repo", repo, "--state", "merged", "--base", branch,
+                         "--search", f'"{text}"', "--json", "number", "--limit", "1"])
+    except GhError:
+        return False
+    return bool(found)
 
 
 def pr_merge_auto(repo: str, number: int) -> None:

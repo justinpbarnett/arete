@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS runs (
     cost_usd REAL DEFAULT 0,
     pr_url TEXT,
     branch TEXT,
-    summary TEXT
+    summary TEXT,
+    landed TEXT
 );
 CREATE TABLE IF NOT EXISTS probes (
     name TEXT PRIMARY KEY,
@@ -59,7 +60,8 @@ CREATE TABLE IF NOT EXISTS evals (
     source TEXT DEFAULT ''
 );
 """
-MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''")]
+MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+              ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT")]
 
 
 @contextmanager

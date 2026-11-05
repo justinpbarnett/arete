@@ -259,14 +259,20 @@ class JiraTracker:
         return error_of(lambda: self.client.comment(tid, body))
 
     def move(self, tid: str, state: str) -> str:
-        target = self.cfg.transitions.get(state, "")
-        if not target:
-            return ""
         try:
-            moved = self.client.transition(tid, target)
+            return self.move_to(tid, self.cfg.transitions.get(state, ""))
         except jira.JiraError as e:
             return str(e)
-        return "" if moved else f"{tid} has no transition to '{target}' from its current status"
+
+    def move_to(self, tid: str, target: str) -> str:
+        if not target:
+            return ""
+        status = (self.client.issue(tid, ["status"]).get("fields", {}).get("status") or {}).get("name", "")
+        if status.lower() == target.lower():
+            return ""
+        if self.client.transition(tid, target):
+            return ""
+        return f"{tid} has no transition to '{target}' from '{status}'"
 
     def pr_title(self, subject: str, t: Ticket) -> str:
         return with_ref(subject, t.ref)

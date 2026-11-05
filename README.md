@@ -67,7 +67,10 @@ project = "ABC"
 
 [jira.transitions]
 running = "In Progress"
-merged = "In QA"
+
+[jira.landed]
+staging = "UAT"
+main = "Done"
 
 [[repo]]
 name = "web"
@@ -78,7 +81,7 @@ tracker = "jira"
 mine = false
 ```
 
-`JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN` come from the environment, else from `env_file`. `[jira.transitions]` moves tickets as the pipeline moves them: each of `running`, `pr`, `failed`, `needs-info` and `merged` maps to a transition name or a target status name. A state left out only sets labels and comments. `arete jira-check` reads Jira with the token and counts the tickets waiting in each project.
+`JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN` come from the environment, else from `env_file`. `[jira.transitions]` moves tickets as the pipeline moves them: each of `running`, `pr`, `failed` and `needs-info` maps to a transition name or a target status name. A state left out only sets labels and comments. `[jira.landed]` moves a ticket once its merged PRs reach a branch, by the same kind of name. List branches in the order work travels: each poll moves the ticket to the last listed branch that holds the work of every PR, and never back. A branch holds a PR's work when it contains the merge commit, or when another PR naming the ticket key merged into it, as a port of the change to `main` does. With the table above, a PR merged into staging moves its ticket to UAT, and the release that brings staging into main moves it to Done. `arete jira-check` reads Jira with the token and counts the tickets waiting in each project.
 
 A ticket runs when all of these hold:
 
@@ -158,7 +161,7 @@ github = "acme/shop-server"
 
 A repo with parts takes no `github` of its own and needs `tracker = "jira"`. Each run gets one folder with a worktree per part at its `dir`, all on the same branch, and the checks run from that folder. Each part continues from its open PR on the branch, or from commits already pushed to the branch with no PR yet, else starts fresh from the base. A ticket can need several runs, and each run adds commits to the PRs already open; it keeps the branch of those PRs even when the ticket's title or type changes.
 
-Arete commits and opens a PR only in the parts the change touched, and every PR body links the others. Before it pushes, it checks that no part's branch moved since the run started. If one did, it pushes nothing and says so on the ticket; remove `agent-failed` to run again on top of the new commits. The ticket moves to `merged` when all its PRs merge, and the run counts as rejected when they are all closed and one did not merge.
+Arete commits and opens a PR only in the parts the change touched, and every PR body links the others. Before it pushes, it checks that no part's branch moved since the run started. If one did, it pushes nothing and says so on the ticket; remove `agent-failed` to run again on top of the new commits. The run counts as merged when all its PRs merge, and the run counts as rejected when they are all closed and one did not merge.
 
 ## Evals
 
