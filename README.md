@@ -56,7 +56,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 
 ## GitHub tickets
 
-An open issue labeled `agent` that the repo owner opened. Issues labeled `bug` or `fix` are fixes; the rest are features. Arete tracks progress with `agent:running`, `agent:pr`, `agent:failed` and `agent:needs-info`, and the PR closes the issue. Remove `agent:failed` or `agent:needs-info` to send it back to the queue.
+An open issue labeled `agent` that the repo owner opened. Issues labeled `bug` or `fix` are fixes; the rest are features. Arete tracks progress with `agent:running`, `agent:pr`, `agent:failed` and `agent:needs-info`, and the PR closes the issue. Remove `agent:failed` or `agent:needs-info` to send it back to the queue. `arete install` creates all of these labels in each GitHub pipeline repo, so `agent` is there to pick from any GitHub client, the phone app included.
 
 ## Jira tickets
 

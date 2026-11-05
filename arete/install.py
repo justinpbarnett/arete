@@ -5,7 +5,7 @@ import plistlib
 import shutil
 from pathlib import Path
 
-from . import paths, util
+from . import config, paths, tracker, util
 
 AGENTS_DIR = paths.HOME / "Library" / "LaunchAgents"
 
@@ -88,7 +88,17 @@ def install(only: list[str] | None = None, dry_run: bool = False) -> int:
         res = util.sh(["launchctl", "bootstrap", _domain(), str(dest)], timeout=30)
         status = "loaded" if res.returncode == 0 else f"bootstrap failed: {util.first_line(res.stderr)}"
         print(f"{pl['Label']}: {status}")
+    if not dry_run:
+        prepare_trackers()
     return 0
+
+
+def prepare_trackers() -> None:
+    cfg = config.load()
+    for repo in cfg.repos:
+        if repo.pipeline and repo.tracker == "github":
+            errors = tracker.for_repo(cfg, repo).prepare()
+            print(f"{repo.github}: " + ("; ".join(errors) if errors else f"labels ready, add `{tracker.LABEL}` to approve"))
 
 
 def uninstall() -> int:

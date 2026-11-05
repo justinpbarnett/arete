@@ -146,10 +146,12 @@ class GitHubTracker:
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""), labels=labels,
                       blocker="" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}")
 
-    def prepare(self) -> None:
-        for s in config.STATES:
-            gh.ensure_label(self.repo.github, self.label_name(s), STATE_COLORS[s], "Arete pipeline state")
-        gh.ensure_label(self.repo.github, "arete", "5319e7", "Arete pipeline state")
+    def prepare(self) -> list[str]:
+        made = [gh.ensure_label(self.repo.github, LABEL, "0052cc", "Approved for arete to build"),
+                gh.ensure_label(self.repo.github, "arete", "5319e7", "Arete pipeline state")]
+        made += [gh.ensure_label(self.repo.github, self.label_name(s), STATE_COLORS[s], "Arete pipeline state")
+                 for s in config.STATES]
+        return [err for err in made if err]
 
     def label(self, tid: str, add=(), remove=()) -> str:
         return error_of(lambda: gh.issue_labels(self.repo.github, int(tid), add=[self.label_name(s) for s in add],
@@ -246,8 +248,8 @@ class JiraTracker:
             out.paths.append(path)
         return out
 
-    def prepare(self) -> None:
-        pass
+    def prepare(self) -> list[str]:
+        return []
 
     def label(self, tid: str, add=(), remove=()) -> str:
         return error_of(lambda: self.client.edit_labels(tid, [self.label_name(s) for s in add],

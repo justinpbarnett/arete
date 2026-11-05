@@ -22,11 +22,12 @@ def gh_json(args: list[str], cwd=None, timeout: float = 120):
     return json.loads(out) if out.strip() else None
 
 
-def ensure_label(repo: str, name: str, color: str = "5319e7", description: str = "") -> None:
+def ensure_label(repo: str, name: str, color: str = "5319e7", description: str = "") -> str:
     try:
         gh(["label", "create", name, "--repo", repo, "--color", color, "--description", description, "--force"])
-    except GhError:
-        pass
+        return ""
+    except GhError as e:
+        return f"{name}: {e}"
 
 
 def issues(repo: str, label: str, state: str = "open", limit: int = 30) -> list[dict]:
