@@ -118,7 +118,7 @@ def check_disk() -> list[Check]:
 
 def check_arete_jobs() -> list[Check]:
     out = []
-    limits = {"poll": 1, "mine": 30, "audit": 30, "eval": 24 * 8}
+    limits = {"poll": 1, "mine": 30, "audit": 30, "eval": 24 * 8, "triage": 3}
     beats = util.read_json(paths.STATE_DIR / "loops.json", {})
     for name, hours in limits.items():
         last = beats.get(name)

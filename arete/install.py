@@ -15,6 +15,7 @@ JOBS = {
     "mine": {"args": ["mine"], "calendar": {"Hour": 23, "Minute": 50}},
     "audit": {"args": ["audit"], "calendar": {"Hour": 4, "Minute": 30}},
     "eval": {"args": ["eval"], "calendar": {"Weekday": 0, "Hour": 2, "Minute": 10}},
+    "triage": {"args": ["triage", "--refresh"], "interval": 3600},
 }
 
 

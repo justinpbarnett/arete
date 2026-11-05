@@ -23,6 +23,7 @@ probe = "haiku"
 uat = "sonnet"
 verify = "opus"
 eval_mine = "sonnet"
+triage = "haiku"
 
 [miner]
 lookback_hours = 24
@@ -55,6 +56,9 @@ label = "com.arete.audit"
 [[job]]
 label = "com.arete.eval"
 
+[[job]]
+label = "com.arete.triage"
+
 [[probe]]
 name = "claude"
 command = ["claude", "-p", "--model", "haiku", "--no-session-persistence", "Reply with the single word ok"]
@@ -82,7 +86,7 @@ def cmd_init(args) -> int:
 
 
 def cmd_status(args) -> int:
-    from . import pipeline, state, tracker, util
+    from . import pipeline, state, tracker, triage, util
 
     cfg = config.load()
     hb = util.read_json(paths.HEARTBEAT_FILE, {})
@@ -127,6 +131,7 @@ def cmd_status(args) -> int:
         for w in waiting:
             when = "review submitted" if w["at_once"] else f"last comment {w['last']}"
             print(f"  {tracker.run_ticket_name(w):<24} {util.count(w['n'], 'comment')}, {when}")
+    print(triage.status_line())
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
     live = pipeline.live_pipeline_runs()
@@ -245,6 +250,26 @@ def cmd_eval(args) -> int:
     return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run, prompts=prompts)
 
 
+def cmd_triage(args) -> int:
+    from . import triage
+
+    if args.refresh or args.dry_run:
+        code = triage.run(dry_run=args.dry_run)
+        if args.dry_run:
+            return code
+    else:
+        code = 0
+    if args.ref:
+        shown = triage.ticket(args.ref)
+        if shown is None:
+            print(f"no triage row for {args.ref}; `arete triage` lists them", file=sys.stderr)
+            return 1
+        print(shown)
+    else:
+        print(triage.board())
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"arete {__version__}")
@@ -319,6 +344,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=3, help="with mine: the most merged PRs to mine in one go")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("triage", help="loop 5: the triage board of your open tickets without the agent label")
+    p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")
+    p.add_argument("--refresh", action="store_true", help="triage what changed, then show the board")
+    p.add_argument("--dry-run", action="store_true", help="list what a refresh would triage; no model calls, no writes")
+    p.set_defaults(fn=cmd_triage)
 
     args = ap.parse_args(argv)
     try:

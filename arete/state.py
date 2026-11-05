@@ -87,6 +87,24 @@ CREATE TABLE IF NOT EXISTS mined (
     task TEXT,
     ts TEXT
 );
+CREATE TABLE IF NOT EXISTS triage (
+    ref TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    tracker TEXT,
+    repo TEXT,
+    route TEXT,
+    title TEXT,
+    url TEXT,
+    updated TEXT,
+    ready INTEGER,
+    code INTEGER,
+    size TEXT,
+    questions TEXT,
+    plan TEXT,
+    why TEXT,
+    cost REAL DEFAULT 0,
+    ts TEXT
+);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT")]
@@ -365,3 +383,31 @@ def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why:
 def mined_urls() -> set[str]:
     with db() as c:
         return {r["pr_url"] for r in c.execute("SELECT pr_url FROM mined")}
+
+
+TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
+                  "questions", "plan", "why", "cost", "ts")
+
+
+def triage_rows() -> list[dict]:
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM triage")]
+    for r in rows:
+        r["questions"] = json.loads(r["questions"] or "[]")
+        r["plan"] = json.loads(r["plan"] or "[]")
+    return rows
+
+
+def triage_replace(source: str, rows: list[dict]) -> None:
+    refs = [r["ref"] for r in rows]
+    with db() as c:
+        c.execute("DELETE FROM triage WHERE source = ?", (source,))
+        c.executemany("DELETE FROM triage WHERE ref = ?", [(ref,) for ref in refs])
+        c.executemany(f"INSERT INTO triage ({', '.join(TRIAGE_COLUMNS)}) VALUES ({', '.join('?' * len(TRIAGE_COLUMNS))})",
+                      [tuple(json.dumps(r[k]) if k in ("questions", "plan") else r[k] for k in TRIAGE_COLUMNS)
+                       for r in rows])
+
+
+def triage_prune(sources: list[str]) -> None:
+    with db() as c:
+        c.execute(f"DELETE FROM triage WHERE source NOT IN ({','.join('?' * len(sources))})", sources)

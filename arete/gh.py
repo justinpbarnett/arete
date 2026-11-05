@@ -43,13 +43,14 @@ def ensure_label(repo: str, name: str, color: str = "5319e7", description: str =
         return f"{name}: {e}"
 
 
-def issues(repo: str, label: str, state: str = "open", limit: int = 30) -> list[dict]:
-    return gh_json(
-        [
-            "issue", "list", "--repo", repo, "--label", label, "--state", state, "--limit", str(limit),
-            "--json", "number,title,body,labels,url,createdAt,author",
-        ]
-    ) or []
+def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, author: str = "") -> list[dict]:
+    args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit),
+            "--json", "number,title,body,labels,url,createdAt,updatedAt,author"]
+    if label:
+        args += ["--label", label]
+    if author:
+        args += ["--author", author]
+    return gh_json(args) or []
 
 
 def issue(repo: str, number: int) -> dict:
@@ -92,6 +93,23 @@ def issue_state(repo: str, number: int) -> str:
         return (gh_json(["issue", "view", str(number), "--repo", repo, "--json", "state"]) or {}).get("state", "")
     except GhError:
         return ""
+
+
+def existing_issue_state(repo: str, number: int) -> str:
+    try:
+        return (gh_json(["issue", "view", str(number), "--repo", repo, "--json", "state"]) or {}).get("state", "")
+    except GhError as e:
+        if "Could not resolve to an issue" in str(e):
+            return ""
+        raise
+
+
+def issue_edit_body(repo: str, number: int, body: str) -> None:
+    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=body)
+
+
+def issue_reopen(repo: str, number: int) -> None:
+    gh(["issue", "reopen", str(number), "--repo", repo])
 
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
@@ -217,3 +235,10 @@ def repo_exists(repo: str) -> bool:
         return True
     except GhError:
         return False
+
+
+def repo_private(repo: str) -> bool | None:
+    try:
+        return bool((gh_json(["repo", "view", repo, "--json", "isPrivate"]) or {}).get("isPrivate"))
+    except GhError:
+        return None
