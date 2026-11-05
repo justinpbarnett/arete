@@ -102,9 +102,11 @@ def cmd_status(args) -> int:
     rs = state.runs(limit=args.limit)
     if rs:
         print("recent runs:")
-        for r in rs:
-            where = tracker.run_ticket_name(r) if r["issue"] else (r["repo"] or "")
-            print(f"  {r['id']:<22} {r['kind']:<9} {where:<18} {r['status']:<9} {r['pr_url'] or r['summary'] or ''}"[:160])
+        rows = [(r["id"], r["kind"], tracker.run_ticket_name(r) if r["issue"] else (r["repo"] or ""), r["status"],
+                 r["pr_url"] or r["summary"] or "") for r in rs]
+        widths = [max(len(row[i]) for row in rows) for i in range(4)]
+        for row in rows:
+            print(("  " + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[4])[:200])
     mem = state.proposals(status=["memory"], limit=10)
     if mem:
         print("memory facts the miner noticed (file them by hand, then `arete forget ID`):")
@@ -115,6 +117,13 @@ def cmd_status(args) -> int:
         print("labeled tickets the pipeline will not run (`arete run REPO ID --force` runs one anyway):")
         for name, v in sorted(skipped.items()):
             print(f"  {name:<24} {v['why']}  since {v.get('since', '')}"[:220])
+    waiting = state.feedback_waiting()
+    if waiting:
+        print(f"your PR comments waiting for a revision (a submitted review goes at once, other comments after "
+              f"{pipeline.FEEDBACK_QUIET_MINUTES} quiet minutes):")
+        for w in waiting:
+            when = "review submitted" if w["at_once"] else f"last comment {w['last']}"
+            print(f"  {tracker.run_ticket_name(w):<24} {util.count(w['n'], 'comment')}, {when}")
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
     live = pipeline.live_pipeline_runs()

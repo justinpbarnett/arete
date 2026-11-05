@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from . import util
 
 
+ARETE_MARK = "<!-- arete -->"
+
+
 class GhError(RuntimeError):
     pass
+
+
+def marked(body: str) -> str:
+    return f"{body.rstrip()}\n\n{ARETE_MARK}"
+
+
+def from_arete(body: str | None) -> bool:
+    return ARETE_MARK in (body or "")
 
 
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
@@ -123,7 +136,36 @@ def pr_edit_body(url: str, body: str) -> None:
 
 
 def pr_comment(url: str, body: str) -> None:
-    gh(["pr", "comment", url, "--body-file", "-"], input=body)
+    gh(["pr", "comment", url, "--body-file", "-"], input=marked(body))
+
+
+def pr_reply(url: str, comment_id: int, body: str) -> None:
+    gh(["api", "-X", "POST", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies",
+        "--input", "-"], input=json.dumps({"body": marked(body)}))
+
+
+def api_list(path: str) -> list[dict]:
+    pages = gh_json(["api", "--paginate", "--slurp", f"{path}?per_page=100"]) or []
+    return [item for page in pages for item in page]
+
+
+@dataclass
+class Discussion:
+    line_comments: list[dict]
+    reviews: list[dict]
+    comments: list[dict]
+
+
+def pr_discussion(url: str) -> Discussion:
+    base = f"repos/{pr_repo(url)}"
+    n = pr_number(url)
+    return Discussion(api_list(f"{base}/pulls/{n}/comments"), api_list(f"{base}/pulls/{n}/reviews"),
+                      api_list(f"{base}/issues/{n}/comments"))
+
+
+@functools.cache
+def me() -> str:
+    return (gh_json(["api", "user"]) or {}).get("login", "")
 
 
 def pr_number(url: str) -> int:
@@ -131,7 +173,7 @@ def pr_number(url: str) -> int:
 
 
 def pr_view(url_or_number: str, repo: str = "") -> dict:
-    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,mergeCommit,closedAt,url,reviews,comments,headRefName"]
+    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName"]
     if repo:
         args += ["--repo", repo]
     return gh_json(args) or {}

@@ -59,6 +59,24 @@ CREATE TABLE IF NOT EXISTS evals (
     ts TEXT,
     source TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    pr_url TEXT NOT NULL,
+    kind TEXT NOT NULL,            -- review | line | comment
+    gh_id INTEGER NOT NULL,
+    repo TEXT,
+    issue TEXT,
+    body TEXT,
+    path TEXT,
+    line INTEGER,
+    hunk TEXT,
+    thread INTEGER,
+    at_once INTEGER DEFAULT 0,
+    created TEXT,
+    pr_state TEXT,                 -- OPEN | MERGED | CLOSED when recorded
+    status TEXT,                   -- new | taken | done | failed | recorded
+    run_id TEXT,
+    PRIMARY KEY (pr_url, kind, gh_id)
+);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT")]
@@ -264,3 +282,65 @@ def eval_history(repo: str, limit: int = 20) -> list[dict]:
             (repo, limit),
         )
         return [dict(r) for r in rows]
+
+
+FEEDBACK_COLUMNS = ("pr_url", "kind", "gh_id", "repo", "issue", "body", "path", "line", "hunk", "thread", "at_once",
+                    "created", "pr_state", "status")
+
+
+def add_feedback(rows: list[dict]) -> int:
+    with db() as c:
+        before = c.total_changes
+        c.executemany(f"INSERT OR IGNORE INTO feedback ({', '.join(FEEDBACK_COLUMNS)}) "
+                      f"VALUES ({', '.join('?' * len(FEEDBACK_COLUMNS))})",
+                      [tuple(r.get(k) for k in FEEDBACK_COLUMNS) for r in rows])
+        return c.total_changes - before
+
+
+def feedback_due(repo: str, quiet_since: str) -> list[str]:
+    with db() as c:
+        rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "
+                         "WHERE repo = ? AND status = 'new' AND EXISTS (SELECT 1 FROM runs WHERE runs.repo = f.repo "
+                         "AND runs.issue = f.issue AND runs.status = 'pr' "
+                         "AND ' ' || runs.pr_url || ' ' LIKE '% ' || f.pr_url || ' %') "
+                         "GROUP BY issue ORDER BY last", (repo,))
+        return [str(r["issue"]) for r in rows if r["at_once"] or r["last"] <= quiet_since]
+
+
+def close_feedback(pr_url: str, pr_state: str) -> None:
+    with db() as c:
+        c.execute("UPDATE feedback SET pr_state = ?, status = CASE WHEN status IN ('new', 'failed') THEN 'recorded' "
+                  "ELSE status END WHERE pr_url = ?", (pr_state, pr_url))
+
+
+def feedback_waiting() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT repo, issue, COUNT(*) AS n, MAX(at_once) AS at_once, "
+                                           "MAX(created) AS last FROM feedback WHERE status = 'new' "
+                                           "GROUP BY repo, issue ORDER BY last")]
+
+
+def open_feedback(pr_urls: list[str]) -> list[dict]:
+    if not pr_urls:
+        return []
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM feedback WHERE pr_url IN ({','.join('?' * len(pr_urls))}) "
+            "AND status IN ('new', 'taken', 'failed') ORDER BY created", pr_urls)]
+
+
+def take_feedback(rows: list[dict], run_id: str) -> None:
+    with db() as c:
+        c.executemany("UPDATE feedback SET status = 'taken', run_id = ? WHERE pr_url = ? AND kind = ? AND gh_id = ?",
+                      [(run_id, r["pr_url"], r["kind"], r["gh_id"]) for r in rows])
+
+
+def settle_feedback(run_id: str, status: str) -> None:
+    with db() as c:
+        c.execute("UPDATE feedback SET status = ? WHERE run_id = ? AND status = 'taken'", (status, run_id))
+
+
+def feedback_since(since: str) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE created >= ? ORDER BY pr_url, created",
+                                           (since,))]

@@ -208,6 +208,31 @@ def render_events(cfg: config.Config, hours: float) -> str:
     return "\n".join(lines)
 
 
+FEEDBACK_STATUS = {"new": "waiting for a revision", "taken": "being revised", "done": "revised",
+                   "failed": "revision failed", "recorded": "not revised"}
+
+
+def render_feedback(rows: list[dict], limit: int = 8000) -> str:
+    if not rows:
+        return "(no comments from the owner on arete PRs in this window)"
+    final_state = {r["pr_url"]: (r["pr_state"] or "").lower() for r in rows}
+    out, used, url = [], 0, None
+    for n, r in enumerate(rows):
+        lines = []
+        if r["pr_url"] != url:
+            url = r["pr_url"]
+            lines += ["", f"### {r['repo']} {r['issue']}: {url} (PR {final_state[url]})"]
+        lines.append(f"- {r['kind']}" + (f" on `{r['path']}`" if r.get("path") else "")
+                     + f", {FEEDBACK_STATUS.get(r['status'], r['status'])}: {_short(r['body'] or '', 400)}")
+        size = sum(len(line) + 1 for line in lines)
+        if used + size > limit:
+            out += ["", f"({util.count(len(rows) - n, 'more comment')} left out)"]
+            break
+        out += lines
+        used += size
+    return "\n".join(out).strip()
+
+
 def sync_feedback() -> None:
     for p in state.proposals(status=["applied"]):
         if not p.get("pr_url"):
@@ -262,8 +287,7 @@ def eval_pr(repo: config.Repo, url: str, branch: str) -> None:
     try:
         md = evals.compare(repo.name, branch)
         if md:
-            gh.issue_comment(repo.github, gh.pr_number(url),
-                             md + "\nThe repo's eval tasks, run with this branch's harness against held out tests.\n")
+            gh.pr_comment(url, md + "\nThe repo's eval tasks, run with this branch's harness against held out tests.\n")
             print(f"{repo.name}: evals posted to {url}")
     except Exception as e:
         print(f"{repo.name}: evals on {branch} failed: {type(e).__name__}: {e}")
@@ -342,7 +366,8 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     digest, used = render_digest(cfg, sessions, cfg.miner_max_digest_chars)
     print(f"{util.iso()} miner: {len(sessions)} sessions with signal, {used} in digest, {len(digest)} chars")
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
-    if not sessions and not audit_wants_fixes:
+    pr_feedback = state.feedback_since(util.iso(util.now() - timedelta(hours=hours)))
+    if not sessions and not audit_wants_fixes and not pr_feedback:
         if not dry_run:
             state.finish_run(run_id, "noop", summary="no human sessions in window")
         return 0
@@ -352,6 +377,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
         pending=_fmt(state.proposals(status=["applied", "pending"])),
         rejected=_fmt(state.proposals(status=["rejected"])),
         events=render_events(cfg, hours), digest=digest, audit=auditor.latest_findings(),
+        feedback=render_feedback(pr_feedback),
     )
     run_dir = paths.RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)

@@ -46,6 +46,15 @@ the audit as evidence; leave the rest.
 
 $audit
 
+## The owner's comments on arete PRs
+
+The owner reviews the PRs that arete's pipeline agents open. Each comment below corrects what those agents
+built in that repo. A pattern that shows up across PRs, or a comment on a PR that closed without a merge,
+is strong evidence: propose the harness change that would have made the agents get it right the first time.
+A comment that only asks for one ticket's detail is not a pattern.
+
+$feedback
+
 $events
 
 # Digest

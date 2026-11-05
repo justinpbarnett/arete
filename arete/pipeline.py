@@ -5,7 +5,9 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from string import Template
 
@@ -82,6 +84,22 @@ UAT_SCHEMA = {
     },
     "required": ["before", "steps"],
 }
+REVISE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "replies": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"comment_id": {"type": "integer"}, "reply": {"type": "string"}},
+            "required": ["comment_id", "reply"],
+        }},
+    },
+    "required": ["summary", "replies"],
+}
+FEEDBACK_QUIET_MINUTES = 10
+HUNK_LINES = 6
+PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
+PR_SEEN_SETTLE = timedelta(minutes=1)
 READ_TOOLS = ["Read", "Glob", "Grep"]
 EDIT_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "TodoWrite"]
 NO_GIT_WRITES = [
@@ -167,6 +185,7 @@ class Run(AgentRun):
     tid: str
     force: bool = False
     story: list[str] = field(default_factory=list)
+    feedback: list[dict] = field(default_factory=list)
 
     @property
     def ref(self) -> str:
@@ -175,6 +194,21 @@ class Run(AgentRun):
     @property
     def where(self) -> str:
         return tracker.ticket_name(self.repo.name, self.ref)
+
+    @property
+    def feedback_prs(self) -> list[str]:
+        return list(dict.fromkeys(f["pr_url"] for f in self.feedback))
+
+    @property
+    def failed_state(self) -> str:
+        return "pr" if self.feedback else "failed"
+
+    @property
+    def retry_hint(self) -> str:
+        if self.feedback:
+            return (f"Comment on the PR again to retry: a submitted review starts at once, a comment after "
+                    f"{FEEDBACK_QUIET_MINUTES} quiet minutes")
+        return f"Remove `{self.tracker.label_name('failed')}` to retry"
 
     def enter(self, status: str) -> None:
         if self.dry_run:
@@ -187,13 +221,23 @@ class Run(AgentRun):
     def say(self, body: str) -> str:
         if self.dry_run:
             return ""
-        if err := self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}"):
+        err = self.say_on_prs(body) if self.feedback else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
+        if err:
             self.log(f"tracker: {util.first_line(err, 300)}")
         return err
 
+    def say_on_prs(self, body: str) -> str:
+        errors = []
+        for url in self.feedback_prs:
+            try:
+                gh.pr_comment(url, body)
+            except gh.GhError as e:
+                errors.append(f"{url}: {e}")
+        return "; ".join(errors)
+
     def give_up(self, why: str) -> None:
-        self.enter("failed")
-        self.say(f"Run `{self.id}` {why}. Remove `{self.tracker.label_name('failed')}` to retry.")
+        self.enter(self.failed_state)
+        self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True) -> str:
@@ -409,21 +453,28 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         earlier = state.ticket_runs(repo.name, tid, limit=1)
         restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
         run_id = state.new_run_id("pipeline") + f"-{repo.name}-{tid}"
-        run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force)
+        run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
+                  feedback=pending_feedback(repo.name, tid))
         run.dir.mkdir(parents=True, exist_ok=True)
         state.start_run(run_id, "pipeline", repo.name, tid)
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
+        if run.feedback:
+            run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
+            if not dry_run:
+                state.take_feedback(run.feedback, run_id)
         try:
             status, summary, pr_url = _run(cfg, run)
         except Exception as e:
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
-        if restarting and status in ("skipped", "noop"):
+        if restarting and status in ("skipped", "noop") and not run.feedback:
             run.enter("failed")
             run.say(f"I did not restart this after the interruption: {summary}. Remove "
                     f"`{tk.label_name('failed')}` to retry.")
+        if run.feedback and not dry_run:
+            state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         state.finish_run(run_id, status, summary=summary, pr_url=pr_url, cost_usd=round(run.cost, 4))
         run.log(f"done: {status} {pr_url or summary}")
         if status == "skipped":
@@ -433,12 +484,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
 
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple[str, str, str]:
     run.log(f"failed: {why}")
-    run.enter("failed")
+    run.enter(run.failed_state)
     extra = f"\n\n{detail.strip()}" if detail.strip() else ""
     if builder_said.strip():
         extra += f"\n\n### What the builder said\n\n{builder_said.strip()[:4000]}"
-    run.say(f"Could not finish this one: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
-            f"Mac. Remove `{run.tracker.label_name('failed')}` to retry.")
+    task = "apply your feedback" if run.feedback else "finish this one"
+    run.say(f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
+            f"Mac. {run.retry_hint}.")
     return "failed", why, ""
 
 
@@ -465,9 +517,13 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         t = tk.get(run.tid)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
-    if not t.open:
+    if run.feedback:
+        closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
+        if closed:
+            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
+    elif not t.open:
         return "noop", "ticket is not open", ""
-    if t.blocker and not run.force:
+    elif t.blocker and not run.force:
         return "skipped", t.blocker, ""
     try:
         images = tk.save_images(t, run.dir / "images")
@@ -517,40 +573,61 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     deny = ALWAYS_DENY + layer.deny
     limit = layer.max_diff_lines
     info = tk.label_name("needs-info")
+    replies: list[dict] = []
 
-    res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title, body=t.body,
-                                    comments=t.comments, attachments=attachments, expertise=expertise,
-                                    commands=commands, max_lines=limit),
-                    ws, model=cfg.model("plan"), allowed_tools=read_tools, json_schema=PLAN_SCHEMA,
-                    timeout=step_timeout)
-    if not res.ok or not isinstance(res.structured, dict):
-        return _fail(run, "planning step failed")
-    plan = res.structured
-    run.save("plan.md", plan.get("plan", ""))
-    estimate = int(plan.get("estimated_lines") or 0)
-    if plan.get("ambiguous") and plan.get("question"):
-        run.log("plan: ambiguous, asking the author")
-        return _ask(run, ws, checkouts, f"Before I build this I need one answer:\n\n{plan['question']}\n\n"
-                    f"Reply here, then remove the `{info}` label and I will pick it up.", plan["question"])
-    if estimate > limit:
-        split = [s for s in plan.get("split") or [] if isinstance(s, dict) and s.get("title")]
-        run.log(f"plan: about {estimate} lines, over the {limit} line limit; proposing a {len(split)} part split")
-        run.save("split.json", split)
-        return _ask(run, ws, checkouts, split_comment(estimate, limit, split, tk.queue_hint, info, layer.config_file),
-                    f"plan estimates {estimate} lines, over the {limit} line limit; split proposed")
+    if run.feedback:
+        feedback = feedback_markdown(run.feedback)
+        plan_text = f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+        estimate = 0
+        run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
+        res = run.agent("revise", prompt("revise", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
+                                         body=t.body, comments=t.comments, attachments=attachments,
+                                         feedback=feedback, expertise=expertise, checks=check_list,
+                                         commands=commands, max_lines=limit),
+                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
+                        json_schema=REVISE_SCHEMA, timeout=step_timeout)
+        if not res.ok or not isinstance(res.structured, dict):
+            return _fail(run, "revise step failed", res.text)
+        build_summary = res.structured.get("summary", "")
+        replies = res.structured.get("replies") or []
+        if not stage(checkouts, deny).files:
+            return answer_without_changes(run, ws, checkouts, branch, build_summary, replies)
+    else:
+        res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
+                                        body=t.body, comments=t.comments, attachments=attachments,
+                                        expertise=expertise, commands=commands, max_lines=limit),
+                        ws, model=cfg.model("plan"), allowed_tools=read_tools, json_schema=PLAN_SCHEMA,
+                        timeout=step_timeout)
+        if not res.ok or not isinstance(res.structured, dict):
+            return _fail(run, "planning step failed")
+        plan = res.structured
+        plan_text = plan.get("plan", "")
+        run.save("plan.md", plan_text)
+        estimate = int(plan.get("estimated_lines") or 0)
+        if plan.get("ambiguous") and plan.get("question"):
+            run.log("plan: ambiguous, asking the author")
+            return _ask(run, ws, checkouts, f"Before I build this I need one answer:\n\n{plan['question']}\n\n"
+                        f"Reply here, then remove the `{info}` label and I will pick it up.", plan["question"])
+        if estimate > limit:
+            split = [s for s in plan.get("split") or [] if isinstance(s, dict) and s.get("title")]
+            run.log(f"plan: about {estimate} lines, over the {limit} line limit; proposing a {len(split)} part split")
+            run.save("split.json", split)
+            return _ask(run, ws, checkouts,
+                        split_comment(estimate, limit, split, tk.queue_hint, info, layer.config_file),
+                        f"plan estimates {estimate} lines, over the {limit} line limit; split proposed")
 
-    res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
-                                     body=t.body, comments=t.comments, attachments=attachments, plan=plan["plan"],
-                                     expertise=expertise, checks=check_list, commands=commands, max_lines=limit,
-                                     estimate=estimate),
-                    ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
-                    timeout=step_timeout)
-    if not res.ok:
-        return _fail(run, "build step failed", res.text)
+        res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
+                                         body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
+                                         expertise=expertise, checks=check_list, commands=commands, max_lines=limit,
+                                         estimate=estimate),
+                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
+                        timeout=step_timeout)
+        if not res.ok:
+            return _fail(run, "build step failed", res.text)
+        build_summary = res.text
+        if not stage(checkouts, deny).files:
+            return _fail(run, "the builder stopped without changing anything", build_summary)
     session = res.session_id
-    build_summary = res.text
-    if not stage(checkouts, deny).files:
-        return _fail(run, "the builder stopped without changing anything", build_summary)
 
     attempts = 1
     ok, report = run_checks(layer, ws, git_dirs, run, step_timeout)
@@ -576,11 +653,11 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     if staged.denied:
         return _fail(run, f"the change touched denied paths: {', '.join(staged.denied[:5])}")
     if staged.lines > limit:
-        return _fail(run, f"the diff is {staged.lines} lines, over the {limit} line limit (the plan estimated "
-                          f"{estimate}); split the ticket",
+        planned = f" (the plan estimated {estimate})" if estimate else ""
+        return _fail(run, f"the diff is {staged.lines} lines, over the {limit} line limit{planned}; split the work",
                      detail=f"### Lines changed by file\n\n{lines_by_file(checkouts)}")
 
-    review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan["plan"], report, staged.diff,
+    review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan_text, report, staged.diff,
                      step_timeout)
     if review.get("verdict") == "request_changes":
         problems = "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
@@ -592,7 +669,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         staged = stage(checkouts, deny)
         if not ok or not staged.files or staged.denied or staged.lines > limit:
             return _fail(run, "changes after review broke the checks or the limits")
-        review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan["plan"], report, staged.diff,
+        review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan_text, report, staged.diff,
                          step_timeout, "review2")
 
     approved = review.get("verdict") == "approve"
@@ -613,10 +690,11 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
         + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
         + f"\n\n## Checks\n\nAll passed after {attempts} attempt{'s' if attempts > 1 else ''}: {check_list}\n\n"
-        f"<details><summary>Plan</summary>\n\n{plan['plan'][:6000]}\n\n</details>\n\n"
-        f"Run `{run.id}`, {size}, ${run.cost:.2f}."
+        + ("" if run.feedback else f"<details><summary>Plan</summary>\n\n{plan_text[:6000]}\n\n</details>\n\n")
+        + f"Run `{run.id}`, {size}, ${run.cost:.2f}."
     )
-    message = f"{tracker.with_ref(subject, t.ref)}\n\nArete-Run: {run.id}"
+    revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
+    message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
     for c in staged.changed:
         try:
             git(["commit", "-q", "-m", message], c.wt)
@@ -653,13 +731,17 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
                 gh.pr_edit_body(c.pr, f"{tk.pr_link(t)}\n\n{report_body}{others}")
         elif opened:
             gh.pr_edit_body(c.pr, with_siblings(gh.pr_body(c.pr), others))
-        if c in pushed:
+        if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
     run.enter("pr")
     pr_lines = "\n".join(f"- {'Opened' if c in opened else 'Pushed to' if c in pushed else 'Unchanged'} [{c.pr_name}]({c.pr})"
                          for c in with_prs)
-    run.say(f"PRs for this ticket:\n\n{pr_lines}"
-            + ("" if approved or not opened else "\n\nThe new PRs are drafts: the reviewer still has concerns."))
+    if run.feedback:
+        answer_feedback(run, replies, "Done in the latest push.")
+        run.say(f"Revised for your review.\n\n{report_body}")
+    else:
+        run.say(f"PRs for this ticket:\n\n{pr_lines}"
+                + ("" if approved or not opened else "\n\nThe new PRs are drafts: the reviewer still has concerns."))
     if approved and layer.trust_level == "automerge":
         for c in opened:
             try:
@@ -706,6 +788,54 @@ def supersede_older_runs(run: Run, urls: list[str]) -> None:
         if older and set(older) <= set(urls):
             state.update_run(r["id"], status="superseded")
             run.log(f"run {r['id']} superseded: its PRs carry on in this run")
+
+
+def pending_feedback(repo_name: str, tid: str) -> list[dict]:
+    return state.open_feedback([url for r in state.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
+
+
+def feedback_markdown(rows: list[dict]) -> str:
+    out = []
+    for url in dict.fromkeys(f["pr_url"] for f in rows):
+        out.append(f"### On {url}")
+        for f in (f for f in rows if f["pr_url"] == url):
+            if f["kind"] == "line":
+                where = f"`{f['path']}`" + (f" line {f['line']}" if f.get("line") else "")
+                in_thread = f", a reply in thread {f['thread']}" if f["thread"] != f["gh_id"] else ""
+                out.append(f"#### Line comment {f['gh_id']} on {where}{in_thread}\n\n```diff\n{f['hunk']}\n```\n\n"
+                           f"{f['body'].strip()}")
+            elif f["kind"] == "review":
+                out.append(f"#### Review summary\n\n{f['body'].strip()}")
+            else:
+                out.append(f"#### Comment on the PR\n\n{f['body'].strip()}")
+    return "\n\n".join(out)
+
+
+def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
+    said = {r["comment_id"]: r["reply"].strip() for r in replies if r.get("reply", "").strip()}
+    threads: dict[tuple[str, int], str] = {}
+    for f in run.feedback:
+        if f["kind"] == "line":
+            key = (f["pr_url"], f["thread"])
+            threads[key] = said.get(f["gh_id"]) or said.get(f["thread"]) or threads.get(key) or fallback
+    for (url, thread), text in threads.items():
+        try:
+            gh.pr_reply(url, thread, text)
+        except gh.GhError as e:
+            run.log(f"reply to comment {thread} on {url} failed: {util.first_line(str(e), 300)}")
+
+
+def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch: str, summary: str,
+                           replies: list[dict]) -> tuple[str, str, str]:
+    run.log("revise: no code changes, answering the review")
+    answer_feedback(run, replies, "No code change for this one; see the overall reply.")
+    run.say(f"No code changes for your review.\n\n{summary.strip()[:3000]}")
+    run.enter("pr")
+    urls = [c.pr for c in checkouts if c.pr]
+    supersede_older_runs(run, urls)
+    state.update_run(run.id, branch=branch)
+    remove_workspace(ws, checkouts)
+    return "pr", "answered the review without code changes", " ".join(urls)
 
 
 def _review(cfg, run: Run, ws: Path, workspace: str, read_tools: list[str], t: tracker.Ticket, attachments: str,
@@ -767,20 +897,70 @@ def commit_layer(layer_dir: Path, message: str) -> None:
         git(["commit", "-q", "-m", message, "--", "."], layer_dir)
 
 
+def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[dict]:
+    owner = gh.me()
+    talk = gh.pr_discussion(url)
+
+    def from_owner(item: dict) -> bool:
+        return (item.get("user") or {}).get("login") == owner and not gh.from_arete(item.get("body"))
+
+    reviews = {r["id"]: r for r in talk.reviews}
+    lines_in_review = Counter(c.get("pull_request_review_id") for c in talk.line_comments)
+    base = {"pr_url": url, "repo": repo_name, "issue": issue, "pr_state": pr_state,
+            "status": "new" if pr_state == "OPEN" else "recorded"}
+    rows = [{**base, "kind": "review", "gh_id": r["id"], "body": r["body"], "at_once": 1, "created": r.get("submitted_at")}
+            for r in talk.reviews if from_owner(r) and r.get("state") != "PENDING" and (r.get("body") or "").strip()]
+    for c in talk.line_comments:
+        review = reviews.get(c.get("pull_request_review_id")) or {}
+        if not from_owner(c) or review.get("state") == "PENDING":
+            continue
+        grouped = bool((review.get("body") or "").strip()) or lines_in_review[c.get("pull_request_review_id")] > 1
+        rows.append({**base, "kind": "line", "gh_id": c["id"], "body": c.get("body") or "", "path": c.get("path"),
+                     "line": c.get("line") or c.get("original_line"),
+                     "hunk": "\n".join((c.get("diff_hunk") or "").splitlines()[-HUNK_LINES:]),
+                     "thread": c.get("in_reply_to_id") or c["id"], "at_once": int(grouped),
+                     "created": c.get("created_at")})
+    rows += [{**base, "kind": "comment", "gh_id": c["id"], "body": c.get("body") or "", "at_once": 0,
+              "created": c.get("created_at")} for c in talk.comments if from_owner(c)]
+    return rows
+
+
+def record_feedback(r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict) -> None:
+    for url, pr in zip(urls, prs):
+        updated = pr.get("updatedAt", "")
+        fresh[url] = seen.get(url, "")
+        if updated and seen.get(url) == updated:
+            continue
+        try:
+            added = state.add_feedback(owner_feedback(url, pr.get("state", ""), r["repo"], str(r["issue"])))
+        except gh.GhError as e:
+            print(f"{util.iso()} {url}: could not read the review comments: {util.first_line(str(e), 300)}")
+            continue
+        fresh[url] = updated if util.iso(util.now() - PR_SEEN_SETTLE) > updated else ""
+        if added:
+            print(f"{util.iso()} {url}: {util.count(added, 'new comment')} from you")
+
+
 def sync_outcomes(cfg: config.Config) -> None:
+    seen, fresh = util.read_json(PR_SEEN_FILE, {}), {}
     for r in state.runs(kind="pipeline", limit=200):
         if r["status"] != "pr" or not r.get("pr_url"):
             continue
+        urls = r["pr_url"].split()
         try:
-            prs = [gh.pr_view(url) for url in r["pr_url"].split()]
+            prs = [gh.pr_view(url) for url in urls]
         except gh.GhError:
             continue
+        record_feedback(r, urls, prs, seen, fresh)
         if not all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs):
             continue
+        for url, pr in zip(urls, prs):
+            state.close_feedback(url, pr["state"])
         if all(pr.get("mergedAt") for pr in prs):
             state.update_run(r["id"], status="merged")
         else:
             state.update_run(r["id"], status="rejected")
+    util.write_json(PR_SEEN_FILE, fresh)
     for repo in cfg.repos:
         if repo.pipeline and repo.github and not repo.layer:
             try:
@@ -958,7 +1138,7 @@ def settle_abandoned_runs(cfg: config.Config) -> None:
                 continue
             repo = cfg.repo(row["repo"])
             run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo),
-                      tid=str(row["issue"]))
+                      tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])))
             run.dir.mkdir(parents=True, exist_ok=True)
             if interrupted_twice(row):
                 state.finish_run(row["id"], "failed", summary=STOPPED)
@@ -1013,6 +1193,9 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
     for tid in state.interrupted_tickets(repo.name):
         if not state.issue_running(repo.name, tid):
             return tid, "restarting after an interruption"
+    for tid in state.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=FEEDBACK_QUIET_MINUTES))):
+        if not state.issue_running(repo.name, tid):
+            return tid, "revising the PR for your review comments"
     for t in tk.replied():
         if state.issue_running(repo.name, t.id):
             continue
@@ -1048,6 +1231,10 @@ def poll(dry_run: bool = False) -> int:
                 settle_abandoned_runs(cfg)
             except Exception as e:
                 failed("settling abandoned runs", e)
+            try:
+                sync_outcomes(cfg)
+            except Exception as e:
+                failed("syncing PR outcomes", e)
         live = live_pipeline_runs()
         busy = {r["repo"] for r in live}
         slots = cfg.max_parallel - len(live)
@@ -1090,7 +1277,6 @@ def poll(dry_run: bool = False) -> int:
         if not dry_run:
             try:
                 util.write_json(SKIPPED_FILE, skips.current)
-                sync_outcomes(cfg)
                 sync_landings(cfg)
                 cleanup_worktrees()
             except Exception as e:
