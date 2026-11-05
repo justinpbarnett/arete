@@ -159,6 +159,10 @@ class Run(AgentRun):
         if err := self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}"):
             self.log(f"tracker: {util.first_line(err, 300)}")
 
+    def give_up(self, why: str) -> None:
+        self.enter("failed")
+        self.say(f"Run `{self.id}` {why}. Remove `{self.tracker.label_name('failed')}` to retry.")
+
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True) -> str:
     res = util.sh(["git", *args], cwd=cwd, timeout=timeout)
@@ -361,7 +365,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         print(f"{repo_name}: {e}")
         return 1
     name = tracker.ticket_name(repo.name, tk.ref(tid))
-    with util.lock(f"run-{repo.name}-{tid}") as got:
+    with util.lock(state.run_lock("pipeline", repo.name, tid)) as got:
         if not got:
             print(f"{name} is already running")
             return 0
@@ -374,8 +378,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except Exception as e:
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
-            run.enter("failed")
-            run.say(f"Run `{run_id}` crashed before finishing. Remove `{tk.label_name('failed')}` to retry.")
+            run.give_up("crashed before finishing")
         state.finish_run(run_id, status, summary=summary, pr_url=pr_url, cost_usd=round(run.cost, 4))
         run.log(f"done: {status} {pr_url or summary}")
         if status == "skipped":
@@ -796,6 +799,25 @@ class SkipLog:
             print(f"{util.iso()} {name}: not run, {blocker}")
 
 
+STOPPED = "stopped before it finished, with nothing left running"
+
+
+def settle_abandoned_runs(cfg: config.Config) -> None:
+    for row in state.runs_marked_running():
+        with util.lock(state.run_lock(row["kind"], row["repo"], row["issue"])) as free:
+            if not free:
+                continue
+            state.finish_run(row["id"], "failed", summary=STOPPED)
+            print(f"{util.iso()} {row['id']}: {STOPPED}")
+            if row["kind"] == "pipeline":
+                repo = cfg.repo(row["repo"])
+                run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo),
+                          tid=str(row["issue"]))
+                run.dir.mkdir(parents=True, exist_ok=True)
+                run.log(STOPPED)
+                run.give_up(STOPPED)
+
+
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
                 other_routes: set[str] = frozenset()) -> tracker.Ticket | None:
     for t in tk.todo():
@@ -829,6 +851,11 @@ def poll(dry_run: bool = False) -> int:
             errors.append(f"{where}: {type(e).__name__}: {e}")
             print(f"{util.iso()} {errors[-1]}")
 
+        if not dry_run:
+            try:
+                settle_abandoned_runs(cfg)
+            except Exception as e:
+                failed("settling abandoned runs", e)
         skips = SkipLog({} if dry_run else util.read_json(SKIPPED_FILE, {}))
         routes = jira_routes_by_project(cfg)
         reached_clients: dict[str, jira.Client] = {}

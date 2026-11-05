@@ -316,7 +316,7 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
     paths.ensure_dirs()
     cfg = config.load()
     hours = hours or cfg.miner_lookback_hours
-    with util.lock("mine") as got:
+    with util.lock(state.run_lock("miner")) as got:
         if not got:
             print("miner already running")
             return 0

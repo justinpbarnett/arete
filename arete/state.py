@@ -125,6 +125,15 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
                                            "ORDER BY started DESC", (repo, issue))]
 
 
+def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
+    return {"pipeline": f"run-{repo}-{issue}", "eval": f"eval-{repo}", "miner": "mine"}[kind]
+
+
+def runs_marked_running() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
+
+
 def issue_running(repo: str, issue: int | str) -> bool:
     with db() as c:
         return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status = 'running' LIMIT 1",

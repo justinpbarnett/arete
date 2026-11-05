@@ -284,7 +284,7 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False) ->
         for t in tasks:
             print(f"{t.name}: base {t.base or 'default branch'}, check `{t.check}`, {len(t.hidden_files)} hidden files")
         return 0
-    with util.lock(f"eval-{repo.name}") as got:
+    with util.lock(state.run_lock("eval", repo.name)) as got:
         if not got:
             print(f"evals already running for {repo.name}")
             return 0
