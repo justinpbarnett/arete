@@ -20,6 +20,8 @@ learn = "sonnet"
 miner = "opus"
 apply = "sonnet"
 probe = "haiku"
+uat = "sonnet"
+verify = "opus"
 
 [miner]
 lookback_hours = 24

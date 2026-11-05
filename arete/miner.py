@@ -9,7 +9,8 @@ from string import Template
 
 from . import auditor, claude, config, evals, gh, hook, paths, state, util
 from .heartbeat import mark_loop
-from .pipeline import git, make_worktree, remove_worktree
+from .pipeline import make_worktree, remove_worktree
+from .util import git
 
 MAX_PROPOSALS = 8
 MIN_CONFIDENCE = 0.6

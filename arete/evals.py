@@ -18,12 +18,13 @@ from .pipeline import (
     AgentRun,
     Checkout,
     bash_rules,
+    check_list,
     command_list,
-    git,
     prompt,
     run_checks,
     workspace_note,
 )
+from .util import git
 
 EVALS = ".agents/evals"
 OVERLAY_EXTRA = [".agents/config.toml"]
@@ -194,7 +195,8 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
     started = time.time()
     result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "seconds": 0.0}
     try:
-        git(["fetch", "-q", "origin"], repo.path, check=False, timeout=300)
+        with util.repo_lock(repo.path):
+            git(["fetch", "-q", "origin"], repo.path, check=False, timeout=300)
         isolated_checkout(repo.path, base, wt)
         copied = overlay_harness(src, wt)
         run.log(f"worktree at {base}, harness from {src.label} ({len(copied)} files)")
@@ -212,13 +214,13 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         commit_overlay(wt)
 
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
-        checks = ", ".join(f"`{c}`" for c in layer.checks.values()) or "(none configured)"
+        checks = check_list(layer)
         timeout = task.timeout_minutes * 60
         commands = command_list(layer.builder_bash)
         workspace = workspace_note("eval", [Checkout("", repo.github, repo.path, wt, base)])
         res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
-                                        body=task.prompt, comments="", expertise=expertise, commands=commands,
-                                        max_lines=layer.max_diff_lines),
+                                        body=task.prompt, comments="", attachments="", expertise=expertise,
+                                        commands=commands, max_lines=layer.max_diff_lines, checks=checks),
                         wt, model=cfg.model("plan"), allowed_tools=READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
                         json_schema=PLAN_SCHEMA, timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
@@ -226,11 +228,13 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
             return result
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
+        in_use = res.structured.get("verify", "")
         tools = EDIT_TOOLS + bash_rules(layer.builder_bash)
         res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=task.name,
-                                         title=task.title, body=task.prompt, comments="", plan=plan,
+                                         title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
                                          expertise=expertise, checks=checks, commands=commands,
-                                         max_lines=layer.max_diff_lines, estimate=estimate),
+                                         max_lines=layer.max_diff_lines, estimate=estimate,
+                                         verify=in_use),
                         wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=NO_GIT_WRITES, timeout=timeout)
         if not res.ok:
             result["why"] = "build step failed"

@@ -20,8 +20,13 @@ Read the code you need (Read, Glob, Grep, read only git and shell commands). Do 
 Then return a plan a separate builder agent will follow without you:
 
 - the files to change and what changes in each
-- how the change will be verified (which existing checks cover it, which tests to add)
 - anything the builder must not touch
+
+Put in `verify` how a person will see the change work, as numbered steps: the commands to run, the requests to
+send, or the pages to open and what to do there, and what each step must show. Cover the edge and error cases the
+issue names, and one thing nearby that must still work. After the build, a verifier follows these steps on the
+running product. Leave out the repo's own checks ($checks): arete runs those before the verifier starts. Plan new
+tests only where the repo's own docs ask for them.
 
 The builder edits files and may run only these shell commands: $commands.
 Anything else is refused: installing a package this allowlist does not cover, running a migration, calling a
@@ -30,7 +35,7 @@ exactly what a human must do first (for example, add the dependency on the base 
 
 ## Size budget
 
-This repo caps a change at $max_lines changed lines (added plus deleted, tests included, lockfiles not counted).
+This repo caps a change at $max_lines changed lines (added plus deleted, lockfiles not counted).
 Arete enforces it after the build, so a plan over it is wasted work. Set `estimated_lines` to your honest estimate.
 If the work cannot fit, keep `plan` to a short outline and fill `split` with two to five smaller issues, in build
 order, that each fit the budget and each leave the repo working; give each a title and a body written like an

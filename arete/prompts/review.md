@@ -20,6 +20,12 @@ $plan
 
 $checks
 
+## Checked in use
+
+A verifier used the running product with the change. What it did and saw:
+
+$evidence
+
 ## Diff
 
 ```diff
@@ -28,8 +34,13 @@ $diff
 
 Read whatever code you need to judge the change (read only tools). Then decide:
 
-- `approve` if the change does what the issue asks, is tested, and you would merge it.
-- `request_changes` if anything is a blocker (wrong behavior, missing the point of the issue, broken edge case, security problem, tests that do not test the change) or major.
+- `approve` if the change does what the issue asks, the evidence shows it working in use, and you would merge it.
+- `request_changes` if anything is a blocker (wrong behavior, missing the point of the issue, broken edge case,
+  security problem, evidence that does not show what the issue asks for) or major (new tests the repo's own docs
+  do not ask for).
+
+Judge the evidence too: a check that did not exercise the change, or a `saw` that does not match its `passed`, is
+a problem. When the check in use was blocked or not set up, judge the diff on its own and say so in `summary`.
 
 List each problem with the file, what is wrong, and severity: blocker, major, or minor.
 Do not request changes for style preferences. Keep `summary` to three sentences.

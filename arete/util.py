@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -118,6 +119,28 @@ def sh_with_network(cmd: list[str] | str, **kw) -> subprocess.CompletedProcess:
                 return res
             time.sleep(5 * 2**attempt)
     return res
+
+
+def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None) -> str:
+    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input)
+    if check and res.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])}: {git_error(res.stderr or res.stdout)}")
+    return res.stdout
+
+
+def git_error(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    errors = [line for line in lines if line.startswith(("fatal:", "error:"))]
+    return "; ".join(errors or lines[:1])[:300]
+
+
+@contextmanager
+def repo_lock(src: Path):
+    paths.ensure_dirs()
+    name = hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12]
+    with open(paths.LOCKS_DIR / f"git-{name}.lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
 
 
 def _s(b) -> str:

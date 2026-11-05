@@ -11,8 +11,9 @@ from datetime import timedelta
 from pathlib import Path
 from string import Template
 
-from . import claude, config, gh, jira, paths, state, tracker, util
+from . import claude, config, gh, jira, paths, state, tracker, util, verify
 from .heartbeat import mark_loop
+from .util import git
 
 ALWAYS_DENY = [".agents/config.toml", ".github/workflows/**", ".env", ".env.*", "**/.env", "**/.env.*"]
 MAX_DIFF_IN_PROMPT = 60_000
@@ -31,6 +32,7 @@ PLAN_SCHEMA = {
         "question": {"type": "string"},
         "risk": {"type": "string", "enum": ["low", "medium", "high"]},
         "estimated_lines": {"type": "integer", "minimum": 0},
+        "verify": {"type": "string"},
         "split": {
             "type": "array",
             "items": {
@@ -40,7 +42,7 @@ PLAN_SCHEMA = {
             },
         },
     },
-    "required": ["plan", "ambiguous", "risk", "estimated_lines"],
+    "required": ["plan", "ambiguous", "risk", "estimated_lines", "verify"],
 }
 REVIEW_SCHEMA = {
     "type": "object",
@@ -240,13 +242,6 @@ class Run(AgentRun):
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
-def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True) -> str:
-    res = util.sh_with_network(["git", *args], cwd=cwd, timeout=timeout)
-    if check and res.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args[:2])}: {util.first_line(res.stderr or res.stdout, 300)}")
-    return res.stdout
-
-
 @dataclass
 class Checkout:
     dir: str
@@ -280,17 +275,25 @@ def remote_head(src: Path, branch: str) -> str:
     return out[0] if out else ""
 
 
+def fetch(src: Path, ref: str) -> None:
+    with util.repo_lock(src):
+        git(["fetch", "origin", ref], src)
+
+
 def add_worktree(c: Checkout, branch: str, start: str) -> None:
     c.wt.parent.mkdir(parents=True, exist_ok=True)
-    git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
+    with util.repo_lock(c.src):
+        git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
 
 
 def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
     for c in checkouts:
-        git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
+        with util.repo_lock(c.src):
+            git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
     shutil.rmtree(ws, ignore_errors=True)
     for c in checkouts:
-        git(["worktree", "prune"], c.src, check=False)
+        with util.repo_lock(c.src):
+            git(["worktree", "prune"], c.src, check=False)
 
 
 def make_workspace(repo: config.Repo, base: str, branch: str, key: str) -> tuple[Path, list[Checkout]]:
@@ -299,12 +302,12 @@ def make_workspace(repo: config.Repo, base: str, branch: str, key: str) -> tuple
                  for p in repo.parts]
     remove_workspace(ws, checkouts)
     for c in checkouts:
-        git(["fetch", "origin", c.base], c.src)
+        fetch(c.src, c.base)
         c.pr = gh.open_pr_url(c.github, branch)
         c.lease = remote_head(c.src, branch)
         c.resumes = bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
         if c.resumes:
-            git(["fetch", "origin", branch], c.src)
+            fetch(c.src, branch)
         add_worktree(c, branch, f"origin/{branch}" if c.resumes else f"origin/{c.base}")
     return ws, checkouts
 
@@ -312,7 +315,7 @@ def make_workspace(repo: config.Repo, base: str, branch: str, key: str) -> tuple
 def make_worktree(repo: config.Repo, base: str, branch: str, key: str) -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
     remove_workspace(c.wt, [c])
-    git(["fetch", "origin", base], c.src)
+    fetch(c.src, base)
     add_worktree(c, branch, f"origin/{base}")
     return c.wt
 
@@ -415,6 +418,71 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     return ok, "\n\n".join(report)
 
 
+class RunFailed(Exception):
+    def __init__(self, why: str, detail: str = ""):
+        super().__init__(why)
+        self.why, self.detail = why, detail
+
+
+@dataclass
+class Build:
+    cfg: config.Config
+    run: Run
+    ticket: tracker.Ticket
+    ws: Path
+    checkouts: list[Checkout]
+    layer: config.RepoLayer
+    tools: list[str]
+    deny: list[str]
+    timeout: float
+    workspace: str
+    attachments: str
+    expertise: str
+    session: str = ""
+    report: str = ""
+    staged: Staged = field(default_factory=Staged)
+    steps: Counter = field(default_factory=Counter)
+
+    @property
+    def git_dirs(self) -> list[Path]:
+        return [c.wt for c in self.checkouts]
+
+    @property
+    def read_bash(self) -> list[str]:
+        return config.DEFAULT_ALLOW_BASH + git_reads(self.checkouts)
+
+    def next_step(self, name: str) -> str:
+        self.steps[name] += 1
+        return name if self.steps[name] == 1 else f"{name}{self.steps[name]}"
+
+    def resume(self, step: str, text: str) -> claude.Result:
+        res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
+                             disallowed_tools=NO_GIT_WRITES, resume=self.session, timeout=self.timeout)
+        self.session = res.session_id or self.session
+        return res
+
+    def check(self) -> bool:
+        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout)
+        return ok
+
+    def restage(self) -> Staged:
+        self.staged = stage(self.checkouts, self.deny)
+        return self.staged
+
+    def recheck(self, after: str) -> None:
+        ok = self.check()
+        staged = self.restage()
+        limit = self.layer.max_diff_lines
+        if not ok:
+            raise RunFailed(f"the checks failed after {after}", self.report)
+        if not staged.files:
+            raise RunFailed(f"{after} undid every change")
+        if staged.denied:
+            raise RunFailed(f"{after} touched denied paths: {', '.join(staged.denied[:5])}")
+        if staged.lines > limit:
+            raise RunFailed(f"after {after} the diff is {staged.lines} lines, over the {limit} line limit")
+
+
 def split_comment(estimate: int, limit: int, split: list[dict], queue_hint: str, info_label: str,
                   config_file: Path) -> str:
     parts = [(f"The plan comes to about {estimate} changed lines, over this repo's {limit} line limit, so I stopped "
@@ -465,6 +533,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 state.take_feedback(run.feedback, run_id)
         try:
             status, summary, pr_url = _run(cfg, run)
+        except RunFailed as e:
+            status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except Exception as e:
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
@@ -561,7 +631,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
             return _fail(run, f"setup command `{cmd}` failed")
 
     expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
-    check_list = ", ".join(f"`{c}`" for c in layer.checks.values()) or "(none configured)"
+    checks = check_list(layer)
     reads = git_reads(checkouts)
     builder_bash = layer.builder_bash + reads
     commands = command_list(builder_bash)
@@ -569,7 +639,6 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     step_timeout = layer.timeout_minutes * 60
     read_tools = READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
     build_tools = EDIT_TOOLS + bash_rules(builder_bash)
-    git_dirs = [c.wt for c in checkouts]
     deny = ALWAYS_DENY + layer.deny
     limit = layer.max_diff_lines
     info = tk.label_name("needs-info")
@@ -578,11 +647,13 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     if run.feedback:
         feedback = feedback_markdown(run.feedback)
         plan_text = f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+        goal = ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
+                + feedback)
         estimate = 0
         run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
         res = run.agent("revise", prompt("revise", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                          body=t.body, comments=t.comments, attachments=attachments,
-                                         feedback=feedback, expertise=expertise, checks=check_list,
+                                         feedback=feedback, expertise=expertise, checks=checks,
                                          commands=commands, max_lines=limit),
                         ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA, timeout=step_timeout)
@@ -595,7 +666,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     else:
         res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                         body=t.body, comments=t.comments, attachments=attachments,
-                                        expertise=expertise, commands=commands, max_lines=limit),
+                                        expertise=expertise, commands=commands, max_lines=limit, checks=checks),
                         ws, model=cfg.model("plan"), allowed_tools=read_tools, json_schema=PLAN_SCHEMA,
                         timeout=step_timeout)
         if not res.ok or not isinstance(res.structured, dict):
@@ -604,6 +675,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         plan_text = plan.get("plan", "")
         run.save("plan.md", plan_text)
         estimate = int(plan.get("estimated_lines") or 0)
+        goal = plan.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for."
         if plan.get("ambiguous") and plan.get("question"):
             run.log("plan: ambiguous, asking the author")
             return _ask(run, ws, checkouts, f"Before I build this I need one answer:\n\n{plan['question']}\n\n"
@@ -618,8 +690,8 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
 
         res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
-                                         expertise=expertise, checks=check_list, commands=commands, max_lines=limit,
-                                         estimate=estimate),
+                                         expertise=expertise, checks=checks, commands=commands, max_lines=limit,
+                                         estimate=estimate, verify=goal),
                         ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
                         timeout=step_timeout)
         if not res.ok:
@@ -627,27 +699,24 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         build_summary = res.text
         if not stage(checkouts, deny).files:
             return _fail(run, "the builder stopped without changing anything", build_summary)
-    session = res.session_id
+    b = Build(cfg, run, t, ws, checkouts, layer, build_tools, deny, step_timeout, workspace, attachments, expertise,
+              session=res.session_id)
 
     attempts = 1
-    ok, report = run_checks(layer, ws, git_dirs, run, step_timeout)
+    ok = b.check()
     while not ok and attempts < layer.max_attempts:
-        run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(report, 2500)}")
+        run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(b.report, 2500)}")
         attempts += 1
-        res = run.agent(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=layer.max_attempts,
-                                                 failures=report),
-                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
-                        resume=session, timeout=step_timeout)
-        session = res.session_id or session
-        ok, report = run_checks(layer, ws, git_dirs, run, step_timeout)
-    run.save("checks.md", report)
+        b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=layer.max_attempts, failures=b.report))
+        ok = b.check()
+    run.save("checks.md", b.report)
     state.update_run(run.id, attempts=attempts)
     if not ok:
         run.story.append("Checks still failing after the last attempt.")
         _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=False)
         return _fail(run, f"checks still failing after {attempts} attempts")
 
-    staged = stage(checkouts, deny)
+    staged = b.restage()
     if not staged.files:
         return _fail(run, "the fix attempts undid every change", build_summary)
     if staged.denied:
@@ -657,26 +726,22 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         return _fail(run, f"the diff is {staged.lines} lines, over the {limit} line limit{planned}; split the work",
                      detail=f"### Lines changed by file\n\n{lines_by_file(checkouts)}")
 
-    review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan_text, report, staged.diff,
-                     step_timeout)
+    verified = verify_in_use(b, goal, build_summary)
+    review = _review(b, plan_text, verified)
     if review.get("verdict") == "request_changes":
         problems = "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
         run.story.append(f"Review requested changes:\n{problems}")
-        res = run.agent("review_fix", prompt("review_fix", problems=problems), ws, model=cfg.model("build"),
-                        allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES, resume=session,
-                        timeout=step_timeout)
-        ok, report = run_checks(layer, ws, git_dirs, run, step_timeout)
-        staged = stage(checkouts, deny)
-        if not ok or not staged.files or staged.denied or staged.lines > limit:
-            return _fail(run, "changes after review broke the checks or the limits")
-        review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan_text, report, staged.diff,
-                         step_timeout, "review2")
+        b.resume("review_fix", prompt("review_fix", problems=problems))
+        b.recheck("the review fixes")
+        verified = verify_in_use(b, goal, build_summary)
+        review = _review(b, plan_text, verified, "review2")
 
     approved = review.get("verdict") == "approve"
+    blocked = verified.verdict == "blocked"
     _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=True)
-    staged = stage(checkouts, deny)
+    staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
-    outcome = f"{size}, review {review.get('verdict')}"
+    outcome = f"{size}, review {review.get('verdict')}, in use {verified.verdict}"
 
     if run.dry_run:
         run.save("diff.patch", staged.diff)
@@ -685,11 +750,13 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
 
     subject = fill_template(layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
     problems = review.get("problems", [])
+    images = evidence_images(run, staged.changed[0], verified)
     report_body = (
         f"## Summary\n\n{build_summary.strip()[:3000]}\n\n"
+        f"## Checked in use\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
         + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
-        + f"\n\n## Checks\n\nAll passed after {attempts} attempt{'s' if attempts > 1 else ''}: {check_list}\n\n"
+        + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else f"<details><summary>Plan</summary>\n\n{plan_text[:6000]}\n\n</details>\n\n")
         + f"Run `{run.id}`, {size}, ${run.cost:.2f}."
     )
@@ -717,9 +784,9 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     for c in staged.changed:
         if not c.pr:
             c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{tk.pr_link(t)}\n\n{report_body}",
-                                labels=tk.pr_labels, draft=not approved, cwd=c.wt)
+                                labels=tk.pr_labels, draft=not approved or blocked, cwd=c.wt)
             opened.append(c)
-            run.log(f"opened {c.pr}{'' if approved else ' as draft'}")
+            run.log(f"opened {c.pr}{'' if approved and not blocked else ' as draft'}")
         else:
             run.log(f"pushed to {c.pr}")
     pushed = [c for c in staged.changed if c not in opened]
@@ -740,9 +807,8 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         answer_feedback(run, replies, "Done in the latest push.")
         run.say(f"Revised for your review.\n\n{report_body}")
     else:
-        run.say(f"PRs for this ticket:\n\n{pr_lines}"
-                + ("" if approved or not opened else "\n\nThe new PRs are drafts: the reviewer still has concerns."))
-    if approved and layer.trust_level == "automerge":
+        run.say(f"PRs for this ticket:\n\n{pr_lines}" + ("" if not opened else draft_note(approved, verified)))
+    if approved and not blocked and layer.trust_level == "automerge":
         for c in opened:
             try:
                 gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
@@ -838,16 +904,123 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch
     return "pr", "answered the review without code changes", " ".join(urls)
 
 
-def _review(cfg, run: Run, ws: Path, workspace: str, read_tools: list[str], t: tracker.Ticket, attachments: str,
-            plan: str, report: str, diff: str, timeout: float, step: str = "review") -> dict:
-    res = run.agent(step, prompt("review", repo=run.repo.name, workspace=workspace, ref=t.ref, title=t.title,
-                                 body=t.body, comments=t.comments, attachments=attachments, plan=plan, checks=report,
-                                 diff=util.tail(diff, MAX_DIFF_IN_PROMPT)),
-                    ws, model=cfg.model("review"), allowed_tools=read_tools, json_schema=REVIEW_SCHEMA,
-                    timeout=timeout)
+def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review") -> dict:
+    t = b.ticket
+    res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
+                                   body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
+                                   checks=b.report, evidence=verified.markdown(),
+                                   diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT)),
+                      b.ws, model=b.cfg.model("review"), allowed_tools=READ_TOOLS + bash_rules(b.read_bash),
+                      json_schema=REVIEW_SCHEMA, timeout=b.timeout)
     if not res.ok or not isinstance(res.structured, dict):
         return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
     return res.structured
+
+
+def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
+    if not b.layer.verify:
+        b.run.log("verify: the layer has no [verify] section, so nothing checks the change in use")
+        return verify.not_configured(b.layer.dir, b.ws)
+    for attempt in range(1, b.layer.max_attempts + 1):
+        verified = check_in_use(b, goal, summary)
+        if verified.verdict != "fail":
+            return verified
+        b.run.story.append(f"The check in use failed on attempt {attempt}:\n{util.tail(verified.markdown(), 2500)}")
+        if attempt == b.layer.max_attempts:
+            break
+        b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=b.layer.max_attempts,
+                                                   failures=verified.markdown(), checks=check_list(b.layer)))
+        b.recheck("fixing what the check in use found")
+    b.run.story.append("Still failing in use after the last attempt.")
+    _learn(b.cfg, b.run, b.ws, b.layer.expertise_file, b.ticket.title, b.expertise, apply=False)
+    raise RunFailed(f"it still does not work in use after {util.count(b.layer.max_attempts, 'attempt')}",
+                    verified.markdown())
+
+
+def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
+    run, v, t = b.run, b.layer.verify, b.ticket
+    step = b.next_step("verify")
+    evidence = run.dir / "evidence"
+    evidence.mkdir(exist_ok=True)
+    if evidence not in run.add_dirs:
+        run.add_dirs.append(evidence)
+    bash = b.read_bash + v.bash
+    untracked_before = {d: untracked_files(d) for d in b.git_dirs}
+    try:
+        with verify.serving(v, b.ws, run.dir / f"{step}-server.log") as url:
+            if url:
+                run.log(f"{step}: the app answers at {url}")
+            res = run.agent(step, prompt("verify", repo=run.repo.name, workspace=b.workspace, ref=t.ref,
+                                         title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
+                                         goal=goal, summary=summary.strip()[:4000], surface=surface_note(v, url, evidence),
+                                         notes=v.notes, commands=command_list(bash), checks=check_list(b.layer),
+                                         diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT)),
+                            b.ws, model=b.cfg.model("verify"),
+                            allowed_tools=READ_TOOLS + bash_rules(bash) + (["mcp__playwright"] if url else []),
+                            disallowed_tools=NO_GIT_WRITES, json_schema=verify.SCHEMA, timeout=b.timeout,
+                            mcp_config=verify.mcp_config(evidence) if url else "")
+    except verify.ServerError as e:
+        run.log(f"{step}: the app did not start")
+        return verify.Verified("fail", f"The app did not start: {e}")
+    finally:
+        restore_worktrees(untracked_before, evidence)
+    if not res.ok or not isinstance(res.structured, dict):
+        return verify.Verified("blocked", "The check in use did not finish.",
+                               blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
+    verified = verify.Verified.from_agent(res.structured)
+    run.save(f"{step}.md", verified.markdown())
+    run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
+            f"{util.count(len(verified.checks), 'check')} passed")
+    return verified
+
+
+def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
+    if not url:
+        return ("Arete started no app for this repo. Run the commands its user runs, with real arguments, and read "
+                "the output and the exit code.")
+    return (f"Arete started the app with `{v.start}` and it answers at {url}. Arete stops it when you finish.\n\n"
+            "- Do in the browser what a person does in the browser, with the `mcp__playwright__browser_*` tools "
+            "(load them with ToolSearch first): navigate, read the page with `browser_snapshot`, click, type.\n"
+            "- After each state you check, call `browser_take_screenshot` with `filename` set to an absolute path "
+            f"in `{evidence}`, such as `{evidence}/01-list.png`, and read `browser_console_messages` for errors.\n"
+            "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
+
+
+def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
+    for d, before in untracked_before.items():
+        for name in untracked_files(d) - before:
+            f = d / name
+            if f.suffix == ".png" and not (evidence / f.name).exists():
+                shutil.move(f, evidence / f.name)
+            else:
+                f.unlink(missing_ok=True)
+        git(["checkout", "-q", "--", "."], d)
+
+
+def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[str, str]:
+    shots = verified.screenshots(run.dir / "evidence")
+    if not shots:
+        return {}
+    try:
+        with util.repo_lock(c.src):
+            images = verify.push_evidence(c.src, c.github, run.id, shots)
+    except RuntimeError as e:
+        run.log(f"evidence: the push failed, so the PR shows no screenshots: {util.first_line(str(e), 300)}")
+        return {}
+    run.log(f"evidence: pushed {util.count(len(shots), 'screenshot')} to {verify.EVIDENCE_BRANCH} on {c.github}")
+    return images
+
+
+def draft_note(approved: bool, verified: verify.Verified) -> str:
+    if verified.verdict == "blocked":
+        return f"\n\nThe new PRs are drafts: the check in use was blocked. {verified.blocked_by}".rstrip()
+    if not approved:
+        return "\n\nThe new PRs are drafts: the reviewer still has concerns."
+    return ""
+
+
+def check_list(layer: config.RepoLayer) -> str:
+    return ", ".join(f"`{c}`" for c in layer.checks.values()) or "(none configured)"
 
 
 def _learn(cfg, run: Run, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:

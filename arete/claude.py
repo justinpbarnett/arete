@@ -44,6 +44,7 @@ def run(
     timeout: float = 1800,
     persist: bool = True,
     add_dirs: list[Path] | None = None,
+    mcp_config: str = "",
 ) -> Result:
     cmd = [binary(), "-p", "--output-format", "json", "--permission-mode", permission_mode]
     if model:
@@ -64,6 +65,8 @@ def run(
         cmd += ["--no-session-persistence"]
     if add_dirs:
         cmd += ["--add-dir", *map(str, add_dirs)]
+    if mcp_config:
+        cmd += ["--strict-mcp-config", "--mcp-config", mcp_config]
 
     env = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
     env["ARETE_AGENT"] = "1"

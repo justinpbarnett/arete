@@ -197,6 +197,20 @@ HARNESS_GLOBS = [
 
 
 @dataclass
+class Verify:
+    start: str = ""
+    url: str = "http://localhost:{port}"
+    ready: str = "/"
+    ready_seconds: int = 180
+    allow_bash: list[str] = field(default_factory=list)
+    notes: str = ""
+
+    @property
+    def bash(self) -> list[str]:
+        return ["curl *", "echo *", *self.allow_bash]
+
+
+@dataclass
 class RepoLayer:
     dir: Path
     setup: list[str] = field(default_factory=list)
@@ -212,10 +226,11 @@ class RepoLayer:
     subject: str = "{kind}: {title}"
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
+    verify: Verify | None = None
 
     @property
     def builder_bash(self) -> list[str]:
-        return self.allow_bash + list(self.checks.values())
+        return self.allow_bash + list(self.checks.values()) + (self.verify.bash if self.verify else [])
 
     @property
     def config_file(self) -> Path:
@@ -253,4 +268,9 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.base_branch = g.get("base", "")
     layer.subject = g.get("subject", layer.subject)
     layer.branch = g.get("branch", layer.branch)
+    if "verify" in data:
+        v = data["verify"]
+        layer.verify = Verify(start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
+                              ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
+                              allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip())
     return layer
