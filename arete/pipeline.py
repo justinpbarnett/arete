@@ -62,9 +62,18 @@ REVIEW_SCHEMA = {
 }
 LEARN_SCHEMA = {
     "type": "object",
-    "properties": {"lessons": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
-    "required": ["lessons"],
+    "properties": {
+        "expertise": {"type": "string"},
+        "added": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+        "removed": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"lesson": {"type": "string"}, "why": {"type": "string"}},
+            "required": ["lesson", "why"],
+        }},
+    },
+    "required": ["expertise", "added", "removed"],
 }
+EXPERTISE_MAX_LINES = 80
 UAT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -716,21 +725,46 @@ def _learn(cfg, run: Run, wt: Path, expertise_file: Path, title: str, expertise:
         run.log("learn: clean run, nothing to learn")
         return
     res = run.agent("learn", prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
-                                     story="\n\n".join(run.story), expertise=expertise),
+                                     story="\n\n".join(run.story), expertise=expertise,
+                                     max_lines=EXPERTISE_MAX_LINES),
                     wt, model=cfg.model("learn"), allowed_tools=READ_TOOLS, json_schema=LEARN_SCHEMA,
-                    timeout=600, persist=False)
-    lessons = [lesson.strip().lstrip("- ").strip() for lesson in (res.structured or {}).get("lessons", [])
-               if lesson.strip()]
-    if not lessons:
+                    timeout=900, persist=False)
+    found = res.structured if res.ok and isinstance(res.structured, dict) else {}
+    rewrite = found.get("expertise", "").strip()
+    lines = len(rewrite.splitlines())
+    if not rewrite:
+        run.log("learn: no expertise file came back, kept the old one")
         return
+    if lines > EXPERTISE_MAX_LINES:
+        run.log(f"learn: the rewrite has {lines} lines, over the {EXPERTISE_MAX_LINES} line cap; kept the old file")
+        return
+    added = [a.strip() for a in found.get("added", []) if a.strip()]
+    removed = [r for r in found.get("removed", []) if r.get("lesson", "").strip()]
+    if (expertise_file.read_text().strip() if expertise_file.exists() else "") == rewrite:
+        run.log("learn: expertise unchanged")
+        return
+    report = "\n".join([f"+ {a}" for a in added] + [f"- {r['lesson']} ({r['why']})" for r in removed])
+    run.save("expertise-report.md", report)
     if not apply:
-        run.save("lessons.md", "\n".join(f"- {lesson}" for lesson in lessons))
+        run.save("expertise.md", rewrite + "\n")
+        run.log(f"learn: rewrite saved in the run, not applied ({len(added)} added, {len(removed)} removed)")
         return
     expertise_file.parent.mkdir(parents=True, exist_ok=True)
-    head = "" if expertise_file.exists() else "# Expertise\n\nLessons agents learned working in this repo. Arete appends; humans prune.\n"
-    with open(expertise_file, "a") as fh:
-        fh.write(f"{head}\n## {util.now():%Y-%m-%d} {run.ref} ({run.id})\n\n" + "\n".join(f"- {lesson}" for lesson in lessons) + "\n")
-    run.log(f"learn: {util.count(len(lessons), 'lesson')} added to {expertise_file}")
+    expertise_file.write_text(rewrite + "\n")
+    run.log(f"learn: {len(added)} added, {len(removed)} removed, {lines} lines in {paths.short_path(expertise_file)}")
+    if run.repo.layer:
+        try:
+            commit_layer(expertise_file.parent, f"{run.repo.name}: learn from {run.ref} ({run.id})\n\n{report}")
+        except RuntimeError as e:
+            run.log(f"learn: wrote the file but the layer commit failed: {util.first_line(str(e), 300)}")
+
+
+def commit_layer(layer_dir: Path, message: str) -> None:
+    if git(["rev-parse", "--is-inside-work-tree"], layer_dir, check=False).strip() != "true":
+        git(["init", "-q"], layer_dir)
+    git(["add", "-A", "--", "."], layer_dir)
+    if util.sh(["git", "diff", "--cached", "--quiet", "--", "."], cwd=layer_dir).returncode:
+        git(["commit", "-q", "-m", message, "--", "."], layer_dir)
 
 
 def sync_outcomes(cfg: config.Config) -> None:
