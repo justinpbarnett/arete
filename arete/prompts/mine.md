@@ -9,6 +9,10 @@ the one harness change that would have prevented it next time, and where that ch
   There is no global CLAUDE.md; a global rule belongs in the skill it is about, or in a new small skill.
 - `repo`: true in one repo. Goes in that repo's `CLAUDE.md`, `AGENTS.md`, `.claude/skills/**`,
   `.agents/expertise.md`, or a nested `CLAUDE.md` near the code it is about.
+- `repo` in `$arete_repo`, the pipeline itself: how arete's own unattended steps (plan, build, review, verify and
+  the rest) do their job. When the same miss shows up in more than one repo, the fix belongs in the step prompt that
+  runs it, not in each repo. You may change these, and no others: $arete_prompts. Keep every `$$name`
+  placeholder in them as it is and add none: the pipeline fills them.
 - `memory`: a fact about the person, their preferences, or their life rather than about code or tools.
   Record it with layer memory; another system handles those.
 
@@ -51,6 +55,7 @@ $audit
 The owner reviews the PRs that arete's pipeline agents open. Each comment below corrects what those agents
 built in that repo. A pattern that shows up across PRs, or a comment on a PR that closed without a merge,
 is strong evidence: propose the harness change that would have made the agents get it right the first time.
+The same correction on PRs in two or more repos is about how arete's steps work: fix it in the step prompt.
 A comment that only asks for one ticket's detail is not a pattern.
 
 $feedback

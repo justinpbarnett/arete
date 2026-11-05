@@ -236,8 +236,13 @@ def cmd_eval(args) -> int:
         print("usage: arete eval [REPO] or arete eval mine [REPO]", file=sys.stderr)
         return 2
     if not words:
+        if args.prompts:
+            print("arete eval --prompts DIR needs a REPO", file=sys.stderr)
+            return 2
         return evals.run_all(dry_run=args.dry_run)
-    return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run)
+    prompts_dir = paths.expand(args.prompts).resolve() if args.prompts else None
+    prompts = evals.Prompts(prompts_dir, paths.short_path(prompts_dir)) if prompts_dir else None
+    return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run, prompts=prompts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -309,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("target", nargs="*", metavar="REPO | mine [REPO]")
     p.add_argument("--task", default="")
     p.add_argument("--ref", default="", help="take the harness and tasks from this git ref, not the working copy")
+    p.add_argument("--prompts", default="", metavar="DIR",
+                   help="run the plan, build and fix steps with the prompts in DIR; the grader keeps the installed one")
     p.add_argument("--limit", type=int, default=3, help="with mine: the most merged PRs to mine in one go")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)

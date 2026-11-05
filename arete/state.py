@@ -277,10 +277,10 @@ def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, co
         )
 
 
-def task_history(repo: str, task: str, limit: int = 5) -> list[bool]:
+def task_history(repo: str, task: str, limit: int = 5, source: str = "worktree") -> list[bool]:
     with db() as c:
-        rows = c.execute("SELECT passed FROM evals WHERE repo = ? AND task = ? ORDER BY ts DESC LIMIT ?",
-                         (repo, task, limit))
+        rows = c.execute("SELECT passed FROM evals WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
+                         (repo, task, source, limit))
         return [bool(r[0]) for r in rows]
 
 

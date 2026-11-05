@@ -70,6 +70,7 @@ class Probe:
 class Config:
     alert_repo: str = ""
     global_repo: str = "ai"
+    arete_repo: str = "arete"
     models: dict[str, str] = field(default_factory=dict)
     repos: list[Repo] = field(default_factory=list)
     jobs: list[Job] = field(default_factory=list)
@@ -107,6 +108,7 @@ def load(path: Path | None = None) -> Config:
     cfg = Config(
         alert_repo=data.get("alert_repo", ""),
         global_repo=data.get("global_repo", "ai"),
+        arete_repo=data.get("arete_repo", "arete"),
         models=dict(data.get("models", {})),
         miner_lookback_hours=float(data.get("miner", {}).get("lookback_hours", 24)),
         miner_max_digest_chars=int(data.get("miner", {}).get("max_digest_chars", 90_000)),

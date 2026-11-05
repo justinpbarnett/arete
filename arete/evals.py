@@ -31,6 +31,8 @@ from .util import git
 
 EVALS = ".agents/evals"
 OVERLAY_EXTRA = [".agents/config.toml"]
+ARETE_PROMPTS = "arete/prompts"
+BUILDER_PROMPTS = ("plan", "build", "fix")
 
 
 @dataclass
@@ -62,6 +64,32 @@ class EvalRun(AgentRun):
     @property
     def where(self) -> str:
         return f"eval {self.repo.name}/{self.task}"
+
+
+@dataclass
+class Prompts:
+    dir: Path = paths.PROMPTS_DIR
+    label: str = ""
+
+    def missing(self) -> list[str]:
+        return [f"{name}.md" for name in BUILDER_PROMPTS if not (self.dir / f"{name}.md").is_file()]
+
+    def on(self, harness: str) -> str:
+        return f"{harness} with prompts {self.label}" if self.label else harness
+
+
+@dataclass
+class Arm:
+    run_id: str
+    results: list[dict]
+
+    @property
+    def score(self) -> str:
+        return f"{sum(r['passed'] for r in self.results)}/{len(self.results)}"
+
+    @property
+    def cost(self) -> float:
+        return sum(r["cost"] for r in self.results)
 
 
 class Source:
@@ -237,7 +265,8 @@ def grade_failure(graded: verify.Verified) -> str:
     return f"failed in use: {util.first_line(failed[0]['what'] if failed else graded.summary, 200)}"
 
 
-def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run_id: str, dry_run: bool) -> dict:
+def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run_id: str, dry_run: bool,
+             prompts: Prompts) -> dict:
     run_dir = paths.RUNS_DIR / run_id / task.name
     run_dir.mkdir(parents=True, exist_ok=True)
     run = EvalRun(id=run_id, repo=repo, dir=run_dir, dry_run=dry_run, task=task.name)
@@ -252,6 +281,8 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         isolated_checkout(repo.path, base, wt)
         run.log(f"checkout at {base}")
         layer = prepare(repo, src, wt, run)
+        if prompts.label:
+            run.log(f"plan, build and fix prompts from {prompts.label}")
         if task.verify and not layer.verify:
             raise RunFailed("the task has `verify` steps but the layer has no `[verify]` section")
 
@@ -260,7 +291,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         timeout = task.timeout_minutes * 60
         commands = command_list(layer.builder_bash)
         workspace = workspace_note("eval", [Checkout("", repo.github, repo.path, wt, base)])
-        res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
+        res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
                                         body=task.prompt, comments="", attachments="", expertise=expertise,
                                         commands=commands, max_lines=layer.max_diff_lines, checks=checks),
                         wt, model=cfg.model("plan"), allowed_tools=READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
@@ -272,7 +303,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
         tools = EDIT_TOOLS + bash_rules(layer.builder_bash)
-        res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=task.name,
+        res = run.agent("build", prompt("build", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name,
                                          title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
                                          expertise=expertise, checks=checks, commands=commands,
                                          max_lines=layer.max_diff_lines, estimate=estimate,
@@ -285,7 +316,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         ok, report = run_checks(layer, wt, [wt], run, timeout)
         while not ok and attempts < layer.max_attempts:
             attempts += 1
-            res = run.agent(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=layer.max_attempts,
+            res = run.agent(f"fix{attempts}", prompt("fix", prompts.dir, attempt=attempts, max_attempts=layer.max_attempts,
                                                      failures=report),
                             wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=NO_GIT_WRITES,
                             resume=session, timeout=timeout)
@@ -325,10 +356,14 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         shutil.rmtree(wt, ignore_errors=True)
 
 
-def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False) -> int:
+def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False, prompts: Prompts | None = None) -> int:
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
+    prompts = prompts or Prompts()
+    if missing := prompts.missing():
+        print(f"{paths.short_path(prompts.dir)} has no {', '.join(missing)}: plan, build and fix all need a prompt")
+        return 1
     if any(p.dir for p in repo.parts):
         print(f"{repo.name}: evals run on a single repo, and this one has parts")
         return 1
@@ -347,25 +382,30 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False) ->
         if not got:
             print(f"evals already running for {repo.name}")
             return 0
-        run_id = f"{state.new_run_id('eval')}-{repo.name}"
-        state.start_run(run_id, "eval", repo=repo.name)
-        results = []
-        for t in tasks:
-            prior = state.task_history(repo.name, t.name, 3)
-            r = run_task(cfg, repo, src, t, run_id, dry_run)
-            state.add_eval(run_id, repo.name, t.name, r["passed"], r["seconds"], r["cost"], src.label)
-            r["regressed"] = len(prior) == 3 and all(prior) and not r["passed"]
-            results.append(r)
-        passed = sum(r["passed"] for r in results)
-        cost = sum(r["cost"] for r in results)
-        summary = f"{passed}/{len(results)} passed on {src.label}"
-        state.finish_run(run_id, "done", summary=summary, cost_usd=cost)
-        print(f"{repo.name}: {summary}, ${cost:.2f}")
-        for r in results:
-            print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s ${r['cost']:.2f} {r['why']}"
-                  + ("  REGRESSED" if r["regressed"] else ""))
-        (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, src.label, results))
+        run_suite(cfg, repo, src, tasks, f"{state.new_run_id('eval')}-{repo.name}", prompts)
         return 0
+
+
+def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Task], run_id: str,
+              prompts: Prompts) -> Arm:
+    label = prompts.on(src.label)
+    state.start_run(run_id, "eval", repo=repo.name)
+    results = []
+    for t in tasks:
+        prior = state.task_history(repo.name, t.name, 3)
+        r = run_task(cfg, repo, src, t, run_id, False, prompts)
+        state.add_eval(run_id, repo.name, t.name, r["passed"], r["seconds"], r["cost"], label)
+        r["regressed"] = len(prior) == 3 and all(prior) and not r["passed"]
+        results.append(r)
+    arm = Arm(run_id, results)
+    summary = f"{arm.score} passed on {label}"
+    state.finish_run(run_id, "done", summary=summary, cost_usd=arm.cost)
+    print(f"{repo.name}: {summary}, ${arm.cost:.2f}")
+    for r in results:
+        print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s ${r['cost']:.2f} {r['why']}"
+              + ("  REGRESSED" if r["regressed"] else ""))
+    (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, label, results))
+    return arm
 
 
 def results_md(repo: str, source: str, results: list[dict]) -> str:
@@ -380,12 +420,15 @@ def results_md(repo: str, source: str, results: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def suites(cfg: config.Config) -> list[config.Repo]:
+    return [r for r in cfg.repos if r.path.is_dir() and (r.layer_dir / "evals").is_dir()]
+
+
 def run_all(dry_run: bool = False) -> int:
     cfg = config.load()
     code = 0
-    for r in cfg.repos:
-        if r.path.is_dir() and (r.layer_dir / "evals").is_dir():
-            code |= run(r.name, dry_run=dry_run)
+    for r in suites(cfg):
+        code |= run(r.name, dry_run=dry_run)
     if not dry_run:
         mark_loop("eval", code == 0)
     return code
@@ -397,7 +440,7 @@ def compare(repo_name: str, ref: str) -> str:
     before = {h["run_id"]: h for h in state.eval_history(repo.name, 50)}
     run(repo_name, ref=ref)
     after = [h for h in state.eval_history(repo.name, 50) if h["run_id"] not in before]
-    base = next((h for h in before.values() if h["source"] != ref), None)
+    base = next((h for h in before.values() if h["source"] == "worktree"), None)
     if not after:
         return ""
     a = after[0]
@@ -405,4 +448,96 @@ def compare(repo_name: str, ref: str) -> str:
     if base:
         line += f"; the last baseline run (`{base['source']}`, {base['ts'][:10]}) passed {base['passed']}/{base['total']}"
     table = (paths.RUNS_DIR / a["run_id"] / "results.md")
-    return line + ".\n\n" + (table.read_text() if table.exists() else "")
+    return (line + ".\n\n" + (table.read_text() if table.exists() else "")
+            + "\nThe repo's eval tasks, run with this branch's harness.\n")
+
+
+def export_prompts(repo: config.Repo, ref: str, dest: Path) -> dict[str, bytes]:
+    src = Source(repo, ref)
+    dest.mkdir(parents=True, exist_ok=True)
+    found = {}
+    for f in src.files(ARETE_PROMPTS):
+        p = Path(f)
+        if p.suffix == ".md" and p.parent.as_posix() == ARETE_PROMPTS:
+            found[p.name] = src.read(f)
+            (dest / p.name).write_bytes(found[p.name])
+    return found
+
+
+def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
+    fetch_origin(arete)
+    root = paths.RUNS_DIR / f"{state.new_run_id('eval')}-prompts"
+    arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
+            "pr": Prompts(root / "pr", f"origin/{branch}")}
+    main, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
+    changed = sorted(name for name in main.keys() | pr.keys() if main.get(name) != pr.get(name))
+    unmeasured = [name for name in changed if Path(name).stem not in BUILDER_PROMPTS]
+    if not changed:
+        return ""
+    if unmeasured == changed:
+        return f"No eval runs {code_list(changed)}, so this change is not measured.\n"
+    ran, skipped = [], []
+    for repo in suites(cfg):
+        if any(p.dir for p in repo.parts):
+            skipped.append((repo, "it has parts"))
+            continue
+        tasks = load_tasks(*task_source(repo, Source(repo)))
+        if not tasks:
+            continue
+        with util.lock(state.run_lock("eval", repo.name)) as got:
+            if not got:
+                skipped.append((repo, "its evals were already running"))
+                continue
+            ran.append((repo, {arm: run_suite(cfg, repo, Source(repo), tasks,
+                                              f"{state.new_run_id('eval')}-{repo.name}-{arm}", prompts)
+                               for arm, prompts in arms.items()}))
+    return prompt_comparison(arete, arms, changed, unmeasured, ran, skipped)
+
+
+def code_list(names: list[str]) -> str:
+    return ", ".join(f"`{n}`" for n in names)
+
+
+def flipped_tasks(main: Arm, pr: Arm, private: bool) -> str:
+    before = {r["task"]: r["passed"] for r in main.results}
+    flips = [r for r in pr.results if before.get(r["task"], r["passed"]) != r["passed"]]
+    if not flips:
+        return "none"
+    if not private:
+        return ", ".join(f"`{r['task']}` now {'passes' if r['passed'] else 'fails'}" for r in flips)
+    up = sum(r["passed"] for r in flips)
+    down = len(flips) - up
+    return ", ".join(filter(None, [f"{util.count(up, 'task')} now {'passes' if up == 1 else 'pass'}" if up else "",
+                                   f"{util.count(down, 'task')} now {'fails' if down == 1 else 'fail'}" if down else ""]))
+
+
+def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: list[str], unmeasured: list[str],
+                      ran: list[tuple[config.Repo, dict[str, Arm]]], skipped: list[tuple[config.Repo, str]]) -> str:
+    aliases: dict[str, str] = {}
+
+    def hidden(repo: config.Repo) -> bool:
+        return arete.public and not repo.public
+
+    def shown(repo: config.Repo) -> str:
+        return aliases.setdefault(repo.name, f"private repo {len(aliases) + 1}") if hidden(repo) else repo.name
+
+    main_label = arms["main"].label
+    lines = [f"Prompt evals: each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and "
+             f"once with this branch's. Changed: {code_list(changed)}.", ""]
+    if ran:
+        lines += [f"| suite | `{main_label}` | this branch | tasks that changed |", "|---|---|---|---|"]
+        for repo, result in ran:
+            lines.append(f"| {shown(repo)} | {result['main'].score} | {result['pr'].score} | "
+                         f"{flipped_tasks(result['main'], result['pr'], hidden(repo))} |")
+        totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in arms}
+        lines += [f"| all | {totals['main'].score} | {totals['pr'].score} | |", ""]
+        ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
+        lines.append(f"Cost ${totals['main'].cost + totals['pr'].cost:.2f}."
+                     + (f" Runs {code_list(ids)}." if ids else ""))
+    else:
+        lines.append("No eval suite ran.")
+    if unmeasured:
+        lines.append(f"Not measured, as no eval runs them: {code_list(unmeasured)}.")
+    if skipped:
+        lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why in skipped) + ".")
+    return "\n".join(lines) + "\n"

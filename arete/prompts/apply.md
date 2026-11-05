@@ -10,5 +10,7 @@ Rules:
 - Before adding a line, check the file does not already say it; if it does, sharpen the existing line instead.
 - If a target file does not exist and the change is a skill, create `SKILL.md` with the usual frontmatter
   (name, description) and a short body.
+- In a prompt under `arete/prompts/`, keep every `$$name` placeholder exactly as it is and add none: the pipeline
+  fills them. Never create or delete a file there.
 - If a change no longer makes sense once you see the file, skip it and say why.
 - Do not run git. Finish with one line per proposal: applied or skipped, and why if skipped.

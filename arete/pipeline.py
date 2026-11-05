@@ -110,8 +110,8 @@ NO_GIT_WRITES = [
 ]
 
 
-def prompt(name: str, **values) -> str:
-    text = (paths.PROMPTS_DIR / f"{name}.md").read_text()
+def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
+    text = (prompts_dir / f"{name}.md").read_text()
     return Template(text).safe_substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
 
 

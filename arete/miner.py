@@ -9,7 +9,7 @@ from string import Template
 
 from . import auditor, claude, config, evals, gh, hook, paths, state, util
 from .heartbeat import mark_loop
-from .pipeline import make_worktree, remove_worktree
+from .pipeline import make_worktree, prompt, remove_worktree
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -18,6 +18,8 @@ HEADLESS_ENTRYPOINT = "sdk-cli"
 MAX_MINER_DIFF = 200
 GLOBAL_GLOBS = ["skills/**", "CLAUDE.md", "AGENTS.md"]
 NEVER = ["**/settings.json", "**/settings.local.json", ".github/**", ".agents/config.toml", "**/.env*"]
+ARETE_PROMPT_GLOB = f"{evals.ARETE_PROMPTS}/*.md"
+HUMAN_EDITED_PROMPTS = ["grade", "eval_mine", "mine", "apply"]
 
 SKIP_PREFIXES = (
     "<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>",
@@ -254,10 +256,34 @@ def _fmt(props: list[dict]) -> str:
     return "\n".join(f"- {p['repo']}/{p['file']}: {_short(p['change'], 200)}" for p in props[:30])
 
 
+def harness_globs(cfg: config.Config, repo: config.Repo) -> list[str]:
+    if repo.name == cfg.global_repo:
+        return GLOBAL_GLOBS
+    if repo.name == cfg.arete_repo:
+        return config.HARNESS_GLOBS + [ARETE_PROMPT_GLOB]
+    return config.HARNESS_GLOBS
+
+
+def human_edited(cfg: config.Config, repo: config.Repo, f: str) -> bool:
+    return repo.name == cfg.arete_repo and f in {f"{evals.ARETE_PROMPTS}/{n}.md" for n in HUMAN_EDITED_PROMPTS}
+
+
+def minable_prompts() -> str:
+    return ", ".join(f"`{evals.ARETE_PROMPTS}/{p.name}`" for p in sorted(paths.PROMPTS_DIR.glob("*.md"))
+                     if p.stem not in HUMAN_EDITED_PROMPTS)
+
+
 def is_harness_file(cfg: config.Config, repo: config.Repo, f: str) -> bool:
-    globs = GLOBAL_GLOBS if repo.name == cfg.global_repo else config.HARNESS_GLOBS
     in_external_layer = bool(repo.layer) and f.startswith(".agents/")
-    return util.matches_any(f, globs) and not util.matches_any(f, NEVER) and not in_external_layer
+    return (util.matches_any(f, harness_globs(cfg, repo)) and not util.matches_any(f, NEVER) and not in_external_layer
+            and not human_edited(cfg, repo, f))
+
+
+def repo_relative(repo: config.Repo, f: str) -> str:
+    f = f.removeprefix("./")
+    if f.startswith(repo.name + "/") and not (repo.path / repo.name).is_dir():
+        return f.removeprefix(repo.name + "/")
+    return f
 
 
 def allowed(cfg: config.Config, p: dict) -> tuple[bool, str]:
@@ -271,7 +297,9 @@ def allowed(cfg: config.Config, p: dict) -> tuple[bool, str]:
         return False, f"unknown repo {p['repo']}"
     if not repo.mine or not repo.github:
         return False, f"mining disabled for {repo.name}"
-    f = p["file"].removeprefix("./").removeprefix(repo.name + "/")
+    f = repo_relative(repo, p["file"])
+    if human_edited(cfg, repo, f):
+        return False, f"{f} stays human edited: arete does not rewrite its own grader, eval writer or miner"
     if not is_harness_file(cfg, repo, f):
         return False, f"{f} is not a harness file"
     p["repo"], p["file"] = repo.name, f
@@ -282,16 +310,43 @@ def miner_branch() -> str:
     return f"arete/miner-{util.now():%Y%m%d}"
 
 
-def eval_pr(repo: config.Repo, url: str, branch: str) -> None:
-    if not (repo.layer_dir / "evals").is_dir():
-        return
-    try:
-        md = evals.compare(repo.name, branch)
-        if md:
-            gh.pr_comment(url, md + "\nThe repo's eval tasks, run with this branch's harness against held out tests.\n")
-            print(f"{repo.name}: evals posted to {url}")
-    except Exception as e:
-        print(f"{repo.name}: evals on {branch} failed: {type(e).__name__}: {e}")
+def eval_pr(cfg: config.Config, repo: config.Repo, url: str, branch: str) -> None:
+    jobs = []
+    if repo.name == cfg.arete_repo:
+        jobs.append(("prompt evals", lambda: evals.compare_prompts(cfg, repo, branch)))
+    if (repo.layer_dir / "evals").is_dir():
+        jobs.append(("evals", lambda: evals.compare(repo.name, branch)))
+    for what, job in jobs:
+        try:
+            md = job()
+            if md:
+                gh.pr_comment(url, md)
+                print(f"{repo.name}: {what} posted to {url}")
+        except Exception as e:
+            print(f"{repo.name}: {what} on {branch} failed: {type(e).__name__}: {e}")
+
+
+def placeholders(text: str) -> set[str]:
+    return set(Template(text).get_identifiers())
+
+
+def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
+    if repo.name != cfg.arete_repo:
+        return ""
+    for row in git(["diff", "--cached", "--name-status", "--no-renames", "HEAD"], wt).splitlines():
+        status, f = row.split("\t", 1)
+        if not util.matches_any(f, [ARETE_PROMPT_GLOB]):
+            continue
+        if status == "A":
+            return f"{f} is a new prompt, and the pipeline runs only the prompts its code names"
+        if status == "D":
+            return f"{f} is deleted, and the pipeline still loads it"
+        before, after = placeholders(git(["show", f"HEAD:{f}"], wt)), placeholders((wt / f).read_text())
+        if before != after:
+            changes = [f"{verb} {', '.join(f'`${n}`' for n in sorted(names))}"
+                       for verb, names in (("drops", before - after), ("adds", after - before)) if names]
+            return f"{f} {' and '.join(changes)}, and the pipeline fills only the placeholders it has"
+    return ""
 
 
 def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict]) -> str:
@@ -302,22 +357,23 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         text = "\n\n".join(
             f"### {i + 1}. `{p['file']}`\n\nChange: {p['change']}\n\nWhy: {p['why']}" for i, p in enumerate(props)
         )
-        res = claude.run(Template((paths.PROMPTS_DIR / "apply.md").read_text()).safe_substitute(proposals=text),
-                         wt, model=cfg.model("apply"), allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"],
+        res = claude.run(prompt("apply", proposals=text), wt, model=cfg.model("apply"), allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"],
                          timeout=1200, persist=False)
         if not res.ok:
             return ""
         git(["add", "-A"], wt)
         files, lines = [], 0
-        for row in git(["diff", "--cached", "--numstat"], wt).splitlines():
+        for row in git(["diff", "--cached", "--numstat", "--no-renames"], wt).splitlines():
             a, d, name = row.split("\t")
             files.append(name)
             lines += (int(a) + int(d)) if a != "-" else 0
         if not files:
             return ""
         bad = [f for f in files if not is_harness_file(cfg, repo, f)]
-        if bad or lines > MAX_MINER_DIFF:
-            print(f"{repo.name}: refused, touched {bad or f'{lines} lines'}")
+        refusal = (f"touched {bad}" if bad else f"touched {lines} lines" if lines > MAX_MINER_DIFF
+                   else prompt_refusal(cfg, repo, wt))
+        if refusal:
+            print(f"{repo.name}: refused, {refusal}")
             return ""
         git(["commit", "-q", "-m", f"docs(harness): apply {util.count(len(props), 'mined fix', 'mined fixes')}\n\nArete-Run: {run_id}"], wt)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
@@ -325,6 +381,8 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         for i, p in enumerate(props, 1):
             ev = ", ".join(p.get("evidence", [])[:4])
             body.append(f"{i}. `{p['file']}`: {p['why']}" + ("" if repo.public else f" (sessions {ev})"))
+        if repo.name == cfg.arete_repo and any(util.matches_any(f, [ARETE_PROMPT_GLOB]) for f in files):
+            body += ["", "The pipeline reads its prompts from the arete checkout, so pull that checkout after the merge."]
         body += ["", f"Run `{run_id}`. {res.text.strip()[:1500]}", "",
                  "Merge what helps, close what does not: closed PRs teach the miner what not to propose."]
         gh.ensure_label(repo.github, "arete-miner", "1d76db", "Harness fixes mined by arete")
@@ -373,8 +431,9 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             state.finish_run(run_id, "noop", summary="no human sessions in window")
         return 0
     repos = "\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in cfg.repos if r.mine)
-    text = Template((paths.PROMPTS_DIR / "mine.md").read_text()).safe_substitute(
-        hours=f"{hours:g}", global_repo=cfg.global_repo, repos=repos, max=MAX_PROPOSALS,
+    text = prompt(
+        "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
+        arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
         pending=_fmt(state.proposals(status=["applied", "pending"])),
         rejected=_fmt(state.proposals(status=["rejected"])),
         events=render_events(cfg, hours), digest=digest, audit=auditor.latest_findings(),
@@ -421,7 +480,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             opened.append(url)
             print(f"{name}: {url}")
             if name != cfg.global_repo:
-                eval_pr(cfg.repo(name), url, miner_branch())
+                eval_pr(cfg, cfg.repo(name), url, miner_branch())
     state.finish_run(run_id, "pr" if opened else "noop", cost_usd=res.cost_usd,
                      summary=f"{len(props)} proposals, {len(opened)} PRs", pr_url=" ".join(opened))
     return 0
