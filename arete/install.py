@@ -11,7 +11,7 @@ AGENTS_DIR = paths.HOME / "Library" / "LaunchAgents"
 
 JOBS = {
     "heartbeat": {"args": ["heartbeat", "--quiet"], "interval": 3600, "run_at_load": True},
-    "poll": {"args": ["poll"], "interval": 300},
+    "poll": {"args": ["poll"], "interval": 300, "abandon_children": True},
     "mine": {"args": ["mine"], "calendar": {"Hour": 23, "Minute": 50}},
     "audit": {"args": ["audit"], "calendar": {"Hour": 4, "Minute": 30}},
     "eval": {"args": ["eval"], "calendar": {"Weekday": 0, "Hour": 2, "Minute": 10}},
@@ -61,6 +61,8 @@ def plist_for(name: str, spec: dict) -> dict:
         pl["StartCalendarInterval"] = spec["calendar"]
     if spec.get("run_at_load"):
         pl["RunAtLoad"] = True
+    if spec.get("abandon_children"):
+        pl["AbandonProcessGroup"] = True
     return pl
 
 

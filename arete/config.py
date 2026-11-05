@@ -77,6 +77,7 @@ class Config:
     jira: JiraConfig = field(default_factory=JiraConfig)
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
+    max_parallel: int = 1
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -109,6 +110,7 @@ def load(path: Path | None = None) -> Config:
         models=dict(data.get("models", {})),
         miner_lookback_hours=float(data.get("miner", {}).get("lookback_hours", 24)),
         miner_max_digest_chars=int(data.get("miner", {}).get("max_digest_chars", 90_000)),
+        max_parallel=max(1, int(data.get("max_parallel", 1))),
     )
     j = data.get("jira", {})
     transitions = {k: str(v) for k, v in (j.get("transitions") or {}).items() if v}

@@ -46,7 +46,7 @@ def check_jobs(cfg: config.Config) -> list[Check]:
             if not job.log.exists():
                 ok, detail = False, "log file missing"
             else:
-                age = (util.now().timestamp() - job.log.stat().st_mtime) / 3600
+                age = util.hours_awake_since(job.log.stat().st_mtime)
                 if age > job.max_age_hours:
                     ok, detail = False, f"log stale: {age:.0f}h old, limit {job.max_age_hours:.0f}h"
                 else:
@@ -105,7 +105,7 @@ def check_hook() -> list[Check]:
         if not paths.EVENTS_FILE.exists():
             out.append(Check("hook:events", False, "no events logged yet", "warn"))
         else:
-            age = (util.now().timestamp() - paths.EVENTS_FILE.stat().st_mtime) / 3600
+            age = util.hours_awake_since(paths.EVENTS_FILE.stat().st_mtime)
             ok = age < 72
             out.append(Check("hook:events", ok, f"last event {age:.0f}h ago", "fail" if not ok else "warn"))
     return out
@@ -124,7 +124,7 @@ def check_arete_jobs() -> list[Check]:
         last = beats.get(name)
         if not last:
             continue
-        age = (util.now() - util.parse_iso(last["ts"])).total_seconds() / 3600
+        age = util.hours_awake_since(util.parse_iso(last["ts"]).timestamp())
         ok = age <= hours and last.get("ok", True)
         detail = f"last run {age:.1f}h ago" + ("" if last.get("ok", True) else f", failed: {last.get('detail', '')}")
         out.append(Check(f"loop:{name}", ok, detail))
@@ -141,6 +141,9 @@ def mark_loop(name: str, ok: bool, detail: str = "") -> None:
 def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) -> int:
     paths.ensure_dirs()
     install.rotate_logs()
+    if not util.online() and not util.wait_for_network(util.WAKE_NETWORK_WAIT_MINUTES):
+        print(f"{util.iso()} heartbeat offline, skipped")
+        return 0
     cfg = config.load()
     checks: list[Check] = []
     for fn in (

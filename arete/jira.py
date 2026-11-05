@@ -107,6 +107,8 @@ class Client:
                 raise JiraError(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}{later}".rstrip()) from None
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 if attempt < RETRIES:
+                    if not util.online():
+                        util.wait_for_network()
                     time.sleep(2**attempt)
                     continue
                 raise JiraError(f"jira {method} {path}: {e}") from None

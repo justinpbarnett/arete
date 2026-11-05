@@ -11,7 +11,7 @@ class GhError(RuntimeError):
 
 
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
-    res = util.sh(["gh", *args], cwd=cwd, timeout=timeout, input=input)
+    res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input)
     if res.returncode != 0:
         raise GhError(f"gh {' '.join(args[:3])}: {util.first_line(res.stderr or res.stdout, 300)}")
     return res.stdout

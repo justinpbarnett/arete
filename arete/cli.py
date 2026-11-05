@@ -117,6 +117,9 @@ def cmd_status(args) -> int:
             print(f"  {name:<24} {v['why']}  since {v.get('since', '')}"[:220])
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
+    live = pipeline.live_pipeline_runs()
+    print(f"runs live: {len(live)} of {cfg.max_parallel}"
+          + "".join(f"\n  {tracker.run_ticket_name(r)}  since {r['started']}" for r in live))
     return 0
 
 

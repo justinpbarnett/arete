@@ -136,6 +136,26 @@ def runs_marked_running() -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
+def ticket_runs(repo: str, issue: int | str, limit: int = 10) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+                                           "ORDER BY started DESC LIMIT ?", (repo, issue, limit))]
+
+
+def interrupted_tickets(repo: str) -> list[str]:
+    with db() as c:
+        rows = c.execute("SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? "
+                         "AND started = (SELECT MAX(started) FROM runs r2 WHERE r2.kind = 'pipeline' "
+                         "AND r2.repo = runs.repo AND r2.issue = runs.issue) ORDER BY started", (repo,))
+        return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
+
+
+def last_pipeline_starts() -> dict[str, str]:
+    with db() as c:
+        return {r[0]: r[1] for r in c.execute("SELECT repo, MAX(started) FROM runs WHERE kind = 'pipeline' "
+                                              "GROUP BY repo")}
+
+
 def issue_running(repo: str, issue: int | str) -> bool:
     with db() as c:
         return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status = 'running' LIMIT 1",

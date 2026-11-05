@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
@@ -17,6 +19,7 @@ LOCKFILES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bu
 NEVER_STAGED = [":(exclude,glob)**/__pycache__/**"]
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
+CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -121,6 +124,17 @@ class AgentRun:
     def agent(self, step: str, text: str, cwd: Path, **kw) -> claude.Result:
         self.log(f"{step}: starting")
         res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
+        for _ in range(util.NETWORK_RETRIES - 1):
+            if not res.connection_failed:
+                break
+            self.cost += res.cost_usd
+            self.log(f"{step}: lost the connection after {res.turns} turns, waiting for the network")
+            if not util.wait_for_network():
+                break
+            if res.session_id and res.turns > 1 and kw.get("persist", True):
+                res = claude.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, **{**kw, "resume": res.session_id})
+            else:
+                res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
         self.cost += res.cost_usd
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session_id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
@@ -165,7 +179,7 @@ class Run(AgentRun):
 
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True) -> str:
-    res = util.sh(["git", *args], cwd=cwd, timeout=timeout)
+    res = util.sh_with_network(["git", *args], cwd=cwd, timeout=timeout)
     if check and res.returncode != 0:
         raise RuntimeError(f"git {' '.join(args[:2])}: {util.first_line(res.stderr or res.stdout, 300)}")
     return res.stdout
@@ -369,16 +383,29 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        live = live_pipeline_runs()
+        if not dry_run and len(live) >= cfg.max_parallel:
+            print(f"{name} was not started: {len(live)} of {cfg.max_parallel} runs going. Wait for one to finish "
+                  f"or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
+            return 1
+        earlier = state.ticket_runs(repo.name, tid, limit=1)
+        restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
         run_id = state.new_run_id("pipeline") + f"-{repo.name}-{tid}"
         run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force)
         run.dir.mkdir(parents=True, exist_ok=True)
         state.start_run(run_id, "pipeline", repo.name, tid)
+        if restarting:
+            run.log(f"restarting after run {earlier[0]['id']} was interrupted")
         try:
             status, summary, pr_url = _run(cfg, run)
         except Exception as e:
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
+        if restarting and status in ("skipped", "noop"):
+            run.enter("failed")
+            run.say(f"I did not restart this after the interruption: {summary}. Remove "
+                    f"`{tk.label_name('failed')}` to retry.")
         state.finish_run(run_id, status, summary=summary, pr_url=pr_url, cost_usd=round(run.cost, 4))
         run.log(f"done: {status} {pr_url or summary}")
         if status == "skipped":
@@ -829,6 +856,13 @@ class SkipLog:
 
 
 STOPPED = "stopped before it finished, with nothing left running"
+INTERRUPTED = ("stopped before it finished (the Mac restarted, lost power or the process was killed); "
+               "I will start it again")
+
+
+def interrupted_twice(row: dict) -> bool:
+    earlier = [r for r in state.ticket_runs(row["repo"], row["issue"], limit=3) if r["id"] != row["id"]]
+    return bool(earlier) and earlier[0]["status"] == "interrupted"
 
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
@@ -836,15 +870,39 @@ def settle_abandoned_runs(cfg: config.Config) -> None:
         with util.lock(state.run_lock(row["kind"], row["repo"], row["issue"])) as free:
             if not free:
                 continue
-            state.finish_run(row["id"], "failed", summary=STOPPED)
-            print(f"{util.iso()} {row['id']}: {STOPPED}")
-            if row["kind"] == "pipeline":
-                repo = cfg.repo(row["repo"])
-                run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo),
-                          tid=str(row["issue"]))
-                run.dir.mkdir(parents=True, exist_ok=True)
-                run.log(STOPPED)
-                run.give_up(STOPPED)
+            if row["kind"] != "pipeline":
+                state.finish_run(row["id"], "failed", summary=STOPPED)
+                print(f"{util.iso()} {row['id']}: {STOPPED}")
+                continue
+            repo = cfg.repo(row["repo"])
+            run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo),
+                      tid=str(row["issue"]))
+            run.dir.mkdir(parents=True, exist_ok=True)
+            if interrupted_twice(row):
+                state.finish_run(row["id"], "failed", summary=STOPPED)
+                run.log(f"{STOPPED}, the second interruption in a row")
+                run.give_up(f"{STOPPED}, the second interruption in a row")
+            else:
+                state.finish_run(row["id"], "interrupted", summary=INTERRUPTED)
+                run.log(INTERRUPTED)
+                run.say(f"Run `{run.id}` {INTERRUPTED}.")
+
+
+def live_pipeline_runs() -> list[dict]:
+    live = []
+    for row in state.runs_marked_running():
+        if row["kind"] != "pipeline":
+            continue
+        with util.lock(state.run_lock("pipeline", row["repo"], row["issue"])) as free:
+            if not free:
+                live.append(row)
+    return live
+
+
+def spawn_run(repo_name: str, tid: str) -> None:
+    with open(paths.LOG_DIR / "runs.log", "a") as log:
+        subprocess.Popen([sys.executable, "-m", "arete.cli", "run", repo_name, tid], stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
@@ -867,6 +925,22 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
     return out
 
 
+def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
+              other_routes: set[str]) -> tuple[str, str] | None:
+    fresh = next_ticket(repo, tk, skips, other_routes)
+    for tid in state.interrupted_tickets(repo.name):
+        if not state.issue_running(repo.name, tid):
+            return tid, "restarting after an interruption"
+    for t in tk.replied():
+        if state.issue_running(repo.name, t.id):
+            continue
+        if blocker := tk.blocker(t.id):
+            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker)
+            continue
+        return t.id, f"{t.title} (you replied to the question)"
+    return (fresh.id, fresh.title) if fresh else None
+
+
 def poll(dry_run: bool = False) -> int:
     paths.ensure_dirs()
     cfg = config.load()
@@ -874,6 +948,13 @@ def poll(dry_run: bool = False) -> int:
         if not got:
             print(f"{util.iso()} poll already running")
             return 0
+        if not util.online():
+            print(f"{util.iso()} offline, waiting up to {util.WAKE_NETWORK_WAIT_MINUTES} minutes for the network", flush=True)
+            if not util.wait_for_network(util.WAKE_NETWORK_WAIT_MINUTES):
+                print(f"{util.iso()} still offline, skipped this poll")
+                if not dry_run:
+                    mark_loop("poll", True, "offline")
+                return 0
         errors: list[str] = []
 
         def failed(where: str, e: Exception) -> None:
@@ -885,23 +966,37 @@ def poll(dry_run: bool = False) -> int:
                 settle_abandoned_runs(cfg)
             except Exception as e:
                 failed("settling abandoned runs", e)
+        live = live_pipeline_runs()
+        busy = {r["repo"] for r in live}
+        slots = cfg.max_parallel - len(live)
+        starts = state.last_pipeline_starts()
+        pipeline_repos = [r for r in cfg.repos if r.pipeline and r.parts]
+        restarting = {r.name for r in pipeline_repos if state.interrupted_tickets(r.name)}
         skips = SkipLog({} if dry_run else util.read_json(SKIPPED_FILE, {}))
         routes = jira_routes_by_project(cfg)
         reached_clients: dict[str, jira.Client] = {}
-        for repo in cfg.repos:
-            if not (repo.pipeline and repo.parts):
-                continue
+        for repo in sorted(pipeline_repos, key=lambda r: (r.name not in restarting, starts.get(r.name, ""))):
             try:
                 tk = tracker.for_repo(cfg, repo)
                 other_routes: set[str] = set()
                 if isinstance(tk, tracker.JiraTracker):
                     other_routes = routes.get(tk.project, set()) - {tk.route}
                     reached_clients.setdefault(tk.project, tk.client)
-                t = next_ticket(repo, tk, skips, other_routes)
-                if t:
-                    print(f"{util.iso()} {tracker.ticket_name(repo.name, t.ref)}: {t.title}")
+                pick = next_pick(repo, tk, skips, other_routes)
+                if not pick:
+                    continue
+                tid, why = pick
+                name = tracker.ticket_name(repo.name, tk.ref(tid))
+                if repo.name in busy:
+                    print(f"{util.iso()} {name}: waiting, {repo.name} already has a run going")
+                elif slots <= 0:
+                    print(f"{util.iso()} {name}: waiting, {cfg.max_parallel} of {cfg.max_parallel} runs going")
+                else:
+                    print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
                     if not dry_run:
-                        run_issue(repo.name, t.id)
+                        spawn_run(repo.name, tid)
+                    busy.add(repo.name)
+                    slots -= 1
             except Exception as e:
                 failed(repo.name, e)
         for project, client in reached_clients.items():

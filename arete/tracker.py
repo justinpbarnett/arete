@@ -13,8 +13,8 @@ LABEL = "agent"
 STATE_COLORS = {"running": "fbca04", "pr": "0e8a16", "failed": "d93f0b", "needs-info": "c5def5"}
 FIX_LABELS = {"bug", "fix"}
 FIX_TYPES = {"bug", "fire", "incident", "problem"}
-JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "created", "creator", "reporter", "parent",
-               "attachment"]
+JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "created", "creator", "reporter", "assignee",
+               "parent", "attachment"]
 JIRA_STATE_LABELS = {f"agent-{s}" for s in config.STATES}
 SEARCH_FIELDS = ["summary", "created", "labels"]
 MAX_COMMENTS = 10
@@ -132,6 +132,19 @@ class GitHubTracker:
     def blocker(self, tid: str) -> str:
         return ""
 
+    def replied(self) -> list[Ticket]:
+        out = []
+        for i in gh.issues(self.repo.github, self.label_name("needs-info")):
+            if LABEL not in {lb["name"] for lb in i.get("labels", [])} or not self.by_owner(i):
+                continue
+            full = gh.issue(self.repo.github, int(i["number"]))
+            mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
+                    if self.by_owner(c) and c.get("createdAt")]
+            if answered(mine):
+                out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], url=i.get("url", ""),
+                                  created=i.get("createdAt", "")))
+        return sorted(out, key=lambda t: t.created)
+
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
 
@@ -141,10 +154,12 @@ class GitHubTracker:
         author = (i.get("author") or {}).get("login", "")
         comments = [(self.owner, c.get("createdAt", ""), c.get("body", "")) for c in i.get("comments", [])
                     if self.by_owner(c)]
+        blocker = ("" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
+            "" if LABEL in labels else f"it has no `{LABEL}` label")
         return Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""), labels=labels,
-                      blocker="" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}")
+                      blocker=blocker)
 
     def prepare(self) -> list[str]:
         made = [gh.ensure_label(self.repo.github, LABEL, "0052cc", "Approved for arete to build"),
@@ -212,6 +227,18 @@ class JiraTracker:
     def blocker(self, tid: str) -> str:
         issue = self.client.issue(tid, JIRA_FIELDS)
         return check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]
+
+    def replied(self) -> list[Ticket]:
+        jql = candidates_jql(self.project, f'labels = "{self.route}" AND labels = "{self.label_name("needs-info")}"',
+                             skip_states=False)
+        me = self.client.me().get("accountId", "")
+        out = []
+        for i in self.client.search(jql, SEARCH_FIELDS, limit=20):
+            mine = [(jira.parse_time(c["created"]), c.get("body") or "") for c in self.client.comments(i["key"])
+                    if _authored_by(c, me) and c.get("created")]
+            if answered(mine):
+                out.append(search_ticket(self.client, i))
+        return out
 
     def get(self, tid: str) -> Ticket:
         issue = self.client.issue(tid, JIRA_FIELDS)
@@ -290,10 +317,11 @@ def route_label(repo: config.Repo) -> str:
     return "repo-" + (repo.github.split("/")[-1] if repo.github else repo.name)
 
 
-def candidates_jql(project: str, extra: str = "") -> str:
+def candidates_jql(project: str, extra: str = "", skip_states: bool = True) -> str:
     skip = ", ".join(f'"{s}"' for s in sorted(JIRA_STATE_LABELS))
-    parts = [f'project = "{project}"', f'labels = "{LABEL}"', "assignee = currentUser()",
-             "statusCategory != Done", f"labels not in ({skip})"]
+    parts = [f'project = "{project}"', f'labels = "{LABEL}"', "assignee = currentUser()", "statusCategory != Done"]
+    if skip_states:
+        parts.append(f"labels not in ({skip})")
     if extra:
         parts.append(extra)
     return " AND ".join(parts) + " ORDER BY created ASC"
@@ -329,6 +357,10 @@ def check_approval(me: str, issue: dict, history: list[dict], route: str) -> tup
     for needed in (LABEL, route):
         if needed not in (f.get("labels") or []):
             return f"it has no `{needed}` label", None
+    assignee = f.get("assignee") or {}
+    if assignee.get("accountId") != me:
+        return (f"it is assigned to {assignee['displayName']}, not you" if assignee.get("displayName")
+                else "it is not assigned to you"), None
     created = jira.parse_time(f["created"]) if f.get("created") else None
     creator = f.get("creator") or f.get("reporter") or {}
     history = sorted(history, key=lambda h: jira.parse_time(h["created"]))
@@ -367,6 +399,12 @@ def safe_filename(name: str) -> str:
 
 def from_arete(body: str) -> bool:
     return body.lstrip().startswith(ARETE_TAG)
+
+
+def answered(comments: list[tuple[datetime, str]]) -> bool:
+    asked = [when for when, body in comments if from_arete(body)]
+    replies = [when for when, body in comments if not from_arete(body)]
+    return bool(asked and replies) and max(replies) > max(asked)
 
 
 def comments_text(comments: list[tuple[str, str, str]]) -> str:

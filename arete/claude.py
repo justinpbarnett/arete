@@ -21,6 +21,7 @@ class Result:
     cost_usd: float = 0.0
     turns: int = 0
     error: str = ""
+    connection_failed: bool = False
     raw: dict = field(default_factory=dict)
 
 
@@ -106,6 +107,7 @@ def run(
         cost_usd=float(data.get("total_cost_usd") or 0),
         turns=int(data.get("num_turns") or 0),
         error=(data.get("result", "") if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
+        connection_failed=data.get("api_error") == "connection_failed",
         raw=data,
     )
 
