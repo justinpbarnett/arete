@@ -1,0 +1,400 @@
+from __future__ import annotations
+
+import json
+import re
+from collections import Counter, defaultdict
+from datetime import timedelta
+from pathlib import Path
+from string import Template
+
+from . import auditor, claude, config, evals, gh, hook, paths, state, util
+from .heartbeat import mark_loop
+from .pipeline import git, make_worktree, remove_worktree
+
+MAX_PROPOSALS = 8
+MIN_CONFIDENCE = 0.6
+HEADLESS_ENTRYPOINT = "sdk-cli"
+MAX_MINER_DIFF = 200
+GLOBAL_GLOBS = ["skills/**", "CLAUDE.md", "AGENTS.md"]
+NEVER = ["**/settings.json", "**/settings.local.json", ".github/**", ".agents/config.toml", "**/.env*"]
+
+SKIP_PREFIXES = (
+    "<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>",
+    "<system-reminder>", "Caveat:", "<bash-input>", "<bash-stdout>", "<bash-stderr>", "<task-notification>",
+    "This session is being continued", "<user-prompt-submit-hook>",
+)
+APPROVALS = re.compile(
+    r"^(y|yes|yep|yeah|ok|okay|k|sure|go|go ahead|do it|continue|proceed|lgtm|looks good|great|perfect|thanks|"
+    r"thank you|ty|nice|cool|sounds good|good|done|next|keep going|yes please|please do|ship it)[.! ]*$",
+    re.IGNORECASE,
+)
+USER_REJECT = "doesn't want to proceed with this tool use"
+CLASSIFIER = "auto mode classifier"
+
+PROPOSAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "proposals": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "layer": {"type": "string", "enum": ["global", "repo", "memory"]},
+                    "repo": {"type": "string"},
+                    "file": {"type": "string"},
+                    "change": {"type": "string"},
+                    "why": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["layer", "repo", "file", "change", "why", "evidence", "confidence"],
+            },
+        }
+    },
+    "required": ["proposals"],
+}
+
+
+def _text_blocks(content) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    out = []
+    for b in content or []:
+        if isinstance(b, dict) and b.get("type") == "text":
+            out.append(b.get("text", ""))
+    return out
+
+
+def _short(s: str, n: int) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def _tool_summary(block: dict) -> str:
+    inp = block.get("input") or {}
+    detail = inp.get("command") or inp.get("file_path") or inp.get("skill") or inp.get("pattern") or inp.get("description") or ""
+    return f"{block.get('name')}({_short(str(detail), 120)})"
+
+
+def session_digest(path: Path, since_ts: float) -> dict | None:
+    items, cwd, sid, entry = [], "", path.stem, None
+    last_agent, tools_by_id, recent_tools = "", {}, []
+    n_human = 0
+    for line in path.read_text(errors="replace").split("\n"):
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("entrypoint"):
+            entry = entry or d["entrypoint"]
+        if d.get("isSidechain"):
+            continue
+        cwd = d.get("cwd") or cwd
+        ts = d.get("timestamp", "")
+        try:
+            t = util.parse_iso(ts).timestamp() if ts else 0
+        except ValueError:
+            t = 0
+        typ = d.get("type")
+        msg = d.get("message") or {}
+        if typ == "assistant":
+            for b in msg.get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and b.get("text", "").strip():
+                    last_agent = b["text"]
+                elif b.get("type") == "tool_use":
+                    tools_by_id[b.get("id")] = b
+                    recent_tools = (recent_tools + [_tool_summary(b)])[-3:]
+            continue
+        if typ != "user" or d.get("isMeta") or d.get("isCompactSummary"):
+            continue
+        content = msg.get("content")
+        hhmm = ts[11:16]
+        if isinstance(content, list):
+            for b in content:
+                if not (isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error")):
+                    continue
+                txt = b.get("content")
+                txt = txt if isinstance(txt, str) else json.dumps(txt)
+                if t < since_ts:
+                    continue
+                tool = _tool_summary(tools_by_id.get(b.get("tool_use_id"), {}))
+                if USER_REJECT in txt:
+                    reason = txt.split("the user said:", 1)[1] if "the user said:" in txt else ""
+                    items.append(f"[{hhmm}] REJECTED by human: {tool}" + (f" reason: {_short(reason, 400)}" if reason else ""))
+                elif CLASSIFIER in txt:
+                    items.append(f"[{hhmm}] DENIED by permission classifier: {tool}")
+        for text in _text_blocks(content):
+            text = text.strip()
+            if not text or t < since_ts or text.startswith(SKIP_PREFIXES):
+                continue
+            if text.startswith("[Request interrupted"):
+                items.append(f"[{hhmm}] INTERRUPTED the agent during: {', '.join(recent_tools) or 'a reply'}")
+                continue
+            if APPROVALS.match(text):
+                continue
+            n_human += 1
+            if n_human == 1:
+                items.append(f"[{hhmm}] HUMAN (task): {_short(text, 500)}")
+            else:
+                ctx = f"  agent before: {_short(last_agent, 300)}" if last_agent else ""
+                tools = f"  agent tools: {', '.join(recent_tools)}" if recent_tools else ""
+                items.append(f"[{hhmm}] HUMAN: {_short(text, 600)}" + (f"\n{ctx}" if ctx else "") + (f"\n{tools}" if tools else ""))
+            recent_tools = []
+    if entry == HEADLESS_ENTRYPOINT or not items:
+        return None
+    if cwd and str(paths.STATE_DIR) in cwd:
+        return None
+    signal = sum(1 for i in items if "REJECTED" in i or "INTERRUPTED" in i) * 3 + sum(1 for i in items if "HUMAN:" in i)
+    return {"session": sid[:8], "cwd": cwd, "items": items, "signal": signal}
+
+
+def collect(hours: float) -> list[dict]:
+    since = util.now() - timedelta(hours=hours)
+    since_ts = since.timestamp()
+    out = []
+    for f in paths.CLAUDE_PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            if f.stat().st_mtime < since_ts:
+                continue
+        except OSError:
+            continue
+        d = session_digest(f, since_ts)
+        if d:
+            out.append(d)
+    return sorted(out, key=lambda d: -d["signal"])
+
+
+def render_digest(cfg: config.Config, sessions: list[dict], limit: int) -> tuple[str, int]:
+    parts, used, n = [], 0, 0
+    for s in sessions:
+        repo = cfg.repo_for_path(s["cwd"]) if s["cwd"] else None
+        head = f"## session {s['session']} in {s['cwd'] or '?'} (repo: {repo.name if repo else 'none'})"
+        block = head + "\n" + "\n".join(s["items"]) + "\n"
+        if used + len(block) > limit:
+            block = block[: max(0, limit - used)]
+            if len(block) < 400:
+                break
+        parts.append(block)
+        used += len(block)
+        n += 1
+    return "\n".join(parts), n
+
+
+def render_events(cfg: config.Config, hours: float) -> str:
+    evs = [e for e in hook.read_events(hours) if not e.get("agent")]
+    if not evs:
+        return "## Tool failure stats\n\n(no hook events recorded in this window)"
+    by = Counter()
+    repeats = Counter()
+    skills = Counter()
+    for e in evs:
+        repo = cfg.repo_for_path(e.get("cwd", "")) if e.get("cwd") else None
+        rn = repo.name if repo else "none"
+        if e.get("kind") == "skill" and e.get("cls") == "invoked":
+            skills[e.get("detail")] += 1
+            continue
+        by[f"{rn} {e.get('kind')}/{e.get('cls')}"] += 1
+        if e.get("cls") not in ("interrupted", "denied"):
+            repeats[f"{rn}: {e.get('tool')} {e.get('cls')}: {_short(e.get('detail', ''), 100)}"] += 1
+    lines = ["## Tool failure stats (from the event hook)", ""]
+    lines += [f"- {n} x {k}" for k, n in by.most_common(15)]
+    rep = [(k, n) for k, n in repeats.most_common(10) if n >= 2]
+    if rep:
+        lines += ["", "Repeated failures:"] + [f"- {n} x {k}" for k, n in rep]
+    if skills:
+        lines += ["", "Skills used: " + ", ".join(f"{k} ({n})" for k, n in skills.most_common(15))]
+    return "\n".join(lines)
+
+
+def sync_feedback() -> None:
+    for p in state.proposals(status=["applied"]):
+        if not p.get("pr_url"):
+            continue
+        try:
+            pr = gh.pr_view(p["pr_url"])
+        except gh.GhError:
+            continue
+        if pr.get("mergedAt"):
+            state.set_proposal_status_by_pr(p["pr_url"], "merged")
+        elif pr.get("state") == "CLOSED":
+            state.set_proposal_status_by_pr(p["pr_url"], "rejected")
+
+
+def _fmt(props: list[dict]) -> str:
+    if not props:
+        return "(none)"
+    return "\n".join(f"- {p['repo']}/{p['file']}: {_short(p['change'], 200)}" for p in props[:30])
+
+
+def is_harness_file(cfg: config.Config, repo: config.Repo, f: str) -> bool:
+    globs = GLOBAL_GLOBS if repo.name == cfg.global_repo else config.HARNESS_GLOBS
+    in_external_layer = bool(repo.layer) and f.startswith(".agents/")
+    return util.matches_any(f, globs) and not util.matches_any(f, NEVER) and not in_external_layer
+
+
+def allowed(cfg: config.Config, p: dict) -> tuple[bool, str]:
+    if p["layer"] == "memory":
+        return False, "memory facts are listed in arete status, not PRs"
+    if float(p.get("confidence", 0)) < MIN_CONFIDENCE:
+        return False, "low confidence"
+    try:
+        repo = cfg.repo(cfg.global_repo if p["layer"] == "global" else p["repo"])
+    except KeyError:
+        return False, f"unknown repo {p['repo']}"
+    if not repo.mine or not repo.github:
+        return False, f"mining disabled for {repo.name}"
+    f = p["file"].removeprefix("./").removeprefix(repo.name + "/")
+    if not is_harness_file(cfg, repo, f):
+        return False, f"{f} is not a harness file"
+    p["repo"], p["file"] = repo.name, f
+    return True, ""
+
+
+def miner_branch() -> str:
+    return f"arete/miner-{util.now():%Y%m%d}"
+
+
+def eval_pr(repo: config.Repo, url: str, branch: str) -> None:
+    if not (repo.layer_dir / "evals").is_dir():
+        return
+    try:
+        md = evals.compare(repo.name, branch)
+        if md:
+            gh.issue_comment(repo.github, gh.pr_number(url),
+                             md + "\nThe repo's eval tasks, run with this branch's harness against held out tests.\n")
+            print(f"{repo.name}: evals posted to {url}")
+    except Exception as e:
+        print(f"{repo.name}: evals on {branch} failed: {type(e).__name__}: {e}")
+
+
+def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict]) -> str:
+    base = gh.default_branch(repo.github)
+    branch = miner_branch()
+    wt = make_worktree(repo, base, branch, "miner")
+    try:
+        text = "\n\n".join(
+            f"### {i + 1}. `{p['file']}`\n\nChange: {p['change']}\n\nWhy: {p['why']}" for i, p in enumerate(props)
+        )
+        res = claude.run(Template((paths.PROMPTS_DIR / "apply.md").read_text()).safe_substitute(proposals=text),
+                         wt, model=cfg.model("apply"), allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"],
+                         timeout=1200, persist=False)
+        if not res.ok:
+            return ""
+        git(["add", "-A"], wt)
+        files, lines = [], 0
+        for row in git(["diff", "--cached", "--numstat"], wt).splitlines():
+            a, d, name = row.split("\t")
+            files.append(name)
+            lines += (int(a) + int(d)) if a != "-" else 0
+        if not files:
+            return ""
+        bad = [f for f in files if not is_harness_file(cfg, repo, f)]
+        if bad or lines > MAX_MINER_DIFF:
+            print(f"{repo.name}: refused, touched {bad or f'{lines} lines'}")
+            return ""
+        git(["commit", "-q", "-m", f"docs(harness): apply {util.count(len(props), 'mined fix', 'mined fixes')}\n\nArete-Run: {run_id}"], wt)
+        git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
+        body = ["Fixes mined from recent sessions where an agent needed correcting.", ""]
+        for i, p in enumerate(props, 1):
+            ev = ", ".join(p.get("evidence", [])[:4])
+            body.append(f"{i}. `{p['file']}`: {p['why']}" + ("" if repo.public else f" (sessions {ev})"))
+        body += ["", f"Run `{run_id}`. {res.text.strip()[:1500]}", "",
+                 "Merge what helps, close what does not: closed PRs teach the miner what not to propose."]
+        gh.ensure_label(repo.github, "arete-miner", "1d76db", "Harness fixes mined by arete")
+        existing = gh.prs(repo.github, label="arete-miner", state="open")
+        if any(p.get("headRefName") == branch for p in existing):
+            return next(p["url"] for p in existing if p.get("headRefName") == branch)
+        return gh.pr_create(repo.github, branch, base, f"docs(harness): {util.count(len(props), 'mined fix', 'mined fixes')} {util.now():%Y-%m-%d}",
+                            "\n".join(body), labels=["arete-miner"], cwd=wt)
+    finally:
+        remove_worktree(repo, wt)
+
+
+def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:
+    paths.ensure_dirs()
+    cfg = config.load()
+    hours = hours or cfg.miner_lookback_hours
+    with util.lock("mine") as got:
+        if not got:
+            print("miner already running")
+            return 0
+        run_id = state.new_run_id("miner")
+        try:
+            code = _run(cfg, run_id, hours, dry_run, apply)
+            if not dry_run:
+                mark_loop("mine", code == 0)
+            return code
+        except Exception as e:
+            print(f"miner crashed: {type(e).__name__}: {e}")
+            if not dry_run:
+                state.finish_run(run_id, "failed", summary=str(e)[:300])
+                mark_loop("mine", False, f"{type(e).__name__}: {e}")
+            return 1
+
+
+def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bool) -> int:
+    if not dry_run:
+        state.start_run(run_id, "miner")
+        sync_feedback()
+    sessions = collect(hours)
+    digest, used = render_digest(cfg, sessions, cfg.miner_max_digest_chars)
+    print(f"{util.iso()} miner: {len(sessions)} sessions with signal, {used} in digest, {len(digest)} chars")
+    audit_wants_fixes = not auditor.latest_findings().startswith("(")
+    if not sessions and not audit_wants_fixes:
+        if not dry_run:
+            state.finish_run(run_id, "noop", summary="no human sessions in window")
+        return 0
+    repos = "\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in cfg.repos if r.mine)
+    text = Template((paths.PROMPTS_DIR / "mine.md").read_text()).safe_substitute(
+        hours=f"{hours:g}", global_repo=cfg.global_repo, repos=repos, max=MAX_PROPOSALS,
+        pending=_fmt(state.proposals(status=["applied", "pending"])),
+        rejected=_fmt(state.proposals(status=["rejected"])),
+        events=render_events(cfg, hours), digest=digest, audit=auditor.latest_findings(),
+    )
+    run_dir = paths.RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "prompt.md").write_text(text)
+    res = claude.run(text, paths.HOME / "dev", model=cfg.model("miner"), allowed_tools=["Read", "Glob", "Grep"],
+                     json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False)
+    (run_dir / "result.json").write_text(json.dumps({"ok": res.ok, "cost": res.cost_usd, "structured": res.structured,
+                                                     "error": res.error}, indent=2))
+    if not res.ok or not isinstance(res.structured, dict):
+        print(f"miner: model call failed: {util.first_line(res.error)}")
+        if not dry_run:
+            state.finish_run(run_id, "failed", summary="model call failed", cost_usd=res.cost_usd)
+        return 1
+    props = res.structured.get("proposals", [])[:MAX_PROPOSALS]
+    by_repo: dict[str, list[dict]] = defaultdict(list)
+    for p in props:
+        ok, why = allowed(cfg, p)
+        mark = "->" if ok else "  "
+        print(f"{mark} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}"
+              + ("" if ok else f"  [skip: {why}]"))
+        if dry_run:
+            continue
+        if ok and apply:
+            by_repo[p["repo"]].append(p)
+        else:
+            state.add_proposal(run_id, p, "memory" if p["layer"] == "memory" else "pending" if ok else "skipped")
+    if dry_run:
+        print(f"miner: dry run, cost ${res.cost_usd:.2f}")
+        return 0
+    opened = []
+    for name, ps in by_repo.items():
+        url = ""
+        try:
+            url = apply_repo(cfg, run_id, cfg.repo(name), ps)
+        except Exception as e:
+            print(f"{name}: apply failed: {e}")
+        for p in ps:
+            state.add_proposal(run_id, p, "applied" if url else "pending", url)
+        if url:
+            opened.append(url)
+            print(f"{name}: {url}")
+            if name != cfg.global_repo:
+                eval_pr(cfg.repo(name), url, miner_branch())
+    state.finish_run(run_id, "pr" if opened else "noop", cost_usd=res.cost_usd,
+                     summary=f"{len(props)} proposals, {len(opened)} PRs", pr_url=" ".join(opened))
+    return 0

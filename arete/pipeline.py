@@ -1,0 +1,869 @@
+from __future__ import annotations
+
+import json
+import re
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from string import Template
+
+from . import claude, config, gh, jira, paths, state, tracker, util
+from .heartbeat import mark_loop
+
+ALWAYS_DENY = [".agents/config.toml", ".github/workflows/**", ".env", ".env.*", "**/.env", "**/.env.*"]
+MAX_DIFF_IN_PROMPT = 60_000
+LOCKFILES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb", "uv.lock", "poetry.lock",
+             "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock"}
+NEVER_STAGED = [":(exclude,glob)**/__pycache__/**"]
+SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
+SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
+
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "plan": {"type": "string"},
+        "ambiguous": {"type": "boolean"},
+        "question": {"type": "string"},
+        "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "estimated_lines": {"type": "integer", "minimum": 0},
+        "split": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+                "required": ["title", "body"],
+            },
+        },
+    },
+    "required": ["plan", "ambiguous", "risk", "estimated_lines"],
+}
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+        "summary": {"type": "string"},
+        "problems": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "problem": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                },
+                "required": ["problem", "severity"],
+            },
+        },
+    },
+    "required": ["verdict", "summary", "problems"],
+}
+LEARN_SCHEMA = {
+    "type": "object",
+    "properties": {"lessons": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
+    "required": ["lessons"],
+}
+READ_TOOLS = ["Read", "Glob", "Grep"]
+EDIT_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "TodoWrite"]
+NO_GIT_WRITES = [
+    "Bash(git commit*)", "Bash(git push*)", "Bash(git reset*)", "Bash(git checkout*)",
+    "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
+]
+
+
+def prompt(name: str, **values) -> str:
+    text = (paths.PROMPTS_DIR / f"{name}.md").read_text()
+    return Template(text).safe_substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
+
+
+def bash_rules(patterns: list[str]) -> list[str]:
+    return [f"Bash({p})" for p in patterns]
+
+
+def command_list(patterns: list[str]) -> str:
+    return ", ".join(f"`{p}`" for p in patterns)
+
+
+def slug(text: str, n: int = 40) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s[:n].rstrip("-") or "change"
+
+
+def fill_template(template: str, default: str, **values) -> str:
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return default.format(**values)
+
+
+@dataclass
+class AgentRun:
+    id: str
+    repo: config.Repo
+    dir: Path
+    dry_run: bool = False
+    cost: float = 0.0
+    add_dirs: list[Path] = field(default_factory=list)
+
+    @property
+    def where(self) -> str:
+        return self.repo.name
+
+    def log(self, msg: str) -> None:
+        line = f"{util.iso()} [{self.where}] {msg}"
+        print(line, flush=True)
+        with open(self.dir / "run.log", "a") as f:
+            f.write(line + "\n")
+
+    def save(self, name: str, data) -> None:
+        p = self.dir / name
+        p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
+
+    def agent(self, step: str, text: str, cwd: Path, **kw) -> claude.Result:
+        self.log(f"{step}: starting")
+        res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
+        self.cost += res.cost_usd
+        self.save(f"{step}.json", {"ok": res.ok, "session": res.session_id, "cost": res.cost_usd,
+                                   "turns": res.turns, "text": res.text, "structured": res.structured,
+                                   "error": res.error})
+        self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} "
+                 f"({res.turns} turns, ${res.cost_usd:.2f})")
+        return res
+
+
+@dataclass(kw_only=True)
+class Run(AgentRun):
+    tracker: tracker.Tracker
+    tid: str
+    force: bool = False
+    story: list[str] = field(default_factory=list)
+
+    @property
+    def ref(self) -> str:
+        return self.tracker.ref(self.tid)
+
+    @property
+    def where(self) -> str:
+        return tracker.ticket_name(self.repo.name, self.ref)
+
+    def enter(self, status: str) -> None:
+        if self.dry_run:
+            return
+        others = [s for s in config.STATES if s != status]
+        for err in (self.tracker.label(self.tid, add=[status], remove=others), self.tracker.move(self.tid, status)):
+            if err:
+                self.log(f"tracker: {util.first_line(err, 300)}")
+
+    def say(self, body: str) -> None:
+        if self.dry_run:
+            return
+        if err := self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}"):
+            self.log(f"tracker: {util.first_line(err, 300)}")
+
+
+def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True) -> str:
+    res = util.sh(["git", *args], cwd=cwd, timeout=timeout)
+    if check and res.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])}: {util.first_line(res.stderr or res.stdout, 300)}")
+    return res.stdout
+
+
+@dataclass
+class Checkout:
+    dir: str
+    github: str
+    src: Path
+    wt: Path
+    base: str
+    pr: str = ""
+    lease: str = ""
+    resumes: bool = False
+
+    @property
+    def prefix(self) -> str:
+        return f"{self.dir}/" if self.dir else ""
+
+    @property
+    def starting_point(self) -> str:
+        if self.pr:
+            return f"continuing the open PR {self.pr}"
+        if self.resumes:
+            return "continuing commits already pushed to the branch, with no PR yet"
+        return f"fresh from `{self.base}`"
+
+    @property
+    def pr_name(self) -> str:
+        return f"{self.github.split('/')[-1]}#{gh.pr_number(self.pr)}"
+
+
+def remote_head(src: Path, branch: str) -> str:
+    out = git(["ls-remote", "origin", f"refs/heads/{branch}"], src).split()
+    return out[0] if out else ""
+
+
+def add_worktree(c: Checkout, branch: str, start: str) -> None:
+    c.wt.parent.mkdir(parents=True, exist_ok=True)
+    git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
+
+
+def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
+    for c in checkouts:
+        git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
+    shutil.rmtree(ws, ignore_errors=True)
+    for c in checkouts:
+        git(["worktree", "prune"], c.src, check=False)
+
+
+def make_workspace(repo: config.Repo, base: str, branch: str, key: str) -> tuple[Path, list[Checkout]]:
+    ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
+    checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
+                 for p in repo.parts]
+    remove_workspace(ws, checkouts)
+    for c in checkouts:
+        git(["fetch", "origin", c.base], c.src)
+        c.pr = gh.open_pr_url(c.github, branch)
+        c.lease = remote_head(c.src, branch)
+        c.resumes = bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
+        if c.resumes:
+            git(["fetch", "origin", branch], c.src)
+        add_worktree(c, branch, f"origin/{branch}" if c.resumes else f"origin/{c.base}")
+    return ws, checkouts
+
+
+def make_worktree(repo: config.Repo, base: str, branch: str, key: str) -> Path:
+    c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
+    remove_workspace(c.wt, [c])
+    git(["fetch", "origin", base], c.src)
+    add_worktree(c, branch, f"origin/{base}")
+    return c.wt
+
+
+def remove_worktree(repo: config.Repo, wt: Path) -> None:
+    remove_workspace(wt, [Checkout("", repo.github, repo.path, wt, "")])
+
+
+def workspace_note(branch: str, checkouts: list[Checkout]) -> str:
+    if len(checkouts) == 1 and not checkouts[0].dir:
+        c = checkouts[0]
+        return f"You are in a worktree on branch `{branch}`, {c.starting_point}. PRs target `{c.base}`."
+    rows = [f"- `{c.prefix}`: {c.github}, {c.starting_point}" for c in checkouts]
+    return "\n".join([
+        f"The working directory holds one git worktree per repo, each on branch `{branch}`:", "", *rows, "",
+        ("The working directory itself is not a git repo, so run git as `git -C <dir> ...`. A change can touch one "
+         "repo or several; arete commits each changed repo and opens a PR in it."),
+    ])
+
+
+def git_reads(checkouts: list[Checkout]) -> list[str]:
+    return [f"git -C {c.dir} {cmd}*" for c in checkouts if c.dir for cmd in ("status", "diff", "log", "show")]
+
+
+def is_lockfile(name: str) -> bool:
+    return Path(name).name in LOCKFILES
+
+
+def staged_line_counts(wt: Path) -> list[tuple[str, int | None]]:
+    out = []
+    for row in git(["diff", "--cached", "--numstat", "--no-renames"], wt).splitlines():
+        parts = row.split("\t")
+        if len(parts) == 3:
+            added, deleted, name = parts
+            out.append((name, None if added == "-" else int(added) + int(deleted)))
+    return out
+
+
+@dataclass
+class Staged:
+    files: list[str] = field(default_factory=list)
+    lines: int = 0
+    diff: str = ""
+    denied: list[str] = field(default_factory=list)
+    changed: list[Checkout] = field(default_factory=list)
+
+
+def stage(checkouts: list[Checkout], deny: list[str]) -> Staged:
+    out = Staged()
+    for c in checkouts:
+        git(["add", "-A", "--", ".", *NEVER_STAGED], c.wt)
+        rows = staged_line_counts(c.wt)
+        if not rows:
+            continue
+        out.changed.append(c)
+        names = [name for name, _ in rows]
+        locks = [name for name in names if is_lockfile(name)]
+        out.files += [c.prefix + name for name in names]
+        out.lines += sum(n for name, n in rows if n and name not in locks)
+        out.denied += [c.prefix + name for name in names
+                       if util.matches_any(name, deny) or util.matches_any(c.prefix + name, deny)]
+        out.diff += git(["diff", "--cached", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
+                         "--", ".", *(f":(exclude){name}" for name in locks)], c.wt)
+        if locks:
+            out.diff += f"\n(lockfile changes not shown: {', '.join(c.prefix + name for name in locks)})\n"
+    return out
+
+
+def lines_by_file(checkouts: list[Checkout], top: int = 12) -> str:
+    rows = sorted(((c.prefix + name, n) for c in checkouts for name, n in staged_line_counts(c.wt)
+                   if n and not is_lockfile(name)), key=lambda r: (-r[1], r[0]))
+    out = [f"- `{name}`: {n}" for name, n in rows[:top]]
+    if len(rows) > top:
+        out.append(f"- {len(rows) - top} more files: {sum(n for _, n in rows[top:])}")
+    return "\n".join(out)
+
+
+def untracked_files(wt: Path) -> set[str]:
+    return set(git(["ls-files", "--others", "--exclude-standard", "-z"], wt).split("\0")) - {""}
+
+
+def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
+               timeout: float) -> tuple[bool, str]:
+    if not layer.checks:
+        return True, "no checks configured"
+    untracked_before = {d: untracked_files(d) for d in git_dirs}
+    report, ok = [], True
+    for name, cmd in layer.checks.items():
+        res = util.sh(cmd, cwd=cwd, timeout=timeout)
+        passed = res.returncode == 0
+        ok = ok and passed
+        run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
+        if not passed:
+            report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{util.tail(res.stdout + res.stderr, 6000)}\n```")
+        else:
+            report.append(f"### {name} passed: `{cmd}`")
+    for d, before in untracked_before.items():
+        for name in untracked_files(d) - before:
+            (d / name).unlink(missing_ok=True)
+    return ok, "\n\n".join(report)
+
+
+def split_comment(estimate: int, limit: int, split: list[dict], queue_hint: str, info_label: str,
+                  config_file: Path) -> str:
+    parts = [(f"The plan comes to about {estimate} changed lines, over this repo's {limit} line limit, so I stopped "
+              "before building.")]
+    if split:
+        parts.append("A split where each part fits and leaves the repo working, in build order:")
+        parts += [f"### {n}. {s.get('title', '').strip()}\n\n{s.get('body', '').strip()}" for n, s in enumerate(split, 1)]
+    parts.append(f"File the parts as {queue_hint}, or narrow this one, then remove `{info_label}`. To build it whole, "
+                 f"raise `max_diff_lines` in `{paths.short_path(config_file)}`.")
+    return "\n\n".join(parts)
+
+
+def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False) -> int:
+    paths.ensure_dirs()
+    cfg = config.load()
+    repo = cfg.repo(repo_name)
+    if not repo.parts:
+        print(f"{repo_name} has no github remote configured")
+        return 1
+    tk = tracker.for_repo(cfg, repo)
+    try:
+        tid = tk.normalize(tid)
+    except ValueError as e:
+        print(f"{repo_name}: {e}")
+        return 1
+    name = tracker.ticket_name(repo.name, tk.ref(tid))
+    with util.lock(f"run-{repo.name}-{tid}") as got:
+        if not got:
+            print(f"{name} is already running")
+            return 0
+        run_id = state.new_run_id("pipeline") + f"-{repo.name}-{tid}"
+        run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force)
+        run.dir.mkdir(parents=True, exist_ok=True)
+        state.start_run(run_id, "pipeline", repo.name, tid)
+        try:
+            status, summary, pr_url = _run(cfg, run)
+        except Exception as e:
+            run.log(f"crashed: {type(e).__name__}: {e}")
+            status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
+            run.enter("failed")
+            run.say(f"Run `{run_id}` crashed before finishing. Remove `{tk.label_name('failed')}` to retry.")
+        state.finish_run(run_id, status, summary=summary, pr_url=pr_url, cost_usd=round(run.cost, 4))
+        run.log(f"done: {status} {pr_url or summary}")
+        if status == "skipped":
+            print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
+        return 0 if status in ("pr", "noop", "needs-info", "dry-run") else 1
+
+
+def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple[str, str, str]:
+    run.log(f"failed: {why}")
+    run.enter("failed")
+    extra = f"\n\n{detail.strip()}" if detail.strip() else ""
+    if builder_said.strip():
+        extra += f"\n\n### What the builder said\n\n{builder_said.strip()[:4000]}"
+    run.say(f"Could not finish this one: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
+            f"Mac. Remove `{run.tracker.label_name('failed')}` to retry.")
+    return "failed", why, ""
+
+
+def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str) -> tuple[str, str, str]:
+    run.say(comment)
+    run.enter("needs-info")
+    remove_workspace(ws, checkouts)
+    return "needs-info", summary[:300], ""
+
+
+def resolve_layer(run: Run, ws: Path) -> config.RepoLayer:
+    repo = run.repo
+    if repo.layer:
+        return config.load_layer(repo.layer)
+    if (ws / ".agents" / "config.toml").exists():
+        return config.load_layer(ws / ".agents")
+    run.log(f"layer: {paths.short_path(repo.path / '.agents')} is not committed; lessons stay in the main checkout")
+    return config.load_layer(repo.path / ".agents")
+
+
+def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
+    repo, tk = run.repo, run.tracker
+    try:
+        t = tk.get(run.tid)
+    except tracker.ERRORS as e:
+        return "failed", f"could not read {run.ref}: {e}", ""
+    if not t.open:
+        return "noop", "ticket is not open", ""
+    if t.blocker and not run.force:
+        return "skipped", t.blocker, ""
+    try:
+        images = tk.save_images(t, run.dir / "images")
+    except tracker.ERRORS as e:
+        return "failed", f"could not download the images on {run.ref}: {e}", ""
+    if images.paths:
+        run.add_dirs.append(run.dir / "images")
+        run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
+    if images.left_out:
+        run.log(f"images: left out {', '.join(images.left_out)}")
+    attachments = images_note(images)
+
+    main_layer = config.load_layer(repo.layer_dir)
+    branch = open_branch(run) or fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
+                                               slug=slug(t.title))
+    if not run.dry_run:
+        tk.prepare()
+    run.enter("running")
+
+    ws, checkouts = make_workspace(repo, main_layer.base_branch, branch, t.id)
+    for c in checkouts:
+        run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
+    layer = resolve_layer(run, ws)
+    for rel in layer.copy:
+        src = repo.path / rel
+        if src.exists():
+            dest = ws / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+    for cmd in layer.setup:
+        res = util.sh(cmd, cwd=ws, timeout=1200)
+        run.log(f"setup `{cmd}`: exit {res.returncode}")
+        if res.returncode != 0:
+            run.save("setup.log", res.stdout + res.stderr)
+            return _fail(run, f"setup command `{cmd}` failed")
+
+    expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
+    check_list = ", ".join(f"`{c}`" for c in layer.checks.values()) or "(none configured)"
+    reads = git_reads(checkouts)
+    builder_bash = layer.builder_bash + reads
+    commands = command_list(builder_bash)
+    workspace = workspace_note(branch, checkouts)
+    step_timeout = layer.timeout_minutes * 60
+    read_tools = READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
+    build_tools = EDIT_TOOLS + bash_rules(builder_bash)
+    git_dirs = [c.wt for c in checkouts]
+    deny = ALWAYS_DENY + layer.deny
+    limit = layer.max_diff_lines
+    info = tk.label_name("needs-info")
+
+    res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title, body=t.body,
+                                    comments=t.comments, attachments=attachments, expertise=expertise,
+                                    commands=commands, max_lines=limit),
+                    ws, model=cfg.model("plan"), allowed_tools=read_tools, json_schema=PLAN_SCHEMA,
+                    timeout=step_timeout)
+    if not res.ok or not isinstance(res.structured, dict):
+        return _fail(run, "planning step failed")
+    plan = res.structured
+    run.save("plan.md", plan.get("plan", ""))
+    estimate = int(plan.get("estimated_lines") or 0)
+    if plan.get("ambiguous") and plan.get("question"):
+        run.log("plan: ambiguous, asking the author")
+        return _ask(run, ws, checkouts, f"Before I build this I need one answer:\n\n{plan['question']}\n\n"
+                    f"Reply here, then remove the `{info}` label and I will pick it up.", plan["question"])
+    if estimate > limit:
+        split = [s for s in plan.get("split") or [] if isinstance(s, dict) and s.get("title")]
+        run.log(f"plan: about {estimate} lines, over the {limit} line limit; proposing a {len(split)} part split")
+        run.save("split.json", split)
+        return _ask(run, ws, checkouts, split_comment(estimate, limit, split, tk.queue_hint, info, layer.config_file),
+                    f"plan estimates {estimate} lines, over the {limit} line limit; split proposed")
+
+    res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
+                                     body=t.body, comments=t.comments, attachments=attachments, plan=plan["plan"],
+                                     expertise=expertise, checks=check_list, commands=commands, max_lines=limit,
+                                     estimate=estimate),
+                    ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
+                    timeout=step_timeout)
+    if not res.ok:
+        return _fail(run, "build step failed", res.text)
+    session = res.session_id
+    build_summary = res.text
+    if not stage(checkouts, deny).files:
+        return _fail(run, "the builder stopped without changing anything", build_summary)
+
+    attempts = 1
+    ok, report = run_checks(layer, ws, git_dirs, run, step_timeout)
+    while not ok and attempts < layer.max_attempts:
+        run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(report, 2500)}")
+        attempts += 1
+        res = run.agent(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=layer.max_attempts,
+                                                 failures=report),
+                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
+                        resume=session, timeout=step_timeout)
+        session = res.session_id or session
+        ok, report = run_checks(layer, ws, git_dirs, run, step_timeout)
+    run.save("checks.md", report)
+    state.update_run(run.id, attempts=attempts)
+    if not ok:
+        run.story.append("Checks still failing after the last attempt.")
+        _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=False)
+        return _fail(run, f"checks still failing after {attempts} attempts")
+
+    staged = stage(checkouts, deny)
+    if not staged.files:
+        return _fail(run, "the fix attempts undid every change", build_summary)
+    if staged.denied:
+        return _fail(run, f"the change touched denied paths: {', '.join(staged.denied[:5])}")
+    if staged.lines > limit:
+        return _fail(run, f"the diff is {staged.lines} lines, over the {limit} line limit (the plan estimated "
+                          f"{estimate}); split the ticket",
+                     detail=f"### Lines changed by file\n\n{lines_by_file(checkouts)}")
+
+    review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan["plan"], report, staged.diff,
+                     step_timeout)
+    if review.get("verdict") == "request_changes":
+        problems = "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
+        run.story.append(f"Review requested changes:\n{problems}")
+        res = run.agent("review_fix", prompt("review_fix", problems=problems), ws, model=cfg.model("build"),
+                        allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES, resume=session,
+                        timeout=step_timeout)
+        ok, report = run_checks(layer, ws, git_dirs, run, step_timeout)
+        staged = stage(checkouts, deny)
+        if not ok or not staged.files or staged.denied or staged.lines > limit:
+            return _fail(run, "changes after review broke the checks or the limits")
+        review = _review(cfg, run, ws, workspace, read_tools, t, attachments, plan["plan"], report, staged.diff,
+                         step_timeout, "review2")
+
+    approved = review.get("verdict") == "approve"
+    _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=True)
+    staged = stage(checkouts, deny)
+    size = f"{len(staged.files)} files, {staged.lines} lines"
+    outcome = f"{size}, review {review.get('verdict')}"
+
+    if run.dry_run:
+        run.save("diff.patch", staged.diff)
+        run.log(f"dry run: {outcome}; worktree kept at {ws}")
+        return "dry-run", outcome, ""
+
+    subject = fill_template(layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
+    problems = review.get("problems", [])
+    report_body = (
+        f"## Summary\n\n{build_summary.strip()[:3000]}\n\n"
+        f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
+        + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
+        + f"\n\n## Checks\n\nAll passed after {attempts} attempt{'s' if attempts > 1 else ''}: {check_list}\n\n"
+        f"<details><summary>Plan</summary>\n\n{plan['plan'][:6000]}\n\n</details>\n\n"
+        f"Run `{run.id}`, {size}, ${run.cost:.2f}."
+    )
+    message = f"{tracker.with_ref(subject, t.ref)}\n\nArete-Run: {run.id}"
+    for c in staged.changed:
+        try:
+            git(["commit", "-q", "-m", message], c.wt)
+        except RuntimeError as e:
+            return _fail(run, f"the commit in {c.github} failed, so arete pushed nothing", detail=str(e))
+    moved = [c.github for c in checkouts if remote_head(c.src, branch) != c.lease]
+    if moved:
+        return _fail(run, f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
+                     detail="Someone pushed to that branch after this run started. A retry builds on top of their work.")
+    pushed_now: list[Checkout] = []
+    for c in staged.changed:
+        try:
+            git(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch], c.wt, timeout=600)
+        except RuntimeError as e:
+            done = ", ".join(p.github for p in pushed_now) or "nothing"
+            return _fail(run, f"the push to {c.github} failed after arete pushed {done}",
+                         detail=f"{e}\n\nA retry builds on whatever reached the branch.")
+        pushed_now.append(c)
+    opened: list[Checkout] = []
+    for c in staged.changed:
+        if not c.pr:
+            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{tk.pr_link(t)}\n\n{report_body}",
+                                labels=tk.pr_labels, draft=not approved, cwd=c.wt)
+            opened.append(c)
+            run.log(f"opened {c.pr}{'' if approved else ' as draft'}")
+        else:
+            run.log(f"pushed to {c.pr}")
+    pushed = [c for c in staged.changed if c not in opened]
+    with_prs = [c for c in checkouts if c.pr]
+    for c in with_prs:
+        others = sibling_section(t.ref, c, with_prs)
+        if c in opened:
+            if others:
+                gh.pr_edit_body(c.pr, f"{tk.pr_link(t)}\n\n{report_body}{others}")
+        elif opened:
+            gh.pr_edit_body(c.pr, with_siblings(gh.pr_body(c.pr), others))
+        if c in pushed:
+            gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
+    run.enter("pr")
+    pr_lines = "\n".join(f"- {'Opened' if c in opened else 'Pushed to' if c in pushed else 'Unchanged'} [{c.pr_name}]({c.pr})"
+                         for c in with_prs)
+    run.say(f"PRs for this ticket:\n\n{pr_lines}"
+            + ("" if approved or not opened else "\n\nThe new PRs are drafts: the reviewer still has concerns."))
+    if approved and layer.trust_level == "automerge":
+        for c in opened:
+            try:
+                gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
+                run.log(f"automerge enabled on {c.pr}")
+            except gh.GhError as e:
+                run.log(f"automerge failed on {c.pr}: {e}")
+    urls = [c.pr for c in with_prs]
+    supersede_older_runs(run, urls)
+    state.update_run(run.id, branch=branch)
+    remove_workspace(ws, checkouts)
+    return "pr", outcome, " ".join(urls)
+
+
+def images_note(images: tracker.SavedImages) -> str:
+    lines = []
+    if images.paths:
+        lines += ["## Images on the issue", "", "Open each one with Read; they show what the issue describes.", ""]
+        lines += [f"- `{p}`" for p in images.paths]
+    if images.left_out:
+        lines += ["", (f"Not downloaded, over the {tracker.MAX_IMAGES} image or "
+                       f"{tracker.MAX_IMAGE_BYTES // 2**20} MB cap: {', '.join(images.left_out)}")]
+    return "\n".join(lines).strip()
+
+
+def open_branch(run: Run) -> str:
+    return next((r["branch"] for r in state.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
+
+
+def with_siblings(body: str, section: str) -> str:
+    return SIBLINGS.sub("", body).rstrip() + section
+
+
+def sibling_section(ref: str, c: Checkout, with_prs: list[Checkout]) -> str:
+    others = [o for o in with_prs if o is not c]
+    if not others:
+        return ""
+    return f"\n\n## Other PRs for {ref}\n\n" + "\n".join(f"- [{o.pr_name}]({o.pr})" for o in others)
+
+
+def supersede_older_runs(run: Run, urls: list[str]) -> None:
+    for r in state.open_runs(run.repo.name, run.tid):
+        older = (r.get("pr_url") or "").split()
+        if older and set(older) <= set(urls):
+            state.update_run(r["id"], status="superseded")
+            run.log(f"run {r['id']} superseded: its PRs carry on in this run")
+
+
+def _review(cfg, run: Run, ws: Path, workspace: str, read_tools: list[str], t: tracker.Ticket, attachments: str,
+            plan: str, report: str, diff: str, timeout: float, step: str = "review") -> dict:
+    res = run.agent(step, prompt("review", repo=run.repo.name, workspace=workspace, ref=t.ref, title=t.title,
+                                 body=t.body, comments=t.comments, attachments=attachments, plan=plan, checks=report,
+                                 diff=util.tail(diff, MAX_DIFF_IN_PROMPT)),
+                    ws, model=cfg.model("review"), allowed_tools=read_tools, json_schema=REVIEW_SCHEMA,
+                    timeout=timeout)
+    if not res.ok or not isinstance(res.structured, dict):
+        return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
+    return res.structured
+
+
+def _learn(cfg, run: Run, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:
+    if not run.story:
+        run.log("learn: clean run, nothing to learn")
+        return
+    res = run.agent("learn", prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
+                                     story="\n\n".join(run.story), expertise=expertise),
+                    wt, model=cfg.model("learn"), allowed_tools=READ_TOOLS, json_schema=LEARN_SCHEMA,
+                    timeout=600, persist=False)
+    lessons = [lesson.strip().lstrip("- ").strip() for lesson in (res.structured or {}).get("lessons", [])
+               if lesson.strip()]
+    if not lessons:
+        return
+    if not apply:
+        run.save("lessons.md", "\n".join(f"- {lesson}" for lesson in lessons))
+        return
+    expertise_file.parent.mkdir(parents=True, exist_ok=True)
+    head = "" if expertise_file.exists() else "# Expertise\n\nLessons agents learned working in this repo. Arete appends; humans prune.\n"
+    with open(expertise_file, "a") as fh:
+        fh.write(f"{head}\n## {util.now():%Y-%m-%d} {run.ref} ({run.id})\n\n" + "\n".join(f"- {lesson}" for lesson in lessons) + "\n")
+    run.log(f"learn: {util.count(len(lessons), 'lesson')} added to {expertise_file}")
+
+
+def sync_outcomes(cfg: config.Config) -> None:
+    for r in state.runs(kind="pipeline", limit=200):
+        if r["status"] != "pr" or not r.get("pr_url"):
+            continue
+        try:
+            prs = [gh.pr_view(url) for url in r["pr_url"].split()]
+        except gh.GhError:
+            continue
+        if not all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs):
+            continue
+        if all(pr.get("mergedAt") for pr in prs):
+            state.update_run(r["id"], status="merged")
+            _move_merged(cfg, r)
+        else:
+            state.update_run(r["id"], status="rejected")
+    for repo in cfg.repos:
+        if repo.pipeline and repo.github and not repo.layer:
+            try:
+                _maybe_propose_trust(repo)
+            except (RuntimeError, OSError) as e:
+                print(f"{util.iso()} {repo.name}: trust proposal failed: {util.first_line(str(e), 300)}")
+
+
+def _move_merged(cfg: config.Config, r: dict) -> None:
+    try:
+        repo = cfg.repo(r["repo"])
+    except KeyError:
+        return
+    if err := tracker.for_repo(cfg, repo).move(str(r["issue"]), "merged"):
+        print(f"{util.iso()} {tracker.run_ticket_name(r)}: {err}")
+
+
+def streak(repo_name: str) -> int:
+    n = 0
+    for r in state.runs(kind="pipeline", repo=repo_name, limit=100):
+        if r["status"] == "merged":
+            n += 1
+        elif r["status"] in ("rejected", "failed"):
+            break
+    return n
+
+
+def layer_is_committed(root: Path) -> bool:
+    return bool(git(["ls-files", ".agents/config.toml"], root, check=False).strip())
+
+
+def _maybe_propose_trust(repo: config.Repo) -> None:
+    layer = config.load_layer(repo.layer_dir)
+    if layer.trust_level != "pr" or streak(repo.name) < layer.automerge_after or not layer_is_committed(repo.path):
+        return
+    branch = "arete/trust-automerge"
+    if gh.open_pr_url(repo.github, branch):
+        return
+    base = layer.base_branch or gh.default_branch(repo.github)
+    labels = ["arete-trust"] if repo.tracker == "github" else []
+    wt = make_worktree(repo, base, branch, "trust")
+    try:
+        f = wt / ".agents" / "config.toml"
+        if not f.exists():
+            return
+        text = f.read_text()
+        new = re.sub(r'(?m)^(\s*level\s*=\s*)"pr"', r'\1"automerge"', text)
+        if new == text:
+            return
+        f.write_text(new)
+        git(["commit", "-q", "-am", "chore(agents): raise trust to automerge"], wt)
+        git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt)
+        for lb in labels:
+            gh.ensure_label(repo.github, lb, "0e8a16", "Trust level change proposed by arete")
+        n = streak(repo.name)
+        gh.pr_create(repo.github, branch, base, "chore(agents): raise trust to automerge",
+                     f"The last {n} arete PRs in this repo merged with none rejected or failed in between.\n\n"
+                     "Merging this lets arete enable automerge on PRs that pass checks and review. "
+                     "Close it to keep every PR waiting for you.", labels=labels)
+    finally:
+        remove_worktree(repo, wt)
+
+
+def cleanup_worktrees(days: float = 7) -> None:
+    cutoff = util.now().timestamp() - days * 86400
+    for d in paths.WORKTREES_DIR.glob("*"):
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+
+class SkipLog:
+    def __init__(self, before: dict):
+        self.before = before
+        self.current: dict[str, dict] = {}
+
+    def note(self, name: str, t: tracker.Ticket, blocker: str) -> None:
+        old = self.before.get(name) or {}
+        same = old.get("why") == blocker
+        self.current[name] = {"why": blocker, "title": t.title, "url": t.url,
+                          "since": old.get("since") if same else util.iso()}
+        if not same:
+            print(f"{util.iso()} {name}: not run, {blocker}")
+
+
+def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
+                other_routes: set[str] = frozenset()) -> tracker.Ticket | None:
+    for t in tk.todo():
+        if other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
+            continue
+        if blocker := tk.blocker(t.id):
+            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker)
+            continue
+        return t
+    return None
+
+
+def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for r in cfg.repos:
+        if r.pipeline and r.parts and r.tracker == "jira":
+            out.setdefault(r.jira_project or cfg.jira.project, set()).add(tracker.route_label(r))
+    return out
+
+
+def poll(dry_run: bool = False) -> int:
+    paths.ensure_dirs()
+    cfg = config.load()
+    with util.lock("poll") as got:
+        if not got:
+            print(f"{util.iso()} poll already running")
+            return 0
+        errors: list[str] = []
+
+        def failed(where: str, e: Exception) -> None:
+            errors.append(f"{where}: {type(e).__name__}: {e}")
+            print(f"{util.iso()} {errors[-1]}")
+
+        skips = SkipLog({} if dry_run else util.read_json(SKIPPED_FILE, {}))
+        routes = jira_routes_by_project(cfg)
+        reached_clients: dict[str, jira.Client] = {}
+        for repo in cfg.repos:
+            if not (repo.pipeline and repo.parts):
+                continue
+            try:
+                tk = tracker.for_repo(cfg, repo)
+                other_routes: set[str] = set()
+                if isinstance(tk, tracker.JiraTracker):
+                    other_routes = routes.get(tk.project, set()) - {tk.route}
+                    reached_clients.setdefault(tk.project, tk.client)
+                t = next_ticket(repo, tk, skips, other_routes)
+                if t:
+                    print(f"{util.iso()} {tracker.ticket_name(repo.name, t.ref)}: {t.title}")
+                    if not dry_run:
+                        run_issue(repo.name, t.id)
+            except Exception as e:
+                failed(repo.name, e)
+        for project, client in reached_clients.items():
+            try:
+                for t in tracker.jira_unrouted(project, routes.get(project, set()), client):
+                    skips.note(t.ref, t, t.blocker)
+            except Exception as e:
+                failed(f"jira {project}", e)
+        if not dry_run:
+            try:
+                util.write_json(SKIPPED_FILE, skips.current)
+                sync_outcomes(cfg)
+                cleanup_worktrees()
+            except Exception as e:
+                failed("poll", e)
+            mark_loop("poll", not errors, "; ".join(errors))
+        return 1 if errors else 0
+
+
+def skipped_tickets() -> dict:
+    return util.read_json(SKIPPED_FILE, {})

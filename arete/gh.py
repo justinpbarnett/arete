@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Sequence
+
+from . import util
+
+
+class GhError(RuntimeError):
+    pass
+
+
+def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
+    res = util.sh(["gh", *args], cwd=cwd, timeout=timeout, input=input)
+    if res.returncode != 0:
+        raise GhError(f"gh {' '.join(args[:3])}: {util.first_line(res.stderr or res.stdout, 300)}")
+    return res.stdout
+
+
+def gh_json(args: list[str], cwd=None, timeout: float = 120):
+    out = gh(args, cwd=cwd, timeout=timeout)
+    return json.loads(out) if out.strip() else None
+
+
+def ensure_label(repo: str, name: str, color: str = "5319e7", description: str = "") -> None:
+    try:
+        gh(["label", "create", name, "--repo", repo, "--color", color, "--description", description, "--force"])
+    except GhError:
+        pass
+
+
+def issues(repo: str, label: str, state: str = "open", limit: int = 30) -> list[dict]:
+    return gh_json(
+        [
+            "issue", "list", "--repo", repo, "--label", label, "--state", state, "--limit", str(limit),
+            "--json", "number,title,body,labels,url,createdAt,author",
+        ]
+    ) or []
+
+
+def issue(repo: str, number: int) -> dict:
+    return gh_json(
+        ["issue", "view", str(number), "--repo", repo, "--json", "number,title,body,labels,url,comments,state,author"]
+    )
+
+
+def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
+    args = ["issue", "create", "--repo", repo, "--title", title, "--body-file", "-"]
+    for lb in labels:
+        args += ["--label", lb]
+    url = gh(args, input=body).strip().splitlines()[-1]
+    return int(url.rstrip("/").rsplit("/", 1)[-1])
+
+
+def issue_comment(repo: str, number: int, body: str) -> None:
+    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=body)
+
+
+def issue_close(repo: str, number: int, comment: str = "") -> None:
+    args = ["issue", "close", str(number), "--repo", repo]
+    if comment:
+        args += ["--comment", comment]
+    gh(args)
+
+
+def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = ()) -> None:
+    args = ["issue", "edit", str(number), "--repo", repo]
+    for lb in add:
+        args += ["--add-label", lb]
+    for lb in remove:
+        args += ["--remove-label", lb]
+    if len(args) > 5:
+        gh(args)
+
+
+def issue_state(repo: str, number: int) -> str:
+    try:
+        return (gh_json(["issue", "view", str(number), "--repo", repo, "--json", "state"]) or {}).get("state", "")
+    except GhError:
+        return ""
+
+
+def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
+              draft: bool = False, cwd=None) -> str:
+    args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", title, "--body-file", "-"]
+    for lb in labels:
+        args += ["--label", lb]
+    if draft:
+        args.append("--draft")
+    return gh(args, cwd=cwd, input=body).strip().splitlines()[-1]
+
+
+def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> list[dict]:
+    args = ["pr", "list", "--repo", repo, "--state", state, "--limit", str(limit),
+            "--json", "number,title,url,state,mergedAt,closedAt,headRefName,labels,body"]
+    if label:
+        args += ["--label", label]
+    return gh_json(args) or []
+
+
+def open_pr_url(repo: str, head: str) -> str:
+    rows = gh_json(["pr", "list", "--repo", repo, "--head", head, "--state", "open", "--limit", "1", "--json", "url"])
+    return rows[0]["url"] if rows else ""
+
+
+def closed_pr_heads(repo: str, head: str) -> set[str]:
+    rows = gh_json(["pr", "list", "--repo", repo, "--head", head, "--state", "closed", "--limit", "20",
+                    "--json", "headRefOid"]) or []
+    return {r["headRefOid"] for r in rows}
+
+
+def pr_body(url: str) -> str:
+    return (gh_json(["pr", "view", url, "--json", "body"]) or {}).get("body") or ""
+
+
+def pr_edit_body(url: str, body: str) -> None:
+    gh(["pr", "edit", url, "--body-file", "-"], input=body)
+
+
+def pr_comment(url: str, body: str) -> None:
+    gh(["pr", "comment", url, "--body-file", "-"], input=body)
+
+
+def pr_number(url: str) -> int:
+    return int(url.rstrip("/").rsplit("/", 1)[-1])
+
+
+def pr_view(url_or_number: str, repo: str = "") -> dict:
+    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,closedAt,url,reviews,comments,headRefName"]
+    if repo:
+        args += ["--repo", repo]
+    return gh_json(args) or {}
+
+
+def pr_merge_auto(repo: str, number: int) -> None:
+    gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch"])
+
+
+def default_branch(repo: str) -> str:
+    try:
+        return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
+    except (GhError, KeyError, TypeError):
+        return "main"
+
+
+def repo_exists(repo: str) -> bool:
+    try:
+        gh(["repo", "view", repo, "--json", "name"])
+        return True
+    except GhError:
+        return False
