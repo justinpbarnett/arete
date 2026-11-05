@@ -372,6 +372,7 @@ class Staged:
 def stage(checkouts: list[Checkout], deny: list[str]) -> Staged:
     out = Staged()
     for c in checkouts:
+        drop_untracked_bytecode(c.wt)
         git(["add", "-A", "--", ".", *NEVER_STAGED], c.wt)
         rows = staged_line_counts(c.wt)
         if not rows:
@@ -403,6 +404,21 @@ def untracked_files(wt: Path) -> set[str]:
     return set(git(["ls-files", "--others", "--exclude-standard", "-z"], wt).split("\0")) - {""}
 
 
+def remove_untracked(wt: Path, name: str) -> None:
+    f = wt / name
+    f.unlink(missing_ok=True)
+    for d in f.parents:
+        if d == wt or not d.is_dir() or any(d.iterdir()):
+            break
+        d.rmdir()
+
+
+def drop_untracked_bytecode(wt: Path) -> None:
+    for name in untracked_files(wt):
+        if Path(name).parent.name == "__pycache__":
+            remove_untracked(wt, name)
+
+
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float) -> tuple[bool, str]:
     if not layer.checks:
@@ -420,7 +436,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             report.append(f"### {name} passed: `{cmd}`")
     for d, before in untracked_before.items():
         for name in untracked_files(d) - before:
-            (d / name).unlink(missing_ok=True)
+            remove_untracked(d, name)
     return ok, "\n\n".join(report)
 
 
@@ -1003,7 +1019,7 @@ def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) ->
             if f.suffix == ".png" and not (evidence / f.name).exists():
                 shutil.move(f, evidence / f.name)
             else:
-                f.unlink(missing_ok=True)
+                remove_untracked(d, name)
         git(["checkout", "-q", "--", "."], d)
 
 

@@ -247,6 +247,9 @@ class RepoLayer:
         return self.dir / "evals"
 
 
+LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify"}
+
+
 def load_layer(layer_dir: Path) -> RepoLayer:
     layer = RepoLayer(dir=layer_dir)
     if not layer.config_file.exists():

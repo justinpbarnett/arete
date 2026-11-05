@@ -465,7 +465,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
         else:
             state.add_proposal(run_id, p, "memory" if p["layer"] == "memory" else "pending" if ok else "skipped")
     if dry_run:
-        print(f"miner: dry run, cost ${res.cost_usd:.2f}")
+        print(f"miner: dry run, {len(props)} proposals, cost ${res.cost_usd:.2f}")
         return 0
     opened = []
     for name, ps in by_repo.items():

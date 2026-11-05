@@ -15,7 +15,6 @@ from .heartbeat import mark_loop
 AUDIT_DIR = paths.STATE_DIR / "audit"
 MAX_SKILL_LINES = 500
 MAX_DESCRIPTION = 1024
-CONFIG_KEYS = {"setup", "checks", "limits", "agent", "trust", "git"}
 
 LINK = re.compile(r"\]\(([^)\s#]+)(?:#[^)]*)?\)")
 HOOK_PATHS = [
@@ -172,7 +171,7 @@ def check_repos(cfg: config.Config) -> list[Finding]:
         if f.exists():
             try:
                 data = tomllib.loads(f.read_text())
-                extra = set(data) - CONFIG_KEYS
+                extra = set(data) - config.LAYER_SECTIONS
                 if extra:
                     out.append(Finding("agents-config", "warn", paths.short_path(f), f"unknown sections: {', '.join(sorted(extra))}"))
                 if r.pipeline and not data.get("checks"):

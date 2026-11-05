@@ -46,7 +46,7 @@ $notes
 - A step you could not do is not a failed check. Leave it out of `checks`. When the step is essential to know
   whether the change works, return `blocked` and name the step and what stopped you in `blocked_by`.
 - Do not edit files and do not fix what you find. Arete gives your findings to the builder.
-- Never run git commands that write.
+- Never run git commands that write. Arete deletes the `__pycache__` your commands leave, so do not report it.
 - A problem that is also on the base branch is not a failure of this change. Note it in `saw` and do not fail it.
 
 ## What to return
