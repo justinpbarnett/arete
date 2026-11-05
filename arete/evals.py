@@ -8,7 +8,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, gh, paths, state, util
+from . import config, gh, paths, state, tracker, util, verify
 from .heartbeat import mark_loop
 from .pipeline import (
     EDIT_TOOLS,
@@ -16,12 +16,15 @@ from .pipeline import (
     PLAN_SCHEMA,
     READ_TOOLS,
     AgentRun,
+    Build,
     Checkout,
+    RunFailed,
     bash_rules,
     check_list,
     command_list,
     prompt,
     run_checks,
+    use_product,
     workspace_note,
 )
 from .util import git
@@ -35,15 +38,26 @@ class Task:
     name: str
     title: str
     prompt: str
-    check: str
+    check: str = ""
+    verify: str = ""
     base: str = ""
+    source: str = ""
     timeout_minutes: int = 30
     hidden_files: dict[str, bytes] = field(default_factory=dict)
+
+    @property
+    def graded_by(self) -> str:
+        return " and ".join(filter(None, [f"check `{self.check}`" if self.check else "",
+                                          "steps graded in use" if self.verify else ""])) or "nothing"
 
 
 @dataclass
 class EvalRun(AgentRun):
     task: str = ""
+
+    @property
+    def ref(self) -> str:
+        return self.task
 
     @property
     def where(self) -> str:
@@ -127,8 +141,9 @@ def load_tasks(src: Source | DirSource, under: str, only: str = "") -> list[Task
         if only and p.stem != only:
             continue
         data = tomllib.loads(src.read(f).decode())
-        t = Task(name=p.stem, title=data.get("title", p.stem), prompt=data["prompt"], check=data["check"],
-                 base=data.get("base", ""), timeout_minutes=int(data.get("timeout_minutes", 30)))
+        t = Task(name=p.stem, title=data.get("title", p.stem), prompt=data["prompt"], check=data.get("check", ""),
+                 verify=data.get("verify", ""), base=data.get("base", ""), source=data.get("source", ""),
+                 timeout_minutes=int(data.get("timeout_minutes", 30)))
         prefix = f"{under}/{p.stem}/"
         for h in files:
             if h.startswith(prefix) and src.link(h) is None:
@@ -186,6 +201,42 @@ def commit_overlay(wt: Path) -> None:
          "--no-verify", "-m", "eval harness overlay"], wt)
 
 
+def fetch_origin(repo: config.Repo) -> None:
+    with util.repo_lock(repo.path):
+        git(["fetch", "-q", "origin"], repo.path, check=False, timeout=300)
+
+
+def prepare(repo: config.Repo, src: Source, wt: Path, run: AgentRun) -> config.RepoLayer:
+    copied = overlay_harness(src, wt)
+    run.log(f"harness from {src.label} ({len(copied)} files)")
+    layer = config.load_layer(repo.layer or wt / ".agents")
+    for c in layer.copy:
+        s = repo.path / c
+        if s.exists():
+            (wt / c).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, wt / c)
+    for cmd in layer.setup:
+        if util.sh(cmd, cwd=wt, timeout=1200).returncode != 0:
+            raise RunFailed(f"setup `{cmd}` failed")
+    commit_overlay(wt)
+    return layer
+
+
+def grade(cfg: config.Config, run: EvalRun, layer: config.RepoLayer, wt: Path, title: str, ask: str, steps: str,
+          timeout: float, step: str = "grade") -> verify.Verified:
+    ticket = tracker.Ticket(id=run.task, ref=run.task, title=title, body=ask)
+    b = Build(cfg, run, ticket, wt, [Checkout("", run.repo.github, run.repo.path, wt, "")], layer, tools=[], deny=[],
+              timeout=timeout, workspace="You are in a checkout of its code.", attachments="", expertise="")
+    return use_product(b, step, "grade", goal=steps)
+
+
+def grade_failure(graded: verify.Verified) -> str:
+    if graded.verdict == "blocked":
+        return f"grading blocked: {util.first_line(graded.blocked_by or graded.summary, 200)}"
+    failed = graded.failed_checks
+    return f"failed in use: {util.first_line(failed[0]['what'] if failed else graded.summary, 200)}"
+
+
 def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run_id: str, dry_run: bool) -> dict:
     run_dir = paths.RUNS_DIR / run_id / task.name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -195,23 +246,14 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
     started = time.time()
     result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "seconds": 0.0}
     try:
-        with util.repo_lock(repo.path):
-            git(["fetch", "-q", "origin"], repo.path, check=False, timeout=300)
+        if not task.check and not task.verify:
+            raise RunFailed("the task has neither `check` nor `verify`")
+        fetch_origin(repo)
         isolated_checkout(repo.path, base, wt)
-        copied = overlay_harness(src, wt)
-        run.log(f"worktree at {base}, harness from {src.label} ({len(copied)} files)")
-        layer = config.load_layer(repo.layer or wt / ".agents")
-        for c in layer.copy:
-            s = repo.path / c
-            if s.exists():
-                (wt / c).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(s, wt / c)
-        for cmd in layer.setup:
-            res = util.sh(cmd, cwd=wt, timeout=1200)
-            if res.returncode != 0:
-                result["why"] = f"setup `{cmd}` failed"
-                return result
-        commit_overlay(wt)
+        run.log(f"checkout at {base}")
+        layer = prepare(repo, src, wt, run)
+        if task.verify and not layer.verify:
+            raise RunFailed("the task has `verify` steps but the layer has no `[verify]` section")
 
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
         checks = check_list(layer)
@@ -251,15 +293,27 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
             ok, report = run_checks(layer, wt, [wt], run, timeout)
         git(["add", "-A"], wt)
         (run_dir / "diff.patch").write_text(git(["diff", "--cached", "HEAD"], wt))
-        for rel, data in task.hidden_files.items():
-            dest = wt / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-        res = util.sh(task.check, cwd=wt, timeout=timeout)
-        (run_dir / "check.log").write_text(res.stdout + res.stderr)
-        result["passed"] = res.returncode == 0
-        result["why"] = "" if result["passed"] else f"check exit {res.returncode}" + ("" if ok else ", repo checks failing")
-        run.log(f"held out check: {'PASS' if result['passed'] else 'FAIL'}")
+        failures = []
+        if task.verify:
+            graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, timeout)
+            if graded.verdict != "pass":
+                failures.append(grade_failure(graded))
+        if task.check:
+            for rel, data in task.hidden_files.items():
+                dest = wt / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+            res = util.sh(task.check, cwd=wt, timeout=timeout)
+            (run_dir / "check.log").write_text(res.stdout + res.stderr)
+            run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
+            if res.returncode != 0:
+                failures.append(f"check exit {res.returncode}")
+        result["passed"] = not failures
+        result["why"] = "; ".join(failures) + ("" if ok or not failures else ", repo checks failing")
+        return result
+    except RunFailed as e:
+        result["why"] = e.why
+        run.log(f"stopped: {e.why}")
         return result
     except Exception as e:
         result["why"] = f"{type(e).__name__}: {util.first_line(str(e), 200)}"
@@ -286,13 +340,14 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False) ->
         return 0 if not task else 1
     if dry_run:
         for t in tasks:
-            print(f"{t.name}: base {t.base or 'default branch'}, check `{t.check}`, {len(t.hidden_files)} hidden files")
+            print(f"{t.name}: base {t.base or 'default branch'}, graded by {t.graded_by}, "
+                  f"{len(t.hidden_files)} hidden files")
         return 0
     with util.lock(state.run_lock("eval", repo.name)) as got:
         if not got:
             print(f"evals already running for {repo.name}")
             return 0
-        run_id = state.new_run_id(f"eval-{repo.name}")
+        run_id = f"{state.new_run_id('eval')}-{repo.name}"
         state.start_run(run_id, "eval", repo=repo.name)
         results = []
         for t in tasks:

@@ -22,6 +22,7 @@ apply = "sonnet"
 probe = "haiku"
 uat = "sonnet"
 verify = "opus"
+eval_mine = "sonnet"
 
 [miner]
 lookback_hours = 24
@@ -226,11 +227,17 @@ def cmd_audit(args) -> int:
 
 
 def cmd_eval(args) -> int:
-    from . import evals
+    from . import eval_mine, evals
 
-    if not args.repo:
+    words = args.target
+    if words[:1] == ["mine"] and len(words) <= 2:
+        return eval_mine.run(words[1] if len(words) == 2 else "", limit=args.limit, dry_run=args.dry_run)
+    if len(words) > 1:
+        print("usage: arete eval [REPO] or arete eval mine [REPO]", file=sys.stderr)
+        return 2
+    if not words:
         return evals.run_all(dry_run=args.dry_run)
-    return evals.run(args.repo, task=args.task, ref=args.ref, dry_run=args.dry_run)
+    return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -297,10 +304,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_audit)
 
-    p = sub.add_parser("eval", help="loop 4: run eval tasks (all repos with evals when REPO is left out)")
-    p.add_argument("repo", nargs="?")
+    p = sub.add_parser("eval", help="loop 4: run eval tasks (all repos with evals when REPO is left out); "
+                                    "`eval mine [REPO]` writes tasks from merged arete PRs")
+    p.add_argument("target", nargs="*", metavar="REPO | mine [REPO]")
     p.add_argument("--task", default="")
     p.add_argument("--ref", default="", help="take the harness and tasks from this git ref, not the working copy")
+    p.add_argument("--limit", type=int, default=3, help="with mine: the most merged PRs to mine in one go")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
 

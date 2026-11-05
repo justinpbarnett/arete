@@ -130,6 +130,7 @@ class Verified:
     summary: str = ""
     checks: list[dict] = field(default_factory=list)
     blocked_by: str = ""
+    finished: bool = True
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:

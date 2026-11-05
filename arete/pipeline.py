@@ -125,7 +125,9 @@ def command_list(patterns: list[str]) -> str:
 
 def slug(text: str, n: int = 40) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return s[:n].rstrip("-") or "change"
+    if len(s) > n:
+        s = s[:n + 1].rpartition("-")[0] or s[:n]
+    return s or "change"
 
 
 def fill_template(template: str, default: str, **values) -> str:
@@ -143,6 +145,11 @@ class AgentRun:
     dry_run: bool = False
     cost: float = 0.0
     add_dirs: list[Path] = field(default_factory=list)
+    story: list[str] = field(default_factory=list)
+
+    @property
+    def ref(self) -> str:
+        return ""
 
     @property
     def where(self) -> str:
@@ -186,7 +193,6 @@ class Run(AgentRun):
     tracker: tracker.Tracker
     tid: str
     force: bool = False
-    story: list[str] = field(default_factory=list)
     feedback: list[dict] = field(default_factory=list)
 
     @property
@@ -427,7 +433,7 @@ class RunFailed(Exception):
 @dataclass
 class Build:
     cfg: config.Config
-    run: Run
+    run: AgentRun
     ticket: tracker.Ticket
     ws: Path
     checkouts: list[Checkout]
@@ -938,8 +944,13 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
+    return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
+                       diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT))
+
+
+def use_product(b: Build, step_name: str, prompt_name: str, **values) -> verify.Verified:
     run, v, t = b.run, b.layer.verify, b.ticket
-    step = b.next_step("verify")
+    step = b.next_step(step_name)
     evidence = run.dir / "evidence"
     evidence.mkdir(exist_ok=True)
     if evidence not in run.add_dirs:
@@ -950,11 +961,10 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         with verify.serving(v, b.ws, run.dir / f"{step}-server.log") as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
-            res = run.agent(step, prompt("verify", repo=run.repo.name, workspace=b.workspace, ref=t.ref,
+            res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
-                                         goal=goal, summary=summary.strip()[:4000], surface=surface_note(v, url, evidence),
-                                         notes=v.notes, commands=command_list(bash), checks=check_list(b.layer),
-                                         diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT)),
+                                         surface=surface_note(v, url, evidence), notes=v.notes,
+                                         commands=command_list(bash), checks=check_list(b.layer), **values),
                             b.ws, model=b.cfg.model("verify"),
                             allowed_tools=READ_TOOLS + bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=NO_GIT_WRITES, json_schema=verify.SCHEMA, timeout=b.timeout,
@@ -965,7 +975,7 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     finally:
         restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
-        return verify.Verified("blocked", "The check in use did not finish.",
+        return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
     verified = verify.Verified.from_agent(res.structured)
     run.save(f"{step}.md", verified.markdown())
@@ -1023,7 +1033,7 @@ def check_list(layer: config.RepoLayer) -> str:
     return ", ".join(f"`{c}`" for c in layer.checks.values()) or "(none configured)"
 
 
-def _learn(cfg, run: Run, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:
+def _learn(cfg, run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:
     if not run.story:
         run.log("learn: clean run, nothing to learn")
         return

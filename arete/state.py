@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS feedback (
     run_id TEXT,
     PRIMARY KEY (pr_url, kind, gh_id)
 );
+CREATE TABLE IF NOT EXISTS mined (
+    pr_url TEXT PRIMARY KEY,
+    repo TEXT,
+    issue TEXT,
+    run_id TEXT,
+    status TEXT,                   -- accepted | rejected | skipped
+    why TEXT,
+    task TEXT,
+    ts TEXT
+);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT")]
@@ -344,3 +354,14 @@ def feedback_since(since: str) -> list[dict]:
     with db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE created >= ? ORDER BY pr_url, created",
                                            (since,))]
+
+
+def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why: str = "", task: str = "") -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO mined (pr_url, repo, issue, run_id, status, why, task, ts) "
+                  "VALUES (?,?,?,?,?,?,?,?)", (pr_url, repo, issue, run_id, status, why, task, util.iso()))
+
+
+def mined_urls() -> set[str]:
+    with db() as c:
+        return {r["pr_url"] for r in c.execute("SELECT pr_url FROM mined")}
