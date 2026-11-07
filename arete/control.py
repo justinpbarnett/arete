@@ -9,7 +9,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import timedelta
 
-from . import config, devices, emits, loops, paths, sources, state, util
+from . import config, devices, emits, loops, paths, record, sources, state, util
 from .loops import Loop
 
 START_WAIT_SECONDS = 15
@@ -32,25 +32,6 @@ class Busy(RuntimeError):
 
 class Refused(ValueError):
     pass
-
-
-def pid_alive(pid) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def end_group(pid) -> None:
-    try:
-        os.killpg(int(pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, TypeError, ValueError):
-        pass
 
 
 def detach(args: list[str], log_name: str = DETACHED_LOG) -> subprocess.Popen:
@@ -85,7 +66,7 @@ def start_loop(name: str, events: list[dict] | None = None) -> dict:
         raise Refused(f"{name} is broken: {loop.error}")
     if util.lock_is_held(state.loop_lock(loop.name)):
         raise Busy(f"{name} is running; stop it or wait")
-    run_id = state.unique_run_id(loop.name)
+    run_id = record.new_id(loop.name)
     args = ["loop", "exec", loop.name, "--run-id", run_id]
     if events:
         fire_file = paths.RUNS_DIR / run_id / "events.json"
@@ -101,11 +82,12 @@ def stop_run(run_id: str) -> dict:
         raise NotFound(f"no run {run_id}")
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
-    if not pid_alive(r.get("pid")):
-        end_group(r.get("pid"))
-        state.finish_run(run_id, "interrupted", summary="the process was gone when stop was asked")
-        state.add_feed(run_id, "end", "interrupted: the process was gone when stop was asked")
-        return {"id": run_id, "stopped": True, "was": "gone"}
+    with record.dead(r) as gone:
+        if gone and r["kind"] not in record.NO_TICKET_KINDS:
+            raise Refused(f"the process of {run_id} is gone; the next pipeline poll settles it and tells its ticket")
+        if gone:
+            record.interrupt(r)
+            return {"id": run_id, "stopped": True, "was": "gone"}
     pid = int(r["pid"])
     try:
         os.killpg(pid, signal.SIGTERM)
@@ -118,7 +100,7 @@ def serve_beat() -> dict:
     data = util.read_json(BEAT_FILE, {})
     if data.get("at"):
         data["age_seconds"] = round((util.now() - util.parse_iso(data["at"])).total_seconds())
-        data["alive"] = pid_alive(data.get("pid")) and data["age_seconds"] < BEAT_STALE_SECONDS
+        data["alive"] = util.pid_alive(data.get("pid")) and data["age_seconds"] < BEAT_STALE_SECONDS
     return data
 
 

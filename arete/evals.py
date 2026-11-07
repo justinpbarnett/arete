@@ -8,7 +8,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, gh, paths, state, tracker, util, verify
+from . import config, gh, paths, record, state, tracker, util, verify
 from .heartbeat import mark_loop
 from .pipeline import (
     EDIT_TOOLS,
@@ -384,14 +384,14 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False, pr
         if not got:
             print(f"evals already running for {repo.name}")
             return 0
-        run_suite(cfg, repo, src, tasks, f"{state.new_run_id('eval')}-{repo.name}", prompts)
+        run_suite(cfg, repo, src, tasks, repo.name, prompts)
         return 0
 
 
-def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Task], run_id: str,
+def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Task], tag: str,
               prompts: Prompts) -> Arm:
     label = prompts.applied_to(src.label)
-    state.start_run(run_id, "eval", repo=repo.name)
+    run_id = record.start("eval", tag=tag, lock=state.run_lock("eval", repo.name), repo=repo.name)
     results = []
     for t in tasks:
         prior = state.task_history(repo.name, t.name, 3)
@@ -401,8 +401,8 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
         results.append(r)
     arm = Arm(run_id, results)
     summary = f"{arm.score} passed on {label}"
-    state.finish_run(run_id, "done", summary=summary, cost_usd=arm.cost)
-    print(f"{repo.name}: {summary}, ${arm.cost:.2f}")
+    record.settle(run_id, "done", summary=summary)
+    print(f"{repo.name}: {summary}, ${record.spent(run_id):.2f}")
     for r in results:
         print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s ${r['cost']:.2f} {r['why']}"
               + ("  REGRESSED" if r["regressed"] else ""))
@@ -468,7 +468,7 @@ def export_prompts(repo: config.Repo, ref: str, dest: Path) -> dict[str, bytes]:
 
 def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
     fetch_origin(arete)
-    root = paths.RUNS_DIR / f"{state.new_run_id('eval')}-prompts"
+    root = paths.RUNS_DIR / record.new_id("eva", "prompts")
     arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
             "pr": Prompts(root / "pr", f"origin/{branch}")}
     main, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
@@ -490,8 +490,7 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
             if not got:
                 skipped.append((repo, "its evals were already running"))
                 continue
-            ran.append((repo, {arm: run_suite(cfg, repo, Source(repo), tasks,
-                                              f"{state.new_run_id('eval')}-{repo.name}-{arm}", prompts)
+            ran.append((repo, {arm: run_suite(cfg, repo, Source(repo), tasks, f"{repo.name}-{arm}", prompts)
                                for arm, prompts in arms.items()}))
     return prompt_comparison(arete, arms, changed, unmeasured, ran, skipped)
 

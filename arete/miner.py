@@ -7,7 +7,19 @@ from datetime import timedelta
 from pathlib import Path
 from string import Template
 
-from . import auditor, claude, config, evals, gh, hook, paths, runner, state, util
+from . import (
+    auditor,
+    claude,
+    config,
+    evals,
+    gh,
+    hook,
+    paths,
+    record,
+    runner,
+    state,
+    util,
+)
 from .heartbeat import mark_loop
 from .pipeline import (
     CLAUDE_CODE_GUARDED,
@@ -412,7 +424,7 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
         if not got:
             print("miner already running")
             return 0
-        run_id = state.new_run_id("miner")
+        run_id = record.new_id("min") if dry_run else record.start("miner", lock=state.run_lock("miner"))
         try:
             code = _run(cfg, run_id, hours, dry_run, apply)
             if not dry_run:
@@ -420,15 +432,14 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
             return code
         except Exception as e:
             print(f"miner crashed: {type(e).__name__}: {e}")
+            record.settle(run_id, "failed", summary=str(e)[:300])
             if not dry_run:
-                state.finish_run(run_id, "failed", summary=str(e)[:300])
                 mark_loop("mine", False, f"{type(e).__name__}: {e}")
             return 1
 
 
 def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bool) -> int:
     if not dry_run:
-        state.start_run(run_id, "miner")
         sync_feedback()
     sessions = collect(hours)
     digest, used = render_digest(cfg, sessions, cfg.miner_max_digest_chars)
@@ -436,13 +447,11 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
     pr_feedback = state.feedback_since(util.iso(util.now() - timedelta(hours=hours)))
     if not sessions and not audit_wants_fixes and not pr_feedback:
-        if not dry_run:
-            state.finish_run(run_id, "noop", summary="no human sessions in window")
+        record.settle(run_id, "noop", summary="no human sessions in window")
         return 0
     mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     if not mine_repos:
-        if not dry_run:
-            state.finish_run(run_id, "noop", summary="no repo with mine = true is checked out here")
+        record.settle(run_id, "noop", summary="no repo with mine = true is checked out here")
         return 0
     repos = "\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt(
@@ -463,8 +472,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
                                                      "error": res.error}, indent=2))
     if not res.ok or not isinstance(res.structured, dict):
         print(f"miner: model call failed: {util.first_line(res.error)}")
-        if not dry_run:
-            state.finish_run(run_id, "failed", summary="model call failed", cost_usd=res.cost_usd)
+        record.settle(run_id, "failed", summary="model call failed")
         return 1
     props = res.structured.get("proposals", [])[:MAX_PROPOSALS]
     by_repo: dict[str, list[dict]] = defaultdict(list)
@@ -502,6 +510,6 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             print(f"{name}: {url}")
             if name != cfg.global_repo:
                 eval_pr(cfg, cfg.repo(name), url, miner_branch())
-    state.finish_run(run_id, "pr" if opened else "noop", cost_usd=res.cost_usd,
-                     summary=f"{len(props)} proposals, {len(opened)} PRs", pr_url=" ".join(opened))
+    record.settle(run_id, "pr" if opened else "noop", summary=f"{len(props)} proposals, {len(opened)} PRs",
+                  pr_url=" ".join(opened))
     return 0

@@ -11,20 +11,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NoReturn
 
-from . import config, control, dashboard, loops, paths, sources, state, util
+from . import config, control, dashboard, loops, paths, record, sources, state, util
 from .loops import Loop
 
 TICK_SECONDS = 20
-SETTLE_GRACE_SECONDS = 60
 PRUNE_SECONDS = 3600
 POLL_THREADS = 8
-INTERRUPTED = "the process stopped before the run finished"
 COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
            "!=": operator.ne}
-
-
-def age_seconds(stamp: str) -> float:
-    return (util.now() - util.parse_iso(stamp)).total_seconds()
 
 
 def next_due(loop: Loop, after: datetime) -> str:
@@ -39,20 +33,6 @@ def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     if loop.trigger.every:
         return (now - last).total_seconds() >= loop.trigger.every
     return loop.trigger.cron.next_after(last.astimezone()) <= now.astimezone()
-
-
-def settle_dead_runs() -> list[str]:
-    settled = []
-    for r in state.runs_marked_running():
-        if r["kind"] not in state.SERVE_KINDS or control.pid_alive(r.get("pid")):
-            continue
-        if age_seconds(r["started"]) < SETTLE_GRACE_SECONDS:
-            continue
-        control.end_group(r.get("pid"))
-        state.finish_run(r["id"], "interrupted", summary=INTERRUPTED)
-        state.add_feed(r["id"], "end", f"interrupted: {INTERRUPTED}")
-        settled.append(r["id"])
-    return settled
 
 
 @dataclass
@@ -85,8 +65,8 @@ class Server:
         self.cfg = config.load()
         every_loop = loops.load_all(self.cfg)
         live = [x for x in every_loop if x.enabled and not x.error]
-        for run_id in settle_dead_runs():
-            self.say(f"{run_id}: {INTERRUPTED}")
+        for row in record.reap(record.NO_TICKET_KINDS):
+            self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
         states = state.loop_states()
         now = util.now()
         for loop in live:
@@ -215,7 +195,7 @@ class Server:
                 if item["grp"]:
                     held_groups.add(key)
                 continue
-            run_id = state.unique_run_id(loop.name)
+            run_id = record.new_id(loop.name)
             state.take_queue_item(item["id"], run_id)
             proc = control.detach(["loop", "exec", loop.name, "--fire", str(item["id"]), "--run-id", run_id])
             self.children[run_id] = Child(proc, loop.name, item["queue"], item["grp"], item["id"])

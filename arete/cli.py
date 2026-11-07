@@ -111,10 +111,10 @@ def cmd_status(args) -> int:
     if rs:
         print("recent runs:")
         rows = [(r["id"], r["kind"], tracker.run_ticket_name(r) if r["issue"] else (r.get("loop") or r["repo"] or ""), r["status"],
-                 r["pr_url"] or r["summary"] or "") for r in rs]
-        widths = [max(len(row[i]) for row in rows) for i in range(4)]
+                 f"${r['cost_usd'] or 0:.2f}", r["pr_url"] or r["summary"] or "") for r in rs]
+        widths = [max(len(row[i]) for row in rows) for i in range(5)]
         for row in rows:
-            print(("  " + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[4])[:200])
+            print(("  " + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[5])[:200])
     mem = state.proposals(status=["memory"], limit=10)
     if mem:
         print("memory facts the miner noticed (file them by hand, then `arete forget ID`):")

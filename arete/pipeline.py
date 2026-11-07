@@ -15,7 +15,20 @@ from pathlib import Path
 from string import Template
 from typing import TextIO
 
-from . import ci, claude, config, gh, jira, paths, runner, state, tracker, util, verify
+from . import (
+    ci,
+    claude,
+    config,
+    gh,
+    jira,
+    paths,
+    record,
+    runner,
+    state,
+    tracker,
+    util,
+    verify,
+)
 from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
@@ -29,7 +42,6 @@ NEVER_STAGED = [":(exclude,glob)**/__pycache__/**"]
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
-STEP_COST = re.compile(r"\(\d+ turns?, \$([\d.]+)\)")
 CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 LEFT_HEADING = f"## {LEFT_TITLE}"
@@ -186,10 +198,6 @@ def fill_template(template: str, default: str, **values) -> str:
 
 def cost_note(res: claude.Result) -> str:
     return f"({res.turns} turns, ${res.cost_usd:.2f})"
-
-
-def logged_cost(log_lines: list[str]) -> float:
-    return round(sum(float(m.group(1)) for line in log_lines if (m := STEP_COST.search(line))), 2)
 
 
 @dataclass
@@ -656,11 +664,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 slot.hold()
             earlier = state.ticket_runs(repo.name, tid, limit=1)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
-            run_id = state.new_run_id("pipeline") + f"-{repo.name}-{tid}"
+            run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=state.run_lock("pipeline", repo.name, tid),
+                                  repo=repo.name, issue=tid)
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=pending_feedback(repo.name, tid))
             run.dir.mkdir(parents=True, exist_ok=True)
-            state.start_run(run_id, "pipeline", repo.name, tid)
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
         if run.feedback:
@@ -683,8 +691,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     f"`{tk.label_name('failed')}` to retry.")
         if run.feedback and not dry_run:
             state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
-        state.finish_run(run_id, status, summary=summary, pr_url=pr_url, cost_usd=round(run.cost, 4))
         run.log(f"done: {status} {pr_url or summary}")
+        record.settle(run_id, status, summary=summary, pr_url=pr_url)
         if status == "skipped":
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if status in ("pr", "noop", "needs-info", "dry-run") else 1
@@ -861,7 +869,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=layer.max_attempts, failures=b.report))
         ok = b.check()
     run.save("checks.md", b.report)
-    state.update_run(run.id, attempts=attempts)
+    record.note(run.id, attempts=attempts)
     if not ok:
         run.story.append("Checks still failing after the last attempt.")
         _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=False)
@@ -901,7 +909,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else f"<details><summary>Plan</summary>\n\n{plan_text[:6000]}\n\n</details>\n\n")
-        + f"Run `{run.id}`, {size}, ${run.cost:.2f}."
+        + f"Run `{run.id}`, {size}, ${record.spent(run.id):.2f}."
     )
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
@@ -1038,7 +1046,7 @@ def relinked(body: str, link: str, other_link: str) -> str:
 def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
     urls = [c.pr for c in with_prs]
     supersede_older_runs(run, urls)
-    state.update_run(run.id, branch=branch)
+    record.note(run.id, branch=branch)
     return " ".join(urls)
 
 
@@ -1292,7 +1300,7 @@ def supersede_older_runs(run: Run, urls: list[str]) -> None:
     for r in state.open_runs(run.repo.name, run.tid):
         older = (r.get("pr_url") or "").split()
         if older and set(older) <= set(urls):
-            state.update_run(r["id"], status="superseded")
+            record.note(r["id"], status="superseded")
             run.log(f"run {r['id']} superseded: its PRs carry on in this run")
 
 
@@ -1583,7 +1591,7 @@ def sync_outcomes(cfg: config.Config) -> None:
         closed = all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs)
         if r["status"] == "rejected":
             if not closed:
-                state.update_run(r["id"], status="pr")
+                record.note(r["id"], status="pr")
             continue
         if not closed:
             continue
@@ -1591,7 +1599,7 @@ def sync_outcomes(cfg: config.Config) -> None:
             state.close_feedback(url, pr["state"])
         merged = all(pr.get("mergedAt") for pr in prs)
         closed_at = max(pr.get("closedAt") or "" for pr in prs) or util.iso()
-        state.update_run(r["id"], status="merged" if merged else "rejected", finished=closed_at)
+        record.note(r["id"], status="merged" if merged else "rejected", finished=closed_at)
     util.write_json(PR_SEEN_FILE, fresh)
     for repo in cfg.repos:
         if repo.pipeline and repo.github and not repo.layer:
@@ -1631,7 +1639,7 @@ def sync_landings(cfg: config.Config) -> None:
         except (gh.GhError, jira.JiraError, RetryNextPoll) as e:
             print(f"{util.iso()} {tracker.run_ticket_name(r)}: landing check failed, trying next poll: {util.first_line(str(e), 300)}")
             continue
-        state.update_run(r["id"], landed=reached)
+        record.note(r["id"], landed=reached)
         print(f"{util.iso()} {tracker.run_ticket_name(r)}: landed on {reached}, " + (err or f"moved to {target}"))
 
 
@@ -1651,7 +1659,6 @@ def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
                                   prs=prs, branch=branch),
                     run.repo.path, model=cfg.model("uat"), allowed_tools=READ_TOOLS, json_schema=UAT_SCHEMA,
                     timeout=600, persist=False)
-    state.update_run(run.id, cost_usd=(row.get("cost_usd") or 0) + run.cost)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     steps = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
     failure = util.first_line(res.error or "none came back")
@@ -1755,40 +1762,22 @@ class SkipLog:
             print(f"{util.iso()} {name}: not run, {blocker}")
 
 
-STOPPED = "stopped before it finished, with nothing left running"
-INTERRUPTED = ("stopped before it finished (the Mac restarted, lost power or the process was killed); "
-               "I will start it again")
-
-
-def interrupted_twice(row: dict) -> bool:
-    earlier = [r for r in state.ticket_runs(row["repo"], row["issue"], limit=3) if r["id"] != row["id"]]
-    return bool(earlier) and earlier[0]["status"] == "interrupted"
-
-
 def settle_abandoned_runs(cfg: config.Config) -> None:
-    for row in state.runs_marked_running():
-        if row["kind"] in state.SERVE_KINDS:
-            continue
-        with util.lock(state.run_lock(row["kind"], row["repo"], row["issue"])) as free:
-            if not free:
-                continue
-            if row["kind"] != "pipeline":
-                state.finish_run(row["id"], "failed", summary=STOPPED)
-                print(f"{util.iso()} {row['id']}: {STOPPED}")
-                continue
-            repo = cfg.repo(row["repo"])
-            run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo),
-                      tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])))
-            run.dir.mkdir(parents=True, exist_ok=True)
-            if interrupted_twice(row):
-                state.finish_run(row["id"], "failed", summary=STOPPED)
-                run.log(f"{STOPPED}, the second interruption in a row")
-                run.give_up(f"{STOPPED}, the second interruption in a row")
-            else:
-                state.finish_run(row["id"], "interrupted", summary=INTERRUPTED)
-                run.log(INTERRUPTED)
-                run.leave("running")
-                run.say(f"Run `{run.id}` {INTERRUPTED}.")
+    record.reap(("pipeline",), then=lambda row: tell_ticket_run_died(cfg, row))
+
+
+def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
+    repo = cfg.repo(row["repo"])
+    run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo), tid=str(row["issue"]),
+              feedback=pending_feedback(repo.name, str(row["issue"])))
+    run.dir.mkdir(parents=True, exist_ok=True)
+    if row["status"] == "failed":
+        run.log(f"{record.INTERRUPTED}, the second interruption in a row")
+        run.give_up(f"{record.INTERRUPTED}, the second interruption in a row")
+    else:
+        run.log(record.INTERRUPTED)
+        run.leave("running")
+        run.say(f"Run `{run.id}` {record.INTERRUPTED}; I will start it again.")
 
 
 def holding(rows: list[dict], lock_kind: str) -> list[dict]:

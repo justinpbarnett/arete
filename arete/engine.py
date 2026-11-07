@@ -23,6 +23,7 @@ from . import (
     loops,
     paths,
     pipeline,
+    record,
     runner,
     sources,
     state,
@@ -95,7 +96,7 @@ class LoopRun:
         state.add_feed(self.id, kind, text)
 
     def spent(self) -> float:
-        return state.run_totals(self.id)["cost_usd"]
+        return record.spent(self.id)
 
     def room(self) -> float | None:
         day_ago = util.iso(util.now() - timedelta(days=1))
@@ -120,7 +121,7 @@ class LoopRun:
                          trace=(self.id, step), cfg=self.cfg, tools=tools, allowed_tools=tools,
                          disallowed_tools=NO_GIT_WRITES, max_budget_usd=left, persist=False,
                          timeout=self.loop.timeout_minutes * 60, device=self.device, **kw)
-        state.update_run(self.id, model=res.model, runner=res.runner)
+        record.note(self.id, model=res.model, runner=res.runner)
         note = f"({res.turns} turns, ${res.cost_usd:.2f})"
         self.log("step" if res.ok else "error",
                  f"{step}: {res.runner} {res.model} {note}" + ("" if res.ok else f" failed: {res.error}"))
@@ -150,7 +151,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     full = devices.wrap(device, argv, cwd, env)
     proc = subprocess.Popen(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, env={**os.environ, **env} if local else None,
-                            start_new_session=True)
+                            **util.own_group())
     expired = threading.Event()
 
     def stop_at_deadline() -> None:
@@ -234,14 +235,14 @@ def execute(name: str, *, fire: int | None = None, run_id: str = "", trial: bool
             if fire:
                 state.take_queue_item(fire, None)
             return "busy", "the last run of this loop is still going"
-        run = LoopRun(loop, run_id or state.unique_run_id(loop.name), cfg, trial=trial,
+        run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
                       trigger="try" if trial else (item["trigger"] if item else "manual"),
                       events=list(events or (item["payload"] if item else [])))
-        state.start_run(run.id, "loop", repo=loop.repo or None)
-        state.update_run(run.id, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger, device=loop.device,
-                         queue=loop.queue_name, grp=item["grp"] if item else "", pid=os.getpid(),
-                         log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
-                         runner=runner.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
+        record.start("loop", run_id=run.id, lock=state.loop_lock(loop.name), repo=loop.repo or None, loop=loop.name,
+                     loop_kind=loop.kind, trigger=run.trigger, device=loop.device, queue=loop.queue_name,
+                     grp=item["grp"] if item else "", log=paths.short_path(run.log_file),
+                     model=loop.model_for(cfg) if loop.agent else "",
+                     runner=runner.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
         if fire:
             state.take_queue_item(fire, run.id)
         try:
@@ -263,9 +264,8 @@ def execute(name: str, *, fire: int | None = None, run_id: str = "", trial: bool
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:
-    totals = state.run_totals(run.id)
-    run.log("end", f"{status}: {summary} (${totals['cost_usd']:.2f})")
-    state.finish_run(run.id, status, summary=summary[:500], **totals)
+    run.log("end", f"{status}: {summary} (${run.spent():.2f})")
+    record.settle(run.id, status, summary=summary[:500])
     return status
 
 

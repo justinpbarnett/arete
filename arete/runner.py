@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 
-from . import claude, config, devices, pi, state
+from . import claude, config, devices, pi, record
 from .agent import NO_SESSION, Result, Session
 
 RUNNERS = ("claude", "pi")
@@ -49,5 +49,5 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     res.cost_usd = priced(res, cfg)
     run_id, step = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     if run_id:
-        state.add_step(run_id, step, res, time.monotonic() - started)
+        record.step(run_id, step, res, time.monotonic() - started)
     return res

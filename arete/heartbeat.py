@@ -129,7 +129,7 @@ def check_serve() -> list[Check]:
     if not beat:
         return [Check("serve:beat", False, "arete serve is installed but has never run; see its log")]
     if not beat["alive"]:
-        why = "its process is gone" if not control.pid_alive(beat.get("pid")) else f"last beat {beat['age_seconds']}s ago"
+        why = "its process is gone" if not util.pid_alive(beat.get("pid")) else f"last beat {beat['age_seconds']}s ago"
         return [Check("serve:beat", False, f"arete serve is down: {why}")]
     out = [Check("serve:beat", True, f"pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['pending']} waiting")]
     for name, error in (beat.get("broken") or {}).items():

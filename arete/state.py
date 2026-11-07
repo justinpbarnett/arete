@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import timedelta
@@ -224,7 +223,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
-                  ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"))]]
+                  ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"))]]
 
 
 @contextmanager
@@ -251,40 +250,6 @@ def reader():
         yield conn
     finally:
         conn.close()
-
-
-def new_run_id(kind: str) -> str:
-    return f"{kind[:3]}-{util.now().strftime('%Y%m%d-%H%M%S')}"
-
-
-SERVE_KINDS = ("loop", "session", "draft")
-
-
-def unique_run_id(prefix: str) -> str:
-    return f"{prefix.replace('/', '.')}-{util.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
-
-
-def start_run(run_id: str, kind: str, repo: str | None = None, issue: int | str | None = None) -> None:
-    with db() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO runs (id, kind, repo, issue, status, started) VALUES (?,?,?,?,?,?)",
-            (run_id, kind, repo, issue, "running", util.iso()),
-        )
-
-
-def finish_run(run_id: str, status: str, **fields) -> None:
-    fields = {"status": status, "finished": util.iso(), **fields}
-    cols = ", ".join(f"{k} = ?" for k in fields)
-    with db() as c:
-        c.execute(f"UPDATE runs SET {cols} WHERE id = ?", (*fields.values(), run_id))
-
-
-def update_run(run_id: str, **fields) -> None:
-    if not fields:
-        return
-    cols = ", ".join(f"{k} = ?" for k in fields)
-    with db() as c:
-        c.execute(f"UPDATE runs SET {cols} WHERE id = ?", (*fields.values(), run_id))
 
 
 FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
@@ -328,7 +293,7 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
 
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
-            "eval": f"eval-{repo}", "miner": "mine"}[kind]
+            "eval": f"eval-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
 
 
 def loop_lock(name: str) -> str:
@@ -341,14 +306,6 @@ def run_get(run_id: str, connect=db) -> dict | None:
         return dict(r) if r else None
 
 
-def add_step(run_id: str, step: str, res, seconds: float) -> None:
-    with db() as c:
-        c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out, turns,"
-                  " seconds, error, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (run_id, step, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                   res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso()))
-
-
 def steps(run_id: str, connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
@@ -358,13 +315,6 @@ def steps_since(since: str, connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT s.*, r.loop, r.kind, r.repo FROM steps s LEFT JOIN runs r "
                                            "ON r.id = s.run_id WHERE s.ts >= ? ORDER BY s.ts", (since,))]
-
-
-def run_totals(run_id: str) -> dict:
-    with db() as c:
-        r = c.execute("SELECT COALESCE(SUM(cost_usd), 0) AS cost, COALESCE(SUM(tokens_in), 0) AS tin, "
-                      "COALESCE(SUM(tokens_out), 0) AS tout FROM steps WHERE run_id = ?", (run_id,)).fetchone()
-        return {"cost_usd": round(r["cost"], 6), "tokens_in": r["tin"], "tokens_out": r["tout"]}
 
 
 def add_feed(run_id: str, kind: str, text: str) -> None:

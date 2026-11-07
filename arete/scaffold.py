@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import threading
@@ -15,6 +14,7 @@ from . import (
     engine,
     loops,
     paths,
+    record,
     runner,
     sources,
     state,
@@ -112,9 +112,7 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", say
         raise control.Refused(f"a loop named {name} already exists")
     if name and not loops.NAME.match(name):
         raise control.Refused(f"the name '{name}' must be lowercase letters, digits and dashes")
-    run_id = state.unique_run_id("draft")
-    state.start_run(run_id, "draft")
-    state.update_run(run_id, pid=os.getpid(), trigger="manual", summary=util.first_line(sentence, 200))
+    run_id = record.start("draft", trigger="manual", summary=util.first_line(sentence, 200))
     prompt = draft_prompt(sentence, cfg, name, repo, taken)
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
     problem, folder, answer = "", Path(), {}
@@ -123,7 +121,7 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", say
             say(f"drafting, try {attempt} of {DRAFT_TRIES}")
             res = runner.run(prompt, DRAFTS_DIR, model=model or cfg.model("loop"), trace=(run_id, f"draft {attempt}"),
                              cfg=cfg, tools=[], json_schema=DRAFT_SCHEMA, persist=False, timeout=600)
-            state.update_run(run_id, model=res.model, runner=res.runner)
+            record.note(run_id, model=res.model, runner=res.runner)
             if not res.ok:
                 problem = f"the model failed: {util.first_line(res.error, 300)}"
                 continue
@@ -134,22 +132,20 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", say
             say(f"  the draft did not validate: {problem}")
             prompt += (f"\n\nYour last draft did not validate: {problem}\n\nThe last loop.toml:\n\n```toml\n"
                        f"{answer.get('loop_toml', '')}\n```\n\nFix it and return the whole draft again.")
-        totals = state.run_totals(run_id)
         if problem:
-            state.finish_run(run_id, "failed", summary=problem[:500], **totals)
+            record.settle(run_id, "failed", summary=problem[:500])
             raise control.Refused(f"no valid draft after {DRAFT_TRIES} tries: {problem}")
         dest = private_dir(cfg) / folder.name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(folder), dest)
         loop = loops.find(folder.name)
         loops.set_enabled(loop, False)
-        state.finish_run(run_id, "done", summary=f"drafted {loop.name} in {paths.short_path(dest)}", **totals)
+        record.settle(run_id, "done", summary=f"drafted {loop.name} in {paths.short_path(dest)}")
     except BaseException:
-        if state.run_get(run_id)["status"] == "running":
-            state.finish_run(run_id, "failed", summary="the draft stopped early", **state.run_totals(run_id))
+        record.settle(run_id, "failed", summary="the draft stopped early")
         raise
     return {"name": loop.name, "dir": str(dest), "note": str(answer.get("note") or ""), "run": run_id,
-            "cost_usd": totals["cost_usd"], "loop_toml": (dest / "loop.toml").read_text()}
+            "cost_usd": record.spent(run_id), "loop_toml": (dest / "loop.toml").read_text()}
 
 
 def sample_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
@@ -168,7 +164,7 @@ def try_loop(name: str, events: list[dict] | None = None, follow=None) -> dict:
         events = sample_events(loop, cfg)
         if not events:
             raise control.Refused(f"{name} found no events to try on; pass --events FILE with a JSON list of events")
-    run_id = state.unique_run_id(loop.name)
+    run_id = record.new_id(loop.name)
     result: dict = {}
     finished = threading.Event()
     follower = threading.Thread(target=follow, args=(run_id, lambda: not finished.is_set()),

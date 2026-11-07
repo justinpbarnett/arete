@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -216,6 +217,40 @@ def hold_lock(name: str) -> TextIO:
     f = lock_file(name)
     take_lock(f, wait=True)
     return f
+
+
+def pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def own_group() -> dict:
+    return {"process_group": 0} if os.getsid(0) == os.getpid() else {"start_new_session": True}
+
+
+def end_session(pid) -> None:
+    if not pid:
+        return
+    groups = {int(pid)}
+    listed = sh(["ps", "-A", "-o", "pid=,pgid="], timeout=10).stdout
+    for member, group in (map(int, line.split()) for line in listed.splitlines()):
+        try:
+            if os.getsid(member) == int(pid):
+                groups.add(group)
+        except OSError:
+            pass
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def lock_is_held(name: str) -> bool:

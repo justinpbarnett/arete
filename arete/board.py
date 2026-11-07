@@ -70,7 +70,7 @@ def live() -> dict:
             "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "repo": r["repo"] or "",
             "started": r["started"], "seconds": seconds_between(r["started"], None),
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
-            "cost": pipeline.logged_cost(lines),
+            "cost": round(r["cost_usd"] or 0, 2),
         })
     return {"runs": rows, "slots": len(pipeline.holding(running, "slot")), "max_parallel": config.load().max_parallel}
 
@@ -93,7 +93,7 @@ def recent(r: dict) -> dict:
         "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"],
         "state": STATE_OF_STATUS.get(r["status"], ""), "started": r["started"],
         "seconds": seconds_between(r["started"], r["finished"]),
-        "cost": pipeline.logged_cost(log_lines(r["id"])) if r["status"] == "running" else round(r["cost_usd"] or 0, 2),
+        "cost": round(r["cost_usd"] or 0, 2),
         "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
     }
 

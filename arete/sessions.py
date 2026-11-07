@@ -7,7 +7,19 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, control, devices, loops, paths, pi, runner, settings, state, util
+from . import (
+    config,
+    control,
+    devices,
+    loops,
+    paths,
+    pi,
+    record,
+    runner,
+    settings,
+    state,
+    util,
+)
 from .agent import NO_SESSION, Session
 from .pipeline import NO_GIT_WRITES
 
@@ -107,19 +119,19 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     which, name = runner.route(model, run_with)
     off = pi.withheld(tools, devices.get(device or "local").remote) if which == "pi" else {}
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
-    spec = Spec(state.unique_run_id("ses"), prompt, device or "local", model, run_with, tools, repo.strip(), budget_usd,
+    spec = Spec(record.new_id("ses"), prompt, device or "local", model, run_with, tools, repo.strip(), budget_usd,
                 created=util.iso())
     workspace(spec, cfg)
     save_spec(spec)
-    state.start_run(spec.id, "session", repo=spec.repo or None)
-    state.update_run(spec.id, device=spec.device, model=name, runner=which, trigger="manual",
-                     log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"),
-                     summary=util.first_line(prompt, 200), branch=spec.branch or None)
+    record.start("session", run_id=spec.id, lock=session_lock(spec.id), pid=None, repo=spec.repo or None,
+                 device=spec.device, model=name, runner=which, trigger="manual",
+                 log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"), summary=util.first_line(prompt, 200),
+                 branch=spec.branch or None)
     state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}; tools "
                                      f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
                                                                 for reason, withheld in off.items()))
     proc = control.detach(["session", "exec", spec.id], SESSION_LOG)
-    state.update_run(spec.id, pid=proc.pid)
+    record.note(spec.id, pid=proc.pid)
     return {"id": spec.id, "cwd": spec.cwd, "branch": spec.branch, "model": name, "runner": which,
             "device": spec.device, "tools": tools}
 
@@ -149,20 +161,23 @@ def stop_on_term(*_) -> None:
     raise SessionStopped("stopped by request")
 
 
+def session_lock(session_id: str) -> str:
+    return f"session-{session_id}"
+
+
 def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, turn: int,
               resume: Session) -> Session:
     log_line(spec, "you", prompt)
     left = None
     if spec.budget_usd:
-        left = round(spec.budget_usd - state.run_totals(spec.id)["cost_usd"], 2)
+        left = round(spec.budget_usd - record.spent(spec.id), 2)
         if left <= runner.BUDGET_FLOOR_USD:
             log_line(spec, "error", f"the session budget of ${spec.budget_usd:g} is spent")
             return resume
     res = runner.run(prompt, spec.cwd, model=spec.model, runner=spec.runner, trace=(spec.id, f"turn {turn}"),
                      resume=resume, cfg=cfg, device=device, tools=spec.tools, allowed_tools=spec.tools,
                      disallowed_tools=NO_GIT_WRITES, max_budget_usd=left, timeout=TURN_TIMEOUT_SECONDS)
-    totals = state.run_totals(spec.id)
-    state.update_run(spec.id, model=res.model, runner=res.runner, **totals)
+    record.note(spec.id, model=res.model, runner=res.runner)
     note = f"({res.turns} turns, ${res.cost_usd:.2f})"
     log_line(spec, "reply" if res.ok else "error", (res.text.strip() or "(no text)") + f"\n{note}" if res.ok
              else f"{res.error} {note}")
@@ -172,10 +187,10 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
 def execute(session_id: str) -> str:
     spec = load_spec(session_id)
     cfg = config.load()
-    with util.lock(f"session-{session_id}") as free:
+    with util.lock(session_lock(session_id)) as free:
         if not free:
             return "busy"
-        state.update_run(session_id, pid=os.getpid())
+        record.note(session_id, pid=os.getpid())
         signal.signal(signal.SIGTERM, stop_on_term)
         status, summary = "done", ""
         try:
@@ -202,10 +217,9 @@ def execute(session_id: str) -> str:
             status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        totals = state.run_totals(session_id)
         kept = f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else ""
-        log_line(spec, "end", f"{status}: {summary}{kept} (${totals['cost_usd']:.2f})")
-        state.finish_run(session_id, status, summary=f"{summary}{kept}"[:500], **totals)
+        log_line(spec, "end", f"{status}: {summary}{kept} (${record.spent(session_id):.2f})")
+        record.settle(session_id, status, summary=f"{summary}{kept}"[:500])
         return status
 
 

@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, paths, state, tracker, util, verify
+from . import config, gh, paths, record, state, tracker, util, verify
 from .evals import (
     EVALS,
     DirSource,
@@ -263,13 +263,13 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
         print(f"skip {s}")
     if dry_run or not picked:
         return 0
-    with util.lock("eval-mine") as got:
+    with util.lock(state.run_lock("eval-mine")) as got:
         if not got:
             print("an eval mine is already running")
             return 0
-        run_id = "-".join(filter(None, [state.new_run_id("eval"), "mine", repo_name]))
-        state.start_run(run_id, "eval", repo=repo_name or None)
-        tally, cost = {}, 0.0
+        run_id = record.start("eval", tag="-".join(filter(None, ["mine", repo_name])), lock=state.run_lock("eval-mine"),
+                              repo=repo_name or None)
+        tally = {}
         for c in picked:
             job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / slug(c.name), task=slug(c.name))
             try:
@@ -279,9 +279,8 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
             else:
                 state.add_mined(c.pr_url, c.repo.name, str(c.run["issue"]), run_id, o.status, o.why, o.task)
             job.log(f"{o.status}: {o.task or o.why}")
-            cost += job.cost
             tally[o.status] = tally.get(o.status, 0) + 1
         summary = f"mined {util.count(len(picked), 'merged PR')}: " + ", ".join(f"{n} {s}" for s, n in tally.items())
-        state.finish_run(run_id, "done", summary=summary, cost_usd=cost)
-        print(f"{summary}, ${cost:.2f}")
+        record.settle(run_id, "done", summary=summary)
+        print(f"{summary}, ${record.spent(run_id):.2f}")
         return 1 if "crashed" in tally else 0
