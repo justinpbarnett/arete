@@ -147,18 +147,13 @@ def feed(run_id: str, after: int = 0) -> dict:
     return {"run": r, "lines": state.feed(run_id, after)}
 
 
-def approvals() -> list[dict]:
-    return [{**a, "action": emits.EMITS[a["emit"]["type"]].describe(a["emit"]["item"])} for a in state.approvals("pending")]
-
-
 def decide(approval_id: int, yes: bool) -> dict:
-    if not state.approval(approval_id):
-        raise NotFound(f"no approval {approval_id}")
     try:
-        result = emits.approve(approval_id, yes)
-    except ValueError as e:
+        return {"id": approval_id, "approved": yes, "result": emits.decide(approval_id, yes)}
+    except LookupError as e:
+        raise NotFound(str(e)) from e
+    except (ValueError, emits.Failed) as e:
         raise Refused(str(e)) from e
-    return {"id": approval_id, "approved": yes, "result": result}
 
 
 def fleet() -> list[dict]:

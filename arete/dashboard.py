@@ -19,6 +19,7 @@ from . import (
     config,
     control,
     devices,
+    emits,
     engine,
     gh,
     hooks,
@@ -195,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith(FEED_PATH):
                 return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
             if path == "/api/approvals":
-                return {"approvals": control.approvals()}
+                return {"approvals": emits.waiting()}
             if path == "/api/devices":
                 return {"devices": control.fleet()}
             if path == "/api/sessions":

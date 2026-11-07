@@ -601,10 +601,9 @@ function serveLine(serve) {
 }
 
 function approvalRow(a) {
-  const body = a.emit?.item?.body || a.emit?.item?.text;
   return el("tr", {},
     cell(a.loop, "nb"),
-    cell([a.action, body ? fold(`approval:${a.id}`, "Show the body", el("pre", { class: "fold-text", text: body })) : null]),
+    cell([a.what, a.detail ? fold(`approval:${a.id}`, "Show the body", el("pre", { class: "fold-text", text: a.detail })) : null]),
     cell(clock(a.created)),
     cell([button("Approve", `approve:${a.id}`, (b) => decide(a.id, true, b)), " ",
       button("Reject", `reject:${a.id}`, (b) => decide(a.id, false, b))], "nb"));

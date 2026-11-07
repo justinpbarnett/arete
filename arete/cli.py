@@ -532,13 +532,13 @@ def cmd_session(args) -> int:
 
 
 def cmd_approve(args) -> int:
-    from . import control
+    from . import control, emits
 
     try:
         if args.id is None:
-            pending = control.approvals()
+            pending = emits.waiting()
             for a in pending:
-                print(f"#{a['id']:<4} {a['loop']:<20} {when(a['created'])}  {a['action']}"[:240])
+                print(f"#{a['id']:<4} {a['loop']:<20} {when(a['created'])}  {a['what']}"[:240])
             if not pending:
                 print("nothing waiting for approval")
             return 0

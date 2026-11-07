@@ -494,14 +494,10 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str) -> int:
         return cur.lastrowid
 
 
-def approvals(status: str | None = "pending", connect=db) -> list[dict]:
-    q, args = "SELECT * FROM approvals", []
-    if status:
-        q += " WHERE status = ?"
-        args.append(status)
-    with connect() as c:
-        return [{**dict(r), "emit": json.loads(r["emit"] or "{}")} for r in c.execute(q + " ORDER BY id DESC LIMIT 100",
-                                                                                     args)]
+def approvals() -> list[dict]:
+    with db() as c:
+        return [{**dict(r), "emit": json.loads(r["emit"] or "{}")}
+                for r in c.execute("SELECT * FROM approvals WHERE status = 'pending' ORDER BY id DESC LIMIT 100")]
 
 
 def approval(approval_id: int) -> dict | None:
