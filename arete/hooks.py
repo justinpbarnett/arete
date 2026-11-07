@@ -82,11 +82,10 @@ def receive(name: str, headers, body: bytes) -> dict:
     if not loop.enabled or loop.error:
         raise HookRefused(409, f"The loop {name} is turned off.")
     e = event_of(name, headers, body)
-    if not loop.trigger.admits(e):
-        raise HookRefused(403, f"The loop {name} takes only {loop.trigger.trust} events, and a webhook is untrusted.")
+    if why := loop.trigger.refusal(e):
+        raise HookRefused(403, f"The loop {name} {why}.")
     if e["key"] in state.seen_keys(e["source"]):
         return {"queued": False, "why": "already received", "key": e["key"]}
     state.mark_seen(e["source"], [e["key"]])
-    state.add_event(name, e)
-    item = state.enqueue(name, loop.queue_name, loop.trigger.group_of(e), "webhook", [e])
+    [item] = sources.fire(loop, "webhook", [e])
     return {"queued": True, "item": item, "key": e["key"], "at": util.iso()}

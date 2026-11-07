@@ -32,11 +32,11 @@ enabled = false                # a draft starts off; `arete loop enable NAME` tu
 [trigger]
 every = "1h"                   # or cron = "30 4 * * *" (minute hour day month weekday, local time); not both
 run_at_load = false            # also fire once when serve starts
-event = ["github.ci_red"]      # only these event types fire the loop; all types when left out
-webhook = false                # POST /hook/<name> fires the loop; `arete webhook secret NAME` prints the token
-metric = "pass_rate < 0.8"     # fire when the latest value of a metric crosses the rule
+event = ["github.ci_red"]      # only these event types fire the loop, from a source or a webhook; all types when left out
+webhook = false                # POST /hook/<name> fires the loop as type github.<X-GitHub-Event>, else webhook; `arete webhook secret NAME` prints the token
+metric = "pass_rate < 0.8"     # fire when the latest value of a metric crosses the rule; a metric event is internal and passes the event list
 group = "repo"                 # events that share this field wait in line one at a time
-trust = "untrusted"            # drop events below this trust: untrusted | internal | owner
+trust = "untrusted"            # refuse events below this trust: untrusted | internal | owner; a refused webhook gets 403
 
 [[source]]                     # polled by serve; new events fire the loop; the first read only sets a baseline
 type = "github"                # github | jira | log | command

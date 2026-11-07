@@ -40,7 +40,7 @@ class Server:
         self.polls: dict[str, Future] = {}
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
-        self.waiting: set[int] = set()
+        self.waiting: dict[int, str] = {}
         self.restarted: Counter[int] = Counter()
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
         self.loaded = False
@@ -87,9 +87,9 @@ class Server:
             state.set_loop_state(loop.name, next_due=due)
 
     def fire(self, loop: Loop, trigger: str, now: datetime) -> None:
-        state.enqueue(loop.name, loop.queue_name, "", trigger)
+        queued = sources.fire(loop, trigger)
         state.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
-        self.say(f"{loop.name}: fired by {trigger}")
+        self.say(f"{loop.name}: fired by {trigger}" if queued else f"{loop.name}: {trigger} fire joins the one that waits")
 
     def watch_metric(self, loop: Loop, st: dict) -> None:
         if not loop.trigger.metric:
@@ -100,12 +100,9 @@ class Server:
             return
         on = COMPARE[op](value, threshold)
         if on and not st.get("metric_on"):
-            state.enqueue(loop.name, loop.queue_name, "", "metric", [{
-                "type": "metric", "source": f"{loop.name}#metric", "key": f"{name}@{util.iso()}",
-                "title": f"{name} = {value:g}, {op} {threshold:g}", "trust": "internal",
-                "data": {"metric": name, "value": value, "rule": f"{op} {threshold:g}"}}])
+            if sources.fire(loop, "metric", [sources.metric_event(loop, value)]):
+                self.say(f"{loop.name}: fired by metric {name} = {value:g}")
             state.set_loop_state(loop.name, metric_on=1)
-            self.say(f"{loop.name}: fired by metric {name} = {value:g}")
         elif not on and st.get("metric_on"):
             state.set_loop_state(loop.name, metric_on=0)
 
@@ -133,22 +130,16 @@ class Server:
             self.errors[sid] = text
             return
         self.errors.pop(sid, None)
-        batches: dict[str, list[dict]] = {}
-        for e in found:
-            state.add_event(loop.name, e)
-            batches.setdefault(loop.trigger.group_of(e), []).append(e)
-        for group, batch in batches.items():
-            state.enqueue(loop.name, loop.queue_name, group, "event", batch)
-        if found:
-            self.say(f"{sid}: {util.count(len(found), 'new event')}")
+        if items := sources.fire(loop, "event", found):
+            self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
         running = [r for r in state.runs_marked_running() if r["kind"] == "loop"]
         per_queue = Counter(r["queue"] or r["loop"] for r in running)
         held_groups = {(r["queue"] or r["loop"], r["grp"]) for r in running if r["grp"]}
-        busy: set[str] = set()
+        busy = {r["loop"] for r in running}
         pending = state.pending()
-        self.waiting &= {item["id"] for item in pending}
+        self.waiting = {i: why for i, why in self.waiting.items() if i in {item["id"] for item in pending}}
         for item in pending:
             loop = by_name.get(item["loop"])
             if not loop or not loop.enabled or loop.error:
@@ -156,32 +147,35 @@ class Server:
                 self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
                 continue
             key = (item["queue"], item["grp"])
-            full = per_queue[item["queue"]] >= self.cfg.queues.get(item["queue"], 1)
-            if item["loop"] in busy or full or (item["grp"] and key in held_groups):
-                if item["grp"]:
-                    held_groups.add(key)
-                continue
-            try:
-                run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)
-            except control.Busy as e:
-                busy.add(loop.name)
-                if item["grp"]:
-                    held_groups.add(key)
-                if item["id"] not in self.waiting:
-                    self.waiting.add(item["id"])
-                    self.say(f"{loop.name}: queue item {item['id']} waits, {e}")
-                continue
-            except engine.NeverBegan as e:
-                self.retry_once(item, str(e))
-                continue
-            except (control.NotFound, control.Refused):
-                continue
-            self.waiting.discard(item["id"])
-            busy.add(loop.name)
-            per_queue[item["queue"]] += 1
+            size = self.cfg.queues.get(item["queue"], 1)
+            if item["grp"] and key in held_groups:
+                why = f"group {item['grp']} takes one at a time"
+            elif loop.name in busy:
+                why = str(control.Busy(loop.name))
+            elif per_queue[item["queue"]] >= size:
+                why = f"queue {item['queue']} is full at {util.count(size, 'run')}"
+            else:
+                try:
+                    run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)
+                except control.Busy as e:
+                    busy.add(loop.name)
+                    why = str(e)
+                except engine.NeverBegan as e:
+                    self.retry_once(item, str(e))
+                    continue
+                except (control.NotFound, control.Refused):
+                    continue
+                else:
+                    self.waiting.pop(item["id"], None)
+                    busy.add(loop.name)
+                    per_queue[item["queue"]] += 1
+                    why = ""
+                    self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
             if item["grp"]:
                 held_groups.add(key)
-            self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
+            if why and self.waiting.get(item["id"]) != why:
+                self.waiting[item["id"]] = why
+                self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
 
     def retry_once(self, item: dict, why: str) -> None:
         if self.restarted[item["id"]]:

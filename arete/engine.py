@@ -201,8 +201,7 @@ def from_loop_folder(argv: list[str], loop: Loop) -> list[str]:
 
 
 def weakest_trust(events: list[dict]) -> str:
-    found = {e.get("trust") or "untrusted" for e in events}
-    return next((t for t in loops.TRUST_ORDER if t in found), "internal")
+    return loops.TRUST_ORDER[min((loops.trust_rank(e.get("trust")) for e in events), default=loops.trust_rank("internal"))]
 
 
 def fingerprint_key(loop: Loop, f: dict) -> str:
@@ -224,7 +223,7 @@ class Stopped(Exception):
 
 
 def stop_on_term(*_) -> None:
-    raise Stopped("stopped by a signal")
+    raise Stopped
 
 
 class NeverBegan(control.Refused):
@@ -242,7 +241,7 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
         raise control.NotFound(f"queue item {item} is gone")
     with util.lock_file(state.loop_lock(loop.name)) as held:
         if not util.take_lock(held, wait=False):
-            raise control.Busy(f"{loop.name} is running; stop it or wait")
+            raise control.Busy(loop.name)
         for stale in state.runs_marked_running():
             if stale["kind"] == "loop" and stale["loop"] == loop.name:
                 record.interrupt(stale)
@@ -300,8 +299,8 @@ def carry(run: LoopRun) -> str:
             status, summary = KINDS[run.loop.kind](run)
     except OverBudget as e:
         status, summary = "skipped", f"budget: {e}"
-    except Stopped as e:
-        status, summary = "stopped", str(e)
+    except Stopped:
+        status, summary = "stopped", record.STOPPED if record.stop_asked(run.id) else "stopped by a signal"
     except Exception as e:
         run.log("error", traceback.format_exc().strip())
         status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
@@ -370,8 +369,8 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     if code != 0:
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
     fresh = new_findings(run, found)
-    outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events)
-               if run.events else "internal", **({"value": value} if value is not None else {})}
+    outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events),
+               **({"value": value} if value is not None else {})}
     if loop.emits and (fresh or value is not None):
         emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", took + (f", {util.count(len(fresh), 'new finding')}" if found else "")
@@ -468,7 +467,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     if not run.trial and isinstance(answer.get("state"), dict):
         state.set_loop_state(loop.name, data=answer["state"])
     summary = util.first_line(answer.get("summary") or "", 300)
-    outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events) if events else "internal"}
+    outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events)}
     if fresh or any(e["type"] == "metric" for e in loop.emits):
         emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", f"{summary} ({util.count(len(fresh), 'new finding')}, {len(found) - len(fresh)} seen before)"

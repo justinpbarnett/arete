@@ -36,6 +36,23 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
             "url": url, "trust": trust, "data": data or {}}
 
 
+def metric_event(loop: Loop, value: float) -> dict:
+    name, op, threshold = loop.trigger.metric
+    return event("metric", f"{loop.name}#metric", f"{name}@{util.iso()}", f"{name} = {value:g}, {op} {threshold:g}",
+                 trust="internal", data={"metric": name, "value": value, "rule": f"{op} {threshold:g}"})
+
+
+def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
+    if events is None:
+        return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how)) else []
+    batches: dict[str, list[dict]] = {}
+    for e in events:
+        if not loop.trigger.refusal(e):
+            state.add_event(loop.name, e)
+            batches.setdefault(loop.trigger.group_of(e), []).append(e)
+    return [state.enqueue(loop.name, loop.queue_name, group, how, batch) for group, batch in batches.items()]
+
+
 def github_name(cfg: config.Config, name: str) -> str:
     if "/" in name:
         return name
@@ -52,19 +69,14 @@ def poll(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
     fresh = list({e["key"]: e for e in fresh}.values())
     state.mark_seen(sid, [e["key"] for e in fresh])
     state.set_cursor(sid, value, True, f"{len(found)} read, {len(fresh)} new{' (baseline)' if first else ''}")
-    return [] if first else wanted_events(loop, fresh)
-
-
-def wanted_events(loop: Loop, found: list[dict]) -> list[dict]:
-    types = loop.trigger.events
-    return [e for e in found if (not types or e["type"] in types) and loop.trigger.admits(e)]
+    return [] if first else fresh
 
 
 def peek(loop: Loop, index: int, cfg: config.Config, limit: int = 5) -> list[dict]:
     source = loop.sources[index]
     sid = source_id(loop, index)
     found, _ = fetch(loop, source, cfg, sid, "{}")
-    return wanted_events(loop, found)[-limit:]
+    return [e for e in found if not loop.trigger.refusal(e)][-limit:]
 
 
 def fetch(loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:

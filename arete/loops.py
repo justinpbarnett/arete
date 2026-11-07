@@ -36,9 +36,13 @@ class Trigger:
     def group_of(self, e: dict) -> str:
         return str(e.get(self.group) or (e.get("data") or {}).get(self.group) or "") if self.group else ""
 
-    def admits(self, e: dict) -> bool:
-        given = e.get("trust")
-        return (TRUST_ORDER.index(given) if given in TRUST_ORDER else 0) >= TRUST_ORDER.index(self.trust)
+    def refusal(self, e: dict) -> str:
+        takes = [*self.events, *(["metric"] if self.metric else [])]
+        if self.events and e.get("type") not in takes:
+            return f"takes only {', '.join(takes)} events, and this one is {e.get('type')}"
+        if trust_rank(e.get("trust")) < trust_rank(self.trust):
+            return f"takes only {self.trust} events or above, and this one is {e.get('trust') or 'untrusted'}"
+        return ""
 
     @property
     def schedule(self) -> str:
@@ -134,6 +138,10 @@ class Loop:
 
 class LoopError(ValueError):
     pass
+
+
+def trust_rank(trust) -> int:
+    return TRUST_ORDER.index(trust) if trust in TRUST_ORDER else 0
 
 
 def fmt_seconds(s: float) -> str:
@@ -255,6 +263,7 @@ def metric_rule(text: str) -> tuple[str, str, float]:
 
 def validate(loop: Loop, cfg: config.Config) -> None:
     from .emits import EMITS
+    from .sources import metric_event
 
     problems = []
     if loop.kind not in KINDS:
@@ -263,6 +272,8 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("[trigger] takes cron or every, not both")
     if loop.trigger.trust not in TRUST_ORDER:
         problems.append(f"[trigger] trust '{loop.trigger.trust}' is not one of {', '.join(TRUST_ORDER)}")
+    elif loop.trigger.metric and (why := loop.trigger.refusal(metric_event(loop, 0))):
+        problems.append(f"[trigger] metric would never fire: the loop {why}")
     if loop.kind == "command" and not loop.command:
         problems.append("a command loop needs [run] command")
     if loop.agent and not loop.prompt_file.is_file():

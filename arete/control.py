@@ -24,7 +24,8 @@ class NotFound(LookupError):
 
 
 class Busy(RuntimeError):
-    pass
+    def __init__(self, name: str) -> None:
+        super().__init__(f"{name} is running; stop it or wait")
 
 
 class Refused(ValueError):
