@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import config, paths, util
@@ -55,19 +55,23 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def with_free_ports(v: config.Verify) -> config.Verify:
+    ports = {name: free_port() for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
+
+    def filled(text: str) -> str:
+        return PORT_FIELD.sub(lambda m: str(ports[m.group(1)]), text)
+
+    return replace(v, start=filled(v.start), url=filled(v.url), notes=filled(v.notes))
+
+
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path):
     if not v.start:
         yield ""
         return
-    ports = {name: free_port() for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url))}
-
-    def with_ports(text: str) -> str:
-        return PORT_FIELD.sub(lambda m: str(ports[m.group(1)]), text)
-
-    url = with_ports(v.url).rstrip("/")
+    url = v.url.rstrip("/")
     with open(log, "w") as out:
-        proc = subprocess.Popen(with_ports(v.start), shell=True, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(v.start, shell=True, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)

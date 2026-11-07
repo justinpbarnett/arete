@@ -980,7 +980,7 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> verify.Verified:
-    run, v, t = b.run, b.layer.verify, b.ticket
+    run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
     step = b.next_step(step_name)
     evidence = run.dir / "evidence"
     evidence.mkdir(exist_ok=True)
