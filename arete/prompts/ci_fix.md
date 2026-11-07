@@ -1,5 +1,5 @@
 Arete committed your change, pushed it and opened the PR. CI then ran on the PR, and these checks failed.
-Round $round of $max_rounds.
+This is round $round of $max_rounds.
 
 $failures
 
@@ -8,7 +8,10 @@ test database or service that drifted, a flaky test, an expired secret, an outag
 date matters: a check that passed on the base weeks ago may fail there now. Compare what failed with what the PR
 changes: $diff. Run each command on its own, with no pipe or `&&`, since Bash allows only the listed commands.
 
-- Caused by the PR: $when_caused.
+- Caused by the PR, in a round before round $max_rounds: fix the cause in the code. Do not weaken, skip, or delete
+  tests, and do not change the CI setup. Run the checks yourself before you finish: $checks.
+- Caused by the PR, in round $max_rounds: change nothing. This is the last round, so arete will not push again. It
+  fails the run and turns the PRs to drafts for a person to pick up.
 - Not caused by the PR: change nothing for that check.
 - Caused by the PR, but the only way to pass is to undo what the ticket asked for, or to change the CI setup: change
   nothing for that check, and say so in its reason, so a person can decide.

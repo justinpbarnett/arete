@@ -11,7 +11,7 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 | 0 heartbeat | `arete heartbeat` | hourly | Checks launchd jobs, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
 | 1 miner | `arete mine` | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. |
 | 2 auditor | `arete audit` | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
-| 3 pipeline | `arete poll`, `arete run REPO TICKET` | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR. Review comments on that PR start a revision. |
+| 3 pipeline | `arete poll`, `arete run REPO TICKET` | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. |
 | 4 evals | `arete eval REPO`, `arete eval mine` | on demand, nightly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `eval mine` writes new tasks from merged arete PRs. |
 | 5 triage | `arete triage` | hourly | Reads your open tickets that do not have the `agent` label yet and says which are ready to build, what each one is missing, its size and a short plan. It never writes to a ticket. |
 
@@ -148,7 +148,7 @@ notes = "Sign up only with addresses at example.test."
 | `setup.commands` | Run in each fresh worktree before the agent starts. |
 | `setup.copy` | Files copied from the main checkout into each worktree. |
 | `checks` | Every check must exit 0 before review. The agent may run them while it builds. |
-| `limits` | Diff size, paths the change may not touch, fix attempts, and the run timeout. Code enforces them after the agent finishes. |
+| `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), and the run timeout. Code enforces them after the agent finishes. |
 | `agent.allow_bash` | Bash patterns the agent may run, on top of read only git and file commands. |
 | `trust.level` | `pr`, or `automerge` once earned. |
 | `trust.automerge_after` | Merged PRs in a row before arete opens a PR proposing automerge. |
@@ -174,6 +174,15 @@ Checks passing is not the bar. After the checks, a verifier agent uses the chang
 - Blocked: the verifier could not check something (a service it may not reach, a sign in it cannot finish). The PR opens as a draft and says what it would take.
 
 Arete stops the server's whole process group after each verifier run, so no dev server outlives its step.
+
+## CI
+
+After the push, the run waits for the checks on the PR. It waits up to 30 minutes, or 3 minutes when no check reports at all. Arete compares each failed check with the same check on the head of the base branch.
+
+- Red on the base too: the PR section notes the base result and its date. This PR did not cause it, so nothing changes.
+- Passed on the base, or no result there: a CI fix step reads the job log and the diff, and decides whether the PR caused the failure. A check that the PR did not cause gets a note with the reason. For a check that the PR did cause, the step fixes the code. Then the checks and the diff limit run again, arete pushes the fix, and the wait starts again. `limits.max_attempts` caps the rounds, and the diff limit counts the whole branch.
+
+After each round, arete writes a `## CI` section into the PR body. It shows what passed, each red check with its base result and reason, and the earlier rounds. When the PR still causes a red check after the last round, or the fix step fails, arete turns the PR to a draft and fails the run. The section then ends with `Arete stopped:` and the reason. The PR stays open. Review comments on it start a revision, as on any arete PR. A later run that is approved and green marks it ready again. A run gets the status `pr` only when its PR caused no red check.
 
 ## PR feedback
 

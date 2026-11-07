@@ -214,8 +214,8 @@ def merged_pr_names(repo: str, branch: str, text: str) -> bool:
     return bool(found)
 
 
-def pr_draft(url: str) -> None:
-    gh(["pr", "ready", url, "--undo"])
+def pr_set_draft(url: str, draft: bool) -> None:
+    gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
 def pr_merge_auto(repo: str, number: int) -> None:
@@ -252,11 +252,11 @@ STATUS_STATES = {"success": "pass", "pending": "pending", "failure": "fail", "er
 class Check:
     name: str
     state: str
-    when: str = ""
+    updated: str = ""
     link: str = ""
     job: int = 0
-    about: str = ""
-    order: int = 0
+    description: str = ""
+    check_run_id: int = 0
 
 
 def check_from_run(row: dict) -> Check:
@@ -277,18 +277,17 @@ def check_from_status(row: dict) -> Check:
 
 def commit_checks(repo: str, ref: str) -> dict[str, Check]:
     pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repo}/commits/{ref}/check-runs?per_page=100"]) or []
-    runs = sorted((check_from_run(r) for page in pages for r in page.get("check_runs", [])), key=lambda c: c.order)
+    runs = sorted((check_from_run(r) for page in pages for r in page.get("check_runs", [])), key=lambda c: c.check_run_id)
     statuses = (gh_json(["api", f"repos/{repo}/commits/{ref}/status?per_page=100"]) or {}).get("statuses", [])
     newest: dict[str, Check] = {c.name: c for c in runs}
     for c in map(check_from_status, statuses):
-        if c.name not in newest or c.when > newest[c.name].when:
+        if c.name not in newest or c.updated > newest[c.name].updated:
             newest[c.name] = c
     return newest
 
 
-def branch_head(repo: str, branch: str) -> tuple[str, str]:
-    found = gh_json(["api", f"repos/{repo}/commits/{branch}", "--jq", "{sha: .sha, date: .commit.committer.date}"])
-    return found["sha"], found["date"]
+def branch_sha(repo: str, branch: str) -> str:
+    return gh(["api", f"repos/{repo}/commits/{branch}", "--jq", ".sha"]).strip()
 
 
 def job_log(repo: str, job: int) -> str:

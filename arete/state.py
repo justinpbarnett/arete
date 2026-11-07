@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 from . import paths, util
 
+OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -184,9 +185,13 @@ def runs_since(since: str, connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
 
 
+def has_open_pr(r: dict) -> bool:
+    return r["status"] == "pr" or (r["status"] == "failed" and bool(r.get("pr_url")))
+
+
 def open_runs(repo: str, issue: int | str) -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE repo = ? AND issue = ? AND status = 'pr' "
+        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "
                                            "ORDER BY started DESC", (repo, issue))]
 
 
@@ -359,7 +364,7 @@ def feedback_due(repo: str, quiet_since: str) -> list[str]:
     with db() as c:
         rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "
                          "WHERE repo = ? AND status = 'new' AND EXISTS (SELECT 1 FROM runs WHERE runs.repo = f.repo "
-                         "AND runs.issue = f.issue AND runs.status = 'pr' "
+                         f"AND runs.issue = f.issue AND {OPEN_PR_RUN} "
                          "AND ' ' || runs.pr_url || ' ' LIKE '% ' || f.pr_url || ' %') "
                          "GROUP BY issue ORDER BY last", (repo,))
         return [str(r["issue"]) for r in rows if r["at_once"] or r["last"] <= quiet_since]

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -118,8 +119,6 @@ CI_FIX_SCHEMA = {
     "required": ["checks", "summary"],
 }
 MAX_CI_REASON_CHARS = 700
-CI_FIX_LAST_ROUND = ("change nothing. This is the last round, so arete will not push again; it fails the run and "
-                     "turns the PRs to drafts for a person to pick up")
 FEEDBACK_QUIET_MINUTES = 10
 HUNK_LINES = 6
 PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
@@ -141,6 +140,10 @@ def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
 
 def bash_rules(patterns: list[str]) -> list[str]:
     return [f"Bash({p})" for p in patterns]
+
+
+def denied_paths(layer: config.RepoLayer) -> list[str]:
+    return ALWAYS_DENY + layer.deny
 
 
 def code_list(names: list[str]) -> str:
@@ -536,6 +539,7 @@ class Build(TicketWork):
     session: claude.Session = field(default_factory=claude.Session)
     report: str = ""
     staged: Staged = field(default_factory=Staged)
+    committed_lines: int = 0
 
     def resume(self, step: str, text: str, **kw) -> claude.Result:
         res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
@@ -554,13 +558,19 @@ class Build(TicketWork):
     def require_valid_diff(self, after: str, planned: str = "") -> None:
         staged = self.restage()
         limit = self.layer.max_diff_lines
+        total = staged.lines + self.committed_lines
         if not staged.files:
             raise RunFailed(f"{after} undid every change")
         if staged.denied:
             raise RunFailed(f"{after} touched denied paths: {', '.join(staged.denied[:5])}")
-        if staged.lines > limit:
-            raise RunFailed(f"after {after} the diff is {staged.lines} lines, over the {limit} line limit{planned}; "
-                            "split the work", f"### Lines changed by file\n\n{lines_by_file(self.checkouts)}")
+        if total > limit:
+            pushed = f"\n- pushed earlier in this run: {self.committed_lines}" if self.committed_lines else ""
+            raise RunFailed(f"after {after} the diff is {total} lines, over the {limit} line limit{planned}; "
+                            "split the work", f"### Lines changed by file\n\n{lines_by_file(self.checkouts)}{pushed}")
+
+    def push(self, branch: str, message: str) -> None:
+        commit_and_push(self.checkouts, self.staged.changed, branch, message)
+        self.committed_lines += self.staged.lines
 
     def recheck(self, after: str) -> None:
         if not self.check():
@@ -725,7 +735,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     step_timeout = layer.timeout_minutes * 60
     read_tools = READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
     build_tools = EDIT_TOOLS + bash_rules(builder_bash)
-    deny = ALWAYS_DENY + layer.deny
+    deny = denied_paths(layer)
     limit = layer.max_diff_lines
     info = tk.label_name("needs-info")
     replies: list[dict] = []
@@ -816,8 +826,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         verified = verify_in_use(b, goal, build_summary)
         review = _review(b, plan_text, verified, "review2")
 
-    approved = review.get("verdict") == "approve"
-    blocked = verified.verdict == "blocked"
+    draft_why = draft_reason(review.get("verdict") == "approve", verified)
     _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=True)
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
@@ -842,14 +851,14 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     )
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
-    commit_and_push(checkouts, staged.changed, branch, message)
+    b.push(branch, message)
     opened: list[Checkout] = []
     for c in staged.changed:
         if not c.pr:
             c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{tk.pr_link(t)}\n\n{report_body}",
-                                labels=tk.pr_labels, draft=not approved or blocked, cwd=c.wt)
+                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
             opened.append(c)
-            run.log(f"opened {c.pr}{'' if approved and not blocked else ' as draft'}")
+            run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
             run.log(f"pushed to {c.pr}")
     pushed = [c for c in staged.changed if c not in opened]
@@ -863,7 +872,15 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
             gh.pr_edit_body(c.pr, with_siblings(gh.pr_body(c.pr), others))
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
-    ci_result = watch_ci(b, branch, staged.changed, with_prs)
+    try:
+        ci_result = watch_ci(b, branch, staged.changed, with_prs, draft_why)
+    except RunFailed as e:
+        if run.feedback:
+            raise
+        prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
+        status, why, _ = _fail(run, e.why, detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR "
+                                                  "start a revision, as on any arete PR.")
+        return status, why, record_prs(run, branch, with_prs)
     outcome += f", CI: {ci_result}"
     run.enter("pr")
     pr_lines = "\n".join(f"- {'Opened' if c in opened else 'Pushed to' if c in pushed else 'Unchanged'} [{c.pr_name}]({c.pr})"
@@ -873,19 +890,24 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         run.say(f"Revised for your review.\n\n{report_body}\n\nCI: {ci_result}.")
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
-                + ("" if not opened else draft_note(approved, verified)))
-    if approved and not blocked and layer.trust_level == "automerge":
+                + ("" if not opened else draft_note(draft_why, verified)))
+    if not draft_why and layer.trust_level == "automerge":
         for c in opened:
             try:
                 gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
                 run.log(f"automerge enabled on {c.pr}")
             except gh.GhError as e:
                 run.log(f"automerge failed on {c.pr}: {e}")
+    urls = record_prs(run, branch, with_prs)
+    remove_workspace(ws, checkouts)
+    return "pr", outcome, urls
+
+
+def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
     urls = [c.pr for c in with_prs]
     supersede_older_runs(run, urls)
     state.update_run(run.id, branch=branch)
-    remove_workspace(ws, checkouts)
-    return "pr", outcome, " ".join(urls)
+    return " ".join(urls)
 
 
 def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
@@ -910,19 +932,39 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
         pushed.append(c)
 
 
-def watch_ci(b: Build, branch: str, pushed: list[Checkout], with_prs: list[Checkout]) -> str:
+def watch_ci(b: Build, branch: str, pushed: list[Checkout], with_prs: list[Checkout], draft_why: str) -> str:
+    run, max_rounds = b.run, b.layer.max_attempts
+    stopped_before = [c for c in pushed if stopped_by_ci(run, c)]
     rounds: list[ci.Round] = []
-    most = b.layer.max_attempts
     try:
-        result = ci_rounds(b, branch, pushed, rounds)
-    except RunFailed as e:
-        drafted = [c for c in with_prs if to_draft(b.run, c)]
-        if rounds:
-            now = drafted_note(drafted, with_prs)
-            publish_ci(b.run, pushed, ci.section(rounds, most, f"Arete stopped: {e.why}. {now}"))
-        raise
-    publish_ci(b.run, pushed, ci.section(rounds, most))
-    return result
+        for current in ci_rounds(b, branch, pushed, max_rounds):
+            rounds.append(current)
+            publish_ci(run, pushed, ci.section(rounds, max_rounds))
+    except Exception as e:
+        failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
+        drafted = [c for c in with_prs if set_draft(run, c, True)]
+        ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, with_prs)}"
+        publish_ci(run, pushed, ci.section(rounds, max_rounds, ending))
+        if failed is e:
+            raise
+        raise failed from e
+    last = rounds[-1]
+    if stopped_before and not draft_why and last.all_read:
+        for c in stopped_before:
+            set_draft(run, c, False)
+    elif stopped_before:
+        why = draft_why or "arete could not read every check"
+        ending = f"{ci.STOPPED} an earlier CI watch made this PR a draft. It stays a draft, since in this run {why}."
+        publish_ci(run, stopped_before, ci.section(rounds, max_rounds, ending))
+    return last.summary()
+
+
+def stopped_by_ci(run: AgentRun, c: Checkout) -> bool:
+    try:
+        return ci.stopped(gh.pr_body(c.pr))
+    except gh.GhError as e:
+        run.log(f"ci: could not read the body of {c.pr}: {util.first_line(str(e), 300)}")
+        return False
 
 
 def drafted_note(drafted: list[Checkout], with_prs: list[Checkout]) -> str:
@@ -931,94 +973,95 @@ def drafted_note(drafted: list[Checkout], with_prs: list[Checkout]) -> str:
     return "The PR is now a draft." if len(with_prs) == 1 else "The PRs are now drafts."
 
 
-def to_draft(run: AgentRun, c: Checkout) -> bool:
+def set_draft(run: AgentRun, c: Checkout, draft: bool) -> bool:
+    now = "a draft" if draft else "ready for review"
     try:
-        gh.pr_draft(c.pr)
+        gh.pr_set_draft(c.pr, draft)
     except gh.GhError as e:
-        run.log(f"ci: could not turn {c.pr} to a draft: {util.first_line(str(e), 300)}")
+        run.log(f"ci: could not mark {c.pr} {now}: {util.first_line(str(e), 300)}")
         return False
-    run.log(f"ci: turned {c.pr} to a draft")
+    run.log(f"ci: marked {c.pr} {now}")
     return True
 
 
-def ci_rounds(b: Build, branch: str, pushed: list[Checkout], rounds: list[ci.Round]) -> str:
-    run, most = b.run, b.layer.max_attempts
+def ci_rounds(b: Build, branch: str, pushed: list[Checkout], max_rounds: int) -> Iterator[ci.Round]:
+    run = b.run
     targets = {c.github: ci_target(c) for c in pushed}
-    cleared: dict[tuple[str, str, str], str] = {}
-    for n in range(1, most + 1):
+    not_caused: dict[tuple[str, str, str], str] = {}
+    for n in range(1, max_rounds + 1):
         current = ci.Round(n, [ci.compare_with_base(ci.watch(t, run.log), run.log) for t in targets.values()])
-        rounds.append(current)
-        judged = [r for r in current.reds if not r.red_on_base]
+        judged = [r for r in current.reds if r.kind != "base"]
         for r in judged:
-            if r.key in cleared:
-                r.caused, r.reason = False, cleared[r.key]
-        fresh = [r for r in judged if r.key not in cleared]
-        fix_summary = judge_ci(b, fresh, n) if fresh else ""
-        cleared.update({r.key: r.reason for r in judged if not r.caused})
+            if r.key in not_caused:
+                r.caused, r.reason = False, not_caused[r.key]
+        fresh = [r for r in judged if r.key not in not_caused]
+        try:
+            fix_summary = judge_ci(b, fresh, n, max_rounds) if fresh else ""
+        except RunFailed:
+            yield current
+            raise
+        not_caused.update({r.key: r.reason for r in judged if not r.caused})
+        yield current
         caused = current.caused
         if not caused:
             if fresh:
                 discard_edits(b)
-            return current.summary()
+            return
         names = ", ".join(r.label for r in caused)
-        if n == most:
-            raise RunFailed(f"CI still fails after {util.count(most, 'round')}: {names}", ci_detail(caused))
-        if not b.restage().files:
-            raise RunFailed(f"the CI fix step said the PR caused {names} but changed nothing", ci_detail(caused))
-        b.recheck("the CI fix")
-        commit_and_push(b.checkouts, b.staged.changed, branch, ci_fix_message(b, caused))
+        if n == max_rounds:
+            raise RunFailed(f"CI still fails after {util.count(max_rounds, 'round')}: {names}", ci.red_list(caused))
+        push_ci_fix(b, branch, caused, names, n)
         for c in b.staged.changed:
             targets[c.github] = ci_target(c)
         current.story = f"{names} failed, caused by this PR, and arete pushed a fix: {fix_summary}".rstrip(": ")
         run.log(f"ci: pushed a fix for {names}")
-    raise AssertionError("the CI loop returns or raises in its last round")
+
+
+def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int) -> None:
+    staged = b.restage()
+    if not staged.files:
+        raise RunFailed(f"{names} failed, caused by this PR, and the CI fix step changed nothing", ci.red_list(caused))
+    if no_pr := [c.github for c in staged.changed if not c.pr]:
+        raise RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
+                        ci.red_list(caused))
+    if not b.check():
+        report = f"checks-ci-round{n}.md"
+        b.run.save(report, b.report)
+        raise RunFailed("the checks failed after the CI fix",
+                        f"{ci.red_list(caused)}\n\nThe check output is in `{report}` of run `{b.run.id}`.")
+    b.require_valid_diff("the CI fix")
+    b.push(branch, ci_fix_message(b, caused))
 
 
 def ci_target(c: Checkout) -> ci.Target:
-    return ci.Target(c.github, c.pr, c.pr_name, git(["rev-parse", "HEAD"], c.wt).strip(), c.base)
+    return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.base)
 
 
-def judge_ci(b: Build, reds: list[ci.Red], n: int) -> str:
+def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int) -> str:
     run = b.run
     logs = run.dir / "ci"
     logs.mkdir(exist_ok=True)
     if logs not in run.add_dirs:
         run.add_dirs.append(logs)
-    failures = "\n\n".join(ci_failure(r, logs / f"round{n}-{slug(r.label)}.log") for r in reds)
+    failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{slug(r.label)}.log") for r in reds)
     diff = ", ".join(f"`git {f'-C {c.dir} ' if c.dir else ''}diff origin/{c.base}...HEAD`" for c in b.checkouts)
-    most = b.layer.max_attempts
-    when_caused = (CI_FIX_LAST_ROUND if n == most else
-                   f"fix the cause in the code. Do not weaken, skip, or delete tests, and do not change the CI setup. "
-                   f"Run the checks yourself before you finish: {check_list(b.layer)}")
-    res = b.resume(b.next_step("ci_fix"), prompt("ci_fix", round=n, max_rounds=most, failures=failures, diff=diff,
-                                                 when_caused=when_caused), json_schema=CI_FIX_SCHEMA)
-    found = res.structured if res.ok and isinstance(res.structured, dict) else {}
-    verdicts = {plain(v.get("name", "")): v for v in found.get("checks", []) if isinstance(v, dict)}
+    res = b.resume(b.next_step("ci_fix"), prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures,
+                                                 diff=diff, checks=check_list(b.layer)), json_schema=CI_FIX_SCHEMA)
+    if not res.ok or not isinstance(res.structured, dict):
+        for r in reds:
+            r.reason = "The CI fix step failed before it judged this check."
+        raise RunFailed("the CI fix step failed", ci.red_list(reds))
+    verdicts = {name_key(v.get("name", "")): v for v in res.structured.get("checks", []) if isinstance(v, dict)}
     for r in reds:
-        v = verdicts.get(plain(r.label)) or verdicts.get(plain(r.check.name)) or {}
+        v = verdicts.get(name_key(r.label)) or verdicts.get(name_key(r.check.name)) or {}
         r.caused = v.get("caused_by_pr") is not False
         r.reason = ci.clip(v.get("reason") or "The fix step gave no verdict for this check.", MAX_CI_REASON_CHARS)
         run.log(f"ci: {r.label} {'caused' if r.caused else 'not caused'} by the PR: {util.first_line(r.reason, 200)}")
-    return ci.clip(found.get("summary", ""), MAX_CI_REASON_CHARS)
+    return ci.clip(res.structured.get("summary", ""), MAX_CI_REASON_CHARS)
 
 
-def plain(name: str) -> str:
+def name_key(name: str) -> str:
     return " ".join(name.lower().split())
-
-
-def ci_failure(r: ci.Red, log_file: Path) -> str:
-    lines = [f"### {r.label}", "", f"- Link: {r.check.link or 'none'}", f"- On the base: {r.base_result}"]
-    if r.check.about:
-        lines.append(f"- GitHub says: {r.check.about}")
-    if not r.check.job:
-        return "\n".join([*lines, "- This check has no Actions log. Judge it from its name, what GitHub says, and the diff."])
-    try:
-        text = gh.job_log(r.target.github, r.check.job)
-    except gh.GhError as e:
-        return "\n".join([*lines, f"- Arete could not read its log: {util.first_line(str(e), 300)}"])
-    log_file.write_text(text)
-    return "\n".join([*lines, f"- Full log: `{log_file}`", "", "The log up to its last error:", "", "````",
-                      ci.excerpt(text), "````"])
 
 
 def discard_edits(b: Build) -> None:
@@ -1032,11 +1075,6 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     subject = fill_template(b.layer.subject, config.RepoLayer.subject, kind="fix", id=b.ticket.id,
                             title=f"make {names} pass in CI")
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
-
-
-def ci_detail(reds: list[ci.Red]) -> str:
-    return "### CI\n\n" + "\n".join(f"- [{r.target.pr_name}]({r.target.pr}): {ci.linked(r.check)}. {r.reason}".rstrip()
-                                     for r in reds)
 
 
 def publish_ci(run: AgentRun, pushed: list[Checkout], ci_section: str) -> None:
@@ -1122,11 +1160,9 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch
     answer_feedback(run, replies, "No code change for this one; see the overall reply.")
     run.say(f"No code changes for your review.\n\n{summary.strip()[:3000]}")
     run.enter("pr")
-    urls = [c.pr for c in checkouts if c.pr]
-    supersede_older_runs(run, urls)
-    state.update_run(run.id, branch=branch)
+    urls = record_prs(run, branch, [c for c in checkouts if c.pr])
     remove_workspace(ws, checkouts)
-    return "pr", "answered the review without code changes", " ".join(urls)
+    return "pr", "answered the review without code changes", urls
 
 
 def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review") -> dict:
@@ -1210,8 +1246,11 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
     return (f"Arete started the app with `{v.start}` and it answers at {url}. Arete stops it when you finish.\n\n"
             "- Do in the browser what a person does in the browser, with the `mcp__playwright__browser_*` tools "
             "(load them with ToolSearch first): navigate, read the page with `browser_snapshot`, click, type.\n"
-            "- After each state you check, call `browser_take_screenshot` with `filename` set to an absolute path "
-            f"in `{evidence}`, such as `{evidence}/01-list.png`, and read `browser_console_messages` for errors.\n"
+            "- After each state you check, wait until the page settles (loading done, entrance animations finished) "
+            "so the shot shows what a person sees, then call `browser_take_screenshot` with `filename` set to an "
+            f"absolute path in `{evidence}`, such as `{evidence}/01-list.png`.\n"
+            "- Read `browser_console_messages` after each state. Name each console error and each dev error overlay "
+            "or badge in `saw`, and say whether the change causes it.\n"
             "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
 
 
@@ -1240,12 +1279,15 @@ def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[st
     return images
 
 
-def draft_note(approved: bool, verified: verify.Verified) -> str:
+def draft_reason(approved: bool, verified: verify.Verified) -> str:
     if verified.verdict == "blocked":
-        return f"\n\nThe new PRs are drafts: the check in use was blocked. {verified.blocked_by}".rstrip()
-    if not approved:
-        return "\n\nThe new PRs are drafts: the reviewer still has concerns."
-    return ""
+        return "the check in use was blocked"
+    return "" if approved else "the review did not approve it"
+
+
+def draft_note(draft_why: str, verified: verify.Verified) -> str:
+    blocked_by = f" {verified.blocked_by}" if verified.verdict == "blocked" else ""
+    return f"\n\nThe new PRs are drafts: {draft_why}.{blocked_by}".rstrip() if draft_why else ""
 
 
 def check_list(layer: config.RepoLayer) -> str:
@@ -1347,7 +1389,7 @@ def reads_pr_comments(r: dict) -> bool:
     if not r.get("pr_url"):
         return False
     rejected_lately = r["status"] == "rejected" and (r.get("finished") or "") >= util.iso(util.now() - REJECTED_PR_LISTEN)
-    return r["status"] == "pr" or rejected_lately
+    return state.has_open_pr(r) or rejected_lately
 
 
 def sync_outcomes(cfg: config.Config) -> None:
