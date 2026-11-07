@@ -147,7 +147,7 @@ def session_digest(path: Path, since_ts: float) -> dict | None:
             recent_tools = []
     if entry == HEADLESS_ENTRYPOINT or not items:
         return None
-    if cwd and str(paths.STATE_DIR) in cwd:
+    if cwd and any(str(d) in cwd for d in (paths.STATE_DIR, paths.WORKTREES_DIR)):
         return None
     signal = sum(1 for i in items if "REJECTED" in i or "INTERRUPTED" in i) * 3 + sum(1 for i in items if "HUMAN:" in i)
     return {"session": sid[:8], "cwd": cwd, "items": items, "signal": signal}

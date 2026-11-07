@@ -10,7 +10,7 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 EVENTS_FILE = STATE_DIR / "events.jsonl"
 DB_FILE = STATE_DIR / "arete.db"
 RUNS_DIR = STATE_DIR / "runs"
-WORKTREES_DIR = STATE_DIR / "worktrees"
+WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 LOCKS_DIR = STATE_DIR / "locks"
 

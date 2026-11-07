@@ -27,7 +27,8 @@ A laptop sleeps and drops its network. When poll, triage or the heartbeat start 
 
 - Code: this repo, a uv project (Python pinned in `.python-version`, everything locked in `uv.lock`). Installed with `uv tool install --editable . --python 3.13`
 - Config: `~/.config/arete/config.toml` (`arete init` writes a starting one)
-- State: `~/.local/share/arete/` (sqlite, events, run logs, worktrees)
+- State: `~/.local/share/arete/` (sqlite, events, run logs)
+- Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
 - Logs: `~/Library/Logs/arete/`
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names
 
