@@ -112,7 +112,7 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", say
         raise control.Refused(f"a loop named {name} already exists")
     if name and not loops.NAME.match(name):
         raise control.Refused(f"the name '{name}' must be lowercase letters, digits and dashes")
-    run_id = f"draft-{util.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+    run_id = state.unique_run_id("draft")
     state.start_run(run_id, "draft")
     state.update_run(run_id, pid=os.getpid(), trigger="manual", summary=util.first_line(sentence, 200))
     prompt = draft_prompt(sentence, cfg, name, repo, taken)
