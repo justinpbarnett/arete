@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import stat
 
@@ -27,8 +28,8 @@ def instead_of(text: str) -> str:
 
 
 def parallel_from(value) -> int:
-    text = str(value).strip()
-    if isinstance(value, bool) or not text.isdigit() or not 1 <= int(text) <= PARALLEL_MAX:
+    text = value.strip() if isinstance(value, str) else json.dumps(value)
+    if not text.isdigit() or not 1 <= int(text) <= PARALLEL_MAX:
         raise Refused(f"Runs at once takes a whole number from 1 to {PARALLEL_MAX}{instead_of(text)}")
     return int(text)
 
