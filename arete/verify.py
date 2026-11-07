@@ -160,12 +160,16 @@ class Verified:
         lines = [f"**{self.verdict}**: {self.summary}"]
         if self.blocked_by:
             lines.append(f"\nBlocked by: {self.blocked_by}")
+        embedded: set[str] = set()
         for c in self.checks:
             lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed'}**: {c['what'].strip()}",
                       f"  - How: {one_line(c['how'])}", f"  - Saw: {one_line(c['saw'])[:MAX_SAW_CHARS]}"]
             shot = Path(c.get("screenshot") or "").name
-            if image_url and shot in image_url:
+            if shot in embedded:
+                lines.append(f"  - Screenshot: `{shot}`, shown above")
+            elif image_url and shot in image_url:
                 lines.append(f"  - ![{shot}]({image_url[shot]})")
+                embedded.add(shot)
             elif shot:
                 lines.append(f"  - Screenshot: `{shot}` (in the run's evidence folder)")
         return "\n".join(lines)
