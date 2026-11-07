@@ -19,6 +19,7 @@ from . import (
     config,
     control,
     devices,
+    engine,
     gh,
     hooks,
     loops,
@@ -239,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         if action in ("enable", "disable"):
             return control.switch(name, action == "enable")
         if action == "start":
-            return control.start_loop(name)
+            return engine.launch(name)
         raise Refusal(404, f"Loops take enable, disable or start, not {action}.")
 
     def launch_session(self) -> dict:

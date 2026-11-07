@@ -386,24 +386,23 @@ def cmd_loop(args) -> int:
             print(f"next: `arete loop try {made['name']}`, then `arete loop enable {made['name']}`")
             return 0
         if args.action == "exec":
-            status, run_id = engine.execute(args.name, fire=args.fire, run_id=args.run_id,
-                                            events=read_events(args.events))
-            return 0 if status in ("done", "skipped", "busy", "gone") else 1
+            status = engine.carry_opened(args.run_id) if not args.name else engine.launch(
+                args.name, item=args.fire, run_id=args.run_id, events=read_events(args.events), detach=False)["status"]
+            return 0 if status in ("done", "skipped") else 1
         if not args.name:
             print(f"arete loop {args.action} needs a NAME", file=sys.stderr)
             return 2
         if args.action == "try":
             result = scaffold.try_loop(args.name, read_events(args.events), follow=follow)
-            print(f"\ntry {result['id']}: {result.get('status')}, every emit held"
-                  + (f", {util.count(result['events'], 'sample event')}" if result["events"] else "")
-                  + (f"\n{result['error']}" if result.get("error") else ""))
-            return 0 if result.get("status") in ("done", "skipped") else 1
+            print(f"\ntry {result['id']}: {result['status']}, every emit held"
+                  + (f", {util.count(result['events'], 'sample event')}" if result["events"] else ""))
+            return 0 if result["status"] in ("done", "skipped") else 1
         if args.action in ("enable", "disable"):
             done = control.switch(args.name, args.action == "enable")
             print(f"{done['name']}: {'on' if done['enabled'] else 'off'}")
             return 0
         if args.action == "start":
-            r = control.start_loop(args.name, read_events(args.events))
+            r = engine.launch(args.name, events=read_events(args.events))
             print(f"started {r['id']}")
             if args.follow:
                 follow(r["id"])

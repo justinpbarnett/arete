@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import json
 import os
 import signal
 import subprocess
 import sys
-import time
 from collections import Counter, defaultdict
 from datetime import timedelta
 
 from . import config, devices, emits, loops, paths, record, sources, state, util
 from .loops import Loop
 
-START_WAIT_SECONDS = 15
 BEAT_FILE = paths.STATE_DIR / "serve.json"
 BEAT_STALE_SECONDS = 120
 DETACHED_LOG = "loops.log"
@@ -34,23 +31,11 @@ class Refused(ValueError):
     pass
 
 
-def detach(args: list[str], log_name: str = DETACHED_LOG) -> subprocess.Popen:
+def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
     paths.ensure_dirs()
     with open(paths.LOG_DIR / log_name, "a") as log:
         return subprocess.Popen([sys.executable, "-m", "arete.cli", *args], stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=subprocess.STDOUT, start_new_session=True)
-
-
-def wait_for_run(run_id: str, proc: subprocess.Popen, what: str) -> dict:
-    deadline = time.monotonic() + START_WAIT_SECONDS
-    while time.monotonic() < deadline:
-        if r := state.run_get(run_id):
-            return r
-        if proc.poll() is not None:
-            raise Refused(f"{what} exited with {proc.returncode} before it started; see "
-                          f"{paths.short_path(paths.LOG_DIR / DETACHED_LOG)}")
-        time.sleep(0.2)
-    raise Refused(f"{what} did not start within {START_WAIT_SECONDS}s")
+                                stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep)
 
 
 def find_loop(name: str, cfg: config.Config | None = None) -> Loop:
@@ -60,22 +45,6 @@ def find_loop(name: str, cfg: config.Config | None = None) -> Loop:
         raise NotFound(str(e)) from e
 
 
-def start_loop(name: str, events: list[dict] | None = None) -> dict:
-    loop = find_loop(name)
-    if loop.error:
-        raise Refused(f"{name} is broken: {loop.error}")
-    if util.lock_is_held(state.loop_lock(loop.name)):
-        raise Busy(f"{name} is running; stop it or wait")
-    run_id = record.new_id(loop.name)
-    args = ["loop", "exec", loop.name, "--run-id", run_id]
-    if events:
-        fire_file = paths.RUNS_DIR / run_id / "events.json"
-        fire_file.parent.mkdir(parents=True, exist_ok=True)
-        fire_file.write_text(json.dumps(events, default=str))
-        args += ["--events", str(fire_file)]
-    return wait_for_run(run_id, detach(args), f"loop {name}")
-
-
 def stop_run(run_id: str) -> dict:
     r = state.run_get(run_id)
     if not r:
@@ -83,11 +52,15 @@ def stop_run(run_id: str) -> dict:
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
     with record.dead(r) as gone:
-        if gone and r["kind"] not in record.NO_TICKET_KINDS:
-            raise Refused(f"the process of {run_id} is gone; the next pipeline poll settles it and tells its ticket")
         if gone:
+            r = record.ask_stop(run_id)
+            if r["kind"] not in record.NO_TICKET_KINDS:
+                return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
             record.interrupt(r)
             return {"id": run_id, "stopped": True, "was": "gone"}
+    if not r["pid"]:
+        raise Refused(f"{run_id} is still starting; stop it again in a moment")
+    record.ask_stop(run_id)
     pid = int(r["pid"])
     try:
         os.killpg(pid, signal.SIGTERM)

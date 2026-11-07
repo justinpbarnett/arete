@@ -223,7 +223,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
-                  ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"))]]
+                  ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
+                  ("stop_asked", "TEXT"))]]
 
 
 @contextmanager
@@ -453,6 +454,11 @@ def take_queue_item(item_id: int, run_id: str | None) -> None:
 def drop_queue_item(item_id: int) -> None:
     with db() as c:
         c.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+
+
+def drop_claimed_items(run_id: str) -> None:
+    with db() as c:
+        c.execute("DELETE FROM queue WHERE run_id = ?", (run_id,))
 
 
 def prune(days: float = 14) -> None:

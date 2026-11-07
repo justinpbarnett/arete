@@ -196,10 +196,14 @@ def take_lock(f: TextIO, wait: bool) -> bool:
         time.sleep(PROBE_GRACE_SECONDS)
         if not flock_now(f):
             return False
-    f.truncate(0)
-    f.write(str(os.getpid()))
-    f.flush()
+    mark_holder(f, os.getpid())
     return True
+
+
+def mark_holder(f: TextIO, pid: int) -> None:
+    f.truncate(0)
+    f.write(str(pid))
+    f.flush()
 
 
 def lock_file(name: str) -> TextIO:

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import (
     config,
+    control,
     devices,
     emits,
     gh,
@@ -38,6 +39,7 @@ KNOWN_FINDINGS_SHOWN = 30
 OUTPUT_TAIL = 6000
 FEED_OUTPUT_LINES = 2000
 FEED_LINE_CHARS = 500
+START_WAIT_SECONDS = 15
 CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {"pass": {"type": "boolean"}, "why": {"type": "string"}},
@@ -88,6 +90,10 @@ class LoopRun:
     @property
     def log_file(self) -> Path:
         return paths.RUNS_DIR / self.id / "run.log"
+
+    @property
+    def events_file(self) -> Path:
+        return paths.RUNS_DIR / self.id / "events.json"
 
     def log(self, kind: str, text: str) -> None:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -221,46 +227,88 @@ def stop_on_term(*_) -> None:
     raise Stopped("stopped by a signal")
 
 
-def execute(name: str, *, fire: int | None = None, run_id: str = "", trial: bool = False,
-            events: list[dict] | None = None, cfg: config.Config | None = None) -> tuple[str, str]:
+class NeverBegan(control.Refused):
+    pass
+
+
+def launch(name: str, *, item: int | None = None, events: list[dict] | None = None, trial: bool = False,
+           detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
     cfg = cfg or config.load()
-    loop = loops.find(name, cfg)
+    loop = control.find_loop(name, cfg)
     if loop.error:
-        raise loops.LoopError(f"{loop.name} is broken: {loop.error}")
-    item = state.queue_item(fire) if fire else None
-    if fire and not item:
-        return "gone", f"queue item {fire} is gone"
-    with util.lock(state.loop_lock(loop.name)) as free:
-        if not free:
-            if fire:
-                state.take_queue_item(fire, None)
-            return "busy", "the last run of this loop is still going"
+        raise control.Refused(f"{loop.name} is broken: {loop.error}")
+    fire = state.queue_item(item) if item else None
+    if item and not fire:
+        raise control.NotFound(f"queue item {item} is gone")
+    with util.lock_file(state.loop_lock(loop.name)) as held:
+        if not util.take_lock(held, wait=False):
+            raise control.Busy(f"{loop.name} is running; stop it or wait")
+        for stale in state.runs_marked_running():
+            if stale["kind"] == "loop" and stale["loop"] == loop.name:
+                record.interrupt(stale)
         run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
-                      trigger="try" if trial else (item["trigger"] if item else "manual"),
-                      events=list(events or (item["payload"] if item else [])))
-        record.start("loop", run_id=run.id, lock=state.loop_lock(loop.name), repo=loop.repo or None, loop=loop.name,
-                     loop_kind=loop.kind, trigger=run.trigger, device=loop.device, queue=loop.queue_name,
-                     grp=item["grp"] if item else "", log=paths.short_path(run.log_file),
-                     model=loop.model_for(cfg) if loop.agent else "",
+                      trigger="try" if trial else (fire["trigger"] if fire else "manual"),
+                      events=list(events or (fire["payload"] if fire else [])))
+        record.start("loop", run_id=run.id, lock=state.loop_lock(loop.name), pid=None if detach else os.getpid(),
+                     repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
+                     device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
+                     log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
                      runner=runner.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
         if fire:
-            state.take_queue_item(fire, run.id)
-        try:
-            signal.signal(signal.SIGTERM, stop_on_term)
-            with devices.lease(loop.device, run.id, lambda text: run.log("device", text)) as run.device:
-                status, summary = KINDS[loop.kind](run)
-        except OverBudget as e:
-            status, summary = "skipped", f"budget: {e}"
-        except Stopped as e:
-            status, summary = "stopped", str(e)
-        except Exception as e:
-            run.log("error", traceback.format_exc().strip())
-            status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-        finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if fire:
-                state.drop_queue_item(fire)
-        return settle(run, status, summary), run.id
+            state.take_queue_item(item, run.id)
+        if run.events:
+            util.write_json(run.events_file, run.events)
+        if not detach:
+            carry(run)
+            return state.run_get(run.id)
+        proc = control.detach(["loop", "exec", "--run-id", run.id], keep=(held.fileno(),))
+        util.mark_holder(held, proc.pid)
+    return began(run, proc)
+
+
+def began(run: LoopRun, proc: subprocess.Popen) -> dict:
+    deadline = time.monotonic() + START_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        exited = proc.poll() is not None
+        r = state.run_get(run.id)
+        if r["pid"] or r["status"] != "running":
+            return r
+        if exited:
+            why = (f"`loop exec` exited with {proc.returncode} before it began; see "
+                   f"{paths.short_path(paths.LOG_DIR / control.DETACHED_LOG)}")
+            settle(run, "failed", why)
+            raise NeverBegan(why)
+        time.sleep(0.1)
+    return state.run_get(run.id)
+
+
+def carry_opened(run_id: str) -> str:
+    r = state.run_get(run_id)
+    if not r or r["kind"] != "loop" or r["status"] != "running":
+        raise control.NotFound(f"no loop run {run_id} waits to begin")
+    cfg = config.load()
+    run = LoopRun(loops.find(r["loop"], cfg), run_id, cfg, trial=r["trigger"] == "try", trigger=r["trigger"])
+    run.events = util.read_json(run.events_file, [])
+    record.note(run_id, pid=os.getpid())
+    return carry(run)
+
+
+def carry(run: LoopRun) -> str:
+    try:
+        signal.signal(signal.SIGTERM, stop_on_term)
+        with devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device:
+            status, summary = KINDS[run.loop.kind](run)
+    except OverBudget as e:
+        status, summary = "skipped", f"budget: {e}"
+    except Stopped as e:
+        status, summary = "stopped", str(e)
+    except Exception as e:
+        run.log("error", traceback.format_exc().strip())
+        status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        state.drop_claimed_items(run.id)
+    return settle(run, status, summary)
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:

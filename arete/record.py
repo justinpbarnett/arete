@@ -9,6 +9,7 @@ from . import state, util
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
+STOPPED = "stopped by request"
 ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva"}
 FAILS_WHEN_DEAD = ("miner", "eval")
 NO_TICKET_KINDS = ("miner", "eval", "draft", "loop", "session")
@@ -55,6 +56,18 @@ def note(run_id: str, **fields) -> None:
         c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
 
 
+def ask_stop(run_id: str) -> dict | None:
+    with state.db() as c:
+        c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running'", (util.iso(), run_id))
+        r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def stop_asked(run_id: str) -> bool:
+    r = state.run_get(run_id)
+    return bool(r and r["stop_asked"])
+
+
 def settle(run_id: str, status: str, **fields) -> dict | None:
     fields = {"status": status, "finished": util.iso(), **fields}
     with state.db() as c:
@@ -65,6 +78,8 @@ def settle(run_id: str, status: str, **fields) -> dict | None:
 
 
 def dead_status(row: dict) -> str:
+    if row.get("stop_asked"):
+        return "stopped"
     if row["kind"] == "pipeline":
         earlier = [r for r in state.ticket_runs(row["repo"], row["issue"], limit=3) if r["id"] != row["id"]]
         return "failed" if earlier and earlier[0]["status"] == "interrupted" else "interrupted"
@@ -85,9 +100,11 @@ def dead(row: dict):
 def interrupt(row: dict) -> dict | None:
     if not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
-    done = settle(row["id"], dead_status(row), summary=INTERRUPTED)
+    status = dead_status(row)
+    summary = STOPPED if status == "stopped" else INTERRUPTED
+    done = settle(row["id"], status, summary=summary)
     if done:
-        state.add_feed(row["id"], "end", f"{done['status']}: {INTERRUPTED}")
+        state.add_feed(row["id"], "end", f"{status}: {summary}")
     return done
 
 

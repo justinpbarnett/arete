@@ -583,7 +583,7 @@ async function stopFeedRun(which, btn, resultId) {
   btn.disabled = true;
   try {
     const r = await call(`/api/runs/${encodeURIComponent(feeds[which].run)}/stop`, {});
-    say(resultId, "ok", r.was === "gone" ? `${r.id} had already stopped, so it is marked interrupted.` : `Asked ${r.id} to stop. Its feed says when it has.`);
+    say(resultId, "ok", r.was === "gone" ? (r.ticket ? `${r.id} had already ended; the next pipeline poll marks it stopped and tells its ticket.` : `${r.id} had already ended, so it is marked stopped.`) : `Asked ${r.id} to stop. Its feed says when it has.`);
   } catch (e) {
     say(resultId, "fault", e.message);
   }

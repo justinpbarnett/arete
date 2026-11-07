@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import operator
 import os
-import subprocess
 import threading
 import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NoReturn
 
-from . import config, control, dashboard, loops, paths, record, sources, state, util
+from . import config, control, dashboard, engine, loops, record, sources, state, util
 from .loops import Loop
 
 TICK_SECONDS = 20
@@ -35,15 +33,6 @@ def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     return loop.trigger.cron.next_after(last.astimezone()) <= now.astimezone()
 
 
-@dataclass
-class Child:
-    proc: subprocess.Popen
-    loop: str
-    queue: str
-    group: str
-    item: int
-
-
 class Server:
     def __init__(self) -> None:
         self.cfg = config.load()
@@ -51,7 +40,7 @@ class Server:
         self.polls: dict[str, Future] = {}
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
-        self.children: dict[str, Child] = {}
+        self.waiting: set[int] = set()
         self.restarted: Counter[int] = Counter()
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
         self.loaded = False
@@ -153,37 +142,14 @@ class Server:
         if found:
             self.say(f"{sid}: {util.count(len(found), 'new event')}")
 
-    def running(self) -> dict[str, tuple[str, str, str]]:
-        out = {r["id"]: (r["loop"], r["queue"] or r["loop"], r["grp"] or "")
-               for r in state.runs_marked_running() if r["kind"] == "loop"}
-        for run_id, child in list(self.children.items()):
-            if child.proc.poll() is not None:
-                del self.children[run_id]
-                self.requeue_if_never_started(run_id, child.item)
-            else:
-                out.setdefault(run_id, (child.loop, child.queue, child.group))
-        return out
-
-    def requeue_if_never_started(self, run_id: str, item_id: int) -> None:
-        item = state.queue_item(item_id)
-        if not item or item["run_id"] != run_id or state.run_get(run_id):
-            return
-        log = paths.short_path(paths.LOG_DIR / control.DETACHED_LOG)
-        if self.restarted[item_id]:
-            state.drop_queue_item(item_id)
-            self.say(f"{item['loop']}: dropped queue item {item_id}, `loop exec` died twice before it started; see {log}")
-            return
-        self.restarted[item_id] += 1
-        state.take_queue_item(item_id, None)
-        self.say(f"{item['loop']}: queue item {item_id} goes back in the queue, `loop exec` died before it started; "
-                 f"see {log}")
-
     def dispatch(self, by_name: dict[str, Loop]) -> None:
-        running = self.running()
-        busy_loops = {name for name, _, _ in running.values()}
-        per_queue = Counter(queue for _, queue, _ in running.values())
-        held_groups = {(queue, group) for _, queue, group in running.values() if group}
-        for item in state.pending():
+        running = [r for r in state.runs_marked_running() if r["kind"] == "loop"]
+        per_queue = Counter(r["queue"] or r["loop"] for r in running)
+        held_groups = {(r["queue"] or r["loop"], r["grp"]) for r in running if r["grp"]}
+        busy: set[str] = set()
+        pending = state.pending()
+        self.waiting &= {item["id"] for item in pending}
+        for item in pending:
             loop = by_name.get(item["loop"])
             if not loop or not loop.enabled or loop.error:
                 state.drop_queue_item(item["id"])
@@ -191,26 +157,47 @@ class Server:
                 continue
             key = (item["queue"], item["grp"])
             full = per_queue[item["queue"]] >= self.cfg.queues.get(item["queue"], 1)
-            if item["loop"] in busy_loops or full or (item["grp"] and key in held_groups):
+            if item["loop"] in busy or full or (item["grp"] and key in held_groups):
                 if item["grp"]:
                     held_groups.add(key)
                 continue
-            run_id = record.new_id(loop.name)
-            state.take_queue_item(item["id"], run_id)
-            proc = control.detach(["loop", "exec", loop.name, "--fire", str(item["id"]), "--run-id", run_id])
-            self.children[run_id] = Child(proc, loop.name, item["queue"], item["grp"], item["id"])
-            busy_loops.add(loop.name)
+            try:
+                run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)
+            except control.Busy as e:
+                busy.add(loop.name)
+                if item["grp"]:
+                    held_groups.add(key)
+                if item["id"] not in self.waiting:
+                    self.waiting.add(item["id"])
+                    self.say(f"{loop.name}: queue item {item['id']} waits, {e}")
+                continue
+            except engine.NeverBegan as e:
+                self.retry_once(item, str(e))
+                continue
+            except (control.NotFound, control.Refused):
+                continue
+            self.waiting.discard(item["id"])
+            busy.add(loop.name)
             per_queue[item["queue"]] += 1
             if item["grp"]:
                 held_groups.add(key)
-            self.say(f"{loop.name}: started {run_id} ({item['trigger']})")
+            self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
+
+    def retry_once(self, item: dict, why: str) -> None:
+        if self.restarted[item["id"]]:
+            state.drop_queue_item(item["id"])
+            self.say(f"{item['loop']}: dropped queue item {item['id']}, {why}, the second time")
+            return
+        self.restarted[item["id"]] += 1
+        state.take_queue_item(item["id"], None)
+        self.say(f"{item['loop']}: queue item {item['id']} goes back in the queue, {why}")
 
     def beat(self, every_loop: list[Loop], live: list[Loop]) -> None:
         util.write_json(control.BEAT_FILE, {
             "pid": os.getpid(), "at": util.iso(), "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": len(state.pending()),
-            "running": len(self.running()), "poll_errors": dict(self.errors),
+            "running": sum(r["kind"] == "loop" for r in state.runs_marked_running()), "poll_errors": dict(self.errors),
         })
 
 

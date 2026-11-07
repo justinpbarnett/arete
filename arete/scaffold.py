@@ -17,7 +17,6 @@ from . import (
     record,
     runner,
     sources,
-    state,
     util,
 )
 
@@ -158,25 +157,20 @@ def sample_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
 def try_loop(name: str, events: list[dict] | None = None, follow=None) -> dict:
     cfg = config.load()
     loop = control.find_loop(name, cfg)
-    if loop.error:
-        raise control.Refused(f"{name} is broken: {loop.error}")
-    if events is None and loop.fed_by_events:
+    if events is None and loop.fed_by_events and not loop.error:
         events = sample_events(loop, cfg)
         if not events:
             raise control.Refused(f"{name} found no events to try on; pass --events FILE with a JSON list of events")
     run_id = record.new_id(loop.name)
-    result: dict = {}
     finished = threading.Event()
     follower = threading.Thread(target=follow, args=(run_id, lambda: not finished.is_set()),
                                 name=f"follow-{loop.name}", daemon=True) if follow else None
     if follower:
         follower.start()
     try:
-        result["status"], _ = engine.execute(loop.name, run_id=run_id, trial=True, events=events, cfg=cfg)
-    except Exception as e:
-        result["status"], result["error"] = "failed", f"{type(e).__name__}: {e}"
+        run = engine.launch(loop.name, events=events, trial=True, detach=False, run_id=run_id, cfg=cfg)
     finally:
         finished.set()
         if follower:
             follower.join()
-    return {"id": run_id, "events": len(events or []), **result, "run": state.run_get(run_id)}
+    return {"id": run_id, "events": len(events or []), "status": run["status"], "run": run}

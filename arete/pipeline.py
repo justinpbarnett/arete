@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -544,6 +546,19 @@ class RetryNextPoll(Exception):
     pass
 
 
+class Stopped(BaseException):
+    pass
+
+
+def stop_on_term(run_id: str) -> Callable:
+    def stop(*_) -> None:
+        if record.stop_asked(run_id):
+            raise Stopped(record.STOPPED)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+    return stop
+
+
 class RunFailed(Exception):
     def __init__(self, why: str, detail: str = ""):
         super().__init__(why)
@@ -675,8 +690,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if not dry_run:
                 state.take_feedback(run.feedback, run_id)
+        signal.signal(signal.SIGTERM, stop_on_term(run_id))
         try:
             status, summary, pr_url = _run(cfg, run, slot)
+        except Stopped:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            status, summary, pr_url = "stopped", record.STOPPED, ""
+            run.log(record.STOPPED)
+            run.give_up("was stopped by request")
         except RunFailed as e:
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except Exception as e:
@@ -684,6 +705,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
         finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
             slot.free()
         if restarting and status in ("skipped", "noop") and not run.feedback:
             run.enter("failed")
@@ -1771,7 +1793,10 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo), tid=str(row["issue"]),
               feedback=pending_feedback(repo.name, str(row["issue"])))
     run.dir.mkdir(parents=True, exist_ok=True)
-    if row["status"] == "failed":
+    if row["status"] == "stopped":
+        run.log(record.STOPPED)
+        run.give_up("was stopped by request")
+    elif row["status"] == "failed":
         run.log(f"{record.INTERRUPTED}, the second interruption in a row")
         run.give_up(f"{record.INTERRUPTED}, the second interruption in a row")
     else:
