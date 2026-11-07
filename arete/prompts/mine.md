@@ -20,7 +20,7 @@ Repos you may change (name, path, public):
 
 $repos
 
-Before proposing, read the target file (Read, Glob, Grep are available, cwd is ~/dev) and do not propose
+Before proposing, read the target file (Read, Glob, Grep work in the repos above) and do not propose
 what it already says. If the file is long, prefer sharpening an existing line over adding a new one.
 
 ## Already proposed and waiting for review (do not repeat)

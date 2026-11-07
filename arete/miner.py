@@ -430,7 +430,12 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
         if not dry_run:
             state.finish_run(run_id, "noop", summary="no human sessions in window")
         return 0
-    repos = "\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in cfg.repos if r.mine)
+    mine_repos = [r for r in cfg.repos if r.mine]
+    if not mine_repos:
+        if not dry_run:
+            state.finish_run(run_id, "noop", summary="no repo has mine = true")
+        return 0
+    repos = "\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
@@ -442,8 +447,8 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     run_dir = paths.RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(text)
-    res = claude.run(text, paths.HOME / "dev", model=cfg.model("miner"), allowed_tools=["Read", "Glob", "Grep"],
-                     json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False)
+    res = claude.run(text, mine_repos[0].path, model=cfg.model("miner"), allowed_tools=["Read", "Glob", "Grep"],
+                     json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]])
     (run_dir / "result.json").write_text(json.dumps({"ok": res.ok, "cost": res.cost_usd, "structured": res.structured,
                                                      "error": res.error}, indent=2))
     if not res.ok or not isinstance(res.structured, dict):

@@ -208,17 +208,13 @@ def record_file(ref: str) -> Path:
     return TICKET_RECORDS_DIR / f"{tracker.safe_filename(ref)}.md"
 
 
-def read_rules(dirs: list[Path]) -> list[str]:
-    return [f"{tool}(/{d}/**)" for d in dict.fromkeys(p for d in dirs for p in (d, d.resolve())) for tool in READ_TOOLS]
-
-
 def triage_one(cfg: config.Config, src: TriageSource, c: Candidate) -> tuple[dict | None, float, str]:
     text = prompt("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=src.ticket_text(c),
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     res = claude.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage") or "haiku",
-                     tools=READ_TOOLS, allowed_tools=read_rules(dirs), mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
+                     tools=READ_TOOLS, allowed_tools=READ_TOOLS, mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
                      timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:])
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None
     record_file(c.ref).write_text(f"{text}\n\n## Triage result (${res.cost_usd:.3f})\n\n```json\n"

@@ -10,6 +10,8 @@ from pathlib import Path
 from . import util
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
+FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")
+GIT_WRITES_TO_ANY_PATH = "Bash(git * --output*)"
 
 
 @dataclass
@@ -53,9 +55,8 @@ def run(
     if tools is not None:
         cmd += ["--tools", ",".join(tools)]
     if allowed_tools:
-        cmd += ["--allowedTools", *allowed_tools]
-    if disallowed_tools:
-        cmd += ["--disallowedTools", *disallowed_tools]
+        cmd += ["--allowedTools", *within(allowed_tools, [Path(cwd), *(add_dirs or [])])]
+    cmd += ["--disallowedTools", GIT_WRITES_TO_ANY_PATH, *(disallowed_tools or [])]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
     if resume:
@@ -73,6 +74,7 @@ def run(
 
     env = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
     env["ARETE_AGENT"] = "1"
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     try:
         proc = subprocess.run(
             cmd, cwd=str(cwd), input=prompt, capture_output=True, text=True, timeout=timeout, env=env, check=False
@@ -116,6 +118,11 @@ def run(
         connection_failed=data.get("api_error") == "connection_failed",
         raw=data,
     )
+
+
+def within(rules: list[str], folders: list[Path]) -> list[str]:
+    roots = dict.fromkeys(p for f in folders for p in (Path(f).absolute(), Path(f).resolve()))
+    return [scoped for rule in rules for scoped in ([f"{rule}(/{r}/**)" for r in roots] if rule in FILE_TOOLS else [rule])]
 
 
 def _json_from_text(text: str):
