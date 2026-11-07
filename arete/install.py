@@ -32,10 +32,10 @@ def nvm_node_bin() -> str | None:
 
 
 def build_path() -> str:
-    parts = [str(paths.HOME / ".local" / "bin"), "/opt/homebrew/bin", "/opt/homebrew/sbin"]
+    parts = [str(paths.HOME / ".local" / "bin")]
     if node_bin := nvm_node_bin():
         parts.append(node_bin)
-    parts += ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    parts += ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     seen, out = set(), []
     for p in parts:
         if p not in seen:
