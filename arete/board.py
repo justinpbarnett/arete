@@ -72,8 +72,7 @@ def live() -> dict:
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
             "cost": pipeline.logged_cost(lines),
         })
-    in_slots = sum(1 for r in running if r["kind"] == "pipeline")
-    return {"runs": rows, "slots": in_slots, "max_parallel": config.load().max_parallel}
+    return {"runs": rows, "slots": len(pipeline.holding(running, "slot")), "max_parallel": config.load().max_parallel}
 
 
 def skipped() -> list[dict]:

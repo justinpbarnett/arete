@@ -1,5 +1,5 @@
 Arete committed your change, pushed it and opened the PR. CI then ran on the PR, and these checks failed.
-This is round $round of $max_rounds.
+This is round $round of $max_rounds. $merged_base
 
 $failures
 

@@ -207,6 +207,15 @@ def hold_lock(name: str) -> TextIO:
     return f
 
 
+def lock_is_held(name: str) -> bool:
+    with lock_file(name) as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
 def read_json(p: Path, default):
     try:
         return json.loads(p.read_text())

@@ -88,6 +88,12 @@ def cmd_init(args) -> int:
     return 0
 
 
+def slot_note(run_id: str, in_slots: set[str], waiting: set[str]) -> str:
+    if run_id in in_slots:
+        return ""
+    return ", waiting for a run slot" if run_id in waiting else ", without a run slot"
+
+
 def cmd_status(args) -> int:
     from . import pipeline, state, tracker, triage, util
 
@@ -147,10 +153,12 @@ def cmd_status(args) -> int:
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
     live = pipeline.live_pipeline_runs()
-    in_slots = {r["id"] for r in pipeline.runs_in_slots()}
-    print(f"runs live: {len(live)}, in {len(in_slots)} of {cfg.max_parallel} slots"
+    in_slots = {r["id"] for r in pipeline.holding(live, "slot")}
+    slot_waiters = {r["id"] for r in pipeline.holding(live, "slot-wait")}
+    print(f"runs live: {len(live)}, in {len(in_slots)} of {cfg.max_parallel} run slots"
+          + (f", {len(slot_waiters)} waiting for one" if slot_waiters else "")
           + "".join(f"\n  {tracker.run_ticket_name(r)}  since {r['started']}"
-                    + ("" if r["id"] in in_slots else ", waiting on CI without a slot") for r in live))
+                    + slot_note(r["id"], in_slots, slot_waiters) for r in live))
     return 0
 
 
