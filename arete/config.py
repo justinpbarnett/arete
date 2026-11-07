@@ -7,6 +7,9 @@ from typing import Literal
 
 from . import paths
 
+MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat")
+MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus"}
+
 
 class UnknownRepo(KeyError):
     def __str__(self) -> str:
@@ -39,6 +42,7 @@ class Repo:
 
 
 STATES = ("running", "pr", "failed", "needs-info")
+DASHBOARD_PORT = 8796
 
 
 @dataclass
@@ -79,6 +83,8 @@ class Config:
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
+    dashboard_port: int = DASHBOARD_PORT
+    dashboard_owner: str = ""
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -97,7 +103,10 @@ class Config:
         return best
 
     def model(self, role: str) -> str:
-        return self.models.get(role, "")
+        return self.models.get(role) or MODEL_FALLBACKS.get(role, "")
+
+    def unused_model_keys(self) -> list[str]:
+        return sorted(set(self.models) - set(MODEL_ROLES))
 
 
 def load(path: Path | None = None) -> Config:
@@ -113,6 +122,8 @@ def load(path: Path | None = None) -> Config:
         miner_lookback_hours=float(data.get("miner", {}).get("lookback_hours", 24)),
         miner_max_digest_chars=int(data.get("miner", {}).get("max_digest_chars", 90_000)),
         max_parallel=max(1, int(data.get("max_parallel", 1))),
+        dashboard_port=int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)),
+        dashboard_owner=data.get("dashboard", {}).get("owner", ""),
     )
     j = data.get("jira", {})
     transitions = {k: str(v) for k, v in (j.get("transitions") or {}).items() if v}

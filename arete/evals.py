@@ -312,7 +312,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         if not res.ok:
             result["why"] = "build step failed"
             return result
-        session, attempts = res.session_id, 1
+        session, attempts = res.session, 1
         ok, report = run_checks(layer, wt, [wt], run, timeout)
         while not ok and attempts < layer.max_attempts:
             attempts += 1
@@ -320,7 +320,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                                      failures=report),
                             wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=NO_GIT_WRITES,
                             resume=session, timeout=timeout)
-            session = res.session_id or session
+            session = res.session if res.session.id else session
             ok, report = run_checks(layer, wt, [wt], run, timeout)
         git(["add", "-A"], wt)
         (run_dir / "diff.patch").write_text(git(["diff", "--cached", "HEAD"], wt))

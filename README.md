@@ -45,12 +45,13 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `global_repo` | Name of the `[[repo]]` that holds global skills and settings. |
 | `arete_repo` | Name of the `[[repo]]` that is this checkout. Its step prompts are harness files the miner may change. Default `arete`. |
 | `max_parallel` | Most pipeline runs at once on the machine. Default 1. |
-| `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`. A role left out uses the claude CLI default, except `triage`, which uses haiku. |
+| `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `chat` (the dashboard console). A role left out uses the claude CLI default, except `triage`, which uses haiku, and `chat`, which uses opus. `arete status` lists each role's model. |
 | `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly transcript digest. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
+| `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 
 | Repo field | Default | Meaning |
 |------------|---------|---------|
@@ -254,6 +255,17 @@ Arete then runs each eval suite twice on the same day, once with main's prompts 
 The step may read only inside the repos it is given, has no MCP servers, and costs at most $0.30 a ticket. A ticket gets a new call only when its updated time changes, at most 20 calls a refresh; the rest wait for the next. `--refresh` triages what changed, then shows the board; `--refresh --dry-run` lists what it would triage with no model call and no writes; `arete triage REF` shows one ticket in full. A launchd job refreshes hourly.
 
 When `alert_repo` is set and private, the board is also one issue there, "[arete] triage", labeled `arete-triage`, edited only when the board changes. A public or unreadable `alert_repo` gets nothing, and the output says why. Triage never adds `agent` and never writes to a ticket: the label is your approval, and the board only tells you where it would pay off.
+
+## Dashboard
+
+`arete dashboard` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet. It listens only on the machine's tailnet addresses. A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends. `arete install` adds it as the launchd job `com.arete.dashboard`, which launchd starts again when it stops, and the default config has the heartbeat watch it.
+
+- Live: the runs going now, with the last log line and the cost so far, the queue, and the last 25 runs. A run's full log opens below the table.
+- Health: the heartbeat checks, the probes, the loops, and the open alerts.
+- Triage: the triage board, with each ticket's questions folded under it.
+- Trends: 30 days of runs and cost by day, and of runs, pass rate, median time and cost by repo.
+- Settings: `max_parallel` and the model for each role in `[models]`. A save changes only the lines that changed in `config.toml`, and refuses a value arete cannot use.
+- Chat: a console agent on the `chat` model. It reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues. It never edits a file. Ask it for a change and it drafts an issue, which the dashboard files on arete's repo. One message costs at most $2, and its reply shows what it cost. Messages continue one session until New chat.
 
 ## Rules
 

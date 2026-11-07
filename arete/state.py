@@ -128,6 +128,16 @@ def db():
         conn.close()
 
 
+@contextmanager
+def reader():
+    conn = sqlite3.connect(f"{paths.DB_FILE.absolute().as_uri()}?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def new_run_id(kind: str) -> str:
     return f"{kind[:3]}-{util.now().strftime('%Y%m%d-%H%M%S')}"
 
@@ -346,11 +356,13 @@ def close_feedback(pr_url: str, pr_state: str) -> None:
                   "ELSE status END WHERE pr_url = ?", (pr_state, pr_url))
 
 
+FEEDBACK_WAITING = ("SELECT repo, issue, COUNT(*) AS n, MAX(at_once) AS at_once, MAX(created) AS last "
+                    "FROM feedback WHERE status = 'new' GROUP BY repo, issue ORDER BY last")
+
+
 def feedback_waiting() -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT repo, issue, COUNT(*) AS n, MAX(at_once) AS at_once, "
-                                           "MAX(created) AS last FROM feedback WHERE status = 'new' "
-                                           "GROUP BY repo, issue ORDER BY last")]
+        return [dict(r) for r in c.execute(FEEDBACK_WAITING)]
 
 
 def open_feedback(pr_urls: list[str]) -> list[dict]:

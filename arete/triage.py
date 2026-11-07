@@ -213,7 +213,7 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate) -> tuple[dic
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-    res = claude.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage") or "haiku",
+    res = claude.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage"),
                      tools=READ_TOOLS, allowed_tools=READ_TOOLS, mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
                      timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:])
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None

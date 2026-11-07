@@ -16,6 +16,7 @@ JOBS = {
     "audit": {"args": ["audit"], "calendar": {"Hour": 4, "Minute": 30}},
     "eval": {"args": ["eval"], "calendar": {"Weekday": 0, "Hour": 2, "Minute": 10}},
     "triage": {"args": ["triage", "--refresh"], "interval": 3600},
+    "dashboard": {"args": ["dashboard"], "run_at_load": True, "keep_alive": True},
 }
 
 
@@ -64,6 +65,9 @@ def plist_for(name: str, spec: dict) -> dict:
         pl["RunAtLoad"] = True
     if spec.get("abandon_children"):
         pl["AbandonProcessGroup"] = True
+    if spec.get("keep_alive"):
+        pl["KeepAlive"] = True
+        pl["ThrottleInterval"] = 10
     return pl
 
 

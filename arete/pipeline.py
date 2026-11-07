@@ -174,12 +174,12 @@ class AgentRun:
             self.log(f"{step}: lost the connection after {res.turns} turns, waiting for the network")
             if util.wait_for_network():
                 self.cost += res.cost_usd
-                if res.session_id and res.turns > 1 and kw.get("persist", True):
-                    res = claude.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, **{**kw, "resume": res.session_id})
+                if res.session.id and res.turns > 1 and kw.get("persist", True):
+                    res = claude.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, **{**kw, "resume": res.session})
                 else:
                     res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
         self.cost += res.cost_usd
-        self.save(f"{step}.json", {"ok": res.ok, "session": res.session_id, "cost": res.cost_usd,
+        self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
         self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} "
@@ -491,14 +491,14 @@ class Build(TicketWork):
     tools: list[str]
     deny: list[str]
     expertise: str
-    session: str = ""
+    session: claude.Session = field(default_factory=claude.Session)
     report: str = ""
     staged: Staged = field(default_factory=Staged)
 
     def resume(self, step: str, text: str) -> claude.Result:
         res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
                              disallowed_tools=NO_GIT_WRITES, resume=self.session, timeout=self.timeout)
-        self.session = res.session_id or self.session
+        self.session = res.session if res.session.id else self.session
         return res
 
     def check(self) -> bool:
@@ -745,7 +745,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
             return _fail(run, "the builder stopped without changing anything", build_summary)
     b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=step_timeout,
               workspace=workspace, attachments=attachments, tools=build_tools, deny=deny, expertise=expertise,
-              session=res.session_id)
+              session=res.session)
 
     attempts = 1
     ok = b.check()

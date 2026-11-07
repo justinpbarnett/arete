@@ -19,7 +19,6 @@ review = "opus"
 learn = "sonnet"
 miner = "opus"
 apply = "sonnet"
-probe = "haiku"
 uat = "sonnet"
 verify = "opus"
 eval_mine = "sonnet"
@@ -59,6 +58,10 @@ label = "com.arete.eval"
 [[job]]
 label = "com.arete.triage"
 
+[[job]]
+label = "com.arete.dashboard"
+keepalive = true
+
 [[probe]]
 name = "claude"
 command = ["claude", "-p", "--model", "haiku", "--no-session-persistence", "Reply with the single word ok"]
@@ -91,6 +94,10 @@ def cmd_status(args) -> int:
     cfg = config.load()
     hb = util.read_json(paths.HEARTBEAT_FILE, {})
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
+    print(f"max_parallel {cfg.max_parallel}")
+    print("models:" + "".join(f"\n  {role:<10} {cfg.model(role) or 'claude default'}" for role in config.MODEL_ROLES))
+    if cfg.unused_model_keys():
+        print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
     if hb:
         bad = [c for c in hb.get("checks", []) if not c["ok"]]
         print(f"heartbeat {hb['ts']}: {'all ok' if not bad else f'{len(bad)} failing'}")
@@ -270,6 +277,12 @@ def cmd_triage(args) -> int:
     return code
 
 
+def cmd_dashboard(args) -> int:
+    from . import dashboard
+
+    return dashboard.serve(args.port)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"arete {__version__}")
@@ -279,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
 
-    p = sub.add_parser("status", help="heartbeat, alerts, recent runs")
+    p = sub.add_parser("status", help="settings, heartbeat, alerts, recent runs")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(fn=cmd_status)
 
@@ -350,6 +363,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--refresh", action="store_true", help="triage what changed, then show the board")
     p.add_argument("--dry-run", action="store_true", help="list what a refresh would triage; no model calls, no writes")
     p.set_defaults(fn=cmd_triage)
+
+    p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")
+    p.add_argument("--port", type=int, default=None, help="the port to listen on; the config's [dashboard] port by default")
+    p.set_defaults(fn=cmd_dashboard)
 
     args = ap.parse_args(argv)
     try:

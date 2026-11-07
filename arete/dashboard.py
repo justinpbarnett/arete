@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import glob
+import json
+import shutil
+import socket
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
+
+from . import board, chat, config, paths, settings, util
+
+WEB_DIR = paths.PACKAGE_DIR / "web"
+STATIC = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/pattern.css": ("pattern.css", "text/css; charset=utf-8"),
+}
+TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                  "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
+RETRY_SECONDS = 10
+WATCH_SECONDS = 30
+WHOIS_SECONDS = 60
+MAX_BODY = 64 * 1024
+LOG_PATH = "/api/log/"
+PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
+               "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+
+
+def tailscale(*args: str) -> dict:
+    exe = shutil.which("tailscale") or next((m for pattern in TAILSCALE_APPS for m in sorted(glob.glob(pattern))), "")
+    if not exe:
+        return {}
+    try:
+        proc = subprocess.run([exe, *args], capture_output=True, text=True, timeout=10, check=False)
+        return json.loads(proc.stdout) if proc.returncode == 0 else {}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError):
+        return {}
+
+
+@dataclass(frozen=True)
+class Node:
+    addresses: tuple[str, ...]
+    names: frozenset[str]
+    owner: str
+
+
+def this_node(owner: str) -> Node | None:
+    status = tailscale("status", "--json")
+    me = status.get("Self") or {}
+    addresses = tuple(me.get("TailscaleIPs") or ())
+    dns_name = (me.get("DNSName") or "").rstrip(".").lower()
+    owner = owner or ((status.get("User") or {}).get(str(me.get("UserID"))) or {}).get("LoginName", "")
+    if status.get("BackendState") != "Running" or not addresses or not owner:
+        return None
+    return Node(addresses, frozenset({*addresses, dns_name, dns_name.split(".")[0]} - {""}), owner)
+
+
+@dataclass
+class Logins:
+    seen: dict[str, tuple[float, str]] = field(default_factory=dict)
+    guard: threading.Lock = field(default_factory=threading.Lock)
+
+    def of(self, address: str) -> str:
+        with self.guard:
+            at, login = self.seen.get(address, (0.0, ""))
+        if time.monotonic() - at < WHOIS_SECONDS:
+            return login
+        login = (tailscale("whois", "--json", address).get("UserProfile") or {}).get("LoginName", "")
+        with self.guard:
+            self.seen[address] = (time.monotonic(), login)
+        return login
+
+
+def host_name(host: str) -> str:
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host[1:host.find("]")]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+class Refusal(Exception):
+    def __init__(self, status: int, text: str):
+        super().__init__(text)
+        self.status = status
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "arete"
+    sys_version = ""
+
+    def do_GET(self) -> None:
+        self.answer("GET")
+
+    def do_POST(self) -> None:
+        self.answer("POST")
+
+    def answer(self, method: str) -> None:
+        try:
+            self.admit(method)
+            path = urlsplit(self.path).path
+            if method == "GET" and path in STATIC:
+                return self.send_static(*STATIC[path])
+            self.send_json(200, self.api(method, path))
+        except Refusal as r:
+            self.send_json(r.status, {"error": str(r)})
+        except Exception as e:
+            self.log_error("%s", f"{type(e).__name__}: {e}")
+            self.send_json(500, {"error": util.first_line(f"{type(e).__name__}: {e}", 300)})
+
+    def admit(self, method: str) -> None:
+        node: Node = self.server.node
+        if host_name(self.headers.get("Host", "")) not in node.names:
+            raise Refusal(421, "This server answers only to its tailnet name or address.")
+        if self.server.logins.of(self.client_address[0]) != node.owner:
+            raise Refusal(403, "The dashboard opens only for its owner's tailnet login.")
+        if method == "POST" and self.headers.get("X-Arete") != "1":
+            raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
+
+    def api(self, method: str, path: str):
+        if method == "GET":
+            if path == "/api/state":
+                return board.snapshot()
+            if path == "/api/trends":
+                return board.trends()
+            if path == "/api/settings":
+                return settings.current()
+            if path == "/api/chat":
+                return chat.view()
+            if path.startswith(LOG_PATH):
+                return self.log_tail(unquote(path[len(LOG_PATH):]))
+        if method == "POST":
+            if path == "/api/settings":
+                return self.save_settings()
+            if path == "/api/chat":
+                return self.send_chat()
+            if path == "/api/chat/new":
+                return self.new_chat()
+        raise Refusal(404, f"Nothing at {method} {path}.")
+
+    def log_tail(self, run_id: str) -> dict:
+        try:
+            return {"id": run_id, "lines": board.run_log(run_id)}
+        except ValueError as e:
+            raise Refusal(400, str(e)) from e
+
+    def save_settings(self) -> dict:
+        try:
+            return settings.save(self.body())
+        except settings.Refused as e:
+            raise Refusal(400, str(e)) from e
+
+    def send_chat(self) -> dict:
+        text = str(self.body().get("text", "")).strip()
+        if not text:
+            raise Refusal(400, "Write a message first.")
+        try:
+            return chat.send(text)
+        except chat.Busy as e:
+            raise Refusal(409, str(e)) from e
+
+    def new_chat(self) -> dict:
+        try:
+            return chat.new()
+        except chat.Busy as e:
+            raise Refusal(409, str(e)) from e
+
+    def body(self) -> dict:
+        size = int(self.headers.get("Content-Length") or 0)
+        if size > MAX_BODY:
+            raise Refusal(413, f"A request body holds at most {MAX_BODY // 1024} KB.")
+        try:
+            data = json.loads(self.rfile.read(size) or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise Refusal(400, "The request body is not JSON.") from e
+        if not isinstance(data, dict):
+            raise Refusal(400, "The request body is not a JSON object.")
+        return data
+
+    def send_static(self, name: str, kind: str) -> None:
+        self.send(200, (WEB_DIR / name).read_bytes(), kind, "no-cache")
+
+    def send_json(self, status: int, data) -> None:
+        self.send(status, json.dumps(data, default=str).encode(), "application/json", "no-store")
+
+    def send(self, status: int, payload: bytes, kind: str, cache: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", cache)
+        self.send_header("Content-Security-Policy", PAGE_POLICY)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_request(self, code="-", size="-") -> None:
+        if self.command == "GET" and isinstance(code, int) and 200 <= code < 300:
+            return
+        super().log_request(code, size)
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address: str, port: int, node: Node, logins: Logins):
+        self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        self.node, self.logins = node, logins
+        super().__init__((address, port), Handler)
+
+
+def open_servers(node: Node, port: int, logins: Logins) -> list[Server]:
+    servers: list[Server] = []
+    try:
+        for address in node.addresses:
+            servers.append(Server(address, port, node, logins))
+    except OSError:
+        for s in servers:
+            s.server_close()
+        raise
+    return servers
+
+
+def say(text: str) -> None:
+    print(f"{util.iso()} {text}", flush=True)
+
+
+def serve(port: int | None = None) -> int:
+    cfg = config.load()
+    port = port or cfg.dashboard_port
+    chat.settle_after_restart()
+    logins = Logins()
+    waiting_for = ""
+    while True:
+        node = this_node(cfg.dashboard_owner)
+        try:
+            if node is None:
+                raise OSError("tailscale is not running or reports no address")
+            servers = open_servers(node, port, logins)
+        except OSError as e:
+            if str(e) != waiting_for:
+                say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
+                waiting_for = str(e)
+            time.sleep(RETRY_SECONDS)
+            continue
+        waiting_for = ""
+        for s in servers:
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+        say(f"dashboard listening on port {port} at {', '.join(node.addresses)}")
+        while this_node(cfg.dashboard_owner) == node:
+            time.sleep(WATCH_SECONDS)
+        say("the tailnet address or owner changed; listening again")
+        for s in servers:
+            s.shutdown()
+            s.server_close()

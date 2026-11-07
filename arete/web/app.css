@@ -1,0 +1,39 @@
+.views { margin: 0 0 8px; }
+
+.chart { display: block; max-width: 100%; height: auto; margin: 18px 0 30px; overflow: visible; }
+.chart .frame { fill: var(--ground); stroke: var(--ink); stroke-width: 1; shape-rendering: crispEdges; }
+.chart .frame.this { fill: var(--ink); }
+.chart .frame.below { stroke-dasharray: 4 3; }
+.chart .axis, .chart .tick { stroke: var(--ink); stroke-width: 1; shape-rendering: crispEdges; }
+.chart .fig { font-family: var(--read); font-size: 12px; fill: var(--ink); }
+.chart .name { font-family: var(--mark); font-size: 12px; letter-spacing: .14em; fill: var(--ink); }
+
+th.c-kind { width: 110px; }
+th.c-time { width: 120px; }
+th.c-cost { width: 90px; }
+th.c-n { width: 90px; }
+th.c-rate { width: 130px; }
+th.c-log { width: 70px; }
+th.c-status { width: 150px; }
+th.c-ref { width: 140px; }
+th.c-verdict { width: 250px; }
+th.c-result { min-width: 260px; }
+td .state { margin-right: 2px; }
+td button { padding-top: 3px; padding-bottom: 2px; }
+td.muted-cell { color: var(--muted); overflow-wrap: anywhere; }
+
+ol.questions { margin: 0; padding-left: 20px; }
+td details { border: 0; margin: 6px 0 0; max-width: none; }
+td summary { font-family: var(--read); text-transform: none; letter-spacing: 0; font-size: inherit; padding: 0; }
+td details[open] > summary { margin-bottom: 8px; }
+ol.questions li { margin: 0 0 6px; }
+
+#log-lines { max-height: 440px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+#messages { margin: 18px 0 8px; border-bottom: 1px solid var(--rule); }
+.msg { border-top: 1px solid var(--rule); padding: 14px 0 12px; }
+.msg .who { font-family: var(--mark); text-transform: uppercase; letter-spacing: .14em; font-size: 12.5px; color: var(--muted); }
+.msg p { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 86ch; margin: 6px 0 0; }
+#chat textarea { width: 100%; }
+.fields.one-row { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.keys { font-size: 13px; }

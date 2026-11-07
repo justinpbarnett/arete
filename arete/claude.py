@@ -14,11 +14,17 @@ FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")
 GIT_WRITES_TO_ANY_PATH = "Bash(git * --output*)"
 
 
+@dataclass(frozen=True)
+class Session:
+    id: str = ""
+    spent_usd: float = 0.0
+
+
 @dataclass
 class Result:
     ok: bool
     text: str = ""
-    session_id: str = ""
+    session: Session = field(default_factory=Session)
     structured: dict | list | None = None
     cost_usd: float = 0.0
     turns: int = 0
@@ -41,7 +47,7 @@ def run(
     disallowed_tools: list[str] | None = None,
     permission_mode: str = "dontAsk",
     json_schema: dict | None = None,
-    resume: str = "",
+    resume: Session = Session(),
     system: str = "",
     max_budget_usd: float | None = None,
     timeout: float = 1800,
@@ -60,8 +66,8 @@ def run(
     cmd += ["--disallowedTools", GIT_WRITES_TO_ANY_PATH, *(disallowed_tools or [])]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
-    if resume:
-        cmd += ["--resume", resume]
+    if resume.id:
+        cmd += ["--resume", resume.id]
     if system:
         cmd += ["--append-system-prompt", system]
     if max_budget_usd:
@@ -108,12 +114,13 @@ def run(
     if structured is None and json_schema:
         structured = _json_from_text(data.get("result", ""))
     is_error = bool(data.get("is_error")) or data.get("subtype", "success") != "success"
+    session_spent = float(data.get("total_cost_usd") or 0)
     return Result(
         ok=not is_error and proc.returncode == 0,
         text=data.get("result", "") or "",
-        session_id=data.get("session_id", ""),
+        session=Session(data.get("session_id", ""), session_spent),
         structured=structured,
-        cost_usd=float(data.get("total_cost_usd") or 0),
+        cost_usd=max(0.0, session_spent - resume.spent_usd),
         turns=int(data.get("num_turns") or 0),
         error=(data.get("result", "") if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",

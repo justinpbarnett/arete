@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arete · Dashboard</title>
+<link rel="stylesheet" href="/pattern.css">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">Arete · Dashboard</div>
+  <h1>Arete</h1>
+  <p class="sub">The pipeline that turns approved tickets into reviewed pull requests: what it runs now, how it stands, what it costs over time, and a console to ask it why.</p>
+  <p class="status" id="status">Loading</p>
+</header>
+
+<nav class="actions views">
+  <div class="seg" role="group" aria-label="Views">
+    <button type="button" data-view="live">Live</button>
+    <button type="button" data-view="health">Health</button>
+    <button type="button" data-view="triage">Triage</button>
+    <button type="button" data-view="trends">Trends</button>
+    <button type="button" data-view="settings">Settings</button>
+    <button type="button" data-view="chat">Chat</button>
+  </div>
+</nav>
+
+<main>
+
+<section data-view="live">
+  <div id="live-now"></div>
+  <div id="log" hidden>
+    <h3 id="log-title">Log</h3>
+    <pre id="log-lines"></pre>
+    <div class="actions"><button type="button" id="log-close">Close the log</button></div>
+  </div>
+  <div id="live-rest"></div>
+</section>
+
+<section data-view="health" hidden>
+  <div id="health"></div>
+</section>
+
+<section data-view="triage" hidden>
+  <div id="triage"></div>
+</section>
+
+<section data-view="trends" hidden>
+  <div id="trends"></div>
+</section>
+
+<section data-view="settings" hidden>
+  <h2><span class="n">01</span>Settings</h2>
+  <p>A save writes <code>config.toml</code> on the Mac. The pipeline reads it at its next poll, and a run already going keeps the models it started with.</p>
+  <form id="settings" novalidate>
+    <div class="fields one-row">
+      <div class="field">
+        <label for="max-parallel">Runs at once</label>
+        <input id="max-parallel" name="max_parallel" type="text" inputmode="numeric" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <h3>Models</h3>
+    <p class="muted">Each role takes opus, sonnet, haiku, or a full claude model id.</p>
+    <div class="fields" id="model-fields"></div>
+    <datalist id="model-names">
+      <option value="opus"></option>
+      <option value="sonnet"></option>
+      <option value="haiku"></option>
+    </datalist>
+    <div class="actions">
+      <button type="submit" id="settings-save">Save</button>
+      <button type="button" id="settings-undo">Undo changes</button>
+    </div>
+  </form>
+  <p id="settings-result" aria-live="polite" hidden></p>
+</section>
+
+<section data-view="chat" hidden>
+  <h2><span class="n">01</span>Console</h2>
+  <p>Ask about runs, health, cost, settings, or arete's own code. It reads and advises, and it files an issue on arete when you ask it to.</p>
+  <div id="messages" aria-live="polite"></div>
+  <p id="working" class="muted" hidden></p>
+  <form id="chat" novalidate>
+    <div class="field">
+      <label for="chat-text">Message</label>
+      <textarea id="chat-text" rows="4" spellcheck="true"></textarea>
+    </div>
+    <div class="actions">
+      <button type="submit" class="act" id="chat-send">Send</button>
+      <button type="button" id="chat-new">New chat</button>
+      <span class="muted keys">Ctrl or Cmd with Enter sends</span>
+    </div>
+  </form>
+  <p id="chat-result" aria-live="polite" hidden></p>
+</section>
+
+</main>
+
+<footer>
+  <p>Arete · served from the Mac to its owner on the tailnet · <a href="https://github.com/justinpbarnett/arete">Source</a></p>
+</footer>
+
+</div>
+</body>
+</html>
