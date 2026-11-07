@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -23,6 +24,7 @@ STATIC = {
 }
 TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
                   "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
+TAILSCALE_AS_CLI = {"TAILSCALE_BE_CLI": "1"}
 RETRY_SECONDS = 10
 WATCH_SECONDS = 30
 WHOIS_SECONDS = 60
@@ -37,7 +39,8 @@ def tailscale(*args: str) -> dict:
     if not exe:
         return {}
     try:
-        proc = subprocess.run([exe, *args], capture_output=True, text=True, timeout=10, check=False)
+        proc = subprocess.run([exe, *args], capture_output=True, text=True, timeout=10, check=False,
+                              env={**os.environ, **TAILSCALE_AS_CLI})
         return json.loads(proc.stdout) if proc.returncode == 0 else {}
     except (subprocess.TimeoutExpired, json.JSONDecodeError):
         return {}
