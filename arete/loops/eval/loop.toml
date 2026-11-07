@@ -1,0 +1,11 @@
+kind = "command"
+description = "Run the eval tasks of every repo that has them"
+
+[trigger]
+cron = "10 2 * * 0"
+
+[run]
+command = "arete eval"
+try_command = "arete eval --dry-run"
+timeout_minutes = 360
+stale_hours = 192

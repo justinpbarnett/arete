@@ -1,0 +1,11 @@
+kind = "command"
+description = "Audit every harness for drift with fixed checks, no model"
+
+[trigger]
+cron = "30 4 * * *"
+
+[run]
+command = "arete audit"
+try_command = "arete audit --dry-run"
+timeout_minutes = 30
+stale_hours = 30

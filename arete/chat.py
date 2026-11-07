@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import threading
 
-from . import board, claude, config, gh, paths, pipeline, util
+from . import board, config, gh, paths, pipeline, runner, util
+from .agent import Result, Session
 
 CHAT_FILE = paths.STATE_DIR / "chat.json"
 CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
@@ -57,7 +58,7 @@ def send(text: str) -> dict:
             raise Busy("The last message is still running. Wait for its answer.")
         h = {**h, "busy": True, "messages": [*h["messages"], message("you", text)]}
         util.write_json(CHAT_FILE, h)
-    threading.Thread(target=answer, args=(text, claude.Session(h["session"], h["spent"])), daemon=True).start()
+    threading.Thread(target=answer, args=(text, Session(h["session"], h["spent"], h.get("runner", ""))), daemon=True).start()
     return view()
 
 
@@ -69,7 +70,7 @@ def new() -> dict:
     return view()
 
 
-def answer(text: str, session: claude.Session) -> None:
+def answer(text: str, session: Session) -> None:
     reply, cost, draft = "", 0.0, None
     try:
         result = ask(text, session)
@@ -82,12 +83,13 @@ def answer(text: str, session: claude.Session) -> None:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
     with chat_file_lock:
         h = history()
-        util.write_json(CHAT_FILE, {**h, "session": session.id, "spent": session.spent_usd, "busy": False,
+        util.write_json(CHAT_FILE, {**h, "session": session.id, "spent": session.spent_usd,
+                                    "runner": session.runner, "busy": False,
                                     "draft": draft or h["draft"],
                                     "messages": [*h["messages"], message("arete", reply, cost)]})
 
 
-def reply_and_draft(result: claude.Result) -> tuple[str, dict | None]:
+def reply_and_draft(result: Result) -> tuple[str, dict | None]:
     drafted = result.structured if isinstance(result.structured, dict) else {}
     title, body = str(drafted.get("issue_title") or "").strip(), str(drafted.get("issue_body") or "").strip()
     return drafted.get("reply") or result.text, {"title": title, "body": body} if title else None
@@ -120,14 +122,16 @@ def arete_repo(cfg: config.Config) -> config.Repo:
         return config.Repo(name=cfg.arete_repo, path=paths.PACKAGE_DIR.parent)
 
 
-def ask(text: str, session: claude.Session) -> claude.Result:
+def ask(text: str, session: Session) -> Result:
     cfg = config.load()
     util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends()})
     repo = arete_repo(cfg)
     github = repo.github
     reads_issues = [f"Bash(gh issue list --repo {github}*)", f"Bash(gh issue view * --repo {github}*)"] if github else []
-    return claude.run(
+    return runner.run(
         text, repo.path,
+        trace=("chat", "chat"),
+        cfg=cfg,
         model=cfg.model("chat"),
         tools=[*pipeline.READ_TOOLS, "Bash"],
         allowed_tools=[*pipeline.READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",

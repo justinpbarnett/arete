@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import alerts, claude, config, gh, jira, paths, state, tracker, util
+from . import alerts, config, gh, jira, paths, runner, state, tracker, util
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import READ_TOOLS, prompt
 
@@ -213,9 +213,10 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate) -> tuple[dic
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-    res = claude.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage"),
-                     tools=READ_TOOLS, allowed_tools=READ_TOOLS, mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
-                     timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:])
+    res = runner.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage"), tools=READ_TOOLS,
+                     allowed_tools=READ_TOOLS, mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA,
+                     max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
+                     trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None
     record_file(c.ref).write_text(f"{text}\n\n## Triage result (${res.cost_usd:.3f})\n\n```json\n"
                                   f"{json.dumps(answer or {'error': res.error}, indent=2)}\n```\n")

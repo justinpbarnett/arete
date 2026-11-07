@@ -1,0 +1,27 @@
+kind = "watch"
+description = "Turn an issue labeled loop that you opened on the arete repo into an agent ticket that specs the loop folder"
+
+[trigger]
+event = ["github.issue"]
+trust = "owner"
+
+[[source]]
+type = "github"
+repos = ["arete"]
+watch = ["issue"]
+label = "loop"
+every = "10m"
+
+[run]
+repo = "arete"
+model = "sonnet"
+tools = ["Read", "Glob", "Grep"]
+timeout_minutes = 15
+budget_usd = 0.75
+daily_budget_usd = 3.00
+
+[[emit]]
+type = "ticket"
+repo = "arete"
+labels = ["agent"]
+prefix = "Build loop: "

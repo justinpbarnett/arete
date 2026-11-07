@@ -41,3 +41,19 @@ ol.questions li { margin: 0 0 6px; }
 .draft { border: 1px solid var(--ink); padding: 4px 16px 2px; margin: 18px 0; }
 .draft h3 { margin-top: 12px; }
 #draft-body { margin: 0; padding: 0; border: 0; max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.feed { margin: 26px 0; }
+.feed-lines { max-height: 440px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.fold-text { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
+#loop-detail { margin-top: 30px; }
+#loop-detail h3 { margin-top: 28px; }
+#loop-detail dl { margin: 14px 0 6px; }
+td div.muted { font-size: 13px; margin-top: 2px; }
+th.c-on { width: 70px; }
+th.c-decide { width: 210px; }
+th.c-loop-buttons { width: 290px; }
+th.c-model { width: 210px; }
+th.c-probe { width: 110px; }
+th.c-loop { min-width: 250px; }
+#launch-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0 18px; }
+th.c-device { min-width: 220px; }

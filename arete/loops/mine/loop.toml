@@ -1,0 +1,11 @@
+kind = "command"
+description = "Mine the last day of transcripts into harness fixes and open PRs for them"
+
+[trigger]
+cron = "50 23 * * *"
+
+[run]
+command = "arete mine"
+try_command = "arete mine --dry-run"
+timeout_minutes = 120
+stale_hours = 30

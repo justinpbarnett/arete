@@ -1,0 +1,11 @@
+kind = "command"
+description = "Run the pipeline on the oldest approved ticket in each pipeline repo"
+
+[trigger]
+every = "5m"
+
+[run]
+command = "arete poll"
+try_command = "arete poll --dry-run"
+timeout_minutes = 240
+stale_hours = 1

@@ -11,9 +11,22 @@ import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NoReturn
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import board, chat, config, gh, paths, settings, util
+from . import (
+    board,
+    chat,
+    config,
+    control,
+    devices,
+    gh,
+    hooks,
+    loops,
+    paths,
+    sessions,
+    settings,
+    util,
+)
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 STATIC = {
@@ -30,6 +43,12 @@ WATCH_SECONDS = 30
 WHOIS_SECONDS = 60
 MAX_BODY = 64 * 1024
 LOG_PATH = "/api/log/"
+LOOP_PATH = "/api/loops/"
+FEED_PATH = "/api/feed/"
+RUN_PATH = "/api/runs/"
+APPROVAL_PATH = "/api/approvals/"
+SESSION_PATH = "/api/sessions/"
+DEVICE_PATH = "/api/devices/"
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
@@ -87,18 +106,31 @@ def host_name(host: str) -> str:
     return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
 
 
+def whole_number(text: str) -> int:
+    if not str(text).strip().isdigit():
+        raise Refusal(400, f"'{text}' is not a whole number.")
+    return int(text)
+
+
 class Refusal(Exception):
     def __init__(self, status: int, text: str):
         super().__init__(text)
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502}
+STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502,
+                     control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
+                     devices.DeviceError: 400}
 
 
 def refusal_status(e: Exception) -> int | None:
-    return e.status if isinstance(e, Refusal) else next(
+    return e.status if isinstance(e, Refusal | hooks.HookRefused) else next(
         (status for kind, status in STATUS_OF_REFUSAL.items() if isinstance(e, kind)), None)
+
+
+def last_part(path: str, prefix: str) -> tuple[str, str]:
+    name, _, action = unquote(path[len(prefix):]).rpartition("/")
+    return name, action
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -113,27 +145,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def answer(self, method: str) -> None:
         try:
-            self.admit(method)
-            path = urlsplit(self.path).path
+            parts = urlsplit(self.path)
+            path = parts.path
+            self.admit(method, path)
             if method == "GET" and path in STATIC:
                 return self.send_static(*STATIC[path])
-            self.send_json(200, self.api(method, path))
+            if method == "POST" and path.startswith(hooks.HOOK_PATH):
+                got = hooks.receive(unquote(path[len(hooks.HOOK_PATH):]), self.headers, self.raw_body())
+                return self.send_json(202 if got["queued"] else 200, got)
+            self.send_json(200, self.api(method, path, {k: v[-1] for k, v in parse_qs(parts.query).items()}))
         except Exception as e:
             if status := refusal_status(e):
                 return self.send_json(status, {"error": str(e)})
             self.log_error("%s", f"{type(e).__name__}: {e}")
             self.send_json(500, {"error": util.first_line(f"{type(e).__name__}: {e}", 300)})
 
-    def admit(self, method: str) -> None:
+    def admit(self, method: str, path: str) -> None:
         node: Node = self.server.node
         if host_name(self.headers.get("Host", "")) not in node.names:
             raise Refusal(421, "This server answers only to its tailnet name or address.")
+        if path.startswith(hooks.HOOK_PATH):
+            if method != "POST":
+                raise Refusal(405, "A webhook takes POST.")
+            return
         if self.server.logins.of(self.client_address[0]) != node.owner:
             raise Refusal(403, "The dashboard opens only for its owner's tailnet login.")
         if method == "POST" and self.headers.get("X-Arete") != "1":
             raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
 
-    def api(self, method: str, path: str):
+    def api(self, method: str, path: str, query: dict):
         if method == "GET":
             if path == "/api/state":
                 return board.snapshot()
@@ -146,6 +186,20 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith(LOG_PATH):
                 run_id = unquote(path[len(LOG_PATH):])
                 return {"id": run_id, "lines": board.run_log(run_id)}
+            if path == "/api/loops":
+                return {"loops": control.loop_views(), "serve": control.serve_beat()}
+            if path.startswith(LOOP_PATH):
+                return control.loop_detail(unquote(path[len(LOOP_PATH):]))
+            if path.startswith(FEED_PATH):
+                return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
+            if path == "/api/approvals":
+                return {"approvals": control.approvals()}
+            if path == "/api/devices":
+                return {"devices": control.fleet()}
+            if path == "/api/sessions":
+                return {"sessions": sessions.views(), "choices": sessions.choices()}
+            if path == "/api/costs":
+                return control.costs(float(whole_number(query.get("days", str(control.COST_DAYS))) or 1))
         if method == "POST":
             if path == "/api/settings":
                 return settings.save(self.body())
@@ -157,7 +211,52 @@ class Handler(BaseHTTPRequestHandler):
                 return chat.file_draft()
             if path == "/api/chat/drop":
                 return chat.drop_draft()
+            if path.startswith(LOOP_PATH):
+                return self.loop_action(*last_part(path, LOOP_PATH))
+            if path.startswith(RUN_PATH):
+                run_id, action = last_part(path, RUN_PATH)
+                if action == "stop":
+                    return control.stop_run(run_id)
+            if path.startswith(APPROVAL_PATH):
+                return control.decide(whole_number(unquote(path[len(APPROVAL_PATH):])),
+                                      self.body().get("approve") is True)
+            if path == "/api/sessions":
+                return self.launch_session()
+            if path.startswith(SESSION_PATH):
+                session_id, action = last_part(path, SESSION_PATH)
+                if action == "send":
+                    return sessions.send(session_id, str(self.body().get("text", "")))
+                if action == "stop":
+                    return control.stop_run(session_id)
+            if path.startswith(DEVICE_PATH):
+                name, action = last_part(path, DEVICE_PATH)
+                if action == "probe":
+                    return devices.probe(name)
         raise Refusal(404, f"Nothing at {method} {path}.")
+
+    def loop_action(self, name: str, action: str):
+        if action in ("enable", "disable"):
+            return control.switch(name, action == "enable")
+        if action == "start":
+            return control.start_loop(name)
+        raise Refusal(404, f"Loops take enable, disable or start, not {action}.")
+
+    def launch_session(self) -> dict:
+        b = self.body()
+        tools = b.get("tools")
+        if tools is not None and not (isinstance(tools, list) and all(isinstance(x, str) for x in tools)):
+            raise Refusal(400, "tools is a list of tool names.")
+        budget = b.get("budget_usd")
+        if budget not in (None, "") and not isinstance(budget, int | float):
+            raise Refusal(400, "budget_usd is a number of dollars.")
+        device, repo = str(b.get("device") or "local"), str(b.get("repo") or "")
+        if repo and repo not in {r.name for r in config.load().repos}:
+            raise Refusal(400, "Pick a repo from the config.")
+        if repo and device != "local":
+            raise Refusal(400, "A session on another device starts in that device's folder; leave the repo empty.")
+        return sessions.launch(str(b.get("prompt", "")), device=device, model=str(b.get("model") or ""),
+                               run_with=str(b.get("runner") or ""), tools=tools, repo=repo,
+                               budget_usd=float(budget) if budget else None)
 
     def chat_text(self) -> str:
         text = str(self.body().get("text", "")).strip()
@@ -165,15 +264,18 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(400, "Write a message first.")
         return text
 
-    def body(self) -> dict:
+    def raw_body(self, limit: int = hooks.MAX_HOOK_BODY) -> bytes:
         length = (self.headers.get("Content-Length") or "0").strip()
         if not length.isdigit():
             raise Refusal(400, "Content-Length takes a whole number of bytes.")
         size = int(length)
-        if size > MAX_BODY:
-            raise Refusal(413, f"A request body holds at most {MAX_BODY // 1024} KB.")
+        if size > limit:
+            raise Refusal(413, f"A request body holds at most {limit // 1024} KB.")
+        return self.rfile.read(size)
+
+    def body(self) -> dict:
         try:
-            data = json.loads(self.rfile.read(size) or b"{}")
+            data = json.loads(self.raw_body(MAX_BODY) or b"{}")
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise Refusal(400, "The request body is not JSON.") from e
         if not isinstance(data, dict):

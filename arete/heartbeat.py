@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
@@ -27,6 +28,8 @@ def launchd_table() -> dict[str, tuple[str, str]]:
 
 
 def check_jobs(cfg: config.Config) -> list[Check]:
+    if not paths.ON_MAC:
+        return []
     table = launchd_table()
     out = []
     for job in cfg.jobs:
@@ -116,18 +119,44 @@ def check_disk() -> list[Check]:
     return [Check("disk:home", free_gb > 15, f"{free_gb:.0f} GB free")]
 
 
-def check_arete_jobs() -> list[Check]:
-    out = []
-    limits = {"poll": 1, "mine": 30, "audit": 30, "eval": 24 * 8, "triage": 3}
+def check_serve() -> list[Check]:
+    from . import control
+
+    beat = control.serve_beat()
+    if not beat:
+        return [Check("serve:beat", False, "arete serve has never run; `arete install` starts it")]
+    if not beat["alive"]:
+        why = "its process is gone" if not control.pid_alive(beat.get("pid")) else f"last beat {beat['age_seconds']}s ago"
+        return [Check("serve:beat", False, f"arete serve is down: {why}")]
+    out = [Check("serve:beat", True, f"pid {beat['pid']}, {beat['loops']} loops on, {beat['pending']} waiting")]
+    for name, error in (beat.get("broken") or {}).items():
+        out.append(Check(f"loop:{name}:broken", False, error, "warn"))
+    for sid, error in (beat.get("poll_errors") or {}).items():
+        out.append(Check(f"source:{sid}", False, error, "warn"))
+    return out
+
+
+def check_loops(cfg: config.Config) -> list[Check]:
+    from . import loops
+
     beats = util.read_json(paths.STATE_DIR / "loops.json", {})
-    for name, hours in limits.items():
-        last = beats.get(name)
+    out = []
+    for loop in loops.load_all(cfg):
+        if not loop.enabled or loop.error or not loop.stale_hours or loop.name == os.environ.get("ARETE_LOOP"):
+            continue
+        last = next((r for r in state.runs(kind="loop", loop=loop.name, limit=10, firings=True)
+                     if r["status"] != "running"), None)
         if not last:
             continue
-        age = util.hours_awake_since(util.parse_iso(last["ts"]).timestamp())
-        ok = age <= hours and last.get("ok", True)
-        detail = f"last run {age:.1f}h ago" + ("" if last.get("ok", True) else f", failed: {last.get('detail', '')}")
-        out.append(Check(f"loop:{name}", ok, detail))
+        age = util.hours_awake_since(util.parse_iso(last["finished"] or last["started"]).timestamp())
+        marked = beats.get(loop.name) or {}
+        ok = age <= loop.stale_hours and last["status"] in ("done", "skipped") and marked.get("ok", True)
+        detail = f"last run {age:.1f}h ago, {last['status']}, limit {loop.stale_hours:g}h"
+        if not marked.get("ok", True):
+            detail += f", failed: {marked.get('detail', '')}"
+        elif last["status"] not in ("done", "skipped"):
+            detail += f": {util.first_line(last['summary'] or '', 160)}"
+        out.append(Check(f"loop:{loop.name}", ok, detail))
     return out
 
 
@@ -163,7 +192,8 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         check_claude_auth,
         check_hook,
         check_disk,
-        check_arete_jobs,
+        check_serve,
+        lambda: check_loops(cfg),
     ):
         try:
             checks += fn()

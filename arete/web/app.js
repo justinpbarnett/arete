@@ -1,6 +1,6 @@
 "use strict";
 
-const VIEWS = ["live", "health", "triage", "trends", "settings", "chat"];
+const VIEWS = ["live", "loops", "launch", "fleet", "health", "triage", "trends", "settings", "chat"];
 const LIVE_MS = 5000;
 const SLOW_MS = 30000;
 const CHAT_BUSY_MS = 3000;
@@ -12,6 +12,7 @@ let timer = 0;
 let refreshCount = 0;
 let openLog = "";
 let trendsData = null;
+let costData = null;
 let settingsData = null;
 let chatSeen = "";
 let lastGood = "";
@@ -145,7 +146,7 @@ function drawLive(snapshot) {
   fill("live-now", heading(1, "Running now"), panelParts(snapshot.live, "The live runs", (live) => [
     el("p", { class: "readout" }, String(live.slots), el("small", { text: `of ${live.max_parallel} slots busy` })),
     live.runs.length
-      ? table("", [["Ticket"], ["Kind", "c-kind"], ["Started", "c-time"], ["Last step"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["", "c-log"]],
+      ? table("", [["Work"], ["Kind", "c-kind"], ["Started", "c-time"], ["Last step"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["", "c-log"]],
         live.runs.map((r) => el("tr", {},
           cell(wholeWords(r.ticket)), cell(r.kind), cell(clock(r.started)), cell(r.step || "starting"),
           cell(duration(r.seconds), "num"), cell(money(r.cost), "num"), cell(logButton(r.id)))))
@@ -167,7 +168,7 @@ function drawLive(snapshot) {
       : quiet("No review feedback is waiting.")),
     heading(4, "Recent runs"),
     panelParts(snapshot.recent, "Recent runs", (recent) => recent.length
-      ? table("Newest first", [["Ticket"], ["Kind", "c-kind"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["Result", "c-result"], ["", "c-log"]],
+      ? table("Newest first", [["Work"], ["Kind", "c-kind"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["Result", "c-result"], ["", "c-log"]],
         recent.map((r) => el("tr", {},
           cell(wholeWords(r.ticket)), cell(r.kind), cell([stateChip(r.state), r.state ? " " : "", r.status], "nb"), cell(clock(r.started)),
           cell(duration(r.seconds), "num"), cell(money(r.cost), "num"),
@@ -362,7 +363,8 @@ function drawTrends() {
     heading(4, "Evals"),
     t.evals.length ? table("Mined eval tasks", [["Repo"], ["Tasks", "num c-n"], ["Passed", "num c-n"], ["Pass rate", "num c-rate"], ["Last", "c-time"]],
       t.evals.map((e) => el("tr", {}, cell(e.repo), cell(e.tasks, "num"), cell(e.passed, "num"), cell(percent(e.pass_rate), "num"), cell(clock(e.last)))))
-      : quiet("No eval ran in this window."));
+      : quiet("No eval ran in this window."),
+    costParts(costData));
 }
 
 function defaultModel(data, role) {
@@ -473,15 +475,449 @@ async function chatAction(path, button, resultId) {
   if (answered) drawChat(answered);
 }
 
+const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", failed: "fault", interrupted: "fault", "needs-info": "caution" };
+const feeds = {
+  loop: { box: "loop-feed", run: "", after: 0, status: "" },
+  session: { box: "session-feed", run: "", after: 0, status: "" },
+};
+let openLoop = "";
+let launchKey = "";
+
+function button(text, focus, onClick, disabled = false) {
+  return el("button", { type: "button", "data-focus": focus, disabled, text, on: { click: (e) => onClick(e.currentTarget) } });
+}
+
+function runStatus(status) {
+  return [stateChip(RUN_STATE[status]), RUN_STATE[status] ? " " : "", status];
+}
+
+function secondsBetween(start, end) {
+  return start ? Math.max(0, Math.round(((end ? new Date(end) : new Date()) - new Date(start)) / 1000)) : null;
+}
+
+function fact(name, value) {
+  return value === "" || value === null || value === undefined ? null : [el("dt", { text: name }), el("dd", {}, value)];
+}
+
+function fold(key, summary, ...content) {
+  return el("details", {
+    open: openQuestions.has(key),
+    on: { toggle: (e) => (e.target.open ? openQuestions.add(key) : openQuestions.delete(key)) },
+  }, el("summary", { text: summary }), ...content);
+}
+
+function feedLine(line) {
+  return `${clock(line.ts).padStart(5)}  ${line.kind.padEnd(7)}  ${line.text}`;
+}
+
+function runAbout(r) {
+  const parts = [r.model && `${r.runner ? `${r.runner} ` : ""}${r.model}`, r.device && `on ${r.device}`,
+    `started ${clock(r.started)}`, r.finished && `ended ${clock(r.finished)}`, money(r.cost_usd)].filter(Boolean);
+  return [stateChip(RUN_STATE[r.status]), RUN_STATE[r.status] ? " " : "", `${r.status} · ${parts.join(" · ")}`,
+    r.status !== "running" && r.summary ? ` · ${r.summary}` : ""];
+}
+
+async function openFeed(which, runId) {
+  const feed = feeds[which];
+  Object.assign(feed, { run: runId, after: 0, status: "" });
+  document.querySelector(`#${feed.box} .feed-lines`).textContent = "";
+  await refreshFeed(which);
+  document.getElementById(feed.box).scrollIntoView({ block: "nearest" });
+}
+
+async function refreshFeed(which) {
+  const feed = feeds[which];
+  if (!feed.run) return;
+  const box = document.getElementById(feed.box);
+  const lines = box.querySelector(".feed-lines");
+  box.hidden = false;
+  try {
+    const data = await call(`/api/feed/${encodeURIComponent(feed.run)}?after=${feed.after}`);
+    if (feeds[which].run !== data.run.id) return;
+    const stick = lines.scrollTop + lines.clientHeight >= lines.scrollHeight - 4;
+    if (data.lines.length) {
+      const text = data.lines.map(feedLine).join("\n");
+      lines.textContent = feed.after ? `${lines.textContent}\n${text}` : text;
+      feed.after = data.lines[data.lines.length - 1].id;
+    } else if (!feed.after) {
+      lines.textContent = "Nothing in the feed yet.";
+    }
+    feed.status = data.run.status;
+    box.querySelector(".feed-title").textContent = `${which === "loop" ? data.run.loop || "Feed" : "Session"} · ${clock(data.run.started)}`;
+    const about = box.querySelector(".feed-about");
+    if (about) about.replaceChildren(...runAbout(data.run).filter(Boolean));
+    else box.querySelector(".feed-title").after(el("p", { class: "muted feed-about" }, runAbout(data.run).filter(Boolean)));
+    box.querySelector(".feed-stop").disabled = data.run.status !== "running";
+    if (which === "session") document.getElementById("session-go").disabled = data.run.status !== "running";
+    if (stick) lines.scrollTop = lines.scrollHeight;
+  } catch (e) {
+    lines.textContent = `The feed could not be read: ${e.message}`;
+  }
+}
+
+function closeFeed(which) {
+  feeds[which].run = "";
+  document.getElementById(feeds[which].box).hidden = true;
+}
+
+async function stopFeedRun(which, btn, resultId) {
+  btn.disabled = true;
+  try {
+    const r = await call(`/api/runs/${encodeURIComponent(feeds[which].run)}/stop`, {});
+    say(resultId, "ok", r.was === "gone" ? `${r.id} had already stopped, so it is marked interrupted.` : `Asked ${r.id} to stop. Its feed says when it has.`);
+  } catch (e) {
+    say(resultId, "fault", e.message);
+  }
+  await refreshFeed(which);
+}
+
+function serveLine(serve) {
+  if (!serve.at) return el("p", {}, stateChip("fault"), " Serve has never run on this machine, so no loop fires on its own. ", el("code", { text: "arete install" }), " starts it and keeps it running.");
+  if (!serve.alive) return el("p", {}, stateChip("fault"), ` Serve last beat ${ago(serve.at)} (${clock(serve.at)}), so no loop fires on its own until it runs again.`);
+  const broken = Object.keys(serve.broken || {}).length;
+  const errors = Object.keys(serve.poll_errors || {}).length;
+  return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),
+    ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running} running, ${serve.pending} waiting.` +
+    (broken ? ` ${broken} broken.` : "") + (errors ? ` ${errors} sources fail to poll; Fleet lists them.` : ""));
+}
+
+function approvalRow(a) {
+  const body = a.emit?.item?.body || a.emit?.item?.text;
+  return el("tr", {},
+    cell(a.loop, "nb"),
+    cell([a.action, body ? fold(`approval:${a.id}`, "Show the body", el("pre", { class: "fold-text", text: body })) : null]),
+    cell(clock(a.created)),
+    cell([button("Approve", `approve:${a.id}`, (b) => decide(a.id, true, b)), " ",
+      button("Reject", `reject:${a.id}`, (b) => decide(a.id, false, b))], "nb"));
+}
+
+async function decide(id, yes, btn) {
+  btn.disabled = true;
+  try {
+    const r = await call(`/api/approvals/${id}`, { approve: yes });
+    say("loops-result", "ok", yes ? `Approved #${id}: ${r.result}.` : `Rejected #${id}. Nothing was sent.`);
+  } catch (e) {
+    say("loops-result", "fault", e.message);
+  }
+  refresh();
+}
+
+function lastRun(l) {
+  if (l.running) return ["running", el("br"), button("Feed", `feed:${l.running}`, () => openFeed("loop", l.running))];
+  if (!l.last) return "never";
+  return [...runStatus(l.last.status), el("br"), el("span", { class: "muted", text: ago(l.last.started) })];
+}
+
+function loopRow(l) {
+  return el("tr", {},
+    cell([el("span", { class: "nb", text: l.name }), el("div", { class: "muted", text: l.error ? l.error : l.description })]),
+    cell(l.error ? stateChip("fault") : l.enabled ? "on" : "off", "nb"),
+    cell(l.kind),
+    cell(l.trigger, "nb"),
+    cell(lastRun(l), "nb"),
+    cell(l.next_due ? clock(l.next_due) : "", "nb"),
+    cell(money(l.spent_24h), "num"),
+    cell([
+      button("Open", `open:${l.name}`, () => openLoopDetail(l.name)), " ",
+      button("Start", `start:${l.name}`, (b) => loopAction(l.name, "start", b), Boolean(l.error || l.running)), " ",
+      button(l.enabled ? "Turn off" : "Turn on", `switch:${l.name}`, (b) => loopAction(l.name, l.enabled ? "disable" : "enable", b), Boolean(l.error && !l.enabled)),
+    ], "nb c-buttons"));
+}
+
+function drawLoops(data, approvals) {
+  fill("loops",
+    heading(1, "Approvals"),
+    approvals.length
+      ? table("Held until you decide", [["Loop", "c-kind"], ["What it does"], ["Held", "c-time"], ["", "c-decide"]], approvals.map(approvalRow))
+      : quiet("Nothing waits for you."),
+    heading(2, "Loops"),
+    serveLine(data.serve),
+    data.loops.length
+      ? table("Spent counts the last 24 hours", [["Loop", "c-loop"], ["On", "c-on"], ["Kind", "c-kind"], ["Trigger"], ["Last run", "c-status"], ["Next", "c-time"], ["Spent", "num c-cost"], ["", "c-loop-buttons"]],
+        data.loops.map(loopRow))
+      : quiet("No loop is installed. arete loop new drafts one from a sentence."));
+}
+
+async function loopAction(name, action, btn) {
+  btn.disabled = true;
+  try {
+    const r = await call(`/api/loops/${encodeURIComponent(name)}/${action}`, {});
+    if (action === "start") {
+      say("loops-result", "ok", `Started ${name}. Its feed is open below.`);
+      await openFeed("loop", r.id);
+    } else {
+      say("loops-result", "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`);
+    }
+  } catch (e) {
+    say("loops-result", "fault", e.message);
+  }
+  refresh();
+}
+
+async function openLoopDetail(name) {
+  openLoop = name;
+  await refreshLoopDetail();
+  document.getElementById("loop-detail").scrollIntoView({ block: "start" });
+}
+
+async function refreshLoopDetail() {
+  if (!openLoop) return;
+  const box = document.getElementById("loop-detail");
+  try {
+    drawLoopDetail(await call(`/api/loops/${encodeURIComponent(openLoop)}`));
+  } catch (e) {
+    fill("loop-detail", heading(3, openLoop), fault(`The loop could not be read: ${e.message}`), closeLoopButton());
+  }
+  box.hidden = false;
+}
+
+function closeLoopButton() {
+  return el("div", { class: "actions" }, button("Close the detail", "close-loop", () => {
+    openLoop = "";
+    document.getElementById("loop-detail").hidden = true;
+  }));
+}
+
+function budgetWords(d) {
+  return [d.budget_usd ? `${money(d.budget_usd)} a run` : "", d.daily_budget_usd ? `${money(d.daily_budget_usd)} a day` : ""].filter(Boolean).join(", ") || "none";
+}
+
+function loopFacts(d) {
+  return el("dl", { class: "w" },
+    fact("Kind", d.kind), fact("Folder", el("code", { text: d.dir })), fact("Trigger", d.trigger),
+    fact("Webhook", d.webhook_path ? el("code", { text: `POST ${d.webhook_path}` }) : ""),
+    fact("Repo", d.repo), fact("Model", d.model ? `${d.model}${d.runner ? ` on ${d.runner}` : ""}` : ""),
+    fact("Device", d.device), fact("Queue", d.queue === d.name ? "its own" : d.queue), fact("Budget", budgetWords(d)),
+    fact("Emits", d.emits.join(", ") || "nothing"),
+    fact("Next", d.next_due ? `${clock(d.next_due)}` : d.enabled ? "" : "off, so never on its own"),
+    fact("Waiting", d.waiting.length ? `${d.waiting.length} in line` : ""));
+}
+
+function loopRuns(d) {
+  return d.runs.length
+    ? table("Newest first", [["Started", "c-time"], ["Trigger", "c-kind"], ["Status", "c-status"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["Result", "c-result"], ["", "c-log"]],
+      d.runs.map((r) => el("tr", {},
+        cell(clock(r.started), "nb"), cell(r.trigger || ""), cell(runStatus(r.status), "nb"),
+        cell(duration(secondsBetween(r.started, r.finished)), "num"), cell(money(r.cost_usd), "num"),
+        cell(r.pr_url ? pullLinks(r.pr_url) : r.summary || "", "muted-cell"),
+        cell(button("Feed", `feed:${r.id}`, () => openFeed("loop", r.id))))))
+    : quiet("It has not run yet.");
+}
+
+function loopSources(d) {
+  return d.cursors.length
+    ? table("", [["Source"], ["Polled", "c-time"], ["State", "c-status"], ["Detail"]],
+      d.cursors.map((c) => el("tr", {}, cell(c.source, "muted-cell"), cell(ago(c.polled), "nb"),
+        cell(stateChip(c.ok ? "ok" : "fault")), cell(c.detail || (c.ok ? "reading" : "")))))
+    : quiet(d.sources.length ? "Serve has not polled its sources yet." : "It has no source.");
+}
+
+function loopDigests(d) {
+  return d.digests.length
+    ? d.digests.map((g) => fold(`digest:${d.name}:${g.day}`, g.day, el("pre", { class: "fold-text", text: g.text })))
+    : quiet("No digest yet.");
+}
+
+function drawLoopDetail(d) {
+  const memory = Object.keys(d.state || {}).length ? JSON.stringify(d.state, null, 2) : "";
+  fill("loop-detail",
+    heading(3, d.name),
+    d.error ? fault(`It does not load: ${d.error}`) : el("p", { text: d.description }),
+    loopFacts(d),
+    el("h3", { text: "Runs" }), loopRuns(d),
+    el("h3", { text: "Findings" }),
+    d.findings.length
+      ? table("Each finding is reported once, by its fingerprint", [["Finding"], ["Seen", "num c-n"], ["First", "c-time"], ["Last", "c-time"]],
+        d.findings.map((f) => el("tr", {}, cell(f.url ? link(f.url, f.title || f.fingerprint) : f.title || f.fingerprint), cell(f.seen, "num"),
+          cell(clock(f.first_seen), "nb"), cell(clock(f.last_seen), "nb"))))
+      : quiet("No finding yet."),
+    el("h3", { text: "Sources" }), loopSources(d),
+    d.metrics.length ? [el("h3", { text: "Metrics" }),
+      table("The last 30 days", [["Metric"], ["Latest", "num c-cost"], ["When", "c-time"], ["Points", "num c-n"]],
+        d.metrics.map((m) => el("tr", {}, cell(m.name), cell(Number(m.value).toLocaleString(), "num"), cell(clock(m.ts), "nb"), cell(m.points, "num"))))] : null,
+    d.emits.some((e) => e.startsWith("digest")) ? [el("h3", { text: "Digests" }), loopDigests(d)] : null,
+    el("h3", { text: "Memory" }),
+    memory ? fold(`memory:${d.name}`, "Show what it keeps between runs", el("pre", { class: "fold-text", text: memory })) : quiet("It keeps nothing between runs yet."),
+    d.prompt ? [el("h3", { text: "Prompt" }), fold(`prompt:${d.name}`, "Show the prompt", el("pre", { class: "fold-text", text: d.prompt }))] : null,
+    closeLoopButton());
+}
+
+function launchValues() {
+  return {
+    device: document.getElementById("launch-device").value,
+    runner: document.getElementById("launch-runner").value,
+    repo: document.getElementById("launch-repo").value,
+    tools: [...document.querySelectorAll("#launch-tools input:checked")].map((i) => i.value),
+  };
+}
+
+function options(id, first, names, keep) {
+  fill(id, first ? el("option", { value: "", text: first }) : null, names.map((n) => el("option", { value: n, text: n })));
+  const box = document.getElementById(id);
+  if (keep !== undefined && [...box.options].some((o) => o.value === keep)) box.value = keep;
+}
+
+function fillChoices(c, reset = false) {
+  const key = JSON.stringify(c);
+  if (key === launchKey && !reset) return;
+  const keep = launchKey && !reset ? launchValues() : { device: "local", runner: "", repo: "", tools: c.default_tools };
+  launchKey = key;
+  options("launch-device", "", c.devices, keep.device);
+  options("launch-runner", "By the model", c.runners, keep.runner);
+  options("launch-repo", "None", c.repos, keep.repo);
+  fill("launch-models", c.models.map((m) => el("option", { value: m })));
+  document.getElementById("launch-model").placeholder = `default: ${c.default_model}`;
+  fill("launch-tools", el("legend", { text: "Tools" }), c.tools.map((t) => el("label", { class: "check" },
+    el("input", { type: "checkbox", value: t, checked: keep.tools.includes(t) }), t)));
+  document.getElementById("launch-about").textContent = "A session is an agent you talk to. It runs on the device and model you pick, " +
+    `takes each message you send, and closes after ${c.idle_hours} hours with no message. A session on a repo works in a worktree of its own, which stays when it ends.`;
+  repoFollowsDevice();
+}
+
+function repoFollowsDevice() {
+  const repo = document.getElementById("launch-repo");
+  const remote = document.getElementById("launch-device").value !== "local";
+  if (remote) repo.value = "";
+  repo.disabled = remote;
+}
+
+function sessionRow(s) {
+  return el("tr", {},
+    cell(clock(s.started), "nb"), cell(runStatus(s.status), "nb"),
+    cell([s.model || "", el("br"), el("span", { class: "muted", text: [s.runner, s.device].filter(Boolean).join(" on ") })]),
+    cell([s.prompt, s.repo ? el("div", { class: "muted", text: `${s.repo}${s.branch ? ` · ${s.branch}` : ""}` }) : null]),
+    cell(money(s.cost_usd), "num"),
+    cell(button("Open", `session:${s.id}`, () => openFeed("session", s.id))));
+}
+
+function drawLaunch(data) {
+  fillChoices(data.choices);
+  fill("sessions", heading(2, "Sessions"),
+    data.sessions.length
+      ? table("Newest first", [["Started", "c-time"], ["Status", "c-status"], ["Model", "c-model"], ["First message"], ["Cost", "num c-cost"], ["", "c-log"]],
+        data.sessions.map(sessionRow))
+      : quiet("No session yet."));
+}
+
+async function launch(event) {
+  event.preventDefault();
+  const prompt = document.getElementById("launch-prompt");
+  const budget = document.getElementById("launch-budget").value.trim();
+  if (!prompt.value.trim()) return say("launch-result", "caution", "Write the first message first.");
+  if (budget && !(Number(budget) > 0)) return say("launch-result", "caution", "The budget is a number of dollars above zero, such as 0.50, or empty for no limit.");
+  const values = launchValues();
+  const btn = document.getElementById("launch-go");
+  btn.disabled = true;
+  try {
+    const s = await call("/api/sessions", { prompt: prompt.value.trim(), device: values.device, model: document.getElementById("launch-model").value.trim(),
+      runner: values.runner, repo: values.repo, tools: values.tools, budget_usd: budget ? Number(budget) : null });
+    say("launch-result", "ok", `Launched: ${s.runner} ${s.model} on ${s.device}. Its feed is open below.`);
+    prompt.value = "";
+    await openFeed("session", s.id);
+    refresh();
+  } catch (e) {
+    say("launch-result", "fault", e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function sendSession(event) {
+  event.preventDefault();
+  const box = document.getElementById("session-text");
+  if (!box.value.trim()) return say("session-result", "caution", "Write a message first.");
+  try {
+    await call(`/api/sessions/${encodeURIComponent(feeds.session.run)}/send`, { text: box.value.trim() });
+    box.value = "";
+    say("session-result", "ok", "Sent. The answer shows in the feed when it comes.");
+    await refreshFeed("session");
+  } catch (e) {
+    say("session-result", "fault", e.message);
+  }
+}
+
+function probeWords(p) {
+  if (!p) return "";
+  return [p.system, p.detail].filter(Boolean).join(" · ");
+}
+
+function deviceRow(d) {
+  const p = d.probe;
+  return el("tr", {},
+    cell([el("span", { class: "nb", text: d.name }), d.note ? el("div", { class: "muted", text: d.note }) : null]),
+    cell(d.kind), cell(d.host || "this machine", "muted-cell"),
+    cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted", text: ago(p.at) })] : "not probed", "nb"),
+    cell(probeWords(p) || (d.error ? d.error : ""), "muted-cell"),
+    cell([p ? (p.tools || []).join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
+    cell(button("Probe", `probe:${d.name}`, (b) => probe(d.name, b))));
+}
+
+async function probe(name, btn) {
+  btn.disabled = true;
+  btn.textContent = "Probing";
+  try {
+    const p = await call(`/api/devices/${encodeURIComponent(name)}/probe`, {});
+    say("fleet-result", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`);
+  } catch (e) {
+    say("fleet-result", "fault", e.message);
+  }
+  refresh();
+}
+
+function drawFleet(loops, devices) {
+  const s = loops.serve;
+  const errors = Object.entries(s.poll_errors || {});
+  const broken = Object.entries(s.broken || {});
+  fill("fleet",
+    heading(1, "Serve"),
+    serveLine(s),
+    s.at ? el("dl", { class: "w" }, fact("Process", String(s.pid)), fact("Last beat", `${ago(s.at)} (${clock(s.at)})`),
+      fact("Ticks", `${s.ticks}, one every ${s.tick_seconds} s`), fact("Started", clock(s.started))) : null,
+    errors.length ? table("Sources that fail to poll", [["Source"], ["Error"]], errors.map(([k, v]) => el("tr", {}, cell(k), cell(v, "muted-cell")))) : null,
+    broken.length ? table("Loops that do not load", [["Loop"], ["Why"]], broken.map(([k, v]) => el("tr", {}, cell(k), cell(v, "muted-cell")))) : null,
+    heading(2, "Devices"),
+    el("p", { text: "Loops and sessions run on these. A probe checks the device answers and lists its tools; devices.toml in the config folder adds one." }),
+    table("", [["Device", "c-device"], ["Kind", "c-kind"], ["Host", "c-ref"], ["State", "c-status"], ["System"], ["Tools"], ["", "c-probe"]], devices.map(deviceRow)));
+}
+
+function costTable(caption, rows) {
+  return rows.length ? table(caption, [["Name"], ["Calls", "num c-n"], ["Tokens in", "num c-rate"], ["Tokens out", "num c-rate"], ["Cost", "num c-cost"]],
+    rows.map((r) => el("tr", {}, cell(r.name), cell(r.steps, "num"), cell(r.tokens_in.toLocaleString(), "num"),
+      cell(r.tokens_out.toLocaleString(), "num"), cell(money(r.cost_usd), "num")))) : quiet("No model call in this window.");
+}
+
+function costParts(c) {
+  if (!c) return [];
+  return [heading(5, "Where it went"),
+    el("p", {}, `${money(c.total_usd)} in ${c.days} days, counted from each model call: pipeline runs, loops, sessions and chat alike.`),
+    el("h3", { text: "By model" }), costTable("", c.by_model),
+    el("h3", { text: "By runner" }), costTable("", c.by_runner),
+    el("h3", { text: "By loop or kind" }), costTable("", c.by_loop)];
+}
+
 const LOADERS = {
   live: async () => {
     drawLive(await call("/api/state"));
     await refreshLog();
   },
+  loops: async () => {
+    const [loops, approvals] = await Promise.all([call("/api/loops"), call("/api/approvals")]);
+    drawLoops(loops, approvals.approvals);
+    await Promise.all([refreshLoopDetail(), refreshFeed("loop")]);
+  },
+  launch: async () => {
+    drawLaunch(await call("/api/sessions"));
+    await refreshFeed("session");
+  },
+  fleet: async () => {
+    const [loops, fleet] = await Promise.all([call("/api/loops"), call("/api/devices")]);
+    drawFleet(loops, fleet.devices);
+  },
   health: async () => drawHealth(await call("/api/state")),
   triage: async () => drawTriage(await call("/api/state")),
   trends: async () => {
     trendsData = await call("/api/trends");
+    costData = trendsData.rows ? await call(`/api/costs?days=${trendsData.rows.days.length}`) : null;
     drawTrends();
   },
   settings: async () => {
@@ -492,7 +928,8 @@ const LOADERS = {
 };
 
 function nextDelay() {
-  if (view === "live") return LIVE_MS;
+  if (view === "live" || view === "loops") return LIVE_MS;
+  if (view === "launch") return feeds.session.run && feeds.session.status === "running" ? CHAT_BUSY_MS : SLOW_MS;
   if (view === "chat") return chatSeen.endsWith(":true") ? CHAT_BUSY_MS : SLOW_MS;
   return SLOW_MS;
 }
@@ -530,6 +967,7 @@ function show(name) {
   view = VIEWS.includes(name) ? name : "live";
   for (const button of document.querySelectorAll(".views [data-view]")) button.setAttribute("aria-pressed", String(button.dataset.view === view));
   for (const section of document.querySelectorAll("main > section")) section.hidden = section.dataset.view !== view;
+  for (const primary of document.querySelectorAll("[data-act]")) primary.classList.toggle("act", primary.closest("section").dataset.view === view);
   refresh();
 }
 
@@ -556,6 +994,22 @@ document.addEventListener("DOMContentLoaded", () => {
     refresh();
   });
   document.getElementById("chat").addEventListener("submit", sendChat);
+  document.getElementById("launch").addEventListener("submit", launch);
+  document.getElementById("launch-device").addEventListener("change", repoFollowsDevice);
+  document.getElementById("launch-reset").addEventListener("click", async () => {
+    document.getElementById("launch").reset();
+    document.getElementById("launch-result").hidden = true;
+    fillChoices((await call("/api/sessions")).choices, true);
+  });
+  document.getElementById("session-send").addEventListener("submit", sendSession);
+  document.getElementById("session-text").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) document.getElementById("session-send").requestSubmit();
+  });
+  for (const [which, resultId] of [["loop", "loops-result"], ["session", "session-result"]]) {
+    const box = document.getElementById(feeds[which].box);
+    box.querySelector(".feed-close").addEventListener("click", () => closeFeed(which));
+    box.querySelector(".feed-stop").addEventListener("click", (event) => stopFeedRun(which, event.currentTarget, resultId));
+  }
   for (const [id, path, resultId] of [["chat-new", "/api/chat/new", "chat-result"],
     ["draft-file", "/api/chat/file", "draft-result"], ["draft-drop", "/api/chat/drop", "draft-result"]]) {
     document.getElementById(id).addEventListener("click", (event) => chatAction(path, event.currentTarget, resultId));

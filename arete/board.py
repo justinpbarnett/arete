@@ -46,7 +46,7 @@ def outcome(status: str) -> str:
 
 
 def ticket(r: dict) -> str:
-    return tracker.run_ticket_name(r) if r["issue"] else (r["repo"] or r["kind"])
+    return tracker.run_ticket_name(r) if r["issue"] else (r.get("loop") or r["repo"] or r["kind"])
 
 
 def seconds_between(start: str, end: str | None) -> int:

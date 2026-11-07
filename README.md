@@ -4,18 +4,65 @@ Agent loops that keep running and keep making the harness they run in better.
 
 Arete is one global engine for every repo on the machine. Each repo gets a thin layer that says how to set up, what checks must pass, and how much the agents are trusted there. The layer is `.agents/` in the repo, or a folder outside it when the rest of the team does not use arete. Agents edit files. Arete's own code commits, pushes and opens PRs, so no agent ever holds git write access.
 
+## Serve
+
+`arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted, and serve picks up its queues again when it starts.
+
 ## Loops
 
-| Loop | Command | When | What it does |
-|------|---------|------|--------------|
-| 0 heartbeat | `arete heartbeat` | hourly | Checks launchd jobs, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
-| 1 miner | `arete mine` | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
-| 2 auditor | `arete audit` | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
-| 3 pipeline | `arete poll`, `arete run REPO TICKET` | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. |
-| 4 evals | `arete eval REPO`, `arete eval mine` | on demand, nightly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `eval mine` writes new tasks from merged arete PRs. |
-| 5 triage | `arete triage` | hourly | Reads your open tickets that do not have the `agent` label yet and says which are ready to build, what each one is missing, its size and a short plan. It never writes to a ticket. |
+A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the four kinds (command, watch, climb, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
 
-The event hook (`arete hook`) records skill use, agent spawns, tool failures, denials, interrupts and API stop failures to `~/.local/share/arete/events.jsonl`. The miner and auditor read it. Register it in `~/.claude/settings.json` for `PostToolUse` (matcher `Skill|Agent|Task|Bash`), `PostToolUseFailure` (matcher `*`) and `StopFailure`, with the command `[ -x "$HOME/.local/bin/arete" ] && "$HOME/.local/bin/arete" hook || true` and a 10 second timeout. Every path through it exits 0, so it never fails a session.
+| Loop | Kind | When | What it does |
+|------|------|------|--------------|
+| `heartbeat` | command | hourly, and when serve starts | Checks serve's beat, the loops, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
+| `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
+| `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
+| `poll` | command | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. `arete run REPO TICKET` runs one ticket by hand. |
+| `eval` | command | weekly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `arete eval mine` writes new tasks from merged arete PRs. |
+| `triage` | command | hourly | Reads your open tickets that do not have the `agent` label yet and says which are ready to build, what each one is missing, its size and a short plan. It never writes to a ticket. |
+| `loop-intake` | watch | on each new issue | Turns an issue labeled `loop` that you opened on the arete repo into an `agent` ticket that specs the new loop folder, so the pipeline builds it. |
+
+A new loop needs no code in arete:
+
+```
+arete loop new "watch the API log for new tracebacks and file a ticket for each"
+arete loop try NAME       # one run now with every emit held; an event loop reads a sample of real events
+arete loop enable NAME
+```
+
+`loop new` has a model draft the folder into `~/.config/arete/loops/`, validates it, and tries again on a problem. The draft starts off. `arete loop list`, `status NAME`, `start NAME`, `stop RUN` and `feed RUN -f` cover the rest, and so does the dashboard's Loops view.
+
+Every run of every kind, pipeline, loop, session, chat and draft, is a row in one runs table with its trigger, model, runner, device, cost and tokens. Each model call is a step under its run. A run's live feed holds its steps, the tools the agent calls, and a command loop's output as it prints.
+
+An emit that changes something outside arete, a ticket or a PR, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it. A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
+
+## Runners, devices and sessions
+
+A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing.
+
+`~/.config/arete/devices.toml` lists the machines loops and sessions run on, besides `local`:
+
+```toml
+[device.virgil]
+kind = "ssh"
+host = "virgil"
+dir = "/root"
+note = "Hetzner box"
+```
+
+`arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `arete` and `ollama` it has.
+
+A session is an agent you start by hand and talk to, on any device, model and tool set:
+
+```
+arete session start "look at why the nightly build is slow" --device virgil --model sonnet --tools Read,Grep,Bash --attach
+arete session send ID "now try the cache"
+arete session attach ID | stop ID | list
+```
+
+`--repo` gives it a new worktree of a config repo. `--budget` caps the whole session in dollars. A session with no message for `session_idle_hours` closes. The dashboard's Launch view starts one with the same choices.
+
+`arete costs` shows model spend by model, runner and loop.
 
 ## Runs, sleep and the network
 
@@ -27,7 +74,9 @@ A laptop sleeps and drops its network. When poll, triage or the heartbeat start 
 
 - Code: this repo, a uv project (Python pinned in `.python-version`, everything locked in `uv.lock`). Installed with `uv tool install --editable . --python 3.13`
 - Config: `~/.config/arete/config.toml` (`arete init` writes a starting one)
-- State: `~/.local/share/arete/` (sqlite, events, run logs)
+- Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
+- Devices: `~/.config/arete/devices.toml`
+- State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
 - Logs: `~/Library/Logs/arete/`
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names
@@ -53,6 +102,8 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
+| `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
+| `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost. |
 
 | Repo field | Default | Meaning |
 |------------|---------|---------|
@@ -262,24 +313,28 @@ Arete then runs each eval suite twice on the same day, once with main's prompts 
 - The repo it belongs in, and a plan of up to 6 steps.
 - Not code work: a meeting, research, a decision, an account, a check done by hand. One line with why, and nothing more.
 
-The step may read only inside the repos it is given, has no MCP servers, and costs at most $0.30 a ticket. A ticket gets a new call only when its updated time changes, at most 20 calls a refresh; the rest wait for the next. `--refresh` triages what changed, then shows the board; `--refresh --dry-run` lists what it would triage with no model call and no writes; `arete triage REF` shows one ticket in full. A launchd job refreshes hourly.
+The step may read only inside the repos it is given, has no MCP servers, and costs at most $0.30 a ticket. A ticket gets a new call only when its updated time changes, at most 20 calls a refresh; the rest wait for the next. `--refresh` triages what changed, then shows the board; `--refresh --dry-run` lists what it would triage with no model call and no writes; `arete triage REF` shows one ticket in full. The `triage` loop refreshes hourly under serve.
 
 When `alert_repo` is set and private, the board is also one issue there, "[arete] triage", labeled `arete-triage`, edited only when the board changes. A public or unreadable `alert_repo` gets nothing, and the output says why. Triage never adds `agent` and never writes to a ticket: the label is your approval, and the board only tells you where it would pay off.
 
 ## Dashboard
 
-`arete dashboard` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet. It listens only on the machine's tailnet addresses. A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends. `arete install` adds it as the launchd job `com.arete.dashboard`, which launchd starts again when it stops, and the default config has the heartbeat watch it.
+`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone. It listens only on the machine's tailnet addresses. A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 
-- Live: the runs going now, with their start time, the last log line and the cost so far; the labeled tickets the pipeline skips; the tickets waiting on review comments; and the last 25 runs. A run's log opens below the table.
-- Health: the heartbeat checks, the probes, the loops, and the open alerts.
+- Live: the runs going now, with their start time, the last log line and the cost so far; the labeled tickets the pipeline skips; the tickets waiting on review comments; and the last 25 runs of every kind. A run's log opens below the table.
+- Loops: what waits for your approval, with Approve and Reject; then every loop with its switch, kind, trigger, last run, next fire and spend in the last 24 hours, and a broken loop with what is wrong. Open shows a loop's facts, runs, findings, sources, memory, digests and metrics. Start runs it now and follows its live feed, where Stop ends the run.
+- Launch: start a session on a device, model, runner, tool set, repo and budget, then talk to it and follow its feed.
+- Fleet: serve's beat, and each device with its last probe and tools; Probe checks one again.
+- Health: the heartbeat checks, the probes, the loops that report on their own, and the open alerts.
 - Triage: the triage board, with each ticket's questions folded under it.
-- Trends: 30 days of runs and cost by day, of runs, pass rate, median time and cost by repo, and of eval pass rate by repo.
+- Trends: 30 days of cost and outcomes by day, runs by repo, eval pass rate by repo, and where the money went, by model, by runner and by loop.
 - Settings: `max_parallel` and the model for each role in `[models]`. A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use. An empty model removes its line, so the role goes back to its default.
 - Chat: a console agent on the `chat` model. It reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues. It never edits a file. Ask it for a change and it drafts an issue. The draft shows under the chat, and nothing reaches GitHub until you press File this issue (Drop discards it). Each call to the model stops at $2, and each reply shows what it cost. Messages continue one session until New chat.
 
 ## Rules
 
-- Agents run through `claude -p` on a Claude subscription. Never the API SDK, never `--bare`.
+- Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`.
+- A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
 - Agents never run git write commands. Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
 - Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`.
 - Alert issues carry check names and one short status line, never log contents.

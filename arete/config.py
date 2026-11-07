@@ -7,8 +7,9 @@ from typing import Literal
 
 from . import paths
 
-MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat")
-MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus"}
+MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
+               "classify", "loop", "session")
+MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet"}
 
 
 class UnknownRepo(KeyError):
@@ -85,6 +86,12 @@ class Config:
     max_parallel: int = 1
     dashboard_port: int = DASHBOARD_PORT
     dashboard_owner: str = ""
+    loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
+    queues: dict[str, int] = field(default_factory=dict)
+    pricing: dict[str, tuple[float, float]] = field(default_factory=dict)
+    local_providers: list[str] = field(default_factory=lambda: ["ollama"])
+    daily_budget_usd: float | None = None
+    session_idle_hours: float = 2
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -125,6 +132,16 @@ def load(path: Path | None = None) -> Config:
         dashboard_port=int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
     )
+    serve = data.get("serve", {})
+    if "loop_dirs" in serve:
+        cfg.loop_dirs = [paths.expand(d) for d in serve["loop_dirs"]]
+    cfg.queues = {str(k): max(1, int(v)) for k, v in (serve.get("queues") or {}).items()}
+    cfg.daily_budget_usd = float(serve["daily_budget_usd"]) if serve.get("daily_budget_usd") else None
+    cfg.session_idle_hours = float(serve.get("session_idle_hours", cfg.session_idle_hours))
+    pricing = data.get("pricing", {})
+    cfg.local_providers = list(pricing.get("local_providers", cfg.local_providers))
+    cfg.pricing = {str(m): (float(r.get("input", 0)), float(r.get("output", 0)))
+                   for m, r in (pricing.get("models") or {}).items()}
     j = data.get("jira", {})
     transitions = {k: str(v) for k, v in (j.get("transitions") or {}).items() if v}
     if bad := sorted(set(transitions) - set(STATES)):

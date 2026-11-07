@@ -8,16 +8,11 @@ from pathlib import Path
 from . import config, paths, tracker, util
 
 AGENTS_DIR = paths.HOME / "Library" / "LaunchAgents"
-
-JOBS = {
-    "heartbeat": {"args": ["heartbeat", "--quiet"], "interval": 3600, "run_at_load": True},
-    "poll": {"args": ["poll"], "interval": 300, "abandon_children": True, "process_type": "Standard"},
-    "mine": {"args": ["mine"], "calendar": {"Hour": 23, "Minute": 50}},
-    "audit": {"args": ["audit"], "calendar": {"Hour": 4, "Minute": 30}},
-    "eval": {"args": ["eval"], "calendar": {"Weekday": 0, "Hour": 2, "Minute": 10}, "process_type": "Standard"},
-    "triage": {"args": ["triage", "--refresh"], "interval": 3600},
-    "dashboard": {"args": ["dashboard"], "run_at_load": True, "keep_alive": True},
-}
+UNITS_DIR = paths.HOME / ".config" / "systemd" / "user"
+SERVE = "serve"
+SERVE_UNIT = "arete-serve.service"
+RETIRED = ("heartbeat", "poll", "mine", "audit", "eval", "triage", "dashboard")
+PLATFORMS = ("mac", "linux")
 
 
 def label(name: str) -> str:
@@ -45,59 +40,107 @@ def build_path() -> str:
     return ":".join(out)
 
 
-def plist_for(name: str, spec: dict) -> dict:
-    exe = shutil.which("arete") or str(paths.HOME / ".local" / "bin" / "arete")
-    log = str(paths.LOG_DIR / f"{name}.log")
-    pl = {
-        "Label": label(name),
-        "ProgramArguments": [exe, *spec["args"]],
+def arete_exe() -> str:
+    return shutil.which("arete") or str(paths.HOME / ".local" / "bin" / "arete")
+
+
+def serve_plist() -> dict:
+    log = str(paths.LOG_DIR / "serve.log")
+    return {
+        "Label": label(SERVE),
+        "ProgramArguments": [arete_exe(), SERVE],
         "EnvironmentVariables": {"PATH": build_path(), "HOME": str(paths.HOME), "LANG": "en_US.UTF-8"},
         "StandardOutPath": log,
         "StandardErrorPath": log,
         "WorkingDirectory": str(paths.HOME),
-        "ProcessType": spec.get("process_type", "Background"),
+        "ProcessType": "Standard",
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "AbandonProcessGroup": True,
     }
-    if "interval" in spec:
-        pl["StartInterval"] = spec["interval"]
-    if "calendar" in spec:
-        pl["StartCalendarInterval"] = spec["calendar"]
-    if spec.get("run_at_load"):
-        pl["RunAtLoad"] = True
-    if spec.get("abandon_children"):
-        pl["AbandonProcessGroup"] = True
-    if spec.get("keep_alive"):
-        pl["KeepAlive"] = True
-        pl["ThrottleInterval"] = 10
-    return pl
+
+
+def serve_unit() -> str:
+    return f"""[Unit]
+Description=arete serve: loops, webhooks, sessions and the dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart={arete_exe()} {SERVE}
+Restart=always
+RestartSec=10
+KillMode=process
+Environment=PATH={build_path()}
+Environment=HOME={paths.HOME}
+Environment=LANG=en_US.UTF-8
+WorkingDirectory={paths.HOME}
+
+[Install]
+WantedBy=default.target
+"""
 
 
 def _domain() -> str:
     return f"gui/{os.getuid()}"
 
 
-def install(only: list[str] | None = None, dry_run: bool = False) -> int:
-    paths.ensure_dirs()
-    names = only or list(JOBS)
-    unknown = [n for n in names if n not in JOBS]
-    if unknown:
-        print(f"unknown jobs: {', '.join(unknown)}; known: {', '.join(JOBS)}")
+def this_platform() -> str:
+    return "mac" if paths.ON_MAC else "linux"
+
+
+def install(dry_run: bool = False, platform: str = "") -> int:
+    platform = platform or this_platform()
+    if platform not in PLATFORMS:
+        print(f"unknown platform {platform}; use {' or '.join(PLATFORMS)}")
         return 1
-    for name in names:
-        pl = plist_for(name, JOBS[name])
-        dest = AGENTS_DIR / f"{pl['Label']}.plist"
-        if dry_run:
-            print(f"--- {dest}")
-            print(plistlib.dumps(pl).decode())
-            continue
-        AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-        util.sh(["launchctl", "bootout", f"{_domain()}/{pl['Label']}"], timeout=30)
-        dest.write_bytes(plistlib.dumps(pl))
-        res = util.sh(["launchctl", "bootstrap", _domain(), str(dest)], timeout=30)
-        status = "loaded" if res.returncode == 0 else f"bootstrap failed: {util.first_line(res.stderr)}"
-        print(f"{pl['Label']}: {status}")
-    if not dry_run:
-        prepare_trackers()
+    if dry_run:
+        dest = (AGENTS_DIR / f"{label(SERVE)}.plist") if platform == "mac" else UNITS_DIR / SERVE_UNIT
+        print(f"--- {dest}")
+        print(plistlib.dumps(serve_plist()).decode() if platform == "mac" else serve_unit(), end="")
+        return 0
+    if platform != this_platform():
+        print(f"this machine is {this_platform()}; install for {platform} on that machine, or pass --dry-run")
+        return 1
+    paths.ensure_dirs()
+    code = install_launchd() if platform == "mac" else install_systemd()
+    prepare_trackers()
+    return code
+
+
+def install_launchd() -> int:
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    for name in RETIRED:
+        retire(label(name))
+    pl = serve_plist()
+    dest = AGENTS_DIR / f"{pl['Label']}.plist"
+    util.sh(["launchctl", "bootout", f"{_domain()}/{pl['Label']}"], timeout=30)
+    dest.write_bytes(plistlib.dumps(pl))
+    res = util.sh(["launchctl", "bootstrap", _domain(), str(dest)], timeout=30)
+    print(f"{pl['Label']}: " + ("loaded" if res.returncode == 0 else f"bootstrap failed: {util.first_line(res.stderr)}"))
+    return 0 if res.returncode == 0 else 1
+
+
+def install_systemd() -> int:
+    UNITS_DIR.mkdir(parents=True, exist_ok=True)
+    (UNITS_DIR / SERVE_UNIT).write_text(serve_unit())
+    for step in (["daemon-reload"], ["enable", "--now", SERVE_UNIT], ["restart", SERVE_UNIT]):
+        res = util.sh(["systemctl", "--user", *step], timeout=60)
+        if res.returncode != 0:
+            print(f"systemctl --user {' '.join(step)} failed: {util.first_line(res.stderr or res.stdout)}")
+            return 1
+    print(f"{SERVE_UNIT}: enabled and started; `loginctl enable-linger` keeps it running after logout")
     return 0
+
+
+def retire(lb: str) -> None:
+    f = AGENTS_DIR / f"{lb}.plist"
+    if not f.exists():
+        return
+    util.sh(["launchctl", "bootout", f"{_domain()}/{lb}"], timeout=30)
+    f.unlink()
+    print(f"{lb}: retired, its loop now runs under {label(SERVE)}")
 
 
 def prepare_trackers() -> None:
@@ -109,13 +152,19 @@ def prepare_trackers() -> None:
 
 
 def uninstall() -> int:
-    for name in JOBS:
+    if not paths.ON_MAC:
+        util.sh(["systemctl", "--user", "disable", "--now", SERVE_UNIT], timeout=60)
+        (UNITS_DIR / SERVE_UNIT).unlink(missing_ok=True)
+        util.sh(["systemctl", "--user", "daemon-reload"], timeout=60)
+        print(f"{SERVE_UNIT}: removed")
+        return 0
+    for name in (SERVE, *RETIRED):
         lb = label(name)
         util.sh(["launchctl", "bootout", f"{_domain()}/{lb}"], timeout=30)
         f = AGENTS_DIR / f"{lb}.plist"
         if f.exists():
             f.unlink()
-        print(f"{lb}: removed")
+            print(f"{lb}: removed")
     return 0
 
 

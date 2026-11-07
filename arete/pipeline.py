@@ -15,7 +15,7 @@ from pathlib import Path
 from string import Template
 from typing import TextIO
 
-from . import ci, claude, config, gh, jira, paths, state, tracker, util, verify
+from . import ci, claude, config, gh, jira, paths, runner, state, tracker, util, verify
 from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
@@ -34,7 +34,7 @@ CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
-LEFT_FOR_A_PERSON = re.compile(rf"{re.escape(LEFT_START)}\n{LEFT_HEADING}\n\n(.*?)\n\n{re.escape(LEFT_END)}\n*", re.S)
+LEFT_FOR_A_PERSON = re.compile(rf"{re.escape(LEFT_START)}\n{LEFT_HEADING}\n\n(.*?)\n\n{re.escape(LEFT_END)}\n*", re.DOTALL)
 MAX_LEFT_FOR_A_PERSON_CHARS = 12_000
 LEFT_BY_A_PERSON = "A person makes these changes after the PR, since the builder may not edit those paths."
 NOT_CHECKED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} Do not check them, and do not fail the change "
@@ -222,16 +222,17 @@ class AgentRun:
 
     def agent(self, step: str, text: str, cwd: Path, **kw) -> claude.Result:
         self.log(f"{step}: starting")
-        res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
+        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
         if res.connection_failed:
             self.log(f"{step}: lost the connection after {res.turns} turns, waiting for the network")
             if util.wait_for_network():
                 self.cost += res.cost_usd
                 self.log(f"{step}: the network is back, the dropped attempt cost {cost_note(res)}")
                 if res.session.id and res.turns > 1 and kw.get("persist", True):
-                    res = claude.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, **{**kw, "resume": res.session})
+                    res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                                     **{**kw, "resume": res.session})
                 else:
-                    res = claude.run(text, cwd, add_dirs=self.add_dirs, **kw)
+                    res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
         self.cost += res.cost_usd
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
@@ -1766,6 +1767,8 @@ def interrupted_twice(row: dict) -> bool:
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     for row in state.runs_marked_running():
+        if row["kind"] in ("loop", "session", "draft"):
+            continue
         with util.lock(state.run_lock(row["kind"], row["repo"], row["issue"])) as free:
             if not free:
                 continue

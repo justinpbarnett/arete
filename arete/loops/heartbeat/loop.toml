@@ -1,0 +1,12 @@
+kind = "command"
+description = "Check serve, the loops, probes, auth, the hook and disk; open or close alert issues"
+
+[trigger]
+every = "1h"
+run_at_load = true
+
+[run]
+command = "arete heartbeat --quiet"
+try_command = "arete heartbeat --dry-run"
+timeout_minutes = 15
+stale_hours = 3

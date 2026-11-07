@@ -1,16 +1,19 @@
 import os
+import sys
 from pathlib import Path
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("ARETE_CONFIG_DIR", HOME / ".config" / "arete"))
 STATE_DIR = Path(os.environ.get("ARETE_STATE_DIR", HOME / ".local" / "share" / "arete"))
-LOG_DIR = Path(os.environ.get("ARETE_LOG_DIR", HOME / "Library" / "Logs" / "arete"))
+ON_MAC = sys.platform == "darwin"
+LOG_DIR = Path(os.environ.get("ARETE_LOG_DIR", HOME / "Library" / "Logs" / "arete" if ON_MAC else STATE_DIR / "logs"))
 
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 EVENTS_FILE = STATE_DIR / "events.jsonl"
 DB_FILE = STATE_DIR / "arete.db"
 RUNS_DIR = STATE_DIR / "runs"
-WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"))
+WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
+                                    if ON_MAC else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 LOCKS_DIR = STATE_DIR / "locks"
 

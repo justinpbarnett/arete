@@ -8,7 +8,7 @@ from . import config, paths, util
 
 PARALLEL_MAX = 8
 MODEL_ALIASES = ("opus", "sonnet", "haiku")
-MODEL_ID = re.compile(r"claude-[a-z0-9.-]+(\[1m\])?")
+MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+/[A-Za-z0-9._:-]+")
 TABLE_HEADER = re.compile(r"\s*\[")
 
 
@@ -39,8 +39,8 @@ def model_from(role, value) -> str:
         raise Refused(f"'{util.first_line(str(role), 40)}' is not a model role arete reads.")
     text = str(value).strip()
     if text and text not in MODEL_ALIASES and not MODEL_ID.fullmatch(text):
-        raise Refused(f"The {role.replace('_', ' ')} model takes opus, sonnet, haiku, a claude model id, "
-                      f"or nothing for its default{instead_of(text)}")
+        raise Refused(f"The {role.replace('_', ' ')} model takes opus, sonnet, haiku, a claude model id, a pi model "
+                      f"as provider/model, or nothing for its default{instead_of(text)}")
     return text
 
 

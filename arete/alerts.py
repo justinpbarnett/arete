@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 
 from . import gh, state, util
 
@@ -14,8 +15,11 @@ def sanitize(text: str, n: int = 200) -> str:
 
 
 def notify(title: str, message: str) -> None:
-    msg = message.replace('"', "'")[:200]
-    util.sh(["osascript", "-e", f'display notification "{msg}" with title "{title}"'], timeout=10)
+    msg, title = message.replace('"', "'")[:200], title.replace('"', "'")[:100]
+    if sys.platform == "darwin":
+        util.sh(["osascript", "-e", f'display notification "{msg}" with title "{title}"'], timeout=10)
+    else:
+        util.sh(["notify-send", title, msg], timeout=10)
 
 
 def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = False) -> str:

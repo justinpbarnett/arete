@@ -41,25 +41,7 @@ github = "you/web"
 pipeline = true
 
 [[job]]
-label = "com.arete.heartbeat"
-
-[[job]]
-label = "com.arete.poll"
-
-[[job]]
-label = "com.arete.mine"
-
-[[job]]
-label = "com.arete.audit"
-
-[[job]]
-label = "com.arete.eval"
-
-[[job]]
-label = "com.arete.triage"
-
-[[job]]
-label = "com.arete.dashboard"
+label = "com.arete.serve"
 keepalive = true
 
 [[probe]]
@@ -99,7 +81,7 @@ def slot_note(run_id: str, in_slots: set[str], waiting: set[str]) -> str:
 
 
 def cmd_status(args) -> int:
-    from . import pipeline, state, tracker, triage, util
+    from . import control, pipeline, state, tracker, triage, util
 
     cfg = config.load()
     hb = util.read_json(paths.HEARTBEAT_FILE, {})
@@ -115,9 +97,11 @@ def cmd_status(args) -> int:
             print(f"  {c['severity'].upper():<5} {c['key']:<38} {c['detail']}")
     else:
         print("heartbeat: never run")
-    loops = util.read_json(paths.STATE_DIR / "loops.json", {})
-    for name, v in sorted(loops.items()):
-        print(f"loop {name:<8} {v['ts']}  {'ok' if v.get('ok', True) else 'FAILED ' + v.get('detail', '')}")
+    print(serve_line())
+    marks = util.read_json(paths.STATE_DIR / "loops.json", {})
+    for v in control.loop_views(cfg):
+        failed = marks.get(v["name"], {})
+        print(f"  {loop_line(v)}" + ("" if failed.get("ok", True) else f"  FAILED {failed.get('detail', '')}"))
     al = state.alerts()
     if al:
         print("open alerts:")
@@ -126,7 +110,7 @@ def cmd_status(args) -> int:
     rs = state.runs(limit=args.limit)
     if rs:
         print("recent runs:")
-        rows = [(r["id"], r["kind"], tracker.run_ticket_name(r) if r["issue"] else (r["repo"] or ""), r["status"],
+        rows = [(r["id"], r["kind"], tracker.run_ticket_name(r) if r["issue"] else (r.get("loop") or r["repo"] or ""), r["status"],
                  r["pr_url"] or r["summary"] or "") for r in rs]
         widths = [max(len(row[i]) for row in rows) for i in range(4)]
         for row in rows:
@@ -204,7 +188,7 @@ def cmd_hook(args) -> int:
 def cmd_install(args) -> int:
     from . import install
 
-    return install.install(only=args.only, dry_run=args.dry_run)
+    return install.install(dry_run=args.dry_run, platform=args.platform)
 
 
 def cmd_uninstall(args) -> int:
@@ -301,6 +285,340 @@ def cmd_dashboard(args) -> int:
 
     return dashboard.serve(args.port)
 
+def refused(e: Exception) -> int:
+    print(e, file=sys.stderr)
+    return 1
+
+
+def when(stamp: str | None) -> str:
+    from . import util
+
+    return util.parse_iso(stamp).astimezone().strftime("%m-%d %H:%M") if stamp else "-"
+
+
+def serve_line() -> str:
+    from . import control
+
+    beat = control.serve_beat()
+    if not beat:
+        return "serve: never ran; `arete install` starts it"
+    if not beat["alive"]:
+        return f"serve: DOWN, last beat {when(beat.get('at'))}"
+    return (f"serve: up, pid {beat['pid']}, {beat['loops']} loops on, {beat['off']} off, {beat['running']} running, "
+            f"{beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else ""))
+
+
+def loop_line(v: dict) -> str:
+    switch = "BROKEN" if v["error"] else ("on" if v["enabled"] else "off")
+    last = v["last"] or {}
+    what = (f"running {v['running']}" if v["running"] else
+            f"{last.get('status', 'never ran')} {when(last.get('finished') or last.get('started'))}" if last
+            else "never ran")
+    due = f"next {when(v['next_due'])}" if v.get("next_due") else ""
+    return (f"{v['name']:<22} {switch:<6} {v['kind']:<7} {v['trigger']:<22} {what:<26} {due:<17}"
+            f" ${v['spent_24h']:.2f}/24h" + (f"\n    {v['error']}" if v["error"] else ""))
+
+
+def print_feed_line(line: dict) -> None:
+    text = line["text"].replace("\n", "\n    ")
+    print(f"{when(line['ts'])[6:]} [{line['kind']}] {text}", flush=True)
+
+
+def follow(run_id: str, alive=None, after: int = 0, send=None) -> int:
+    import time
+
+    from . import state
+
+    while True:
+        for line in state.feed(run_id, after):
+            print_feed_line(line)
+            after = line["id"]
+        r = state.run_get(run_id) or {}
+        if not (alive() if alive else r.get("status") == "running"):
+            for line in state.feed(run_id, after):
+                print_feed_line(line)
+            return after
+        if send:
+            send()
+        time.sleep(1)
+
+
+def read_events(file: str) -> list[dict] | None:
+    if not file:
+        return None
+    data = json.loads(paths.expand(file).read_text())
+    return data if isinstance(data, list) else [data]
+
+
+def latest_run(name_or_run: str) -> str:
+    from . import control, state
+
+    if state.run_get(name_or_run):
+        return name_or_run
+    loop = control.find_loop(name_or_run)
+    last = next(iter(state.runs(kind="loop", loop=loop.name, limit=1, firings=True)), None)
+    if not last:
+        raise control.NotFound(f"{loop.name} has not run yet")
+    return last["id"]
+
+
+def cmd_serve(args) -> int:
+    from . import serve
+
+    serve.run(with_dashboard=not args.no_dashboard)
+
+
+def cmd_loop(args) -> int:
+    from . import control, engine, loops, scaffold, state, util
+
+    try:
+        if args.action == "list":
+            print(serve_line())
+            for v in control.loop_views():
+                print(loop_line(v))
+            return 0
+        if args.action == "new":
+            made = scaffold.draft(" ".join(args.words), name=args.name, repo=args.repo, model=args.model)
+            print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, ${made['cost_usd']:.2f})\n")
+            print(made["loop_toml"])
+            if made["note"]:
+                print(f"note: {made['note']}")
+            print(f"next: `arete loop try {made['name']}`, then `arete loop enable {made['name']}`")
+            return 0
+        if args.action == "exec":
+            status, run_id = engine.execute(args.name, fire=args.fire, run_id=args.run_id,
+                                            events=read_events(args.events))
+            return 0 if status in ("done", "skipped", "busy", "gone") else 1
+        if not args.name:
+            print(f"arete loop {args.action} needs a NAME", file=sys.stderr)
+            return 2
+        if args.action == "try":
+            result = scaffold.try_loop(args.name, read_events(args.events), follow=follow)
+            print(f"\ntry {result['id']}: {result.get('status')}, every emit held"
+                  + (f", {result['events']} sample events" if result["events"] else "")
+                  + (f"\n{result['error']}" if result.get("error") else ""))
+            return 0 if result.get("status") in ("done", "skipped") else 1
+        if args.action in ("enable", "disable"):
+            done = control.switch(args.name, args.action == "enable")
+            print(f"{done['name']}: {'on' if done['enabled'] else 'off'}")
+            return 0
+        if args.action == "start":
+            r = control.start_loop(args.name, read_events(args.events))
+            print(f"started {r['id']}")
+            if args.follow:
+                follow(r["id"])
+            return 0
+        if args.action == "stop":
+            target = args.name
+            if not state.run_get(target):
+                running = [r for r in state.runs_marked_running()
+                           if r["kind"] == "loop" and r["loop"] == control.find_loop(target).name]
+                if not running:
+                    raise control.Refused(f"{target} has no run going")
+                target = running[0]["id"]
+            print(json.dumps(control.stop_run(target)))
+            return 0
+        if args.action == "status":
+            d = control.loop_detail(args.name)
+            print(loop_line(d))
+            print(f"  {d['description']}\n  dir {d['dir']}, origin {d['origin']}"
+                  + (f", repo {d['repo']}" if d["repo"] else ""))
+            if d["model"]:
+                print(f"  model {d['model']} {d['runner'] or ''} on {d['device']}, budget "
+                      f"{d['budget_usd'] or '-'} per run, {d['daily_budget_usd'] or '-'} per day")
+            if d["emits"]:
+                print(f"  emits {', '.join(d['emits'])}")
+            if d["webhook_path"]:
+                print(f"  webhook POST {d['webhook_path']}")
+            for c in d["cursors"]:
+                print(f"  source {c['source']}: {'ok' if c['ok'] else 'FAILING'} {c['note'] or ''} at {when(c['at'])}")
+            if d["waiting"]:
+                print(f"  waiting: {util.count(len(d['waiting']), 'firing')}")
+            if d["state"]:
+                print(f"  memory: {json.dumps(d['state'])[:300]}")
+            for r in d["runs"][:8]:
+                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} ${r['cost_usd'] or 0:.2f} "
+                      f"{util.first_line(r['summary'] or '', 90)}")
+            for f in d["findings"][:8]:
+                print(f"  finding {f['title'][:90]} {f['url'] or ''}")
+            return 0
+        if args.action == "feed":
+            run_id = latest_run(args.name)
+            r = state.run_get(run_id)
+            print(f"{run_id} {r['status']} {r.get('loop') or r['kind']}")
+            if args.follow:
+                follow(run_id)
+            else:
+                for line in state.feed(run_id):
+                    print_feed_line(line)
+            return 0
+    except (control.NotFound, control.Busy, control.Refused, loops.LoopError) as e:
+        return refused(e)
+    return 2
+
+
+def cmd_devices(args) -> int:
+    from . import control, devices
+
+    try:
+        if args.probe:
+            info = devices.probe(args.probe)
+            print(json.dumps(info, indent=2))
+            return 0 if info["ok"] else 1
+        for d in control.fleet():
+            p = d.get("probe") or {}
+            seen = (("ok" if p.get("ok") else "FAIL") + f" {when(p.get('at'))}") if p else "not probed"
+            extra = ", ".join(x for x in (p.get("system", ""), " ".join(p.get("tools") or []),
+                                          "; ".join(p.get("gpus") or []), p.get("detail", "")) if x)
+            print(f"{d['name']:<14} {d['kind']:<9} {d.get('host') or '':<22} {seen:<18} {extra}"[:220])
+            if d.get("error"):
+                print(f"  {d['error']}")
+        return 0
+    except devices.DeviceError as e:
+        return refused(e)
+
+
+def cmd_session(args) -> int:
+    import select
+    import threading
+
+    from . import control, sessions, state
+
+    try:
+        if args.action == "start":
+            tools = [t for t in args.tools.split(",") if t] if args.tools is not None else None
+            s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
+                                tools=tools, repo=args.repo, budget_usd=args.budget)
+            print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
+                  + (f" on {s['branch']}" if s["branch"] else ""))
+            if not args.attach:
+                print(f"`arete session attach {s['id']}` follows it and sends what you type")
+                return 0
+            args.id = s["id"]
+        if args.action in ("start", "attach"):
+            stop = threading.Event()
+            print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
+
+            def send_typed() -> None:
+                if stop.is_set() or not sys.stdin.isatty() and sys.stdin.closed:
+                    return
+                ready, _, _ = select.select([sys.stdin], [], [], 0)
+                if ready:
+                    line = sys.stdin.readline()
+                    if not line:
+                        stop.set()
+                    elif line.strip():
+                        sessions.send(args.id, line)
+            try:
+                follow(args.id, send=send_typed)
+            except KeyboardInterrupt:
+                print(f"\ndetached; the session keeps running. `arete session stop {args.id}` ends it")
+            return 0
+        if args.action == "send":
+            print(json.dumps(sessions.send(args.id, " ".join(args.words))))
+            return 0
+        if args.action == "stop":
+            print(json.dumps(control.stop_run(args.id)))
+            return 0
+        if args.action == "exec":
+            return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
+        for s in sessions.views():
+            print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
+                  f"{s['device']:<10} ${s['cost_usd'] or 0:.2f}  {s['prompt'][:70]}")
+        if not state.runs(kind="session", limit=1):
+            print("no sessions yet; `arete session start \"what to do\"`")
+        return 0
+    except (control.NotFound, control.Busy, control.Refused) as e:
+        return refused(e)
+
+
+def cmd_approve(args) -> int:
+    from . import control
+
+    try:
+        if args.id is None:
+            pending = control.approvals()
+            for a in pending:
+                print(f"#{a['id']:<4} {a['loop']:<20} {when(a['created'])}  {a['action']}"[:240])
+            if not pending:
+                print("nothing waiting for approval")
+            return 0
+        print(json.dumps(control.decide(args.id, not args.reject)))
+        return 0
+    except (control.NotFound, control.Refused) as e:
+        return refused(e)
+
+
+def cmd_webhook(args) -> int:
+    from . import control, dashboard, hooks
+
+    try:
+        loop = control.find_loop(args.name)
+    except control.NotFound as e:
+        return refused(e)
+    if not loop.trigger.webhook:
+        print(f"{loop.name} has no webhook; set `webhook = true` under [trigger] in {paths.short_path(loop.file)}",
+              file=sys.stderr)
+        return 1
+    key = hooks.secret(loop.name)
+    node = dashboard.this_node(config.load().dashboard_owner)
+    host = node.addresses[0] if node else "<this machine's tailnet address>"
+    print(f"POST http://{host}:{config.load().dashboard_port}{hooks.HOOK_PATH}{loop.name}")
+    print(f"X-Arete-Token: {key}")
+    print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
+    return 0
+
+
+def cmd_costs(args) -> int:
+    from . import control
+
+    c = control.costs(args.days)
+    print(f"${c['total_usd']:.2f} in the last {args.days:g} days")
+    for group in ("model", "runner", "loop"):
+        print(f"by {group}:")
+        for row in c[f"by_{group}"][:12]:
+            print(f"  {row['name']:<36} ${row['cost_usd']:>8.2f}  {row['steps']:>5} steps  "
+                  f"{row['tokens_in']:>10,} in  {row['tokens_out']:>9,} out")
+    return 0
+
+
+
+def cmd_loop_args(args) -> int:
+    words = list(args.words)
+    if args.action == "new":
+        words = [args.name, *words] if args.name else words
+        args.name = args.new_name
+        if not words:
+            print('arete loop new "one sentence on what the loop does"', file=sys.stderr)
+            return 2
+    args.words = words
+    return cmd_loop(args)
+
+
+def cmd_devices_args(args) -> int:
+    if (args.probe, bool(args.target)) not in (("", False), ("probe", True)):
+        print("usage: arete devices [probe NAME]", file=sys.stderr)
+        return 2
+    args.probe = args.target
+    return cmd_devices(args)
+
+
+def cmd_session_args(args) -> int:
+    words = list(args.words)
+    if args.action in ("attach", "send", "stop", "exec"):
+        if not words:
+            print(f"arete session {args.action} needs a session id", file=sys.stderr)
+            return 2
+        args.id, words = words[0], words[1:]
+    args.words = words
+    if args.action == "start" and not words:
+        print('arete session start "what to do" [--device NAME --model M --repo R]', file=sys.stderr)
+        return 2
+    if args.action == "send" and not words:
+        print("arete session send ID \"text\"", file=sys.stderr)
+        return 2
+    return cmd_session(args)
+
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -330,13 +648,63 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
 
-    p = sub.add_parser("install", help="write and load the launchd agents")
-    p.add_argument("--only", nargs="*", default=None)
-    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("install", help="run arete serve at login: one launchd agent on a Mac, one systemd user unit on "
+                                       "Linux; retires the old per loop agents")
+    p.add_argument("--dry-run", action="store_true", help="print the agent or unit, change nothing")
+    p.add_argument("--platform", choices=("mac", "linux"), default="", help="with --dry-run: print for this platform")
     p.set_defaults(fn=cmd_install)
 
-    p = sub.add_parser("uninstall", help="unload and remove the launchd agents")
+    p = sub.add_parser("uninstall", help="stop arete serve and remove its agent or unit")
     p.set_defaults(fn=cmd_uninstall)
+
+    p = sub.add_parser("serve", help="the daemon: fire loops on their triggers, run the queues, serve the dashboard")
+    p.add_argument("--no-dashboard", action="store_true")
+    p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("loop", help="list, draft, try, switch, start, stop and follow loops")
+    p.add_argument("action", choices=("list", "new", "try", "enable", "disable", "start", "stop", "status", "feed",
+                                      "exec"))
+    p.add_argument("name", nargs="?", default="", help="a loop name; a run id also works for stop and feed")
+    p.add_argument("words", nargs="*", help=argparse.SUPPRESS)
+    p.add_argument("--name", dest="new_name", default="", help="new: the loop name")
+    p.add_argument("--repo", default="", help="new: the repo the loop works on")
+    p.add_argument("--model", default="", help="new: the model that drafts it")
+    p.add_argument("--events", default="", metavar="FILE", help="try, start: a JSON list of events to feed it")
+    p.add_argument("-f", "--follow", action="store_true", help="feed, start: keep printing until the run ends")
+    p.add_argument("--fire", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--run-id", default="", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_loop_args)
+
+    p = sub.add_parser("devices", help="the devices loops and sessions run on, with their last probe")
+    p.add_argument("probe", nargs="?", default="", metavar="probe NAME")
+    p.add_argument("target", nargs="?", default="", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_devices_args)
+
+    p = sub.add_parser("session", help="start, follow, message and stop agent sessions on any device")
+    p.add_argument("action", choices=("start", "attach", "send", "list", "stop", "exec"))
+    p.add_argument("words", nargs="*", help="start: the first message; others: the session id, then send: the text")
+    p.add_argument("--device", default="local")
+    p.add_argument("--model", default="")
+    p.add_argument("--runner", default="", choices=("", "claude", "pi"))
+    p.add_argument("--tools", default=None, help="comma separated; Read,Edit,Write,Glob,Grep,Bash by default")
+    p.add_argument("--repo", default="", help="a repo name from the config or a path; work in a new worktree of it")
+    p.add_argument("--budget", type=float, default=None, help="USD for the whole session")
+    p.add_argument("--attach", action="store_true", help="start: follow it at once")
+    p.set_defaults(fn=cmd_session_args)
+
+    p = sub.add_parser("approve", help="list emits waiting for approval, or approve one by id")
+    p.add_argument("id", type=int, nargs="?", default=None)
+    p.add_argument("--reject", action="store_true")
+    p.set_defaults(fn=cmd_approve)
+
+    p = sub.add_parser("webhook", help="print the URL and token for a loop's webhook")
+    p.add_argument("action", choices=("secret",))
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_webhook)
+
+    p = sub.add_parser("costs", help="model spend by model, runner and loop")
+    p.add_argument("--days", type=float, default=7)
+    p.set_defaults(fn=cmd_costs)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")

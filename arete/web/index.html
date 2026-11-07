@@ -15,13 +15,16 @@
 <header>
   <div class="kicker">Arete · Dashboard</div>
   <h1>Arete</h1>
-  <p class="sub">The pipeline that turns approved tickets into reviewed pull requests: what it runs now, how it stands, what it costs over time, and a console to ask it why.</p>
+  <p class="sub">The pipeline that turns approved tickets into reviewed pull requests, the loops that watch and fix beside it, and the sessions you launch: what runs now, how it stands, what it costs, and a console to ask it why.</p>
   <p class="status" id="status">Loading</p>
 </header>
 
 <nav class="actions views">
   <div class="seg" role="group" aria-label="Views">
     <button type="button" data-view="live">Live</button>
+    <button type="button" data-view="loops">Loops</button>
+    <button type="button" data-view="launch">Launch</button>
+    <button type="button" data-view="fleet">Fleet</button>
     <button type="button" data-view="health">Health</button>
     <button type="button" data-view="triage">Triage</button>
     <button type="button" data-view="trends">Trends</button>
@@ -40,6 +43,83 @@
     <div class="actions"><button type="button" id="log-close">Close the log</button></div>
   </div>
   <div id="live-rest"></div>
+</section>
+
+<section data-view="loops" hidden>
+  <div id="loops"></div>
+  <p id="loops-result" aria-live="polite" hidden></p>
+  <div id="loop-detail" hidden></div>
+  <div id="loop-feed" class="feed" hidden>
+    <h3 class="feed-title">Feed</h3>
+    <pre class="feed-lines"></pre>
+    <div class="actions">
+      <button type="button" class="feed-stop">Stop this run</button>
+      <button type="button" class="feed-close">Close the feed</button>
+    </div>
+  </div>
+</section>
+
+<section data-view="launch" hidden>
+  <h2><span class="n">01</span>Launch a session</h2>
+  <p id="launch-about">A session is an agent you talk to. It runs on the device and model you pick and takes each message you send.</p>
+  <form id="launch" novalidate>
+    <div class="field">
+      <label for="launch-prompt">First message</label>
+      <textarea id="launch-prompt" rows="4" spellcheck="true"></textarea>
+    </div>
+    <div class="fields">
+      <div class="field">
+        <label for="launch-device">Device</label>
+        <select id="launch-device"></select>
+      </div>
+      <div class="field">
+        <label for="launch-model">Model</label>
+        <input id="launch-model" type="text" list="launch-models" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="launch-runner">Runner</label>
+        <select id="launch-runner"></select>
+      </div>
+      <div class="field">
+        <label for="launch-repo">Repo</label>
+        <select id="launch-repo"></select>
+      </div>
+      <div class="field">
+        <label for="launch-budget">Budget in dollars</label>
+        <input id="launch-budget" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="no limit">
+      </div>
+    </div>
+    <fieldset id="launch-tools"><legend>Tools</legend></fieldset>
+    <datalist id="launch-models"></datalist>
+    <div class="actions">
+      <button type="submit" data-act id="launch-go">Launch</button>
+      <button type="button" id="launch-reset">Reset the form</button>
+    </div>
+  </form>
+  <p id="launch-result" aria-live="polite" hidden></p>
+  <div id="session-feed" class="feed" hidden>
+    <h3 class="feed-title">Session</h3>
+    <p class="muted feed-about"></p>
+    <pre class="feed-lines"></pre>
+    <form id="session-send" novalidate>
+      <div class="field">
+        <label for="session-text">Message</label>
+        <textarea id="session-text" rows="3" spellcheck="true"></textarea>
+      </div>
+      <div class="actions">
+        <button type="submit" id="session-go">Send</button>
+        <button type="button" class="feed-stop">Stop the session</button>
+        <button type="button" class="feed-close">Close</button>
+      </div>
+    </form>
+    <p id="session-result" aria-live="polite" hidden></p>
+  </div>
+  <div id="sessions"></div>
+</section>
+
+<section data-view="fleet" hidden>
+  <div id="fleet"></div>
+  <p id="fleet-result" aria-live="polite" hidden></p>
 </section>
 
 <section data-view="health" hidden>
@@ -100,7 +180,7 @@
       <textarea id="chat-text" rows="4" spellcheck="true"></textarea>
     </div>
     <div class="actions">
-      <button type="submit" class="act" id="chat-send">Send</button>
+      <button type="submit" data-act id="chat-send">Send</button>
       <button type="button" id="chat-new">New chat</button>
       <span class="muted keys">Ctrl or Cmd with Enter sends</span>
     </div>
