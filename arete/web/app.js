@@ -38,10 +38,29 @@ function svg(tag, attrs = {}, text) {
   return node;
 }
 
+function scrollersByPlace(box) {
+  const found = new Map();
+  let under = "";
+  for (const node of box.querySelectorAll("h2, h3, summary, .wide, pre")) {
+    if (!node.matches(".wide, pre")) {
+      under = node.textContent;
+      continue;
+    }
+    let place = `${under}|${node.className}`;
+    while (found.has(place)) place += "+";
+    found.set(place, node);
+  }
+  return found;
+}
+
 function fill(id, ...nodes) {
   const box = document.getElementById(id);
   const focused = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.focus : "";
+  const scrolled = [...scrollersByPlace(box)].filter(([, node]) => node.scrollLeft || node.scrollTop)
+    .map(([place, node]) => [place, node.scrollLeft, node.scrollTop]);
   box.replaceChildren(...nodes.flat(Infinity).filter(Boolean));
+  const fresh = scrolled.length ? scrollersByPlace(box) : new Map();
+  for (const [place, left, top] of scrolled) fresh.get(place)?.scrollTo(left, top);
   if (focused) box.querySelector(`[data-focus="${CSS.escape(focused)}"]`)?.focus();
 }
 
