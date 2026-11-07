@@ -85,7 +85,7 @@ def start_loop(name: str, events: list[dict] | None = None) -> dict:
         raise Refused(f"{name} is broken: {loop.error}")
     if util.lock_is_held(state.loop_lock(loop.name)):
         raise Busy(f"{name} is running; stop it or wait")
-    run_id = state.new_loop_run_id(loop.name)
+    run_id = state.unique_run_id(loop.name)
     args = ["loop", "exec", loop.name, "--run-id", run_id]
     if events:
         fire_file = paths.RUNS_DIR / run_id / "events.json"
@@ -192,7 +192,7 @@ def feed(run_id: str, after: int = 0) -> dict:
 
 
 def approvals() -> list[dict]:
-    return [{**a, "action": emits.describe(a["emit"]["type"], a["emit"]["item"])} for a in state.approvals("pending")]
+    return [{**a, "action": emits.EMITS[a["emit"]["type"]].describe(a["emit"]["item"])} for a in state.approvals("pending")]
 
 
 def decide(approval_id: int, yes: bool) -> dict:

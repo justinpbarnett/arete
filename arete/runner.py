@@ -8,6 +8,7 @@ from . import claude, config, devices, pi, state
 from .agent import NO_SESSION, Result, Session
 
 RUNNERS = ("claude", "pi")
+BUDGET_FLOOR_USD = 0.005
 
 
 def route(model: str, runner: str = "") -> tuple[str, str]:

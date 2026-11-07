@@ -54,10 +54,6 @@ def save_spec(spec: Spec) -> None:
     util.write_json(spec_file(spec.id), asdict(spec))
 
 
-def new_id() -> str:
-    return f"ses-{util.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
-
-
 def repo_path(name: str, cfg: config.Config) -> Path:
     for r in cfg.repos:
         if r.name == name:
@@ -111,7 +107,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     which, name = runner.route(model, run_with)
     off = pi.withheld(tools, devices.get(device or "local").remote) if which == "pi" else {}
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
-    spec = Spec(new_id(), prompt, device or "local", model, run_with, tools, repo.strip(), budget_usd,
+    spec = Spec(state.unique_run_id("ses"), prompt, device or "local", model, run_with, tools, repo.strip(), budget_usd,
                 created=util.iso())
     workspace(spec, cfg)
     save_spec(spec)
@@ -159,7 +155,7 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     left = None
     if spec.budget_usd:
         left = round(spec.budget_usd - state.run_totals(spec.id)["cost_usd"], 2)
-        if left <= 0.005:
+        if left <= runner.BUDGET_FLOOR_USD:
             log_line(spec, "error", f"the session budget of ${spec.budget_usd:g} is spent")
             return resume
     res = runner.run(prompt, spec.cwd, model=spec.model, runner=spec.runner, trace=(spec.id, f"turn {turn}"),
@@ -226,13 +222,9 @@ def views(limit: int = 30) -> list[dict]:
 
 def choices() -> dict:
     cfg = config.load()
-    try:
-        names = [d.name for d in devices.load()]
-    except devices.DeviceError:
-        names = [devices.LOCAL.name]
     since = util.iso(util.now() - timedelta(days=SEEN_MODEL_DAYS))
     seen = {s["model"] for s in state.steps_since(since) if s["model"]}
     models = sorted({*settings.MODEL_ALIASES, *(m for m in cfg.models.values() if m), *cfg.pricing, *seen})
-    return {"devices": names, "repos": [r.name for r in cfg.repos], "models": models, "runners": list(runner.RUNNERS),
+    return {"devices": devices.names(), "repos": [r.name for r in cfg.repos], "models": models, "runners": list(runner.RUNNERS),
             "tools": sorted(loops.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
             "idle_hours": cfg.session_idle_hours}

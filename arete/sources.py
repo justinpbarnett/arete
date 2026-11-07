@@ -46,10 +46,7 @@ def poll(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
     source = loop.sources[index]
     sid = source_id(loop, index)
     first = state.cursor(sid) is None
-    if source["type"] == "log":
-        found, value = read_logs(source, (state.cursor(sid) or {}).get("value"), sid)
-    else:
-        found, value = FETCHERS[source["type"]](loop, source, cfg, sid), None
+    found, value = fetch(loop, source, cfg, sid, (state.cursor(sid) or {}).get("value"))
     seen = state.seen_keys(sid)
     fresh = [e for e in found if e["key"] not in seen]
     fresh = list({e["key"]: e for e in fresh}.values())
@@ -66,11 +63,14 @@ def wanted_events(loop: Loop, found: list[dict]) -> list[dict]:
 def peek(loop: Loop, index: int, cfg: config.Config, limit: int = 5) -> list[dict]:
     source = loop.sources[index]
     sid = source_id(loop, index)
-    if source["type"] == "log":
-        found, _ = read_logs(source, "{}", sid)
-    else:
-        found = FETCHERS[source["type"]](loop, source, cfg, sid)
+    found, _ = fetch(loop, source, cfg, sid, "{}")
     return wanted_events(loop, found)[-limit:]
+
+
+def fetch(loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
+    if source["type"] == "log":
+        return read_logs(source, cursor, sid)
+    return FETCHERS[source["type"]](loop, source, cfg, sid), None
 
 
 def github_events(loop: Loop, source: dict, cfg: config.Config, sid: str) -> list[dict]:

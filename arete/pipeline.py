@@ -1767,7 +1767,7 @@ def interrupted_twice(row: dict) -> bool:
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     for row in state.runs_marked_running():
-        if row["kind"] in ("loop", "session", "draft"):
+        if row["kind"] in state.SERVE_KINDS:
             continue
         with util.lock(state.run_lock(row["kind"], row["repo"], row["issue"])) as free:
             if not free:

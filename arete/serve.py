@@ -41,15 +41,10 @@ def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     return loop.trigger.cron.next_after(last.astimezone()) <= now.astimezone()
 
 
-def group_of(loop: Loop, e: dict) -> str:
-    field = loop.trigger.group
-    return str(e.get(field) or (e.get("data") or {}).get(field) or "") if field else ""
-
-
 def settle_dead_runs() -> list[str]:
     settled = []
     for r in state.runs_marked_running():
-        if r["kind"] not in ("loop", "session", "draft") or control.pid_alive(r.get("pid")):
+        if r["kind"] not in state.SERVE_KINDS or control.pid_alive(r.get("pid")):
             continue
         if age_seconds(r["started"]) < SETTLE_GRACE_SECONDS:
             continue
@@ -172,7 +167,7 @@ class Server:
         batches: dict[str, list[dict]] = {}
         for e in found:
             state.add_event(loop.name, e)
-            batches.setdefault(group_of(loop, e), []).append(e)
+            batches.setdefault(loop.trigger.group_of(e), []).append(e)
         for group, batch in batches.items():
             state.enqueue(loop.name, loop.queue_name, group, "event", batch)
         if found:
@@ -220,7 +215,7 @@ class Server:
                 if item["grp"]:
                     held_groups.add(key)
                 continue
-            run_id = state.new_loop_run_id(loop.name)
+            run_id = state.unique_run_id(loop.name)
             state.take_queue_item(item["id"], run_id)
             proc = control.detach(["loop", "exec", loop.name, "--fire", str(item["id"]), "--run-id", run_id])
             self.children[run_id] = Child(proc, loop.name, item["queue"], item["grp"], item["id"])

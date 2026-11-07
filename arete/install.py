@@ -90,8 +90,16 @@ def this_platform() -> str:
     return "mac" if paths.ON_MAC else "linux"
 
 
+def agent_file(lb: str) -> Path:
+    return AGENTS_DIR / f"{lb}.plist"
+
+
+def serve_file(platform: str) -> Path:
+    return agent_file(label(SERVE)) if platform == "mac" else UNITS_DIR / SERVE_UNIT
+
+
 def serve_installed() -> bool:
-    return (AGENTS_DIR / f"{label(SERVE)}.plist" if paths.ON_MAC else UNITS_DIR / SERVE_UNIT).exists()
+    return serve_file(this_platform()).exists()
 
 
 def retired_labels() -> set[str]:
@@ -104,11 +112,10 @@ def install(dry_run: bool = False, platform: str = "") -> int:
         print(f"unknown platform {platform}; use {' or '.join(PLATFORMS)}")
         return 1
     if dry_run:
-        dest = (AGENTS_DIR / f"{label(SERVE)}.plist") if platform == "mac" else UNITS_DIR / SERVE_UNIT
-        print(f"--- {dest}")
+        print(f"--- {serve_file(platform)}")
         print(plistlib.dumps(serve_plist()).decode() if platform == "mac" else serve_unit(), end="")
         if platform == "mac":
-            for lb in (label(name) for name in RETIRED if (AGENTS_DIR / f"{label(name)}.plist").exists()):
+            for lb in (label(name) for name in RETIRED if agent_file(label(name)).exists()):
                 print(f"would retire {lb}")
         return 0
     if platform != this_platform():
@@ -125,7 +132,7 @@ def install_launchd() -> int:
     for name in RETIRED:
         retire(label(name))
     pl = serve_plist()
-    dest = AGENTS_DIR / f"{pl['Label']}.plist"
+    dest = serve_file("mac")
     util.sh(["launchctl", "bootout", f"{_domain()}/{pl['Label']}"], timeout=30)
     dest.write_bytes(plistlib.dumps(pl))
     res = util.sh(["launchctl", "bootstrap", _domain(), str(dest)], timeout=30)
@@ -135,7 +142,7 @@ def install_launchd() -> int:
 
 def install_systemd() -> int:
     UNITS_DIR.mkdir(parents=True, exist_ok=True)
-    (UNITS_DIR / SERVE_UNIT).write_text(serve_unit())
+    serve_file("linux").write_text(serve_unit())
     for step in (["daemon-reload"], ["enable", "--now", SERVE_UNIT], ["restart", SERVE_UNIT]):
         res = util.sh(["systemctl", "--user", *step], timeout=60)
         if res.returncode != 0:
@@ -145,13 +152,17 @@ def install_systemd() -> int:
     return 0
 
 
-def retire(lb: str) -> None:
-    f = AGENTS_DIR / f"{lb}.plist"
-    if not f.exists():
-        return
+def remove_agent(lb: str) -> bool:
+    if not agent_file(lb).exists():
+        return False
     util.sh(["launchctl", "bootout", f"{_domain()}/{lb}"], timeout=30)
-    f.unlink()
-    print(f"{lb}: retired, its loop now runs under {label(SERVE)}")
+    agent_file(lb).unlink()
+    return True
+
+
+def retire(lb: str) -> None:
+    if remove_agent(lb):
+        print(f"{lb}: retired, its loop now runs under {label(SERVE)}")
 
 
 def prepare_trackers() -> None:
@@ -165,16 +176,12 @@ def prepare_trackers() -> None:
 def uninstall() -> int:
     if not paths.ON_MAC:
         util.sh(["systemctl", "--user", "disable", "--now", SERVE_UNIT], timeout=60)
-        (UNITS_DIR / SERVE_UNIT).unlink(missing_ok=True)
+        serve_file("linux").unlink(missing_ok=True)
         util.sh(["systemctl", "--user", "daemon-reload"], timeout=60)
         print(f"{SERVE_UNIT}: removed")
         return 0
-    for name in (SERVE, *RETIRED):
-        lb = label(name)
-        util.sh(["launchctl", "bootout", f"{_domain()}/{lb}"], timeout=30)
-        f = AGENTS_DIR / f"{lb}.plist"
-        if f.exists():
-            f.unlink()
+    for lb in (label(name) for name in (SERVE, *RETIRED)):
+        if remove_agent(lb):
             print(f"{lb}: removed")
     return 0
 

@@ -7,7 +7,6 @@ from . import alerts, config, gh, paths, sources, state, util
 from .loops import Loop
 
 DIGESTS_DIR = paths.STATE_DIR / "digests"
-PER_FINDING = ("ticket",)
 SEVERITIES = ("low", "medium", "high", "critical")
 FENCE = re.compile(r"`{3,}")
 TAGS = re.compile(r"<[^>]{0,200}>")
@@ -51,16 +50,55 @@ def ticket_body(loop: Loop, run_id: str, f: dict, trust: str) -> str:
     ] if part))
 
 
-def render(loop: Loop, run_id: str, spec: dict, payload: dict) -> dict:
-    kind = spec["type"]
-    findings = payload.get("findings") or []
-    outcome = payload.get("outcome") or {}
-    if kind == "ticket":
+class Emit:
+    def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
+        return [findings] if findings or outcome.get("branch") else []
+
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
+        raise NotImplementedError
+
+    def execute(self, item: dict, loop_name: str, run_id: str, cfg: config.Config) -> str:
+        raise NotImplementedError
+
+    def describe(self, item: dict) -> str:
+        raise NotImplementedError
+
+    def delivered(self, loop_name: str, batch: list[dict], done: str) -> None:
+        pass
+
+    def rejected(self, item: dict) -> None:
+        pass
+
+
+class Ticket(Emit):
+    def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
+        return [[f] for f in findings]
+
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         f = findings[0]
         return {"repo": spec["repo"], "title": plain(spec.get("prefix", "") + f["title"], 120),
-                "body": ticket_body(loop, run_id, f, payload.get("trust", "")),
+                "body": ticket_body(loop, run_id, f, outcome.get("trust", "")),
                 "labels": list(spec.get("labels", ["agent"]))}
-    if kind == "pr":
+
+    def execute(self, item: dict, loop_name: str, run_id: str, cfg: config.Config) -> str:
+        repo = sources.github_name(cfg, item["repo"])
+        for label in item["labels"]:
+            gh.ensure_label(repo, label)
+        return gh.issue_url(repo, gh.issue_create(repo, item["title"], item["body"], item["labels"]))
+
+    def describe(self, item: dict) -> str:
+        return f"file a ticket on {item['repo']} [{', '.join(item['labels'])}]: {item['title']}"
+
+    def delivered(self, loop_name: str, batch: list[dict], done: str) -> None:
+        for f in batch:
+            state.set_finding_url(loop_name, f["fingerprint_key"], done)
+
+
+class PullRequest(Emit):
+    def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
+        return [findings] if outcome.get("branch") else []
+
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         public = outcome.get("public", True)
         title = f"{loop.name}: {outcome.get('facts', '')}" if public else \
             outcome.get("title") or f"{loop.name}: {outcome.get('summary', '')}"
@@ -69,7 +107,22 @@ def render(loop: Loop, run_id: str, spec: dict, payload: dict) -> dict:
                 "workdir": outcome.get("workdir", ""), "title": plain(spec.get("title") or title, 120),
                 "body": gh.marked(f"Made by the `{loop.name}` loop, run `{run_id}`.\n\n{plain(told, 6000)}"),
                 "draft": bool(spec.get("draft", True)), "labels": list(spec.get("labels", []))}
-    if kind == "digest":
+
+    def execute(self, item: dict, loop_name: str, run_id: str, cfg: config.Config) -> str:
+        util.git(["push", "-u", "origin", item["branch"]], Path(item["workdir"]), timeout=300)
+        return gh.pr_create(item["repo"], item["branch"], item["base"], item["title"], item["body"], item["labels"],
+                            draft=item["draft"])
+
+    def describe(self, item: dict) -> str:
+        return f"open a {'draft ' if item['draft'] else ''}PR on {item['repo']} from {item['branch']}: {item['title']}"
+
+    def rejected(self, item: dict) -> None:
+        if item.get("workdir"):
+            util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+
+
+class Digest(Emit):
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         lines = [f"## {util.now().astimezone().strftime('%H:%M')} {loop.name} ({run_id})", ""]
         lines += [f"- **{plain(f['title'], 160)}** ({f.get('severity') or 'unrated'}): {plain(f.get('summary'), 600)}"
                   + (f" [{plain(f.get('location'), 200)}]" if f.get("location") else "") for f in findings]
@@ -77,38 +130,48 @@ def render(loop: Loop, run_id: str, spec: dict, payload: dict) -> dict:
             lines.append(f"- {plain(outcome['summary'], 600)}")
         return {"file": str(DIGESTS_DIR / loop.name.replace("/", ".") / f"{util.now().astimezone():%Y-%m-%d}.md"),
                 "text": "\n".join(lines) + "\n\n"}
-    if kind == "notify":
-        titles = "; ".join(plain(f["title"], 80) for f in findings[:3]) or plain(outcome.get("summary"), 160)
-        return {"title": f"arete: {loop.name}", "message": f"{len(findings)} found: {titles}" if findings else titles}
-    if kind == "metric":
-        value = outcome.get("value", len(findings))
-        return {"name": spec["name"], "value": float(value)}
-    raise ValueError(f"unknown emit {kind}")
 
-
-def execute(kind: str, item: dict, loop_name: str, run_id: str, cfg: config.Config) -> str:
-    if kind == "ticket":
-        repo = sources.github_name(cfg, item["repo"])
-        for label in item["labels"]:
-            gh.ensure_label(repo, label)
-        return gh.issue_url(repo, gh.issue_create(repo, item["title"], item["body"], item["labels"]))
-    if kind == "pr":
-        util.git(["push", "-u", "origin", item["branch"]], Path(item["workdir"]), timeout=300)
-        return gh.pr_create(item["repo"], item["branch"], item["base"], item["title"], item["body"], item["labels"],
-                            draft=item["draft"])
-    if kind == "digest":
+    def execute(self, item: dict, loop_name: str, run_id: str, cfg: config.Config) -> str:
         p = Path(item["file"])
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a") as fh:
             fh.write(item["text"])
         return paths.short_path(p)
-    if kind == "notify":
+
+    def describe(self, item: dict) -> str:
+        return f"add {item['text'].count(chr(10) + '- ')} lines to the digest {paths.short_path(item['file'])}"
+
+
+class Notify(Emit):
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
+        titles = "; ".join(plain(f["title"], 80) for f in findings[:3]) or plain(outcome.get("summary"), 160)
+        return {"title": f"arete: {loop.name}", "message": f"{len(findings)} found: {titles}" if findings else titles}
+
+    def execute(self, item: dict, loop_name: str, run_id: str, cfg: config.Config) -> str:
         alerts.notify(item["title"], item["message"])
         return "notified"
-    if kind == "metric":
+
+    def describe(self, item: dict) -> str:
+        return f"notify: {item['message']}"
+
+
+class Metric(Emit):
+    def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
+        return [findings]
+
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
+        return {"name": spec["name"], "value": float(outcome.get("value", len(findings)))}
+
+    def execute(self, item: dict, loop_name: str, run_id: str, cfg: config.Config) -> str:
         state.add_metric(item["name"], item["value"], loop_name, run_id)
         return f"{item['name']} = {item['value']:g}"
-    raise ValueError(f"unknown emit {kind}")
+
+    def describe(self, item: dict) -> str:
+        return f"record metric {item['name']} = {item['value']:g}"
+
+
+EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "digest": Digest(), "notify": Notify(),
+                          "metric": Metric()}
 
 
 def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, trial: bool, log,
@@ -116,10 +179,10 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
     results = []
     for spec in loop.emits:
         kind = spec["type"]
-        for batch in batches(kind, findings, outcome):
-            payload = {"findings": batch, "outcome": outcome, "trust": outcome.get("trust", "")}
-            item = render(loop, run_id, spec, payload)
-            what = describe(kind, item)
+        emit = EMITS[kind]
+        for batch in emit.batches(findings, outcome):
+            item = emit.render(loop, run_id, spec, batch, outcome)
+            what = emit.describe(item)
             if trial:
                 log("held", f"would {what}")
                 results.append(f"held: {what}")
@@ -130,39 +193,14 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                 results.append(f"approval #{approval_id}")
                 continue
             try:
-                done = execute(kind, item, loop.name, run_id, cfg)
+                done = emit.execute(item, loop.name, run_id, cfg)
                 log("emit", f"{kind}: {done}")
                 results.append(done)
-                for f in batch if kind == "ticket" else []:
-                    state.set_finding_url(loop.name, f["fingerprint_key"], done)
+                emit.delivered(loop.name, batch, done)
             except (RuntimeError, OSError, ValueError) as e:
                 log("error", f"{kind} failed: {util.first_line(str(e), 300)}")
                 results.append(f"{kind} failed")
     return results
-
-
-def batches(kind: str, findings: list[dict], outcome: dict) -> list[list[dict]]:
-    if kind in PER_FINDING:
-        return [[f] for f in findings]
-    if kind == "pr":
-        return [findings] if outcome.get("branch") else []
-    if kind == "metric":
-        return [findings]
-    return [findings] if findings or outcome.get("branch") else []
-
-
-def describe(kind: str, item: dict) -> str:
-    if kind == "ticket":
-        return f"file a ticket on {item['repo']} [{', '.join(item['labels'])}]: {item['title']}"
-    if kind == "pr":
-        return f"open a {'draft ' if item['draft'] else ''}PR on {item['repo']} from {item['branch']}: {item['title']}"
-    if kind == "digest":
-        return f"add {item['text'].count(chr(10) + '- ')} lines to the digest {paths.short_path(item['file'])}"
-    if kind == "notify":
-        return f"notify: {item['message']}"
-    if kind == "metric":
-        return f"record metric {item['name']} = {item['value']:g}"
-    return kind
 
 
 def approve(approval_id: int, yes: bool, cfg: config.Config | None = None) -> str:
@@ -171,13 +209,12 @@ def approve(approval_id: int, yes: bool, cfg: config.Config | None = None) -> st
         raise ValueError(f"no approval #{approval_id}")
     if not state.decide_approval(approval_id, "approved" if yes else "rejected"):
         raise ValueError(f"approval #{approval_id} is already {row['status']}")
+    emit, item = EMITS[row["emit"]["type"]], row["emit"]["item"]
     if not yes:
-        item = row["emit"]["item"]
-        if row["emit"]["type"] == "pr" and item.get("workdir"):
-            util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+        emit.rejected(item)
         return "rejected"
     try:
-        done = execute(row["emit"]["type"], row["emit"]["item"], row["loop"], row["run_id"], cfg or config.load())
+        done = emit.execute(item, row["loop"], row["run_id"], cfg or config.load())
     except Exception as e:
         state.decide_approval(approval_id, "failed", str(e))
         raise

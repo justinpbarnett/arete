@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, cron, devices, paths, pi, runner
+from . import config, cron, devices, paths, pi, runner, util
 
 ENGINE_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -16,10 +16,10 @@ READING_TOOLS = {"Read", "Glob", "Grep", "LS"}
 KNOWN_TOOLS = READING_TOOLS | {"Edit", "MultiEdit", "Write", "Bash"}
 EDITING_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"]
 SOURCE_TYPES = ("github", "jira", "log", "command")
-EMIT_TYPES = ("ticket", "pr", "digest", "notify", "metric")
 METRIC_RULE = re.compile(r"^\s*([\w.\-/]+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?)\s*$")
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
+GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 
 
 @dataclass
@@ -32,6 +32,9 @@ class Trigger:
     metric: tuple[str, str, float] | None = None
     group: str = ""
     trust: str = "untrusted"
+
+    def group_of(self, e: dict) -> str:
+        return str(e.get(self.group) or (e.get("data") or {}).get(self.group) or "") if self.group else ""
 
     def admits(self, e: dict) -> bool:
         given = e.get("trust")
@@ -108,6 +111,14 @@ class Loop:
 
     def model_for(self, cfg: config.Config) -> str:
         return self.model or cfg.model("loop")
+
+    def work_repo(self, cfg: config.Config) -> config.Repo:
+        for r in cfg.repos:
+            if r.name == self.repo:
+                return r
+        path = paths.expand(self.repo)
+        m = GITHUB_REMOTE.search(util.git(["remote", "get-url", "origin"], path, check=False).strip())
+        return config.Repo(name=self.repo, path=path, github=m.group(1) if m else "")
 
     def view(self) -> dict:
         return {"name": self.name, "origin": self.origin, "kind": self.kind, "description": self.description,
@@ -243,6 +254,8 @@ def metric_rule(text: str) -> tuple[str, str, float]:
 
 
 def validate(loop: Loop, cfg: config.Config) -> None:
+    from .emits import EMITS
+
     problems = []
     if loop.kind not in KINDS:
         problems.append(f"kind '{loop.kind}' is not one of {', '.join(KINDS)}")
@@ -254,8 +267,8 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("a command loop needs [run] command")
     if loop.agent and not loop.prompt_file.is_file():
         problems.append(f"a {loop.kind} loop needs prompt.md")
-    if loop.runner and loop.runner not in ("claude", "pi"):
-        problems.append(f"runner '{loop.runner}' is not claude or pi")
+    if loop.runner and loop.runner not in runner.RUNNERS:
+        problems.append(f"runner '{loop.runner}' is not one of {', '.join(runner.RUNNERS)}")
     if unknown := sorted(set(loop.tools) - KNOWN_TOOLS):
         problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
     if loop.agent and runner.route(loop.model_for(cfg), loop.runner)[0] == "pi":
@@ -286,12 +299,15 @@ def validate(loop: Loop, cfg: config.Config) -> None:
             problems.append("a command source needs command")
     for e in loop.emits:
         kind = e.get("type")
-        if kind not in EMIT_TYPES:
-            problems.append(f"emit type '{kind}' is not one of {', '.join(EMIT_TYPES)}")
+        if kind not in EMITS:
+            problems.append(f"emit type '{kind}' is not one of {', '.join(EMITS)}")
         if kind == "ticket" and e.get("repo") not in repos and "/" not in str(e.get("repo", "")):
             problems.append(f"ticket emit repo '{e.get('repo', '')}' is not a repo in the config or owner/name")
         if kind == "pr" and loop.kind not in ("climb", "search"):
             problems.append("only climb and search loops emit a pr")
+        elif kind == "pr" and loop.repo and not loop.work_repo(cfg).github:
+            problems.append(f"a pr emit needs a GitHub repo; '{loop.repo}' has no github in the config or GitHub "
+                            "remote")
         if kind == "metric" and not e.get("name"):
             problems.append("a metric emit needs name")
     if loop.classify and not loop.classify.get("prompt"):

@@ -32,7 +32,6 @@ from .agent import Result
 from .loops import Loop
 from .pipeline import NO_GIT_WRITES
 
-GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:e-?\d+)?")
 KNOWN_FINDINGS_SHOWN = 30
 OUTPUT_TAIL = 6000
@@ -70,6 +69,10 @@ class Workspace:
     max_diff_lines: int
     public: bool
 
+    def outcome_fields(self) -> dict:
+        return {"branch": self.branch, "base": self.base, "workdir": str(self.src), "github": self.github,
+                "public": self.public}
+
 
 @dataclass
 class LoopRun:
@@ -106,7 +109,7 @@ class LoopRun:
         if not limits:
             return None
         name, left = min(limits, key=lambda x: x[1])
-        if left <= 0.005:
+        if left <= runner.BUDGET_FLOOR_USD:
             raise OverBudget(f"{name} is spent")
         return round(left, 2)
 
@@ -178,19 +181,10 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     return 124 if expired.is_set() else proc.returncode, "".join(lines)
 
 
-def loop_repo(loop: Loop, cfg: config.Config) -> config.Repo:
-    for r in cfg.repos:
-        if r.name == loop.repo:
-            return r
-    path = paths.expand(loop.repo)
-    m = GITHUB_REMOTE.search(util.git(["remote", "get-url", "origin"], path, check=False).strip())
-    return config.Repo(name=loop.repo, path=path, github=m.group(1) if m else "")
-
-
 def work_dir(run: LoopRun) -> Path | str:
     if run.device.remote:
         return run.device.dir
-    return loop_repo(run.loop, run.cfg).path if run.loop.repo else run.loop.dir
+    return run.loop.work_repo(run.cfg).path if run.loop.repo else run.loop.dir
 
 
 def from_loop_folder(argv: list[str], loop: Loop) -> list[str]:
@@ -240,7 +234,7 @@ def execute(name: str, *, fire: int | None = None, run_id: str = "", trial: bool
             if fire:
                 state.take_queue_item(fire, None)
             return "busy", "the last run of this loop is still going"
-        run = LoopRun(loop, run_id or state.new_loop_run_id(loop.name), cfg, trial=trial,
+        run = LoopRun(loop, run_id or state.unique_run_id(loop.name), cfg, trial=trial,
                       trigger="try" if trial else (item["trigger"] if item else "manual"),
                       events=list(events or (item["payload"] if item else [])))
         state.start_run(run.id, "loop", repo=loop.repo or None)
@@ -433,7 +427,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
 
 
 def open_workspace(run: LoopRun) -> Workspace:
-    repo = loop_repo(run.loop, run.cfg)
+    repo = run.loop.work_repo(run.cfg)
     src, github = repo.path, repo.github
     if "origin" in util.git(["remote"], src, check=False).split():
         base = gh.default_branch(github) if github else "main"
@@ -568,8 +562,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         if not kept:
             return "done", f"no try beat the baseline {baseline:g}"
         summary = f"{spec['measure']}: {baseline:g} -> {best:g}"
-        outcome = {"value": best, "branch": ws.branch, "base": ws.base, "workdir": str(ws.src), "github": ws.github,
-                   "public": ws.public, "facts": summary, "summary": summary,
+        outcome = {**ws.outcome_fields(), "value": best, "facts": summary, "summary": summary,
                    "title": f"{run.loop.name}: {baseline:g} -> {best:g}",
                    "report": f"Climbed `{spec['measure']}` from {baseline:g} to {best:g}.\n\n" + "\n".join(history)}
         emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
@@ -614,8 +607,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
         if not hit:
             return "done", f"no hit in {util.count(len(history) - 1, 'try', 'tries')}"
         summary = f"`{spec['check']}` passes: {history[-1][2:]}"
-        outcome = {"value": len(history) - 1, "branch": ws.branch, "base": ws.base, "workdir": str(ws.src),
-                   "github": ws.github, "public": ws.public, "summary": summary,
+        outcome = {**ws.outcome_fields(), "value": len(history) - 1, "summary": summary,
                    "facts": f"`{spec['check']}` passes after {util.count(len(history) - 1, 'try', 'tries')}",
                    "title": f"{run.loop.name}: {history[-1].split(': ', 2)[-1]}",
                    "report": f"Searched for a change that makes `{spec['check']}` pass.\n\n" + "\n".join(history)}

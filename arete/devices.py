@@ -189,6 +189,13 @@ def lease(device: Device | str, label: str, log=lambda text: None):
             log(f"destroyed VM {vmid}")
 
 
+def names() -> list[str]:
+    try:
+        return [d.name for d in load()]
+    except DeviceError:
+        return [LOCAL.name]
+
+
 def views() -> list[dict]:
     known = cached()
     return [{**d.view(), "probe": known.get(d.name)} for d in load()]

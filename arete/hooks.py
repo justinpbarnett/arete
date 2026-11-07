@@ -88,7 +88,5 @@ def receive(name: str, headers, body: bytes) -> dict:
         return {"queued": False, "why": "already received", "key": e["key"]}
     state.mark_seen(e["source"], [e["key"]])
     state.add_event(name, e)
-    group = loop.trigger.group
-    item = state.enqueue(name, loop.queue_name, str(e.get(group) or e["data"].get(group) or "") if group else "",
-                         "webhook", [e])
+    item = state.enqueue(name, loop.queue_name, loop.trigger.group_of(e), "webhook", [e])
     return {"queued": True, "item": item, "key": e["key"], "at": util.iso()}

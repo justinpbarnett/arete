@@ -257,8 +257,11 @@ def new_run_id(kind: str) -> str:
     return f"{kind[:3]}-{util.now().strftime('%Y%m%d-%H%M%S')}"
 
 
-def new_loop_run_id(name: str) -> str:
-    return f"{name.replace('/', '.')}-{util.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+SERVE_KINDS = ("loop", "session", "draft")
+
+
+def unique_run_id(prefix: str) -> str:
+    return f"{prefix.replace('/', '.')}-{util.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
 
 
 def start_run(run_id: str, kind: str, repo: str | None = None, issue: int | str | None = None) -> None:

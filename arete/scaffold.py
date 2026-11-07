@@ -46,13 +46,6 @@ def private_dir(cfg: config.Config) -> Path:
     return cfg.loop_dirs[0] if cfg.loop_dirs else paths.CONFIG_DIR / "loops"
 
 
-def device_names() -> list[str]:
-    try:
-        return [d.name for d in devices.load()]
-    except devices.DeviceError:
-        return ["local"]
-
-
 def draft_prompt(sentence: str, cfg: config.Config, name: str, repo: str, taken: set[str]) -> str:
     repos = "\n".join(f"- {r.name}: {r.github or 'no GitHub remote'}{', pipeline' if r.pipeline else ''}"
                       for r in cfg.repos)
@@ -61,7 +54,7 @@ def draft_prompt(sentence: str, cfg: config.Config, name: str, repo: str, taken:
         "The reference below is the whole loop folder format. Use only what it describes.",
         "<reference>\n" + REFERENCE.read_text() + "\n</reference>",
         f"Repos in the config:\n{repos}",
-        f"Devices: {', '.join(device_names())}.",
+        f"Devices: {', '.join(devices.names())}.",
         f"Loop names already taken: {', '.join(sorted(taken)) or 'none'}.",
         ("Pick the simplest kind that does the job: a command loop when a script can decide on its own, a watch "
          "loop when it needs judgment, climb or search only to change code. Put `enabled = false` at the top. Give "
@@ -175,7 +168,7 @@ def try_loop(name: str, events: list[dict] | None = None, follow=None) -> dict:
         events = sample_events(loop, cfg)
         if not events:
             raise control.Refused(f"{name} found no events to try on; pass --events FILE with a JSON list of events")
-    run_id = state.new_loop_run_id(loop.name)
+    run_id = state.unique_run_id(loop.name)
     result: dict = {}
     finished = threading.Event()
     follower = threading.Thread(target=follow, args=(run_id, lambda: not finished.is_set()),
