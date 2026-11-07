@@ -126,6 +126,11 @@ def cmd_status(args) -> int:
         print("memory facts the miner noticed (file them by hand, then `arete forget ID`):")
         for p in mem:
             print(f"  {p['id']:<4} {p['change']}"[:200])
+    hand = state.proposals(status=["hand"], limit=10)
+    if hand:
+        print("harness fixes to make by hand, since Claude Code denies agent writes under .claude/ (then `arete forget ID`):")
+        for p in hand:
+            print(f"  {p['id']:<4} {p['repo']}/{p['file']}: {p['change']}"[:400])
     skipped = pipeline.skipped_tickets()
     if skipped:
         print("labeled tickets the pipeline will not run (`arete run REPO ID --force` runs one anyway):")
@@ -151,7 +156,7 @@ def cmd_forget(args) -> int:
     from . import state
 
     with state.db() as c:
-        c.execute("UPDATE proposals SET status = 'filed' WHERE id = ? AND status = 'memory'", (args.id,))
+        c.execute("UPDATE proposals SET status = 'filed' WHERE id = ? AND status IN ('memory', 'hand')", (args.id,))
     return 0
 
 
@@ -336,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-apply", action="store_true", help="record proposals but open no PRs")
     p.set_defaults(fn=cmd_mine)
 
-    p = sub.add_parser("forget", help="mark a memory fact from the miner as filed")
+    p = sub.add_parser("forget", help="mark a memory fact or hand edit from the miner as done")
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_forget)
 

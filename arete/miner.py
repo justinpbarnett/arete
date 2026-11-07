@@ -19,6 +19,8 @@ MAX_MINER_DIFF = 200
 GLOBAL_GLOBS = ["skills/**", "CLAUDE.md", "AGENTS.md"]
 NEVER = ["**/settings.json", "**/settings.local.json", ".github/**", ".agents/config.toml", "**/.env*"]
 ARETE_PROMPT_GLOB = f"{evals.ARETE_PROMPTS}/*.md"
+CLAUDE_CODE_GUARDED = [".claude/**", "**/.claude/**"]
+HAND_EDIT_WHY = "Claude Code denies agent writes under .claude/"
 HUMAN_EDITED_PROMPTS = ["grade", "eval_mine", "mine", "apply"]
 
 SKIP_PREFIXES = (
@@ -349,7 +351,7 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
     return ""
 
 
-def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict]) -> str:
+def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict]) -> tuple[str, list[dict]]:
     base = gh.default_branch(repo.github)
     branch = miner_branch()
     wt = make_worktree(repo, base, branch, "miner")
@@ -360,25 +362,27 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         res = claude.run(prompt("apply", proposals=text), wt, model=cfg.model("apply"), allowed_tools=list(claude.FILE_TOOLS),
                          timeout=1200, persist=False)
         if not res.ok:
-            return ""
+            return "", []
         git(["add", "-A"], wt)
         files, lines = [], 0
         for row in git(["diff", "--cached", "--numstat", "--no-renames"], wt).splitlines():
             a, d, name = row.split("\t")
             files.append(name)
             lines += (int(a) + int(d)) if a != "-" else 0
-        if not files:
-            return ""
+        landed = [p for p in props if p["file"] in files]
+        if not landed:
+            return "", []
         bad = [f for f in files if not is_harness_file(cfg, repo, f)]
         refusal = (f"touched {bad}" if bad else f"touched {lines} lines" if lines > MAX_MINER_DIFF
                    else prompt_refusal(cfg, repo, wt))
         if refusal:
             print(f"{repo.name}: refused, {refusal}")
-            return ""
-        git(["commit", "-q", "-m", f"docs(harness): apply {util.count(len(props), 'mined fix', 'mined fixes')}\n\nArete-Run: {run_id}"], wt)
+            return "", []
+        fixes = util.count(len(landed), "mined fix", "mined fixes")
+        git(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
         body = ["Fixes mined from recent sessions where an agent needed correcting.", ""]
-        for i, p in enumerate(props, 1):
+        for i, p in enumerate(landed, 1):
             ev = ", ".join(p.get("evidence", [])[:4])
             body.append(f"{i}. `{p['file']}`: {p['why']}" + ("" if repo.public else f" (sessions {ev})"))
         if repo.name == cfg.arete_repo and any(util.matches_any(f, [ARETE_PROMPT_GLOB]) for f in files):
@@ -388,9 +392,9 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         gh.ensure_label(repo.github, "arete-miner", "1d76db", "Harness fixes mined by arete")
         existing = gh.prs(repo.github, label="arete-miner", state="open")
         if any(p.get("headRefName") == branch for p in existing):
-            return next(p["url"] for p in existing if p.get("headRefName") == branch)
-        return gh.pr_create(repo.github, branch, base, f"docs(harness): {util.count(len(props), 'mined fix', 'mined fixes')} {util.now():%Y-%m-%d}",
-                            "\n".join(body), labels=["arete-miner"], cwd=wt)
+            return next(p["url"] for p in existing if p.get("headRefName") == branch), landed
+        return gh.pr_create(repo.github, branch, base, f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
+                            "\n".join(body), labels=["arete-miner"], cwd=wt), landed
     finally:
         remove_worktree(repo, wt)
 
@@ -439,7 +443,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     text = prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
-        pending=_fmt(state.proposals(status=["applied", "pending"])),
+        pending=_fmt(state.proposals(status=["applied", "pending", "hand"])),
         rejected=_fmt(state.proposals(status=["rejected"])),
         events=render_events(cfg, hours), digest=digest, audit=auditor.latest_findings(),
         feedback=render_feedback(pr_feedback),
@@ -460,12 +464,15 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     by_repo: dict[str, list[dict]] = defaultdict(list)
     for p in props:
         ok, why = allowed(cfg, p)
-        mark = "->" if ok else "  "
-        print(f"{mark} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}"
-              + ("" if ok else f"  [skip: {why}]"))
+        by_hand = ok and util.matches_any(p["file"], CLAUDE_CODE_GUARDED)
+        mark = "->" if ok and not by_hand else "  "
+        note = f"  [skip: {why}]" if not ok else f"  [by hand: {HAND_EDIT_WHY}]" if by_hand else ""
+        print(f"{mark} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}{note}")
         if dry_run:
             continue
-        if ok and apply:
+        if by_hand:
+            state.add_proposal(run_id, p, "hand")
+        elif ok and apply:
             by_repo[p["repo"]].append(p)
         else:
             state.add_proposal(run_id, p, "memory" if p["layer"] == "memory" else "pending" if ok else "skipped")
@@ -474,13 +481,16 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
         return 0
     opened = []
     for name, ps in by_repo.items():
-        url = ""
+        url, landed = "", []
         try:
-            url = apply_repo(cfg, run_id, cfg.repo(name), ps)
+            url, landed = apply_repo(cfg, run_id, cfg.repo(name), ps)
         except Exception as e:
             print(f"{name}: apply failed: {e}")
         for p in ps:
-            state.add_proposal(run_id, p, "applied" if url else "pending", url)
+            if p in landed:
+                state.add_proposal(run_id, p, "applied", url)
+            else:
+                state.add_proposal(run_id, p, "skipped" if url else "pending")
         if url:
             opened.append(url)
             print(f"{name}: {url}")

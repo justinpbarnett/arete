@@ -9,7 +9,7 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 | Loop | Command | When | What it does |
 |------|---------|------|--------------|
 | 0 heartbeat | `arete heartbeat` | hourly | Checks launchd jobs, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
-| 1 miner | `arete mine` | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. |
+| 1 miner | `arete mine` | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
 | 2 auditor | `arete audit` | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
 | 3 pipeline | `arete poll`, `arete run REPO TICKET` | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. |
 | 4 evals | `arete eval REPO`, `arete eval mine` | on demand, nightly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `eval mine` writes new tasks from merged arete PRs. |
