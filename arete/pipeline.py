@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 STEP_COST = re.compile(r"\(\d+ turns?, \$([\d.]+)\)")
+CHECKS_LOCK = "checks"
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -439,21 +441,33 @@ def drop_untracked_bytecode(wt: Path) -> None:
             remove_untracked(wt, name)
 
 
+@contextmanager
+def machine_to_itself(run: AgentRun):
+    with util.lock(CHECKS_LOCK) as free:
+        if free:
+            yield
+            return
+    run.log("checks: waiting for another run's checks to finish")
+    with util.lock(CHECKS_LOCK, wait=True):
+        yield
+
+
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float) -> tuple[bool, str]:
     if not layer.checks:
         return True, "no checks configured"
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
-    for name, cmd in layer.checks.items():
-        res = util.sh(cmd, cwd=cwd, timeout=timeout)
-        passed = res.returncode == 0
-        ok = ok and passed
-        run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
-        if not passed:
-            report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{util.tail(res.stdout + res.stderr, 6000)}\n```")
-        else:
-            report.append(f"### {name} passed: `{cmd}`")
+    with machine_to_itself(run):
+        for name, cmd in layer.checks.items():
+            res = util.sh(cmd, cwd=cwd, timeout=timeout)
+            passed = res.returncode == 0
+            ok = ok and passed
+            run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
+            if not passed:
+                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{util.tail(res.stdout + res.stderr, 6000)}\n```")
+            else:
+                report.append(f"### {name} passed: `{cmd}`")
     for d, name in untracked_added_since(untracked_before):
         remove_untracked(d, name)
     return ok, "\n\n".join(report)
