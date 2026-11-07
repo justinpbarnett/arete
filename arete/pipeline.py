@@ -20,6 +20,7 @@ from typing import TextIO
 from . import (
     ci,
     config,
+    diffguard,
     gh,
     jira,
     paths,
@@ -34,13 +35,7 @@ from .agent import Result, Session
 from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
-CLAUDE_CODE_GUARDED = [".claude/**", "**/.claude/**"]
-ALWAYS_DENY = [".agents/config.toml", ".github/workflows/**", ".env", ".env.*", "**/.env", "**/.env.*",
-               *CLAUDE_CODE_GUARDED]
 MAX_DIFF_IN_PROMPT = 60_000
-LOCKFILES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb", "uv.lock", "poetry.lock",
-             "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock"}
-NEVER_STAGED = [":(exclude,glob)**/__pycache__/**"]
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
@@ -168,10 +163,6 @@ def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
 
 def bash_rules(patterns: list[str]) -> list[str]:
     return [f"Bash({p})" for p in patterns]
-
-
-def denied_paths(layer: config.RepoLayer) -> list[str]:
-    return ALWAYS_DENY + layer.deny
 
 
 def code_list(names: list[str]) -> str:
@@ -419,26 +410,9 @@ def git_reads(checkouts: list[Checkout]) -> list[str]:
     return [f"git -C {c.dir} {cmd}*" for c in checkouts if c.dir for cmd in ("status", "diff", "log", "show")]
 
 
-def is_lockfile(name: str) -> bool:
-    return Path(name).name in LOCKFILES
-
-
-def staged_line_counts(wt: Path, against: str = "HEAD") -> list[tuple[str, int | None]]:
-    out = []
-    for row in git(["diff", "--cached", "--numstat", "--no-renames", against], wt).splitlines():
-        parts = row.split("\t")
-        if len(parts) == 3:
-            added, deleted, name = parts
-            out.append((name, None if added == "-" else int(added) + int(deleted)))
-    return out
-
-
 @dataclass
-class Staged:
-    files: list[str] = field(default_factory=list)
-    lines: int = 0
-    diff: str = ""
-    denied: list[str] = field(default_factory=list)
+class Staged(diffguard.Diff):
+    patch: str = ""
     changed: list[Checkout] = field(default_factory=list)
 
 
@@ -446,27 +420,20 @@ def stage(checkouts: list[Checkout], deny: list[str]) -> Staged:
     out = Staged()
     for c in checkouts:
         drop_untracked_bytecode(c.wt)
-        git(["add", "-A", "--", ".", *NEVER_STAGED], c.wt)
-        rows = staged_line_counts(c.wt)
-        if not rows:
+        diff = diffguard.stage(c.wt, deny, prefix=c.prefix)
+        if not diff.counts:
             continue
+        out += diff
         out.changed.append(c)
-        names = [name for name, _ in rows]
-        locks = [name for name in names if is_lockfile(name)]
-        out.files += [c.prefix + name for name in names]
-        out.lines += sum(n for name, n in rows if n and name not in locks)
-        out.denied += [c.prefix + name for name in names
-                       if util.matches_any(name, deny) or util.matches_any(c.prefix + name, deny)]
-        out.diff += git(["diff", "--cached", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
-                         "--", ".", *(f":(exclude){name}" for name in locks)], c.wt)
-        if locks:
-            out.diff += f"\n(lockfile changes not shown: {', '.join(c.prefix + name for name in locks)})\n"
+        out.patch += git(["diff", "--cached", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
+                          "--", ".", *(f":(exclude){name.removeprefix(c.prefix)}" for name in diff.locks)], c.wt)
+        if diff.locks:
+            out.patch += f"\n(lockfile changes not shown: {', '.join(diff.locks)})\n"
     return out
 
 
-def lines_by_file(checkouts: list[Checkout], top: int = 12) -> str:
-    rows = sorted(((c.prefix + name, n) for c in checkouts for name, n in staged_line_counts(c.wt)
-                   if n and not is_lockfile(name)), key=lambda r: (-r[1], r[0]))
+def lines_by_file(staged: Staged, top: int = 12) -> str:
+    rows = sorted(((name, n) for name, n in staged.counts.items() if n), key=lambda r: (-r[1], r[0]))
     out = [f"- `{name}`: {n}" for name, n in rows[:top]]
     if len(rows) > top:
         out.append(f"- {len(rows) - top} more files: {sum(n for _, n in rows[top:])}")
@@ -608,16 +575,15 @@ class Build(TicketWork):
 
     def require_valid_diff(self, after: str, planned: str = "") -> None:
         staged = self.restage()
-        limit = self.layer.max_diff_lines
-        total = staged.lines + self.committed_lines
         if not staged.files:
             raise RunFailed(f"{after} undid every change")
+        why = staged.refusal(self.layer.max_diff_lines, earlier=self.committed_lines)
         if staged.denied:
-            raise RunFailed(f"{after} touched denied paths: {', '.join(staged.denied[:5])}")
-        if total > limit:
+            raise RunFailed(f"{after} {why}")
+        if why:
             pushed = f"\n- pushed earlier in this run: {self.committed_lines}" if self.committed_lines else ""
-            raise RunFailed(f"after {after} the diff is {total} lines, over the {limit} line limit{planned}; "
-                            "split the work", f"### Lines changed by file\n\n{lines_by_file(self.checkouts)}{pushed}")
+            raise RunFailed(f"after {after} {why}{planned}; split the work",
+                            f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
 
     def push(self, branch: str, message: str) -> None:
         commit_and_push(self.checkouts, self.staged.changed, branch, message)
@@ -799,7 +765,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     step_timeout = layer.timeout_minutes * 60
     read_tools = runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
     build_tools = runner.BUILD_TOOLS + bash_rules(builder_bash)
-    deny = denied_paths(layer)
+    deny = diffguard.denied_paths(layer)
     limit = layer.max_diff_lines
     info = tk.label_name("needs-info")
     replies: list[dict] = []
@@ -906,7 +872,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     outcome = f"{size}, review {review.get('verdict')}, in use {verified.verdict}"
 
     if run.dry_run:
-        run.save("diff.patch", staged.diff)
+        run.save("diff.patch", staged.patch)
         run.log(f"dry run: {outcome}; worktree kept at {ws}")
         return "dry-run", outcome, ""
 
@@ -1367,7 +1333,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
     res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
-                                   diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT)),
+                                   diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT)),
                       b.ws, model=b.cfg.model("review"), allowed_tools=runner.READ_TOOLS + bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA, timeout=b.timeout)
     if not res.ok or not isinstance(res.structured, dict):
@@ -1397,7 +1363,7 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
-                       diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT))
+                       diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT))
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> verify.Verified:

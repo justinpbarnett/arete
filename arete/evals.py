@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, gh, paths, record, runner, state, tracker, util, verify
+from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
     PLAN_SCHEMA,
@@ -19,7 +20,6 @@ from .pipeline import (
     bash_rules,
     check_list,
     code_list,
-    denied_paths,
     prompt,
     run_checks,
     use_product,

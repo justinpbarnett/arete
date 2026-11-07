@@ -10,6 +10,7 @@ from string import Template
 from . import (
     auditor,
     config,
+    diffguard,
     evals,
     gh,
     hook,
@@ -21,7 +22,6 @@ from . import (
 )
 from .heartbeat import mark_loop
 from .pipeline import (
-    CLAUDE_CODE_GUARDED,
     make_worktree,
     prompt,
     remove_worktree,
@@ -378,18 +378,13 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
                          allowed_tools=runner.EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
         if not res.ok:
             return "", []
-        git(["add", "-A"], wt)
-        files, lines = [], 0
-        for row in git(["diff", "--cached", "--numstat", "--no-renames"], wt).splitlines():
-            a, d, name = row.split("\t")
-            files.append(name)
-            lines += (int(a) + int(d)) if a != "-" else 0
-        landed = [p for p in props if p["file"] in files]
+        diff = diffguard.stage(wt)
+        landed = [p for p in props if p["file"] in diff.counts]
         if not landed:
             return "", []
-        bad = [f for f in files if not is_harness_file(cfg, repo, f)]
-        refusal = (f"touched {bad}" if bad else f"touched {lines} lines" if lines > MAX_MINER_DIFF
-                   else prompt_refusal(cfg, repo, wt))
+        bad = [f for f in diff.files if not is_harness_file(cfg, repo, f)]
+        refusal = (f"touched {', '.join(bad[:5])}" if bad else diff.refusal(MAX_MINER_DIFF)
+                   or prompt_refusal(cfg, repo, wt))
         if refusal:
             print(f"{repo.name}: refused, {refusal}")
             return "", []
@@ -400,7 +395,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         for i, p in enumerate(landed, 1):
             ev = ", ".join(p.get("evidence", [])[:4])
             body.append(f"{i}. `{p['file']}`: {p['why']}" + ("" if repo.public else f" (sessions {ev})"))
-        if repo.name == cfg.arete_repo and any(util.matches_any(f, [ARETE_PROMPT_GLOB]) for f in files):
+        if repo.name == cfg.arete_repo and any(util.matches_any(f, [ARETE_PROMPT_GLOB]) for f in diff.files):
             body += ["", "The pipeline reads its prompts from the arete checkout, so pull that checkout after the merge."]
         body += ["", f"Run `{run_id}`. {res.text.strip()[:1500]}", "",
                  "Merge what helps, close what does not: closed PRs teach the miner what not to propose."]
@@ -476,7 +471,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     by_repo: dict[str, list[dict]] = defaultdict(list)
     for p in props:
         ok, why = allowed(cfg, p)
-        by_hand = ok and util.matches_any(p["file"], CLAUDE_CODE_GUARDED)
+        by_hand = ok and util.matches_any(p["file"], diffguard.CLAUDE_CODE_GUARDED)
         mark = "->" if ok and not by_hand else "  "
         note = f"  [skip: {why}]" if not ok else f"  [by hand: {HAND_EDIT_WHY}]" if by_hand else ""
         print(f"{mark} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}{note}")

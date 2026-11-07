@@ -19,11 +19,11 @@ from . import (
     config,
     control,
     devices,
+    diffguard,
     emits,
     gh,
     loops,
     paths,
-    pipeline,
     record,
     runner,
     sources,
@@ -488,7 +488,7 @@ def open_workspace(run: LoopRun) -> Workspace:
     layer = config.load_layer(repo.layer_dir)
     public = repo.public or (bool(github) and gh.repo_private(github) is not True)
     return Workspace(src, wt, branch, base, github, start=util.git(["rev-parse", "HEAD"], wt).strip(),
-                     deny=pipeline.denied_paths(layer), max_diff_lines=layer.max_diff_lines, public=public)
+                     deny=diffguard.denied_paths(layer), max_diff_lines=layer.max_diff_lines, public=public)
 
 
 def close_workspace(ws: Workspace, keep_branch: bool) -> None:
@@ -497,31 +497,15 @@ def close_workspace(ws: Workspace, keep_branch: bool) -> None:
         util.git(["branch", "-D", ws.branch], ws.src, check=False)
 
 
-def changed_paths(wt: Path) -> list[str]:
-    out = util.git(["status", "--porcelain", "--untracked-files=all"], wt)
-    return [line[3:].split(" -> ")[-1].strip('"') for line in out.splitlines() if line.strip()]
-
-
 def revert(wt: Path) -> None:
     util.git(["reset", "-q", "--hard"], wt, check=False)
     util.git(["clean", "-fdq"], wt, check=False)
 
 
-def broken_limit(ws: Workspace) -> str:
-    util.git(["add", "-A", "--", ".", *pipeline.NEVER_STAGED], ws.wt)
-    rows = pipeline.staged_line_counts(ws.wt, against=ws.start)
-    if denied := [name for name, _ in rows if util.matches_any(name, ws.deny)]:
-        return f"touched denied {', '.join(denied[:5])}"
-    lines = sum(n for name, n in rows if n and not pipeline.is_lockfile(name))
-    if lines > ws.max_diff_lines:
-        return f"{lines} lines changed since {ws.base}, over the {ws.max_diff_lines} line limit"
-    return ""
-
-
 def commit(wt: Path, message: str) -> None:
     identity = [] if util.git(["config", "user.email"], wt, check=False).strip() else \
         ["-c", "user.name=arete", "-c", "user.email=arete@localhost"]
-    util.git(["add", "-A"], wt)
+    diffguard.add(wt)
     util.git([*identity, "commit", "-q", "--no-verify", "-m", message], wt)
 
 
@@ -550,15 +534,15 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     if not res.ok:
         revert(ws.wt)
         return "", f"the agent failed: {util.first_line(res.error, 200)}"
-    changed = changed_paths(ws.wt)
+    changed = diffguard.stage(ws.wt).files
     if not changed:
         return "", f"{idea} (no files changed)"
     if files and (outside := [p for p in changed if not util.matches_any(p, files)]):
         revert(ws.wt)
         return "", f"{idea} (thrown away: touched {', '.join(outside[:5])})"
-    if over := broken_limit(ws):
+    if why := diffguard.stage(ws.wt, ws.deny, against=ws.start).refusal(ws.max_diff_lines, since=ws.base):
         revert(ws.wt)
-        return "", f"{idea} (thrown away: {over})"
+        return "", f"{idea} (thrown away: {why})"
     return idea, ""
 
 
