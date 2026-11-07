@@ -494,7 +494,7 @@ async function chatAction(path, button, resultId) {
   if (answered) drawChat(answered);
 }
 
-const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
+const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 const feeds = {
   loop: { box: "loop-feed", run: "", after: 0, status: "" },
   session: { box: "session-feed", run: "", after: 0, status: "" },
