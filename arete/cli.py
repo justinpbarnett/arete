@@ -297,15 +297,15 @@ def when(stamp: str | None) -> str:
 
 
 def serve_line() -> str:
-    from . import control
+    from . import control, util
 
     beat = control.serve_beat()
     if not beat:
         return "serve: never ran; `arete install` starts it"
     if not beat["alive"]:
         return f"serve: DOWN, last beat {when(beat.get('at'))}"
-    return (f"serve: up, pid {beat['pid']}, {beat['loops']} loops on, {beat['off']} off, {beat['running']} running, "
-            f"{beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else ""))
+    return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
+            f"{beat['running']} running, {beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else ""))
 
 
 def loop_line(v: dict) -> str:
@@ -395,7 +395,7 @@ def cmd_loop(args) -> int:
         if args.action == "try":
             result = scaffold.try_loop(args.name, read_events(args.events), follow=follow)
             print(f"\ntry {result['id']}: {result.get('status')}, every emit held"
-                  + (f", {result['events']} sample events" if result["events"] else "")
+                  + (f", {util.count(result['events'], 'sample event')}" if result["events"] else "")
                   + (f"\n{result['error']}" if result.get("error") else ""))
             return 0 if result.get("status") in ("done", "skipped") else 1
         if args.action in ("enable", "disable"):
@@ -577,7 +577,8 @@ def cmd_costs(args) -> int:
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
         for row in c[f"by_{group}"][:12]:
-            print(f"  {row['name']:<36} ${row['cost_usd']:>8.2f}  {row['steps']:>5} steps  "
+            steps = "step " if row["steps"] == 1 else "steps"
+            print(f"  {row['name']:<36} ${row['cost_usd']:>8.2f}  {row['steps']:>5} {steps}  "
                   f"{row['tokens_in']:>10,} in  {row['tokens_out']:>9,} out")
     return 0
 

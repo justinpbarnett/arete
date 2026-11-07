@@ -31,8 +31,9 @@ def check_jobs(cfg: config.Config) -> list[Check]:
     if not paths.ON_MAC:
         return []
     table = launchd_table()
+    skipped = {install.label("heartbeat")} | (install.retired_labels() if install.serve_installed() else set())
     out = []
-    for job in cfg.jobs:
+    for job in (j for j in cfg.jobs if j.label not in skipped):
         key = f"job:{job.label}"
         if job.label not in table:
             out.append(Check(key, False, "not loaded in launchd"))
@@ -123,12 +124,14 @@ def check_serve() -> list[Check]:
     from . import control
 
     beat = control.serve_beat()
+    if not beat and not install.serve_installed():
+        return [Check("serve:beat", True, "not installed yet; the launchd jobs run the loops until `arete install`")]
     if not beat:
-        return [Check("serve:beat", False, "arete serve has never run; `arete install` starts it")]
+        return [Check("serve:beat", False, "arete serve is installed but has never run; see its log")]
     if not beat["alive"]:
         why = "its process is gone" if not control.pid_alive(beat.get("pid")) else f"last beat {beat['age_seconds']}s ago"
         return [Check("serve:beat", False, f"arete serve is down: {why}")]
-    out = [Check("serve:beat", True, f"pid {beat['pid']}, {beat['loops']} loops on, {beat['pending']} waiting")]
+    out = [Check("serve:beat", True, f"pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['pending']} waiting")]
     for name, error in (beat.get("broken") or {}).items():
         out.append(Check(f"loop:{name}:broken", False, error, "warn"))
     for sid, error in (beat.get("poll_errors") or {}).items():

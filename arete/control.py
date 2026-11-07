@@ -46,6 +46,13 @@ def pid_alive(pid) -> bool:
     return True
 
 
+def end_group(pid) -> None:
+    try:
+        os.killpg(int(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, TypeError, ValueError):
+        pass
+
+
 def detach(args: list[str], log_name: str = DETACHED_LOG) -> subprocess.Popen:
     paths.ensure_dirs()
     with open(paths.LOG_DIR / log_name, "a") as log:
@@ -95,6 +102,7 @@ def stop_run(run_id: str) -> dict:
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
     if not pid_alive(r.get("pid")):
+        end_group(r.get("pid"))
         state.finish_run(run_id, "interrupted", summary="the process was gone when stop was asked")
         state.add_feed(run_id, "end", "interrupted: the process was gone when stop was asked")
         return {"id": run_id, "stopped": True, "was": "gone"}

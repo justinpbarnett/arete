@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
 import tomllib
@@ -24,15 +25,20 @@ DRAFT_TRIES = 3
 REFERENCE = loops.ENGINE_DIR / "README.md"
 DRAFTS_DIR = paths.STATE_DIR / "drafts"
 SAMPLE_EVENTS = 3
+FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+OWN_FILES = ("loop.toml", "prompt.md")
 DRAFT_SCHEMA = {
     "type": "object",
     "properties": {
         "name": {"type": "string", "description": "lowercase letters, digits and dashes"},
         "loop_toml": {"type": "string"},
         "prompt_md": {"type": "string", "description": "empty for a command loop"},
+        "files": {"type": "array", "description": "each script the loop calls, saved in the loop folder",
+                  "items": {"type": "object", "properties": {"name": {"type": "string"}, "text": {"type": "string"}},
+                            "required": ["name", "text"]}},
         "note": {"type": "string", "description": "one or two lines on what to check before turning it on"},
     },
-    "required": ["name", "loop_toml", "prompt_md", "note"],
+    "required": ["name", "loop_toml", "prompt_md", "files", "note"],
 }
 
 
@@ -68,7 +74,8 @@ def draft_prompt(sentence: str, cfg: config.Config, name: str, repo: str, taken:
     if repo:
         parts.append(f"The loop works on the repo `{repo}`.")
     parts.append("Return JSON: `name`, `loop_toml` (the whole file), `prompt_md` (the whole prompt for an agent "
-                 "loop, empty for a command loop), and `note`.")
+                 "loop, empty for a command loop), `files` (each script the loop calls, with its whole text; call it "
+                 "as `./NAME` in loop.toml), and `note`.")
     return "\n\n".join(parts)
 
 
@@ -84,10 +91,21 @@ def check_draft(draft: dict, cfg: config.Config, taken: set[str]) -> tuple[Path,
     (folder / "loop.toml").write_text(str(draft.get("loop_toml") or "").strip() + "\n")
     if str(draft.get("prompt_md") or "").strip():
         (folder / "prompt.md").write_text(str(draft["prompt_md"]).strip() + "\n")
+    for f in draft.get("files") or []:
+        file_name = str(f.get("name") or "").strip()
+        if not FILE_NAME.match(file_name) or file_name in OWN_FILES:
+            return folder, f"the file name '{file_name}' must be a plain file name other than {' and '.join(OWN_FILES)}"
+        script = folder / file_name
+        script.write_text(str(f.get("text") or ""))
+        if script.read_text().startswith("#!"):
+            script.chmod(0o755)
     try:
-        loops.load(folder, "private", "", cfg)
+        loop = loops.load(folder, "private", "", cfg)
     except (loops.LoopError, cron.BadSchedule, tomllib.TOMLDecodeError, ValueError, TypeError, KeyError) as e:
         return folder, f"{type(e).__name__}: {e}"
+    for argv in (loop.command, loop.try_command, loop.script):
+        if argv and argv[0].startswith("./") and not (folder / argv[0]).is_file():
+            return folder, f"loop.toml calls {argv[0]}, which is not in files"
     return folder, ""
 
 

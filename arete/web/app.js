@@ -621,7 +621,7 @@ function loopRow(l) {
       button("Open", `open:${l.name}`, () => openLoopDetail(l.name)), " ",
       button("Start", `start:${l.name}`, (b) => loopAction(l.name, "start", b), Boolean(l.error || l.running)), " ",
       button(l.enabled ? "Turn off" : "Turn on", `switch:${l.name}`, (b) => loopAction(l.name, l.enabled ? "disable" : "enable", b), Boolean(l.error && !l.enabled)),
-    ], "nb c-buttons"));
+    ], "c-buttons"));
 }
 
 function drawLoops(data, approvals) {
@@ -633,7 +633,7 @@ function drawLoops(data, approvals) {
     heading(2, "Loops"),
     serveLine(data.serve),
     data.loops.length
-      ? table("Spent counts the last 24 hours", [["Loop", "c-loop"], ["On", "c-on"], ["Kind", "c-kind"], ["Trigger"], ["Last run", "c-status"], ["Next", "c-time"], ["Spent", "num c-cost"], ["", "c-loop-buttons"]],
+      ? table("Spent counts the last 24 hours", [["Loop", "c-loop"], ["On", "c-on"], ["Kind"], ["Trigger"], ["Last run", "c-status"], ["Next", "c-time"], ["Spent", "num"], ["", "c-loop-buttons"]],
         data.loops.map(loopRow))
       : quiet("No loop is installed. arete loop new drafts one from a sentence."));
 }

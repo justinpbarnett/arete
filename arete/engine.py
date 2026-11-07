@@ -168,6 +168,12 @@ def work_dir(run: LoopRun) -> Path | str:
     return repo_of(run.loop, run.cfg)[0] if run.loop.repo else run.loop.dir
 
 
+def from_loop_folder(argv: list[str], loop: Loop) -> list[str]:
+    if argv and argv[0].startswith("./") and (loop.dir / argv[0]).is_file():
+        return [str(loop.dir / argv[0]), *argv[1:]]
+    return argv
+
+
 def weakest_trust(events: list[dict]) -> str:
     found = {e.get("trust") or "untrusted" for e in events}
     return next((t for t in loops.TRUST_ORDER if t in found), "internal")
@@ -249,7 +255,7 @@ def feed_output(run: LoopRun):
 
     def show(line: str) -> None:
         nonlocal shown
-        if not line.strip() or line.lstrip().startswith("{"):
+        if not line.strip() or reports(json_object(line)):
             return
         shown += 1
         if shown <= FEED_OUTPUT_LINES:
@@ -257,6 +263,20 @@ def feed_output(run: LoopRun):
         elif shown == FEED_OUTPUT_LINES + 1:
             state.add_feed(run.id, "out", f"the rest is in {paths.short_path(run.log_file)}")
     return show
+
+
+def json_object(line: str) -> dict:
+    if not line.lstrip().startswith("{"):
+        return {}
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return {}
+    return row if isinstance(row, dict) else {}
+
+
+def reports(row: dict) -> bool:
+    return bool(row.get("title") and row.get("fingerprint")) or isinstance(row.get("value"), int | float)
 
 
 def command_loop(run: LoopRun) -> tuple[str, str]:
@@ -267,25 +287,23 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     argv = loop.try_command if run.trial and loop.try_command else loop.command
     run.log("start", f"$ {shlex.join(argv)}" + (f" on {run.device.name}" if run.device.remote else ""))
     started = time.monotonic()
-    code, text = run_command(argv, work_dir(run), timeout=loop.timeout_minutes * 60, env=env,
+    code, text = run_command(argv if run.device.remote else from_loop_folder(argv, loop), work_dir(run), timeout=loop.timeout_minutes * 60, env=env,
                              device=run.device, stdin=stdin, output=run.log_file, on_line=feed_output(run))
     lines = [line for line in text.splitlines() if line.strip()]
-    found, value = [], None
+    found, value, said = [], None, []
     for line in lines:
-        if line.lstrip().startswith("{"):
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("title") and row.get("fingerprint"):
-                found.append(row)
-            elif isinstance(row.get("value"), int | float):
-                value = row["value"]
+        row = json_object(line)
+        if row.get("title") and row.get("fingerprint"):
+            found.append(row)
+        elif isinstance(row.get("value"), int | float):
+            value = row["value"]
+        else:
+            said.append(line)
     took = f"exit {code} in {time.monotonic() - started:.0f}s"
     if code != 0:
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
     fresh = new_findings(run, found)
-    outcome = {"summary": util.first_line(lines[-1], 300) if lines else took, "trust": weakest_trust(run.events)
+    outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events)
                if run.events else "internal", **({"value": value} if value is not None else {})}
     if loop.emits and (fresh or value is not None):
         emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)

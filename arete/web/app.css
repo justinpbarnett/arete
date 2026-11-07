@@ -51,9 +51,11 @@ pre.fold-text { max-height: 420px; overflow: auto; white-space: pre-wrap; overfl
 td div.muted { font-size: 13px; margin-top: 2px; }
 th.c-on { width: 70px; }
 th.c-decide { width: 210px; }
-th.c-loop-buttons { width: 290px; }
+th.c-loop-buttons { width: 195px; }
+td.c-buttons button { margin-bottom: 6px; }
 th.c-model { width: 210px; }
 th.c-probe { width: 110px; }
 th.c-loop { min-width: 250px; }
 #launch-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0 18px; }
 th.c-device { min-width: 220px; }
+#triage > p:first-child { margin-top: 30px; }

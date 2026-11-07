@@ -51,7 +51,7 @@ every = "5m"                   # how often to poll; 5m when left out
 # type = "command": command = "./check.sh", timeout = 120, trust = "internal"; each JSON line it prints is an event
 
 [run]
-command = "arete poll"         # command loops: what to run
+command = "arete poll"         # command loops: what to run, split into words as a shell would; pipes go in a script; ./NAME runs NAME from the loop folder
 try_command = "arete poll --dry-run"   # command loops: what `arete loop try` runs instead
 script = "./gather.sh"         # watch loops with no source: its output is the input
 repo = "arete"                 # a config repo name or a path to a git repo; climb and search need one

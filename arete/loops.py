@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -111,7 +112,8 @@ class Loop:
     def view(self) -> dict:
         return {"name": self.name, "origin": self.origin, "kind": self.kind, "description": self.description,
                 "enabled": self.enabled, "repo": self.repo,
-                "trigger": self.trigger.summary or ("any source event" if self.sources else "by hand"),
+                "trigger": "" if self.error else self.trigger.summary or ("any source event" if self.sources
+                                                                          else "by hand"),
                 "sources": [s.get("type") for s in self.sources], "model": self.model if self.agent else "",
                 "runner": self.runner, "device": self.device, "queue": self.queue_name,
                 "budget_usd": self.budget_usd, "daily_budget_usd": self.daily_budget_usd,
@@ -147,8 +149,8 @@ def load_all(cfg: config.Config | None = None) -> list[Loop]:
         try:
             loop = load(folder, origin, repo, cfg)
         except (LoopError, cron.BadSchedule, tomllib.TOMLDecodeError, ValueError, TypeError, KeyError) as e:
-            loop = Loop(name=name, dir=folder, origin=origin, enabled=False, error=f"{type(e).__name__}: {e}"
-                        if not isinstance(e, LoopError | cron.BadSchedule) else str(e))
+            loop = broken(name, folder, origin, str(e) if isinstance(e, LoopError | cron.BadSchedule)
+                          else f"{type(e).__name__}: {e}")
         if not loop.error and name in switched:
             loop.enabled = switched[name]
         if name in loops:
@@ -157,6 +159,15 @@ def load_all(cfg: config.Config | None = None) -> list[Loop]:
             continue
         loops[name] = loop
     return list(loops.values())
+
+
+def broken(name: str, folder: Path, origin: str, error: str) -> Loop:
+    try:
+        declared = tomllib.loads((folder / "loop.toml").read_text())
+    except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+        declared = {}
+    return Loop(name=name, dir=folder, origin=origin, kind=str(declared.get("kind", "?")),
+                description=str(declared.get("description", "")).strip(), enabled=False, error=error)
 
 
 def find(name: str, cfg: config.Config | None = None) -> Loop:
@@ -215,7 +226,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
 def as_argv(value) -> list[str]:
     if not value:
         return []
-    return value.split() if isinstance(value, str) else [str(v) for v in value]
+    return shlex.split(value) if isinstance(value, str) else [str(v) for v in value]
 
 
 def as_list(value) -> list[str]:

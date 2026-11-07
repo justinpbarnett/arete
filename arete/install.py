@@ -90,6 +90,14 @@ def this_platform() -> str:
     return "mac" if paths.ON_MAC else "linux"
 
 
+def serve_installed() -> bool:
+    return (AGENTS_DIR / f"{label(SERVE)}.plist" if paths.ON_MAC else UNITS_DIR / SERVE_UNIT).exists()
+
+
+def retired_labels() -> set[str]:
+    return {label(name) for name in RETIRED}
+
+
 def install(dry_run: bool = False, platform: str = "") -> int:
     platform = platform or this_platform()
     if platform not in PLATFORMS:
@@ -99,6 +107,9 @@ def install(dry_run: bool = False, platform: str = "") -> int:
         dest = (AGENTS_DIR / f"{label(SERVE)}.plist") if platform == "mac" else UNITS_DIR / SERVE_UNIT
         print(f"--- {dest}")
         print(plistlib.dumps(serve_plist()).decode() if platform == "mac" else serve_unit(), end="")
+        if platform == "mac":
+            for lb in (label(name) for name in RETIRED if (AGENTS_DIR / f"{label(name)}.plist").exists()):
+                print(f"would retire {lb}")
         return 0
     if platform != this_platform():
         print(f"this machine is {this_platform()}; install for {platform} on that machine, or pass --dry-run")

@@ -52,6 +52,7 @@ def settle_dead_runs() -> list[str]:
             continue
         if age_seconds(r["started"]) < SETTLE_GRACE_SECONDS:
             continue
+        control.end_group(r.get("pid"))
         state.finish_run(r["id"], "interrupted", summary=INTERRUPTED)
         state.add_feed(r["id"], "end", f"interrupted: {INTERRUPTED}")
         settled.append(r["id"])
