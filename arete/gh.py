@@ -163,6 +163,18 @@ def api_list(path: str) -> list[dict]:
     return [item for page in pages for item in page]
 
 
+DEPENDABOT_OFF = "Dependabot alerts are disabled"
+
+
+def open_dependabot_alerts(repo: str) -> list[dict]:
+    try:
+        return [a for a in api_list(f"repos/{repo}/dependabot/alerts") if a.get("state") == "open"]
+    except GhError as e:
+        if DEPENDABOT_OFF in str(e):
+            return []
+        raise
+
+
 @dataclass
 class Discussion:
     line_comments: list[dict]

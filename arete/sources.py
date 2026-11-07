@@ -101,7 +101,7 @@ def github_events(loop: Loop, source: dict, cfg: config.Config, sid: str) -> lis
                                  data={"number": i["number"], "author": author, "body": (i.get("body") or "")[:6000],
                                        "labels": [label["name"] for label in i.get("labels", [])]}))
         if "advisory" in watch:
-            for a in (a for a in gh.api_list(f"repos/{repo}/dependabot/alerts") if a.get("state") == "open"):
+            for a in gh.open_dependabot_alerts(repo):
                 adv, dep = a.get("security_advisory") or {}, a.get("dependency") or {}
                 pkg = (dep.get("package") or {}).get("name", "")
                 out.append(event("github.advisory", sid, f"{repo}#{a['number']}", f"{pkg}: {adv.get('summary', '')}",
