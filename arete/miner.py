@@ -9,7 +9,7 @@ from string import Template
 
 from . import auditor, claude, config, evals, gh, hook, paths, state, util
 from .heartbeat import mark_loop
-from .pipeline import make_worktree, prompt, remove_worktree
+from .pipeline import READ_TOOLS, make_worktree, prompt, remove_worktree
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -357,7 +357,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         text = "\n\n".join(
             f"### {i + 1}. `{p['file']}`\n\nChange: {p['change']}\n\nWhy: {p['why']}" for i, p in enumerate(props)
         )
-        res = claude.run(prompt("apply", proposals=text), wt, model=cfg.model("apply"), allowed_tools=["Read", "Edit", "Write", "Glob", "Grep"],
+        res = claude.run(prompt("apply", proposals=text), wt, model=cfg.model("apply"), allowed_tools=list(claude.FILE_TOOLS),
                          timeout=1200, persist=False)
         if not res.ok:
             return ""
@@ -430,10 +430,10 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
         if not dry_run:
             state.finish_run(run_id, "noop", summary="no human sessions in window")
         return 0
-    mine_repos = [r for r in cfg.repos if r.mine]
+    mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     if not mine_repos:
         if not dry_run:
-            state.finish_run(run_id, "noop", summary="no repo has mine = true")
+            state.finish_run(run_id, "noop", summary="no repo with mine = true is checked out here")
         return 0
     repos = "\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt(
@@ -447,7 +447,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     run_dir = paths.RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(text)
-    res = claude.run(text, mine_repos[0].path, model=cfg.model("miner"), allowed_tools=["Read", "Glob", "Grep"],
+    res = claude.run(text, mine_repos[0].path, model=cfg.model("miner"), allowed_tools=READ_TOOLS,
                      json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]])
     (run_dir / "result.json").write_text(json.dumps({"ok": res.ok, "cost": res.cost_usd, "structured": res.structured,
                                                      "error": res.error}, indent=2))

@@ -49,13 +49,14 @@ def run(
     add_dirs: list[Path] | None = None,
     mcp_config: str = "",
 ) -> Result:
+    add_dirs = [Path(d).absolute() for d in add_dirs or []]
     cmd = [binary(), "-p", "--output-format", "json", "--permission-mode", permission_mode]
     if model:
         cmd += ["--model", model]
     if tools is not None:
         cmd += ["--tools", ",".join(tools)]
     if allowed_tools:
-        cmd += ["--allowedTools", *within(allowed_tools, [Path(cwd), *(add_dirs or [])])]
+        cmd += ["--allowedTools", *scoped_to([cwd, *add_dirs], allowed_tools)]
     cmd += ["--disallowedTools", GIT_WRITES_TO_ANY_PATH, *(disallowed_tools or [])]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
@@ -120,9 +121,15 @@ def run(
     )
 
 
-def within(rules: list[str], folders: list[Path]) -> list[str]:
+def scoped_to(folders: list[Path | str], rules: list[str]) -> list[str]:
     roots = dict.fromkeys(p for f in folders for p in (Path(f).absolute(), Path(f).resolve()))
-    return [scoped for rule in rules for scoped in ([f"{rule}(/{r}/**)" for r in roots] if rule in FILE_TOOLS else [rule])]
+    scoped = []
+    for rule in rules:
+        if rule in FILE_TOOLS:
+            scoped += [f"{rule}(/{root}/**)" for root in roots]
+        else:
+            scoped.append(rule)
+    return scoped
 
 
 def _json_from_text(text: str):
