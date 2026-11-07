@@ -501,6 +501,7 @@ const feeds = {
 };
 let openLoop = "";
 let launchKey = "";
+let remoteDevices = [];
 
 function button(text, focus, onClick, disabled = false) {
   return el("button", { type: "button", "data-focus": focus, disabled, text, on: { click: (e) => onClick(e.currentTarget) } });
@@ -780,6 +781,7 @@ function fillChoices(c, reset = false) {
   if (key === launchKey && !reset) return;
   const keep = launchKey && !reset ? launchValues() : { device: "local", runner: "", repo: "", tools: c.default_tools };
   launchKey = key;
+  remoteDevices = c.remote_devices;
   options("launch-device", "", c.devices, keep.device);
   options("launch-runner", "By the model", c.runners, keep.runner);
   options("launch-repo", "None", c.repos, keep.repo);
@@ -794,7 +796,7 @@ function fillChoices(c, reset = false) {
 
 function repoFollowsDevice() {
   const repo = document.getElementById("launch-repo");
-  const remote = document.getElementById("launch-device").value !== "local";
+  const remote = remoteDevices.includes(document.getElementById("launch-device").value);
   if (remote) repo.value = "";
   repo.disabled = remote;
 }

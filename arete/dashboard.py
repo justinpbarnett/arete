@@ -250,16 +250,11 @@ class Handler(BaseHTTPRequestHandler):
         if tools is not None and not (isinstance(tools, list) and all(isinstance(x, str) for x in tools)):
             raise Refusal(400, "tools is a list of tool names.")
         budget = b.get("budget_usd")
-        if budget not in (None, "") and not isinstance(budget, int | float):
+        if budget not in (None, "") and (isinstance(budget, bool) or not isinstance(budget, int | float)):
             raise Refusal(400, "budget_usd is a number of dollars.")
-        device, repo = str(b.get("device") or "local"), str(b.get("repo") or "")
-        if repo and repo not in {r.name for r in config.load().repos}:
-            raise Refusal(400, "Pick a repo from the config.")
-        if repo and device != "local":
-            raise Refusal(400, "A session on another device starts in that device's folder; leave the repo empty.")
-        return sessions.launch(str(b.get("prompt", "")), device=device, model=str(b.get("model") or ""),
-                               run_with=str(b.get("runner") or ""), tools=tools, repo=repo,
-                               budget_usd=float(budget) if budget else None)
+        return sessions.launch(str(b.get("prompt", "")), device=str(b.get("device") or ""),
+                               model=str(b.get("model") or ""), run_with=str(b.get("runner") or ""), tools=tools,
+                               repo=str(b.get("repo") or ""), budget_usd=None if budget in (None, "") else float(budget))
 
     def chat_text(self) -> str:
         text = str(self.body().get("text", "")).strip()

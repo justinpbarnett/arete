@@ -60,7 +60,7 @@ arete session send ID "now try the cache"
 arete session attach ID | stop ID | list
 ```
 
-`--repo` gives it a new worktree of a config repo. `--budget` caps the whole session in dollars. A session with no message for `session_idle_hours` closes. The dashboard's Launch view starts one with the same choices.
+`--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars. A session with no message for `session_idle_hours` closes. The dashboard's Launch view starts one with the same choices.
 
 `arete costs` shows model spend by model, runner and loop.
 

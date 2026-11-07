@@ -71,8 +71,10 @@ def load() -> list[Device]:
 
 
 def get(name: str) -> Device:
+    if (name or LOCAL.name) == LOCAL.name:
+        return LOCAL
     for d in load():
-        if d.name == (name or "local"):
+        if d.name == name:
             return d
     raise DeviceError(f"no device named {name}; add it to {paths.short_path(DEVICES_FILE)}")
 
@@ -189,11 +191,11 @@ def lease(device: Device | str, label: str, log=lambda text: None):
             log(f"destroyed VM {vmid}")
 
 
-def names() -> list[str]:
+def known() -> list[Device]:
     try:
-        return [d.name for d in load()]
+        return load()
     except DeviceError:
-        return [LOCAL.name]
+        return [LOCAL]
 
 
 def views() -> list[dict]:

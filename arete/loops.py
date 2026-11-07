@@ -261,6 +261,15 @@ def metric_rule(text: str) -> tuple[str, str, float]:
     return m.group(1), m.group(2), float(m.group(3))
 
 
+def agent_problems(run_with: str, tools: list[str]) -> list[str]:
+    problems = []
+    if run_with and run_with not in runner.RUNNERS:
+        problems.append(f"runner '{run_with}' is not one of {', '.join(runner.RUNNERS)}")
+    if unknown := sorted(set(tools) - KNOWN_TOOLS):
+        problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
+    return problems
+
+
 def validate(loop: Loop, cfg: config.Config) -> None:
     from .emits import EMITS
     from .sources import metric_event
@@ -278,13 +287,15 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("a command loop needs [run] command")
     if loop.agent and not loop.prompt_file.is_file():
         problems.append(f"a {loop.kind} loop needs prompt.md")
-    if loop.runner and loop.runner not in runner.RUNNERS:
-        problems.append(f"runner '{loop.runner}' is not one of {', '.join(runner.RUNNERS)}")
-    if unknown := sorted(set(loop.tools) - KNOWN_TOOLS):
-        problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
+    problems += agent_problems(loop.runner, loop.tools)
+    try:
+        remote = devices.get(loop.device).remote
+    except devices.DeviceError as e:
+        problems.append(str(e))
+        remote = False
     if loop.agent and runner.route(loop.model_for(cfg), loop.runner)[0] == "pi":
         problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
-                     for reason, tools in pi.withheld(loop.tools, loop.device != devices.LOCAL.name).items()]
+                     for reason, tools in pi.withheld(loop.tools, remote).items()]
     if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - READING_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")
@@ -292,7 +303,7 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("a climb loop needs [climb] measure, a command that prints a number")
     if loop.kind == "search" and not loop.search.get("check"):
         problems.append("a search loop needs [search] check, a command that exits 0 on a hit")
-    if loop.kind in ("climb", "search") and loop.device != "local":
+    if loop.kind in ("climb", "search") and remote:
         problems.append(f"a {loop.kind} loop keeps or reverts each try in a local worktree, so it runs on local")
     if loop.kind in ("climb", "search") and not loop.repo:
         problems.append(f"a {loop.kind} loop needs [run] repo, a repo name from the config or a path to a git repo")

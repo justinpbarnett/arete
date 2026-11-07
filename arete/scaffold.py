@@ -53,7 +53,7 @@ def draft_prompt(sentence: str, cfg: config.Config, name: str, repo: str, taken:
         "The reference below is the whole loop folder format. Use only what it describes.",
         "<reference>\n" + REFERENCE.read_text() + "\n</reference>",
         f"Repos in the config:\n{repos}",
-        f"Devices: {', '.join(devices.names())}.",
+        f"Devices: {', '.join(d.name for d in devices.known())}.",
         f"Loop names already taken: {', '.join(sorted(taken)) or 'none'}.",
         ("Pick the simplest kind that does the job: a command loop when a script can decide on its own, a watch "
          "loop when it needs judgment, climb or search only to change code. Put `enabled = false` at the top. Give "

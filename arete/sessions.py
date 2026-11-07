@@ -66,45 +66,38 @@ def save_spec(spec: Spec) -> None:
     util.write_json(spec_file(spec.id), asdict(spec))
 
 
-def repo_path(name: str, cfg: config.Config) -> Path:
-    for r in cfg.repos:
-        if r.name == name:
-            return r.path
-    path = paths.expand(name)
-    if not (path / ".git").exists():
-        raise control.Refused(f"repo '{name}' is not a repo in the config or a path to a git repo")
-    return path
+def device_named(name: str) -> devices.Device:
+    try:
+        return devices.get(name)
+    except devices.DeviceError as e:
+        raise control.Refused(str(e)) from e
 
 
-def workspace(spec: Spec, cfg: config.Config) -> None:
-    device = devices.get(spec.device)
+def repo_named(name: str, device: devices.Device, cfg: config.Config) -> config.Repo | None:
+    if not name.strip():
+        return None
     if device.remote:
-        spec.cwd = spec.repo or device.dir
+        raise control.Refused(f"a session on {device.name} starts in its folder {device.dir}; leave the repo empty")
+    try:
+        return cfg.repo(name.strip())
+    except config.UnknownRepo as e:
+        raise control.Refused(e.args[0]) from e
+
+
+def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> None:
+    if device.remote:
+        spec.cwd = device.dir
         return
-    if not spec.repo:
+    if not repo:
         scratch = SESSIONS_DIR / spec.id / "work"
         scratch.mkdir(parents=True, exist_ok=True)
         spec.cwd = str(scratch)
         return
-    src = repo_path(spec.repo, cfg)
-    spec.source = str(src)
+    spec.source = str(repo.path)
     spec.branch = f"session/{spec.id}"
     wt = paths.WORKTREES_DIR / f"session-{spec.id}"
-    util.git(["worktree", "add", "-q", "-b", spec.branch, str(wt), "HEAD"], src)
+    util.git(["worktree", "add", "-q", "-b", spec.branch, str(wt), "HEAD"], repo.path)
     spec.cwd = str(wt)
-
-
-def check_choices(device: str, model: str, run_with: str, tools: list[str]) -> None:
-    try:
-        devices.get(device)
-    except devices.DeviceError as e:
-        raise control.Refused(str(e)) from e
-    if run_with and run_with not in runner.RUNNERS:
-        raise control.Refused(f"runner '{run_with}' is not one of {', '.join(runner.RUNNERS)}")
-    if unknown := sorted(set(tools) - loops.KNOWN_TOOLS):
-        raise control.Refused(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(loops.KNOWN_TOOLS))}")
-    if not model.strip() and not config.load().model("session"):
-        raise control.Refused("pick a model, or set [models] session in the config")
 
 
 def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str = "", tools: list[str] | None = None,
@@ -113,15 +106,22 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     if not prompt:
         raise control.Refused("a session needs a first message")
     tools = list(SESSION_TOOLS if tools is None else tools)
-    check_choices(device, model, run_with, tools)
+    if problems := loops.agent_problems(run_with, tools):
+        raise control.Refused("; ".join(problems))
+    if budget_usd is not None and budget_usd <= 0:
+        raise control.Refused("the budget is a number of dollars above zero, or none for no limit")
     cfg = config.load()
     model = model.strip() or cfg.model("session")
+    if not model:
+        raise control.Refused("pick a model, or set [models] session in the config")
+    target = device_named(device)
+    work_repo = repo_named(repo, target, cfg)
     which, name = runner.route(model, run_with)
-    off = pi.withheld(tools, devices.get(device or "local").remote) if which == "pi" else {}
+    off = pi.withheld(tools, target.remote) if which == "pi" else {}
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
-    spec = Spec(record.new_id("ses"), prompt, device or "local", model, run_with, tools, repo.strip(), budget_usd,
-                created=util.iso())
-    workspace(spec, cfg)
+    spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
+                budget_usd, created=util.iso())
+    workspace(spec, target, work_repo)
     save_spec(spec)
     record.start("session", run_id=spec.id, lock=session_lock(spec.id), pid=None, repo=spec.repo or None,
                  device=spec.device, model=name, runner=which, trigger="manual",
@@ -195,8 +195,6 @@ def execute(session_id: str) -> str:
         status, summary = "done", ""
         try:
             with devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text)) as device:
-                if device.remote and not spec.cwd:
-                    spec.cwd = device.dir
                 resume, turn, prompt = NO_SESSION, 0, spec.prompt
                 idle_since = time.monotonic()
                 while True:
@@ -239,6 +237,8 @@ def choices() -> dict:
     since = util.iso(util.now() - timedelta(days=SEEN_MODEL_DAYS))
     seen = {s["model"] for s in state.steps_since(since) if s["model"]}
     models = sorted({*settings.MODEL_ALIASES, *(m for m in cfg.models.values() if m), *cfg.pricing, *seen})
-    return {"devices": devices.names(), "repos": [r.name for r in cfg.repos], "models": models, "runners": list(runner.RUNNERS),
+    fleet = devices.known()
+    return {"devices": [d.name for d in fleet], "remote_devices": [d.name for d in fleet if d.remote],
+            "repos": [r.name for r in cfg.repos], "models": models, "runners": list(runner.RUNNERS),
             "tools": sorted(loops.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
             "idle_hours": cfg.session_idle_hours}

@@ -523,7 +523,7 @@ def cmd_session(args) -> int:
             return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
         for s in sessions.views():
             print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
-                  f"{s['device']:<10} ${s['cost_usd'] or 0:.2f}  {s['prompt'][:70]}")
+                  f"{s['device'] or '':<10} ${s['cost_usd'] or 0:.2f}  {s['prompt'][:70]}")
         if not state.runs(kind="session", limit=1):
             print("no sessions yet; `arete session start \"what to do\"`")
         return 0
@@ -685,9 +685,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("words", nargs="*", help="start: the first message; others: the session id, then send: the text")
     p.add_argument("--device", default="local")
     p.add_argument("--model", default="")
-    p.add_argument("--runner", default="", choices=("", "claude", "pi"))
+    p.add_argument("--runner", default="", help="claude or pi; by the model when left out")
     p.add_argument("--tools", default=None, help="comma separated; Read,Edit,Write,Glob,Grep,Bash by default")
-    p.add_argument("--repo", default="", help="a repo name from the config or a path; work in a new worktree of it")
+    p.add_argument("--repo", default="", help="a repo name from the config; work in a new worktree of it on a device of kind local")
     p.add_argument("--budget", type=float, default=None, help="USD for the whole session")
     p.add_argument("--attach", action="store_true", help="start: follow it at once")
     p.set_defaults(fn=cmd_session_args)
