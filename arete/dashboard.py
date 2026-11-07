@@ -42,6 +42,7 @@ RETRY_SECONDS = 10
 WATCH_SECONDS = 30
 WHOIS_SECONDS = 60
 MAX_BODY = 64 * 1024
+TLS_HANDSHAKE = b"\x16\x03"
 LOG_PATH = "/api/log/"
 LOOP_PATH = "/api/loops/"
 FEED_PATH = "/api/feed/"
@@ -303,6 +304,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and isinstance(code, int) and 200 <= code < 300:
             return
         super().log_request(code, size)
+
+    def log_message(self, format: str, *args) -> None:
+        if not getattr(self, "raw_requestline", b"").startswith(TLS_HANDSHAKE):
+            super().log_message(format, *args)
 
 
 class Server(ThreadingHTTPServer):
