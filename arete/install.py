@@ -11,10 +11,10 @@ AGENTS_DIR = paths.HOME / "Library" / "LaunchAgents"
 
 JOBS = {
     "heartbeat": {"args": ["heartbeat", "--quiet"], "interval": 3600, "run_at_load": True},
-    "poll": {"args": ["poll"], "interval": 300, "abandon_children": True},
+    "poll": {"args": ["poll"], "interval": 300, "abandon_children": True, "process_type": "Standard"},
     "mine": {"args": ["mine"], "calendar": {"Hour": 23, "Minute": 50}},
     "audit": {"args": ["audit"], "calendar": {"Hour": 4, "Minute": 30}},
-    "eval": {"args": ["eval"], "calendar": {"Weekday": 0, "Hour": 2, "Minute": 10}},
+    "eval": {"args": ["eval"], "calendar": {"Weekday": 0, "Hour": 2, "Minute": 10}, "process_type": "Standard"},
     "triage": {"args": ["triage", "--refresh"], "interval": 3600},
     "dashboard": {"args": ["dashboard"], "run_at_load": True, "keep_alive": True},
 }
@@ -55,7 +55,7 @@ def plist_for(name: str, spec: dict) -> dict:
         "StandardOutPath": log,
         "StandardErrorPath": log,
         "WorkingDirectory": str(paths.HOME),
-        "ProcessType": "Background",
+        "ProcessType": spec.get("process_type", "Background"),
     }
     if "interval" in spec:
         pl["StartInterval"] = spec["interval"]
