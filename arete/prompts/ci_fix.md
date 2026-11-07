@@ -16,6 +16,8 @@ changes: $diff. Run each command on its own, with no pipe or `&&`, since Bash al
 - Caused by the PR, but the only way to pass is to undo what the ticket asked for, or to change the CI setup: change
   nothing for that check, and say so in its reason, so a person can decide.
 
-Answer with one entry per check, named exactly as its heading above. Give each a reason of one or two sentences
+$left_for_a_person
+
+Answer with one entry per check, named exactly as its heading in the failures above. Give each a reason of one or two sentences
 that names the evidence, such as the error line and the file it points to. The summary says what you changed, or
 that you changed nothing.

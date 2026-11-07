@@ -89,9 +89,13 @@ def cmd_init(args) -> int:
 
 
 def slot_note(run_id: str, in_slots: set[str], waiting: set[str]) -> str:
+    from . import pipeline
+
     if run_id in in_slots:
         return ""
-    return ", waiting for a run slot" if run_id in waiting else ", without a run slot"
+    if run_id in waiting:
+        return ", waiting for a run slot"
+    return ", waiting on CI without a run slot" if pipeline.freed_slot_for_ci(run_id) else ", without a run slot"
 
 
 def cmd_status(args) -> int:

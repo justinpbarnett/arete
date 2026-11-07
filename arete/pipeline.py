@@ -31,14 +31,20 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 STEP_COST = re.compile(r"\(\d+ turns?, \$([\d.]+)\)")
 CHECKS_LOCK = "checks"
-STALE_BASE_NOTE = ("Compare with `origin/<base>`, as in `git diff origin/main...HEAD`, never with the local base "
-                   "branch: arete fetched `origin`, but the local base branch can be days old.")
-LEFT_FOR_A_PERSON = re.compile(r"^## Left for a person\n\n(.*?)\n\n## Checked in use\n", re.S | re.M)
+LEFT_TITLE = "Left for a person"
+LEFT_HEADING = f"## {LEFT_TITLE}"
+LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
+LEFT_FOR_A_PERSON = re.compile(rf"{re.escape(LEFT_START)}\n{LEFT_HEADING}\n\n(.*?)\n\n{re.escape(LEFT_END)}\n*", re.S)
 MAX_LEFT_FOR_A_PERSON_CHARS = 12_000
-NOT_CHECKED_LEFT_FOR_A_PERSON = ("## Left for a person\n\nA person makes these changes after the PR, since the "
-                                 "builder may not edit those paths. Do not check them, and do not fail the change "
+LEFT_BY_A_PERSON = "A person makes these changes after the PR, since the builder may not edit those paths."
+NOT_CHECKED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} Do not check them, and do not fail the change "
                                  "because they are missing:\n\n")
+NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red check that only these changes would fix "
+                                "is not caused by the PR: set `caused_by_pr` to false, say in its reason that it waits "
+                                "on the change left for a person, and do not make it pass another way.\n\n")
+CHECKED_IN_USE_HEADING = "## Checked in use"
 SLOTS_LOCK = "run-slots"
+FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
 
 PLAN_SCHEMA = {
@@ -320,12 +326,20 @@ class Checkout:
             return f"fresh from `{self.base}`"
         start = (f"continuing the open PR {self.pr}" if self.pr
                  else "continuing commits already pushed to the branch, with no PR yet")
-        return start + (f", with `origin/{self.base}` merged in since the base moved after the last push"
+        return start + (f", with `{self.origin_base}` merged in since the base moved after the last push"
                         if self.merged_base else "")
 
     @property
     def pr_name(self) -> str:
         return f"{self.github.split('/')[-1]}#{gh.pr_number(self.pr)}"
+
+    @property
+    def origin_base(self) -> str:
+        return f"origin/{self.base}"
+
+    @property
+    def diff_from_base(self) -> str:
+        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.origin_base}...HEAD"
 
 
 def remote_head(src: Path, branch: str) -> str:
@@ -366,7 +380,7 @@ def make_workspace(repo: config.Repo, base: str, branch: str, key: str) -> tuple
         c.resumes = bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
         if c.resumes:
             fetch(c.src, branch)
-        add_worktree(c, branch, f"origin/{branch}" if c.resumes else f"origin/{c.base}")
+        add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
     return ws, checkouts
 
 
@@ -374,7 +388,7 @@ def make_worktree(repo: config.Repo, base: str, branch: str, key: str) -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
     remove_workspace(c.wt, [c])
     fetch(c.src, base)
-    add_worktree(c, branch, f"origin/{base}")
+    add_worktree(c, branch, c.origin_base)
     return c.wt
 
 
@@ -382,16 +396,21 @@ def remove_worktree(repo: config.Repo, wt: Path) -> None:
     remove_workspace(wt, [Checkout("", repo.github, repo.path, wt, "")])
 
 
+def stale_base_note(c: Checkout) -> str:
+    return (f"Compare with `origin/<base>`, as in `{c.diff_from_base}`, never with the local base branch: arete "
+            "fetched `origin`, but the local base branch can be days old.")
+
+
 def workspace_note(branch: str, checkouts: list[Checkout]) -> str:
     if len(checkouts) == 1 and not checkouts[0].dir:
         c = checkouts[0]
         return (f"You are in a worktree on branch `{branch}`, {c.starting_point}. PRs target `{c.base}`. "
-                f"{STALE_BASE_NOTE}")
+                f"{stale_base_note(c)}")
     rows = [f"- `{c.prefix}`: {c.github}, {c.starting_point}; PRs target `{c.base}`" for c in checkouts]
     return "\n".join([
         f"The working directory holds one git worktree per repo, each on branch `{branch}`:", "", *rows, "",
         ("The working directory itself is not a git repo, so run git as `git -C <dir> ...`. A change can touch one "
-         f"repo or several; arete commits each changed repo and opens a PR in it. {STALE_BASE_NOTE}"),
+         f"repo or several; arete commits each changed repo and opens a PR in it. {stale_base_note(checkouts[0])}"),
     ])
 
 
@@ -557,6 +576,7 @@ class Build(TicketWork):
     report: str = ""
     staged: Staged = field(default_factory=Staged)
     committed_lines: int = 0
+    left_for_a_person: str = ""
 
     def resume(self, step: str, text: str, **kw) -> claude.Result:
         res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
@@ -733,7 +753,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     ws, checkouts = make_workspace(repo, main_layer.base_branch, branch, t.id)
     for c in checkouts:
         run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
-    for c in merge_moved_bases(run, [c for c in checkouts if c.resumes], ""):
+    for c in merge_moved_bases(run, [c for c in checkouts if c.resumes]):
         c.merged_base = True
     layer = resolve_layer(run, ws)
     for rel in layer.copy:
@@ -820,14 +840,17 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             return _fail(run, "build step failed", res.text)
         build_summary = res.text
         if not stage(checkouts, deny).files:
-            return _fail(run, "the builder stopped without changing anything", build_summary)
+            if estimate == 0:
+                return nothing_to_build(run, t, ws, checkouts, branch, build_summary, left_for_a_person)
+            return _fail(run, f"the builder stopped without changing anything, though the plan estimated "
+                              f"{util.count(estimate, 'line')}", build_summary)
     plan_to_review = plan_text
     if left_for_a_person:
         not_checked = NOT_CHECKED_LEFT_FOR_A_PERSON + left_for_a_person
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
     b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=step_timeout,
               workspace=workspace, attachments=attachments, tools=build_tools, deny=deny, expertise=expertise,
-              session=res.session)
+              session=res.session, left_for_a_person=left_for_a_person)
 
     attempts = 1
     ok = b.check()
@@ -871,8 +894,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     images = evidence_images(run, staged.changed[0], verified)
     report_body = (
         f"## Summary\n\n{build_summary.strip()[:3000]}\n\n"
-        + (f"## Left for a person\n\n{left_for_a_person}\n\n" if left_for_a_person else "")
-        + f"## Checked in use\n\n{verified.markdown(images)}\n\n"
+        + left_block(left_for_a_person)
+        + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
         + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
@@ -901,9 +924,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                 gh.pr_edit_body(c.pr, f"{link}\n\n{report_body}{others}")
             continue
         body = gh.pr_body(c.pr)
-        new_body = relinked(body, link, tk.pr_link(t, whole=bool(left_for_a_person)))
-        if new_body != body:
-            run.log(f"{c.pr} now links the ticket with: {link}")
+        new_body = synced_pr_body(run, c.pr, body, t, left_for_a_person)
         if opened:
             new_body = with_siblings(new_body, others)
         if new_body != body:
@@ -941,11 +962,64 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     return "pr", outcome, urls
 
 
+def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Checkout], branch: str, summary: str,
+                     left: str) -> tuple[str, str, str]:
+    with_prs = [c for c in checkouts if c.pr]
+    why = f"the open PRs already cover {t.ref}" if with_prs else "the plan found no code change to make"
+    run.log(f"build: nothing to build, since {why}")
+    if run.dry_run:
+        remove_workspace(ws, checkouts)
+        return "dry-run", f"nothing to build: {why}", ""
+    said = summary.strip()[:3000] + (f"\n\n{LEFT_HEADING}\n\n{left}" if left else "")
+    if not with_prs:
+        return _ask(run, ws, checkouts,
+                    f"I made no change, since {why}.\n\n{said}\n\nClose this if it is done. If it is not, say here "
+                    f"what is missing, then remove the `{run.tracker.label_name('needs-info')}` label and I will "
+                    "pick it up.", f"nothing to build: {why}")
+    for c in with_prs:
+        body = gh.pr_body(c.pr)
+        if (new_body := synced_pr_body(run, c.pr, body, t, left)) != body:
+            gh.pr_edit_body(c.pr, new_body)
+    run.enter("pr")
+    prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
+    run.say(f"Nothing more to build, since the open PRs already cover this:\n\n{prs}\n\n{said}")
+    urls = record_prs(run, branch, with_prs)
+    remove_workspace(ws, checkouts)
+    return "pr", f"nothing to build: {why}", urls
+
+
+def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> str:
+    link = run.tracker.pr_link(t, whole=not left)
+    relinked_body = relinked(body, link, run.tracker.pr_link(t, whole=bool(left)))
+    if relinked_body != body:
+        run.log(f"{pr} now links the ticket with: {link}")
+    left_synced = with_left_section(relinked_body, left)
+    if left_synced != relinked_body:
+        run.log(f"{pr}: {'wrote' if left else 'removed'} the {LEFT_TITLE} section")
+    return left_synced
+
+
 def left_section(run: Run, text: str) -> str:
     if len(text) <= MAX_LEFT_FOR_A_PERSON_CHARS:
         return text
     return (f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
             f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
+
+
+def left_block(left: str) -> str:
+    return f"{LEFT_START}\n{LEFT_HEADING}\n\n{left}\n\n{LEFT_END}\n\n" if left else ""
+
+
+def with_left_section(body: str, left: str) -> str:
+    found = LEFT_FOR_A_PERSON.search(body)
+    if (found.group(1) if found else "") == left:
+        return body
+    if found:
+        return body[:found.start()] + left_block(left) + body[found.end():]
+    checked = body.find(f"\n{CHECKED_IN_USE_HEADING}\n")
+    if checked < 0:
+        return f"{body.rstrip()}\n\n{left_block(left).rstrip()}"
+    return body[:checked + 1] + left_block(left) + body[checked + 1:]
 
 
 def left_on_prs(urls: list[str]) -> str:
@@ -1044,12 +1118,12 @@ def set_draft(run: AgentRun, c: Checkout, draft: bool) -> bool:
 
 def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_rounds: int) -> Iterator[ci.Round]:
     run = b.run
-    targets = {c.github: ci_target(c) for c in pushed}
+    watched = list(pushed)
     not_caused: dict[tuple[str, str, str], str] = {}
     for n in range(1, max_rounds + 1):
         slot.free()
-        run.log("ci: freed the run slot for the wait")
-        current = ci.Round(n, [ci.compare_with_base(ci.watch(t, run.log), run.log) for t in targets.values()])
+        run.log(FREED_SLOT_FOR_CI)
+        current = ci.Round(n, [ci.compare_with_base(ci.watch(ci_target(c), run.log), run.log) for c in watched])
         judged = [r for r in current.reds if r.kind != "base"]
         for r in judged:
             if r.key in not_caused:
@@ -1058,7 +1132,6 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
         if fresh:
             slot.take(run.log)
         try:
-            watched = [c for c in b.checkouts if c.github in targets]
             fix_summary = judge_ci(b, fresh, n, max_rounds, watched) if fresh else ""
         except RunFailed:
             yield current
@@ -1074,8 +1147,7 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
         if n == max_rounds:
             raise RunFailed(f"CI still fails after {util.count(max_rounds, 'round')}: {names}", ci.red_list(caused))
         push_ci_fix(b, branch, caused, names, n)
-        for c in b.staged.changed:
-            targets[c.github] = ci_target(c)
+        watched += [c for c in b.staged.changed if c not in watched]
         current.story = f"{names} failed, caused by this PR, and arete pushed a fix: {fix_summary}".rstrip(": ")
         run.log(f"ci: pushed a fix for {names}")
 
@@ -1100,31 +1172,38 @@ def ci_target(c: Checkout) -> ci.Target:
     return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.base)
 
 
-def merge_moved_bases(run: Run, checkouts: list[Checkout], step: str) -> list[Checkout]:
+def merge_moved_bases(run: Run, checkouts: list[Checkout], log_prefix: str = "") -> list[Checkout]:
     merged = []
     for c in checkouts:
-        base = f"origin/{c.base}"
-        if git(["rev-list", "--count", f"HEAD..{base}"], c.wt).strip() == "0":
-            continue
         try:
-            git(["merge", "-q", "--no-edit", base], c.wt)
+            if git(["rev-list", "--count", f"HEAD..{c.origin_base}"], c.wt).strip() == "0":
+                continue
+            git(["merge", "-q", "--no-edit", c.origin_base], c.wt)
         except RuntimeError as e:
             git(["merge", "--abort"], c.wt, check=False)
-            run.log(f"{step}`{base}` moved and conflicts with the branch in {c.github}, so this run works on the "
-                    f"branch as it is: {e}")
+            run.log(f"{log_prefix}could not merge `{c.origin_base}` into the branch in {c.github}, so this run works "
+                    f"on the branch as it is: {e}")
             continue
-        run.log(f"{step}merged `{base}` into the branch in {c.github}, since the base moved after the last push")
+        run.log(f"{log_prefix}merged `{c.origin_base}` into the branch in {c.github}, since the base moved after "
+                "the last push")
         merged.append(c)
     return merged
 
 
-def merge_moved_base(b: Build, watched: list[Checkout]) -> str:
+def merge_moved_bases_for_ci_fix(b: Build, watched: list[Checkout]) -> str:
+    fetched = []
     for c in watched:
-        fetch(c.src, c.base)
-    merged = merge_moved_bases(b.run, watched, "ci: ")
+        try:
+            fetch(c.src, c.base)
+        except RuntimeError as e:
+            b.run.log(f"ci: could not fetch `{c.origin_base}` in {c.github}, so the CI fix works on the branch as it "
+                      f"is: {e}")
+            continue
+        fetched.append(c)
+    merged = merge_moved_bases(b.run, fetched, "ci: ")
     if not merged:
         return ""
-    names = ", ".join(f"`origin/{c.base}` into `{c.prefix or './'}`" for c in merged)
+    names = ", ".join(f"`{c.origin_base}` into `{c.prefix or './'}`" for c in merged)
     return (f"Before this step arete merged {names}, since the base moved after the last push. CI tested the PR "
             "merged with that base, so the worktree now holds what CI ran, and files the base added are yours to "
             "edit like any other.")
@@ -1132,15 +1211,17 @@ def merge_moved_base(b: Build, watched: list[Checkout]) -> str:
 
 def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: list[Checkout]) -> str:
     run = b.run
-    merged_base = merge_moved_base(b, watched)
+    merged_base = merge_moved_bases_for_ci_fix(b, watched)
     logs = run.dir / "ci"
     logs.mkdir(exist_ok=True)
     if logs not in run.add_dirs:
         run.add_dirs.append(logs)
     failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{slug(r.label)}.log") for r in reds)
-    diff = ", ".join(f"`git {f'-C {c.dir} ' if c.dir else ''}diff origin/{c.base}...HEAD`" for c in b.checkouts)
+    diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
+    left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""
     res = b.resume(b.next_step("ci_fix"), prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures,
-                                                 diff=diff, checks=check_list(b.layer), merged_base=merged_base),
+                                                 diff=diff, checks=check_list(b.layer), merged_base=merged_base,
+                                                 left_for_a_person=left),
                    json_schema=CI_FIX_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         for r in reds:
@@ -1725,7 +1806,21 @@ def runs_waiting_for_a_slot() -> list[dict]:
 
 
 def slots_free_to_start(max_parallel: int) -> int:
-    return max_parallel - len(runs_in_slots()) - len(runs_waiting_for_a_slot())
+    if runs_waiting_for_a_slot():
+        return 0
+    return max_parallel - len(runs_in_slots())
+
+
+def freed_slot_for_ci(run_id: str) -> bool:
+    log = paths.RUNS_DIR / run_id / "run.log"
+    return log.exists() and FREED_SLOT_FOR_CI in log.read_text()
+
+
+def live_max_parallel(last_read: int) -> int:
+    try:
+        return config.load().max_parallel
+    except (OSError, ValueError):
+        return last_read
 
 
 @dataclass
@@ -1745,6 +1840,7 @@ class RunSlot:
         try:
             while True:
                 with util.lock(SLOTS_LOCK, wait=True):
+                    self.max_parallel = live_max_parallel(self.max_parallel)
                     if len(runs_in_slots()) < self.max_parallel:
                         self.hold()
                         log("ci: took a run slot back" + (" after waiting for one" if waiting else ""))
@@ -1764,10 +1860,10 @@ class RunSlot:
 
 
 def no_free_slot(max_parallel: int) -> str:
-    waiting = len(runs_waiting_for_a_slot())
-    return f"no run slot is free (max_parallel {max_parallel})" + (
-        f", and {util.count(waiting, 'run')} {'waits' if waiting == 1 else 'wait'} to take a slot back first"
-        if waiting else "")
+    if waiting := len(runs_waiting_for_a_slot()):
+        return (f"{util.count(waiting, 'run')} {'waits' if waiting == 1 else 'wait'} to take a run slot back first "
+                f"(max_parallel {max_parallel})")
+    return f"no run slot is free (max_parallel {max_parallel})"
 
 
 def spawn_run(repo_name: str, tid: str) -> None:

@@ -36,7 +36,12 @@ The builder may not edit these paths either: $denied. Arete rejects a diff that 
 there. If the work needs a change there, such as a CI workflow that asserts the old behavior, plan the rest and
 put the exact change a person must make in `left_for_a_person`: the path and the full content or edit. Arete shows
 it in the PR and links the PR to the issue without closing it. Leave `left_for_a_person` empty when the build covers
-the whole issue.
+the whole issue. A change in `left_for_a_person` is never a reason to set `ambiguous`.
+
+The branch may already do all that the builder can do for the issue, for example when this run continues an open
+PR. Then plan no edits, set `estimated_lines` to 0, and fill `left_for_a_person` only when a change is left for a
+person. Arete keeps the PR, updates its "Left for a person" section, and tells the author that nothing more is left
+to build.
 
 ## Size budget
 

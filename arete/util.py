@@ -16,6 +16,7 @@ from typing import TextIO
 
 from . import paths
 
+PROBE_GRACE_SECONDS = 0.2
 
 def now() -> datetime:
     return datetime.now(UTC)
@@ -179,11 +180,21 @@ def matches_any(path: str, globs: list[str]) -> bool:
     return False
 
 
-def take_lock(f: TextIO, wait: bool) -> bool:
+def flock_now(f: TextIO) -> bool:
     try:
-        fcntl.flock(f, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return False
+    return True
+
+
+def take_lock(f: TextIO, wait: bool) -> bool:
+    if wait:
+        fcntl.flock(f, fcntl.LOCK_EX)
+    elif not flock_now(f):
+        time.sleep(PROBE_GRACE_SECONDS)
+        if not flock_now(f):
+            return False
     f.truncate(0)
     f.write(str(os.getpid()))
     f.flush()
