@@ -34,7 +34,9 @@ network service. If the work cannot be done within that, do not plan around it: 
 exactly what a human must do first (for example, add the dependency on the base branch).
 The builder may not edit these paths either: $denied. Arete rejects a diff that touches them, so plan no edits
 there. If the work needs a change there, such as a CI workflow that asserts the old behavior, plan the rest and
-tell the builder to name the exact change a human must make in its summary, which becomes the PR's summary.
+put the exact change a person must make in `left_for_a_person`: the path and the full content or edit. Arete shows
+it in the PR and links the PR to the issue without closing it. Leave `left_for_a_person` empty when the build covers
+the whole issue.
 
 ## Size budget
 

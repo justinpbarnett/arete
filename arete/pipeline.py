@@ -5,19 +5,23 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from string import Template
+from typing import TextIO
 
 from . import ci, claude, config, gh, jira, paths, state, tracker, util, verify
 from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
-ALWAYS_DENY = [".agents/config.toml", ".github/workflows/**", ".env", ".env.*", "**/.env", "**/.env.*"]
+CLAUDE_CODE_GUARDED = [".claude/**", "**/.claude/**"]
+ALWAYS_DENY = [".agents/config.toml", ".github/workflows/**", ".env", ".env.*", "**/.env", "**/.env.*",
+               *CLAUDE_CODE_GUARDED]
 MAX_DIFF_IN_PROMPT = 60_000
 LOCKFILES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb", "uv.lock", "poetry.lock",
              "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock"}
@@ -27,6 +31,7 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 STEP_COST = re.compile(r"\(\d+ turns?, \$([\d.]+)\)")
 CHECKS_LOCK = "checks"
+SLOT_POLL_SECONDS = 30
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -37,6 +42,7 @@ PLAN_SCHEMA = {
         "risk": {"type": "string", "enum": ["low", "medium", "high"]},
         "estimated_lines": {"type": "integer", "minimum": 0},
         "verify": {"type": "string"},
+        "left_for_a_person": {"type": "string"},
         "split": {
             "type": "array",
             "items": {
@@ -609,10 +615,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             print(f"{name} is already running")
             return 0
         with util.lock("run-slots", wait=True):
-            live = live_pipeline_runs()
-            if not dry_run and len(live) >= cfg.max_parallel:
-                print(f"{name} was not started: {len(live)} of {cfg.max_parallel} runs going. Wait for one to finish "
-                      f"or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
+            slot = RunSlot(state.run_lock("slot", repo.name, tid), cfg.max_parallel)
+            if not dry_run and not slot.take_if_free():
+                print(f"{name} was not started: all {cfg.max_parallel} run slots are taken. Wait for a run to "
+                      f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                 return 1
             earlier = state.ticket_runs(repo.name, tid, limit=1)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
@@ -628,7 +634,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not dry_run:
                 state.take_feedback(run.feedback, run_id)
         try:
-            status, summary, pr_url = _run(cfg, run)
+            status, summary, pr_url = _run(cfg, run, slot)
         except RunFailed as e:
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except Exception as e:
@@ -677,7 +683,7 @@ def resolve_layer(run: Run, ws: Path) -> config.RepoLayer:
     return config.load_layer(repo.path / ".agents")
 
 
-def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
+def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     repo, tk = run.repo, run.tracker
     try:
         t = tk.get(run.tid)
@@ -743,6 +749,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     if run.feedback:
         feedback = feedback_markdown(run.feedback)
         plan_text = f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+        left_for_a_person = ""
         goal = ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                 + feedback)
         estimate = 0
@@ -770,6 +777,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
             return _fail(run, "planning step failed")
         plan = res.structured
         plan_text = plan.get("plan", "")
+        left_for_a_person = (plan.get("left_for_a_person") or "").strip()
         run.save("plan.md", plan_text)
         estimate = int(plan.get("estimated_lines") or 0)
         goal = plan.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for."
@@ -842,7 +850,8 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     images = evidence_images(run, staged.changed[0], verified)
     report_body = (
         f"## Summary\n\n{build_summary.strip()[:3000]}\n\n"
-        f"## Checked in use\n\n{verified.markdown(images)}\n\n"
+        + (f"## Left for a person\n\n{left_for_a_person[:3000]}\n\n" if left_for_a_person else "")
+        + f"## Checked in use\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
         + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
@@ -855,7 +864,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     opened: list[Checkout] = []
     for c in staged.changed:
         if not c.pr:
-            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{tk.pr_link(t)}\n\n{report_body}",
+            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{tk.pr_link(t, whole=not left_for_a_person)}\n\n{report_body}",
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
             opened.append(c)
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
@@ -867,13 +876,13 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
             if others:
-                gh.pr_edit_body(c.pr, f"{tk.pr_link(t)}\n\n{report_body}{others}")
+                gh.pr_edit_body(c.pr, f"{tk.pr_link(t, whole=not left_for_a_person)}\n\n{report_body}{others}")
         elif opened:
             gh.pr_edit_body(c.pr, with_siblings(gh.pr_body(c.pr), others))
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
     try:
-        ci_result = watch_ci(b, branch, staged.changed, with_prs, draft_why)
+        ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why)
     except RunFailed as e:
         if run.feedback:
             raise
@@ -932,12 +941,13 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
         pushed.append(c)
 
 
-def watch_ci(b: Build, branch: str, pushed: list[Checkout], with_prs: list[Checkout], draft_why: str) -> str:
+def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_prs: list[Checkout],
+             draft_why: str) -> str:
     run, max_rounds = b.run, b.layer.max_attempts
     stopped_before = [c for c in pushed if stopped_by_ci(run, c)]
     rounds: list[ci.Round] = []
     try:
-        for current in ci_rounds(b, branch, pushed, max_rounds):
+        for current in ci_rounds(b, slot, branch, pushed, max_rounds):
             rounds.append(current)
             publish_ci(run, pushed, ci.section(rounds, max_rounds))
     except Exception as e:
@@ -984,17 +994,21 @@ def set_draft(run: AgentRun, c: Checkout, draft: bool) -> bool:
     return True
 
 
-def ci_rounds(b: Build, branch: str, pushed: list[Checkout], max_rounds: int) -> Iterator[ci.Round]:
+def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_rounds: int) -> Iterator[ci.Round]:
     run = b.run
     targets = {c.github: ci_target(c) for c in pushed}
     not_caused: dict[tuple[str, str, str], str] = {}
     for n in range(1, max_rounds + 1):
+        slot.free()
+        run.log("ci: freed the run slot for the wait")
         current = ci.Round(n, [ci.compare_with_base(ci.watch(t, run.log), run.log) for t in targets.values()])
         judged = [r for r in current.reds if r.kind != "base"]
         for r in judged:
             if r.key in not_caused:
                 r.caused, r.reason = False, not_caused[r.key]
         fresh = [r for r in judged if r.key not in not_caused]
+        if fresh:
+            slot.take(run.log)
         try:
             fix_summary = judge_ci(b, fresh, n, max_rounds) if fresh else ""
         except RunFailed:
@@ -1612,15 +1626,55 @@ def settle_abandoned_runs(cfg: config.Config) -> None:
                 run.say(f"Run `{run.id}` {INTERRUPTED}.")
 
 
-def live_pipeline_runs() -> list[dict]:
-    live = []
+def pipeline_runs_holding(lock_kind: str) -> list[dict]:
+    holding = []
     for row in state.runs_marked_running():
         if row["kind"] != "pipeline":
             continue
-        with util.lock(state.run_lock("pipeline", row["repo"], row["issue"])) as free:
+        with util.lock(state.run_lock(lock_kind, row["repo"], row["issue"])) as free:
             if not free:
-                live.append(row)
-    return live
+                holding.append(row)
+    return holding
+
+
+def live_pipeline_runs() -> list[dict]:
+    return pipeline_runs_holding("pipeline")
+
+
+def runs_in_slots() -> list[dict]:
+    return pipeline_runs_holding("slot")
+
+
+@dataclass
+class RunSlot:
+    lock: str
+    max_parallel: int
+    held: TextIO | None = None
+
+    def take_if_free(self) -> bool:
+        if len(runs_in_slots()) >= self.max_parallel:
+            return False
+        self.held = util.hold_lock(self.lock)
+        return True
+
+    def take(self, log: Callable[[str], None]) -> None:
+        if self.held:
+            return
+        waited = False
+        while True:
+            with util.lock("run-slots", wait=True):
+                if self.take_if_free():
+                    log("ci: took a run slot back" + (" after waiting for one" if waited else ""))
+                    return
+            if not waited:
+                log(f"ci: waiting for one of the {self.max_parallel} run slots")
+                waited = True
+            time.sleep(SLOT_POLL_SECONDS)
+
+    def free(self) -> None:
+        if self.held:
+            self.held.close()
+            self.held = None
 
 
 def spawn_run(repo_name: str, tid: str) -> None:
@@ -1692,9 +1746,8 @@ def poll(dry_run: bool = False) -> int:
                 sync_outcomes(cfg)
             except Exception as e:
                 failed("syncing PR outcomes", e)
-        live = live_pipeline_runs()
-        busy = {r["repo"] for r in live}
-        slots = cfg.max_parallel - len(live)
+        busy = {r["repo"] for r in live_pipeline_runs()}
+        slots = cfg.max_parallel - len(runs_in_slots())
         starts = state.last_pipeline_starts()
         pipeline_repos = [r for r in cfg.repos if r.pipeline and r.parts]
         restarting = {r.name for r in pipeline_repos if state.interrupted_tickets(r.name)}

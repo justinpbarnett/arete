@@ -181,8 +181,8 @@ class GitHubTracker:
     def pr_title(self, subject: str, t: Ticket) -> str:
         return subject
 
-    def pr_link(self, t: Ticket) -> str:
-        return f"Closes #{t.id}"
+    def pr_link(self, t: Ticket, whole: bool) -> str:
+        return f"Closes #{t.id}" if whole else f"Part of #{t.id}"
 
 
 class JiraTracker:
@@ -304,7 +304,7 @@ class JiraTracker:
     def pr_title(self, subject: str, t: Ticket) -> str:
         return with_ref(subject, t.ref)
 
-    def pr_link(self, t: Ticket) -> str:
+    def pr_link(self, t: Ticket, whole: bool) -> str:
         return f"Jira: [{t.ref}]({t.url})"
 
 

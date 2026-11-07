@@ -147,8 +147,10 @@ def cmd_status(args) -> int:
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
     live = pipeline.live_pipeline_runs()
-    print(f"runs live: {len(live)} of {cfg.max_parallel}"
-          + "".join(f"\n  {tracker.run_ticket_name(r)}  since {r['started']}" for r in live))
+    in_slots = {r["id"] for r in pipeline.runs_in_slots()}
+    print(f"runs live: {len(live)}, in {len(in_slots)} of {cfg.max_parallel} slots"
+          + "".join(f"\n  {tracker.run_ticket_name(r)}  since {r['started']}"
+                    + ("" if r["id"] in in_slots else ", waiting on CI without a slot") for r in live))
     return 0
 
 

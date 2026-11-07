@@ -18,7 +18,7 @@ LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.M)
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
 SECTION = re.compile(rf"\n*{re.escape(SECTION_START)}.*?{re.escape(SECTION_END)}", re.S)
 STOPPED = "Arete stopped:"
-PAST_TENSE = {"pass": "passed", "fail": "failed", "pending": "was still running"}
+PAST_TENSE = {"pass": "passed", "fail": "failed", "pending": "was still running", "skipped": "was skipped"}
 READ_ERRORS = (gh.GhError, KeyError, TypeError, ValueError)
 RED_LINE = {
     "base": "- Failed on the base too: {check}. It {base_result}, so this PR did not cause it.",
@@ -99,6 +99,8 @@ class Watched:
         lines = []
         if passed := self.in_state("pass"):
             lines.append(f"- Passed: {', '.join(map(linked, passed))}")
+        if skipped := self.in_state("skipped"):
+            lines.append(f"- Skipped: {', '.join(map(linked, skipped))}")
         lines += [r.markdown() for r in self.reds]
         if pending := self.in_state("pending"):
             lines.append(f"- Still running after {minutes(WAIT_SECONDS)}: {', '.join(map(linked, pending))}")
@@ -125,7 +127,10 @@ class Round:
 
     def summary(self) -> str:
         checks = [c for w in self.seen for c in w.checks.values()]
-        parts = [f"{sum(c.state == 'pass' for c in checks)} of {len(checks)} passed"] if checks else []
+        ran = [c for c in checks if c.state != "skipped"]
+        parts = [f"{sum(c.state == 'pass' for c in ran)} of {len(ran)} passed"] if ran else []
+        if skipped := len(checks) - len(ran):
+            parts.append(f"{skipped} skipped")
         kinds = Counter(r.kind for r in self.reds)
         parts += [f"{kinds[kind]} {words}" for kind, words in RED_COUNT.items() if kinds[kind]]
         if pending := sum(c.state == "pending" for c in checks):

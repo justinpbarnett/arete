@@ -244,7 +244,7 @@ def repo_private(repo: str) -> bool | None:
         return None
 
 
-PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
+PASSING_CONCLUSIONS = {"success", "neutral"}
 STATUS_STATES = {"success": "pass", "pending": "pending", "failure": "fail", "error": "fail"}
 
 
@@ -262,6 +262,8 @@ class Check:
 def check_from_run(row: dict) -> Check:
     if row.get("status") != "completed":
         state = "pending"
+    elif row.get("conclusion") == "skipped":
+        state = "skipped"
     else:
         state = "pass" if row.get("conclusion") in PASSING_CONCLUSIONS else "fail"
     actions = (row.get("app") or {}).get("slug") == "github-actions"

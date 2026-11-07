@@ -19,7 +19,7 @@ The event hook (`arete hook`) records skill use, agent spawns, tool failures, de
 
 ## Runs, sleep and the network
 
-Poll does not wait for a run. It starts each run as its own detached `arete run` process and returns in about a second, so a long run never holds up the next poll. `max_parallel` sets how many runs go at once on the machine, manual runs included. Poll takes tickets round robin across repos, and a repo with a run going gets no second one.
+Poll does not wait for a run. It starts each run as its own detached `arete run` process and returns in about a second, so a long run never holds up the next poll. `max_parallel` sets how many runs go at once on the machine, manual runs included. A run frees its slot while it waits on its PR's CI, and takes one back before a CI fix step. Poll takes tickets round robin across repos, and a repo with a run going gets no second one.
 
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
@@ -148,7 +148,7 @@ notes = "Sign up only with addresses at example.test."
 | `setup.commands` | Run in each fresh worktree before the agent starts. |
 | `setup.copy` | Files copied from the main checkout into each worktree. |
 | `checks` | Every check must exit 0 before review. The agent may run them while it builds. |
-| `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), and the run timeout. Code enforces them after the agent finishes. |
+| `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), and the run timeout. Code enforces them after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. |
 | `agent.allow_bash` | Bash patterns the agent may run, on top of read only git and file commands. |
 | `trust.level` | `pr`, or `automerge` once earned. |
 | `trust.automerge_after` | Merged PRs in a row before arete opens a PR proposing automerge. |
@@ -177,7 +177,7 @@ Arete stops the server's whole process group after each verifier run, so no dev 
 
 ## CI
 
-After the push, the run waits for the checks on the PR. It waits up to 30 minutes, or 3 minutes when no check reports at all. Arete compares each failed check with the same check on the head of the base branch.
+After the push, the run waits for the checks on the PR. It waits up to 30 minutes, or 3 minutes when no check reports at all. The run frees its `max_parallel` slot for the wait, so another ticket can start, and takes a slot back before a CI fix step. Arete compares each failed check with the same check on the head of the base branch.
 
 - Red on the base too: the PR section notes the base result and its date. This PR did not cause it, so nothing changes.
 - Passed on the base, or no result there: a CI fix step reads the job log and the diff, and decides whether the PR caused the failure. A check that the PR did not cause gets a note with the reason. For a check that the PR did cause, the step fixes the code. Then the checks and the diff limit run again, arete pushes the fix, and the wait starts again. `limits.max_attempts` caps the rounds, and the diff limit counts the whole branch.

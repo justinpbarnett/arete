@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TextIO
 
 from . import paths
 
@@ -178,19 +179,32 @@ def matches_any(path: str, globs: list[str]) -> bool:
     return False
 
 
+def take_lock(f: TextIO, wait: bool) -> bool:
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    f.truncate(0)
+    f.write(str(os.getpid()))
+    f.flush()
+    return True
+
+
+def lock_file(name: str) -> TextIO:
+    paths.ensure_dirs()
+    return open(paths.LOCKS_DIR / f"{name}.lock", "a")
+
+
 @contextmanager
 def lock(name: str, wait: bool = False):
-    paths.ensure_dirs()
-    with open(paths.LOCKS_DIR / f"{name}.lock", "a") as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        f.truncate(0)
-        f.write(str(os.getpid()))
-        f.flush()
-        yield True
+    with lock_file(name) as f:
+        yield take_lock(f, wait)
+
+
+def hold_lock(name: str) -> TextIO:
+    f = lock_file(name)
+    take_lock(f, wait=True)
+    return f
 
 
 def read_json(p: Path, default):

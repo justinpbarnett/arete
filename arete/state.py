@@ -196,7 +196,8 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
 
 
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
-    return {"pipeline": f"run-{repo}-{issue}", "eval": f"eval-{repo}", "miner": "mine"}[kind]
+    return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "eval": f"eval-{repo}",
+            "miner": "mine"}[kind]
 
 
 def runs_marked_running(connect=db) -> list[dict]:

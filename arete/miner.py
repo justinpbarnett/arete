@@ -9,7 +9,7 @@ from string import Template
 
 from . import auditor, claude, config, evals, gh, hook, paths, state, util
 from .heartbeat import mark_loop
-from .pipeline import READ_TOOLS, make_worktree, prompt, remove_worktree
+from .pipeline import CLAUDE_CODE_GUARDED, READ_TOOLS, make_worktree, prompt, remove_worktree
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -19,7 +19,6 @@ MAX_MINER_DIFF = 200
 GLOBAL_GLOBS = ["skills/**", "CLAUDE.md", "AGENTS.md"]
 NEVER = ["**/settings.json", "**/settings.local.json", ".github/**", ".agents/config.toml", "**/.env*"]
 ARETE_PROMPT_GLOB = f"{evals.ARETE_PROMPTS}/*.md"
-CLAUDE_CODE_GUARDED = [".claude/**", "**/.claude/**"]
 HAND_EDIT_WHY = "Claude Code denies agent writes under .claude/"
 HUMAN_EDITED_PROMPTS = ["grade", "eval_mine", "mine", "apply"]
 
