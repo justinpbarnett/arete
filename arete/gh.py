@@ -214,6 +214,10 @@ def merged_pr_names(repo: str, branch: str, text: str) -> bool:
     return bool(found)
 
 
+def pr_draft(url: str) -> None:
+    gh(["pr", "ready", url, "--undo"])
+
+
 def pr_merge_auto(repo: str, number: int) -> None:
     gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch"])
 
@@ -238,3 +242,54 @@ def repo_private(repo: str) -> bool | None:
         return bool((gh_json(["repo", "view", repo, "--json", "isPrivate"]) or {}).get("isPrivate"))
     except GhError:
         return None
+
+
+PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
+STATUS_STATES = {"success": "pass", "pending": "pending", "failure": "fail", "error": "fail"}
+
+
+@dataclass
+class Check:
+    name: str
+    state: str
+    when: str = ""
+    link: str = ""
+    job: int = 0
+    about: str = ""
+    order: int = 0
+
+
+def check_from_run(row: dict) -> Check:
+    if row.get("status") != "completed":
+        state = "pending"
+    else:
+        state = "pass" if row.get("conclusion") in PASSING_CONCLUSIONS else "fail"
+    actions = (row.get("app") or {}).get("slug") == "github-actions"
+    return Check(row["name"], state, row.get("completed_at") or row.get("started_at") or "",
+                 row.get("html_url") or row.get("details_url") or "", row["id"] if actions else 0,
+                 ((row.get("output") or {}).get("title") or "").strip(), row["id"])
+
+
+def check_from_status(row: dict) -> Check:
+    return Check(row["context"], STATUS_STATES.get(row.get("state"), "fail"), row.get("updated_at") or "",
+                 row.get("target_url") or "", 0, (row.get("description") or "").strip())
+
+
+def commit_checks(repo: str, ref: str) -> dict[str, Check]:
+    pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repo}/commits/{ref}/check-runs?per_page=100"]) or []
+    runs = sorted((check_from_run(r) for page in pages for r in page.get("check_runs", [])), key=lambda c: c.order)
+    statuses = (gh_json(["api", f"repos/{repo}/commits/{ref}/status?per_page=100"]) or {}).get("statuses", [])
+    newest: dict[str, Check] = {c.name: c for c in runs}
+    for c in map(check_from_status, statuses):
+        if c.name not in newest or c.when > newest[c.name].when:
+            newest[c.name] = c
+    return newest
+
+
+def branch_head(repo: str, branch: str) -> tuple[str, str]:
+    found = gh_json(["api", f"repos/{repo}/commits/{branch}", "--jq", "{sha: .sha, date: .commit.committer.date}"])
+    return found["sha"], found["date"]
+
+
+def job_log(repo: str, job: int) -> str:
+    return gh(["api", f"repos/{repo}/actions/jobs/{job}/logs"], timeout=300)

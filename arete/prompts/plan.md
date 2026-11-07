@@ -32,6 +32,9 @@ The builder edits files and may run only these shell commands: $commands.
 Anything else is refused: installing a package this allowlist does not cover, running a migration, calling a
 network service. If the work cannot be done within that, do not plan around it: set `ambiguous` and ask for
 exactly what a human must do first (for example, add the dependency on the base branch).
+The builder may not edit these paths either: $denied. Arete rejects a diff that touches them, so plan no edits
+there. If the work needs a change there, such as a CI workflow that asserts the old behavior, plan the rest and
+say in the plan exactly what a human must change in the PR.
 
 ## Size budget
 

@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from string import Template
 
-from . import claude, config, gh, jira, paths, state, tracker, util, verify
+from . import ci, claude, config, gh, jira, paths, state, tracker, util, verify
 from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
@@ -101,6 +101,25 @@ REVISE_SCHEMA = {
     },
     "required": ["summary", "replies"],
 }
+CI_FIX_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "checks": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "caused_by_pr": {"type": "boolean"},
+                "reason": {"type": "string"},
+            },
+            "required": ["name", "caused_by_pr", "reason"],
+        }},
+        "summary": {"type": "string"},
+    },
+    "required": ["checks", "summary"],
+}
+MAX_CI_REASON_CHARS = 700
+CI_FIX_LAST_ROUND = ("change nothing. This is the last round, so arete will not push again; it fails the run and "
+                     "turns the PRs to drafts for a person to pick up")
 FEEDBACK_QUIET_MINUTES = 10
 HUNK_LINES = 6
 PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
@@ -518,9 +537,9 @@ class Build(TicketWork):
     report: str = ""
     staged: Staged = field(default_factory=Staged)
 
-    def resume(self, step: str, text: str) -> claude.Result:
+    def resume(self, step: str, text: str, **kw) -> claude.Result:
         res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
-                             disallowed_tools=NO_GIT_WRITES, resume=self.session, timeout=self.timeout)
+                             disallowed_tools=NO_GIT_WRITES, resume=self.session, timeout=self.timeout, **kw)
         self.session = res.session
         return res
 
@@ -733,7 +752,8 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     else:
         res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                         body=t.body, comments=t.comments, attachments=attachments,
-                                        expertise=expertise, commands=commands, max_lines=limit, checks=checks),
+                                        expertise=expertise, commands=commands, denied=code_list(deny), max_lines=limit,
+                                        checks=checks),
                         ws, model=cfg.model("plan"), allowed_tools=read_tools, json_schema=PLAN_SCHEMA,
                         timeout=step_timeout)
         if not res.ok or not isinstance(res.structured, dict):
@@ -822,24 +842,7 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     )
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
-    for c in staged.changed:
-        try:
-            git(["commit", "-q", "-m", message], c.wt)
-        except RuntimeError as e:
-            return _fail(run, f"the commit in {c.github} failed, so arete pushed nothing", detail=str(e))
-    moved = [c.github for c in checkouts if remote_head(c.src, branch) != c.lease]
-    if moved:
-        return _fail(run, f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
-                     detail="Someone pushed to that branch after this run started. A retry builds on top of their work.")
-    pushed_now: list[Checkout] = []
-    for c in staged.changed:
-        try:
-            git(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch], c.wt, timeout=600)
-        except RuntimeError as e:
-            done = ", ".join(p.github for p in pushed_now) or "nothing"
-            return _fail(run, f"the push to {c.github} failed after arete pushed {done}",
-                         detail=f"{e}\n\nA retry builds on whatever reached the branch.")
-        pushed_now.append(c)
+    commit_and_push(checkouts, staged.changed, branch, message)
     opened: list[Checkout] = []
     for c in staged.changed:
         if not c.pr:
@@ -860,14 +863,17 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
             gh.pr_edit_body(c.pr, with_siblings(gh.pr_body(c.pr), others))
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
+    ci_result = watch_ci(b, branch, staged.changed, with_prs)
+    outcome += f", CI: {ci_result}"
     run.enter("pr")
     pr_lines = "\n".join(f"- {'Opened' if c in opened else 'Pushed to' if c in pushed else 'Unchanged'} [{c.pr_name}]({c.pr})"
                          for c in with_prs)
     if run.feedback:
         answer_feedback(run, replies, "Done in the latest push.")
-        run.say(f"Revised for your review.\n\n{report_body}")
+        run.say(f"Revised for your review.\n\n{report_body}\n\nCI: {ci_result}.")
     else:
-        run.say(f"PRs for this ticket:\n\n{pr_lines}" + ("" if not opened else draft_note(approved, verified)))
+        run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
+                + ("" if not opened else draft_note(approved, verified)))
     if approved and not blocked and layer.trust_level == "automerge":
         for c in opened:
             try:
@@ -880,6 +886,165 @@ def _run(cfg: config.Config, run: Run) -> tuple[str, str, str]:
     state.update_run(run.id, branch=branch)
     remove_workspace(ws, checkouts)
     return "pr", outcome, " ".join(urls)
+
+
+def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
+    for c in changed:
+        try:
+            git(["commit", "-q", "-m", message], c.wt)
+        except RuntimeError as e:
+            raise RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
+    moved = [c.github for c in checkouts if remote_head(c.src, branch) != c.lease]
+    if moved:
+        raise RunFailed(f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
+                        "Someone pushed to that branch after this run started. A retry builds on top of their work.")
+    pushed: list[Checkout] = []
+    for c in changed:
+        try:
+            git(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch], c.wt, timeout=600)
+        except RuntimeError as e:
+            done = ", ".join(p.github for p in pushed) or "nothing"
+            raise RunFailed(f"the push to {c.github} failed after arete pushed {done}",
+                            f"{e}\n\nA retry builds on whatever reached the branch.") from e
+        c.lease = git(["rev-parse", "HEAD"], c.wt).strip()
+        pushed.append(c)
+
+
+def watch_ci(b: Build, branch: str, pushed: list[Checkout], with_prs: list[Checkout]) -> str:
+    rounds: list[ci.Round] = []
+    most = b.layer.max_attempts
+    try:
+        result = ci_rounds(b, branch, pushed, rounds)
+    except RunFailed as e:
+        drafted = [c for c in with_prs if to_draft(b.run, c)]
+        if rounds:
+            now = drafted_note(drafted, with_prs)
+            publish_ci(b.run, pushed, ci.section(rounds, most, f"Arete stopped: {e.why}. {now}"))
+        raise
+    publish_ci(b.run, pushed, ci.section(rounds, most))
+    return result
+
+
+def drafted_note(drafted: list[Checkout], with_prs: list[Checkout]) -> str:
+    if drafted != with_prs:
+        return "Arete could not turn every PR to a draft."
+    return "The PR is now a draft." if len(with_prs) == 1 else "The PRs are now drafts."
+
+
+def to_draft(run: AgentRun, c: Checkout) -> bool:
+    try:
+        gh.pr_draft(c.pr)
+    except gh.GhError as e:
+        run.log(f"ci: could not turn {c.pr} to a draft: {util.first_line(str(e), 300)}")
+        return False
+    run.log(f"ci: turned {c.pr} to a draft")
+    return True
+
+
+def ci_rounds(b: Build, branch: str, pushed: list[Checkout], rounds: list[ci.Round]) -> str:
+    run, most = b.run, b.layer.max_attempts
+    targets = {c.github: ci_target(c) for c in pushed}
+    cleared: dict[tuple[str, str, str], str] = {}
+    for n in range(1, most + 1):
+        current = ci.Round(n, [ci.compare_with_base(ci.watch(t, run.log), run.log) for t in targets.values()])
+        rounds.append(current)
+        judged = [r for r in current.reds if not r.red_on_base]
+        for r in judged:
+            if r.key in cleared:
+                r.caused, r.reason = False, cleared[r.key]
+        fresh = [r for r in judged if r.key not in cleared]
+        fix_summary = judge_ci(b, fresh, n) if fresh else ""
+        cleared.update({r.key: r.reason for r in judged if not r.caused})
+        caused = current.caused
+        if not caused:
+            if fresh:
+                discard_edits(b)
+            return current.summary()
+        names = ", ".join(r.label for r in caused)
+        if n == most:
+            raise RunFailed(f"CI still fails after {util.count(most, 'round')}: {names}", ci_detail(caused))
+        if not b.restage().files:
+            raise RunFailed(f"the CI fix step said the PR caused {names} but changed nothing", ci_detail(caused))
+        b.recheck("the CI fix")
+        commit_and_push(b.checkouts, b.staged.changed, branch, ci_fix_message(b, caused))
+        for c in b.staged.changed:
+            targets[c.github] = ci_target(c)
+        current.story = f"{names} failed, caused by this PR, and arete pushed a fix: {fix_summary}".rstrip(": ")
+        run.log(f"ci: pushed a fix for {names}")
+    raise AssertionError("the CI loop returns or raises in its last round")
+
+
+def ci_target(c: Checkout) -> ci.Target:
+    return ci.Target(c.github, c.pr, c.pr_name, git(["rev-parse", "HEAD"], c.wt).strip(), c.base)
+
+
+def judge_ci(b: Build, reds: list[ci.Red], n: int) -> str:
+    run = b.run
+    logs = run.dir / "ci"
+    logs.mkdir(exist_ok=True)
+    if logs not in run.add_dirs:
+        run.add_dirs.append(logs)
+    failures = "\n\n".join(ci_failure(r, logs / f"round{n}-{slug(r.label)}.log") for r in reds)
+    diff = ", ".join(f"`git {f'-C {c.dir} ' if c.dir else ''}diff origin/{c.base}...HEAD`" for c in b.checkouts)
+    most = b.layer.max_attempts
+    when_caused = (CI_FIX_LAST_ROUND if n == most else
+                   f"fix the cause in the code. Do not weaken, skip, or delete tests, and do not change the CI setup. "
+                   f"Run the checks yourself before you finish: {check_list(b.layer)}")
+    res = b.resume(b.next_step("ci_fix"), prompt("ci_fix", round=n, max_rounds=most, failures=failures, diff=diff,
+                                                 when_caused=when_caused), json_schema=CI_FIX_SCHEMA)
+    found = res.structured if res.ok and isinstance(res.structured, dict) else {}
+    verdicts = {plain(v.get("name", "")): v for v in found.get("checks", []) if isinstance(v, dict)}
+    for r in reds:
+        v = verdicts.get(plain(r.label)) or verdicts.get(plain(r.check.name)) or {}
+        r.caused = v.get("caused_by_pr") is not False
+        r.reason = ci.clip(v.get("reason") or "The fix step gave no verdict for this check.", MAX_CI_REASON_CHARS)
+        run.log(f"ci: {r.label} {'caused' if r.caused else 'not caused'} by the PR: {util.first_line(r.reason, 200)}")
+    return ci.clip(found.get("summary", ""), MAX_CI_REASON_CHARS)
+
+
+def plain(name: str) -> str:
+    return " ".join(name.lower().split())
+
+
+def ci_failure(r: ci.Red, log_file: Path) -> str:
+    lines = [f"### {r.label}", "", f"- Link: {r.check.link or 'none'}", f"- On the base: {r.base_result}"]
+    if r.check.about:
+        lines.append(f"- GitHub says: {r.check.about}")
+    if not r.check.job:
+        return "\n".join([*lines, "- This check has no Actions log. Judge it from its name, what GitHub says, and the diff."])
+    try:
+        text = gh.job_log(r.target.github, r.check.job)
+    except gh.GhError as e:
+        return "\n".join([*lines, f"- Arete could not read its log: {util.first_line(str(e), 300)}"])
+    log_file.write_text(text)
+    return "\n".join([*lines, f"- Full log: `{log_file}`", "", "The log up to its last error:", "", "````",
+                      ci.excerpt(text), "````"])
+
+
+def discard_edits(b: Build) -> None:
+    for c in b.restage().changed:
+        git(["reset", "-q", "--hard"], c.wt)
+        b.run.log(f"ci: threw away the fix step's edits in {c.github}, since the PR caused no failure")
+
+
+def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
+    names = ", ".join(dict.fromkeys(r.check.name for r in caused))
+    subject = fill_template(b.layer.subject, config.RepoLayer.subject, kind="fix", id=b.ticket.id,
+                            title=f"make {names} pass in CI")
+    return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
+
+
+def ci_detail(reds: list[ci.Red]) -> str:
+    return "### CI\n\n" + "\n".join(f"- [{r.target.pr_name}]({r.target.pr}): {ci.linked(r.check)}. {r.reason}".rstrip()
+                                     for r in reds)
+
+
+def publish_ci(run: AgentRun, pushed: list[Checkout], ci_section: str) -> None:
+    for c in pushed:
+        try:
+            gh.pr_edit_body(c.pr, ci.with_section(gh.pr_body(c.pr), ci_section))
+        except gh.GhError as e:
+            run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
 
 def images_note(images: tracker.SavedImages) -> str:
