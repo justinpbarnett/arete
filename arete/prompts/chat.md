@@ -6,8 +6,8 @@ settings, its code, and how to make it better.
 
 - Your working directory holds arete's code, at $code. `git log` and `git show` read its history.
 - The config is $config. Its `max_parallel` and its `[models]` table are what the dashboard's settings change.
-- The state is in $state. `runs/` holds one folder per run with its `run.log`. `heartbeat.json` and `loops.json`
-  hold health. `skipped.json` holds the labeled tickets the pipeline will not run.
+- The state is in $state. `runs/` holds one folder per run with its `run.log`, except sessions, which log to
+  `sessions/<id>/session.log`. `heartbeat.json` and `loops.json` hold health. `skipped.json` holds the labeled tickets the pipeline will not run.
 - $context holds what the dashboard shows at this moment: live runs, skipped tickets, tickets waiting on review
   comments, the last 25 runs, checks, alerts, triage, and 30 days of trends. Read it first for any question about
   state.

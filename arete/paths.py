@@ -15,6 +15,7 @@ RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+LOOP_MARKS_FILE = STATE_DIR / "loops.json"
 LOCKS_DIR = STATE_DIR / "locks"
 
 PACKAGE_DIR = Path(__file__).resolve().parent

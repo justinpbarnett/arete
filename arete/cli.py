@@ -70,84 +70,115 @@ def cmd_init(args) -> int:
     return 0
 
 
-def slot_note(run_id: str, in_slots: set[str], waiting: set[str]) -> str:
-    from . import pipeline
-
-    if run_id in in_slots:
-        return ""
-    if run_id in waiting:
-        return ", waiting for a run slot"
-    return ", waiting on CI without a run slot" if pipeline.freed_slot_for_ci(run_id) else ", without a run slot"
-
-
 def cmd_status(args) -> int:
-    from . import control, pipeline, state, tracker, triage, util
+    from . import board, control
 
     cfg = config.load()
-    hb = util.read_json(paths.HEARTBEAT_FILE, {})
+    views = control.loop_views(cfg)
+    snap = board.snapshot(recent_runs=args.limit)
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     print(f"max_parallel {cfg.max_parallel}")
     print("models:" + "".join(f"\n  {role:<10} {cfg.model(role) or 'claude default'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
-    if hb:
-        bad = [c for c in hb.get("checks", []) if not c["ok"]]
-        print(f"heartbeat {hb['ts']}: {'all ok' if not bad else f'{len(bad)} failing'}")
-        for c in bad:
-            print(f"  {c['severity'].upper():<5} {c['key']:<38} {c['detail']}")
-    else:
-        print("heartbeat: never run")
-    print(serve_line())
-    marks = util.read_json(paths.STATE_DIR / "loops.json", {})
-    for v in control.loop_views(cfg):
-        failed = marks.get(v["name"], {})
-        print(f"  {loop_line(v)}" + ("" if failed.get("ok", True) else f"  FAILED {failed.get('detail', '')}"))
-    al = state.alerts()
-    if al:
-        print("open alerts:")
-        for a in al:
-            print(f"  {a['key']}  issue #{a['issue'] or '-'}  since {a['opened']}")
-    rs = state.runs(limit=args.limit)
-    if rs:
-        print("recent runs:")
-        rows = [(r["id"], r["kind"], tracker.run_ticket_name(r) if r["issue"] else (r.get("loop") or r["repo"] or ""), r["status"],
-                 f"${r['cost_usd'] or 0:.2f}", r["pr_url"] or r["summary"] or "") for r in rs]
-        widths = [max(len(row[i]) for row in rows) for i in range(5)]
-        for row in rows:
-            print(("  " + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[5])[:200])
-    mem = state.proposals(status=["memory"], limit=10)
-    if mem:
-        print("memory facts the miner noticed (file them by hand, then `arete forget ID`):")
-        for p in mem:
-            print(f"  {p['id']:<4} {p['change']}"[:200])
-    hand = state.proposals(status=["hand"], limit=10)
-    if hand:
-        print("harness fixes to make by hand, since Claude Code denies agent writes under .claude/ (then `arete forget ID`):")
-        for p in hand:
-            print(f"  {p['id']:<4} {p['repo']}/{p['file']}: {p['change']}"[:400])
-    skipped = pipeline.skipped_tickets()
-    if skipped:
-        print("labeled tickets the pipeline will not run (`arete run REPO ID --force` runs one anyway):")
-        for name, v in sorted(skipped.items()):
-            print(f"  {name:<24} {v['why']}  since {v.get('since', '')}"[:220])
-    waiting = state.feedback_waiting()
-    if waiting:
-        print(f"your PR comments waiting for a revision (a submitted review goes at once, other comments after "
-              f"{pipeline.FEEDBACK_QUIET_MINUTES} quiet minutes):")
-        for w in waiting:
-            when = "review submitted" if w["at_once"] else f"last comment {w['last']}"
-            print(f"  {tracker.run_ticket_name(w):<24} {util.count(w['n'], 'comment')}, {when}")
-    print(triage.status_line())
+    show(snap["checks"], "the heartbeat", print_checks)
+    show(snap["serve"], "the serve beat", lambda beat: print(serve_line(beat)))
+    marks = {m["name"]: m for m in snap["checks"].get("rows", {}).get("loops", [])}
+    for v in views:
+        mark = marks.get(v["name"], {})
+        print(f"  {loop_line(v)}" + ("" if mark.get("ok", True) else f"  FAILED {mark.get('detail', '')}"))
+    show(snap["alerts"], "the alerts", print_alerts)
+    show(snap["recent"], "the recent runs", print_recent)
+    show(snap["proposals"], "the miner proposals", print_proposals)
+    show(snap["skipped"], "the skipped tickets", print_skipped)
+    show(snap["waiting"], "the review feedback", print_waiting)
+    show(snap["triage"], "triage", print_triage)
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
-    live = pipeline.live_pipeline_runs()
-    in_slots = {r["id"] for r in pipeline.holding(live, "slot")}
-    slot_waiters = {r["id"] for r in pipeline.holding(live, "slot-wait")}
-    print(f"runs live: {len(live)}, in {len(in_slots)} of {cfg.max_parallel} run slots"
-          + (f", {len(slot_waiters)} waiting for one" if slot_waiters else "")
-          + "".join(f"\n  {tracker.run_ticket_name(r)}  since {r['started']}"
-                    + slot_note(r["id"], in_slots, slot_waiters) for r in live))
+    show(snap["live"], "the live runs", print_live)
     return 0
+
+
+def show(panel: dict, what: str, draw) -> None:
+    if "error" in panel:
+        print(f"{what} could not be read: {panel['error']}")
+    else:
+        draw(panel["rows"])
+
+
+def print_table(rows: list[tuple[str, ...]], width: int) -> None:
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]
+    for row in rows:
+        print(("  " + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[-1])[:width])
+
+
+def print_checks(h: dict) -> None:
+    if not h["heartbeat"]:
+        print("heartbeat: never run")
+        return
+    bad = [c for c in h["checks"] if not c["ok"]]
+    print(f"heartbeat {h['heartbeat']}: {f'{len(bad)} failing' if bad else 'all ok'}")
+    for c in bad:
+        print(f"  {c['severity'].upper():<5} {c['key']:<38} {c['detail']}")
+
+
+def print_alerts(a: dict) -> None:
+    if a["alerts"]:
+        print("open alerts:")
+    for x in a["alerts"]:
+        print(f"  {x['key']}  issue #{x['issue'] or '-'}  since {x['opened']}")
+
+
+def print_recent(runs: list[dict]) -> None:
+    if runs:
+        print("recent runs:")
+        print_table([(r["id"], r["kind"], r["ticket"], r["status"], f"${r['cost']:.2f}", r["pr_url"] or r["summary"])
+                     for r in runs], 200)
+
+
+def print_proposals(p: dict) -> None:
+    if p["memory"]:
+        print("memory facts the miner noticed (file them by hand, then `arete forget ID`):")
+    for m in p["memory"]:
+        print(f"  {m['id']:<4} {m['change']}"[:200])
+    if p["hand"]:
+        print("harness fixes to make by hand, since Claude Code denies agent writes under .claude/ (then `arete forget ID`):")
+    for h in p["hand"]:
+        print(f"  {h['id']:<4} {h['repo']}/{h['file']}: {h['change']}"[:400])
+
+
+def print_skipped(skipped: list[dict]) -> None:
+    if skipped:
+        print("labeled tickets the pipeline will not run (`arete run REPO ID --force` runs one anyway):")
+    for s in skipped:
+        print(f"  {s['ticket']:<24} {s['why']}  since {s['since']}"[:220])
+
+
+def print_waiting(w: dict) -> None:
+    from . import util
+
+    if w["tickets"]:
+        print(f"your PR comments waiting for a revision (a submitted review goes at once, other comments after "
+              f"{w['quiet_minutes']} quiet minutes):")
+    for t in w["tickets"]:
+        print(f"  {t['ticket']:<24} {util.count(t['comments'], 'comment')}, "
+              + ("review submitted" if t["at_once"] else f"last comment {t['last']}"))
+
+
+def print_triage(t: dict) -> None:
+    if not t["refreshed"]:
+        print("triage: never refreshed (`arete triage --refresh`)")
+        return
+    errors = f"; FAILED {'; '.join(t['errors'])}" if t["errors"] else ""
+    print(f"triage: {t['summary']}; refreshed {t['refreshed']}; board {t['posted']}{errors}"[:300])
+
+
+def print_live(live: dict) -> None:
+    print(f"runs live: {len(live['runs'])}, in {live['slots']} of {live['max_parallel']} run slots"
+          + (f", {live['waiting']} waiting for one" if live["waiting"] else ""))
+    if live["runs"]:
+        print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", f"${r['cost']:.2f}",
+                      r["slot"] or r["step"]) for r in live["runs"]], 200)
 
 
 def cmd_forget(args) -> int:
@@ -296,10 +327,9 @@ def when(stamp: str | None) -> str:
     return util.parse_iso(stamp).astimezone().strftime("%m-%d %H:%M") if stamp else "-"
 
 
-def serve_line() -> str:
-    from . import control, util
+def serve_line(beat: dict) -> str:
+    from . import util
 
-    beat = control.serve_beat()
     if not beat:
         return "serve: never ran; `arete install` starts it"
     if not beat["alive"]:
@@ -373,7 +403,7 @@ def cmd_loop(args) -> int:
 
     try:
         if args.action == "list":
-            print(serve_line())
+            print(serve_line(control.serve_beat()))
             for v in control.loop_views():
                 print(loop_line(v))
             return 0

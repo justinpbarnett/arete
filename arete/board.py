@@ -4,15 +4,15 @@ import re
 import statistics
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, time, timedelta
+from pathlib import Path
 
-from . import config, gh, paths, pipeline, state, tracker, triage, util
+from . import config, control, gh, paths, pipeline, state, tracker, triage, util
 
 RECENT_RUNS = 25
 TREND_DAYS = 30
 LOG_TAIL_LINES = 40
+PROPOSALS_SHOWN = 10
 LOG_PREFIX = re.compile(r"^\S+ \[[^\]]+\] ")
-STATE_OF_STATUS = {"merged": "ok", "pr": "ok", "done": "ok", "failed": "fault", "interrupted": "fault",
-                   "needs-info": "caution"}
 OUTCOME_OF_STATUS = {"merged": "shipped", "pr": "shipped", "failed": "failed"}
 STATE_OF_SEVERITY = {"fail": "fault", "warn": "caution"}
 
@@ -21,16 +21,18 @@ class NotARunId(ValueError):
     pass
 
 
-def snapshot() -> dict:
+def snapshot(recent_runs: int = RECENT_RUNS) -> dict:
     return {
         "now": util.iso(),
+        "serve": panel(control.serve_beat),
         "live": panel(live),
         "skipped": panel(skipped),
         "waiting": panel(waiting),
-        "recent": panel(lambda: [recent(r) for r in state.runs(limit=RECENT_RUNS, connect=state.reader)]),
+        "recent": panel(lambda: [recent(r) for r in state.runs(limit=recent_runs, connect=state.reader)]),
         "checks": panel(checks),
         "alerts": panel(alerts),
         "triage": panel(triage_board),
+        "proposals": panel(proposals),
     }
 
 
@@ -54,25 +56,41 @@ def seconds_between(start: str, end: str | None) -> int:
     return int((finish - util.parse_iso(start)).total_seconds())
 
 
-def log_lines(run_id: str) -> list[str]:
+def log_lines(r: dict) -> list[str]:
     try:
-        return (paths.RUNS_DIR / run_id / "run.log").read_text().splitlines()
+        return log_file(r).read_text().splitlines()
     except (FileNotFoundError, NotADirectoryError):
         return []
 
 
+def log_file(r: dict) -> Path:
+    return paths.expand(r["log"]) if r.get("log") else paths.RUNS_DIR / r["id"] / "run.log"
+
+
 def live() -> dict:
     running = state.runs_marked_running(connect=state.reader)
+    in_slots = {r["id"] for r in pipeline.holding(running, "slot")}
+    waiting_for_slot = {r["id"] for r in pipeline.holding(running, "slot-wait")}
     rows = []
     for r in running:
-        lines = log_lines(r["id"])
+        lines = log_lines(r)
         rows.append({
             "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "repo": r["repo"] or "",
             "started": r["started"], "seconds": seconds_between(r["started"], None),
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
+            "slot": slot_note(r, in_slots, waiting_for_slot),
             "cost": round(r["cost_usd"] or 0, 2),
         })
-    return {"runs": rows, "slots": len(pipeline.holding(running, "slot")), "max_parallel": config.load().max_parallel}
+    return {"runs": rows, "slots": len(in_slots), "waiting": len(waiting_for_slot),
+            "max_parallel": config.load().max_parallel}
+
+
+def slot_note(r: dict, in_slots: set[str], waiting_for_slot: set[str]) -> str:
+    if r["kind"] != "pipeline" or r["id"] in in_slots:
+        return ""
+    if r["id"] in waiting_for_slot:
+        return "waiting for a run slot"
+    return "waiting on CI without a run slot" if pipeline.freed_slot_for_ci(r["id"]) else "without a run slot"
 
 
 def skipped() -> list[dict]:
@@ -90,8 +108,7 @@ def waiting() -> dict:
 
 def recent(r: dict) -> dict:
     return {
-        "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"],
-        "state": STATE_OF_STATUS.get(r["status"], ""), "started": r["started"],
+        "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"], "started": r["started"],
         "seconds": seconds_between(r["started"], r["finished"]),
         "cost": round(r["cost_usd"] or 0, 2),
         "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
@@ -104,7 +121,7 @@ def checks() -> dict:
         "heartbeat": beat.get("ts", ""),
         "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")}
                    for c in sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))],
-        "loops": [{"name": k, **v} for k, v in sorted(util.read_json(paths.STATE_DIR / "loops.json", {}).items())],
+        "loops": [{"name": k, **v} for k, v in sorted(util.read_json(paths.LOOP_MARKS_FILE, {}).items())],
     }
 
 
@@ -119,8 +136,10 @@ def alerts() -> dict:
 
 def triage_board() -> dict:
     rows = sorted(state.triage_rows(connect=state.reader), key=lambda r: triage.natural(r["ref"]))
+    meta = util.read_json(triage.META_FILE, {})
     return {
-        "refreshed": util.read_json(triage.META_FILE, {}).get("refreshed", ""),
+        "refreshed": meta.get("refreshed", ""), "posted": meta.get("posted", ""), "errors": meta.get("errors", []),
+        "summary": triage.summary(rows),
         "groups": [{"standing": name, "rows": [{"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "",
                                                 "url": r["url"] or "", "verdict": triage.verdict(r),
                                                 "questions": r["questions"]} for r in members]}
@@ -128,10 +147,16 @@ def triage_board() -> dict:
     }
 
 
+def proposals() -> dict:
+    return {status: [{k: p[k] for k in ("id", "repo", "file", "change")}
+                     for p in state.proposals(status=[status], limit=PROPOSALS_SHOWN, connect=state.reader)]
+            for status in ("memory", "hand")}
+
+
 def run_log(run_id: str) -> list[str]:
     if not re.fullmatch(r"\w[\w.-]*", run_id):
         raise NotARunId(f"'{run_id}' is not a run id.")
-    return log_lines(run_id)[-LOG_TAIL_LINES:]
+    return log_lines(state.run_get(run_id, connect=state.reader) or {"id": run_id})[-LOG_TAIL_LINES:]
 
 
 def local_day(ts: str) -> str:

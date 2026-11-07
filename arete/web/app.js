@@ -163,11 +163,11 @@ function logButton(id) {
 
 function drawLive(snapshot) {
   fill("live-now", heading(1, "Running now"), panelParts(snapshot.live, "The live runs", (live) => [
-    el("p", { class: "readout" }, String(live.slots), el("small", { text: `of ${live.max_parallel} slots busy` })),
+    el("p", { class: "readout" }, String(live.slots), el("small", { text: `of ${live.max_parallel} slots busy${live.waiting ? `, ${live.waiting} waiting for one` : ""}` })),
     live.runs.length
       ? table("", [["Work"], ["Kind", "c-kind"], ["Started", "c-time"], ["Last step"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["", "c-log"]],
         live.runs.map((r) => el("tr", {},
-          cell(wholeWords(r.ticket)), cell(r.kind), cell(clock(r.started)), cell(r.step || "starting"),
+          cell(wholeWords(r.ticket)), cell(r.kind), cell(clock(r.started)), cell(r.slot || r.step || "starting"),
           cell(duration(r.seconds), "num"), cell(money(r.cost), "num"), cell(logButton(r.id)))))
       : quiet("Nothing is running."),
   ]));
@@ -189,7 +189,7 @@ function drawLive(snapshot) {
     panelParts(snapshot.recent, "Recent runs", (recent) => recent.length
       ? table("Newest first", [["Work"], ["Kind", "c-kind"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["Result", "c-result"], ["", "c-log"]],
         recent.map((r) => el("tr", {},
-          cell(wholeWords(r.ticket)), cell(r.kind), cell([stateChip(r.state), r.state ? " " : "", r.status], "nb"), cell(clock(r.started)),
+          cell(wholeWords(r.ticket)), cell(r.kind), cell(runStatus(r.status), "nb"), cell(clock(r.started)),
           cell(duration(r.seconds), "num"), cell(money(r.cost), "num"),
           cell(r.pr_url ? pullLinks(r.pr_url) : r.summary, "muted-cell"),
           cell(logButton(r.id)))))
@@ -494,7 +494,7 @@ async function chatAction(path, button, resultId) {
   if (answered) drawChat(answered);
 }
 
-const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", failed: "fault", interrupted: "fault", "needs-info": "caution" };
+const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 const feeds = {
   loop: { box: "loop-feed", run: "", after: 0, status: "" },
   session: { box: "session-feed", run: "", after: 0, status: "" },
@@ -533,7 +533,7 @@ function feedLine(line) {
 function runAbout(r) {
   const parts = [r.model && `${r.runner ? `${r.runner} ` : ""}${r.model}`, r.device && `on ${r.device}`,
     `started ${clock(r.started)}`, r.finished && `ended ${clock(r.finished)}`, money(r.cost_usd)].filter(Boolean);
-  return [stateChip(RUN_STATE[r.status]), RUN_STATE[r.status] ? " " : "", `${r.status} · ${parts.join(" · ")}`,
+  return [...runStatus(r.status), ` · ${parts.join(" · ")}`,
     r.status !== "running" && r.summary ? ` · ${r.summary}` : ""];
 }
 

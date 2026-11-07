@@ -637,14 +637,14 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
         )
 
 
-def proposals(status: list[str] | None = None, limit: int = 200) -> list[dict]:
+def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> list[dict]:
     q, args = "SELECT * FROM proposals", []
     if status:
         q += f" WHERE status IN ({','.join('?' * len(status))})"
         args += status
     q += " ORDER BY id DESC LIMIT ?"
     args.append(limit)
-    with db() as c:
+    with connect() as c:
         return [dict(r) for r in c.execute(q, args)]
 
 

@@ -385,14 +385,6 @@ def summary(rows: list[dict]) -> str:
     return f"{util.count(len(rows), 'ticket')}: " + ", ".join(f"{len(g[s])} {s.lower()}" for s in STANDINGS)
 
 
-def status_line() -> str:
-    meta = util.read_json(META_FILE, {})
-    if not meta.get("refreshed"):
-        return "triage: never refreshed (`arete triage --refresh`)"
-    errors = f"; FAILED {'; '.join(meta['errors'])}" if meta.get("errors") else ""
-    return f"triage: {summary(rows_now())}; refreshed {meta['refreshed']}; board {meta.get('posted', '')}{errors}"[:300]
-
-
 def board() -> str:
     meta = util.read_json(META_FILE, {})
     rows = rows_now()

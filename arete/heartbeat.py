@@ -142,7 +142,7 @@ def check_serve() -> list[Check]:
 def check_loops(cfg: config.Config) -> list[Check]:
     from . import loops
 
-    beats = util.read_json(paths.STATE_DIR / "loops.json", {})
+    beats = util.read_json(paths.LOOP_MARKS_FILE, {})
     out = []
     for loop in loops.load_all(cfg):
         if not loop.enabled or loop.error or not loop.stale_hours or loop.name == os.environ.get("ARETE_LOOP"):
@@ -164,10 +164,9 @@ def check_loops(cfg: config.Config) -> list[Check]:
 
 
 def mark_loop(name: str, ok: bool, detail: str = "") -> None:
-    f = paths.STATE_DIR / "loops.json"
-    beats = util.read_json(f, {})
+    beats = util.read_json(paths.LOOP_MARKS_FILE, {})
     beats[name] = {"ts": util.iso(), "ok": ok, "detail": detail[:200]}
-    util.write_json(f, beats)
+    util.write_json(paths.LOOP_MARKS_FILE, beats)
 
 
 def network_up_or_skip(loop: str, dry_run: bool) -> bool:
