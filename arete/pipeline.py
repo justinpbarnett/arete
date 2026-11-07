@@ -423,9 +423,9 @@ def is_lockfile(name: str) -> bool:
     return Path(name).name in LOCKFILES
 
 
-def staged_line_counts(wt: Path) -> list[tuple[str, int | None]]:
+def staged_line_counts(wt: Path, against: str = "HEAD") -> list[tuple[str, int | None]]:
     out = []
-    for row in git(["diff", "--cached", "--numstat", "--no-renames"], wt).splitlines():
+    for row in git(["diff", "--cached", "--numstat", "--no-renames", against], wt).splitlines():
         parts = row.split("\t")
         if len(parts) == 3:
             added, deleted, name = parts

@@ -46,7 +46,8 @@ def run(
     if tools is not None:
         cmd += ["--tools", ",".join(tools)]
     if allowed_tools:
-        cmd += ["--allowedTools", *(allowed_tools if remote else scoped_to([cwd, *add_dirs], allowed_tools))]
+        roots = [remote_root(cwd)] if remote else local_roots([cwd, *add_dirs])
+        cmd += ["--allowedTools", *scoped_to(roots, allowed_tools)]
     cmd += ["--disallowedTools", GIT_WRITES_TO_ANY_PATH, *(disallowed_tools or [])]
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
@@ -122,12 +123,22 @@ def run(
     )
 
 
-def scoped_to(folders: list[Path | str], rules: list[str]) -> list[str]:
-    roots = dict.fromkeys(p for f in folders for p in (Path(f).absolute(), Path(f).resolve()))
+def local_roots(folders: list[Path | str]) -> list[str]:
+    return list(dict.fromkeys(f"/{p}" for f in folders for p in (Path(f).absolute(), Path(f).resolve())))
+
+
+def remote_root(folder: Path | str) -> str:
+    text = str(folder).rstrip("/") or "/"
+    if text.startswith("/"):
+        return f"/{text}"
+    return text if text == "~" or text.startswith("~/") else f"~/{text}"
+
+
+def scoped_to(roots: list[str], rules: list[str]) -> list[str]:
     scoped = []
     for rule in rules:
         family = PATH_RULE_OF.get(rule)
-        scoped += [f"{family}(/{root}/**)" for root in roots] if family else [rule]
+        scoped += [f"{family}({root}/**)" for root in roots] if family else [rule]
     return list(dict.fromkeys(scoped))
 
 

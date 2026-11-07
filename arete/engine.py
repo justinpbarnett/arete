@@ -15,7 +15,19 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, devices, emits, gh, loops, paths, runner, sources, state, util
+from . import (
+    config,
+    devices,
+    emits,
+    gh,
+    loops,
+    paths,
+    pipeline,
+    runner,
+    sources,
+    state,
+    util,
+)
 from .agent import Result
 from .loops import Loop
 from .pipeline import NO_GIT_WRITES
@@ -53,6 +65,10 @@ class Workspace:
     branch: str
     base: str
     github: str
+    start: str
+    deny: list[str]
+    max_diff_lines: int
+    public: bool
 
 
 @dataclass
@@ -84,9 +100,9 @@ class LoopRun:
         if self.loop.budget_usd:
             limits.append(("run budget", self.loop.budget_usd - self.spent()))
         if self.loop.daily_budget_usd:
-            limits.append(("daily loop budget", self.loop.daily_budget_usd - state.spent_since(day_ago, self.loop.name)))
+            limits.append(("daily loop budget", self.loop.daily_budget_usd - state.loop_spent_since(day_ago, self.loop.name)))
         if self.cfg.daily_budget_usd:
-            limits.append(("daily budget for all loops", self.cfg.daily_budget_usd - state.spent_since(day_ago)))
+            limits.append(("daily budget for all loops", self.cfg.daily_budget_usd - state.loop_spent_since(day_ago)))
         if not limits:
             return None
         name, left = min(limits, key=lambda x: x[1])
@@ -116,6 +132,13 @@ def feed_stdin(proc: subprocess.Popen, text: str) -> None:
         pass
 
 
+def kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, device: devices.Device,
                 stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
     local = not device.remote
@@ -123,12 +146,13 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
         argv = [sys.executable, "-m", "arete.cli", *argv[1:]]
     full = devices.wrap(device, argv, cwd, env)
     proc = subprocess.Popen(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, env={**os.environ, **env} if local else None)
+                            stderr=subprocess.STDOUT, text=True, env={**os.environ, **env} if local else None,
+                            start_new_session=True)
     expired = threading.Event()
 
     def stop_at_deadline() -> None:
         expired.set()
-        proc.kill()
+        kill_group(proc)
 
     timer = threading.Timer(timeout, stop_at_deadline)
     timer.start()
@@ -149,23 +173,24 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
                 lines.append(note)
     finally:
         timer.cancel()
+        if proc.poll() is None:
+            kill_group(proc)
     return 124 if expired.is_set() else proc.returncode, "".join(lines)
 
 
-def repo_of(loop: Loop, cfg: config.Config) -> tuple[Path, str]:
+def loop_repo(loop: Loop, cfg: config.Config) -> config.Repo:
     for r in cfg.repos:
         if r.name == loop.repo:
-            return r.path, r.github
+            return r
     path = paths.expand(loop.repo)
-    url = util.git(["remote", "get-url", "origin"], path, check=False).strip()
-    m = GITHUB_REMOTE.search(url)
-    return path, m.group(1) if m else ""
+    m = GITHUB_REMOTE.search(util.git(["remote", "get-url", "origin"], path, check=False).strip())
+    return config.Repo(name=loop.repo, path=path, github=m.group(1) if m else "")
 
 
 def work_dir(run: LoopRun) -> Path | str:
     if run.device.remote:
         return run.device.dir
-    return repo_of(run.loop, run.cfg)[0] if run.loop.repo else run.loop.dir
+    return loop_repo(run.loop, run.cfg).path if run.loop.repo else run.loop.dir
 
 
 def from_loop_folder(argv: list[str], loop: Loop) -> list[str]:
@@ -386,9 +411,10 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     if loop.fed_by_events and not events and not loop.script:
         return "skipped", "no events to read"
     run.log("start", f"{util.count(len(events), 'event')} in" if events else "start")
+    arrived = len(events)
     events = classify(run, events)
-    if loop.fed_by_events and not events:
-        return "done", "the classifier passed no events"
+    if arrived and not events:
+        return "skipped", f"the classifier passed none of {util.count(arrived, 'event')}"
     memory = state.loop_state(loop.name)["data"]
     res = run.agent("watch", watch_prompt(run, events, memory), work_dir(run), tools=loop.tools,
                     json_schema=WATCH_SCHEMA)
@@ -401,12 +427,14 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
         state.set_loop_state(loop.name, data=answer["state"])
     summary = util.first_line(answer.get("summary") or "", 300)
     outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events) if events else "internal"}
-    emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+    if fresh or any(e["type"] == "metric" for e in loop.emits):
+        emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", f"{summary} ({util.count(len(fresh), 'new finding')}, {len(found) - len(fresh)} seen before)"
 
 
 def open_workspace(run: LoopRun) -> Workspace:
-    src, github = repo_of(run.loop, run.cfg)
+    repo = loop_repo(run.loop, run.cfg)
+    src, github = repo.path, repo.github
     if "origin" in util.git(["remote"], src, check=False).split():
         base = gh.default_branch(github) if github else "main"
         util.git(["fetch", "origin", base], src)
@@ -418,7 +446,10 @@ def open_workspace(run: LoopRun) -> Workspace:
     wt = paths.WORKTREES_DIR / f"loop-{run.id}"
     util.git(["worktree", "add", "-q", "-b", branch, str(wt), start], src)
     run.log("start", f"worktree {paths.short_path(wt)} on {branch} from {start}")
-    return Workspace(src, wt, branch, base, github)
+    layer = config.load_layer(repo.layer_dir)
+    public = repo.public or (bool(github) and gh.repo_private(github) is not True)
+    return Workspace(src, wt, branch, base, github, start=util.git(["rev-parse", "HEAD"], wt).strip(),
+                     deny=pipeline.denied_paths(layer), max_diff_lines=layer.max_diff_lines, public=public)
 
 
 def close_workspace(ws: Workspace, keep_branch: bool) -> None:
@@ -433,8 +464,19 @@ def changed_paths(wt: Path) -> list[str]:
 
 
 def revert(wt: Path) -> None:
-    util.git(["checkout", "--", "."], wt, check=False)
+    util.git(["reset", "-q", "--hard"], wt, check=False)
     util.git(["clean", "-fdq"], wt, check=False)
+
+
+def broken_limit(ws: Workspace) -> str:
+    util.git(["add", "-A", "--", ".", *pipeline.NEVER_STAGED], ws.wt)
+    rows = pipeline.staged_line_counts(ws.wt, against=ws.start)
+    if denied := [name for name, _ in rows if util.matches_any(name, ws.deny)]:
+        return f"touched denied {', '.join(denied[:5])}"
+    lines = sum(n for name, n in rows if n and not pipeline.is_lockfile(name))
+    if lines > ws.max_diff_lines:
+        return f"{lines} lines changed since {ws.base}, over the {ws.max_diff_lines} line limit"
+    return ""
 
 
 def commit(wt: Path, message: str) -> None:
@@ -475,6 +517,9 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     if files and (outside := [p for p in changed if not util.matches_any(p, files)]):
         revert(ws.wt)
         return "", f"{idea} (thrown away: touched {', '.join(outside[:5])})"
+    if over := broken_limit(ws):
+        revert(ws.wt)
+        return "", f"{idea} (thrown away: {over})"
     return idea, ""
 
 
@@ -501,6 +546,8 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
             try:
                 idea, why_not = try_once(run, ws, i, goal + f" Best so far: {best:g}.", history, files)
             except OverBudget as e:
+                if i == 1:
+                    raise
                 run.log("budget", f"stopped before try {i}: {e}")
                 break
             if not idea:
@@ -522,7 +569,8 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
             return "done", f"no try beat the baseline {baseline:g}"
         summary = f"{spec['measure']}: {baseline:g} -> {best:g}"
         outcome = {"value": best, "branch": ws.branch, "base": ws.base, "workdir": str(ws.src), "github": ws.github,
-                   "summary": summary, "title": f"{run.loop.name}: {baseline:g} -> {best:g}",
+                   "public": ws.public, "facts": summary, "summary": summary,
+                   "title": f"{run.loop.name}: {baseline:g} -> {best:g}",
                    "report": f"Climbed `{spec['measure']}` from {baseline:g} to {best:g}.\n\n" + "\n".join(history)}
         emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
         return "done", summary
@@ -545,6 +593,8 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             try:
                 idea, why_not = try_once(run, ws, i, goal, history, files)
             except OverBudget as e:
+                if i == 1:
+                    raise
                 run.log("budget", f"stopped before try {i}: {e}")
                 break
             if not idea:
@@ -562,10 +612,12 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             history.append(f"- try {i}: miss, exit {code}: {util.last_line(text, 200)}: {idea}")
             run.log("miss", f"try {i}: exit {code}: {idea}")
         if not hit:
-            return "done", f"no hit in {len(history) - 1} tries"
+            return "done", f"no hit in {util.count(len(history) - 1, 'try', 'tries')}"
         summary = f"`{spec['check']}` passes: {history[-1][2:]}"
         outcome = {"value": len(history) - 1, "branch": ws.branch, "base": ws.base, "workdir": str(ws.src),
-                   "github": ws.github, "summary": summary, "title": f"{run.loop.name}: {history[-1].split(': ', 2)[-1]}",
+                   "github": ws.github, "public": ws.public, "summary": summary,
+                   "facts": f"`{spec['check']}` passes after {util.count(len(history) - 1, 'try', 'tries')}",
+                   "title": f"{run.loop.name}: {history[-1].split(': ', 2)[-1]}",
                    "report": f"Searched for a change that makes `{spec['check']}` pass.\n\n" + "\n".join(history)}
         emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
         return "done", summary

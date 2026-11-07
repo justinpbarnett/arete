@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, control, devices, loops, paths, runner, settings, state, util
+from . import config, control, devices, loops, paths, pi, runner, settings, state, util
 from .agent import NO_SESSION, Session
 from .pipeline import NO_GIT_WRITES
 
@@ -107,21 +107,25 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     tools = list(SESSION_TOOLS if tools is None else tools)
     check_choices(device, model, run_with, tools)
     cfg = config.load()
-    spec = Spec(new_id(), prompt, device or "local", model.strip() or cfg.model("session"), run_with, tools,
-                repo.strip(), budget_usd, created=util.iso())
+    model = model.strip() or cfg.model("session")
+    which, name = runner.route(model, run_with)
+    off = pi.withheld(tools, devices.get(device or "local").remote) if which == "pi" else {}
+    tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
+    spec = Spec(new_id(), prompt, device or "local", model, run_with, tools, repo.strip(), budget_usd,
+                created=util.iso())
     workspace(spec, cfg)
     save_spec(spec)
-    which, name = runner.route(spec.model, spec.runner)
     state.start_run(spec.id, "session", repo=spec.repo or None)
     state.update_run(spec.id, device=spec.device, model=name, runner=which, trigger="manual",
                      log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"),
                      summary=util.first_line(prompt, 200), branch=spec.branch or None)
     state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}; tools "
-                                     f"{', '.join(tools) or 'none'}")
+                                     f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
+                                                                for reason, withheld in off.items()))
     proc = control.detach(["session", "exec", spec.id], SESSION_LOG)
     state.update_run(spec.id, pid=proc.pid)
     return {"id": spec.id, "cwd": spec.cwd, "branch": spec.branch, "model": name, "runner": which,
-            "device": spec.device}
+            "device": spec.device, "tools": tools}
 
 
 def send(session_id: str, text: str) -> dict:

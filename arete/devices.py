@@ -81,10 +81,6 @@ def resolve(device: Device | str) -> Device:
     return device if isinstance(device, Device) else get(device)
 
 
-def is_local(device: Device | str) -> bool:
-    return not resolve(device).remote
-
-
 def ssh_argv(d: Device) -> list[str]:
     argv = ["ssh", *SSH_OPTIONS]
     if d.port:

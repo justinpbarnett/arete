@@ -135,11 +135,15 @@ def command_events(loop: Loop, source: dict, cfg: config.Config, sid: str) -> li
         raise RuntimeError(f"exit {res.returncode}: {util.first_line(res.stderr or res.stdout, 300)}")
     out = []
     for line in res.stdout.splitlines():
-        if line.strip().startswith("{"):
+        if not line.strip().startswith("{"):
+            continue
+        try:
             row = json.loads(line)
-            out.append(event(row.get("type", "command"), sid, row.get("key") or row.get("title"), row.get("title", ""),
-                             repo=row.get("repo", loop.repo), url=row.get("url", ""),
-                             trust=source.get("trust", "internal"), data=row.get("data") or {}))
+        except json.JSONDecodeError:
+            continue
+        out.append(event(row.get("type", "command"), sid, row.get("key") or row.get("title"), row.get("title", ""),
+                         repo=row.get("repo", loop.repo), url=row.get("url", ""),
+                         trust=source.get("trust", "internal"), data=row.get("data") or {}))
     return out
 
 

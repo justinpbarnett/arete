@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, cron, paths
+from . import config, cron, devices, paths, pi, runner
 
 ENGINE_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -258,6 +258,9 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append(f"runner '{loop.runner}' is not claude or pi")
     if unknown := sorted(set(loop.tools) - KNOWN_TOOLS):
         problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
+    if loop.agent and runner.route(loop.model_for(cfg), loop.runner)[0] == "pi":
+        problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
+                     for reason, tools in pi.withheld(loop.tools, loop.device != devices.LOCAL.name).items()]
     if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - READING_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")

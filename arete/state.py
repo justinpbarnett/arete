@@ -12,11 +12,11 @@ OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url !=
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,            -- pipeline | miner | eval | loop | session
+    kind TEXT NOT NULL,            -- pipeline | miner | eval | draft | loop | session
     repo TEXT,
     issue INTEGER,
     status TEXT NOT NULL,          -- running | pr | needs-info | skipped | noop | dry-run | failed | interrupted
-                                   -- | superseded | merged | rejected | done
+                                   -- | superseded | merged | rejected | done | stopped
     started TEXT NOT NULL,
     finished TEXT,
     attempts INTEGER DEFAULT 0,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS feed (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
     ts TEXT,
-    kind TEXT,                     -- start | step | event | skip | finding | emit | held | try | state | error | end
+    kind TEXT,
     text TEXT
 );
 CREATE INDEX IF NOT EXISTS feed_run ON feed (run_id, id);
@@ -572,8 +572,9 @@ def take_messages(run_id: str) -> list[str]:
         return [r["text"] for r in rows]
 
 
-def spent_since(since: str, loop: str | None = None) -> float:
-    q = "SELECT COALESCE(SUM(s.cost_usd), 0) FROM steps s LEFT JOIN runs r ON r.id = s.run_id WHERE s.ts >= ?"
+def loop_spent_since(since: str, loop: str | None = None) -> float:
+    q = ("SELECT COALESCE(SUM(s.cost_usd), 0) FROM steps s JOIN runs r ON r.id = s.run_id "
+         "WHERE s.ts >= ? AND r.kind = 'loop'")
     args: list = [since]
     if loop:
         q += " AND r.loop = ?"

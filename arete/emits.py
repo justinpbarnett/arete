@@ -29,13 +29,9 @@ FINDING_SCHEMA = {
 }
 
 
-class Held(Exception):
-    pass
-
-
 def plain(text, n: int) -> str:
     text = LINKS.sub(r"\1", TAGS.sub("", str(text or "")))
-    return alerts._SECRETISH.sub("[redacted]", FENCE.sub("'''", text)).strip()[:n]
+    return alerts.redact(FENCE.sub("'''", text)).strip()[:n]
 
 
 def ticket_body(loop: Loop, run_id: str, f: dict, trust: str) -> str:
@@ -65,10 +61,13 @@ def render(loop: Loop, run_id: str, spec: dict, payload: dict) -> dict:
                 "body": ticket_body(loop, run_id, f, payload.get("trust", "")),
                 "labels": list(spec.get("labels", ["agent"]))}
     if kind == "pr":
+        public = outcome.get("public", True)
+        title = f"{loop.name}: {outcome.get('facts', '')}" if public else \
+            outcome.get("title") or f"{loop.name}: {outcome.get('summary', '')}"
+        told = outcome.get("facts", "") if public else outcome.get("report")
         return {"repo": outcome.get("github", ""), "branch": outcome.get("branch", ""), "base": outcome.get("base", ""),
-                "workdir": outcome.get("workdir", ""), "title": plain(spec.get("title") or outcome.get("title")
-                                                                      or f"{loop.name}: {outcome.get('summary', '')}", 120),
-                "body": gh.marked(f"Made by the `{loop.name}` loop, run `{run_id}`.\n\n{plain(outcome.get('report'), 6000)}"),
+                "workdir": outcome.get("workdir", ""), "title": plain(spec.get("title") or title, 120),
+                "body": gh.marked(f"Made by the `{loop.name}` loop, run `{run_id}`.\n\n{plain(told, 6000)}"),
                 "draft": bool(spec.get("draft", True)), "labels": list(spec.get("labels", []))}
     if kind == "digest":
         lines = [f"## {util.now().astimezone().strftime('%H:%M')} {loop.name} ({run_id})", ""]
@@ -149,7 +148,7 @@ def batches(kind: str, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [findings] if outcome.get("branch") else []
     if kind == "metric":
         return [findings]
-    return [findings] if findings or outcome.get("summary") else []
+    return [findings] if findings or outcome.get("branch") else []
 
 
 def describe(kind: str, item: dict) -> str:
@@ -173,6 +172,9 @@ def approve(approval_id: int, yes: bool, cfg: config.Config | None = None) -> st
     if not state.decide_approval(approval_id, "approved" if yes else "rejected"):
         raise ValueError(f"approval #{approval_id} is already {row['status']}")
     if not yes:
+        item = row["emit"]["item"]
+        if row["emit"]["type"] == "pr" and item.get("workdir"):
+            util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
         return "rejected"
     try:
         done = execute(row["emit"]["type"], row["emit"]["item"], row["loop"], row["run_id"], cfg or config.load())

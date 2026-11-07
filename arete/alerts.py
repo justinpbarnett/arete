@@ -6,12 +6,15 @@ import sys
 from . import gh, state, util
 
 LABEL = "arete-alert"
-_SECRETISH = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
+SECRETISH = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
+
+
+def redact(text: str) -> str:
+    return SECRETISH.sub("[redacted]", text)
 
 
 def sanitize(text: str, n: int = 200) -> str:
-    text = util.first_line(text, n)
-    return _SECRETISH.sub("[redacted]", text)
+    return redact(util.first_line(text, n))
 
 
 def notify(title: str, message: str) -> None:

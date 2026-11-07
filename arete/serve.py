@@ -7,10 +7,11 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NoReturn
 
-from . import config, control, dashboard, loops, sources, state, util
+from . import config, control, dashboard, loops, paths, sources, state, util
 from .loops import Loop
 
 TICK_SECONDS = 20
@@ -59,6 +60,15 @@ def settle_dead_runs() -> list[str]:
     return settled
 
 
+@dataclass
+class Child:
+    proc: subprocess.Popen
+    loop: str
+    queue: str
+    group: str
+    item: int
+
+
 class Server:
     def __init__(self) -> None:
         self.cfg = config.load()
@@ -66,7 +76,8 @@ class Server:
         self.polls: dict[str, Future] = {}
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
-        self.children: dict[str, tuple[subprocess.Popen, str, str, str]] = {}
+        self.children: dict[str, Child] = {}
+        self.restarted: Counter[int] = Counter()
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
         self.loaded = False
         self.pruned = 0.0
@@ -170,12 +181,27 @@ class Server:
     def running(self) -> dict[str, tuple[str, str, str]]:
         out = {r["id"]: (r["loop"], r["queue"] or r["loop"], r["grp"] or "")
                for r in state.runs_marked_running() if r["kind"] == "loop"}
-        for run_id, (proc, name, queue, group) in list(self.children.items()):
-            if proc.poll() is not None:
+        for run_id, child in list(self.children.items()):
+            if child.proc.poll() is not None:
                 del self.children[run_id]
+                self.requeue_if_never_started(run_id, child.item)
             else:
-                out.setdefault(run_id, (name, queue, group))
+                out.setdefault(run_id, (child.loop, child.queue, child.group))
         return out
+
+    def requeue_if_never_started(self, run_id: str, item_id: int) -> None:
+        item = state.queue_item(item_id)
+        if not item or item["run_id"] != run_id or state.run_get(run_id):
+            return
+        log = paths.short_path(paths.LOG_DIR / control.DETACHED_LOG)
+        if self.restarted[item_id]:
+            state.drop_queue_item(item_id)
+            self.say(f"{item['loop']}: dropped queue item {item_id}, `loop exec` died twice before it started; see {log}")
+            return
+        self.restarted[item_id] += 1
+        state.take_queue_item(item_id, None)
+        self.say(f"{item['loop']}: queue item {item_id} goes back in the queue, `loop exec` died before it started; "
+                 f"see {log}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
         running = self.running()
@@ -197,7 +223,7 @@ class Server:
             run_id = state.new_loop_run_id(loop.name)
             state.take_queue_item(item["id"], run_id)
             proc = control.detach(["loop", "exec", loop.name, "--fire", str(item["id"]), "--run-id", run_id])
-            self.children[run_id] = (proc, loop.name, item["queue"], item["grp"])
+            self.children[run_id] = Child(proc, loop.name, item["queue"], item["grp"], item["id"])
             busy_loops.add(loop.name)
             per_queue[item["queue"]] += 1
             if item["grp"]:

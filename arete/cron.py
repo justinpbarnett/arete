@@ -34,9 +34,6 @@ class Cron:
             return dom and dow
         return dom or dow
 
-    def matches(self, t: datetime) -> bool:
-        return self.day_matches(t) and t.hour in self.hours and t.minute in self.minutes
-
     def next_after(self, t: datetime) -> datetime:
         t = t.replace(second=0, microsecond=0) + timedelta(minutes=1)
         limit = t + timedelta(days=SEARCH_DAYS)
@@ -85,8 +82,3 @@ def seconds(text: str | float) -> float:
     if not m:
         raise BadSchedule(f"every '{text}' needs a number and a unit: 30s, 5m, 1h, 1d")
     return float(m.group(1)) * UNITS[m.group(2)]
-
-
-def due(cron: Cron, last: datetime, now: datetime) -> datetime | None:
-    nxt = cron.next_after(last)
-    return nxt if nxt <= now else None

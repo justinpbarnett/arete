@@ -431,7 +431,7 @@ def cmd_loop(args) -> int:
             if d["webhook_path"]:
                 print(f"  webhook POST {d['webhook_path']}")
             for c in d["cursors"]:
-                print(f"  source {c['source']}: {'ok' if c['ok'] else 'FAILING'} {c['note'] or ''} at {when(c['at'])}")
+                print(f"  source {c['source']}: {'ok' if c['ok'] else 'FAILING'} {c['detail'] or ''} at {when(c['polled'])}")
             if d["waiting"]:
                 print(f"  waiting: {util.count(len(d['waiting']), 'firing')}")
             if d["state"]:
@@ -490,7 +490,7 @@ def cmd_session(args) -> int:
             s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
                                 tools=tools, repo=args.repo, budget_usd=args.budget)
             print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
-                  + (f" on {s['branch']}" if s["branch"] else ""))
+                  + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
             if not args.attach:
                 print(f"`arete session attach {s['id']}` follows it and sends what you type")
                 return 0
