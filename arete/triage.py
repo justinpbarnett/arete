@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import alerts, config, gh, jira, paths, runner, state, tracker, util
 from .heartbeat import mark_loop, network_up_or_skip
-from .pipeline import READ_TOOLS, prompt
+from .pipeline import prompt
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
@@ -213,8 +213,8 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate) -> tuple[dic
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-    res = runner.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage"), tools=READ_TOOLS,
-                     allowed_tools=READ_TOOLS, mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA,
+    res = runner.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage"), tools=runner.READ_TOOLS,
+                     allowed_tools=runner.READ_TOOLS, mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA,
                      max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
                      trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None

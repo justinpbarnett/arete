@@ -32,7 +32,6 @@ from . import (
 )
 from .agent import Result
 from .loops import Loop
-from .pipeline import NO_GIT_WRITES
 
 NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:e-?\d+)?")
 KNOWN_FINDINGS_SHOWN = 30
@@ -125,12 +124,11 @@ class LoopRun:
         left = self.room()
         res = runner.run(prompt, cwd, model=model or self.loop.model_for(self.cfg), runner=self.loop.runner,
                          trace=(self.id, step), cfg=self.cfg, tools=tools, allowed_tools=tools,
-                         disallowed_tools=NO_GIT_WRITES, max_budget_usd=left, persist=False,
+                         disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left, persist=False,
                          timeout=self.loop.timeout_minutes * 60, device=self.device, **kw)
         record.note(self.id, model=res.model, runner=res.runner)
-        note = f"({res.turns} turns, ${res.cost_usd:.2f})"
-        self.log("step" if res.ok else "error",
-                 f"{step}: {res.runner} {res.model} {note}" + ("" if res.ok else f" failed: {res.error}"))
+        self.log("step" if res.ok else "error", f"{step}: {res.runner} {res.model} {runner.cost_note(res)}"
+                 + ("" if res.ok else f" failed: {res.error.strip()}"))
         return res
 
 

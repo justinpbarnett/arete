@@ -6,7 +6,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import alerts, claude, config, install, paths, state, util
+from . import alerts, config, install, paths, runner, state, util
 
 
 @dataclass
@@ -84,18 +84,8 @@ def check_probes(cfg: config.Config, force: bool = False) -> list[Check]:
 
 
 def check_claude_auth() -> list[Check]:
-    st = claude.auth_status()
-    if not st.get("loggedIn"):
-        return [Check("claude:auth", False, "claude CLI is not logged in")]
-    exp = st.get("loginExpiresAt")
-    if not exp:
-        return [Check("claude:auth", True, "logged in")]
-    days = (util.parse_iso(exp) - util.now()).total_seconds() / 86400
-    if days < 0:
-        return [Check("claude:auth", False, "login expired; run `claude auth login`")]
-    if days < 7:
-        return [Check("claude:auth", False, f"login expires in {days:.1f} days; run `claude auth login`")]
-    return [Check("claude:auth", True, f"login good for {days:.0f} days")]
+    ok, detail = runner.claude_login()
+    return [Check("claude:auth", ok, detail)]
 
 
 def check_hook() -> list[Check]:

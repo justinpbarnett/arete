@@ -13,16 +13,13 @@ from .agent import NO_SESSION, Result, Session, json_from_text
 
 TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": ("ls",), "Edit": ("edit",),
             "MultiEdit": ("edit",), "Write": ("write",), "Bash": ("bash",)}
-READ_ONLY = ("read", "grep", "find", "ls")
 WRITING = {"edit", "write", "bash"}
 SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 PI_HOME = paths.HOME / ".pi"
 SCHEMA_RULE = ("Reply with only one JSON value that matches this JSON schema, in a ```json fence, and nothing after "
                "it:\n\n{schema}")
 WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
-NO_BASH_REASON = "pi cannot hold the rules that stop git writes"
 NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
-WRITING_TOOLS = ("Edit", "MultiEdit", "Write")
 
 
 def binary() -> str:
@@ -46,16 +43,6 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
 
 def can_confine(remote: bool) -> bool:
     return not remote and sys.platform == "darwin" and bool(shutil.which("sandbox-exec"))
-
-
-def withheld(tools: list[str], remote: bool) -> dict[str, list[str]]:
-    reasons: dict[str, list[str]] = {}
-    for tool in tools:
-        if tool == "Bash":
-            reasons.setdefault(NO_BASH_REASON, []).append(tool)
-        elif tool in WRITING_TOOLS and not can_confine(remote):
-            reasons.setdefault(NO_CONFINEMENT_REASON, []).append(tool)
-    return reasons
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path]) -> list[str]:

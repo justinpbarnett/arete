@@ -11,9 +11,7 @@ from . import (
     config,
     control,
     devices,
-    loops,
     paths,
-    pi,
     record,
     runner,
     settings,
@@ -21,10 +19,9 @@ from . import (
     util,
 )
 from .agent import NO_SESSION, Session
-from .pipeline import NO_GIT_WRITES
 
 SESSIONS_DIR = paths.STATE_DIR / "sessions"
-SESSION_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
+SESSION_TOOLS = [*runner.EDIT_TOOLS, "Bash"]
 TURN_TIMEOUT_SECONDS = 3600
 INBOX_POLL_SECONDS = 2
 SESSION_LOG = "sessions.log"
@@ -106,7 +103,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     if not prompt:
         raise control.Refused("a session needs a first message")
     tools = list(SESSION_TOOLS if tools is None else tools)
-    if problems := loops.agent_problems(run_with, tools):
+    if problems := runner.agent_problems(run_with, tools):
         raise control.Refused("; ".join(problems))
     if budget_usd is not None and budget_usd <= 0:
         raise control.Refused("the budget is a number of dollars above zero, or none for no limit")
@@ -117,7 +114,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     target = device_named(device)
     work_repo = repo_named(repo, target, cfg)
     which, name = runner.route(model, run_with)
-    off = pi.withheld(tools, target.remote) if which == "pi" else {}
+    off = runner.withheld(model, run_with, tools, target.remote)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
                 budget_usd, created=util.iso())
@@ -176,11 +173,11 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
             return resume
     res = runner.run(prompt, spec.cwd, model=spec.model, runner=spec.runner, trace=(spec.id, f"turn {turn}"),
                      resume=resume, cfg=cfg, device=device, tools=spec.tools, allowed_tools=spec.tools,
-                     disallowed_tools=NO_GIT_WRITES, max_budget_usd=left, timeout=TURN_TIMEOUT_SECONDS)
+                     disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left, timeout=TURN_TIMEOUT_SECONDS)
     record.note(spec.id, model=res.model, runner=res.runner)
-    note = f"({res.turns} turns, ${res.cost_usd:.2f})"
+    note = runner.cost_note(res)
     log_line(spec, "reply" if res.ok else "error", (res.text.strip() or "(no text)") + f"\n{note}" if res.ok
-             else f"{res.error} {note}")
+             else f"{res.error.strip()} {note}")
     return res.session if res.session.id else resume
 
 
@@ -240,5 +237,5 @@ def choices() -> dict:
     fleet = devices.known()
     return {"devices": [d.name for d in fleet], "remote_devices": [d.name for d in fleet if d.remote],
             "repos": [r.name for r in cfg.repos], "models": models, "runners": list(runner.RUNNERS),
-            "tools": sorted(loops.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
+            "tools": sorted(runner.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
             "idle_hours": cfg.session_idle_hours}

@@ -7,14 +7,11 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, cron, devices, paths, pi, runner, util
+from . import config, cron, devices, paths, runner, util
 
 ENGINE_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
 KINDS = ("command", "watch", "climb", "search")
-READING_TOOLS = {"Read", "Glob", "Grep", "LS"}
-KNOWN_TOOLS = READING_TOOLS | {"Edit", "MultiEdit", "Write", "Bash"}
-EDITING_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"]
 SOURCE_TYPES = ("github", "jira", "log", "command")
 METRIC_RULE = re.compile(r"^\s*([\w.\-/]+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?)\s*$")
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -80,7 +77,7 @@ class Loop:
     script: list[str] = field(default_factory=list)
     model: str = ""
     runner: str = ""
-    tools: list[str] = field(default_factory=lambda: ["Read", "Glob", "Grep"])
+    tools: list[str] = field(default_factory=lambda: list(runner.READ_TOOLS))
     device: str = "local"
     timeout_minutes: float = 30
     budget_usd: float | None = None
@@ -216,7 +213,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         script=as_argv(run.get("script")),
         model=str(run.get("model", "")),
         runner=str(run.get("runner", "")),
-        tools=list(run.get("tools", EDITING_TOOLS if kind in ("climb", "search") else ["Read", "Glob", "Grep"])),
+        tools=list(run.get("tools", runner.EDIT_TOOLS if kind in ("climb", "search") else runner.READ_TOOLS)),
         device=str(run.get("device", "local")),
         timeout_minutes=float(run.get("timeout_minutes", 30)),
         budget_usd=float(run["budget_usd"]) if run.get("budget_usd") else None,
@@ -261,15 +258,6 @@ def metric_rule(text: str) -> tuple[str, str, float]:
     return m.group(1), m.group(2), float(m.group(3))
 
 
-def agent_problems(run_with: str, tools: list[str]) -> list[str]:
-    problems = []
-    if run_with and run_with not in runner.RUNNERS:
-        problems.append(f"runner '{run_with}' is not one of {', '.join(runner.RUNNERS)}")
-    if unknown := sorted(set(tools) - KNOWN_TOOLS):
-        problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
-    return problems
-
-
 def validate(loop: Loop, cfg: config.Config) -> None:
     from .emits import EMITS
     from .sources import metric_event
@@ -287,16 +275,16 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("a command loop needs [run] command")
     if loop.agent and not loop.prompt_file.is_file():
         problems.append(f"a {loop.kind} loop needs prompt.md")
-    problems += agent_problems(loop.runner, loop.tools)
+    problems += runner.agent_problems(loop.runner, loop.tools)
     try:
         remote = devices.get(loop.device).remote
     except devices.DeviceError as e:
         problems.append(str(e))
         remote = False
-    if loop.agent and runner.route(loop.model_for(cfg), loop.runner)[0] == "pi":
+    if loop.agent:
         problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
-                     for reason, tools in pi.withheld(loop.tools, remote).items()]
-    if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - READING_TOOLS)):
+                     for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, remote).items()]
+    if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")
     if loop.kind == "climb" and not loop.climb.get("measure"):

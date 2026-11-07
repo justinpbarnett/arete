@@ -8,13 +8,10 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, gh, paths, record, state, tracker, util, verify
+from . import config, gh, paths, record, runner, state, tracker, util, verify
 from .heartbeat import mark_loop
 from .pipeline import (
-    EDIT_TOOLS,
-    NO_GIT_WRITES,
     PLAN_SCHEMA,
-    READ_TOOLS,
     AgentRun,
     Checkout,
     RunFailed,
@@ -296,7 +293,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                         body=task.prompt, comments="", attachments="", expertise=expertise,
                                         commands=commands, denied=code_list(denied_paths(layer)),
                                         max_lines=layer.max_diff_lines, checks=checks),
-                        wt, model=cfg.model("plan"), allowed_tools=READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
+                        wt, model=cfg.model("plan"), allowed_tools=runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
                         json_schema=PLAN_SCHEMA, timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
             result["why"] = "plan step failed"
@@ -304,13 +301,13 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
-        tools = EDIT_TOOLS + bash_rules(layer.builder_bash)
+        tools = runner.BUILD_TOOLS + bash_rules(layer.builder_bash)
         res = run.agent("build", prompt("build", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name,
                                          title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
                                          expertise=expertise, checks=checks, commands=commands,
                                          max_lines=layer.max_diff_lines, estimate=estimate,
                                          verify=in_use),
-                        wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=NO_GIT_WRITES, timeout=timeout)
+                        wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES, timeout=timeout)
         if not res.ok:
             result["why"] = "build step failed"
             return result
@@ -320,7 +317,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
             attempts += 1
             res = run.agent(f"fix{attempts}", prompt("fix", prompts.dir, attempt=attempts, max_attempts=layer.max_attempts,
                                                      failures=report),
-                            wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=NO_GIT_WRITES,
+                            wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES,
                             resume=session, timeout=timeout)
             session = res.session
             ok, report = run_checks(layer, wt, [wt], run, timeout)

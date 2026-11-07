@@ -19,7 +19,6 @@ from typing import TextIO
 
 from . import (
     ci,
-    claude,
     config,
     gh,
     jira,
@@ -31,6 +30,7 @@ from . import (
     util,
     verify,
 )
+from .agent import Result, Session
 from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
@@ -159,12 +159,6 @@ PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
 PR_SEEN_SETTLE = timedelta(minutes=1)
 REJECTED_PR_LISTEN = timedelta(days=7)
 UAT_TRIES = 3
-READ_TOOLS = ["Read", "Glob", "Grep"]
-EDIT_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "TodoWrite"]
-NO_GIT_WRITES = [
-    "Bash(git commit*)", "Bash(git push*)", "Bash(git reset*)", "Bash(git checkout*)",
-    "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
-]
 
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
@@ -198,10 +192,6 @@ def fill_template(template: str, default: str, **values) -> str:
         return default.format(**values)
 
 
-def cost_note(res: claude.Result) -> str:
-    return f"({res.turns} turns, ${res.cost_usd:.2f})"
-
-
 @dataclass
 class AgentRun:
     id: str
@@ -230,14 +220,14 @@ class AgentRun:
         p = self.dir / name
         p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
 
-    def agent(self, step: str, text: str, cwd: Path, **kw) -> claude.Result:
+    def agent(self, step: str, text: str, cwd: Path, **kw) -> Result:
         self.log(f"{step}: starting")
         res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
         if res.connection_failed:
-            self.log(f"{step}: lost the connection after {res.turns} turns, waiting for the network")
+            self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
             if util.wait_for_network():
                 self.cost += res.cost_usd
-                self.log(f"{step}: the network is back, the dropped attempt cost {cost_note(res)}")
+                self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                 if res.session.id and res.turns > 1 and kw.get("persist", True):
                     res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
                                      **{**kw, "resume": res.session})
@@ -247,7 +237,7 @@ class AgentRun:
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
-        self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} {cost_note(res)}")
+        self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} {runner.cost_note(res)}")
         return res
 
 
@@ -596,15 +586,15 @@ class Build(TicketWork):
     tools: list[str]
     deny: list[str]
     expertise: str
-    session: claude.Session = field(default_factory=claude.Session)
+    session: Session = field(default_factory=Session)
     report: str = ""
     staged: Staged = field(default_factory=Staged)
     committed_lines: int = 0
     left_for_a_person: str = ""
 
-    def resume(self, step: str, text: str, **kw) -> claude.Result:
+    def resume(self, step: str, text: str, **kw) -> Result:
         res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
-                             disallowed_tools=NO_GIT_WRITES, resume=self.session, timeout=self.timeout, **kw)
+                             disallowed_tools=runner.NO_GIT_WRITES, resume=self.session, timeout=self.timeout, **kw)
         self.session = res.session
         return res
 
@@ -807,8 +797,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     commands = code_list(builder_bash)
     workspace = workspace_note(branch, checkouts)
     step_timeout = layer.timeout_minutes * 60
-    read_tools = READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
-    build_tools = EDIT_TOOLS + bash_rules(builder_bash)
+    read_tools = runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
+    build_tools = runner.BUILD_TOOLS + bash_rules(builder_bash)
     deny = denied_paths(layer)
     limit = layer.max_diff_lines
     info = tk.label_name("needs-info")
@@ -826,7 +816,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                          body=t.body, comments=t.comments, attachments=attachments,
                                          feedback=feedback, expertise=expertise, checks=checks,
                                          commands=commands, max_lines=limit),
-                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
+                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA, timeout=step_timeout)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "revise step failed", res.text)
@@ -865,7 +855,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
                                          expertise=expertise, checks=checks, commands=commands, max_lines=limit,
                                          estimate=estimate, verify=goal),
-                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=NO_GIT_WRITES,
+                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES,
                         timeout=step_timeout)
         if not res.ok:
             return _fail(run, "build step failed", res.text)
@@ -1378,7 +1368,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
                                    diff=util.tail(b.staged.diff, MAX_DIFF_IN_PROMPT)),
-                      b.ws, model=b.cfg.model("review"), allowed_tools=READ_TOOLS + bash_rules(b.read_bash),
+                      b.ws, model=b.cfg.model("review"), allowed_tools=runner.READ_TOOLS + bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA, timeout=b.timeout)
     if not res.ok or not isinstance(res.structured, dict):
         return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
@@ -1428,8 +1418,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
                                          surface=surface_note(v, url, evidence), notes=v.notes,
                                          commands=code_list(bash), checks=check_list(b.layer), **values),
                             b.ws, model=b.cfg.model("verify"),
-                            allowed_tools=READ_TOOLS + bash_rules(bash) + (["mcp__playwright"] if url else []),
-                            disallowed_tools=NO_GIT_WRITES, json_schema=verify.SCHEMA, timeout=b.timeout,
+                            allowed_tools=runner.READ_TOOLS + bash_rules(bash) + (["mcp__playwright"] if url else []),
+                            disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA, timeout=b.timeout,
                             mcp_config=verify.mcp_config(evidence) if url else "")
     except verify.ServerError as e:
         run.log(f"{step}: the app did not start")
@@ -1508,7 +1498,7 @@ def _learn(cfg, run: AgentRun, wt: Path, expertise_file: Path, title: str, exper
     res = run.agent("learn", prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
                                      story="\n\n".join(run.story), expertise=expertise,
                                      max_lines=EXPERTISE_MAX_LINES),
-                    wt, model=cfg.model("learn"), allowed_tools=READ_TOOLS, json_schema=LEARN_SCHEMA,
+                    wt, model=cfg.model("learn"), allowed_tools=runner.READ_TOOLS, json_schema=LEARN_SCHEMA,
                     timeout=900, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     rewrite = found.get("expertise", "").strip()
@@ -1679,7 +1669,7 @@ def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
                        for url in urls)
     res = run.agent("uat", prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
                                   prs=prs, branch=branch),
-                    run.repo.path, model=cfg.model("uat"), allowed_tools=READ_TOOLS, json_schema=UAT_SCHEMA,
+                    run.repo.path, model=cfg.model("uat"), allowed_tools=runner.READ_TOOLS, json_schema=UAT_SCHEMA,
                     timeout=600, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     steps = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]

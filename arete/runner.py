@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
 
-from . import claude, config, devices, pi, record
+from . import claude, config, devices, pi, record, util
 from .agent import NO_SESSION, Result, Session
 
 RUNNERS = ("claude", "pi")
 BUDGET_FLOOR_USD = 0.005
+READ_TOOLS = ["Read", "Glob", "Grep"]
+EDIT_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"]
+BUILD_TOOLS = [*EDIT_TOOLS, "TodoWrite"]
+READ_ONLY_TOOLS = frozenset({*READ_TOOLS, "LS"})
+WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write"})
+KNOWN_TOOLS = READ_ONLY_TOOLS | WRITING_TOOLS | {"Bash"}
+NO_GIT_WRITES = [
+    "Bash(git commit*)", "Bash(git push*)", "Bash(git reset*)", "Bash(git checkout*)",
+    "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
+]
+PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
+LOGIN_WARNING_DAYS = 7
 
 
 def route(model: str, runner: str = "") -> tuple[str, str]:
@@ -22,6 +35,49 @@ def route(model: str, runner: str = "") -> tuple[str, str]:
 
 def provider_of(model: str) -> str:
     return model.split("/", 1)[0] if "/" in model else ""
+
+
+def agent_problems(run_with: str, tools: list[str]) -> list[str]:
+    problems = []
+    if run_with and run_with not in RUNNERS:
+        problems.append(f"runner '{run_with}' is not one of {', '.join(RUNNERS)}")
+    if unknown := sorted(set(tools) - KNOWN_TOOLS):
+        problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
+    return problems
+
+
+def withheld(model: str, run_with: str, tools: list[str], remote: bool) -> dict[str, list[str]]:
+    if route(model, run_with)[0] != "pi":
+        return {}
+    reasons: dict[str, list[str]] = {}
+    for tool in tools:
+        if tool == "Bash":
+            reasons.setdefault(PI_HOLDS_NO_BASH_RULES, []).append(tool)
+        elif tool in WRITING_TOOLS and not pi.can_confine(remote):
+            reasons.setdefault(pi.NO_CONFINEMENT_REASON, []).append(tool)
+    return reasons
+
+
+def claude_login() -> tuple[bool, str]:
+    res = util.sh([claude.binary(), "auth", "status"], timeout=30)
+    try:
+        status = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return False, f"claude auth status failed: {util.first_line(res.stderr or res.stdout) or f'exit {res.returncode}'}"
+    if not status.get("loggedIn"):
+        return False, "claude CLI is not logged in"
+    if not status.get("loginExpiresAt"):
+        return True, "logged in"
+    days = (util.parse_iso(status["loginExpiresAt"]) - util.now()).total_seconds() / 86400
+    if days < 0:
+        return False, "login expired; run `claude auth login`"
+    if days < LOGIN_WARNING_DAYS:
+        return False, f"login expires in {days:.1f} days; run `claude auth login`"
+    return True, f"login good for {days:.0f} days"
+
+
+def cost_note(res: Result) -> str:
+    return f"({util.count(res.turns, 'turn')}, ${res.cost_usd:.2f})"
 
 
 def priced(res: Result, cfg: config.Config) -> float:

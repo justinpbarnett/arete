@@ -9,7 +9,6 @@ from string import Template
 
 from . import (
     auditor,
-    claude,
     config,
     evals,
     gh,
@@ -23,7 +22,6 @@ from . import (
 from .heartbeat import mark_loop
 from .pipeline import (
     CLAUDE_CODE_GUARDED,
-    READ_TOOLS,
     make_worktree,
     prompt,
     remove_worktree,
@@ -377,7 +375,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
             f"### {i + 1}. `{p['file']}`\n\nChange: {p['change']}\n\nWhy: {p['why']}" for i, p in enumerate(props)
         )
         res = runner.run(prompt("apply", proposals=text), wt, model=cfg.model("apply"),
-                         allowed_tools=list(claude.FILE_TOOLS), timeout=1200, persist=False, trace=(run_id, "apply"))
+                         allowed_tools=runner.EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
         if not res.ok:
             return "", []
         git(["add", "-A"], wt)
@@ -465,7 +463,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     run_dir = paths.RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(text)
-    res = runner.run(text, mine_repos[0].path, model=cfg.model("miner"), allowed_tools=READ_TOOLS,
+    res = runner.run(text, mine_repos[0].path, model=cfg.model("miner"), allowed_tools=runner.READ_TOOLS,
                      json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]],
                      trace=(run_id, "mine"))
     (run_dir / "result.json").write_text(json.dumps({"ok": res.ok, "cost": res.cost_usd, "structured": res.structured,

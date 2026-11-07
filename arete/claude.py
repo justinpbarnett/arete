@@ -10,7 +10,6 @@ from . import devices, util
 from .agent import NO_SESSION, Result, Session, json_from_text
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
-FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")
 PATH_RULE_OF = {"Read": "Read", "Glob": "Read", "Grep": "Read", "LS": "Read", "Edit": "Edit", "MultiEdit": "Edit",
                 "Write": "Edit", "NotebookEdit": "Edit"}
 GIT_WRITES_TO_ANY_PATH = "Bash(git * --output*)"
@@ -140,11 +139,3 @@ def scoped_to(roots: list[str], rules: list[str]) -> list[str]:
         family = PATH_RULE_OF.get(rule)
         scoped += [f"{family}({root}/**)" for root in roots] if family else [rule]
     return list(dict.fromkeys(scoped))
-
-
-def auth_status() -> dict:
-    res = util.sh([binary(), "auth", "status"], timeout=30)
-    try:
-        return json.loads(res.stdout)
-    except json.JSONDecodeError:
-        return {"loggedIn": False, "error": util.first_line(res.stderr or res.stdout)}
