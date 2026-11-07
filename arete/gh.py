@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 from . import util
 
-
 ARETE_MARK = "<!-- arete -->"
 
 

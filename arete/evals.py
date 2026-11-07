@@ -518,8 +518,8 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
         return aliases.setdefault(repo.name, f"private repo {len(aliases) + 1}") if hidden(repo) else repo.name
 
     main_label = arms["main"].label
-    lines = [f"Prompt evals: each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and "
-             f"once with this branch's. Changed: {code_list(changed)}.", ""]
+    lines = [(f"Prompt evals: each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and "
+              f"once with this branch's. Changed: {code_list(changed)}."), ""]
     if ran:
         lines += [f"| suite | `{main_label}` | this branch | tasks that changed |", "|---|---|---|---|"]
         for repo, result in ran:

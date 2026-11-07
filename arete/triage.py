@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import alerts, claude, config, gh, jira, paths, state, tracker, util
@@ -41,7 +41,7 @@ SCHEMA = {
     "required": ["asks_for", "ready", "questions", "size", "repo", "plan", "why"],
 }
 WAITING = f"waiting: more than {MAX_CALLS} tickets were due in one refresh"
-EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
+EARLIEST = datetime.min.replace(tzinfo=UTC)
 READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED = "Ready", "With questions", "Not code work", "Not triaged"
 STANDINGS = (READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED)
 
@@ -193,7 +193,7 @@ def moment(ts: str) -> datetime:
         when = jira.parse_time(ts)
     except ValueError:
         return EARLIEST
-    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+    return when if when.tzinfo else when.replace(tzinfo=UTC)
 
 
 def natural(ref: str) -> list:
