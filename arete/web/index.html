@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Arete · Dashboard</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/pattern.css">
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
@@ -64,13 +65,9 @@
       </div>
     </div>
     <h3>Models</h3>
-    <p class="muted">Each role takes opus, sonnet, haiku, or a full claude model id.</p>
+    <p class="muted" id="model-hint"></p>
     <div class="fields" id="model-fields"></div>
-    <datalist id="model-names">
-      <option value="opus"></option>
-      <option value="sonnet"></option>
-      <option value="haiku"></option>
-    </datalist>
+    <datalist id="model-names"></datalist>
     <div class="actions">
       <button type="submit" id="settings-save">Save</button>
       <button type="button" id="settings-undo">Undo changes</button>
@@ -81,9 +78,22 @@
 
 <section data-view="chat" hidden>
   <h2><span class="n">01</span>Console</h2>
-  <p>Ask about runs, health, cost, settings, or arete's own code. It reads and advises, and it files an issue on arete when you ask it to.</p>
+  <p>Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here.</p>
   <div id="messages" aria-live="polite"></div>
   <p id="working" class="muted" hidden></p>
+  <div id="draft" class="draft" hidden>
+    <h3>Drafted issue</h3>
+    <p class="muted">Nothing reaches GitHub until you file it.</p>
+    <dl>
+      <dt>Title</dt><dd id="draft-title"></dd>
+      <dt>Body</dt><dd><pre id="draft-body"></pre></dd>
+    </dl>
+    <div class="actions">
+      <button type="button" id="draft-file">File this issue</button>
+      <button type="button" id="draft-drop">Drop</button>
+    </div>
+    <p id="draft-result" aria-live="polite" hidden></p>
+  </div>
   <form id="chat" novalidate>
     <div class="field">
       <label for="chat-text">Message</label>
@@ -101,7 +111,7 @@
 </main>
 
 <footer>
-  <p>Arete · served from the Mac to its owner on the tailnet · <a href="https://github.com/justinpbarnett/arete">Source</a></p>
+  <p>Arete · served from this machine to its owner on the tailnet</p>
 </footer>
 
 </div>

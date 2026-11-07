@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import stat
 
 from . import config, paths, util
 
@@ -16,18 +17,19 @@ class Refused(ValueError):
 
 def current() -> dict:
     cfg = config.load()
-    return {"max_parallel": cfg.max_parallel, "parallel_max": PARALLEL_MAX,
-            "models": {role: cfg.model(role) for role in config.MODEL_ROLES}}
+    return {"max_parallel": cfg.max_parallel, "parallel_max": PARALLEL_MAX, "aliases": MODEL_ALIASES,
+            "models": {role: cfg.models.get(role, "") for role in config.MODEL_ROLES},
+            "defaults": {role: config.MODEL_FALLBACKS.get(role, "") for role in config.MODEL_ROLES}}
 
 
-def not_this(text: str) -> str:
+def instead_of(text: str) -> str:
     return f", not '{util.first_line(text, 40)}'." if text else "."
 
 
 def parallel_from(value) -> int:
     text = str(value).strip()
     if isinstance(value, bool) or not text.isdigit() or not 1 <= int(text) <= PARALLEL_MAX:
-        raise Refused(f"Runs at once takes a whole number from 1 to {PARALLEL_MAX}{not_this(text)}")
+        raise Refused(f"Runs at once takes a whole number from 1 to {PARALLEL_MAX}{instead_of(text)}")
     return int(text)
 
 
@@ -35,26 +37,36 @@ def model_from(role, value) -> str:
     if role not in config.MODEL_ROLES:
         raise Refused(f"'{util.first_line(str(role), 40)}' is not a model role arete reads.")
     text = str(value).strip()
-    if text not in MODEL_ALIASES and not MODEL_ID.fullmatch(text):
-        raise Refused(f"The {role.replace('_', ' ')} model takes opus, sonnet, haiku or a claude model id{not_this(text)}")
+    if text and text not in MODEL_ALIASES and not MODEL_ID.fullmatch(text):
+        raise Refused(f"The {role.replace('_', ' ')} model takes opus, sonnet, haiku, a claude model id, "
+                      f"or nothing for its default{instead_of(text)}")
     return text
 
 
 def save(values: dict) -> dict:
     wanted_parallel = parallel_from(values["max_parallel"]) if "max_parallel" in values else None
-    wanted_models = {role: model_from(role, m) for role, m in (values.get("models") or {}).items()}
+    models = values.get("models") or {}
+    if not isinstance(models, dict):
+        raise Refused("Models takes an object that maps each role to its model.")
+    wanted_models = {role: model_from(role, m) for role, m in models.items()}
     with util.lock("config", wait=True):
         lines = paths.CONFIG_FILE.read_text().splitlines(keepends=True)
         if wanted_parallel is not None:
             set_key(lines, None, "max_parallel", str(wanted_parallel))
         for role, model in wanted_models.items():
-            set_key(lines, "models", role, f'"{model}"')
+            if model:
+                set_key(lines, "models", role, f'"{model}"')
+            else:
+                drop_key(lines, "models", role)
         replace_config("".join(lines), wanted_parallel, wanted_models)
     return current()
 
 
 def replace_config(text: str, wanted_parallel: int | None, wanted_models: dict[str, str]) -> None:
     draft = paths.CONFIG_FILE.with_suffix(".toml.tmp")
+    mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
+    draft.touch(mode=mode)
+    draft.chmod(mode)
     draft.write_text(text)
     try:
         cfg = config.load(draft)
@@ -62,7 +74,7 @@ def replace_config(text: str, wanted_parallel: int | None, wanted_models: dict[s
         draft.unlink()
         raise Refused(f"The new config would not load ({util.first_line(str(e), 120)}), so config.toml is unchanged.") from e
     if (wanted_parallel is not None and cfg.max_parallel != wanted_parallel) or any(
-            cfg.models.get(role) != model for role, model in wanted_models.items()):
+            cfg.models.get(role, "") != model for role, model in wanted_models.items()):
         draft.unlink()
         raise Refused("The new config read back other values than the ones saved, so config.toml is unchanged.")
     draft.replace(paths.CONFIG_FILE)
@@ -73,15 +85,24 @@ def set_key(lines: list[str], table: str | None, key: str, value: str) -> None:
     if start is None:
         lines += ["\n" if lines and lines[-1].strip() else "", f"[{table}]\n", f"{key} = {value}\n"]
         return
-    key_line = re.compile(rf"(\s*{re.escape(key)}\s*=\s*)[^#\r\n]*?(\s*(?:#[^\r\n]*)?)(\r?\n?)\Z")
     for i in range(start, end):
-        if m := key_line.match(lines[i]):
+        if m := key_line(key).match(lines[i]):
             lines[i] = f"{m.group(1)}{value}{m.group(2)}{m.group(3)}"
             return
     last = max((i for i in range(start, end) if lines[i].strip()), default=start - 1)
     if last >= 0 and not lines[last].endswith("\n"):
         lines[last] += "\n"
     lines.insert(last + 1, f"{key} = {value}\n")
+
+
+def drop_key(lines: list[str], table: str | None, key: str) -> None:
+    start, end = table_span(lines, table)
+    if start is not None:
+        lines[start:end] = [line for line in lines[start:end] if not key_line(key).match(line)]
+
+
+def key_line(key: str) -> re.Pattern:
+    return re.compile(rf"(\s*{re.escape(key)}\s*=\s*)[^#\r\n]*?(\s*(?:#[^\r\n]*)?)(\r?\n?)\Z")
 
 
 def table_span(lines: list[str], table: str | None) -> tuple[int | None, int]:

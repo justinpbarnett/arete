@@ -260,12 +260,12 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 
 `arete dashboard` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet. It listens only on the machine's tailnet addresses. A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends. `arete install` adds it as the launchd job `com.arete.dashboard`, which launchd starts again when it stops, and the default config has the heartbeat watch it.
 
-- Live: the runs going now, with the last log line and the cost so far, the queue, and the last 25 runs. A run's full log opens below the table.
+- Live: the runs going now, with their start time, the last log line and the cost so far; the labeled tickets the pipeline skips; the tickets waiting on review comments; and the last 25 runs. A run's log opens below the table.
 - Health: the heartbeat checks, the probes, the loops, and the open alerts.
 - Triage: the triage board, with each ticket's questions folded under it.
-- Trends: 30 days of runs and cost by day, and of runs, pass rate, median time and cost by repo.
-- Settings: `max_parallel` and the model for each role in `[models]`. A save changes only the lines that changed in `config.toml`, and refuses a value arete cannot use.
-- Chat: a console agent on the `chat` model. It reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues. It never edits a file. Ask it for a change and it drafts an issue, which the dashboard files on arete's repo. One message costs at most $2, and its reply shows what it cost. Messages continue one session until New chat.
+- Trends: 30 days of runs and cost by day, of runs, pass rate, median time and cost by repo, and of eval pass rate by repo.
+- Settings: `max_parallel` and the model for each role in `[models]`. A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use. An empty model removes its line, so the role goes back to its default.
+- Chat: a console agent on the `chat` model. It reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues. It never edits a file. Ask it for a change and it drafts an issue. The draft shows under the chat, and nothing reaches GitHub until you press File this issue (Drop discards it). Each call to the model stops at $2, and each reply shows what it cost. Messages continue one session until New chat.
 
 ## Rules
 

@@ -9,9 +9,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import NoReturn
 from urllib.parse import unquote, urlsplit
 
-from . import board, chat, config, paths, settings, util
+from . import board, chat, config, gh, paths, settings, util
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 STATIC = {
@@ -89,6 +90,14 @@ class Refusal(Exception):
         self.status = status
 
 
+STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502}
+
+
+def refusal_status(e: Exception) -> int | None:
+    return e.status if isinstance(e, Refusal) else next(
+        (status for kind, status in STATUS_OF_REFUSAL.items() if isinstance(e, kind)), None)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "arete"
     sys_version = ""
@@ -106,9 +115,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and path in STATIC:
                 return self.send_static(*STATIC[path])
             self.send_json(200, self.api(method, path))
-        except Refusal as r:
-            self.send_json(r.status, {"error": str(r)})
         except Exception as e:
+            if status := refusal_status(e):
+                return self.send_json(status, {"error": str(e)})
             self.log_error("%s", f"{type(e).__name__}: {e}")
             self.send_json(500, {"error": util.first_line(f"{type(e).__name__}: {e}", 300)})
 
@@ -132,45 +141,32 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/chat":
                 return chat.view()
             if path.startswith(LOG_PATH):
-                return self.log_tail(unquote(path[len(LOG_PATH):]))
+                run_id = unquote(path[len(LOG_PATH):])
+                return {"id": run_id, "lines": board.run_log(run_id)}
         if method == "POST":
             if path == "/api/settings":
-                return self.save_settings()
+                return settings.save(self.body())
             if path == "/api/chat":
-                return self.send_chat()
+                return chat.send(self.chat_text())
             if path == "/api/chat/new":
-                return self.new_chat()
+                return chat.new()
+            if path == "/api/chat/file":
+                return chat.file_draft()
+            if path == "/api/chat/drop":
+                return chat.drop_draft()
         raise Refusal(404, f"Nothing at {method} {path}.")
 
-    def log_tail(self, run_id: str) -> dict:
-        try:
-            return {"id": run_id, "lines": board.run_log(run_id)}
-        except ValueError as e:
-            raise Refusal(400, str(e)) from e
-
-    def save_settings(self) -> dict:
-        try:
-            return settings.save(self.body())
-        except settings.Refused as e:
-            raise Refusal(400, str(e)) from e
-
-    def send_chat(self) -> dict:
+    def chat_text(self) -> str:
         text = str(self.body().get("text", "")).strip()
         if not text:
             raise Refusal(400, "Write a message first.")
-        try:
-            return chat.send(text)
-        except chat.Busy as e:
-            raise Refusal(409, str(e)) from e
-
-    def new_chat(self) -> dict:
-        try:
-            return chat.new()
-        except chat.Busy as e:
-            raise Refusal(409, str(e)) from e
+        return text
 
     def body(self) -> dict:
-        size = int(self.headers.get("Content-Length") or 0)
+        length = (self.headers.get("Content-Length") or "0").strip()
+        if not length.isdigit():
+            raise Refusal(400, "Content-Length takes a whole number of bytes.")
+        size = int(length)
         if size > MAX_BODY:
             raise Refusal(413, f"A request body holds at most {MAX_BODY // 1024} KB.")
         try:
@@ -229,7 +225,7 @@ def say(text: str) -> None:
     print(f"{util.iso()} {text}", flush=True)
 
 
-def serve(port: int | None = None) -> int:
+def serve(port: int | None = None) -> NoReturn:
     cfg = config.load()
     port = port or cfg.dashboard_port
     chat.settle_after_restart()

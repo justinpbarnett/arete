@@ -87,9 +87,9 @@ def run(
             cmd, cwd=str(cwd), input=prompt, capture_output=True, text=True, timeout=timeout, env=env, check=False
         )
     except subprocess.TimeoutExpired:
-        return Result(ok=False, error=f"timed out after {timeout}s")
+        return Result(ok=False, session=resume, error=f"timed out after {timeout}s")
     except FileNotFoundError as e:
-        return Result(ok=False, error=f"claude not found: {e}")
+        return Result(ok=False, session=resume, error=f"claude not found: {e}")
 
     out = proc.stdout.strip()
     data: dict = {}
@@ -108,19 +108,19 @@ def run(
             except json.JSONDecodeError:
                 pass
     if not data:
-        return Result(ok=False, error=util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500))
+        return Result(ok=False, session=resume, error=util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500))
 
     structured = data.get("structured_output")
     if structured is None and json_schema:
         structured = _json_from_text(data.get("result", ""))
     is_error = bool(data.get("is_error")) or data.get("subtype", "success") != "success"
-    session_spent = float(data.get("total_cost_usd") or 0)
+    session = Session(data["session_id"], float(data.get("total_cost_usd") or 0)) if data.get("session_id") else resume
     return Result(
         ok=not is_error and proc.returncode == 0,
         text=data.get("result", "") or "",
-        session=Session(data.get("session_id", ""), session_spent),
+        session=session,
         structured=structured,
-        cost_usd=max(0.0, session_spent - resume.spent_usd),
+        cost_usd=max(0.0, session.spent_usd - resume.spent_usd),
         turns=int(data.get("num_turns") or 0),
         error=(data.get("result", "") if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",

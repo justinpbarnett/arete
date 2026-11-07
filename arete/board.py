@@ -1,41 +1,37 @@
 from __future__ import annotations
 
-import json
 import re
 import statistics
-from collections import defaultdict
-from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+from datetime import UTC, datetime, time, timedelta
 
-from . import config, paths, pipeline, state, tracker, triage, util
+from . import config, gh, paths, pipeline, state, tracker, triage, util
 
 RECENT_RUNS = 25
 TREND_DAYS = 30
 LOG_TAIL_LINES = 40
-STEP_COST = re.compile(r"\(\d+ turns?, \$([\d.]+)\)")
 LOG_PREFIX = re.compile(r"^\S+ \[[^\]]+\] ")
-SHIPPED = {"pr", "merged"}
 STATE_OF_STATUS = {"merged": "ok", "pr": "ok", "done": "ok", "failed": "fault", "interrupted": "fault",
                    "needs-info": "caution"}
+OUTCOME_OF_STATUS = {"merged": "shipped", "pr": "shipped", "failed": "failed"}
 STATE_OF_SEVERITY = {"fail": "fault", "warn": "caution"}
-RUNNING = "SELECT * FROM runs WHERE status = 'running' ORDER BY started"
-LATEST = "SELECT * FROM runs ORDER BY started DESC LIMIT ?"
+
+
+class NotARunId(ValueError):
+    pass
 
 
 def snapshot() -> dict:
-    cfg = config.load()
     return {
         "now": util.iso(),
-        "live": panel(lambda: live(cfg, rows_of(RUNNING))),
-        "queue": panel(queue),
-        "recent": panel(lambda: [recent(r) for r in rows_of(LATEST, RECENT_RUNS)]),
-        "health": panel(lambda: health(cfg)),
+        "live": panel(live),
+        "skipped": panel(skipped),
+        "waiting": panel(waiting),
+        "recent": panel(lambda: [recent(r) for r in state.runs(limit=RECENT_RUNS, connect=state.reader)]),
+        "checks": panel(checks),
+        "alerts": panel(alerts),
         "triage": panel(triage_board),
     }
-
-
-def rows_of(query: str, *args) -> list[dict]:
-    with state.reader() as db:
-        return [dict(r) for r in db.execute(query, args)]
 
 
 def panel(read) -> dict:
@@ -43,6 +39,10 @@ def panel(read) -> dict:
         return {"rows": read()}
     except Exception as e:
         return {"error": util.first_line(f"{type(e).__name__}: {e}", 300)}
+
+
+def outcome(status: str) -> str:
+    return OUTCOME_OF_STATUS.get(status, "other")
 
 
 def ticket(r: dict) -> str:
@@ -61,11 +61,8 @@ def log_lines(run_id: str) -> list[str]:
         return []
 
 
-def logged_cost(lines: list[str]) -> float:
-    return round(sum(float(m.group(1)) for line in lines if (m := STEP_COST.search(line))), 2)
-
-
-def live(cfg: config.Config, running: list[dict]) -> dict:
+def live() -> dict:
+    running = state.runs_marked_running(connect=state.reader)
     rows = []
     for r in running:
         lines = log_lines(r["id"])
@@ -73,20 +70,21 @@ def live(cfg: config.Config, running: list[dict]) -> dict:
             "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "repo": r["repo"] or "",
             "started": r["started"], "seconds": seconds_between(r["started"], None),
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
-            "cost": logged_cost(lines),
+            "cost": pipeline.logged_cost(lines),
         })
     in_slots = sum(1 for r in running if r["kind"] == "pipeline")
-    return {"runs": rows, "slots": in_slots, "max_parallel": cfg.max_parallel}
+    return {"runs": rows, "slots": in_slots, "max_parallel": config.load().max_parallel}
 
 
-def queue() -> dict:
-    with state.reader() as db:
-        waiting = [dict(r) for r in db.execute(state.FEEDBACK_WAITING)]
+def skipped() -> list[dict]:
+    return [{"ticket": name, "why": v["why"], "since": v.get("since", ""), "url": v.get("url", "")}
+            for name, v in sorted(pipeline.skipped_tickets().items())]
+
+
+def waiting() -> dict:
     return {
-        "skipped": [{"ticket": name, "why": v["why"], "since": v.get("since", ""), "url": v.get("url", "")}
-                    for name, v in sorted(pipeline.skipped_tickets().items())],
-        "waiting": [{"ticket": tracker.run_ticket_name(w), "comments": w["n"],
-                     "when": "review submitted" if w["at_once"] else f"last comment {w['last']}"} for w in waiting],
+        "tickets": [{"ticket": tracker.run_ticket_name(w), "comments": w["n"], "at_once": bool(w["at_once"]),
+                     "last": w["last"]} for w in state.feedback_waiting(connect=state.reader)],
         "quiet_minutes": pipeline.FEEDBACK_QUIET_MINUTES,
     }
 
@@ -96,33 +94,32 @@ def recent(r: dict) -> dict:
         "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"],
         "state": STATE_OF_STATUS.get(r["status"], ""), "started": r["started"],
         "seconds": seconds_between(r["started"], r["finished"]),
-        "cost": logged_cost(log_lines(r["id"])) if r["status"] == "running" else round(r["cost_usd"] or 0, 2),
+        "cost": pipeline.logged_cost(log_lines(r["id"])) if r["status"] == "running" else round(r["cost_usd"] or 0, 2),
         "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
     }
 
 
-def health(cfg: config.Config) -> dict:
+def checks() -> dict:
     beat = util.read_json(paths.HEARTBEAT_FILE, {})
-    checks = sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))
-    with state.reader() as db:
-        alerts = [dict(r) for r in db.execute("SELECT * FROM alerts ORDER BY opened")]
-        probes = [dict(r) for r in db.execute("SELECT * FROM probes ORDER BY name")]
     return {
         "heartbeat": beat.get("ts", ""),
-        "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")} for c in checks],
+        "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")}
+                   for c in sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))],
         "loops": [{"name": k, **v} for k, v in sorted(util.read_json(paths.STATE_DIR / "loops.json", {}).items())],
-        "alerts": [{**a, "url": f"https://github.com/{cfg.alert_repo}/issues/{a['issue']}"
-                    if a["issue"] and cfg.alert_repo else ""} for a in alerts],
-        "probes": probes,
+    }
+
+
+def alerts() -> dict:
+    alert_repo = config.load().alert_repo
+    return {
+        "alerts": [{**a, "url": gh.issue_url(alert_repo, a["issue"]) if a["issue"] and alert_repo else ""}
+                   for a in state.alerts(connect=state.reader)],
+        "probes": state.probes(connect=state.reader),
     }
 
 
 def triage_board() -> dict:
-    with state.reader() as db:
-        rows = [dict(r) for r in db.execute("SELECT * FROM triage")]
-    for r in rows:
-        r["questions"] = json.loads(r["questions"] or "[]")
-    rows.sort(key=lambda r: triage.natural(r["ref"]))
+    rows = sorted(state.triage_rows(connect=state.reader), key=lambda r: triage.natural(r["ref"]))
     return {
         "refreshed": util.read_json(triage.META_FILE, {}).get("refreshed", ""),
         "groups": [{"standing": name, "rows": [{"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "",
@@ -134,7 +131,7 @@ def triage_board() -> dict:
 
 def run_log(run_id: str) -> list[str]:
     if not re.fullmatch(r"\w[\w.-]*", run_id):
-        raise ValueError(f"'{run_id}' is not a run id")
+        raise NotARunId(f"'{run_id}' is not a run id.")
     return log_lines(run_id)[-LOG_TAIL_LINES:]
 
 
@@ -147,12 +144,11 @@ def trends() -> dict:
 
 
 def trend_figures() -> dict:
-    today = datetime.now().astimezone().date()
-    days = [(today - timedelta(days=n)).isoformat() for n in range(TREND_DAYS - 1, -1, -1)]
-    since = util.iso(util.now() - timedelta(days=TREND_DAYS + 1))
-    with state.reader() as db:
-        runs = [dict(r) for r in db.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
-        evals = [dict(r) for r in db.execute("SELECT * FROM evals WHERE ts >= ? ORDER BY ts", (since,))]
+    first_day = datetime.now().astimezone().date() - timedelta(days=TREND_DAYS - 1)
+    days = [(first_day + timedelta(days=n)).isoformat() for n in range(TREND_DAYS)]
+    since = util.iso(datetime.combine(first_day, time.min).astimezone().astimezone(UTC))
+    runs = state.runs_since(since, connect=state.reader)
+    evals = state.evals_since(since, connect=state.reader)
 
     by_day = {d: {"day": d, "cost": 0.0, "shipped": 0, "failed": 0, "other": 0} for d in days}
     by_repo: dict[str, list[dict]] = defaultdict(list)
@@ -164,23 +160,23 @@ def trend_figures() -> dict:
             continue
         by_repo[r["repo"]].append(r)
         if day:
-            day["shipped" if r["status"] in SHIPPED else "failed" if r["status"] == "failed" else "other"] += 1
+            day[outcome(r["status"])] += 1
 
     eval_repos: dict[str, list[dict]] = defaultdict(list)
     for e in evals:
         eval_repos[e["repo"]].append(e)
     return {
+        "since": since,
         "days": [{**d, "cost": round(d["cost"], 2)} for d in by_day.values()],
         "repos": [repo_trend(name, rows) for name, rows in sorted(by_repo.items())],
-        "evals": [{"repo": name, "tasks": len(rows), "passed": sum(1 for e in rows if e["passed"]),
-                   "last": rows[-1]["ts"]} for name, rows in sorted(eval_repos.items())],
+        "evals": [eval_trend(name, rows) for name, rows in sorted(eval_repos.items())],
         "total_cost": round(sum(d["cost"] for d in by_day.values()), 2),
     }
 
 
 def repo_trend(name: str, rows: list[dict]) -> dict:
-    shipped = sum(1 for r in rows if r["status"] in SHIPPED)
-    failed = sum(1 for r in rows if r["status"] == "failed")
+    outcomes = Counter(outcome(r["status"]) for r in rows)
+    shipped, failed = outcomes["shipped"], outcomes["failed"]
     finished = [seconds_between(r["started"], r["finished"]) for r in rows if r["finished"]]
     return {
         "repo": name, "runs": len(rows), "shipped": shipped, "failed": failed,
@@ -188,3 +184,9 @@ def repo_trend(name: str, rows: list[dict]) -> dict:
         "median_seconds": int(statistics.median(finished)) if finished else None,
         "cost": round(sum(r["cost_usd"] or 0 for r in rows), 2),
     }
+
+
+def eval_trend(name: str, rows: list[dict]) -> dict:
+    passed = sum(1 for e in rows if e["passed"])
+    return {"repo": name, "tasks": len(rows), "passed": passed, "pass_rate": round(passed / len(rows), 2),
+            "last": rows[-1]["ts"]}

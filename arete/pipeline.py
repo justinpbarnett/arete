@@ -23,6 +23,7 @@ NEVER_STAGED = [":(exclude,glob)**/__pycache__/**"]
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
+STEP_COST = re.compile(r"\(\d+ turns?, \$([\d.]+)\)")
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -139,6 +140,14 @@ def fill_template(template: str, default: str, **values) -> str:
         return default.format(**values)
 
 
+def cost_note(res: claude.Result) -> str:
+    return f"({res.turns} turns, ${res.cost_usd:.2f})"
+
+
+def logged_cost(log_lines: list[str]) -> float:
+    return round(sum(float(m.group(1)) for line in log_lines if (m := STEP_COST.search(line))), 2)
+
+
 @dataclass
 class AgentRun:
     id: str
@@ -174,6 +183,7 @@ class AgentRun:
             self.log(f"{step}: lost the connection after {res.turns} turns, waiting for the network")
             if util.wait_for_network():
                 self.cost += res.cost_usd
+                self.log(f"{step}: the network is back, the dropped attempt cost {cost_note(res)}")
                 if res.session.id and res.turns > 1 and kw.get("persist", True):
                     res = claude.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, **{**kw, "resume": res.session})
                 else:
@@ -182,8 +192,7 @@ class AgentRun:
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
-        self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} "
-                 f"({res.turns} turns, ${res.cost_usd:.2f})")
+        self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} {cost_note(res)}")
         return res
 
 
@@ -498,7 +507,7 @@ class Build(TicketWork):
     def resume(self, step: str, text: str) -> claude.Result:
         res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
                              disallowed_tools=NO_GIT_WRITES, resume=self.session, timeout=self.timeout)
-        self.session = res.session if res.session.id else self.session
+        self.session = res.session
         return res
 
     def check(self) -> bool:

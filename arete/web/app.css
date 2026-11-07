@@ -37,3 +37,7 @@ ol.questions li { margin: 0 0 6px; }
 #chat textarea { width: 100%; }
 .fields.one-row { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
 .keys { font-size: 13px; }
+
+.draft { border: 1px solid var(--ink); padding: 4px 16px 2px; margin: 18px 0; }
+.draft h3 { margin-top: 12px; }
+#draft-body { margin: 0; padding: 0; border: 0; max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

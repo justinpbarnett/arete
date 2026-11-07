@@ -9,7 +9,7 @@ const URL_IN_TEXT = /(https:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
 
 let view = "live";
 let timer = 0;
-let round = 0;
+let refreshCount = 0;
 let openLog = "";
 let trendsData = null;
 let settingsData = null;
@@ -109,7 +109,7 @@ function ago(ts) {
   return `${Math.round(minutes / 1440)} d ago`;
 }
 
-function span(seconds) {
+function duration(seconds) {
   if (seconds === null || seconds === undefined) return "";
   if (seconds < 60) return `${seconds} s`;
   const minutes = Math.round(seconds / 60);
@@ -129,10 +129,12 @@ async function call(path, body) {
   return data;
 }
 
-function rowsOf(panel, box, n, title) {
-  if (panel && "rows" in panel) return panel.rows;
-  fill(box, heading(n, title), fault(`This part could not be read: ${panel?.error || "no answer"}.`));
-  return null;
+function panelParts(panel, what, draw) {
+  return panel && "rows" in panel ? draw(panel.rows) : fault(`${what} could not be read: ${panel?.error || "no answer"}.`);
+}
+
+function percent(rate) {
+  return rate === null || rate === undefined ? "" : `${Math.round(rate * 100)}%`;
 }
 
 function logButton(id) {
@@ -140,50 +142,38 @@ function logButton(id) {
 }
 
 function drawLive(snapshot) {
-  const live = rowsOf(snapshot.live, "live-now", 1, "Running now");
-  if (live) {
-    const rows = live.runs.map((r) => el("tr", {},
-      cell(wholeWords(r.ticket)), cell(r.kind), cell(r.step || "starting"), cell(span(r.seconds), "num"), cell(money(r.cost), "num"),
-      cell(logButton(r.id))));
-    fill("live-now", heading(1, "Running now"),
-      el("p", { class: "readout" }, String(live.slots), el("small", { text: `of ${live.max_parallel} slots busy` })),
-      rows.length ? table("", [["Ticket"], ["Kind", "c-kind"], ["Last step"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["", "c-log"]], rows)
-        : quiet("Nothing is running."));
-  }
+  fill("live-now", heading(1, "Running now"), panelParts(snapshot.live, "The live runs", (live) => [
+    el("p", { class: "readout" }, String(live.slots), el("small", { text: `of ${live.max_parallel} slots busy` })),
+    live.runs.length
+      ? table("", [["Ticket"], ["Kind", "c-kind"], ["Started", "c-time"], ["Last step"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["", "c-log"]],
+        live.runs.map((r) => el("tr", {},
+          cell(wholeWords(r.ticket)), cell(r.kind), cell(clock(r.started)), cell(r.step || "starting"),
+          cell(duration(r.seconds), "num"), cell(money(r.cost), "num"), cell(logButton(r.id)))))
+      : quiet("Nothing is running."),
+  ]));
 
-  const parts = [];
-  const queue = snapshot.queue;
-  parts.push(heading(2, "Queue"));
-  if (queue && "rows" in queue) {
-    const q = queue.rows;
-    parts.push(q.skipped.length
-      ? table("Skipped tickets", [["Ticket"], ["Why"], ["Since", "c-time"]],
-        q.skipped.map((s) => el("tr", {}, cell(link(s.url, s.ticket)), cell(s.why), cell(clock(s.since)))))
-      : quiet("No labeled ticket is skipped."));
-    parts.push(...(q.waiting.length
-      ? [el("p", {}, `Review feedback runs ${q.quiet_minutes} min after the last comment, or at once when a review is submitted.`),
-        table("Review feedback waiting", [["Ticket"], ["Comments", "num c-time"], ["When"]],
-          q.waiting.map((w) => el("tr", {}, cell(w.ticket), cell(w.comments, "num"), cell(w.when))))]
-      : [quiet("No review feedback is waiting.")]));
-  } else {
-    parts.push(fault(`The queue could not be read: ${queue?.error || "no answer"}.`));
-  }
-
-  parts.push(heading(3, "Recent runs"));
-  const recent = snapshot.recent;
-  if (recent && "rows" in recent) {
-    parts.push(recent.rows.length
-      ? table("Newest first", [["Ticket"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["Result", "c-result"], ["", "c-log"]],
-        recent.rows.map((r) => el("tr", {},
-          cell(wholeWords(r.ticket)), cell([stateChip(r.state), r.state ? " " : "", r.status], "nb"), cell(clock(r.started)),
-          cell(span(r.seconds), "num"), cell(money(r.cost), "num"),
+  fill("live-rest",
+    heading(2, "Skipped"),
+    panelParts(snapshot.skipped, "The skipped tickets", (skipped) => skipped.length
+      ? table("Labeled tickets the pipeline will not run", [["Ticket"], ["Why"], ["Since", "c-time"]],
+        skipped.map((s) => el("tr", {}, cell(link(s.url, s.ticket)), cell(s.why), cell(clock(s.since)))))
+      : quiet("No labeled ticket is skipped.")),
+    heading(3, "Review feedback"),
+    panelParts(snapshot.waiting, "The review feedback", (waiting) => waiting.tickets.length
+      ? [el("p", {}, `Review feedback runs ${waiting.quiet_minutes} min after the last comment, or at once when a review is submitted.`),
+        table("Waiting", [["Ticket"], ["Comments", "num c-time"], ["When"]],
+          waiting.tickets.map((w) => el("tr", {}, cell(w.ticket), cell(w.comments, "num"),
+            cell(`${w.at_once ? "review submitted" : "last comment"} ${clock(w.last)}`))))]
+      : quiet("No review feedback is waiting.")),
+    heading(4, "Recent runs"),
+    panelParts(snapshot.recent, "Recent runs", (recent) => recent.length
+      ? table("Newest first", [["Ticket"], ["Kind", "c-kind"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["Result", "c-result"], ["", "c-log"]],
+        recent.map((r) => el("tr", {},
+          cell(wholeWords(r.ticket)), cell(r.kind), cell([stateChip(r.state), r.state ? " " : "", r.status], "nb"), cell(clock(r.started)),
+          cell(duration(r.seconds), "num"), cell(money(r.cost), "num"),
           cell(r.pr_url ? pullLinks(r.pr_url) : r.summary, "muted-cell"),
           cell(logButton(r.id)))))
-      : quiet("No run has started yet."));
-  } else {
-    parts.push(fault(`Recent runs could not be read: ${recent?.error || "no answer"}.`));
-  }
-  fill("live-rest", parts);
+      : quiet("No run has started yet.")));
 }
 
 async function showLog(id) {
@@ -213,28 +203,35 @@ function closeLog() {
   document.getElementById("log").hidden = true;
 }
 
-function drawHealth(snapshot) {
-  const h = rowsOf(snapshot.health, "health", 1, "Checks");
-  if (!h) return;
+function checksSummary(h) {
+  if (!h.heartbeat) return el("p", {}, stateChip("caution"), " The heartbeat has not run yet, so no check has a result.");
   const failing = h.checks.filter((c) => !c.ok).length;
+  const state = !failing ? "ok" : h.checks.some((c) => c.state === "fault") ? "fault" : "caution";
+  return el("p", {}, stateChip(state), " ",
+    `${h.checks.length} checks, ${failing} failing. The last heartbeat came ${ago(h.heartbeat)} (${clock(h.heartbeat)}).`);
+}
+
+function drawHealth(snapshot) {
   fill("health",
     heading(1, "Checks"),
-    el("p", {}, failing ? stateChip(h.checks.some((c) => c.state === "fault") ? "fault" : "caution") : stateChip("ok"), " ",
-      `${h.checks.length} checks, ${failing} failing. The last heartbeat came ${ago(h.heartbeat)}${h.heartbeat ? ` (${clock(h.heartbeat)})` : ""}.`),
-    table("", [["Check"], ["State", "c-status"], ["Detail"]],
-      h.checks.map((c) => el("tr", {}, cell(c.key), cell(stateChip(c.state)), cell(c.detail || "")))),
+    panelParts(snapshot.checks, "The heartbeat", (h) => [checksSummary(h),
+      h.checks.length ? table("", [["Check"], ["State", "c-status"], ["Detail"]],
+        h.checks.map((c) => el("tr", {}, cell(c.key), cell(stateChip(c.state)), cell(c.detail || "")))) : ""]),
     heading(2, "Loops"),
-    h.loops.length ? table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail"]],
-      h.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(ago(l.ts)), cell(l.detail || ""))))
-      : quiet("No loop has reported yet."),
+    panelParts(snapshot.checks, "The loops", (h) => h.loops.length
+      ? table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail"]],
+        h.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(ago(l.ts)), cell(l.detail || ""))))
+      : quiet("No loop has reported yet.")),
     heading(3, "Probes"),
-    h.probes.length ? table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time"], ["Detail"]],
-      h.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(ago(p.last_run)), cell(ago(p.last_ok)), cell(p.detail || ""))))
-      : quiet("No probe has run yet."),
+    panelParts(snapshot.alerts, "The probes", (a) => a.probes.length
+      ? table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time"], ["Detail"]],
+        a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(ago(p.last_run)), cell(ago(p.last_ok)), cell(p.detail || ""))))
+      : quiet("No probe has run yet.")),
     heading(4, "Alerts"),
-    h.alerts.length ? table("Open alerts", [["Alert"], ["Opened", "c-time"], ["Last seen", "c-time"], ["Issue"]],
-      h.alerts.map((a) => el("tr", {}, cell(a.key), cell(clock(a.opened)), cell(ago(a.last_seen)), cell(a.url ? link(a.url, `#${a.issue}`) : ""))))
-      : el("p", {}, stateChip("ok"), " No alert is open."));
+    panelParts(snapshot.alerts, "The alerts", (a) => a.alerts.length
+      ? table("Open alerts", [["Alert"], ["Opened", "c-time"], ["Last seen", "c-time"], ["Issue"]],
+        a.alerts.map((x) => el("tr", {}, cell(x.key), cell(clock(x.opened)), cell(ago(x.last_seen)), cell(x.url ? link(x.url, `#${x.issue}`) : ""))))
+      : el("p", {}, stateChip("ok"), " No alert is open.")));
 }
 
 function questionFold(ref, questions) {
@@ -245,9 +242,11 @@ function questionFold(ref, questions) {
 }
 
 function drawTriage(snapshot) {
-  const t = rowsOf(snapshot.triage, "triage", 1, "Triage");
-  if (!t) return;
-  const parts = [quiet(`Triage last ran ${ago(t.refreshed)}${t.refreshed ? ` (${clock(t.refreshed)})` : ""}. It reads every open ticket and says what each one needs.`)];
+  fill("triage", panelParts(snapshot.triage, "Triage", triageParts));
+}
+
+function triageParts(t) {
+  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${clock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket and says what each one needs.`)];
   t.groups.forEach((g, i) => {
     parts.push(heading(i + 1, g.standing));
     parts.push(g.rows.length
@@ -259,11 +258,11 @@ function drawTriage(snapshot) {
             cell(wholeWords(r.verdict)))))]
       : quiet("None."));
   });
-  fill("triage", parts);
+  return parts;
 }
 
 function niceMax(value, whole) {
-  if (value <= 0) return whole ? 1 : 1;
+  if (value <= 0) return 1;
   const step = 10 ** Math.floor(Math.log10(value));
   const nice = [1, 2, 2.5, 5, 10].map((m) => m * step).find((m) => m >= value && (!whole || Number.isInteger(m)));
   return nice ?? Math.ceil(value);
@@ -273,32 +272,38 @@ function dayLabel(day) {
   return day.slice(5).replace("-", " ");
 }
 
-function chartFrame(width, height, label) {
-  return svg("svg", { class: "chart", viewBox: `0 0 ${width} ${height}`, width, height, role: "img", "aria-label": label });
+function dayChart(days, width, height, top, label, dayTickGap) {
+  const frame = { left: 58, right: width - 16, top, bottom: height - 32 };
+  frame.pitch = (frame.right - frame.left) / days.length;
+  frame.X = (i) => frame.left + i * frame.pitch;
+  frame.chart = svg("svg", { class: "chart", viewBox: `0 0 ${width} ${height}`, width, height, role: "img", "aria-label": label });
+  days.forEach((d, i) => {
+    if (i % 7 !== (days.length - 1) % 7) return;
+    const x = frame.X(i) + frame.pitch / 2, y = frame.bottom + dayTickGap;
+    frame.chart.append(svg("line", { class: "tick", x1: x, y1: y, x2: x, y2: y + 5 }));
+    frame.chart.append(svg("text", { class: "fig", x, y: y + 20, "text-anchor": i === days.length - 1 ? "end" : "middle" }, dayLabel(d.day)));
+  });
+  return frame;
+}
+
+function valueTicks(frame, values, Y, words) {
+  for (const v of values) {
+    frame.chart.append(svg("line", { class: "tick", x1: frame.left - 5, y1: Y(v), x2: frame.left, y2: Y(v) }));
+    frame.chart.append(svg("text", { class: "fig", x: frame.left - 9, y: Y(v) + 4, "text-anchor": "end" }, words(v)));
+  }
+}
+
+function bar(frame, i, cls, y, height) {
+  frame.chart.append(svg("rect", { class: cls, x: frame.X(i) + frame.pitch * 0.18, y, width: Math.max(1, frame.pitch * 0.64), height }));
 }
 
 function costChart(days, width) {
-  const height = 230;
-  const left = 58, right = width - 16, top = 30, bottom = height - 32;
+  const frame = dayChart(days, width, 230, 30, `Cost per day for the last ${days.length} days, with today's bar filled`, 0);
+  const { chart, left, right, top, bottom, pitch, X } = frame;
   const max = niceMax(Math.max(...days.map((d) => d.cost)), false);
-  const pitch = (right - left) / days.length;
-  const X = (i) => left + i * pitch;
   const Y = (v) => bottom - (v / max) * (bottom - top);
-  const chart = chartFrame(width, height, `Cost per day for the last ${days.length} days, with today's bar filled`);
-  for (const v of [0, max / 2, max]) {
-    chart.append(svg("line", { class: "tick", x1: left - 5, y1: Y(v), x2: left, y2: Y(v) }));
-    chart.append(svg("text", { class: "fig", x: left - 9, y: Y(v) + 4, "text-anchor": "end" }, money(v).replace(".00", "")));
-  }
-  days.forEach((d, i) => {
-    const today = i === days.length - 1;
-    if (d.cost > 0) {
-      chart.append(svg("rect", { class: today ? "frame this" : "frame", x: X(i) + pitch * 0.18, y: Y(d.cost), width: Math.max(1, pitch * 0.64), height: bottom - Y(d.cost) }));
-    }
-    if (i % 7 === (days.length - 1) % 7) {
-      chart.append(svg("line", { class: "tick", x1: X(i) + pitch / 2, y1: bottom, x2: X(i) + pitch / 2, y2: bottom + 5 }));
-      chart.append(svg("text", { class: "fig", x: X(i) + pitch / 2, y: bottom + 20, "text-anchor": today ? "end" : "middle" }, dayLabel(d.day)));
-    }
-  });
+  valueTicks(frame, [0, max / 2, max], Y, (v) => money(v).replace(".00", ""));
+  days.forEach((d, i) => d.cost > 0 && bar(frame, i, i === days.length - 1 ? "frame this" : "frame", Y(d.cost), bottom - Y(d.cost)));
   const today = days[days.length - 1];
   const label = `Today ${money(today.cost)}`;
   const under = days.slice(-Math.ceil((label.length * 7.4) / pitch) - 1);
@@ -310,26 +315,15 @@ function costChart(days, width) {
 }
 
 function outcomeChart(days, width) {
-  const height = 240;
-  const left = 58, right = width - 16, top = 22, bottom = height - 32;
+  const frame = dayChart(days, width, 240, 22, `Runs shipped above the line and runs failed below it, per day for the last ${days.length} days`, 6);
+  const { chart, left, right, top, bottom } = frame;
   const max = niceMax(Math.max(1, ...days.map((d) => Math.max(d.shipped, d.failed))), true);
   const mid = (top + bottom) / 2;
-  const pitch = (right - left) / days.length;
-  const X = (i) => left + i * pitch;
   const Y = (v) => mid - (v / max) * (mid - top);
-  const chart = chartFrame(width, height, `Runs shipped above the line and runs failed below it, per day for the last ${days.length} days`);
-  for (const v of [-max, 0, max]) {
-    chart.append(svg("line", { class: "tick", x1: left - 5, y1: Y(v), x2: left, y2: Y(v) }));
-    chart.append(svg("text", { class: "fig", x: left - 9, y: Y(v) + 4, "text-anchor": "end" }, String(Math.abs(v))));
-  }
+  valueTicks(frame, [-max, 0, max], Y, (v) => String(Math.abs(v)));
   days.forEach((d, i) => {
-    const x = X(i) + pitch * 0.18, w = Math.max(1, pitch * 0.64);
-    if (d.shipped) chart.append(svg("rect", { class: "frame", x, y: Y(d.shipped), width: w, height: mid - Y(d.shipped) }));
-    if (d.failed) chart.append(svg("rect", { class: "frame below", x, y: mid, width: w, height: Y(-d.failed) - mid }));
-    if (i % 7 === (days.length - 1) % 7) {
-      chart.append(svg("line", { class: "tick", x1: X(i) + pitch / 2, y1: bottom + 6, x2: X(i) + pitch / 2, y2: bottom + 11 }));
-      chart.append(svg("text", { class: "fig", x: X(i) + pitch / 2, y: bottom + 26, "text-anchor": i === days.length - 1 ? "end" : "middle" }, dayLabel(d.day)));
-    }
+    if (d.shipped) bar(frame, i, "frame", Y(d.shipped), mid - Y(d.shipped));
+    if (d.failed) bar(frame, i, "frame below", mid, Y(-d.failed) - mid);
   });
   chart.append(svg("line", { class: "axis", x1: left, y1: top - 4, x2: left, y2: bottom + 4 }));
   chart.append(svg("line", { class: "axis", x1: left, y1: mid, x2: right, y2: mid }));
@@ -363,20 +357,29 @@ function drawTrends() {
     t.repos.length ? table("",
       [["Repo"], ["Runs", "num c-n"], ["Shipped", "num c-n"], ["Failed", "num c-n"], ["Pass rate", "num c-rate"], ["Median time", "num c-time"], ["Cost", "num c-cost"]],
       t.repos.map((r) => el("tr", {}, cell(r.repo), cell(r.runs, "num"), cell(r.shipped, "num"), cell(r.failed, "num"),
-        cell(r.pass_rate === null ? "" : `${Math.round(r.pass_rate * 100)}%`, "num"), cell(span(r.median_seconds), "num"), cell(money(r.cost), "num"))))
+        cell(percent(r.pass_rate), "num"), cell(duration(r.median_seconds), "num"), cell(money(r.cost), "num"))))
       : quiet("No pipeline run finished in this window."),
     heading(4, "Evals"),
-    t.evals.length ? table("Mined eval tasks", [["Repo"], ["Tasks", "num c-n"], ["Passed", "num c-n"], ["Last", "c-time"]],
-      t.evals.map((e) => el("tr", {}, cell(e.repo), cell(e.tasks, "num"), cell(e.passed, "num"), cell(clock(e.last)))))
+    t.evals.length ? table("Mined eval tasks", [["Repo"], ["Tasks", "num c-n"], ["Passed", "num c-n"], ["Pass rate", "num c-rate"], ["Last", "c-time"]],
+      t.evals.map((e) => el("tr", {}, cell(e.repo), cell(e.tasks, "num"), cell(e.passed, "num"), cell(percent(e.pass_rate), "num"), cell(clock(e.last)))))
       : quiet("No eval ran in this window."));
+}
+
+function defaultModel(data, role) {
+  return `default: ${data.defaults[role] || "claude default"}`;
 }
 
 function drawSettings(data) {
   settingsData = data;
-  document.getElementById("max-parallel").value = data.max_parallel;
+  const parallel = document.getElementById("max-parallel");
+  if (parallel.value !== String(data.max_parallel)) parallel.value = data.max_parallel;
+  document.getElementById("model-hint").textContent =
+    `Each role takes ${data.aliases.join(", ")}, or a full claude model id. An empty role uses its default.`;
+  fill("model-names", data.aliases.map((alias) => el("option", { value: alias })));
   fill("model-fields", Object.entries(data.models).map(([role, model]) => el("div", { class: "field" },
     el("label", { for: `model-${role}`, text: role.replace("_", " ") }),
-    el("input", { id: `model-${role}`, "data-role": role, type: "text", value: model, placeholder: "claude default", list: "model-names", autocomplete: "off", spellcheck: "false" }))));
+    el("input", { id: `model-${role}`, "data-role": role, "data-focus": `model-${role}`, type: "text", value: model,
+      placeholder: defaultModel(data, role), list: "model-names", autocomplete: "off", spellcheck: "false" }))));
 }
 
 function settingsChanges() {
@@ -407,7 +410,8 @@ async function saveSettings(event) {
     const saved = await call("/api/settings", changes);
     drawSettings(saved);
     const words = [changes.max_parallel ? `runs at once ${saved.max_parallel}` : "",
-      ...Object.keys(changes.models || {}).map((role) => `${role} ${saved.models[role]}`)].filter(Boolean);
+      ...Object.keys(changes.models || {}).map((role) => saved.models[role] ? `${role} ${saved.models[role]}`
+        : `${role} back to its default (${saved.defaults[role] || "claude default"})`)].filter(Boolean);
     say("settings-result", "ok", `Saved ${words.join(", ")}. The pipeline takes it at its next poll.`);
   } catch (e) {
     say("settings-result", "fault", e.message);
@@ -427,6 +431,12 @@ function drawChat(data) {
   document.getElementById("chat-new").disabled = data.busy;
   const working = document.getElementById("working");
   working.hidden = !data.busy;
+  document.getElementById("draft").hidden = !data.draft;
+  if (!data.draft) document.getElementById("draft-result").hidden = true;
+  if (data.draft) {
+    document.getElementById("draft-title").textContent = data.draft.title;
+    document.getElementById("draft-body").textContent = data.draft.body;
+  }
   if (data.busy) {
     const asked = [...data.messages].reverse().find((m) => m.from === "you");
     working.textContent = `Working on it · sent ${clock(asked?.ts)} · the answer shows here when it comes`;
@@ -455,13 +465,12 @@ async function sendChat(event) {
   }
 }
 
-async function newChat() {
-  document.getElementById("chat-result").hidden = true;
-  try {
-    drawChat(await call("/api/chat/new", {}));
-  } catch (e) {
-    say("chat-result", "fault", e.message);
-  }
+async function chatAction(path, button, resultId) {
+  document.getElementById(resultId).hidden = true;
+  button.disabled = true;
+  const answered = await call(path, {}).catch((e) => say(resultId, "fault", e.message));
+  button.disabled = false;
+  if (answered) drawChat(answered);
 }
 
 const LOADERS = {
@@ -476,7 +485,8 @@ const LOADERS = {
     drawTrends();
   },
   settings: async () => {
-    if (!settingsData || !Object.keys(settingsChanges()).length) drawSettings(await call("/api/settings"));
+    const fresh = await call("/api/settings");
+    if (!settingsData || !Object.keys(settingsChanges()).length) drawSettings(fresh);
   },
   chat: async () => drawChat(await call("/api/chat")),
 };
@@ -484,7 +494,6 @@ const LOADERS = {
 function nextDelay() {
   if (view === "live") return LIVE_MS;
   if (view === "chat") return chatSeen.endsWith(":true") ? CHAT_BUSY_MS : SLOW_MS;
-  if (view === "settings") return 0;
   return SLOW_MS;
 }
 
@@ -500,21 +509,21 @@ function status(state, sentence) {
 
 async function refresh() {
   clearTimeout(timer);
-  const mine = ++round;
+  const mine = ++refreshCount;
   if (document.hidden) return;
   try {
     await LOADERS[view]();
-    if (mine !== round) return;
+    if (mine !== refreshCount) return;
     lastGood = clock(new Date().toISOString());
     const label = document.querySelector(`.views [data-view="${view}"]`).textContent;
     status("", `${label} · updated ${new Date().toLocaleTimeString([], { hour12: false })}${nextDelay() ? ` · refreshes every ${nextDelay() / 1000} s` : ""}`);
     document.querySelectorAll(".readout").forEach((r) => r.classList.remove("stale"));
   } catch (e) {
-    if (mine !== round) return;
+    if (mine !== refreshCount) return;
     status("fault", `Arete did not answer: ${e.message}${lastGood ? ` What shows came at ${lastGood}.` : ""}`);
     document.querySelectorAll(".readout").forEach((r) => r.classList.add("stale"));
   }
-  if (mine === round) schedule(nextDelay());
+  if (mine === refreshCount) schedule(nextDelay());
 }
 
 function show(name) {
@@ -544,9 +553,13 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("settings-undo").addEventListener("click", () => {
     if (settingsData) drawSettings(settingsData);
     document.getElementById("settings-result").hidden = true;
+    refresh();
   });
   document.getElementById("chat").addEventListener("submit", sendChat);
-  document.getElementById("chat-new").addEventListener("click", newChat);
+  for (const [id, path, resultId] of [["chat-new", "/api/chat/new", "chat-result"],
+    ["draft-file", "/api/chat/file", "draft-result"], ["draft-drop", "/api/chat/drop", "draft-result"]]) {
+    document.getElementById(id).addEventListener("click", (event) => chatAction(path, event.currentTarget, resultId));
+  }
   document.getElementById("chat-text").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) document.getElementById("chat").requestSubmit();
   });

@@ -9,7 +9,7 @@ CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
 BUDGET_USD = 2
 TIMEOUT_SECONDS = 900
 RESTARTED = "The dashboard restarted before this answer came back. Send the message again."
-EMPTY = {"session": "", "spent": 0.0, "messages": [], "busy": False}
+EMPTY = {"session": "", "spent": 0.0, "messages": [], "busy": False, "draft": None}
 REPLY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -19,10 +19,14 @@ REPLY_SCHEMA = {
     },
     "required": ["reply", "issue_title", "issue_body"],
 }
-turn = threading.Lock()
+chat_file_lock = threading.Lock()
 
 
 class Busy(RuntimeError):
+    pass
+
+
+class NoDraft(RuntimeError):
     pass
 
 
@@ -32,7 +36,7 @@ def history() -> dict:
 
 def view() -> dict:
     h = history()
-    return {"messages": h["messages"], "busy": h["busy"]}
+    return {"messages": h["messages"], "busy": h["busy"], "draft": h["draft"]}
 
 
 def message(sender: str, text: str, cost: float = 0.0) -> dict:
@@ -40,14 +44,14 @@ def message(sender: str, text: str, cost: float = 0.0) -> dict:
 
 
 def settle_after_restart() -> None:
-    with turn:
+    with chat_file_lock:
         h = history()
         if h["busy"]:
             util.write_json(CHAT_FILE, {**h, "busy": False, "messages": [*h["messages"], message("arete", RESTARTED)]})
 
 
 def send(text: str) -> dict:
-    with turn:
+    with chat_file_lock:
         h = history()
         if h["busy"]:
             raise Busy("The last message is still running. Wait for its answer.")
@@ -58,7 +62,7 @@ def send(text: str) -> dict:
 
 
 def new() -> dict:
-    with turn:
+    with chat_file_lock:
         if history()["busy"]:
             raise Busy("The last message is still running. Wait for its answer, then start a new chat.")
         util.write_json(CHAT_FILE, EMPTY)
@@ -66,17 +70,47 @@ def new() -> dict:
 
 
 def answer(text: str, session: claude.Session) -> None:
-    reply, cost = "", 0.0
+    reply, cost, draft = "", 0.0, None
     try:
         result = ask(text, session)
-        session, cost = result.session if result.session.id else session, result.cost_usd
-        reply = file_issue_if_drafted(result) if result.ok else f"The agent stopped: {result.error or result.text}"
+        session, cost = result.session, result.cost_usd
+        if result.ok:
+            reply, draft = reply_and_draft(result)
+        else:
+            reply = f"The agent stopped: {result.error or result.text}"
     except Exception as e:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
-    with turn:
+    with chat_file_lock:
         h = history()
         util.write_json(CHAT_FILE, {**h, "session": session.id, "spent": session.spent_usd, "busy": False,
+                                    "draft": draft or h["draft"],
                                     "messages": [*h["messages"], message("arete", reply, cost)]})
+
+
+def reply_and_draft(result: claude.Result) -> tuple[str, dict | None]:
+    drafted = result.structured if isinstance(result.structured, dict) else {}
+    title, body = str(drafted.get("issue_title") or "").strip(), str(drafted.get("issue_body") or "").strip()
+    return drafted.get("reply") or result.text, {"title": title, "body": body} if title else None
+
+
+def file_draft() -> dict:
+    with chat_file_lock:
+        h = history()
+        if not h["draft"]:
+            raise NoDraft("There is no drafted issue to file.")
+        github = arete_repo(config.load()).github
+        if not github:
+            raise NoDraft("The config names no GitHub repo for arete, so the draft stays unfiled.")
+        number = gh.issue_create(github, h["draft"]["title"], h["draft"]["body"])
+        util.write_json(CHAT_FILE, {**h, "draft": None,
+                                    "messages": [*h["messages"], message("arete", f"Filed {gh.issue_url(github, number)}")]})
+    return view()
+
+
+def drop_draft() -> dict:
+    with chat_file_lock:
+        util.write_json(CHAT_FILE, {**history(), "draft": None})
+    return view()
 
 
 def arete_repo(cfg: config.Config) -> config.Repo:
@@ -107,18 +141,3 @@ def ask(text: str, session: claude.Session) -> claude.Result:
         add_dirs=[paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR],
     )
 
-
-def file_issue_if_drafted(result: claude.Result) -> str:
-    drafted = result.structured if isinstance(result.structured, dict) else {}
-    reply = drafted.get("reply") or result.text
-    title, body = drafted.get("issue_title", "").strip(), drafted.get("issue_body", "").strip()
-    if not title:
-        return reply
-    github = arete_repo(config.load()).github
-    if not github:
-        return f"{reply}\n\nI did not file the issue: the config names no GitHub repo for arete."
-    try:
-        number = gh.issue_create(github, title, body)
-    except gh.GhError as e:
-        return f"{reply}\n\nFiling the issue failed: {e}"
-    return f"{reply}\n\nFiled: https://github.com/{github}/issues/{number}"

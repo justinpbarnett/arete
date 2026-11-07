@@ -165,7 +165,7 @@ def update_run(run_id: str, **fields) -> None:
         c.execute(f"UPDATE runs SET {cols} WHERE id = ?", (*fields.values(), run_id))
 
 
-def runs(kind: str | None = None, repo: str | None = None, limit: int = 50) -> list[dict]:
+def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=db) -> list[dict]:
     q, args = "SELECT * FROM runs WHERE 1=1", []
     if kind:
         q += " AND kind = ?"
@@ -175,8 +175,13 @@ def runs(kind: str | None = None, repo: str | None = None, limit: int = 50) -> l
         args.append(repo)
     q += " ORDER BY started DESC LIMIT ?"
     args.append(limit)
-    with db() as c:
+    with connect() as c:
         return [dict(r) for r in c.execute(q, args)]
+
+
+def runs_since(since: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
 
 
 def open_runs(repo: str, issue: int | str) -> list[dict]:
@@ -189,8 +194,8 @@ def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None)
     return {"pipeline": f"run-{repo}-{issue}", "eval": f"eval-{repo}", "miner": "mine"}[kind]
 
 
-def runs_marked_running() -> list[dict]:
-    with db() as c:
+def runs_marked_running(connect=db) -> list[dict]:
+    with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
@@ -257,8 +262,13 @@ def alert_clear(key: str) -> None:
         c.execute("DELETE FROM alerts WHERE key = ?", (key,))
 
 
-def alerts() -> list[dict]:
-    with db() as c:
+def probes(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM probes ORDER BY name")]
+
+
+def alerts(connect=db) -> list[dict]:
+    with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM alerts ORDER BY opened")]
 
 
@@ -327,6 +337,11 @@ def eval_history(repo: str, limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def evals_since(since: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM evals WHERE ts >= ? ORDER BY ts", (since,))]
+
+
 FEEDBACK_COLUMNS = ("pr_url", "kind", "gh_id", "repo", "issue", "body", "path", "line", "hunk", "thread", "at_once",
                     "created", "pr_state", "status")
 
@@ -356,13 +371,11 @@ def close_feedback(pr_url: str, pr_state: str) -> None:
                   "ELSE status END WHERE pr_url = ?", (pr_state, pr_url))
 
 
-FEEDBACK_WAITING = ("SELECT repo, issue, COUNT(*) AS n, MAX(at_once) AS at_once, MAX(created) AS last "
-                    "FROM feedback WHERE status = 'new' GROUP BY repo, issue ORDER BY last")
-
-
-def feedback_waiting() -> list[dict]:
-    with db() as c:
-        return [dict(r) for r in c.execute(FEEDBACK_WAITING)]
+def feedback_waiting(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT repo, issue, COUNT(*) AS n, MAX(at_once) AS at_once, "
+                                           "MAX(created) AS last FROM feedback WHERE status = 'new' "
+                                           "GROUP BY repo, issue ORDER BY last")]
 
 
 def open_feedback(pr_urls: list[str]) -> list[dict]:
@@ -406,8 +419,8 @@ TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "
                   "questions", "plan", "why", "cost", "ts")
 
 
-def triage_rows() -> list[dict]:
-    with db() as c:
+def triage_rows(connect=db) -> list[dict]:
+    with connect() as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM triage")]
     for r in rows:
         r["questions"] = json.loads(r["questions"] or "[]")

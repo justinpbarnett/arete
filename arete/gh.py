@@ -66,6 +66,10 @@ def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
+def issue_url(repo: str, number: int | str) -> str:
+    return f"https://github.com/{repo}/issues/{number}"
+
+
 def issue_comment(repo: str, number: int, body: str) -> None:
     gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=body)
 
