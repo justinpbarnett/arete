@@ -600,7 +600,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     fresh = new_findings(run, found)
     if not run.trial and isinstance(answer.get("state"), dict):
         state.set_loop_state(loop.name, data=answer["state"])
-    summary = util.first_line(answer.get("summary") or "", 300)
+    summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
     outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events)}
     if fresh or any(e["type"] == "metric" for e in loop.emits):
         emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
