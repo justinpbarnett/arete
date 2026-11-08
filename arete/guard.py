@@ -60,7 +60,7 @@ def secret_named(command: str, cwd: str) -> str:
     except ValueError:
         words = command.split()
     for part in (p for w in words for p in re.split(r"[=<>]", w) if p):
-        path = Path(part).expanduser()
+        path = Path(os.path.expanduser(part))
         if secret_path(path) and (path if path.is_absolute() else Path(cwd) / path).exists():
             return part
     return ""
