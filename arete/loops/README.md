@@ -53,7 +53,7 @@ every = "5m"                   # how often to poll; 5m when left out
 [run]
 command = "arete poll"         # command loops: what to run, split into words as a shell would; pipes go in a script; ./NAME runs NAME from the loop folder
 try_command = "arete poll --dry-run"   # command loops: what `arete loop try` runs instead
-script = "./gather.sh"         # watch loops with no source: its output is the input
+script = "./gather.sh"         # watch loops with no source: its output is the input; printing nothing skips the run
 repo = "arete"                 # a config repo name or a path to a git repo; climb and search need one
 model = "sonnet"               # an alias or claude-* runs on claude; provider/model (deepseek/deepseek-flash, ollama/gemma4) runs on pi
 runner = ""                    # claude | pi, to force one

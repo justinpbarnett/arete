@@ -512,6 +512,8 @@ def watch_input(run: LoopRun) -> list[dict]:
                              env={**loops.check_env(loop, run.id), "ARETE_REPO_DIR": repo_dir}, device=devices.LOCAL)
     if code != 0:
         raise RuntimeError(f"script exit {code}: {util.last_line(text, 300)}")
+    if not text.strip():
+        return []
     run.log("input", f"script printed {util.count(len(text.splitlines()), 'line')}")
     return [sources.event("script", f"{loop.name}#script", hashlib.sha1(text.encode()).hexdigest()[:16],
                           util.first_line(text, 200), trust="internal", data={"output": util.tail(text, OUTPUT_TAIL)})]
@@ -594,7 +596,9 @@ def watch_prompt(run: LoopRun, events: list[dict], memory: dict) -> str:
 def watch_loop(run: LoopRun) -> tuple[str, str]:
     loop = run.loop
     events = watch_input(run)
-    if loop.fed_by_events and not events and not loop.script:
+    if not events and loop.script:
+        return "skipped", "the script printed nothing"
+    if not events and loop.fed_by_events:
         return "skipped", "no events to read"
     run.log("start", f"{util.count(len(events), 'event')} in" if events else "start")
     arrived = len(events)
