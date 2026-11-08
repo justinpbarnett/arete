@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 import shutil
 from pathlib import Path
 
@@ -23,8 +24,12 @@ def nvm_node_bin() -> str | None:
     current = shutil.which("node")
     if current and ".nvm" in current:
         return str(Path(current).parent)
-    installed = sorted((paths.HOME / ".nvm" / "versions" / "node").glob("v*"), key=lambda p: p.name)
+    installed = sorted((paths.HOME / ".nvm" / "versions" / "node").glob("v*"), key=node_version)
     return str(installed[-1] / "bin") if installed else None
+
+
+def node_version(folder: Path) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", folder.name))
 
 
 def build_path() -> str:
