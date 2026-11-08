@@ -214,11 +214,11 @@ def not_code_by_jev(cfg: config.Config, src: TriageSource, c: Candidate, ticket:
         return None
     reply = jev.ask(f"{c.title}\n\n{ticket}", {"code": jev.yes_no(ASKS_FOR_CODE)}, cfg, trace=("", f"triage {c.ref} jev"))
     a = reply.answers.get("code")
-    if not a or a.value or not a.sure(cfg.jev.confidence):
+    if not a or a.yes > cfg.jev.triage_skip:
         return None
     cost = reply.cost_usd
     answer = {"asks_for": NOT_CODE, "ready": False, "questions": [], "plan": [], "repo": "",
-              "why": f"JEV is sure it asks for no change to a repo ({a.note()})"}
+              "why": f"JEV reads it as asking for no change to a repo ({a.note()}, at or under {cfg.jev.triage_skip:g})"}
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     record_file(c.ref).write_text(f"{ticket}\n\n## Triage result (${cost:.5f})\n\n```json\n"
                                   f"{json.dumps(answer, indent=2)}\n```\n")

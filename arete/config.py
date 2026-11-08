@@ -64,6 +64,7 @@ class JevConfig:
     risk_hold: float = 0.5
     irreversible_hold: float = 0.5
     secrets_hold: float = 0.55
+    triage_skip: float = 0.2
     risk_weights: dict[str, float] = field(default_factory=lambda: {"blast": 0.4, "sensitivity": 0.4, "surprise": 0.2})
     guard: bool = True
     compact_tokens: int = 120_000
@@ -190,6 +191,7 @@ def load(path: Path | None = None) -> Config:
         risk_hold=float(jv.get("risk_hold", JevConfig.risk_hold)),
         irreversible_hold=float(jv.get("irreversible_hold", JevConfig.irreversible_hold)),
         secrets_hold=float(jv.get("secrets_hold", JevConfig.secrets_hold)),
+        triage_skip=float(jv.get("triage_skip", JevConfig.triage_skip)),
         risk_weights={**JevConfig().risk_weights, **{str(k): float(v) for k, v in (jv.get("risk_weights") or {}).items()}},
         guard=bool(jv.get("guard", True)),
         compact_tokens=int(jv.get("compact_tokens", JevConfig.compact_tokens)),
