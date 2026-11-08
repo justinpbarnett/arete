@@ -24,7 +24,6 @@ from .pipeline import (
     prompt,
     run_checks,
     use_product,
-    workspace_note,
 )
 from .util import git
 
@@ -302,7 +301,8 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         checks = check_list(layer)
         timeout = task.timeout_minutes * 60
         commands = code_list(layer.builder_bash)
-        workspace = workspace_note("eval", [Checkout("", repo.github, repo.path, wt, base)])
+        workspace = ("You are in a checkout of its code on branch `main`. It has no `origin` remote, so compare with "
+                     "`HEAD`, as in `git diff HEAD`.")
         res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
                                         body=task.prompt, comments="", attachments="", triage="", expertise=expertise,
                                         commands=commands, denied=code_list(denied_paths(layer)),
