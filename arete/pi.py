@@ -184,16 +184,21 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float,
     timer = threading.Timer(timeout, lambda: (out_of_time.set(), proc.kill()))
     timer.start()
     lines, spent, over_budget = [], 0.0, ""
-    for line in proc.stdout:
-        lines.append(line)
-        if max_budget_usd and '"message_end"' in line:
-            spent += reply_cost(line)
-            if spent > max_budget_usd:
-                over_budget = f"stopped at its ${max_budget_usd:g} budget after ${spent:.2f}"
-                proc.kill()
-                break
-    proc.wait()
-    timer.cancel()
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            if max_budget_usd and '"message_end"' in line:
+                spent += reply_cost(line)
+                if spent > max_budget_usd:
+                    over_budget = f"stopped at its ${max_budget_usd:g} budget after ${spent:.2f}"
+                    proc.kill()
+                    break
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     reader.join(5)
     done = subprocess.CompletedProcess(cmd, proc.returncode, "".join(lines), "".join(stderr))
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")
