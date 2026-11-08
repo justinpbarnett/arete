@@ -656,6 +656,10 @@ def revert(wt: Path) -> None:
     util.git(["clean", "-fdq"], wt, check=False)
 
 
+def replace_held_commit(ws: Workspace) -> None:
+    util.git(["reset", "-q", "--soft", ws.start], ws.wt)
+
+
 def commit_message(run: LoopRun, ws: Workspace, text: str) -> str:
     return f"{run.loop.name}: run {run.id}" if ws.public else f"{run.loop.name}: {text}"
 
@@ -816,8 +820,10 @@ def narrowing_goal(goal: str, ws: Workspace, held: str) -> str:
     return (f"{goal}\n\nThe change below makes the check exit 0, but the push screen holds it for a person: "
             f"{held}\n\n```diff\n{patch}\n```\n\nAdjust the change so the check still exits 0 and the screen "
             f"has nothing to hold: fix only the failure above, and leave alone every protection, name and behavior "
-            f"the fix does not need. When the fix needs what the screen holds, change nothing and end with one line "
-            f"that starts `{STOP_WORD}` and says why; a person then reviews the change as it stands.")
+            f"the fix does not need. Your adjusted change replaces the one above, so the line you end with says what "
+            f"the whole fix changes, not what you adjusted. When the fix needs what the screen holds, change nothing "
+            f"and end with one line that starts `{STOP_WORD}` and says why; a person then reviews the change as it "
+            f"stands.")
 
 
 @loops.runs_kind("search")
@@ -857,6 +863,8 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
                 history.append(f"- try {i}: miss, exit {code}: {util.last_line(text, 200)}: {idea}")
                 run.log("miss", f"try {i}: exit {code}: {idea}")
                 continue
+            if fix:
+                replace_held_commit(ws)
             commit(ws.wt, commit_message(run, ws, idea[:72]))
             fix = f"try {i}: hit: {idea}"
             history.append(f"- {fix}")
