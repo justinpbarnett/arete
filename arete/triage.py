@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 from . import alerts, config, gh, jev, jira, paths, runner, state, tracker, util
 from .heartbeat import mark_loop, network_up_or_skip
@@ -98,10 +99,15 @@ class TicketText:
         return len(WORDS.findall(MARKUP.sub(" ", self.body))) < THIN_WORDS
 
 
+def issue_id(kind: str, ref: str) -> str:
+    return ref.rpartition("#")[2] if kind == "github" else ref
+
+
 @dataclass
 class Source:
     key: str
     repos: list[config.Repo] = field(default_factory=list)
+    tracker: ClassVar[str]
 
     def repos_text(self) -> str:
         lines = []
@@ -115,6 +121,9 @@ class Source:
 
     def ticket_text(self, c: Candidate) -> str:
         return self.ticket(c).text
+
+    def tid(self, ref: str) -> str:
+        return issue_id(self.tracker, ref)
 
     def candidate(self, r: dict) -> Candidate:
         return Candidate(r["ref"], self.tid(r["ref"]), r["title"], r["url"], r["updated"])
@@ -188,9 +197,6 @@ class JiraSource(Source):
     def route(self, repo: str) -> str:
         return tracker.route_label(self.by_name()[repo]) if repo else ""
 
-    def tid(self, ref: str) -> str:
-        return ref
-
     def comment(self, ref: str, text: str) -> None:
         self.client.comment(ref, text)
 
@@ -241,9 +247,6 @@ class GitHubSource(Source):
 
     def route(self, repo: str) -> str:
         return ""
-
-    def tid(self, ref: str) -> str:
-        return ref.rpartition("#")[2]
 
     def comment(self, ref: str, text: str) -> None:
         gh.issue_comment(self.key, int(self.tid(ref)), text)
@@ -667,8 +670,8 @@ def standing(r: dict) -> str:
 def sent(connect=state.db) -> list[dict]:
     out = []
     for a in state.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
-        issue = a["ref"].rpartition("#")[2] if a["tracker"] == "github" else a["ref"]
-        runs = [r for r in state.ticket_runs(a["repo"], issue, limit=1, connect=connect) if r["started"] >= a["ts"]]
+        runs = [r for r in state.ticket_runs(a["repo"], issue_id(a["tracker"], a["ref"]), limit=1, connect=connect)
+                if r["started"] >= a["ts"]]
         out.append({**a, "run": runs[0] if runs else None})
     return out
 
