@@ -71,10 +71,12 @@ def stop_run(run_id: str) -> dict:
         raise Refused(f"{run_id} is still starting; stop it again in a moment")
     record.ask_stop(run_id)
     pid = int(r["pid"])
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        os.kill(pid, signal.SIGTERM)
+    for kill in (os.killpg, os.kill):
+        try:
+            kill(pid, signal.SIGTERM)
+            break
+        except (ProcessLookupError, PermissionError):
+            continue
     return {"id": run_id, "stopped": True, "pid": pid}
 
 
