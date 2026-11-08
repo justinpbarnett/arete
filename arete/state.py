@@ -225,7 +225,8 @@ CREATE TABLE IF NOT EXISTS triage (
     ts TEXT,
     kind TEXT DEFAULT '',
     repos TEXT DEFAULT '[]',
-    assumptions TEXT DEFAULT '[]'
+    assumptions TEXT DEFAULT '[]',
+    in_sprint INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS triage_approvals (
     ref TEXT PRIMARY KEY,
@@ -261,6 +262,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               ("triage", "kind", "ALTER TABLE triage ADD COLUMN kind TEXT DEFAULT ''"),
               ("triage", "repos", "ALTER TABLE triage ADD COLUMN repos TEXT DEFAULT '[]'"),
               ("triage", "assumptions", "ALTER TABLE triage ADD COLUMN assumptions TEXT DEFAULT '[]'"),
+              ("triage", "in_sprint", "ALTER TABLE triage ADD COLUMN in_sprint INTEGER DEFAULT 0"),
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
@@ -835,7 +837,7 @@ def mined_urls() -> set[str]:
 
 
 TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
-                  "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions")
+                  "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint")
 TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions")
 APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "plan", "assumptions", "why", "ts")
 APPROVAL_LISTS = ("plan", "assumptions")

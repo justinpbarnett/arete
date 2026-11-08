@@ -56,6 +56,7 @@ class JiraConfig:
     landed: dict[str, str] = field(default_factory=dict)
     auto: bool = False
     auto_per_refresh: int = 3
+    sprint_only: bool = True
 
 
 @dataclass
@@ -188,6 +189,7 @@ def load(path: Path | None = None) -> Config:
         landed={str(branch): str(target) for branch, target in (j.get("landed") or {}).items() if target},
         auto=bool(j.get("auto", False)),
         auto_per_refresh=max(0, int(j.get("auto_per_refresh", JiraConfig.auto_per_refresh))),
+        sprint_only=bool(j.get("sprint_only", JiraConfig.sprint_only)),
     )
     jv = data.get("jev", {})
     cfg.jev = JevConfig(

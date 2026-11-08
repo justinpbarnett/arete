@@ -29,7 +29,7 @@ def tickets() -> list[dict]:
 
 
 def due() -> list[dict]:
-    return [r for r in tickets() if triage.research_due(r, state.research_get(r["ref"]))]
+    return [r for r in tickets() if triage.in_sprint(r) and triage.research_due(r, state.research_get(r["ref"]))]
 
 
 def tidy() -> None:

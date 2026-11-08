@@ -24,6 +24,7 @@ META_FILE = paths.STATE_DIR / "triage.json"
 TICKET_RECORDS_DIR = paths.STATE_DIR / "triage"
 NO_MCP_SERVERS = json.dumps({"mcpServers": {}})
 SEARCH_FIELDS = ["summary", "updated", "labels"]
+SPRINT_JQL = "sprint in openSprints() OR (sprint in closedSprints() AND sprint not in futureSprints())"
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent"]
 MAX_ASSUMPTIONS = 8
 SENT_DAYS = 7
@@ -68,6 +69,7 @@ class Candidate:
     title: str
     url: str
     updated: str
+    in_sprint: bool | None = None
 
 
 @dataclass
@@ -103,14 +105,19 @@ class JiraSource(Source):
         if not self.key:
             raise jira.JiraError("no Jira project; set [jira] project or jira_project on the repo")
         client = self.client
-        jql = (f'project = "{self.key}" AND assignee = currentUser() AND statusCategory != Done '
-               f'AND (labels is EMPTY OR labels not in ("{tracker.LABEL}")) ORDER BY updated DESC')
+        mine = (f'project = "{self.key}" AND assignee = currentUser() AND statusCategory != Done '
+                f'AND (labels is EMPTY OR labels not in ("{tracker.LABEL}"))')
         out = []
-        for i in client.search(jql, SEARCH_FIELDS, limit=PER_SOURCE):
+        for i in client.search(f"{mine} ORDER BY updated DESC", SEARCH_FIELDS, limit=PER_SOURCE):
             f = i.get("fields") or {}
             if tracker.LABEL not in (f.get("labels") or []):
                 out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
                                      f.get("updated") or ""))
+        if self.jira_cfg.sprint_only:
+            scoped = {i["key"] for i in client.search(f"{mine} AND ({SPRINT_JQL}) ORDER BY updated DESC", ["updated"],
+                                                      limit=PER_SOURCE)}
+            for c in out:
+                c.in_sprint = c.ref in scoped
         return out
 
     def ticket_text(self, c: Candidate) -> str:
@@ -297,13 +304,14 @@ def settle(src: TriageSource, c: Candidate, answer: dict, cost: float) -> dict:
 def row(src: TriageSource, c: Candidate, **fields) -> dict:
     base = {"ref": c.ref, "source": src.name, "tracker": src.tracker, "repo": "", "route": "", "title": c.title,
             "url": c.url, "updated": "", "ready": None, "code": None, "kind": "", "size": "", "repos": [],
-            "questions": [], "assumptions": [], "plan": [], "why": "", "cost": 0.0, "ts": util.iso()}
+            "questions": [], "assumptions": [], "plan": [], "why": "", "cost": 0.0, "ts": util.iso(),
+            "in_sprint": c.in_sprint}
     return {**base, **fields}
 
 
 def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dict:
     if prev and prev["ready"] is not None:
-        return {**prev, "source": src.name, "title": c.title, "url": c.url}
+        return {**prev, "source": src.name, "title": c.title, "url": c.url, "in_sprint": c.in_sprint}
     return row(src, c, why=reason)
 
 
@@ -410,7 +418,7 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
 
 def approvable(srcs: list[TriageSource], rows: list[dict]) -> list[dict]:
     jira_sources = {s.name for s in srcs if isinstance(s, JiraSource)}
-    ready = [r for r in rows if r["source"] in jira_sources and standing(r) == READY and r["route"]]
+    ready = [r for r in rows if r["source"] in jira_sources and standing(r) == READY and r["route"] and in_sprint(r)]
     return sorted(ready, key=lambda r: moment(r["updated"]), reverse=True)
 
 
@@ -509,6 +517,10 @@ def labels_to_add(r: dict) -> list[str]:
     return [tracker.LABEL, r["route"]] if r["route"] else [tracker.LABEL]
 
 
+def in_sprint(r: dict) -> bool:
+    return r.get("in_sprint") != 0
+
+
 def research_due(r: dict, report: dict | None) -> bool:
     return not report or report["status"] != "running" and report["updated"] != r["updated"]
 
@@ -518,11 +530,13 @@ def stamp(ts: str) -> str:
 
 
 def research_note(r: dict, report: dict | None) -> str:
+    by_hand = f"it is outside the sprint, so `arete research {r['ref']} --run` researches it"
     if not report:
-        return "queued for research"
+        return "queued for research" if in_sprint(r) else by_hand
     if report["status"] == "running":
         return f"researching since {stamp(report['ts'])}"
-    again = ", and the ticket changed since, so it runs again" if research_due(r, report) else ""
+    again = ((", and the ticket changed since, so it runs again" if in_sprint(r) else f", and the ticket changed since; "
+              f"{by_hand} again") if research_due(r, report) else "")
     if report["status"] == "done":
         return f"report ready {stamp(report['ts'])}{again}"
     if report["status"] == "held":
@@ -545,7 +559,8 @@ def sent_note(a: dict, with_prs: bool = True) -> str:
 def verdict(r: dict, reports: dict | None = None) -> str:
     kind = standing(r)
     if kind == READY:
-        return ", ".join(p for p in (f"ready {r['kind']}".strip(), r["size"], f"add {' '.join(labels_to_add(r))}") if p)
+        return ", ".join(p for p in (f"ready {r['kind']}".strip(), r["size"], f"add {' '.join(labels_to_add(r))}",
+                                     "" if in_sprint(r) else "outside the sprint") if p)
     if kind == WITH_QUESTIONS:
         return ", ".join(p for p in ("not ready", r["kind"], r["size"], util.count(len(r["questions"]), "question")) if p)
     if kind == RESEARCH_WORK:
@@ -560,8 +575,9 @@ def summary(v: dict) -> str:
 
 def auto_note(cfg: config.Config) -> str:
     if cfg.jira.auto:
-        return (f"arete adds the labels to up to {cfg.jira.auto_per_refresh} Jira tickets each refresh; add them "
-                "yourself to approve sooner")
+        scope = " in the open sprint or left over from a closed one" if cfg.jira.sprint_only else ""
+        return (f"arete adds the labels to up to {cfg.jira.auto_per_refresh} Jira tickets{scope} each refresh; add "
+                "them yourself to approve sooner")
     return "add the labels to approve"
 
 
@@ -582,7 +598,7 @@ def board() -> str:
     if g[READY]:
         lines += ["", f"Ready to build: {auto_note(config.load())}"]
         lines += [f"  {r['ref']:<{width}}  {r['size']}  {r['repo']:<{repo_width}}  {' '.join(labels_to_add(r)):<16}  "
-                  f"{r['title']}" for r in g[READY]]
+                  f"{r['title']}{'' if in_sprint(r) else '  (outside the sprint)'}" for r in g[READY]]
     if g[SENT]:
         lines += ["", f"Sent to the pipeline in the last {SENT_DAYS} days"]
         for a in g[SENT]:
