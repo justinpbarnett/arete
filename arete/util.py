@@ -125,6 +125,10 @@ def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, in
     return res.stdout
 
 
+def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
+    return [r for r in git([args[0], "-z", *args[1:]], cwd, **kw).split("\0") if r]
+
+
 def git_error(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     errors = [line for line in lines if line.startswith(("fatal:", "error:"))]

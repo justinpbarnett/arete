@@ -59,8 +59,12 @@ class Diff:
 
 def stage(wt: Path, deny: Sequence[str] = (), against: str = "HEAD", prefix: str = "") -> Diff:
     add(wt)
+    return between(wt, "--cached", against, deny=deny, prefix=prefix)
+
+
+def between(wt: Path, *revs: str, deny: Sequence[str] = (), prefix: str = "") -> Diff:
     diff = Diff()
-    for row in util.git(["diff", "--cached", "--numstat", "--no-renames", against], wt).splitlines():
+    for row in util.git_records(["diff", "--numstat", "--no-renames", *revs], wt):
         added, removed, name = row.split("\t", 2)
         path = prefix + name
         lock = is_lockfile(name)

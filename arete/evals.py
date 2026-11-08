@@ -99,7 +99,7 @@ class Source:
     def modes(self) -> dict[str, str]:
         if self._modes is None:
             self._modes = {}
-            for row in git(["ls-tree", "-r", self.ref], self.repo.path).splitlines():
+            for row in util.git_records(["ls-tree", "-r", self.ref], self.repo.path):
                 meta, _, name = row.partition("\t")
                 mode, kind, _sha = meta.split()
                 if kind == "blob":
@@ -110,12 +110,12 @@ class Source:
         if self.ref:
             prefix = under.rstrip("/") + "/" if under else ""
             return [f for f in self.modes() if f.startswith(prefix)]
-        out = git(["ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "--", under or "."],
-                  self.repo.path)
+        out = util.git_records(["ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "--",
+                                under or "."], self.repo.path)
         keep = []
-        for f in out.splitlines():
+        for f in out:
             p = self.repo.path / f
-            if f and (p.is_symlink() or p.is_file()):
+            if p.is_symlink() or p.is_file():
                 keep.append(f)
         return keep
 
@@ -185,7 +185,7 @@ def remove_empty_parents(d: Path, stop: Path) -> None:
 
 
 def remove_base_harness(wt: Path, globs: list[str]) -> None:
-    for f in git(["ls-files"], wt).splitlines():
+    for f in util.git_records(["ls-files"], wt):
         if util.matches_any(f, globs) and not f.startswith(EVALS):
             (wt / f).unlink(missing_ok=True)
             remove_empty_parents((wt / f).parent, wt)

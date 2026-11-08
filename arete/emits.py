@@ -173,8 +173,8 @@ class Push(Emit):
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         src = Path(outcome["workdir"])
         start, branch = outcome["start"], outcome["branch"]
-        diff = landed_diff(src, start, branch)
-        deleted = util.git(["diff", "--name-only", "--no-renames", "--diff-filter=D", start, branch], src).split()
+        diff = diffguard.between(src, start, branch)
+        deleted = util.git_records(["diff", "--name-only", "--no-renames", "--diff-filter=D", start, branch], src)
         public = outcome.get("public", True)
         return {"repo": loop.repo, "workdir": str(src), "branch": branch, "base": outcome["base"],
                 "check": spec.get("check") or loop.spec.get("check", ""), "env": check_env(loop, run_id),
@@ -237,14 +237,6 @@ def shown_patch(patch: str, start: str, branch: str) -> str:
     if len(patch) <= PATCH_SHOWN:
         return patch
     return f"{patch[:PATCH_SHOWN]}\n\ncut at {PATCH_SHOWN} characters; git diff {start[:10]} {branch} shows the rest"
-
-
-def landed_diff(src: Path, start: str, branch: str) -> diffguard.Diff:
-    diff = diffguard.Diff()
-    for row in util.git(["diff", "--numstat", "--no-renames", start, branch], src).splitlines():
-        added, removed, name = row.split("\t", 2)
-        diff.counts[name] = 0 if diffguard.is_lockfile(name) or added == "-" else int(added) + int(removed)
-    return diff
 
 
 def land(item: dict, wt: Path, src: Path, base: str) -> str:

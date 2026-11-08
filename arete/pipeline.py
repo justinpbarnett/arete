@@ -441,7 +441,7 @@ def lines_by_file(staged: Staged, top: int = 12) -> str:
 
 
 def untracked_files(wt: Path) -> set[str]:
-    return set(git(["ls-files", "--others", "--exclude-standard", "-z"], wt).split("\0")) - {""}
+    return set(util.git_records(["ls-files", "--others", "--exclude-standard"], wt))
 
 
 def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:

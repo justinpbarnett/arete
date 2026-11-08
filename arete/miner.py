@@ -350,8 +350,8 @@ def placeholders(text: str) -> set[str]:
 def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
     if repo.name != cfg.arete_repo:
         return ""
-    for row in git(["diff", "--cached", "--name-status", "--no-renames", "HEAD"], wt).splitlines():
-        status, f = row.split("\t", 1)
+    rows = util.git_records(["diff", "--cached", "--name-status", "--no-renames", "HEAD"], wt)
+    for status, f in zip(rows[::2], rows[1::2]):
         if not util.matches_any(f, [ARETE_PROMPT_GLOB]):
             continue
         if status == "A":
