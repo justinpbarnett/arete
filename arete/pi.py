@@ -26,8 +26,9 @@ PI_HOME = paths.HOME / ".pi"
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
 RESTATE = ("An agent finished a task but did not write its answer as the JSON it was asked for. Below is how its run "
-           "ended: its last replies, and the tool calls it tried. Write the answer it gave as that JSON, using only "
-           "what it said.")
+           "ended: its last replies, the tool calls it tried, and its last thoughts when it ended on a thought. Write "
+           "the answer it gave as that JSON, using only what it said.")
+NO_ANSWER = "A tool call is not an answer. If the ending holds no answer, reply with only the words: no answer."
 ENDING_REPLIES = 3
 ENDING_CHARS = 12000
 RESTATE_TIMEOUT = 600
@@ -137,13 +138,18 @@ def run(
 
 def ending(stdout: str) -> str:
     end = next((e for e in reversed(events(stdout)) if e.get("type") == "agent_end"), {})
+    replies = [m for m in end.get("messages", []) if m.get("role") == "assistant"][-ENDING_REPLIES:]
     said = []
-    for reply in [m for m in end.get("messages", []) if m.get("role") == "assistant"][-ENDING_REPLIES:]:
+    for reply in replies:
         for block in reply.get("content", []):
             if block.get("type") == "text" and block.get("text", "").strip():
                 said.append(block["text"].strip())
             elif block.get("type") == "toolCall":
                 said.append(f"tool call {block.get('name')}: {json.dumps(block.get('arguments'))}")
+    last_blocks = replies[-1].get("content", []) if replies else []
+    if not any(b.get("type") == "text" and b.get("text", "").strip() for b in last_blocks):
+        said += [f"its last thoughts, which it never wrote as a reply:\n{b['thinking'].strip()}" for b in last_blocks
+                 if b.get("type") == "thinking" and b.get("thinking", "").strip()]
     return util.tail("\n\n".join(said), ENDING_CHARS)
 
 
@@ -152,7 +158,7 @@ def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd
     if not ending_text:
         return
     prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
-              f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}")
+              f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}\n\n{NO_ANSWER}")
     again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote)
     result.cost_usd += again.cost_usd
     result.tokens_in += again.tokens_in
