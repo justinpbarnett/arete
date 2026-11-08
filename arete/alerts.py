@@ -35,7 +35,7 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
     if not repo:
         if not prev:
             notify("arete", f"{title}: {status}")
-        state.alert_set(key, None)
+        state.alert_set(key, (prev or {}).get("issue"))
         return f"notified {key}"
     try:
         if prev and prev.get("issue") and gh.issue_state(repo, prev["issue"]) == "OPEN":
@@ -45,7 +45,7 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
         body = (
             f"Check `{key}` is failing.\n\n"
             f"Status: {status}\n\n"
-            f"First seen: {util.iso()}\n\n"
+            f"First seen: {(prev or {}).get('opened') or util.iso()}\n\n"
             "Arete closes this issue when the check passes again. Details: `arete status` on the Mac."
         )
         num = gh.issue_create(repo, f"[arete] {title}", body, [LABEL])
