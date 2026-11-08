@@ -427,7 +427,8 @@ def results_md(repo: str, source: str, results: list[dict]) -> str:
     lines = [f"Evals for {repo} on `{source}`: {passed}/{len(results)} passed.", "",
              "| task | result | time | cost |", "|---|---|---|---|"]
     for r in results:
-        res = "pass" if r["passed"] else f"fail ({r['why']})"
+        why = r["why"].replace("|", "\\|")
+        res = "pass" if r["passed"] else f"fail ({why})"
         if r.get("regressed"):
             res += ", passed the three runs before"
         lines.append(f"| {r['task']} | {res} | {r['seconds']:.0f}s | ${r['cost']:.2f} |")
