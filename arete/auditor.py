@@ -116,7 +116,7 @@ def enabled_plugins() -> list[Path]:
     installed = util.read_json(paths.HOME / ".claude" / "plugins" / "installed_plugins.json", {})
     try:
         enabled = json.loads(paths.CLAUDE_SETTINGS.read_text()).get("enabledPlugins") or {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         enabled = {}
     out = []
     for name, installs in (installed.get("plugins") or {}).items():
@@ -141,7 +141,7 @@ def check_hooks(cfg: config.Config) -> list[Finding]:
         rel = paths.short_path(f)
         try:
             commands = hook_commands(json.loads(f.read_text()))
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
             out.append(Finding("hooks", "fail", rel, f"does not parse: {e}"))
             continue
         except (AttributeError, TypeError) as e:
@@ -179,7 +179,7 @@ def check_repos(cfg: config.Config) -> list[Finding]:
                     out.append(Finding("agents-config", "warn", paths.short_path(f), f"unknown sections: {', '.join(sorted(extra))}"))
                 if r.pipeline and not data.get("checks"):
                     out.append(Finding("agents-config", "warn", paths.short_path(f), "pipeline is on but no checks are set"))
-            except tomllib.TOMLDecodeError as e:
+            except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
                 out.append(Finding("agents-config", "fail", paths.short_path(f), f"does not parse: {e}"))
         elif r.pipeline:
             out.append(Finding("agents-config", "fail", r.name, f"pipeline is on but {paths.short_path(f)} is missing"))
