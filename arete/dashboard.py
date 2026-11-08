@@ -123,7 +123,7 @@ def host_name(host: str) -> str:
 
 
 def whole_number(text: str) -> int:
-    if not str(text).strip().isdigit():
+    if not str(text).strip().isdecimal():
         raise Refusal(400, f"'{text}' is not a whole number.")
     return int(text)
 
