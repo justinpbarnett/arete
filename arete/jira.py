@@ -214,6 +214,7 @@ def adf(markdown: str) -> dict:
     para: list[str] = []
     bullets: list[str] = []
     numbered: list[str] = []
+    first_number = 1
     code: list[str] | None = None
 
     def flush() -> None:
@@ -227,9 +228,12 @@ def adf(markdown: str) -> dict:
             para.clear()
         for kind, items in (("bulletList", bullets), ("orderedList", numbered)):
             if items:
-                content.append({"type": kind, "content": [
+                node: dict = {"type": kind, "content": [
                     {"type": "listItem", "content": [{"type": "paragraph", "content": _inline(i)}]} for i in items
-                ]})
+                ]}
+                if items is numbered and first_number != 1:
+                    node["attrs"] = {"order": first_number}
+                content.append(node)
                 items.clear()
 
     def code_block(lines: list[str]) -> dict:
@@ -257,10 +261,12 @@ def adf(markdown: str) -> dict:
             if para or numbered:
                 flush()
             bullets.append(m.group(1))
-        elif m := re.match(r"^\s*\d+[.)]\s+(.*)$", line):
+        elif m := re.match(r"^\s*(\d{1,9})[.)]\s+(.*)$", line):
             if para or bullets:
                 flush()
-            numbered.append(m.group(1))
+            if not numbered:
+                first_number = int(m.group(1))
+            numbered.append(m.group(2))
         else:
             if bullets or numbered:
                 flush()
