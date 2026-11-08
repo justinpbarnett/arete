@@ -248,6 +248,10 @@ def last_number(text: str) -> float | None:
     return float(found[-1]) if found else None
 
 
+def number_text(value: float) -> str:
+    return str(value).removesuffix(".0")
+
+
 def fenced(data) -> str:
     return "```json\n" + json.dumps(data, indent=2, default=str).replace("```", "'''") + "\n```"
 
@@ -739,13 +743,13 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         baseline = measure(ws.wt)
         if baseline is None:
             return "failed", f"`{spec['measure']}` did not print a number on the base branch"
-        best, history = baseline, [f"- baseline: {baseline:g}"]
-        run.log("measure", f"baseline {baseline:g}")
+        best, history = baseline, [f"- baseline: {number_text(baseline)}"]
+        run.log("measure", f"baseline {number_text(baseline)}")
         goal = (f"Make `{spec['measure']}` print a {'higher' if higher else 'lower'} number. It prints "
-                f"{baseline:g} now.")
+                f"{number_text(baseline)} now.")
         for i in range(1, run.loop.tries + 1):
             try:
-                idea, why_not = try_once(run, ws, i, goal + f" Best so far: {best:g}.", history, files)
+                idea, why_not = try_once(run, ws, i, goal + f" Best so far: {number_text(best)}.", history, files)
             except OverBudget as e:
                 if i == 1:
                     raise
@@ -762,21 +766,26 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                 continue
             value = measure(ws.wt)
             if value is not None and (value > best if higher else value < best):
-                commit(ws.wt, commit_message(run, ws, f"{idea[:60]} ({best:g} -> {value:g})"))
-                history.append(f"- try {i}: kept, {best:g} -> {value:g}: {idea}")
-                run.log("keep", f"try {i}: {best:g} -> {value:g}: {idea}")
+                change = f"{number_text(best)} -> {number_text(value)}"
+                commit(ws.wt, commit_message(run, ws, f"{idea[:60]} ({change})"))
+                history.append(f"- try {i}: kept, {change}: {idea}")
+                run.log("keep", f"try {i}: {change}: {idea}")
                 best, kept = value, True
             else:
                 revert(ws.wt)
-                result = "measure failed" if value is None else f"{value:g}, not better than {best:g}"
+                result = "measure failed" if value is None else \
+                    f"{number_text(value)}, not better than {number_text(best)}"
                 history.append(f"- try {i}: reverted, {result}: {idea}")
                 run.log("revert", f"try {i}: {result}: {idea}")
         if not kept:
-            return "done", f"the agent stopped the run: {stopped}" if stopped else f"no try beat the baseline {baseline:g}"
-        summary = f"{spec['measure']}: {baseline:g} -> {best:g}"
+            return "done", (f"the agent stopped the run: {stopped}" if stopped
+                            else f"no try beat the baseline {number_text(baseline)}")
+        climbed = f"{number_text(baseline)} -> {number_text(best)}"
+        summary = f"{spec['measure']}: {climbed}"
         outcome = {**ws.outcome_fields(), "value": best, "facts": summary, "summary": summary,
-                   "title": f"{run.loop.name}: {baseline:g} -> {best:g}",
-                   "report": f"Climbed `{spec['measure']}` from {baseline:g} to {best:g}.\n\n" + "\n".join(history)}
+                   "title": f"{run.loop.name}: {climbed}",
+                   "report": f"Climbed `{spec['measure']}` from {number_text(baseline)} to {number_text(best)}.\n\n"
+                   + "\n".join(history)}
         drop_worktree(ws)
         emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
         return "done", summary
