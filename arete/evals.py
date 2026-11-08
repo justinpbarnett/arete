@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -211,13 +212,25 @@ def overlay_harness(src: Source, wt: Path) -> list[str]:
     return copied
 
 
+def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
+    git(["init", "-q"], staging)
+    git(["fetch", "-q", "--no-tags", "--depth", "1", str(repo_path), sha], staging, timeout=600)
+    git(["read-tree", sha], staging)
+    git(["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", EVALS], staging)
+    tree = git(["write-tree"], staging).strip()
+    return git(["-c", "user.name=arete", "-c", "user.email=arete@localhost", "commit-tree", tree, "-m",
+                "eval base"], staging).strip()
+
+
 def isolated_checkout(repo_path: Path, base: str, dest: Path) -> None:
     # Not a worktree: a worktree shares the remote refs, so the agent could read the real fix from origin/main.
     shutil.rmtree(dest, ignore_errors=True)
     sha = git(["rev-parse", f"{base}^{{commit}}"], repo_path).strip()
     dest.mkdir(parents=True)
     git(["init", "-q"], dest)
-    git(["fetch", "-q", "--no-tags", str(repo_path), sha], dest, timeout=600)
+    with tempfile.TemporaryDirectory(prefix=f"{dest.name}-base-", dir=dest.parent) as staging:
+        snapshot = commit_without_evals(repo_path, sha, Path(staging))
+        git(["fetch", "-q", "--no-tags", staging, snapshot], dest, timeout=600)
     git(["checkout", "-q", "-B", "main", "FETCH_HEAD"], dest)
 
 
