@@ -173,7 +173,10 @@ def fleet() -> list[dict]:
 
 def costs(days: float | None = None) -> dict:
     days = COST_DAYS if days is None else days
-    since = util.iso(util.now() - timedelta(days=days))
+    try:
+        since = util.iso(util.now() - timedelta(days=days))
+    except (OverflowError, ValueError) as e:
+        raise Refused(f"cannot look back {days:g} days: {e}") from e
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
     for s in state.steps_since(since):

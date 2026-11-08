@@ -605,7 +605,10 @@ def cmd_webhook(args) -> int:
 def cmd_costs(args) -> int:
     from . import control
 
-    c = control.costs(args.days)
+    try:
+        c = control.costs(args.days)
+    except control.Refused as e:
+        return refused(e)
     print(f"${c['total_usd']:.2f} in the last {c['days']:g} days")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
