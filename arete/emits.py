@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import contextlib
 import re
 from pathlib import Path
 
-from . import alerts, config, gh, paths, sources, state, util
-from .loops import Loop, as_list, worktree_kinds
+from . import alerts, config, diffguard, gh, paths, sources, state, util
+from .loops import FINDING_EVENT, Loop, as_list, check_env, find, worktree_kinds
 
 DIGESTS_DIR = paths.STATE_DIR / "digests"
 SEVERITIES = ("low", "medium", "high", "critical")
+PUSH_RULES = ("lines", "deletes", "paths")
 FENCE = re.compile(r"`{3,}")
 TAGS = re.compile(r"<[^>]{0,200}>")
 LINKS = re.compile(r"!?\[([^\]]{0,200})\]\([^)]{0,500}\)")
@@ -60,8 +60,13 @@ class Failed(RuntimeError):
 
 
 class Emit:
+    kept_when_failed = False
+
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         return []
+
+    def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
+        return "approve is on" if spec.get("approve") else ""
 
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [findings] if findings or outcome.get("branch") else []
@@ -148,6 +153,156 @@ class PullRequest(Emit):
             util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
 
 
+class Push(Emit):
+    kept_when_failed = True
+
+    def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        if loop.kind not in worktree_kinds():
+            return [f"only {' and '.join(worktree_kinds())} loops emit a push"]
+        approve = spec.get("approve", False)
+        if isinstance(approve, dict) and (unknown := sorted(set(approve) - set(PUSH_RULES))):
+            return [f"a push emit's approve table takes {', '.join(PUSH_RULES)}, not {', '.join(unknown)}"]
+        if not isinstance(approve, bool | dict):
+            return ["a push emit's approve is true, false, or a table of lines, deletes and paths"]
+        return []
+
+    def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
+        return [findings] if outcome.get("branch") else []
+
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
+        src = Path(outcome["workdir"])
+        start, branch = outcome["start"], outcome["branch"]
+        diff = landed_diff(src, start, branch)
+        deleted = util.git(["diff", "--name-only", "--no-renames", "--diff-filter=D", start, branch], src).split()
+        public = outcome.get("public", True)
+        return {"repo": loop.repo, "workdir": str(src), "branch": branch, "base": outcome["base"],
+                "check": spec.get("check") or loop.spec.get("check", ""), "env": check_env(loop, run_id),
+                "timeout": loop.timeout_minutes * 60, "lines": diff.lines, "files": diff.files, "deleted": deleted,
+                "title": plain(f"{loop.name}: run {run_id}" if public else outcome.get("title", ""), 120),
+                "report": plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000)}
+
+    def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
+        try:
+            layer_dir = cfg.repo(item["repo"]).layer_dir
+        except config.UnknownRepo:
+            layer_dir = Path(item["workdir"]) / ".agents"
+        layer = config.load_layer(layer_dir)
+        if layer.trust_level != "automerge":
+            return f"the trust level of {item['repo']} is pr, so a person lands each push"
+        if denied := [f for f in item["files"] if util.matches_any(f, diffguard.denied_paths(layer))]:
+            return f"touches {', '.join(denied[:5])}, which only a person may change"
+        approve = spec.get("approve", False)
+        if approve is True:
+            return "approve is on"
+        rules = approve if isinstance(approve, dict) else {}
+        if (limit := rules.get("lines")) and item["lines"] > int(limit):
+            return f"{item['lines']} lines changed, over the {limit} line approval limit"
+        if rules.get("deletes") and item["deleted"]:
+            return f"deletes {', '.join(item['deleted'][:5])}"
+        if touched := [f for f in item["files"] if util.matches_any(f, as_list(rules.get("paths")))]:
+            return f"touches {', '.join(touched[:5])}"
+        return ""
+
+    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
+        src, base = Path(item["workdir"]), item["base"]
+        if "origin" not in util.git(["remote"], src, check=False).split():
+            raise RuntimeError(f"{paths.short_path(src)} has no origin to push to")
+        wt = paths.WORKTREES_DIR / f"push-{run_id}"
+        util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
+        util.git(["worktree", "add", "-q", "--detach", str(wt), item["branch"]], src)
+        try:
+            sha = land(item, wt, src, base)
+        finally:
+            util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
+        util.git(["branch", "-D", item["branch"]], src, check=False)
+        return f"pushed {sha[:10]} to {base}; {fast_forward(src, base, sha)}"
+
+    def describe(self, item: dict) -> str:
+        return (f"push {item['branch']} to {item['base']} of {item['repo']} after `{item['check']}` passes "
+                f"({item['lines']} lines in {util.count(len(item['files']), 'file')})")
+
+    def detail(self, item: dict) -> str:
+        return f"{item['title']}\n\nFiles: {', '.join(item['files'])}\n\n{item['report']}"
+
+    def rejected(self, item: dict) -> None:
+        util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+
+
+def landed_diff(src: Path, start: str, branch: str) -> diffguard.Diff:
+    diff = diffguard.Diff()
+    for row in util.git(["diff", "--numstat", "--no-renames", start, branch], src).splitlines():
+        added, removed, name = row.split("\t", 2)
+        diff.counts[name] = 0 if diffguard.is_lockfile(name) or added == "-" else int(added) + int(removed)
+    return diff
+
+
+def land(item: dict, wt: Path, src: Path, base: str) -> str:
+    for attempt in (1, 2):
+        util.git(["fetch", "-q", "origin", base], src)
+        try:
+            util.git(["rebase", "-q", f"origin/{base}"], wt)
+        except RuntimeError as e:
+            util.git(["rebase", "--abort"], wt, check=False)
+            raise RuntimeError(f"the change does not rebase onto origin/{base}: {e}") from e
+        gate = util.sh(item["check"], cwd=wt, timeout=item["timeout"], env=item["env"])
+        if gate.returncode != 0:
+            raise RuntimeError(f"`{item['check']}` exits {gate.returncode} after the rebase: "
+                               f"{util.last_line((gate.stdout or '') + (gate.stderr or ''), 300)}")
+        try:
+            util.git(["push", "-q", "origin", f"HEAD:refs/heads/{base}"], wt)
+        except RuntimeError:
+            if attempt == 2:
+                raise
+            continue
+        util.git(["fetch", "-q", "origin", base], src, check=False)
+        return util.git(["rev-parse", "HEAD"], wt).strip()
+    raise RuntimeError("unreachable")
+
+
+def fast_forward(src: Path, base: str, sha: str) -> str:
+    on = util.git(["rev-parse", "--abbrev-ref", "HEAD"], src, check=False).strip()
+    if on != base:
+        return f"{paths.short_path(src)} is on {on}, not {base}, so it was left alone"
+    try:
+        util.git(["merge", "-q", "--ff-only", sha], src)
+    except RuntimeError as e:
+        return f"{paths.short_path(src)} did not fast forward: {e}"
+    return f"{paths.short_path(src)} fast forwarded"
+
+
+class ToLoop(Emit):
+    def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        if not spec.get("loop"):
+            return ["a loop emit needs loop, the name of the loop that takes each finding"]
+        if spec["loop"] == loop.name:
+            return ["a loop emit cannot feed its own loop"]
+        return []
+
+    def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
+        return [[f] for f in findings]
+
+    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
+        f = findings[0]
+        return {"loop": spec["loop"], "event": sources.event(
+            FINDING_EVENT, f"{loop.name}#finding", f["fingerprint_key"], plain(f["title"], 200), repo=f.get("repo", ""),
+            trust=outcome.get("trust") or "internal", data={**f, "from_loop": loop.name, "from_run": run_id})}
+
+    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
+        target = find(item["loop"], cfg)
+        if not target.enabled:
+            raise RuntimeError(f"the loop {target.name} is off{': ' + target.error if target.error else ''}")
+        if why := target.trigger.refusal(item["event"]):
+            raise ValueError(f"{target.name} {why}")
+        queued = sources.fire(target, f"finding from {loop_name}", [item["event"]])
+        return f"queued for {target.name} as #{queued[0]}"
+
+    def describe(self, item: dict) -> str:
+        return f"hand the finding to {item['loop']}: {item['event']['title']}"
+
+    def detail(self, item: dict) -> str:
+        return plain(item["event"]["data"].get("summary"), 2000)
+
+
 class Digest(Emit):
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         lines = [f"## {util.now().astimezone().strftime('%H:%M')} {loop.name} ({run_id})", ""]
@@ -203,8 +358,8 @@ class Metric(Emit):
         return f"record metric {item['name']} = {item['value']:g}"
 
 
-EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "digest": Digest(), "notify": Notify(),
-                          "metric": Metric()}
+EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(), "loop": ToLoop(),
+                          "digest": Digest(), "notify": Notify(), "metric": Metric()}
 
 
 def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, trial: bool, log,
@@ -216,11 +371,16 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
             what = emit.describe(delivery["item"])
             if trial:
                 log("held", f"would {what}")
-            elif spec.get("approve"):
-                log("emit", f"waiting for approval #{state.add_approval(loop.name, run_id, delivery, what)}: {what}")
+            elif why := emit.held(spec, delivery["item"], cfg):
+                log("emit", f"waiting for approval #{state.add_approval(loop.name, run_id, delivery, what)} "
+                            f"({why}): {what}")
             else:
-                with contextlib.suppress(Failed):
+                try:
                     send(delivery, loop.name, run_id, cfg, log)
+                except Failed as e:
+                    if emit.kept_when_failed:
+                        log("emit", f"kept as approval #{state.add_approval(loop.name, run_id, delivery, what, str(e))}"
+                                    f" to try again or reject")
 
 
 def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -> str:

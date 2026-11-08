@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import operator
 import os
+import sys
 import threading
 import time
 from collections import Counter
@@ -9,12 +10,26 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import NoReturn
 
-from . import config, control, dashboard, engine, loops, record, sources, state, util
+from . import (
+    chat,
+    config,
+    control,
+    dashboard,
+    engine,
+    loops,
+    paths,
+    record,
+    sources,
+    state,
+    util,
+)
 from .loops import Loop
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
 POLL_THREADS = 8
+IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.engine"
+RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
            "!=": operator.ne}
 
@@ -24,6 +39,25 @@ def next_due(loop: Loop, after: datetime) -> str:
     if t.every:
         return util.iso(after + timedelta(seconds=t.every))
     return util.iso(t.cron.next_after(after.astimezone()).astimezone(after.tzinfo)) if t.cron else ""
+
+
+def code_stamp() -> frozenset:
+    stamp = set()
+    for p in paths.PACKAGE_DIR.rglob("*.py"):
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            continue
+        stamp.add((str(p), st.st_mtime_ns, st.st_size))
+    return frozenset(stamp)
+
+
+def reap_children() -> None:
+    try:
+        while os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except ChildProcessError:
+        pass
 
 
 def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
@@ -43,9 +77,11 @@ class Server:
         self.waiting: dict[int, str] = {}
         self.restarted: Counter[int] = Counter()
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
-        self.loaded = False
+        self.loaded = os.environ.pop(RESTARTED_FOR_NEW_CODE, "") == "1"
         self.pruned = 0.0
         self.ticks = 0
+        self.code = self.code_seen = code_stamp()
+        self.code_note = ""
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -186,6 +222,40 @@ class Server:
         state.take_queue_item(item["id"], None)
         self.say(f"{item['loop']}: queue item {item['id']} goes back in the queue, {why}")
 
+    def busy_with(self) -> str:
+        if running := state.runs_marked_running():
+            return f"{util.count(len(running), 'run')} still running"
+        if sum(not f.done() for f in self.polls.values()):
+            return "a source poll is still running"
+        if dashboard.POSTS_IN_FLIGHT.count:
+            return "the dashboard is still answering a request"
+        if chat.history()["busy"]:
+            return "a chat message is still running"
+        return ""
+
+    def load_new_code(self) -> None:
+        stamp = code_stamp()
+        steady, self.code_seen = stamp == self.code_seen, stamp
+        if stamp == self.code or not steady:
+            return
+        if busy := self.busy_with():
+            self.note_once(f"new code waits to load: {busy}")
+            return
+        check = util.sh([sys.executable, "-c", IMPORT_CHECK], timeout=120)
+        if check.returncode != 0:
+            self.note_once("new code does not import, so serve keeps the code it started with: "
+                           + util.last_line(check.stderr or check.stdout, 300))
+            return
+        reap_children()
+        self.say(f"new code: serve {os.getpid()} restarts itself")
+        os.environ[RESTARTED_FOR_NEW_CODE] = "1"
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+
+    def note_once(self, text: str) -> None:
+        if self.code_note != text:
+            self.code_note = text
+            self.say(text)
+
     def beat(self, every_loop: list[Loop], live: list[Loop]) -> None:
         util.write_json(control.BEAT_FILE, {
             "pid": os.getpid(), "at": util.iso(), "started": util.iso(self.started), "ticks": self.ticks,
@@ -204,6 +274,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
         started = time.monotonic()
         try:
             server.tick()
+            server.load_new_code()
         except Exception as e:
             server.say(f"tick failed: {type(e).__name__}: {e}")
         time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))

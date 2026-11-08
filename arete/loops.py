@@ -16,6 +16,7 @@ TRIES = 5
 METRIC_RULE = re.compile(r"^\s*([\w.\-/]+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?)\s*$")
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
+FINDING_EVENT = "finding"
 GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 
 
@@ -100,6 +101,10 @@ class Loop:
     @property
     def fed_by_events(self) -> bool:
         return bool(self.sources or self.trigger.webhook)
+
+    @property
+    def takes_findings(self) -> bool:
+        return FINDING_EVENT in self.trigger.events
 
     @property
     def queue_name(self) -> str:
@@ -342,6 +347,11 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")
+    elif (loop.agent and loop.takes_findings and trust_rank(loop.trigger.trust) < trust_rank("internal")
+          and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS))):
+        problems.append(f"a loop that takes findings from other loops and has the acting tools {', '.join(acting)} "
+                        f"needs [trigger] trust = \"internal\" or above, so a finding from untrusted text never "
+                        f"reaches it")
     for s in loop.sources:
         if s.get("type") not in SOURCES:
             problems.append(f"source type '{s.get('type')}' is not one of {', '.join(SOURCES)}")
@@ -356,6 +366,11 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("[classify] needs prompt, the yes or no question")
     if problems:
         raise LoopError("; ".join(problems))
+
+
+def check_env(loop: Loop, run_id: str) -> dict[str, str]:
+    return {"ARETE_RUN_ID": run_id, "ARETE_LOOP": loop.name, "ARETE_LOOP_DIR": str(loop.dir),
+            "ARETE_SCRATCH": str(paths.scratch_dir(run_id))}
 
 
 def prompt_text(loop: Loop) -> str:

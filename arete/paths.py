@@ -33,6 +33,10 @@ def short_path(p: str | Path) -> str:
     return "~" + s[len(home):] if s.startswith(home) else s
 
 
+def scratch_dir(run_id: str) -> Path:
+    return RUNS_DIR / run_id / "scratch"
+
+
 def ensure_dirs() -> None:
     for d in (STATE_DIR, RUNS_DIR, WORKTREES_DIR, LOCKS_DIR, LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)

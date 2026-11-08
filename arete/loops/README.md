@@ -32,7 +32,7 @@ enabled = false                # a draft starts off; `arete loop enable NAME` tu
 [trigger]
 every = "1h"                   # or cron = "30 4 * * *" (minute hour day month weekday, local time); not both
 run_at_load = false            # also fire once when serve starts
-event = ["github.ci_red"]      # only these event types fire the loop, from a source or a webhook; all types when left out
+event = ["github.ci_red"]      # only these event types fire the loop, from a source or a webhook; all types when left out; "finding" takes findings from another loop's loop emit
 webhook = false                # POST /hook/<name> fires the loop as type github.<X-GitHub-Event>, else webhook; `arete webhook secret NAME` prints the token
 metric = "pass_rate < 0.8"     # fire when the latest value of a metric crosses the rule; a metric event is internal and passes the event list
 group = "repo"                 # events that share this field wait in line one at a time
@@ -81,23 +81,59 @@ iterations = 5
 files = ["src/"]
 
 [[emit]]                       # what the loop puts out; several are fine
-type = "ticket"                # ticket | pr | digest | notify | metric
+type = "ticket"                # ticket | pr | push | loop | digest | notify | metric
 repo = "arete"                 # ticket: config repo name or owner/name
 labels = ["agent"]             # ticket: `agent` hands the ticket to the pipeline
 prefix = "[ci] "               # ticket: put before each title
 approve = false                # true holds it until you approve it on the dashboard or with `arete approve ID`
 # type = "pr":     draft = true, labels = [], title = ""; climb and search only
+# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"] }, check = ""; climb and search only; see Push below
+# type = "loop":   loop = "fix-it"; hands each finding to that loop as a finding event
 # type = "digest": appends to ~/.local/share/arete/digests/<loop>/<day>.md
 # type = "notify": a desktop notification
 # type = "metric": name = "open_ci_red"; the value is the finding count or the command's `value`
 ```
+
+## What a run can read
+
+A command loop, a watch loop's `[run] script`, and a climb or search check run with these in the environment:
+
+| Name | Holds |
+|---|---|
+| `ARETE_RUN_ID` | the run id |
+| `ARETE_LOOP` | the loop name |
+| `ARETE_LOOP_DIR` | the loop folder, for a script that keeps a file there, such as a cursor |
+| `ARETE_SCRATCH` | climb, search and the watch script: `runs/<run id>/scratch/` in the state folder. It keeps its files across tries and is never committed. The agent gets its path and may write there, so a check can run a file that the agent wrote, such as a repro |
+| `ARETE_REPO_DIR` | the watch script: the checkout of `[run] repo`, empty without one |
+| `ARETE_TRIAL` | a command loop: `1` under `arete loop try` |
+
+A climb or search agent that finds the goal cannot or should not be met changes nothing and ends with a line that starts `Stop:` and says why. The run ends as done with that reason, and nothing is emitted.
+
+## Findings from another loop
+
+A `loop` emit hands each finding to another loop, which fires once per finding. That loop takes them with `[trigger] event = ["finding"]`, and the finding reaches its agent under `## Input`, fenced as data. A finding carries the weakest trust among the events that led to it, so a finding read out of untrusted text stays untrusted. A run with no events, or fed only by its own script, hands on internal findings. A loop that takes findings and has an acting tool such as Edit needs `[trigger] trust = "internal"` or above, so a finding read out of untrusted text never reaches an agent that edits.
+
+## Push
+
+A `push` emit lands a climb or search run's change on the repo's default branch, with no PR. To land it, arete rebases the run's branch onto `origin/<base>`, runs the check again on the rebased tree, and pushes. When the push loses a race, arete fetches and tries once more. Then it fast forwards the repo's own checkout when that checkout is on the base branch, and deletes the run's branch.
+
+`check` is the command that must pass after the rebase. When it is left out, the `[search] check` runs. On a public repo, the commit message, the title and the report name the loop and the run id only, never what the agent wrote.
+
+A push waits for approval in these cases:
+
+- Always, while the repo's `trust.level` is `pr`.
+- Always, when it touches a path the repo denies: `.agents/config.toml`, `.github/workflows/`, `.env` files, `.claude/`, and the layer's `limits.deny`.
+- When `approve = true`.
+- When a rule in the `approve` table matches. `lines` holds a change over that many lines, `deletes` holds any file deletion, and `paths` holds a change to any file that matches one of its patterns.
+
+The approval says which rule held it. Approving it lands it then, and rejecting it deletes the branch. A push that fails to land, because it no longer rebases or the check fails after the rebase, stays listed as a failed approval with its error, so you can try it again or reject it.
 
 ## Safety
 
 A watch loop fed by a source or a webhook reads text from outside, so it may only have the reading tools Read, Glob, Grep and LS.
 Its events reach the agent fenced as data, and a ticket it files is built from the finding fields, not from the event text.
 To act on what it finds, it emits a ticket labeled `agent` and the pipeline does the work under its own gates.
-Agents never run git writes; climb and search commit in their own worktree, and a `pr` emit pushes.
+Agents never run git writes; climb and search commit in their own worktree, and a `pr` or `push` emit pushes.
 
 ## prompt.md
 

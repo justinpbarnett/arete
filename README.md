@@ -8,6 +8,8 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 
 `arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted, and serve picks up its queues again when it starts.
 
+Serve restarts itself when its own code changes. On each tick it looks at the `.py` files of the arete package, and once a change has held still for one tick and nothing is busy (no run, source poll, dashboard request or chat message in flight), it checks that the new code imports and then replaces itself with a fresh serve in the same process. New code that does not import is named in the serve log, and serve keeps the code it started with. A self restart is not a start, so loops with `run_at_load` do not fire again. So a push to arete's own main, followed by a fast forward of the checkout serve runs from, reaches serve with no restart by hand.
+
 ## Loops
 
 A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the four kinds (command, watch, climb, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
@@ -34,7 +36,7 @@ arete loop enable NAME
 
 Every run of every kind, pipeline, loop, session, chat and draft, is a row in one runs table with its trigger, model, runner, device, cost and tokens. Each model call is a step under its run. A run's live feed holds its steps, the tools the agent calls, and a command loop's output as it prints.
 
-An emit that changes something outside arete, a ticket or a PR, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it. A delivery that fails stays listed with its error, and approving it again tries the delivery again. A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
+An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it. A delivery that fails stays listed with its error, and approving it again tries the delivery again. A `push` emit lands a climb or search change on the default branch with no PR. It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path. A push that fails to land stays as a failed approval. A `loop` emit hands each finding to another loop, so one loop can find and another can fix. [arete/loops/README.md](arete/loops/README.md) has the rules for both. A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
 
 ## Runners, devices and sessions
 
@@ -336,7 +338,7 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 - Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
 - Agents never run git write commands. Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
-- Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`.
+- Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`. A `push` emit follows the same level: under `pr`, a person lands every push.
 - Alert issues carry check names and one short status line, never log contents.
 - PRs to public repos cite run ids, never transcript text.
 - Triage reads tickets and never writes to them. Its board goes only to a private repo.

@@ -87,6 +87,19 @@ def this_node(owner: str) -> Node | None:
 
 
 @dataclass
+class Gauge:
+    count: int = 0
+    guard: threading.Lock = field(default_factory=threading.Lock)
+
+    def add(self, n: int) -> None:
+        with self.guard:
+            self.count += n
+
+
+POSTS_IN_FLIGHT = Gauge()
+
+
+@dataclass
 class Logins:
     seen: dict[str, tuple[float, str]] = field(default_factory=dict)
     guard: threading.Lock = field(default_factory=threading.Lock)
@@ -144,7 +157,11 @@ class Handler(BaseHTTPRequestHandler):
         self.answer("GET")
 
     def do_POST(self) -> None:
-        self.answer("POST")
+        POSTS_IN_FLIGHT.add(1)
+        try:
+            self.answer("POST")
+        finally:
+            POSTS_IN_FLIGHT.add(-1)
 
     def answer(self, method: str) -> None:
         try:

@@ -614,6 +614,7 @@ function approvalRow(a) {
 
 async function decide(id, yes, btn) {
   btn.disabled = true;
+  if (yes) say("loops-result", null, `Approving #${id}. A push rebases and runs its check again before it lands, so it can take a minute.`);
   try {
     const r = await call(`/api/approvals/${id}`, { approve: yes });
     say("loops-result", "ok", yes ? `Approved #${id}: ${r.result}.` : `Rejected #${id}. Nothing was sent.`);

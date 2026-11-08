@@ -491,10 +491,11 @@ def metrics_since(since: str, connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM metrics WHERE ts >= ? ORDER BY ts", (since,))]
 
 
-def add_approval(loop: str, run_id: str, emit: dict, summary: str) -> int:
+def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str = "") -> int:
     with db() as c:
-        cur = c.execute("INSERT INTO approvals (loop, run_id, emit, summary, status, created) VALUES (?,?,?,?,?,?)",
-                        (loop, run_id, json.dumps(emit, default=str), summary[:2000], "pending", util.iso()))
+        cur = c.execute("INSERT INTO approvals (loop, run_id, emit, summary, status, result, created) "
+                        "VALUES (?,?,?,?,?,?,?)", (loop, run_id, json.dumps(emit, default=str), summary[:2000],
+                                                   "failed" if failed else "pending", failed[:1000], util.iso()))
         return cur.lastrowid
 
 
