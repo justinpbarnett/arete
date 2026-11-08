@@ -416,9 +416,10 @@ def cmd_loop(args) -> int:
             print(f"next: `arete loop try {made['name']}`, then `arete loop enable {made['name']}`")
             return 0
         if args.action == "exec":
-            status = engine.carry_opened(args.run_id) if not args.name else engine.launch(
-                args.name, item=args.fire, run_id=args.run_id, events=read_events(args.events), detach=False)["status"]
-            return 0 if status in ("done", "skipped") else 1
+            if not args.run_id:
+                print("arete loop exec needs --run-id; serve and `arete loop start` pass it", file=sys.stderr)
+                return 2
+            return 0 if engine.carry_opened(args.run_id) in ("done", "skipped") else 1
         if not args.name:
             print(f"arete loop {args.action} needs a NAME", file=sys.stderr)
             return 2
@@ -703,7 +704,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", default="", help="new: the model that drafts it")
     p.add_argument("--events", default="", metavar="FILE", help="try, start: a JSON list of events to feed it")
     p.add_argument("-f", "--follow", action="store_true", help="feed, start: keep printing until the run ends")
-    p.add_argument("--fire", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--run-id", default="", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_loop_args)
 

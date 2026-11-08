@@ -54,7 +54,7 @@ class Server:
         self.cfg = config.load()
         every_loop = loops.load_all(self.cfg)
         live = [x for x in every_loop if x.enabled and not x.error]
-        for row in record.reap(record.NO_TICKET_KINDS):
+        for row in record.reap(tickets=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
         states = state.loop_states()
         now = util.now()

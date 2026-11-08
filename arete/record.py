@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from contextlib import contextmanager
 
 from . import state, util
@@ -12,7 +12,7 @@ INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the 
 STOPPED = "stopped by request"
 ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva"}
 FAILS_WHEN_DEAD = ("miner", "eval")
-NO_TICKET_KINDS = ("miner", "eval", "draft", "loop", "session")
+TICKET_KINDS = ("pipeline",)
 
 
 def new_id(prefix: str, tag: str = "") -> str:
@@ -77,6 +77,15 @@ def settle(run_id: str, status: str, **fields) -> dict | None:
         return dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
 
 
+@contextmanager
+def failed_on_crash(run_id: str):
+    try:
+        yield
+    except BaseException as e:
+        settle(run_id, "failed", summary=util.first_line(f"crashed: {type(e).__name__}: {e}", 300))
+        raise
+
+
 def dead_status(row: dict) -> str:
     if row.get("stop_asked"):
         return "stopped"
@@ -108,10 +117,10 @@ def interrupt(row: dict) -> dict | None:
     return done
 
 
-def reap(kinds: Iterable[str], then: Callable[[dict], None] = lambda row: None) -> list[dict]:
+def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> list[dict]:
     settled = []
     for row in state.runs_marked_running():
-        if row["kind"] not in kinds or (util.now() - util.parse_iso(row["started"])).total_seconds() < SETTLE_GRACE_SECONDS:
+        if (row["kind"] in TICKET_KINDS) != tickets or (util.now() - util.parse_iso(row["started"])).total_seconds() < SETTLE_GRACE_SECONDS:
             continue
         with dead(row) as gone:
             if gone and (done := interrupt(row)):

@@ -9,7 +9,14 @@ import threading
 from pathlib import Path
 
 from . import devices, paths, util
-from .agent import NO_SESSION, Result, Session, json_from_text
+from .agent import (
+    NO_SESSION,
+    READ_ONLY_TOOLS,
+    READ_TOOLS,
+    Result,
+    Session,
+    json_from_text,
+)
 
 TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": ("ls",), "Edit": ("edit",),
             "MultiEdit": ("edit",), "Write": ("write",), "Bash": ("bash",)}
@@ -28,14 +35,14 @@ def binary() -> str:
 
 
 def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallowed_tools: list[str] | None) -> list[str]:
-    granted = tools if tools is not None else [*(allowed_tools or []), "Read", "Glob", "Grep"]
-    allowed = set(allowed_tools or []) | {"Read", "Glob", "Grep"}
+    granted = tools if tools is not None else [*(allowed_tools or []), *READ_TOOLS]
+    allowed = set(allowed_tools or []) | set(READ_TOOLS)
     denied = {t.split("(", 1)[0] for t in disallowed_tools or []}
     names: list[str] = []
     for tool in granted:
         if tool in denied or "(" in tool:
             continue
-        if tool not in allowed and tool not in ("Read", "Glob", "Grep", "LS"):
+        if tool not in allowed and tool not in READ_ONLY_TOOLS:
             continue
         names += [n for n in TOOLS_OF.get(tool, ()) if n not in names]
     return names

@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+READ_TOOLS = ["Read", "Glob", "Grep"]
+READ_ONLY_TOOLS = frozenset({*READ_TOOLS, "LS"})
+
 
 @dataclass(frozen=True)
 class Session:

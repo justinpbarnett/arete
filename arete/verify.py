@@ -72,7 +72,7 @@ def serving(v: config.Verify, cwd: Path, log: Path):
     url = v.url.rstrip("/")
     with open(log, "w") as out:
         proc = subprocess.Popen(v.start, shell=True, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, **util.own_group())
+                                stdin=subprocess.DEVNULL, **util.own_group_args())
     try:
         wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
         yield url

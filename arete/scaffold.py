@@ -115,7 +115,7 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", say
     prompt = draft_prompt(sentence, cfg, name, repo, taken)
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
     problem, folder, answer = "", Path(), {}
-    try:
+    with record.failed_on_crash(run_id):
         for attempt in range(1, DRAFT_TRIES + 1):
             say(f"drafting, try {attempt} of {DRAFT_TRIES}")
             res = runner.run(prompt, DRAFTS_DIR, model=model or cfg.model("loop"), trace=(run_id, f"draft {attempt}"),
@@ -140,9 +140,6 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", say
         loop = loops.find(folder.name)
         loops.set_enabled(loop, False)
         record.settle(run_id, "done", summary=f"drafted {loop.name} in {paths.short_path(dest)}")
-    except BaseException:
-        record.settle(run_id, "failed", summary="the draft stopped early")
-        raise
     return {"name": loop.name, "dir": str(dest), "note": str(answer.get("note") or ""), "run": run_id,
             "cost_usd": record.spent(run_id), "loop_toml": (dest / "loop.toml").read_text()}
 

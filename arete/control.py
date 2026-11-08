@@ -61,8 +61,9 @@ def stop_run(run_id: str) -> dict:
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
     with record.dead(r) as gone:
         if gone:
-            r = record.ask_stop(run_id)
-            if r["kind"] not in record.NO_TICKET_KINDS:
+            if not (r := record.ask_stop(run_id)):
+                raise NotFound(f"no run {run_id}")
+            if r["kind"] in record.TICKET_KINDS:
                 return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
             record.interrupt(r)
             return {"id": run_id, "stopped": True, "was": "gone"}

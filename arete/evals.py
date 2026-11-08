@@ -390,15 +390,16 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
     label = prompts.applied_to(src.label)
     run_id = record.start("eval", tag=tag, lock=state.run_lock("eval", repo.name), repo=repo.name)
     results = []
-    for t in tasks:
-        prior = state.task_history(repo.name, t.name, 3)
-        r = run_task(cfg, repo, src, t, run_id, False, prompts)
-        state.add_eval(run_id, repo.name, t.name, r["passed"], r["seconds"], r["cost"], label)
-        r["regressed"] = len(prior) == 3 and all(prior) and not r["passed"]
-        results.append(r)
-    arm = Arm(run_id, results)
-    summary = f"{arm.score} passed on {label}"
-    record.settle(run_id, "done", summary=summary)
+    with record.failed_on_crash(run_id):
+        for t in tasks:
+            prior = state.task_history(repo.name, t.name, 3)
+            r = run_task(cfg, repo, src, t, run_id, False, prompts)
+            state.add_eval(run_id, repo.name, t.name, r["passed"], r["seconds"], r["cost"], label)
+            r["regressed"] = len(prior) == 3 and all(prior) and not r["passed"]
+            results.append(r)
+        arm = Arm(run_id, results)
+        summary = f"{arm.score} passed on {label}"
+        record.settle(run_id, "done", summary=summary)
     print(f"{repo.name}: {summary}, ${record.spent(run_id):.2f}")
     for r in results:
         print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s ${r['cost']:.2f} {r['why']}"

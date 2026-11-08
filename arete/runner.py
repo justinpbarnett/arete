@@ -6,14 +6,12 @@ import time
 from pathlib import Path
 
 from . import claude, config, devices, pi, record, util
-from .agent import NO_SESSION, Result, Session
+from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, Result, Session
 
 RUNNERS = ("claude", "pi")
 BUDGET_FLOOR_USD = 0.005
-READ_TOOLS = ["Read", "Glob", "Grep"]
-EDIT_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"]
+EDIT_TOOLS = [*READ_TOOLS, "Edit", "Write"]
 BUILD_TOOLS = [*EDIT_TOOLS, "TodoWrite"]
-READ_ONLY_TOOLS = frozenset({*READ_TOOLS, "LS"})
 WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write"})
 KNOWN_TOOLS = READ_ONLY_TOOLS | WRITING_TOOLS | {"Bash"}
 NO_GIT_WRITES = [

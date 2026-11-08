@@ -161,10 +161,7 @@ def graded_on(cfg: config.Config, parent: EvalRun, where: str, layer: config.Rep
               draft: Draft) -> verify.Verified:
     run = EvalRun(id=parent.id, repo=parent.repo, dir=parent.dir / slug(where), task=parent.task)
     run.dir.mkdir(parents=True, exist_ok=True)
-    try:
-        graded = grade(cfg, run, layer, wt, draft.title, draft.prompt, draft.verify, layer.timeout_minutes * 60)
-    finally:
-        parent.cost += run.cost
+    graded = grade(cfg, run, layer, wt, draft.title, draft.prompt, draft.verify, layer.timeout_minutes * 60)
     if not graded.finished:
         raise RuntimeError(f"the grader did not finish on the {where}: {graded.blocked_by}")
     parent.log(f"graded on the {where}: {graded.verdict}")
@@ -262,24 +259,26 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
         print(f"skip {s}")
     if dry_run or not picked:
         return 0
-    with util.lock(state.run_lock("eval-mine")) as got:
+    lock = state.run_lock("eval-mine")
+    with util.lock(lock) as got:
         if not got:
             print("an eval mine is already running")
             return 0
-        run_id = record.start("eval", tag="-".join(filter(None, ["mine", repo_name])), lock=state.run_lock("eval-mine"),
+        run_id = record.start("eval", tag="-".join(filter(None, ["mine", repo_name])), lock=lock,
                               repo=repo_name or None)
         tally = {}
-        for c in picked:
-            job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / slug(c.name), task=slug(c.name))
-            try:
-                o = mine_one(cfg, job, c)
-            except Exception as e:
-                o = Outcome("crashed", f"{type(e).__name__}: {util.first_line(str(e), 300)}; the next mine retries it")
-            else:
-                state.add_mined(c.pr_url, c.repo.name, str(c.run["issue"]), run_id, o.status, o.why, o.task)
-            job.log(f"{o.status}: {o.task or o.why}")
-            tally[o.status] = tally.get(o.status, 0) + 1
-        summary = f"mined {util.count(len(picked), 'merged PR')}: " + ", ".join(f"{n} {s}" for s, n in tally.items())
-        record.settle(run_id, "done", summary=summary)
+        with record.failed_on_crash(run_id):
+            for c in picked:
+                job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / slug(c.name), task=slug(c.name))
+                try:
+                    o = mine_one(cfg, job, c)
+                except Exception as e:
+                    o = Outcome("crashed", f"{type(e).__name__}: {util.first_line(str(e), 300)}; the next mine retries it")
+                else:
+                    state.add_mined(c.pr_url, c.repo.name, str(c.run["issue"]), run_id, o.status, o.why, o.task)
+                job.log(f"{o.status}: {o.task or o.why}")
+                tally[o.status] = tally.get(o.status, 0) + 1
+            summary = f"mined {util.count(len(picked), 'merged PR')}: " + ", ".join(f"{n} {s}" for s, n in tally.items())
+            record.settle(run_id, "done", summary=summary)
         print(f"{summary}, ${record.spent(run_id):.2f}")
         return 1 if "crashed" in tally else 0

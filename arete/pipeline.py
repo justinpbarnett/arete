@@ -621,7 +621,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         print(f"{repo_name}: {e}")
         return 1
     name = tracker.ticket_name(repo.name, tk.ref(tid))
-    with util.lock(state.run_lock("pipeline", repo.name, tid)) as got:
+    lock = state.run_lock("pipeline", repo.name, tid)
+    with util.lock(lock) as got:
         if not got:
             print(f"{name} is already running")
             return 0
@@ -635,8 +636,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 slot.hold()
             earlier = state.ticket_runs(repo.name, tid, limit=1)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
-            run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=state.run_lock("pipeline", repo.name, tid),
-                                  repo=repo.name, issue=tid)
+            run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid)
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=pending_feedback(repo.name, tid))
             run.dir.mkdir(parents=True, exist_ok=True)
@@ -1732,7 +1732,7 @@ class SkipLog:
 
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
-    record.reap(("pipeline",), then=lambda row: tell_ticket_run_died(cfg, row))
+    record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:

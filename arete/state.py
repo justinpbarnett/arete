@@ -272,7 +272,7 @@ def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, conn
     if repo:
         q += " AND repo = ?"
         args.append(repo)
-    q += " ORDER BY started DESC LIMIT ?"
+    q += " ORDER BY started DESC, rowid DESC LIMIT ?"
     args.append(limit)
     with connect() as c:
         return [dict(r) for r in c.execute(q, args)]

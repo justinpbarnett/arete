@@ -141,7 +141,7 @@ class Kind:
     name: str
     table: str = ""
     needs: str = ""
-    means: str = ""
+    needs_hint: str = ""
     agent: bool = True
     worktree: bool = False
     run: Callable[..., tuple[str, str]] | None = None
@@ -152,7 +152,7 @@ class Kind:
             problems.append(f"a {self.name} loop needs prompt.md")
         if self.needs and blank(loop.spec.get(self.needs)):
             problems.append(f"a {self.name} loop needs [{self.table}] "
-                            + ", ".join(filter(None, (self.needs, self.means))))
+                            + ", ".join(filter(None, (self.needs, self.needs_hint))))
         if self.worktree:
             iterations = str(loop.spec.get("iterations", TRIES))
             if not iterations.isdigit() or int(iterations) < 1:
@@ -169,8 +169,8 @@ class Kind:
 KINDS = {kind.name: kind for kind in (
     Kind("command", table="run", needs="command", agent=False),
     Kind("watch"),
-    Kind("climb", table="climb", needs="measure", means="a command that prints a number", worktree=True),
-    Kind("search", table="search", needs="check", means="a command that exits 0 on a hit", worktree=True),
+    Kind("climb", table="climb", needs="measure", needs_hint="a command that prints a number", worktree=True),
+    Kind("search", table="search", needs="check", needs_hint="a command that exits 0 on a hit", worktree=True),
 )}
 
 

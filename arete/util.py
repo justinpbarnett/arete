@@ -235,7 +235,7 @@ def pid_alive(pid) -> bool:
     return True
 
 
-def own_group() -> dict:
+def own_group_args() -> dict:
     return {"process_group": 0} if os.getsid(0) == os.getpid() else {"start_new_session": True}
 
 

@@ -155,7 +155,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     full = devices.wrap(device, argv, cwd, env)
     proc = subprocess.Popen(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, env={**os.environ, **env} if local else None,
-                            **util.own_group())
+                            **util.own_group_args())
     expired = threading.Event()
 
     def stop_at_deadline() -> None:
