@@ -408,7 +408,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     fresh = new_findings(run, found)
     outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events),
                **({"value": value} if value is not None else {})}
-    if loop.emits and (fresh or value is not None):
+    if loop.emits:
         emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", took + (f", {util.count(len(fresh), 'new finding')}" if found else "")
 
