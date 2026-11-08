@@ -182,18 +182,18 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
     cfg = config.load()
     checks: list[Check] = []
     ran_fine = set()
-    for fn in (
-        lambda: check_jobs(cfg),
-        lambda: check_probes(cfg, force_probes),
-        check_claude_auth,
-        check_hook,
-        check_disk,
-        check_serve,
-        lambda: check_loops(cfg),
+    for fn, *args in (
+        (check_jobs, cfg),
+        (check_probes, cfg, force_probes),
+        (check_claude_auth,),
+        (check_hook,),
+        (check_disk,),
+        (check_serve,),
+        (check_loops, cfg),
     ):
-        crash_key = f"heartbeat:{getattr(fn, '__name__', 'check')}"
+        crash_key = f"heartbeat:{fn.__name__}"
         try:
-            checks += fn()
+            checks += fn(*args)
             ran_fine.add(crash_key)
         except Exception as e:
             checks.append(Check(crash_key, False, f"check crashed: {e}"))
