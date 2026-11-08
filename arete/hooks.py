@@ -70,7 +70,7 @@ def event_of(name: str, headers, body: bytes) -> dict:
     action = data.get("action", "") if isinstance(data.get("action"), str) else ""
     title = (f"GitHub {github_event}{' ' + action if action else ''}" if github_event
              else str(data.get("title") or data.get("summary") or data.get("text") or f"webhook for {name}"))
-    key = headers.get("X-GitHub-Delivery") or headers.get("X-Request-Id") or hashlib.sha1(body).hexdigest()[:20]
+    key = headers.get("X-GitHub-Delivery") or headers.get("X-Request-Id") or secrets.token_hex(10)
     repo = ((data.get("repository") or {}).get("full_name", "") if isinstance(data.get("repository"), dict) else
             str(data.get("repo", "")))
     return sources.event("webhook" if not github_event else f"github.{github_event}", f"{name}#webhook", key, title,
