@@ -194,8 +194,10 @@ def lease(device: Device | str, label: str, log=lambda text: None):
         if d.keep:
             log(f"keeping VM {vmid}")
         else:
-            util.sh([*ssh_argv(d), f"qm stop {vmid} --skiplock 1; qm destroy {vmid} --purge 1"], timeout=300)
-            log(f"destroyed VM {vmid}")
+            res = util.sh([*ssh_argv(d), f"qm stop {vmid} --skiplock 1; qm destroy {vmid} --purge 1"], timeout=300)
+            log(f"destroyed VM {vmid}" if res.returncode == 0 else
+                f"could not destroy VM {vmid} on {d.name}, so it is still there: "
+                f"{util.first_line(res.stderr or res.stdout or f'exit {res.returncode}', 300)}")
 
 
 def known() -> list[Device]:
