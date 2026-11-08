@@ -10,6 +10,7 @@ DIGESTS_DIR = paths.STATE_DIR / "digests"
 SEVERITIES = ("low", "medium", "high", "critical")
 PUSH_RULES = ("lines", "deletes", "paths")
 PATCH_SHOWN = 12000
+RETRIED = ("screen", "proof")
 FENCE = re.compile(r"`{3,}")
 TAGS = re.compile(r"<[^>]{0,200}>")
 LINKS = re.compile(r"!?\[([^\]]{0,200})\]\([^)]{0,500}\)")
@@ -69,6 +70,7 @@ def config_repo(cfg: config.Config, name: str) -> config.Repo | None:
 
 class Emit:
     kept_when_failed = False
+    judged = False
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         return []
@@ -173,6 +175,7 @@ class PullRequest(Emit):
 
 class Push(Emit):
     kept_when_failed = True
+    judged = True
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         if loop.kind not in worktree_kinds():
@@ -199,7 +202,8 @@ class Push(Emit):
                 "title": plain(f"{loop.name}: run {run_id}" if public else outcome.get("title", ""), 120),
                 "report": plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000),
                 "about": plain(outcome.get("title", ""), 120), "story": plain(outcome.get("report", ""), 6000),
-                "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src), start, branch)}
+                "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src), start, branch),
+                "proof": outcome.get("proof")}
 
     def ruled(self, spec: dict, item: dict, cfg: config.Config) -> str:
         repo = config_repo(cfg, item["repo"])
@@ -223,19 +227,21 @@ class Push(Emit):
         return ""
 
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
-        if why := self.ruled(spec, item, cfg):
-            return why
-        try:
-            return self.objection(item, cfg)
-        except jev.Unjudged as e:
-            return f"JEV could not judge the diff, so a person decides: {e}"
+        return self.ruled(spec, item, cfg) or ". ".join(self.objections(item, cfg).values())
 
-    def objection(self, item: dict, cfg: config.Config) -> str:
+    def objections(self, item: dict, cfg: config.Config) -> dict[str, str]:
         if not jev.ready(cfg, [config_repo(cfg, item["repo"])]):
-            return ""
-        found = jev.screen(item.get("patch", ""), item.get("about") or item["title"], cfg,
-                           trace=(item.get("env", {}).get("ARETE_RUN_ID", ""), "push screen jev"))
-        return f"JEV holds it: {'; '.join(found)}" if found else ""
+            return {}
+        run_id, about = item.get("env", {}).get("ARETE_RUN_ID", ""), item.get("about") or item["title"]
+        found = {}
+        try:
+            if held := jev.screen(item.get("patch", ""), about, cfg, trace=(run_id, "push screen jev")):
+                found["screen"] = f"JEV holds it: {'; '.join(held)}"
+        except jev.Unjudged as e:
+            found["unjudged screen"] = f"JEV could not judge the diff, so a person decides: {e}"
+        if proof := item.get("proof"):
+            found |= proof_objection(proof, item.get("patch", ""), about, cfg, run_id)
+        return found
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         src, base = Path(item["workdir"]), item["base"]
@@ -248,6 +254,7 @@ class Push(Emit):
             sha = land(item, wt, src, base)
         finally:
             util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
+        state.set_verdict_sha(run_id, sha)
         util.git(["branch", "-D", item["branch"]], src, check=False)
         return f"pushed {sha[:10]} to {base}; {fast_forward(src, base, sha)}"
 
@@ -256,11 +263,27 @@ class Push(Emit):
                 f"({item['lines']} lines in {util.count(len(item['files']), 'file')})")
 
     def detail(self, item: dict) -> str:
+        proof = item.get("proof") or {}
+        shown = f"Proof, {proof['name']}:\n{proof.get('text') or 'missing from the scratch folder'}" if proof else ""
         return "\n\n".join(filter(None, [item.get("about") or item["title"], f"Files: {', '.join(item['files'])}",
-                                          item.get("story") or item["report"], item.get("patch", "")]))
+                                          item.get("story") or item["report"], item.get("patch", ""), shown]))
 
     def rejected(self, item: dict) -> None:
         util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+
+
+def proof_objection(proof: dict, patch: str, about: str, cfg: config.Config, run_id: str) -> dict[str, str]:
+    name, text = proof["name"], proof.get("text") or ""
+    if not text.strip():
+        return {"proof": f"the scratch folder holds no {name}, so nothing shows the fix works"}
+    if len(text) > PATCH_SHOWN:
+        return {"proof": f"{name} runs past the {PATCH_SHOWN} characters JEV reads"}
+    try:
+        doubts = jev.proof(proof.get("problem") or about, name, text, patch, about, cfg,
+                           trace=(run_id, "proof check jev"))
+    except jev.Unjudged as e:
+        return {"unjudged proof": f"JEV could not judge {name}, so a person decides: {e}"}
+    return {"proof": f"JEV doubts that {name} proves the problem: {'; '.join(doubts)}"} if doubts else {}
 
 
 def shown_patch(patch: str, start: str, branch: str) -> str:
@@ -408,29 +431,38 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
             if trial:
                 log("held", f"would {what}")
             elif why := emit.held(spec, delivery["item"], cfg):
-                log("emit", f"waiting for approval #{state.add_approval(loop.name, run_id, delivery, what)} "
-                            f"({why}): {what}")
+                waiting_id = state.add_approval(loop.name, run_id, delivery, what)
+                settle_judged(emit, run_id, "waiting", waiting_id)
+                log("emit", f"waiting for approval #{waiting_id} ({why}): {what}")
             else:
                 try:
                     send(delivery, loop.name, run_id, cfg, log)
+                    settle_judged(emit, run_id, "landed")
                 except Failed as e:
                     if emit.kept_when_failed:
-                        log("emit", f"kept as approval #{state.add_approval(loop.name, run_id, delivery, what, str(e))}"
-                                    f" to try again or reject")
+                        failed_id = state.add_approval(loop.name, run_id, delivery, what, str(e))
+                        settle_judged(emit, run_id, "failed", failed_id)
+                        log("emit", f"kept as approval #{failed_id} to try again or reject")
 
 
-def objection(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> str:
+def settle_judged(emit: Emit, run_id: str, outcome: str, approval: int | None = None,
+                  was: tuple[str, ...] = ("",)) -> None:
+    if emit.judged:
+        state.settle_verdicts(run_id, outcome, approval, was)
+
+
+def objections(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> dict[str, str]:
     push = EMITS["push"]
     for spec in loop.emits:
         if spec["type"] != "push" or not push.batches([], outcome):
             continue
         item = push.render(loop, run_id, spec, [], outcome)
-        try:
-            if not push.ruled(spec, item, cfg) and (why := push.objection(item, cfg)):
-                return why
-        except jev.Unjudged:
+        if push.ruled(spec, item, cfg):
             continue
-    return ""
+        found = push.objections(item, cfg)
+        if found and all(kind in RETRIED for kind in found):
+            return found
+    return {}
 
 
 def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -> str:
@@ -465,6 +497,7 @@ def decide(approval_id: int, yes: bool) -> str:
         if row["run_id"]:
             state.add_feed(row["run_id"], kind, f"{verb} #{approval_id}, {text}")
 
+    settle_judged(emit, row["run_id"], verb, approval_id, ("waiting", "failed", "approved"))
     if not yes:
         emit.rejected(delivery["item"])
         log("emit", f"nothing sent: {row['summary']}")
@@ -473,6 +506,7 @@ def decide(approval_id: int, yes: bool) -> str:
         done = send(delivery, row["loop"], row["run_id"], cfg, log)
     except Exception as e:
         state.decide_approval(approval_id, "failed", str(e))
+        settle_judged(emit, row["run_id"], "failed", approval_id, ("approved",))
         raise
     state.decide_approval(approval_id, "done", done)
     return done

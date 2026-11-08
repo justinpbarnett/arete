@@ -16,6 +16,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from . import (
+    alerts,
     config,
     control,
     devices,
@@ -38,6 +39,11 @@ NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 KNOWN_FINDINGS_SHOWN = 30
 KNOWN_FINDINGS_ASKED = 200
 OUTPUT_TAIL = 6000
+PROBLEM_FIELDS = ("title", "summary", "location", "evidence")
+PROBLEM_SHOWN = 6000
+COMMITS_READ = 60
+FIXES_ASKED = 40
+HELD_BY = {"screen": "the push screen", "proof": "the proof check"}
 FEED_OUTPUT_LINES = 2000
 FEED_LINE_CHARS = 500
 OUTPUT_GRACE_SECONDS = 5
@@ -719,7 +725,8 @@ def stop_reason(idea: str) -> str:
     return idea[len(STOP_WORD):].strip() if idea.lower().startswith(STOP_WORD.lower()) else ""
 
 
-def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str], files: list[str]) -> tuple[str, str]:
+def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str], files: list[str],
+             keep_empty: bool = False) -> tuple[str, str]:
     res = run.agent(f"try {i}", attempt_prompt(run, goal, history, files), ws.wt, tools=run.loop.tools,
                     add_dirs=[run.scratch])
     idea = util.last_line(res.text or res.error or "", 200)
@@ -732,7 +739,7 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     idea = idea or "the agent did not say what it changed"
     changed = diffguard.stage(ws.wt).files
     if not changed:
-        return "", f"{idea} (no files changed)"
+        return (idea, "") if keep_empty else ("", f"{idea} (no files changed)")
     if files and (outside := [p for p in changed if not util.matches_any(p, files)]):
         revert(ws.wt)
         return "", f"{idea} (thrown away: touched {', '.join(outside[:5])})"
@@ -811,23 +818,104 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         close_workspace(ws, keep_branch=kept and not run.trial)
 
 
+def problem(run: LoopRun) -> str:
+    found = [e["data"] for e in run.events if e.get("type") == loops.FINDING_EVENT and e.get("data")]
+    if found:
+        text = "\n\n".join(json.dumps({k: f[k] for k in PROBLEM_FIELDS if f.get(k)}, indent=1, default=str)
+                           for f in found)
+    else:
+        text = json.dumps(run.events, indent=1, default=str) if run.events else loops.prompt_text(run.loop)
+    return alerts.redact(text)[:PROBLEM_SHOWN]
+
+
+def proof_file(run: LoopRun) -> Path | None:
+    name = run.loop.spec.get("proof")
+    return run.scratch / name if name else None
+
+
+def read_proof(run: LoopRun) -> bytes | None:
+    path = proof_file(run)
+    return path.read_bytes() if path and path.is_file() else None
+
+
+def restore_proof(run: LoopRun, kept: bytes | None) -> None:
+    if not (path := proof_file(run)):
+        return
+    if kept is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.write_bytes(kept)
+
+
 def search_outcome(run: LoopRun, ws: Workspace, history: list[str], tries: int, fix: str) -> dict:
     check = run.loop.spec["check"]
-    return {**ws.outcome_fields(), "value": tries, "summary": f"`{check}` passes: {fix}",
-            "facts": f"`{check}` passes after {util.count(tries, 'try', 'tries')}",
-            "title": f"{run.loop.name}: {fix.split(': ', 2)[-1]}",
-            "report": f"Searched for a change that makes `{check}` pass.\n\n" + "\n".join(history)}
+    outcome = {**ws.outcome_fields(), "value": tries, "summary": f"`{check}` passes: {fix}",
+               "facts": f"`{check}` passes after {util.count(tries, 'try', 'tries')}",
+               "title": f"{run.loop.name}: {fix.split(': ', 2)[-1]}",
+               "report": f"Searched for a change that makes `{check}` pass.\n\n" + "\n".join(history)}
+    if proof_file(run):
+        kept = read_proof(run)
+        outcome["proof"] = {"name": run.loop.spec["proof"], "text": kept.decode(errors="replace") if kept else "",
+                            "problem": problem(run)}
+    return outcome
 
 
-def narrowing_goal(goal: str, ws: Workspace, held: str) -> str:
+def narrowing_goal(goal: str, ws: Workspace, holds: dict[str, str], proof_name: str) -> str:
     patch = util.git(["diff", "--no-renames", ws.start, "HEAD"], ws.wt)
-    return (f"{goal}\n\nThe change below makes the check exit 0, but the push screen holds it for a person: "
-            f"{held}\n\n```diff\n{patch}\n```\n\nAdjust the change so the check still exits 0 and the screen "
-            f"has nothing to hold: fix only the failure above, and leave alone every protection, name and behavior "
-            f"the fix does not need. Your adjusted change replaces the one above, so the line you end with says what "
-            f"the whole fix changes, not what you adjusted. When the fix needs what the screen holds, change nothing "
-            f"and end with one line that starts `{STOP_WORD}` and says why; a person then reviews the change as it "
-            f"stands.")
+    asks = []
+    if why := holds.get("screen"):
+        asks.append(f"The push screen holds it for a person: {why}. Adjust the change so the screen has nothing to "
+                    f"hold: fix only the failure above, and leave alone every protection, name and behavior the fix "
+                    f"does not need.")
+    if why := holds.get("proof"):
+        asks.append(f"The proof check holds it for a person: {why}. Rewrite `{proof_name}` in the scratch folder so "
+                    f"it runs the code into the problem this run fixes and checks for the wrong result: it fails "
+                    f"before the fix and passes after it. A new proof with the code left as it is answers this hold.")
+    return (f"{goal}\n\nThe change below makes the check exit 0, but it is held:\n\n```diff\n{patch}\n```\n\n"
+            + "\n\n".join(asks)
+            + f"\n\nThe check must still exit 0. Your adjusted change replaces the one above, so the line you end "
+              f"with says what the whole fix changes, not what you adjusted. When the fix needs what is held, change "
+              f"nothing and end with one line that starts `{STOP_WORD}` and says why; a person then reviews the "
+              f"change as it stands.")
+
+
+def landed_fixes(run: LoopRun, ws: Workspace, found: list[dict]) -> list[tuple[str, str]]:
+    starts = [util.parse_iso(r["started"]).timestamp() for f in found if (r := state.run_get(f.get("from_run") or ""))]
+    if not starts:
+        return []
+    log = util.git(["log", "--no-merges", "--format=%H %ct %s", "-n", str(COMMITS_READ), ws.start], ws.wt, check=False)
+    landed = []
+    for line in log.splitlines():
+        sha, when, subject = (line.split(" ", 2) + ["", ""])[:3]
+        if when.isdigit() and int(when) >= min(starts):
+            patch = util.git(["show", "--format=", "--no-renames", sha], ws.wt, check=False)
+            landed.append((f"{sha[:10]} {util.first_line(subject, 120)}", alerts.redact(patch)[:emits.PATCH_SHOWN]))
+    return landed[:FIXES_ASKED]
+
+
+def waiting_fixes(run: LoopRun) -> list[tuple[str, str]]:
+    return [(f"waiting for approval #{a['id']}", a["emit"]["item"]["patch"]) for a in state.approvals()
+            if a["loop"] == run.loop.name and a["status"] == "pending" and a["emit"].get("type") == "push"
+            and a["emit"].get("item", {}).get("patch")]
+
+
+def already_fixed(run: LoopRun, ws: Workspace) -> str:
+    found = [e["data"] for e in run.events if e.get("type") == loops.FINDING_EVENT and e.get("data")]
+    if run.trial or not found or not jev.ready(run.cfg, [loop_repo(run)]):
+        return ""
+    candidates = landed_fixes(run, ws, found) + waiting_fixes(run)
+    if not candidates:
+        return ""
+    matches = jev.fixed(problem(run), candidates, emits.plain(found[0].get("title"), 120), run.cfg,
+                        trace=(run.id, "fixed check jev"))
+    if matches and matches[0].sure:
+        return f"already fixed by {matches[0].ref} (JEV p {matches[0].p:.2f})"
+    if matches:
+        run.log("fixed", f"none of {util.count(len(candidates), 'change')} fixes it yet; the closest is "
+                         f"{matches[0].ref} (JEV p {matches[0].p:.2f})")
+    if unread := len(candidates) - len(matches):
+        run.log("fixed", f"JEV could not check {util.count(unread, 'change')}")
+    return ""
 
 
 @loops.runs_kind("search")
@@ -835,50 +923,65 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
     spec = run.loop.spec
     files = loops.as_list(spec.get("files"))
     ws = open_workspace(run)
-    fix, held, stopped, tries = "", "", "", 0
+    fix, stopped, tries = "", "", 0
+    held: dict[str, str] = {}
+    held_proof: bytes | None = None
     try:
         code, text = shell(run, spec["check"], ws.wt)
         if code == 0:
             return "done", f"`{spec['check']}` already passes on {ws.base}"
+        if why := already_fixed(run, ws):
+            run.log("fixed", why)
+            return "done", why
         history = [f"- base: exit {code}: {util.last_line(text, 300)}"]
         goal = (f"Make `{spec['check']}` exit 0. It exits {code} on {ws.base}, ending with:\n\n"
                 f"```\n{util.tail(text, 1500)}\n```")
         for i in range(1, run.loop.tries + 1):
             try:
-                idea, why_not = try_once(run, ws, i, narrowing_goal(goal, ws, held) if held else goal, history, files)
+                idea, why_not = try_once(run, ws, i, narrowing_goal(goal, ws, held, spec.get("proof", "")) if held
+                                         else goal, history, files, keep_empty="proof" in held)
             except OverBudget as e:
                 if i == 1:
                     raise
                 run.log("budget", f"stopped before try {i}: {e}")
                 break
             except StoppedByAgent as e:
+                if fix:
+                    restore_proof(run, held_proof)
                 history.append(f"- try {i}: stopped: {e}")
                 run.log("stop", f"try {i}: the agent stopped the run: {e}")
                 stopped, tries = str(e), i
                 break
             tries = i
             if not idea:
+                if fix:
+                    restore_proof(run, held_proof)
                 history.append(f"- try {i}: {why_not}")
                 run.log("try", f"try {i}: {why_not}")
                 continue
             code, text = shell(run, spec["check"], ws.wt)
             if code != 0:
                 revert(ws.wt)
+                if fix:
+                    restore_proof(run, held_proof)
                 history.append(f"- try {i}: miss, exit {code}: {util.last_line(text, 200)}: {idea}")
                 run.log("miss", f"try {i}: exit {code}: {idea}")
                 continue
             if fix:
+                state.settle_verdicts(run.id, "replaced")
                 replace_held_commit(ws)
             commit(ws.wt, commit_message(run, ws, idea[:72]))
+            held_proof = read_proof(run)
             fix = f"try {i}: hit: {idea}"
             history.append(f"- {fix}")
             run.log("hit", f"try {i}: {idea}")
-            held = "" if run.trial else emits.objection(run.loop, run.id, search_outcome(run, ws, history, i, fix),
-                                                        run.cfg)
+            held = {} if run.trial else emits.objections(run.loop, run.id, search_outcome(run, ws, history, i, fix),
+                                                         run.cfg)
+            for kind, why in held.items():
+                history.append(f"- try {i}: held by {HELD_BY[kind]}: {why}")
+                run.log("held", f"try {i}: {why}")
             if not held:
                 break
-            history.append(f"- try {i}: held by the push screen: {held}")
-            run.log("held", f"try {i}: {held}")
         if not fix:
             return "done", f"the agent stopped the run: {stopped}" if stopped else \
                 f"no hit in {util.count(tries, 'try', 'tries')}"

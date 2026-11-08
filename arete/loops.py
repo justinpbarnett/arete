@@ -336,6 +336,15 @@ def metric_rule(text: str) -> tuple[str, str, float]:
     return m.group(1), m.group(2), float(m.group(3))
 
 
+def proof_problems(loop: Loop) -> list[str]:
+    name, problems = loop.spec["proof"], []
+    if not isinstance(name, str) or blank(name) or Path(name).is_absolute() or ".." in Path(name).parts:
+        problems.append('[search] proof must name a file in the scratch folder, such as "repro.py"')
+    if not any(e.get("type") == "push" for e in loop.emits):
+        problems.append("[search] proof is checked before a push lands, so the loop needs a push emit")
+    return problems
+
+
 def validate(loop: Loop, cfg: config.Config) -> None:
     from .emits import EMITS
     from .sources import SOURCES, metric_event
@@ -358,6 +367,8 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems += kind.problems(loop, remote)
     if loop.kind == "climb" and (goal := climb_goal(loop.spec)) not in CLIMB_GOALS:
         problems.append(f"[climb] goal '{goal}' is not one of {', '.join(CLIMB_GOALS)}")
+    if loop.kind == "search" and "proof" in loop.spec:
+        problems += proof_problems(loop)
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
     if loop.agent:

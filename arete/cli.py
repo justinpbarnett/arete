@@ -228,6 +228,16 @@ def cmd_ask(args) -> int:
     return ask.main(args)
 
 
+def cmd_jev(args) -> int:
+    import json
+
+    from . import verdicts
+
+    data = verdicts.report(args.days, config.load())
+    print(json.dumps(data, indent=2) if args.json else verdicts.render(data))
+    return 0
+
+
 def cmd_install(args) -> int:
     from . import install
 
@@ -730,6 +740,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--only", metavar="ANSWER", help="print only the rows with this answer")
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_ask)
+
+    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts")
+    p.add_argument("action", choices=("report",))
+    p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.set_defaults(fn=cmd_jev)
 
     p = sub.add_parser("install", help="run arete serve at login: one launchd agent on a Mac, one systemd user unit on "
                                        "Linux; retires the old per loop agents")

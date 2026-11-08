@@ -241,6 +241,23 @@ CREATE TABLE IF NOT EXISTS triage_approvals (
     why TEXT,
     ts TEXT
 );
+CREATE TABLE IF NOT EXISTS verdicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT,
+    run_id TEXT,
+    loop TEXT,
+    kind TEXT,                     -- push | proof | fixed
+    subject TEXT,
+    about TEXT,
+    answers TEXT,
+    held TEXT,
+    outcome TEXT DEFAULT '',       -- '' | replaced | waiting | landed | failed | approved | rejected | skipped | went on
+    outcome_at TEXT,
+    sha TEXT DEFAULT '',
+    approval INTEGER,
+    UNIQUE (run_id, kind, subject)
+);
+CREATE INDEX IF NOT EXISTS verdicts_at ON verdicts (at);
 CREATE TABLE IF NOT EXISTS research (
     ref TEXT PRIMARY KEY,
     source TEXT,
@@ -568,6 +585,37 @@ def decide_approval(approval_id: int, status: str, result: str = "") -> bool:
         c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ? WHERE id = ? AND status IN "
                   f"({','.join('?' * len(came_from))})", (status, result[:1000], util.iso(), approval_id, *came_from))
         return c.total_changes > before
+
+
+def add_verdict(run_id: str, kind: str, subject: str, about: str, answers: dict, held: str,
+                outcome: str = "") -> None:
+    with db() as c:
+        c.execute("INSERT INTO verdicts (at, run_id, loop, kind, subject, about, answers, held, outcome, outcome_at) "
+                  "VALUES (?,?,(SELECT loop FROM runs WHERE id = ?),?,?,?,?,?,?,?) "
+                  "ON CONFLICT (run_id, kind, subject) DO UPDATE SET at = excluded.at, about = excluded.about, "
+                  "answers = excluded.answers, held = excluded.held, outcome = excluded.outcome, "
+                  "outcome_at = excluded.outcome_at, sha = '', approval = NULL",
+                  (util.iso(), run_id, run_id, kind, subject, about[:300], json.dumps(answers), held[:1000], outcome,
+                   util.iso() if outcome else None))
+
+
+def settle_verdicts(run_id: str, outcome: str, approval: int | None = None, was: tuple[str, ...] = ("",)) -> None:
+    with db() as c:
+        c.execute(f"UPDATE verdicts SET outcome = ?, outcome_at = ?, approval = COALESCE(?, approval) "
+                  f"WHERE run_id = ? AND kind IN ('push', 'proof') AND outcome IN ({','.join('?' * len(was))})",
+                  (outcome, util.iso(), approval, run_id, *was))
+
+
+def set_verdict_sha(run_id: str, sha: str) -> None:
+    with db() as c:
+        c.execute("UPDATE verdicts SET sha = ? WHERE run_id = ? AND kind IN ('push', 'proof') AND outcome != 'replaced'",
+                  (sha, run_id))
+
+
+def verdicts_since(since: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [{**dict(r), "answers": json.loads(r["answers"] or "{}")}
+                for r in c.execute("SELECT * FROM verdicts WHERE at >= ? ORDER BY at", (since,))]
 
 
 def add_message(run_id: str, text: str) -> None:

@@ -80,6 +80,7 @@ files = ["src/"]               # where the agent may change code
 check = "pytest -x tests/test_bug.py"  # exits 0 on a hit
 iterations = 5
 files = ["src/"]
+proof = "repro.py"             # with a push emit: the scratch script that proves the bug; see Push below
 
 [[emit]]                       # what the loop puts out; several are fine
 type = "ticket"                # ticket | pr | push | loop | digest | notify | metric
@@ -108,7 +109,7 @@ A command loop, a watch loop's `[run] script`, and a climb or search check run w
 | `ARETE_REPO_DIR` | the watch script: the checkout of `[run] repo`, empty without one |
 | `ARETE_TRIAL` | a command loop: `1` under `arete loop try` |
 
-A climb or search agent that finds the goal cannot or should not be met changes nothing and ends with a line that starts `Stop:` and says why. The run ends as done with that reason, and nothing is emitted. The one exception is a search agent that stops while it narrows a fix the push screen held: that fix goes to a person as an approval, with the reason in its report.
+A climb or search agent that finds the goal cannot or should not be met changes nothing and ends with a line that starts `Stop:` and says why. The run ends as done with that reason, and nothing is emitted. The one exception is a search agent that stops while it narrows a fix the push screen or the proof check held: that fix goes to a person as an approval, with the reason in its report.
 
 ## Findings from another loop
 
@@ -127,9 +128,12 @@ A push waits for approval in these cases:
 - When `approve = true`.
 - When a rule in the `approve` table matches. `lines` holds a change over that many lines, `deletes` holds any file deletion, and `paths` holds a change to any file that matches one of its patterns.
 - With JEV on, when JEV reads the diff as more than a narrow fix: a chance of `[jev] screen_hold` (0.4) or more that it weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses; a chance of `irreversible_hold` (0.5) or more that it does harm a revert will not undo; or a reach past the fix it names of `screen_reach` (0.6) or more.
+- With JEV on and `[search] proof` set, when JEV doubts that the proof script tests the problem the finding describes: a chance of `[jev] proof_hold` (0.5) or more that it checks something else, or under it that it runs the code into the problem and checks for the wrong result. A missing proof, or one past 12000 characters, holds too, and the approval shows the proof.
 - With JEV on, when the diff runs past the 12000 characters JEV reads, or when the JEV call fails.
 
-In a search loop, the JEV screen runs as soon as a try makes the check pass, and a hold goes back to the agent before it reaches a person. The agent's next try gets JEV's reason and the diff so far, and adjusts the change so the check still passes and only the fix remains. Each adjusted change that passes the check replaces the held change as one commit and is screened again, and a try that fails the check goes back to the held change. The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for a person when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds. Only a JEV hold goes back to the agent. A rule in the list above, a diff past 12000 characters, and a failed JEV call go to a person at once, and a climb run's push is screened only when it is delivered.
+In a search loop, the JEV screen runs as soon as a try makes the check pass, and a hold goes back to the agent before it reaches a person. The agent's next try gets JEV's reason and the diff so far, and adjusts the change so the check still passes and only the fix remains. Each adjusted change that passes the check replaces the held change as one commit and is screened again, and a try that fails the check goes back to the held change and its proof. The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for a person when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds. A proof check hold goes back to the agent the same way: the agent rewrites the proof, and may leave the code as it is. Only a JEV hold goes back to the agent. A rule in the list above, a diff past 12000 characters, and a failed JEV call go to a person at once, and a climb run's push is screened only when it is delivered.
+
+Before the first try of a search run fed by findings, JEV checks whether a commit that landed since the finding's run started, or a push of the same loop that waits for approval, already fixes the finding. At a chance of `[jev] fixed_skip` (0.7) or more, the run ends as done, already fixed by that change, and no agent runs. `arete jev report` shows what came of each verdict.
 
 The approval says which rule held it. Approving it lands it then, and rejecting it deletes the branch. A push that fails to land, because it no longer rebases or the check fails after the rebase, stays listed as a failed approval with its error, so you can try it again or reject it.
 

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, paths, pi, record, util
+from . import config, paths, pi, record, util, verdicts
 from .agent import Result
 
 URL = "https://openrouter.ai/api/v1/systemone"
@@ -63,6 +63,18 @@ REACH = ("How far does this diff reach beyond fixing the bug its description nam
          ["only the broken case changes", "a small side effect on nearby cases",
           "changes behavior that already worked, or an interface, default or stored data",
           "a new feature, a redesign, or a broad change"])
+PROOF = {
+    "elsewhere": (("Does the script check something other than the problem the finding describes, so it could pass "
+                   "while that problem is still there: for example only that new code exists, that a source file "
+                   "holds some text, or a different problem?"), True,
+                  "it checks something other than the problem the finding describes"),
+    "reproduces": (("Does the script reproduce the problem the finding describes: run the code with an input that "
+                    "triggers it and check for the wrong result the finding names, so it fails while the problem is "
+                    "there and passes once it is fixed?"), False,
+                   "it does not run the code into the problem and check for the wrong result"),
+}
+FIXED = ("Is the problem the finding describes gone from code that includes this commit, because the commit fixes "
+         "that same problem, even if it was found in other words or fixed as part of a related change?")
 SCREENED: dict[str, dict] = {}
 
 
@@ -98,6 +110,13 @@ class Reply:
 
 class Unjudged(Exception):
     pass
+
+
+@dataclass
+class Match:
+    ref: str
+    p: float
+    sure: bool
 
 
 @dataclass
@@ -257,24 +276,62 @@ def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("
     return Risk(score, irreversible, parts, hold)
 
 
-def screen(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> list[str]:
-    text = f"Description: {about}\n\nDiff:\n{patch}"
-    seen = hashlib.sha256(f"{cfg.jev.model}\0{text}".encode()).hexdigest()
-    if (answers := SCREENED.get(seen)) is None:
-        questions = {name: yes_no(q) for name, (q, _) in SCREEN.items()}
-        questions["reach"] = rate(*REACH)
+def judged(text: str, questions: dict[str, dict], cfg: config.Config,
+           trace: tuple[str, str]) -> tuple[str, dict[str, Answer]]:
+    subject = hashlib.sha256(f"{cfg.jev.model}\0{','.join(questions)}\0{text}".encode()).hexdigest()
+    if (answers := SCREENED.get(subject)) is None:
         reply = ask(text, questions, cfg, trace=trace)
         if set(reply.answers) != set(questions):
             raise Unjudged(reply.error or "its reply left questions out")
         while len(SCREENED) >= SCREENS_KEPT:
             SCREENED.pop(next(iter(SCREENED)))
-        answers = SCREENED[seen] = reply.answers
-    lines = {"irreversible": cfg.jev.irreversible_hold}
-    found = [f"{why} (p {answers[name].yes:.2f})" for name, (_, why) in SCREEN.items()
-             if answers[name].yes >= lines.get(name, cfg.jev.screen_hold)]
-    if (reach := float(answers["reach"].value)) >= cfg.jev.screen_reach:
-        found.append(f"reaches past the fix it names ({reach:.2f} of 1)")
+        answers = SCREENED[subject] = reply.answers
+    return subject, answers
+
+
+def traced_run(trace: tuple[str, str]) -> str:
+    return trace[0] or os.environ.get("ARETE_RUN_ID", "")
+
+
+def screen(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> list[str]:
+    questions = {name: yes_no(q) for name, (q, _) in SCREEN.items()} | {"reach": rate(*REACH)}
+    subject, answers = judged(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace)
+    scores = {name: verdicts.scored(answers[name].yes,
+                                    cfg.jev.irreversible_hold if name == "irreversible" else cfg.jev.screen_hold)
+              for name in SCREEN}
+    scores["reach"] = verdicts.scored(float(answers["reach"].value), cfg.jev.screen_reach)
+    found = [f"{why} (p {scores[name]['p']:.2f})" for name, (_, why) in SCREEN.items() if verdicts.holds(scores[name])]
+    if verdicts.holds(scores["reach"]):
+        found.append(f"reaches past the fix it names ({scores['reach']['p']:.2f} of 1)")
+    verdicts.record(traced_run(trace), "push", subject, about, scores, "; ".join(found))
     return found
+
+
+def proof(problem: str, name: str, script: str, patch: str, about: str, cfg: config.Config,
+          trace: tuple[str, str] = ("", "")) -> list[str]:
+    text = (f"Finding:\n{problem}\n\nProof script ({name}), which must fail on the code before the fix and pass "
+            f"after it:\n```\n{script}\n```\n\nFix diff:\n{patch}")
+    subject, answers = judged(text, {n: yes_no(q) for n, (q, _, _) in PROOF.items()}, cfg, trace)
+    scores = {n: verdicts.scored(answers[n].yes, cfg.jev.proof_hold, over) for n, (_, over, _) in PROOF.items()}
+    found = [f"{why} (p {scores[n]['p']:.2f}{'' if scores[n]['over'] else ' that it does'})"
+             for n, (_, _, why) in PROOF.items() if verdicts.holds(scores[n])]
+    verdicts.record(traced_run(trace), "proof", subject, about, scores, "; ".join(found))
+    return found
+
+
+def fixed(problem: str, candidates: list[tuple[str, str]], about: str, cfg: config.Config,
+          trace: tuple[str, str] = ("", "")) -> list[Match]:
+    question = {"fixed": yes_no(FIXED)}
+    replies = ask_many([(f"Finding:\n{problem}\n\nCommit {ref}\n\nDiff:\n{patch}", question)
+                        for ref, patch in candidates], cfg, trace=trace)
+    matches = sorted((Match(ref, a.yes, a.yes >= cfg.jev.fixed_skip) for (ref, _), reply in
+                      zip(candidates, replies, strict=True) if (a := reply.answers.get("fixed"))),
+                     key=lambda m: m.p, reverse=True)
+    outcome = "skipped" if matches and matches[0].sure else "went on"
+    for m in matches:
+        verdicts.record(traced_run(trace), "fixed", m.ref, about, {"fixed": verdicts.scored(m.p, cfg.jev.fixed_skip)},
+                        f"already fixed (p {m.p:.2f})" if m.sure else "", outcome)
+    return matches
 
 
 def files_matching(patterns: list[str], recursive: bool) -> list[Path]:
