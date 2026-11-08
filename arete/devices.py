@@ -18,6 +18,7 @@ PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi arete ollama; do command
          "done; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/gpu:/'")
 CLONE_BOOT_SECONDS = 180
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+HOME_DIR = re.compile(r"~([a-z_][a-z0-9_.-]*)?")
 
 
 @dataclass(frozen=True)
@@ -51,10 +52,16 @@ class DeviceError(RuntimeError):
 
 
 def load() -> list[Device]:
-    found = [LOCAL]
     if not DEVICES_FILE.is_file():
-        return found
-    data = tomllib.loads(DEVICES_FILE.read_text())
+        return [LOCAL]
+    try:
+        return [LOCAL, *parse(tomllib.loads(DEVICES_FILE.read_text()))]
+    except (ValueError, TypeError, AttributeError) as e:
+        raise DeviceError(f"{paths.short_path(DEVICES_FILE)}: {e}") from e
+
+
+def parse(data: dict) -> list[Device]:
+    found = []
     for name, d in data.get("device", {}).items():
         kind = d.get("kind", "ssh")
         if kind not in KINDS:
@@ -96,11 +103,10 @@ def ssh_argv(d: Device) -> list[str]:
 
 def remote_dir(path) -> str:
     text = str(path)
-    if text == "~":
-        return "~"
-    if text.startswith("~/"):
-        return "~/" + shlex.quote(text[2:])
-    return shlex.quote(text)
+    home, slash, rest = text.partition("/")
+    if not HOME_DIR.fullmatch(home):
+        return shlex.quote(text)
+    return home + slash + (shlex.quote(rest) if rest else "")
 
 
 def wrap(device: Device | str, argv: list[str], cwd, env: dict | None = None, mkdirs: tuple = ()) -> list[str]:
@@ -182,7 +188,8 @@ def lease(device: Device | str, label: str, log=lambda text: None):
         pve(d, f"qm start {vmid}")
         address = clone_address(d, vmid)
         log(f"VM {vmid} is up at {address}")
-        yield replace(d, kind="ssh", host=f"{d.user}@{address}", jump=d.host, port=None)
+        yield replace(d, kind="ssh", host=f"{d.user}@{address}", port=None,
+                      jump=",".join(filter(None, [d.jump, f"{d.host}:{d.port}" if d.port else d.host])))
     finally:
         if d.keep:
             log(f"keeping VM {vmid}")
