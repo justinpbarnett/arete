@@ -8,7 +8,7 @@ FIELDS = (("minute", 0, 59), ("hour", 0, 23), ("day", 1, 31), ("month", 1, 12), 
 ALIASES = {"@hourly": "0 * * * *", "@daily": "0 0 * * *", "@midnight": "0 0 * * *", "@weekly": "0 0 * * 0",
            "@monthly": "0 0 1 * *", "@yearly": "0 0 1 1 *"}
 UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-SEARCH_DAYS = 400
+SEARCH_DAYS = 8 * 366
 
 
 class BadSchedule(ValueError):
