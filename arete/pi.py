@@ -23,8 +23,14 @@ TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": 
 WRITING = {"edit", "write", "bash"}
 SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 PI_HOME = paths.HOME / ".pi"
-SCHEMA_RULE = ("Reply with only one JSON value that matches this JSON schema, in a ```json fence, and nothing after "
-               "it:\n\n{schema}")
+SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
+               "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
+RESTATE = ("An agent finished a task but did not write its answer as the JSON it was asked for. Below is how its run "
+           "ended: its last replies, and the tool calls it tried. Write the answer it gave as that JSON, using only "
+           "what it said.")
+ENDING_REPLIES = 3
+ENDING_CHARS = 12000
+RESTATE_TIMEOUT = 600
 WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
 NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
 
@@ -123,7 +129,35 @@ def run(
         return Result(ok=False, session=resume, error=f"pi not found: {e}", runner="pi", model=model)
     if cut_short_by:
         return cut_short(proc, resume, model, cut_short_by)
-    return parse(proc, resume, model, json_schema)
+    result = parse(proc, resume, model, json_schema)
+    if json_schema and result.ok and result.structured is None:
+        restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT))
+    return result
+
+
+def ending(stdout: str) -> str:
+    end = next((e for e in reversed(events(stdout)) if e.get("type") == "agent_end"), {})
+    said = []
+    for reply in [m for m in end.get("messages", []) if m.get("role") == "assistant"][-ENDING_REPLIES:]:
+        for block in reply.get("content", []):
+            if block.get("type") == "text" and block.get("text", "").strip():
+                said.append(block["text"].strip())
+            elif block.get("type") == "toolCall":
+                said.append(f"tool call {block.get('name')}: {json.dumps(block.get('arguments'))}")
+    return util.tail("\n\n".join(said), ENDING_CHARS)
+
+
+def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd: Path | str,
+            remote: devices.Device | None, timeout: float) -> None:
+    if not ending_text:
+        return
+    prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
+              f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}")
+    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote)
+    result.cost_usd += again.cost_usd
+    result.tokens_in += again.tokens_in
+    result.tokens_out += again.tokens_out
+    result.structured = json_from_text(again.text) if again.ok else None
 
 
 def mcp_servers(mcp_config: str) -> dict:

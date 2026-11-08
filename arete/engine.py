@@ -423,10 +423,11 @@ def classify(run: LoopRun, events: list[dict]) -> list[dict]:
                         f"event deserves a closer look, and `why` is one short line.",
                         work_dir(run), model=spec.get("model") or run.cfg.model("classify"),
                         tools=[], json_schema=CLASSIFY_SCHEMA)
-        verdict = res.structured or {}
-        passed = bool(verdict.get("pass")) if res.ok else True
+        verdict = res.structured if res.ok and isinstance(res.structured, dict) else {}
+        passed = bool(verdict.get("pass")) if verdict else True
+        why = verdict.get("why") or res.error or "no JSON verdict, so it passes"
         run.log("classify", f"{'pass' if passed else 'drop'}: {util.first_line(e.get('title', ''), 120)}"
-                            f" ({util.first_line(verdict.get('why') or res.error or '', 200)})")
+                            f" ({util.first_line(why, 200)})")
         if passed:
             kept.append(e)
     return kept
@@ -469,7 +470,10 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
                     json_schema=WATCH_SCHEMA)
     if not res.ok:
         return "failed", f"agent failed: {util.first_line(res.error, 300)}"
-    answer = res.structured or {}
+    answer = res.structured
+    if not isinstance(answer, dict):
+        return "failed", ("the agent ended without its JSON answer: "
+                          + (util.first_line(res.text, 200) or "its last reply held no text"))
     found = [f for f in answer.get("findings") or [] if isinstance(f, dict) and f.get("title")]
     fresh = new_findings(run, found)
     if not run.trial and isinstance(answer.get("state"), dict):
