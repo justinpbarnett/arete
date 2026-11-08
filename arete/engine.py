@@ -691,6 +691,7 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     if why := stop_reason(idea):
         revert(ws.wt)
         raise StoppedByAgent(why)
+    idea = idea or "the agent did not say what it changed"
     changed = diffguard.stage(ws.wt).files
     if not changed:
         return "", f"{idea} (no files changed)"
