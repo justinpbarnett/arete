@@ -214,6 +214,7 @@ class AgentRun:
 
     def agent(self, step: str, text: str, cwd: Path, **kw) -> Result:
         self.log(f"{step}: starting")
+        kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
         if res.connection_failed:
             self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")

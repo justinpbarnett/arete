@@ -76,7 +76,7 @@ def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) 
 
 
 def spent_limit(loop: Loop, cfg: config.Config) -> str:
-    tightest = tightest_limit(loop, cfg) if loop.agent else None
+    tightest = tightest_limit(loop, cfg) if loop.meters_spend(cfg) else None
     return tightest[0] if tightest and tightest[1] <= runner.BUDGET_FLOOR_USD else ""
 
 
@@ -133,7 +133,7 @@ class LoopRun:
         return record.spent(self.id)
 
     def room(self) -> float | None:
-        tightest = tightest_limit(self.loop, self.cfg, self.spent())
+        tightest = tightest_limit(self.loop, self.cfg, record.metered_spent(self.id))
         if not tightest:
             return None
         name, left = tightest
@@ -143,11 +143,12 @@ class LoopRun:
 
     def agent(self, step: str, prompt: str, cwd: Path, *, model: str = "", tools: list[str] | None = None,
               **kw) -> Result:
-        left = self.room()
-        res = runner.run(prompt, cwd, model=model or self.loop.model_for(self.cfg), runner=self.loop.runner,
-                         trace=(self.id, step), cfg=self.cfg, tools=tools, allowed_tools=tools,
-                         disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left, persist=False,
-                         timeout=self.loop.timeout_minutes * 60, device=self.device, **kw)
+        model = model or self.loop.model_for(self.cfg)
+        left = self.room() if runner.metered(model, self.loop.runner) else None
+        res = runner.run(prompt, cwd, model=model, runner=self.loop.runner, trace=(self.id, step), cfg=self.cfg,
+                         tools=tools, allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left,
+                         persist=False, timeout=self.loop.timeout_minutes * 60, device=self.device,
+                         say=lambda text: self.log("wait", f"{step}: {text}"), **kw)
         record.note(self.id, model=res.model, runner=res.runner)
         self.log("step" if res.ok else "error", f"{step}: {res.runner} {res.model} {runner.cost_note(res)}"
                  + ("" if res.ok else f" failed: {res.error.strip()}"))

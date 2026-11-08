@@ -142,6 +142,7 @@ def ask(text: str, session: Session) -> Result:
                                context=CONTEXT_FILE, logs=paths.LOG_DIR, github=github or "(no GitHub repo set)"),
         max_budget_usd=BUDGET_USD,
         timeout=TIMEOUT_SECONDS,
+        wait_out_limits=False,
         add_dirs=[paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR],
     )
 

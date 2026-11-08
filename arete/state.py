@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS probes (
     ok INTEGER,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS holds (
+    scope TEXT PRIMARY KEY,        -- claude | opus | sonnet
+    until TEXT NOT NULL,
+    why TEXT,
+    ts TEXT
+);
 CREATE TABLE IF NOT EXISTS alerts (
     key TEXT PRIMARY KEY,
     issue INTEGER,
@@ -544,13 +550,34 @@ def take_messages(run_id: str) -> list[str]:
 
 def loop_spent_since(since: str, loop: str | None = None) -> float:
     q = ("SELECT COALESCE(SUM(s.cost_usd), 0) FROM steps s JOIN runs r ON r.id = s.run_id "
-         "WHERE s.ts >= ? AND r.kind = 'loop'")
+         "WHERE s.ts >= ? AND r.kind = 'loop' AND COALESCE(s.runner, '') != 'claude'")
     args: list = [since]
     if loop:
         q += " AND r.loop = ?"
         args.append(loop)
     with db() as c:
         return float(c.execute(q, args).fetchone()[0])
+
+
+def hold(scope: str, until: str, why: str) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO holds (scope, until, why, ts) VALUES (?,?,?,?)", (scope, until, why, util.iso()))
+
+
+def holds(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM holds WHERE until > ? ORDER BY until", (util.iso(),))]
+
+
+def hold_until(scope: str) -> str:
+    with db() as c:
+        r = c.execute("SELECT until FROM holds WHERE scope = ? AND until > ?", (scope, util.iso())).fetchone()
+    return r["until"] if r else ""
+
+
+def clear_holds(scopes: list[str]) -> None:
+    with db() as c:
+        c.executemany("DELETE FROM holds WHERE scope = ?", [(s,) for s in scopes])
 
 
 def runs_marked_running(connect=db) -> list[dict]:

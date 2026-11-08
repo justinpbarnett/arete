@@ -121,6 +121,18 @@ class Loop:
     def model_for(self, cfg: config.Config) -> str:
         return self.model or cfg.model("loop")
 
+    def agent_models(self, cfg: config.Config) -> list[str]:
+        if not self.agent:
+            return []
+        return [self.model_for(cfg), *([self.classify.get("model") or cfg.model("classify")] if self.classify else [])]
+
+    def meters_spend(self, cfg: config.Config) -> bool:
+        return any(runner.metered(model, self.runner) for model in self.agent_models(cfg))
+
+    def usage_hold(self, cfg: config.Config) -> str:
+        held = next(filter(None, (runner.usage_hold(model, self.runner) for model in self.agent_models(cfg))), None)
+        return runner.hold_words(held) if held else ""
+
     def work_repo(self, cfg: config.Config) -> config.Repo:
         for r in cfg.repos:
             if r.name == self.repo:

@@ -60,8 +60,8 @@ runner = ""                    # claude | pi, to force one
 tools = ["Read", "Glob", "Grep"]       # Read Glob Grep LS, plus Edit MultiEdit Write Bash
 device = "local"               # a device from ~/.config/arete/devices.toml
 timeout_minutes = 30
-budget_usd = 0.50              # stop one run when it spends this
-daily_budget_usd = 2.00        # refuse to start when the last 24 hours spent this
+budget_usd = 0.50              # pi only: stop one run when it spends this
+daily_budget_usd = 2.00        # pi only: refuse to start when the last 24 hours spent this
 queue = ""                     # share a named queue with other loops; [serve.queues] sets how many run at once
 stale_hours = 3                # heartbeat alerts when the last good run is older than this
 

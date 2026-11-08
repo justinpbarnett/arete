@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import devices, paths, util
-from .agent import NO_SESSION, Result, Session, json_from_text
+from .agent import NO_SESSION, Result, Session, UsageLimit, json_from_text
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
 PATH_RULE_OF = {"Read": "Read", "Glob": "Read", "Grep": "Read", "LS": "Read", "Edit": "Edit", "MultiEdit": "Edit",
                 "Write": "Edit", "NotebookEdit": "Edit"}
 GIT_WRITES_TO_ANY_PATH = "Bash(git * --output*)"
+USAGE_LIMIT_TEXT = re.compile(r"(?:hit|reached) your [^.\n]{0,60}limit|usage limit reached", re.IGNORECASE)
+LEGACY_LIMIT_RESET = re.compile(r"usage limit reached\|(\d{10,13})", re.IGNORECASE)
+LIMIT_SCOPES = {"seven_day_opus": "opus", "seven_day_sonnet": "sonnet"}
+EVERY_MODEL = "claude"
+LIMIT_SLACK_SECONDS = 60
+LIMIT_RECHECK_SECONDS = 1800
+MILLISECOND_STAMPS = 1e12
 
 
 def binary() -> str:
@@ -72,7 +81,8 @@ def run(
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     env.update(extra_env or {})
     if remote:
-        cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
+        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd,
+                           {"ARETE_AGENT": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
     try:
         proc = subprocess.run(
             cmd, cwd=None if remote else str(cwd), input=prompt, capture_output=True, text=True, timeout=timeout,
@@ -100,7 +110,9 @@ def run(
             except json.JSONDecodeError:
                 pass
     if not data:
-        return Result(ok=False, session=resume, error=util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500))
+        error = util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500)
+        return Result(ok=False, session=resume, error=error,
+                      usage_limit=usage_limit({}, error) if proc.returncode else None)
 
     structured = data.get("structured_output")
     if structured is None and json_schema:
@@ -118,6 +130,7 @@ def run(
         turns=int(data.get("num_turns") or 0),
         error=(data.get("result", "") if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",
+        usage_limit=usage_limit(data, data.get("result", "") or "") if is_error else None,
         raw=data,
         tokens_in=sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
                                                          "cache_read_input_tokens")),
@@ -125,6 +138,22 @@ def run(
         model=next(iter(data.get("modelUsage") or {}), model),
         provider="anthropic",
     )
+
+
+def usage_limit(data: dict, text: str) -> UsageLimit | None:
+    if data.get("api_error") != "usage_limit_reached" and not USAGE_LIMIT_TEXT.search(text):
+        return None
+    info = (data.get("api_error_params") or {}).get("rate_limit_info") or {}
+    legacy = LEGACY_LIMIT_RESET.search(text)
+    resets = float(info.get("resetsAt") or (legacy.group(1) if legacy else 0))
+    soonest = util.now() + timedelta(seconds=LIMIT_SLACK_SECONDS)
+    if resets:
+        stamp = resets / 1000 if resets > MILLISECOND_STAMPS else resets
+        until = max(soonest, datetime.fromtimestamp(stamp, UTC) + timedelta(seconds=LIMIT_SLACK_SECONDS))
+    else:
+        until = util.now() + timedelta(seconds=LIMIT_RECHECK_SECONDS)
+    kind = str(info.get("rateLimitType") or "")
+    return UsageLimit(util.iso(until), LIMIT_SCOPES.get(kind, EVERY_MODEL), kind.replace("_", " "))
 
 
 def local_roots(folders: list[Path | str]) -> list[str]:

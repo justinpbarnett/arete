@@ -466,8 +466,11 @@ def cmd_loop(args) -> int:
             print(f"  {d['description']}\n  dir {d['dir']}, origin {d['origin']}"
                   + (f", repo {d['repo']}" if d["repo"] else ""))
             if d["model"]:
-                print(f"  model {d['model']} {d['runner'] or ''} on {d['device']}, budget "
-                      f"{d['budget_usd'] or '-'} per run, {d['daily_budget_usd'] or '-'} per day")
+                budget = (f"budget {d['budget_usd'] or '-'} per run, {d['daily_budget_usd'] or '-'} per day"
+                          if d["metered"] else "no budget, claude runs on the subscription")
+                print(f"  model {d['model']} {d['runner'] or ''} on {d['device']}, {budget}")
+            if d["held"]:
+                print(f"  {d['held']}")
             if d["emits"]:
                 print(f"  emits {', '.join(d['emits'])}")
             if d["webhook_path"]:

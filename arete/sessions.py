@@ -173,15 +173,16 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     recent = util.tail(log.read_text(errors="replace"), RECENT_CHARS) if log.exists() else ""
     log_line(spec, "you", prompt)
     left = None
-    if spec.budget_usd:
-        left = round(spec.budget_usd - record.spent(spec.id), 2)
+    if spec.budget_usd and runner.metered(spec.model, spec.runner or resume.runner):
+        left = round(spec.budget_usd - record.metered_spent(spec.id), 2)
         if left <= runner.BUDGET_FLOOR_USD:
             log_line(spec, "error", f"the session budget of ${spec.budget_usd:g} is spent")
             return resume
     resume = compacted(spec, cfg, device, prompt, recent, turn, resume)
     res = runner.run(prompt, spec.cwd, model=spec.model, runner=spec.runner, trace=(spec.id, f"turn {turn}"),
                      resume=resume, cfg=cfg, device=device, tools=spec.tools, allowed_tools=spec.tools,
-                     disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left, timeout=TURN_TIMEOUT_SECONDS)
+                     disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left, timeout=TURN_TIMEOUT_SECONDS,
+                     say=lambda text: log_line(spec, "wait", text))
     record.note(spec.id, model=res.model, runner=res.runner)
     note = runner.cost_note(res)
     log_line(spec, "reply" if res.ok else "error", (res.text.strip() or "(no text)") + f"\n{note}" if res.ok

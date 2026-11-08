@@ -57,7 +57,8 @@ def draft_prompt(sentence: str, cfg: config.Config, name: str, repo: str, taken:
         f"Loop names already taken: {', '.join(sorted(taken)) or 'none'}.",
         ("Pick the simplest kind that does the job: a command loop when a script can decide on its own, a watch "
          "loop when it needs judgment, climb or search only to change code. Put `enabled = false` at the top. Give "
-         "every agent loop a run budget_usd, and a daily_budget_usd when it fires more than once a day. Set "
+         "an agent loop whose model runs on pi a run budget_usd, and a daily_budget_usd when it fires more than "
+         "once a day; a loop that runs on claude takes no budget, since the subscription carries it. Set "
          "stale_hours on a scheduled loop. Prefer emits that need no approval only for digest, notify and metric; "
          "a ticket or pr emit on a repo you cannot see should set approve = true."),
     ]
@@ -119,10 +120,13 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", say
         for attempt in range(1, DRAFT_TRIES + 1):
             say(f"drafting, try {attempt} of {DRAFT_TRIES}")
             res = runner.run(prompt, DRAFTS_DIR, model=model or cfg.model("loop"), trace=(run_id, f"draft {attempt}"),
-                             cfg=cfg, tools=[], json_schema=DRAFT_SCHEMA, persist=False, timeout=600)
+                             cfg=cfg, tools=[], json_schema=DRAFT_SCHEMA, persist=False, timeout=600,
+                             wait_out_limits=False)
             record.note(run_id, model=res.model, runner=res.runner)
             if not res.ok:
                 problem = f"the model failed: {util.first_line(res.error, 300)}"
+                if res.usage_limit:
+                    break
                 continue
             answer = res.structured or {}
             folder, problem = check_draft(answer, cfg, taken)

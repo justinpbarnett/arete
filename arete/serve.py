@@ -199,6 +199,8 @@ class Server:
                 why = f"queue {item['queue']} is full at {util.count(size, 'run')}"
             elif spent := engine.spent_limit(loop, self.cfg):
                 why = f"its {spent} is spent"
+            elif held := loop.usage_hold(self.cfg):
+                why = held
             else:
                 try:
                     run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)

@@ -701,6 +701,7 @@ function closeLoopButton() {
 }
 
 function budgetWords(d) {
+  if (d.metered === false) return "none, claude runs on the subscription";
   return [d.budget_usd ? `${money(d.budget_usd)} a run` : "", d.daily_budget_usd ? `${money(d.daily_budget_usd)} a day` : ""].filter(Boolean).join(", ") || "none";
 }
 
@@ -712,7 +713,7 @@ function loopFacts(d) {
     fact("Device", d.device), fact("Queue", d.queue === d.name ? "its own" : d.queue), fact("Budget", budgetWords(d)),
     fact("Emits", d.emits.join(", ") || "nothing"),
     fact("Next", d.next_due ? `${clock(d.next_due)}` : d.enabled ? "" : "off, so never on its own"),
-    fact("Waiting", d.waiting.length ? `${d.waiting.length} in line` : ""));
+    fact("Waiting", d.waiting.length ? `${d.waiting.length} in line` : ""), fact("Held", d.held));
 }
 
 function loopRuns(d) {

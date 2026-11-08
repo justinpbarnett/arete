@@ -124,7 +124,8 @@ def loop_detail(name: str) -> dict:
             "waiting": [i for i in state.pending() if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors() if c["source"] in source_ids],
             "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
-            "digests": digests(loop), "metrics": loop_metrics(loop)}
+            "digests": digests(loop), "metrics": loop_metrics(loop), "metered": loop.meters_spend(cfg) if loop.agent else None,
+            "held": loop.usage_hold(cfg)}
 
 
 def digests(loop: Loop) -> list[dict]:

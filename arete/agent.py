@@ -14,6 +14,13 @@ class Session:
     runner: str = ""
 
 
+@dataclass(frozen=True)
+class UsageLimit:
+    until: str
+    scope: str
+    kind: str = ""
+
+
 @dataclass
 class Result:
     ok: bool
@@ -24,6 +31,7 @@ class Result:
     turns: int = 0
     error: str = ""
     connection_failed: bool = False
+    usage_limit: UsageLimit | None = None
     raw: dict = field(default_factory=dict)
     tokens_in: int = 0
     tokens_out: int = 0

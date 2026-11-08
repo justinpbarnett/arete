@@ -143,8 +143,11 @@ def check_loops(cfg: config.Config) -> list[Check]:
             continue
         age = util.hours_awake_since(util.parse_iso(last["finished"] or last["started"]).timestamp())
         marked = beats.get(loop.name) or {}
-        ok = age <= loop.stale_hours and last["status"] in ("done", "skipped") and marked.get("ok", True)
+        held = loop.usage_hold(cfg)
+        ok = (age <= loop.stale_hours or bool(held)) and last["status"] in ("done", "skipped") and marked.get("ok", True)
         detail = f"last run {age:.1f}h ago, {last['status']}, limit {loop.stale_hours:g}h"
+        if held:
+            detail += f", {held}"
         if not marked.get("ok", True):
             detail += f", failed: {marked.get('detail', '')}"
         elif last["status"] not in ("done", "skipped"):

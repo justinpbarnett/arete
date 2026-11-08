@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
-from . import ask, claude, config, devices, guard, jev, pi, record, util
+from . import ask, claude, config, devices, guard, jev, pi, record, state, util
 from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, Result, Session
 
 RUNNERS = ("claude", "pi")
@@ -20,6 +22,9 @@ NO_GIT_WRITES = [
 ]
 PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
 LOGIN_WARNING_DAYS = 7
+HOLD_CHECK_SECONDS = 60
+CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
+LIMIT_SCOPES = (claude.EVERY_MODEL, *claude.LIMIT_SCOPES.values())
 
 
 def route(model: str, runner: str = "") -> tuple[str, str]:
@@ -29,6 +34,38 @@ def route(model: str, runner: str = "") -> tuple[str, str]:
     if runner in RUNNERS:
         return runner, model
     return ("pi" if "/" in model else "claude"), model
+
+
+def metered(model: str, run_with: str = "") -> bool:
+    return route(model, run_with)[0] != "claude"
+
+
+def limit_applies(scope: str, model: str) -> bool:
+    return scope == claude.EVERY_MODEL or scope in model.lower()
+
+
+def usage_hold(model: str, run_with: str = "") -> dict | None:
+    which, name = route(model, run_with)
+    if which != "claude":
+        return None
+    return next((h for h in reversed(state.holds()) if limit_applies(h["scope"], name)), None)
+
+
+def hold_words(hold: dict) -> str:
+    return f"{hold['why']}, waiting until {local_time(hold['until'])}"
+
+
+def local_time(stamp: str) -> str:
+    return util.parse_iso(stamp).astimezone().strftime("%a %b %d %H:%M")
+
+
+def wait_out(scope: str) -> None:
+    while until := state.hold_until(scope):
+        time.sleep(max(1.0, min(HOLD_CHECK_SECONDS, (util.parse_iso(until) - util.now()).total_seconds())))
+
+
+def tell_stderr(text: str) -> None:
+    print(f"{util.iso()} {text}", file=sys.stderr, flush=True)
 
 
 def provider_of(model: str) -> str:
@@ -89,23 +126,48 @@ def priced(res: Result, cfg: config.Config) -> float:
 
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
-        **kw) -> Result:
+        wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, **kw) -> Result:
     cfg = cfg or config.load()
     target = devices.resolve(device)
     if target.remote:
         kw["remote"] = target
     which, name = route(model, runner or resume.runner)
-    run_id, step = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
-    if which == "claude" and not target.remote:
-        kw = local_claude(kw, cwd, cfg, run_id)
+    trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
+    if which == "claude":
+        kw.pop("max_budget_usd", None)
+        if not target.remote:
+            kw = local_claude(kw, cwd, cfg, trace[0])
+    while True:
+        if wait_out_limits and (held := usage_hold(name, which)):
+            say(hold_words(held))
+            wait_out(held["scope"])
+            say("the claude usage limit has lifted, going on")
+        res = attempt(which, name, prompt, cwd, resume, cfg, trace, kw)
+        if not res.usage_limit:
+            if which == "claude" and res.ok:
+                state.clear_holds([s for s in LIMIT_SCOPES if limit_applies(s, res.model)])
+            return res
+        limit = res.usage_limit
+        state.hold(limit.scope, limit.until, f"claude {limit.kind or 'usage'} limit reached")
+        if not wait_out_limits:
+            return res
+        say(hold_words({"why": f"claude {limit.kind or 'usage'} limit reached", "until": limit.until}))
+        wait_out(limit.scope)
+        say("the claude usage limit has lifted, going on")
+        if res.session.id and res.turns > 1 and kw.get("persist", True):
+            prompt, resume = CONTINUE_AFTER_LIMIT, res.session
+
+
+def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
+            trace: tuple[str, str], kw: dict) -> Result:
     started = time.monotonic()
     res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, **kw)
     res.runner = which
     res.model = res.model or name
     res.provider = res.provider or provider_of(res.model)
     res.cost_usd = priced(res, cfg)
-    if run_id:
-        record.step(run_id, step, res, time.monotonic() - started)
+    if trace[0]:
+        record.step(trace[0], trace[1], res, time.monotonic() - started)
     return res
 
 
