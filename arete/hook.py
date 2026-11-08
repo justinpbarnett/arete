@@ -33,7 +33,8 @@ STOP_CLASSES = [
     ("timeout", r"timeout|timed out"),
     ("context", r"context|too long|prompt is too long"),
 ]
-DENIED = re.compile(r"denied|declined|rejected|doesn't want|not allowed|permission to use", re.IGNORECASE)
+DENIED = re.compile(r"doesn't want|declined|not allowed|permission to use\b|has been denied|denied by your permission",
+                    re.IGNORECASE)
 
 
 def classify(text: str, table: list[tuple[str, str]], default: str) -> str:
