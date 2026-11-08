@@ -392,7 +392,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     started = time.monotonic()
     code, text = run_command(argv if run.device.remote else from_loop_folder(argv, loop), work_dir(run), timeout=loop.timeout_minutes * 60, env=env,
                              device=run.device, stdin=stdin, output=run.log_file, on_line=feed_output(run))
-    lines = [line for line in text.splitlines() if line.strip()]
+    lines = [line for line in text.split("\n") if line.strip()]
     found, value, said = [], None, []
     for line in lines:
         row = json_object(line)
