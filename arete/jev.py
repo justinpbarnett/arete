@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import http.client
 import json
 import os
 import time
@@ -187,16 +188,23 @@ def post(body: bytes, token: str) -> tuple[dict, str]:
             with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as r:
                 return json.loads(r.read()), ""
         except urllib.error.HTTPError as e:
-            error = f"HTTP {e.code}: {util.first_line(e.read().decode(errors='replace'), 200)}"
+            error = f"HTTP {e.code}: {util.first_line(error_body(e), 200)}"
             if e.code != 429 and e.code < 500:
                 return {}, error
             wait = retry_after(e.headers.get("retry-after"), attempt)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, http.client.HTTPException) as e:
             error = f"{type(e).__name__}: {util.first_line(str(e), 200)}"
             wait = 2.0 ** attempt
         if attempt + 1 < TRIES:
             time.sleep(min(wait, LONGEST_WAIT_SECONDS))
     return {}, error
+
+
+def error_body(e: urllib.error.HTTPError) -> str:
+    try:
+        return e.read().decode(errors="replace")
+    except (OSError, http.client.HTTPException):
+        return ""
 
 
 def retry_after(header: str | None, attempt: int) -> float:
