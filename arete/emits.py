@@ -352,6 +352,8 @@ class ToLoop(Emit):
             raise RuntimeError(f"the loop {target.name} is off{': ' + target.error if target.error else ''}")
         if why := target.trigger.refusal(item["event"]):
             raise ValueError(f"{target.name} {why}")
+        if not target.takes_findings:
+            raise ValueError(f"{target.name} takes findings only with [trigger] event = [\"{FINDING_EVENT}\"]")
         queued = sources.fire(target, f"finding from {loop_name}", [item["event"]])
         return f"queued for {target.name} as #{queued[0]}"
 
