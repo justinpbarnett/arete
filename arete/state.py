@@ -241,7 +241,9 @@ CREATE TABLE IF NOT EXISTS triage_approvals (
     plan TEXT,
     assumptions TEXT,
     why TEXT,
-    ts TEXT
+    ts TEXT,
+    tracker TEXT DEFAULT 'jira',
+    sent_by TEXT DEFAULT 'triage'  -- triage | owner
 );
 CREATE TABLE IF NOT EXISTS verdicts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,6 +289,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               ("triage", "in_sprint", "ALTER TABLE triage ADD COLUMN in_sprint INTEGER DEFAULT 0"),
               ("triage", "parent", "ALTER TABLE triage ADD COLUMN parent TEXT DEFAULT ''"),
               ("feedback", "asks", "ALTER TABLE feedback ADD COLUMN asks REAL"),
+              ("triage_approvals", "tracker", "ALTER TABLE triage_approvals ADD COLUMN tracker TEXT DEFAULT 'jira'"),
+              ("triage_approvals", "sent_by", "ALTER TABLE triage_approvals ADD COLUMN sent_by TEXT DEFAULT 'triage'"),
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
                 for col in ("ticket", "basis", "answered_by")],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
@@ -902,7 +906,8 @@ def mined_urls() -> set[str]:
 TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
                   "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint", "parent")
 TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions")
-APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "plan", "assumptions", "why", "ts")
+APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "plan", "assumptions", "why", "ts", "tracker",
+                    "sent_by")
 APPROVAL_LISTS = ("plan", "assumptions")
 RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
                     "cost", "ts", "ticket", "basis", "answered_by")
@@ -944,10 +949,10 @@ def triage_drop(ref: str) -> None:
         c.execute("DELETE FROM triage WHERE ref = ?", (ref,))
 
 
-def triage_approve(row: dict) -> None:
+def triage_approve(row: dict, sent_by: str) -> None:
     with db() as c:
         c.execute(insert_sql("triage_approvals", APPROVAL_COLUMNS, "INSERT OR REPLACE"),
-                  lists_written({**row, "ts": util.iso()}, APPROVAL_COLUMNS, APPROVAL_LISTS))
+                  lists_written({**row, "ts": util.iso(), "sent_by": sent_by}, APPROVAL_COLUMNS, APPROVAL_LISTS))
 
 
 def triage_approvals(since: str = "", connect=db) -> list[dict]:

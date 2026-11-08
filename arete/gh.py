@@ -57,7 +57,7 @@ def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, aut
 
 def issue(repo: str, number: int) -> dict:
     return gh_json(
-        ["issue", "view", str(number), "--repo", repo, "--json", "number,title,body,labels,url,comments,state,author"]
+        ["issue", "view", str(number), "--repo", repo, "--json", "number,title,body,labels,url,comments,state,author,updatedAt"]
     )
 
 

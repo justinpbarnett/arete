@@ -10,6 +10,7 @@ from typing import Literal
 from . import config, gh, jira
 
 LABEL = "agent"
+APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
 STATE_COLORS = {"running": "fbca04", "pr": "0e8a16", "failed": "d93f0b", "needs-info": "c5def5"}
 FIX_LABELS = {"bug", "fix"}
 FIX_TYPES = {"bug", "fire", "incident", "problem"}
@@ -162,11 +163,16 @@ class GitHubTracker:
                       blocker=blocker)
 
     def prepare(self) -> list[str]:
-        made = [gh.ensure_label(self.repo.github, LABEL, "0052cc", "Approved for arete to build"),
+        made = [gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE),
                 gh.ensure_label(self.repo.github, "arete", "5319e7", "Arete pipeline state")]
         made += [gh.ensure_label(self.repo.github, self.label_name(s), STATE_COLORS[s], "Arete pipeline state")
                  for s in config.STATES]
         return [err for err in made if err]
+
+    def approve(self, tid: str) -> None:
+        if failed := gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE, restyle=False):
+            raise gh.GhError(failed)
+        gh.issue_labels(self.repo.github, int(tid), add=[LABEL])
 
     def label(self, tid: str, add=(), remove=()) -> str:
         return error_of(lambda: gh.issue_labels(self.repo.github, int(tid), add=[self.label_name(s) for s in add],

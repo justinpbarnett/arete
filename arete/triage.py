@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -63,6 +64,9 @@ EARLIEST = datetime.min.replace(tzinfo=UTC)
 READY, SENT, RESEARCH_WORK, WITH_QUESTIONS, NEEDS_PERSON, NOT_TRIAGED = (
     "Ready to build", "Sent to the pipeline", "Research", "With questions", "Needs a person", "Not triaged")
 STANDINGS = (READY, SENT, RESEARCH_WORK, WITH_QUESTIONS, NEEDS_PERSON, NOT_TRIAGED)
+SENDABLE = (READY, WITH_QUESTIONS)
+WHICH_REPO = "Which repo is it for"
+SENDING = threading.Lock()
 
 
 @dataclass
@@ -110,6 +114,9 @@ class Source:
 
     def ticket_text(self, c: Candidate) -> str:
         return self.ticket(c).text
+
+    def candidate(self, r: dict) -> Candidate:
+        return Candidate(r["ref"], self.tid(r["ref"]), r["title"], r["url"], r["updated"])
 
 
 @dataclass
@@ -179,6 +186,18 @@ class JiraSource(Source):
     def route(self, repo: str) -> str:
         return tracker.route_label(self.by_name()[repo]) if repo else ""
 
+    def tid(self, ref: str) -> str:
+        return ref
+
+    def updated_now(self, ref: str) -> str:
+        return (self.client.issue(ref, ["updated"]).get("fields") or {}).get("updated") or ""
+
+    def comment(self, ref: str, text: str) -> None:
+        self.client.comment(ref, text)
+
+    def approve(self, r: dict) -> None:
+        self.client.edit_labels(r["ref"], labels_to_add(r))
+
 
 @dataclass
 class GitHubSource(Source):
@@ -223,6 +242,18 @@ class GitHubSource(Source):
 
     def route(self, repo: str) -> str:
         return ""
+
+    def tid(self, ref: str) -> str:
+        return ref.rpartition("#")[2]
+
+    def updated_now(self, ref: str) -> str:
+        return gh.issue(self.key, int(self.tid(ref))).get("updatedAt") or ""
+
+    def comment(self, ref: str, text: str) -> None:
+        gh.issue_comment(self.key, int(self.tid(ref)), text)
+
+    def approve(self, r: dict) -> None:
+        self.issues.approve(self.tid(r["ref"]))
 
 
 TriageSource = JiraSource | GitHubSource
@@ -320,7 +351,7 @@ def settle(src: TriageSource, c: Candidate, answer: dict, cost: float) -> dict:
     questions = lines_of(answer.get("questions"))
     size = answer.get("size") if answer.get("size") in SIZES else "M"
     if not repos:
-        questions.append(f"Which repo is it for: {', '.join(src.by_name())}?")
+        questions.append(f"{WHICH_REPO}: {', '.join(src.by_name())}?")
     elif len(repos) > 1:
         questions.append(f"It needs changes in {' and '.join(repos)}. Can you split it into one ticket per repo?")
     if size == "L":
@@ -344,6 +375,10 @@ def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dic
         return {**prev, "source": src.name, "title": c.title, "url": c.url, "in_sprint": c.in_sprint,
                 "parent": c.parent}
     return row(src, c, why=reason)
+
+
+def sent_since_read(c: Candidate, sent: dict[str, str]) -> bool:
+    return c.ref in sent and util.parse_iso(sent[c.ref]) >= moment(c.updated).replace(microsecond=0)
 
 
 def due(c: Candidate, prev: dict | None) -> bool:
@@ -416,12 +451,13 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         else:
             failed[c.ref] = error
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
+    sent = {a["ref"]: a["ts"] for a in state.triage_approvals()}
     for src in srcs:
         if src.name in read:
             state.triage_replace(src.name, [
                 answered.get(c.ref) or kept(src, c, old.get(c.ref),
                                             f"triage failed: {failed[c.ref]}" if c.ref in failed else WAITING)
-                for c in read[src.name]])
+                for c in read[src.name] if not sent_since_read(c, sent)])
     state.triage_prune([s.name for s in srcs])
     approved, held = approve_ready(cfg, srcs)
     keep = {record_file(r["ref"]).name for r in state.triage_rows()}
@@ -481,8 +517,7 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
         return f"{r['repo'] or 'no repo'} is not a pipeline repo of {src.name}"
     if not jev.ready(cfg, [repo]):
         return "JEV is not on for it, so nothing screens the ticket; add the labels by hand"
-    c = Candidate(r["ref"], r["ref"], r["title"], r["url"], r["updated"])
-    screened = jev.injection(f"{r['title']}\n\n{src.ticket_text(c)}", cfg, trace=("", f"triage {r['ref']} injection jev"))
+    screened = screen(cfg, src, r, "injection")
     if screened is None:
         return "JEV could not screen it this time"
     if screened.yes >= cfg.jev.injection:
@@ -491,13 +526,103 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
             f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f}). Check the ticket, then add {labels} "
             "by hand to approve it."]})
         return f"held for the injection screen (p {screened.yes:.2f})"
-    now = (src.client.issue(r["ref"], ["updated"]).get("fields") or {}).get("updated") or ""
-    if now != r["updated"]:
+    if src.updated_now(r["ref"]) != r["updated"]:
         return "it changed since triage, so the next refresh triages it again"
-    src.client.edit_labels(r["ref"], labels_to_add(r))
-    state.triage_approve(r)
+    src.approve(r)
+    state.triage_approve(r, "triage")
     state.triage_drop(r["ref"])
     return ""
+
+
+def screen(cfg: config.Config, src: TriageSource, r: dict, why: str) -> jev.Answer | None:
+    return jev.injection(f"{r['title']}\n\n{src.ticket_text(src.candidate(r))}", cfg,
+                         trace=("", f"triage {r['ref']} {why} jev"))
+
+
+class NotOnBoard(LookupError):
+    pass
+
+
+class NotSendable(RuntimeError):
+    pass
+
+
+class BadAnswers(ValueError):
+    pass
+
+
+class TrackerFailed(RuntimeError):
+    pass
+
+
+def tracker_said(e: Exception) -> str:
+    return util.first_line(str(e), 200).rstrip(".")
+
+
+def repo_question(r: dict) -> str:
+    return next((q for q in r["questions"] if q.startswith(WHICH_REPO)), "")
+
+
+def answers_comment(pairs: list[tuple[str, str]]) -> str:
+    return "Answers to triage's questions:\n\n" + "\n\n".join(f"**{q}**\n{a}" for q, a in pairs)
+
+
+def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str], repo_name: str) -> str:
+    with SENDING:
+        r = next((r for r in state.triage_rows() if r["ref"].lower() == ref.strip().lower()), None)
+        if not r:
+            if a := state.triage_approval(ref.strip()):
+                raise NotSendable(f"{a['ref']} went to the pipeline {stamp(a['ts'])}, so there is nothing left to send.")
+            raise NotOnBoard(f"{ref} is not on the triage board.")
+        if standing(r) not in SENDABLE:
+            raise NotSendable(f"{r['ref']} is under {standing(r)}. Only tickets that are ready or have questions go to "
+                              "the pipeline from here.")
+        if questions != r["questions"]:
+            raise NotSendable(f"Triage asked new questions about {r['ref']} since the page loaded. Read them and send "
+                              "again.")
+        if len(answers) != len(questions):
+            raise BadAnswers(f"Send one answer for each of the {util.count(len(questions), 'question')}.")
+        src = next((s for s in sources(cfg) if s.name == r["source"]), None)
+        if not src:
+            raise NotSendable(f"{r['source']} is no longer a triage source, so the next refresh drops {r['ref']}.")
+        names = src.by_name()
+        if r["repo"] and repo_name not in ("", r["repo"]):
+            raise BadAnswers(f"Triage settled {r['ref']} on {r['repo']}, not {repo_name}.")
+        repo = names.get(r["repo"] or repo_name)
+        if not repo:
+            raise BadAnswers(f"{repo_name} is not a pipeline repo of {src.name}." if repo_name
+                             else f"Pick the repo {r['ref']} is for, from {', '.join(names)}.")
+        sent_row = {**r, "repo": repo.name, "route": src.route(repo.name)}
+        labels = " and ".join(labels_to_add(sent_row))
+        try:
+            if jev.ready(cfg, [repo]):
+                screened = screen(cfg, src, r, "send injection")
+                if screened is None:
+                    raise NotSendable(f"JEV could not screen {r['ref']} for injected instructions this time. Try again.")
+                if screened.yes >= cfg.jev.injection:
+                    raise NotSendable(f"JEV reads text in {r['ref']} as instructions to an agent (p {screened.yes:.2f}). "
+                                      f"Read the ticket, then add {labels} by hand to send it.")
+            if src.updated_now(r["ref"]) != r["updated"]:
+                raise NotSendable(f"{r['ref']} changed since triage read it, so the next refresh triages it again.")
+        except tracker.ERRORS as e:
+            raise TrackerFailed(f"Could not read {r['ref']} ({tracker_said(e)}).") from e
+        pairs = [(q, a.strip()) for q, a in zip(questions, answers, strict=True) if q != repo_question(r) and a.strip()]
+        if pairs:
+            try:
+                src.comment(r["ref"], answers_comment(pairs))
+            except tracker.ERRORS as e:
+                raise TrackerFailed(f"Could not post your answers to {r['ref']} ({tracker_said(e)}).") from e
+        try:
+            src.approve(sent_row)
+        except tracker.ERRORS as e:
+            if pairs:
+                raise TrackerFailed(f"Posted your answers, but could not add {labels} to {r['ref']} ({tracker_said(e)}). "
+                                    "Add them by hand, or the next refresh triages it again with your answers.") from e
+            raise TrackerFailed(f"Could not add {labels} to {r['ref']} ({tracker_said(e)}).") from e
+        state.triage_approve(sent_row, "owner")
+        state.triage_drop(r["ref"])
+    done = f"posted your answers and added {labels}" if pairs else f"added {labels}"
+    return f"Sent {r['ref']} to the pipeline for {repo.name}: {done}."
 
 
 def preview(srcs: list[TriageSource], read: dict[str, list[Candidate]], old: dict[str, dict],
@@ -528,8 +653,9 @@ def standing(r: dict) -> str:
 def sent(connect=state.db) -> list[dict]:
     out = []
     for a in state.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
-        runs = [r for r in state.ticket_runs(a["repo"], a["ref"], limit=1, connect=connect) if r["started"] >= a["ts"]]
-        out.append({**a, "tracker": "jira", "run": runs[0] if runs else None})
+        issue = a["ref"].rpartition("#")[2] if a["tracker"] == "github" else a["ref"]
+        runs = [r for r in state.ticket_runs(a["repo"], issue, limit=1, connect=connect) if r["started"] >= a["ts"]]
+        out.append({**a, "run": runs[0] if runs else None})
     return out
 
 
@@ -583,10 +709,11 @@ def sent_prs(a: dict) -> list[str]:
 
 def sent_note(a: dict, with_prs: bool = True) -> str:
     run = a.get("run")
+    by_you = a["sent_by"] == "owner"
     if not run:
-        return f"approved {stamp(a['ts'])}, waiting for the pipeline"
+        return f"{'sent by you' if by_you else 'approved'} {stamp(a['ts'])}, waiting for the pipeline"
     prs = sent_prs(a) if with_prs else []
-    return f"pipeline {run['status']}" + (f": {', '.join(prs)}" if prs else "")
+    return ("sent by you, " if by_you else "") + f"pipeline {run['status']}" + (f": {', '.join(prs)}" if prs else "")
 
 
 def verdict(r: dict, reports: dict | None = None) -> str:
@@ -603,7 +730,9 @@ def verdict(r: dict, reports: dict | None = None) -> str:
 
 def summary(v: dict) -> str:
     g = groups(v)
-    return f"{util.count(len(v['rows']), 'open ticket')}: " + ", ".join(f"{len(g[s])} {s.lower()}" for s in STANDINGS)
+    on_board = ", ".join(f"{len(g[s])} {s.lower()}" for s in STANDINGS if s != SENT)
+    return (f"{util.count(len(v['rows']), 'open ticket')}: {on_board}; {len(g[SENT])} sent to the pipeline in the last "
+            f"{SENT_DAYS} days")
 
 
 def auto_note(cfg: config.Config) -> str:
@@ -667,8 +796,10 @@ def ticket(ref: str) -> str | None:
         a = next((a for a in sent() if a["ref"].lower() == want), None) or state.triage_approval(want)
         if not a:
             return None
-        lines = [f"{a['ref']}: {a['title']}", a["url"], f"Sent to the pipeline {stamp(a['ts'])} for `{a['repo']}`.",
-                 sent_note(a) if "run" in a else ""]
+        by = " by you" if a["sent_by"] == "owner" else " by triage"
+        lines = [f"{a['ref']}: {a['title']}", a["url"], f"Sent to the pipeline{by} {stamp(a['ts'])} for `{a['repo']}`."]
+        if "run" in a:
+            lines.append(f"Run: {a['run']['status']} {' '.join(sent_prs(a))}".rstrip() if a["run"] else "Run: none yet")
         lines += ["Assumed:"] + [f"  - {x}" for x in a["assumptions"]] if a["assumptions"] else []
         return "\n".join(x for x in lines if x)
     lines = [f"{r['ref']}: {r['title']}", r["url"], f"{r['source']}, updated {r['updated'] or 'unknown'}"]

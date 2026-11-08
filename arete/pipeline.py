@@ -713,16 +713,24 @@ def triage_notes(approval: dict | None) -> str:
     if not approval:
         return ""
     assumed = "".join(f"\n- {a}" for a in approval["assumptions"]) or "\n- nothing it named"
+    keep = ("Keep an assumption only where the ticket still leaves it open. End `plan` with an \"Assumed\" list of every "
+            "choice the ticket leaves open, these and your own, so the owner can check them in the pull request.")
+    if approval["sent_by"] == "owner":
+        return (f"## Sent by its owner after triage\n\nIts owner sent this ticket to the pipeline from arete's triage "
+                f"board at {approval['ts']}, after reading triage's questions and assumptions. Any answers they gave are "
+                "in the comments, under \"Answers to triage's questions\", and an answer wins over what triage "
+                f"assumed. Triage assumed:{assumed}\n\n{keep}")
     return (f"## Approved by triage, not by a person\n\nArete's triage approved this ticket on its own at "
-            f"{approval['ts']}, so its owner has not read it closely. Triage assumed:{assumed}\n\nKeep an assumption "
-            "only where the ticket still leaves it open. End `plan` with an \"Assumed\" list of every choice the ticket "
-            "leaves open, these and your own, so the owner can check them in the pull request.")
+            f"{approval['ts']}, so its owner has not read it closely. Triage assumed:{assumed}\n\n{keep}")
 
 
 def triage_block(approval: dict | None) -> str:
     if not approval:
         return ""
     assumed = "".join(f"\n- {a}" for a in approval["assumptions"])
+    if approval["sent_by"] == "owner":
+        return (f"## Sent from the triage board\n\nIts owner sent this ticket from arete's triage board. Triage "
+                f"assumed:{assumed}\n\n") if assumed else ""
     return ("## Approved by triage\n\nArete's triage approved this ticket on its own, so check the choices it made"
             + (f". It assumed:{assumed}" if assumed else "; the plan below lists them.") + "\n\n")
 
@@ -733,7 +741,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         t = tk.get(run.tid)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
-    approval = state.triage_approval(t.ref) if repo.tracker == "jira" else None
+    approval = state.triage_approval(t.ref if repo.tracker == "jira" else tracker.ticket_name(repo.name, t.ref))
     if run.feedback:
         closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
         if closed:
@@ -961,7 +969,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
                 + ("" if not opened else draft_note(draft_why, verified)))
-    if not draft_why and layer.trust_level == "automerge" and approval:
+    if not draft_why and layer.trust_level == "automerge" and approval and approval["sent_by"] == "triage":
         run.log("automerge left off: triage approved the ticket, so a person merges it")
     elif not draft_why and layer.trust_level == "automerge":
         risk = jev.risk(staged.patch, f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,

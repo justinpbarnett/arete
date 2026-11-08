@@ -17,6 +17,9 @@ let settingsData = null;
 let chatSeen = "";
 let lastGood = "";
 const openQuestions = new Set();
+const drafts = new Map();
+const sendSaid = new Map();
+const sending = new Set();
 
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
@@ -278,13 +281,89 @@ function triageParts(t) {
 
 function triageFolds(r) {
   const list = (items) => el("ol", { class: "questions" }, items.map((q) => el("li", { text: q })));
+  const answerable = r.send && r.questions.length;
   return [
     r.summary ? el("p", { class: "muted", text: r.summary }) : null,
-    r.questions.length ? fold(`triage:q:${r.ref}`, "Show the questions", list(r.questions)) : null,
+    r.questions.length && !answerable ? fold(`triage:q:${r.ref}`, "Show the questions", list(r.questions)) : null,
     r.assumptions.length ? fold(`triage:a:${r.ref}`, "Show what the build assumes", list(r.assumptions)) : null,
     r.plan.length ? fold(`triage:p:${r.ref}`, "Show the plan", list(r.plan)) : null,
     r.report ? fold(`triage:r:${r.ref}`, "Show the report", el("pre", { class: "fold-text", text: r.report })) : null,
+    answerable ? fold(`triage:q:${r.ref}`, "Answer the questions", sendForm(r)) : r.send ? sendForm(r) : null,
   ];
+}
+
+function draftKey(ref, part) {
+  return `${ref}\n${part}`;
+}
+
+function pickedRepo(r) {
+  return r.send.pick ? drafts.get(draftKey(r.ref, "repo")) || "" : r.repo;
+}
+
+function sendWords(r) {
+  const choice = r.send.choices.find((c) => c.repo === pickedRepo(r));
+  const labels = choice ? `${choice.labels.length === 1 ? "the label" : "the labels"} ${choice.labels.join(" and ")}` : "the labels of the repo you pick";
+  return r.questions.some((q) => q !== r.send.repo_question)
+    ? `Send posts your answers to the ticket as one comment from you, leaving out blank ones. Then it adds ${labels} and starts a poll to build it.`
+    : `Send adds ${labels} to the ticket and starts a poll to build it.`;
+}
+
+function sendForm(r) {
+  const id = (part) => `send:${r.ref}:${part}`;
+  const field = (control, label) => el("div", { class: "field" }, el("label", { for: control.id, text: label }), control);
+  const picker = el("select", { id: id("repo"), "data-focus": id("repo"), on: { change: (e) => {
+    drafts.set(draftKey(r.ref, "repo"), e.target.value);
+    e.target.form.querySelector(".send-about").textContent = sendWords(r);
+  } } }, el("option", { value: "", text: "Pick a repo" }), r.send.choices.map((c) => el("option", { value: c.repo, text: c.repo })));
+  picker.value = pickedRepo(r);
+  const box = (q, i) => el("textarea", { id: id(i), "data-focus": id(i), text: drafts.get(draftKey(r.ref, q)) || "", on: {
+    input: (e) => drafts.set(draftKey(r.ref, q), e.target.value),
+    keydown: (e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.target.form.requestSubmit(),
+  } });
+  const fields = r.questions.map((q, i) => field(r.send.pick && q === r.send.repo_question ? picker : box(q, i), q));
+  if (r.send.pick && !r.send.repo_question) fields.push(field(picker, "The repo to build it in"));
+  const said = sendSaid.get(r.ref);
+  return el("form", { class: "send", "aria-label": `Send ${r.ref} to the pipeline`, on: { submit: (e) => sendTicket(e, r) } },
+    fields,
+    el("p", { class: "muted send-about", text: sendWords(r) }),
+    el("div", { class: "actions" }, el("button", { type: "submit", "data-focus": id("go"), disabled: sending.has(r.ref), text: "Send to the pipeline" })),
+    el("p", { class: "send-said", "aria-live": "polite", hidden: !said }, said ? [stateChip(said[0]), said[0] ? " " : "", said[1]] : null));
+}
+
+function sendSay(form, r, state, sentence) {
+  sendSaid.set(r.ref, [state, sentence]);
+  const line = form.querySelector(".send-said");
+  line.replaceChildren(...[stateChip(state), state ? " " : "", sentence].filter(Boolean));
+  line.hidden = false;
+}
+
+async function sendTicket(event, r) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const repo = pickedRepo(r);
+  if (!repo) {
+    sendSay(form, r, "caution", "Pick the repo it is for first.");
+    return form.querySelector("select").focus();
+  }
+  document.getElementById("triage-result").hidden = true;
+  sending.add(r.ref);
+  form.querySelector("button[type=submit]").disabled = true;
+  sendSay(form, r, null, `Sending ${r.ref}. It screens the ticket and writes to it, so it can take a few seconds.`);
+  try {
+    const answers = r.questions.map((q) => (r.send.pick && q === r.send.repo_question ? "" : drafts.get(draftKey(r.ref, q)) || ""));
+    const done = await call(`/api/triage/${encodeURIComponent(r.ref)}/send`, { questions: r.questions, answers, repo });
+    for (const key of drafts.keys()) if (key.startsWith(draftKey(r.ref, ""))) drafts.delete(key);
+    sendSaid.delete(r.ref);
+    openQuestions.delete(`triage:q:${r.ref}`);
+    say("triage-result", "ok", done.said);
+    document.getElementById("triage-result").focus();
+  } catch (e) {
+    sendSay(form, r, "fault", e.message);
+  } finally {
+    sending.delete(r.ref);
+    form.querySelector("button[type=submit]").disabled = false;
+  }
+  refresh();
 }
 
 function niceMax(value, whole) {
@@ -944,7 +1023,10 @@ const LOADERS = {
     drawFleet(loops, fleet.devices);
   },
   health: async () => drawHealth(await call("/api/state")),
-  triage: async () => drawTriage(await call("/api/state")),
+  triage: async () => {
+    const snapshot = await call("/api/state");
+    if (!sending.size && !document.activeElement?.closest("#triage form")) drawTriage(snapshot);
+  },
   trends: async () => {
     trendsData = await call("/api/trends");
     costData = trendsData.rows ? await call(`/api/costs?days=${trendsData.rows.days.length}`) : null;

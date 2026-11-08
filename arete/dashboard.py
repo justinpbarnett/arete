@@ -27,6 +27,7 @@ from . import (
     paths,
     sessions,
     settings,
+    triage,
     util,
 )
 
@@ -52,6 +53,7 @@ RUN_PATH = "/api/runs/"
 APPROVAL_PATH = "/api/approvals/"
 SESSION_PATH = "/api/sessions/"
 DEVICE_PATH = "/api/devices/"
+TRIAGE_PATH = "/api/triage/"
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
@@ -136,7 +138,8 @@ class Refusal(Exception):
 
 STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
-                     devices.DeviceError: 400}
+                     devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
+                     triage.TrackerFailed: 502}
 
 
 def refusal_status(e: Exception) -> int | None:
@@ -252,6 +255,10 @@ class Handler(BaseHTTPRequestHandler):
                 name, action = last_part(path, DEVICE_PATH)
                 if action == "probe":
                     return devices.probe(name)
+            if path.startswith(TRIAGE_PATH):
+                ref, action = last_part(path, TRIAGE_PATH)
+                if action == "send":
+                    return self.send_ticket(ref)
         raise Refusal(404, f"Nothing at {method} {path}.")
 
     def loop_action(self, name: str, action: str):
@@ -272,6 +279,14 @@ class Handler(BaseHTTPRequestHandler):
         return sessions.launch(str(b.get("prompt", "")), device=str(b.get("device") or ""),
                                model=str(b.get("model") or ""), run_with=str(b.get("runner") or ""), tools=tools,
                                repo=str(b.get("repo") or ""), budget_usd=None if budget in (None, "") else float(budget))
+
+    def send_ticket(self, ref: str) -> dict:
+        b = self.body()
+        questions, answers = b.get("questions"), b.get("answers")
+        if not all(isinstance(x, list) and all(isinstance(t, str) for t in x) for x in (questions, answers)):
+            raise Refusal(400, "Questions and answers take lists of text.")
+        said = triage.send(config.load(), ref, questions, answers, str(b.get("repo") or ""))
+        return {"ref": ref, "said": f"{said} {start_poll()}"}
 
     def chat_text(self) -> str:
         text = str(self.body().get("text", "")).strip()
@@ -331,6 +346,18 @@ class Server(ThreadingHTTPServer):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
         self.node, self.logins = node, logins
         super().__init__((address, port), Handler)
+
+
+def start_poll() -> str:
+    try:
+        if not control.find_loop("poll").enabled:
+            return "The poll loop is off, so it builds once you turn poll on."
+        engine.launch("poll")
+    except control.Busy:
+        return "A poll is running now, so the next one picks it up."
+    except Exception as e:  # the ticket is already sent, so a poll that cannot start must not fail the send
+        return f"The poll did not start: {util.first_line(str(e), 200)}."
+    return "Started a poll to build it."
 
 
 def open_servers(node: Node, port: int, logins: Logins) -> list[Server]:

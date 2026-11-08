@@ -136,17 +136,18 @@ def alerts() -> dict:
 
 def triage_board() -> dict:
     v = triage.view(connect=state.reader)
+    srcs = {s.name: s for s in triage.sources(config.load())}
     meta = util.read_json(triage.META_FILE, {})
     return {
         "refreshed": meta.get("refreshed", ""), "posted": meta.get("posted", ""), "errors": meta.get("errors", []),
         "approved": meta.get("approved", []), "held": meta.get("held", {}),
         "summary": triage.summary(v),
-        "groups": [{"standing": name, "rows": [triage_entry(r, v, name) for r in members]}
+        "groups": [{"standing": name, "rows": [triage_entry(r, v, name, srcs) for r in members]}
                    for name, members in triage.groups(v).items()],
     }
 
 
-def triage_entry(r: dict, v: dict, standing: str) -> dict:
+def triage_entry(r: dict, v: dict, standing: str, srcs: dict[str, triage.TriageSource]) -> dict:
     report = v["research"].get(r["ref"]) if standing == triage.RESEARCH_WORK else None
     if report and report.get("answered_by"):
         report = v["research"].get(report["answered_by"])
@@ -155,7 +156,17 @@ def triage_entry(r: dict, v: dict, standing: str) -> dict:
             "verdict": triage.sent_note(r, False) if standing == triage.SENT else triage.verdict(r, v["research"]),
             "prs": " ".join(triage.sent_prs(r)) if standing == triage.SENT else "",
             "questions": r.get("questions") or [], "assumptions": r["assumptions"] or [], "plan": r["plan"] or [],
-            "summary": report["summary"] if report else "", "report": report["report"] if report else ""}
+            "summary": report["summary"] if report else "", "report": report["report"] if report else "",
+            "send": send_form(r, srcs.get(r.get("source", ""))) if standing in triage.SENDABLE else None}
+
+
+def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:
+    names = list(src.by_name()) if src else []
+    choices = [n for n in ([r["repo"]] if r["repo"] else names) if n in names]
+    if not choices:
+        return None
+    return {"pick": not r["repo"], "repo_question": triage.repo_question(r),
+            "choices": [{"repo": n, "labels": triage.labels_to_add({"route": src.route(n)})} for n in choices]}
 
 
 def proposals() -> dict:

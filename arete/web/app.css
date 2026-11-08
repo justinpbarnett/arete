@@ -59,3 +59,13 @@ th.c-loop { min-width: 250px; }
 #launch-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0 18px; }
 th.c-device { min-width: 220px; }
 #triage > p:first-child { margin-top: 30px; }
+#triage-result { margin-top: 30px; }
+#triage-result:not([hidden]) + #triage > p:first-child { margin-top: 0; }
+form.send { margin: 8px 0 0; max-width: 72ch; }
+form.send .field > label { font-family: var(--read); text-transform: none; letter-spacing: 0; font-size: inherit; color: var(--ink); }
+form.send .actions { margin: 4px 0 8px; }
+form.send p { margin: 0 0 8px; }
+@media (max-width: 751px) {
+  #triage th.c-ref { width: 84px; }
+  #triage .wide > table { min-width: calc(100% + 250px); }
+}
