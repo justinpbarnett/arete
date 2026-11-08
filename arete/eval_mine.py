@@ -169,13 +169,28 @@ def graded_on(cfg: config.Config, parent: EvalRun, where: str, layer: config.Rep
     return graded
 
 
+def commit_lines(repo: Path, args: list[str]) -> list[str]:
+    return git(["log", "--format=%at %ae %s", *args, "--"], repo, check=False).splitlines()
+
+
+def commits_landed(repo: Path, merge: str, branch: str) -> int:
+    if not branch:
+        return 1
+    for ref in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}"):
+        own = commit_lines(repo, [f"{merge}..{ref}"])
+        if len(own) > 1 and commit_lines(repo, ["--first-parent", "-n", str(len(own)), merge]) == own:
+            return len(own)
+    return 1
+
+
 def mine_one(cfg: config.Config, run: EvalRun, c: Candidate) -> Outcome:
     run.dir.mkdir(parents=True, exist_ok=True)
     merge = (gh.pr_view(c.pr_url).get("mergeCommit") or {}).get("oid") or ""
     if not merge:
         return Outcome("skipped", "GitHub gives no merge commit for it")
     fetch_origin(c.repo)
-    base = git(["rev-parse", f"{merge}^1"], c.repo.path).strip()
+    back = commits_landed(c.repo.path, merge, c.run["branch"] or "")
+    base = git(["rev-parse", f"{merge}~{back}"], c.repo.path).strip()
     ticket = tracker.for_repo(cfg, c.repo).get(str(c.run["issue"]))
     wt = paths.WORKTREES_DIR / f"mine-{c.repo.name}-{run.task}"
     try:
