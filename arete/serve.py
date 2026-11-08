@@ -60,6 +60,11 @@ def reap_children() -> None:
         pass
 
 
+def child_pids() -> set[int]:
+    found = util.sh(["pgrep", "-P", str(os.getpid())], timeout=10)
+    return {int(p) for p in found.stdout.split()} if found.returncode == 0 else set()
+
+
 def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     last = util.parse_iso(last_fire)
     if loop.trigger.every:
@@ -77,7 +82,9 @@ class Server:
         self.waiting: dict[int, str] = {}
         self.restarted: Counter[int] = Counter()
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
-        self.loaded = os.environ.pop(RESTARTED_FOR_NEW_CODE, "") == "1"
+        restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
+        self.loaded = restarted_with is not None
+        self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
         self.pruned = 0.0
         self.ticks = 0
         self.code = self.code_seen = code_stamp()
@@ -222,9 +229,16 @@ class Server:
         state.take_queue_item(item["id"], None)
         self.say(f"{item['loop']}: queue item {item['id']} goes back in the queue, {why}")
 
+    def reap_inherited(self) -> None:
+        for pid in list(self.inherited):
+            try:
+                ended = os.waitpid(pid, os.WNOHANG)[0]
+            except ChildProcessError:
+                ended = pid
+            if ended:
+                self.inherited.discard(pid)
+
     def busy_with(self) -> str:
-        if running := state.runs_marked_running():
-            return f"{util.count(len(running), 'run')} still running"
         if sum(not f.done() for f in self.polls.values()):
             return "a source poll is still running"
         if dashboard.POSTS_IN_FLIGHT.count:
@@ -247,8 +261,10 @@ class Server:
                            + util.last_line(check.stderr or check.stdout, 300))
             return
         reap_children()
-        self.say(f"new code: serve {os.getpid()} restarts itself")
-        os.environ[RESTARTED_FOR_NEW_CODE] = "1"
+        still_running = child_pids()
+        self.say(f"new code: serve {os.getpid()} restarts itself" + (
+            f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
+        os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
         os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
 
     def note_once(self, text: str) -> None:
@@ -273,8 +289,9 @@ def run(with_dashboard: bool = True) -> NoReturn:
     while True:
         started = time.monotonic()
         try:
-            server.tick()
             server.load_new_code()
+            server.tick()
+            server.reap_inherited()
         except Exception as e:
             server.say(f"tick failed: {type(e).__name__}: {e}")
         time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))
