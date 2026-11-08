@@ -65,7 +65,8 @@ def clear_alert(repo: str, key: str, dry_run: bool = False) -> str | None:
     if repo and prev.get("issue"):
         try:
             gh.issue_close(repo, prev["issue"], f"Recovered at {util.iso()}.")
-        except gh.GhError:
-            pass
+        except gh.GhError as e:
+            if "Could not resolve to an issue" not in str(e):
+                return f"gh failed closing #{prev['issue']} for {key} ({e}); retrying next pass"
     state.alert_clear(key)
     return f"cleared {key}"
