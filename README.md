@@ -42,6 +42,8 @@ An emit that changes something outside arete, a ticket, a PR or a push, can wait
 
 A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing.
 
+Arete runs pi with a pi folder of its own, `~/.local/share/arete/pi-agent/`. It links `models.json` and `settings.json` from `~/.pi/agent/` and holds no logins. Keys for pi's providers go in `~/.config/arete/pi.env` as `NAME=value` lines, such as `OPENROUTER_API_KEY=...`. A loop then spends on a key you give arete, such as one with a weekly limit, and never on your own pi logins. A provider with no key there falls back to a key set in arete's own environment, and fails the step when there is none; the launchd serve sets no keys. A device other than `local` runs its own pi with its own logins.
+
 `~/.config/arete/devices.toml` lists the machines loops and sessions run on, besides `local`:
 
 ```toml
@@ -78,6 +80,7 @@ A laptop sleeps and drops its network. When poll, triage or the heartbeat start 
 - Config: `~/.config/arete/config.toml` (`arete init` writes a starting one)
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
+- Provider keys for pi: `~/.config/arete/pi.env`, mode 600
 - State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
 - Logs: `~/Library/Logs/arete/`

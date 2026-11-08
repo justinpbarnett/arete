@@ -23,6 +23,9 @@ TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": 
 WRITING = {"edit", "write", "bash"}
 SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 PI_HOME = paths.HOME / ".pi"
+AGENT_DIR = paths.STATE_DIR / "pi-agent"
+KEYS_FILE = paths.CONFIG_DIR / "pi.env"
+SHARED_SETTINGS = ("models.json", "settings.json")
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
 RESTATE = ("An agent finished a task but did not write its answer as the JSON it was asked for. Below is how its run "
@@ -55,12 +58,25 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
     return names
 
 
+def agent_dir() -> Path:
+    AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    for name in SHARED_SETTINGS:
+        link, source = AGENT_DIR / name, PI_HOME / "agent" / name
+        if source.exists() and not link.is_symlink():
+            link.unlink(missing_ok=True)
+            try:
+                link.symlink_to(source)
+            except FileExistsError:
+                pass
+    return AGENT_DIR
+
+
 def can_confine(remote: bool) -> bool:
     return not remote and sys.platform == "darwin" and bool(shutil.which("sandbox-exec"))
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path]) -> list[str]:
-    roots = [cwd, *add_dirs, PI_HOME, SESSIONS_DIR]
+    roots = [cwd, *add_dirs, AGENT_DIR, SESSIONS_DIR]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
     allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
     profile = f'(version 1)(allow default)(deny file-write* (subpath "/"))(allow file-write* {allow})'
@@ -121,6 +137,9 @@ def run(
 
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
     env["ARETE_AGENT"] = "1"
+    if not remote:
+        env |= util.read_env_file(KEYS_FILE)
+        env["PI_CODING_AGENT_DIR"] = str(agent_dir())
     cmd = [*cmd, "--", prompt]
     if remote:
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir,))

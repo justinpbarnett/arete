@@ -24,22 +24,8 @@ class JiraError(RuntimeError):
     pass
 
 
-def read_env_file(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
-    if not path.exists():
-        return out
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        k, sep, v = line.removeprefix("export ").partition("=")
-        if sep:
-            out[k.strip()] = v.strip().strip('"').strip("'")
-    return out
-
-
 def credentials(env_file: Path | None) -> tuple[str, str, str]:
-    from_file = read_env_file(env_file) if env_file else {}
+    from_file = util.read_env_file(env_file) if env_file else {}
     vals = [os.environ.get(k) or from_file.get(k, "") for k in ENV_KEYS]
     missing = [k for k, v in zip(ENV_KEYS, vals) if not v]
     if missing:

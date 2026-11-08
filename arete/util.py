@@ -270,6 +270,20 @@ def lock_is_held(name: str) -> bool:
         return False
 
 
+def read_env_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, sep, v = line.removeprefix("export ").partition("=")
+        if sep:
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
 def read_json(p: Path, default):
     try:
         return json.loads(p.read_text())
