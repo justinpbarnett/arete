@@ -106,9 +106,9 @@ class Logins:
 
     def of(self, address: str) -> str:
         with self.guard:
-            at, login = self.seen.get(address, (0.0, ""))
-        if time.monotonic() - at < WHOIS_SECONDS:
-            return login
+            seen = self.seen.get(address)
+        if seen and time.monotonic() - seen[0] < WHOIS_SECONDS:
+            return seen[1]
         login = (tailscale("whois", "--json", address).get("UserProfile") or {}).get("LoginName", "")
         with self.guard:
             self.seen[address] = (time.monotonic(), login)
