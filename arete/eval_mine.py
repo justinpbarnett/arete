@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -198,9 +199,9 @@ def mine_one(cfg: config.Config, run: EvalRun, c: Candidate) -> Outcome:
         shutil.rmtree(wt, ignore_errors=True)
 
 
-def free_name(evals_dir: Path, name: str) -> str:
+def free_name(name: str, taken: Callable[[str], bool]) -> str:
     n, found = 1, name
-    while (evals_dir / f"{found}.toml").exists():
+    while taken(found):
         n += 1
         found = f"{name}-{n}"
     return found
@@ -214,10 +215,11 @@ def read_back(src: DirSource, under: str, name: str, draft: Draft) -> None:
 
 def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_merge: verify.Verified,
          on_base: verify.Verified) -> str:
-    name = free_name(c.layer.evals_dir, slug(f"{ticket.ref} {draft.title}"))
+    wanted = slug(f"{ticket.ref} {draft.title}")
     summary = (f"An eval task mined from {c.pr_url} ({c.name}). The grader passed its steps on the merge commit and "
                f"failed them on the base `{draft.base[:10]}`.")
     if c.repo.layer:
+        name = free_name(wanted, lambda n: (c.layer.evals_dir / f"{n}.toml").exists())
         f = c.layer.evals_dir / f"{name}.toml"
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(draft.toml)
@@ -226,6 +228,9 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
         run.log(f"saved {paths.short_path(f)}")
         return paths.short_path(f)
     base = gh.default_branch(c.repo.github)
+    merged = set(Source(c.repo, f"origin/{base}").files(EVALS))
+    pushed = set(git(["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/arete"], c.repo.path).split())
+    name = free_name(wanted, lambda n: f"{EVALS}/{n}.toml" in merged or f"arete/evals-{n}" in pushed)
     branch = f"arete/evals-{name}"
     wt = make_worktree(c.repo, base, branch, f"evals-{name}")
     try:
