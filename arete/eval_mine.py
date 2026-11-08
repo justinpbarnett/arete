@@ -77,7 +77,7 @@ class Draft:
     @property
     def toml(self) -> str:
         fields = {"title": self.title, "source": self.source, "base": self.base}
-        lines = [f"{k} = {json.dumps(v, ensure_ascii=False)}" for k, v in fields.items()]
+        lines = [f"{k} = {toml_string(v)}" for k, v in fields.items()]
         return "\n".join(lines + [f"prompt = {toml_text(self.prompt)}", f"verify = {toml_text(self.verify)}", ""])
 
     def matches(self, task) -> bool:
@@ -85,9 +85,13 @@ class Draft:
                 == (self.title, self.prompt, self.verify, self.base, self.source))
 
 
+def toml_string(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
 def toml_text(text: str) -> str:
-    if "'''" in text or any(ord(ch) < 32 and ch not in "\t\n" for ch in text):
-        return json.dumps(text, ensure_ascii=False)
+    if "'''" in text or any(ch == "\x7f" or ord(ch) < 32 and ch not in "\t\n" for ch in text):
+        return toml_string(text)
     return f"'''\n{text}\n'''"
 
 
