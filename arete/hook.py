@@ -27,9 +27,9 @@ EDIT_CLASSES = [
     ("permission_denied", r"permission"),
 ]
 STOP_CLASSES = [
-    ("rate_limit", r"rate.?limit|429|usage limit"),
-    ("auth", r"auth|401|403|unauthori[sz]ed|forbidden|login"),
-    ("overloaded", r"overload|capacity|529"),
+    ("rate_limit", r"rate.?limit|\b429\b|usage limit"),
+    ("auth", r"auth|\b40[13]\b|unauthori[sz]ed|forbidden|login"),
+    ("overloaded", r"overload|capacity|\b529\b"),
     ("timeout", r"timeout|timed out"),
     ("context", r"context|too long|prompt is too long"),
 ]
