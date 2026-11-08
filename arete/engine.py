@@ -653,9 +653,18 @@ def commit(wt: Path, message: str) -> None:
     util.git([*identity, "commit", "-q", "--no-verify", "-m", message], wt)
 
 
+def shell_result(run: LoopRun, command: str, wt: Path) -> subprocess.CompletedProcess:
+    return util.sh(command, cwd=wt, timeout=run.loop.timeout_minutes * 60, env=loops.check_env(run.loop, run.id))
+
+
 def shell(run: LoopRun, command: str, wt: Path) -> tuple[int, str]:
-    res = util.sh(command, cwd=wt, timeout=run.loop.timeout_minutes * 60, env=loops.check_env(run.loop, run.id))
+    res = shell_result(run, command, wt)
     return res.returncode, (res.stdout or "") + (res.stderr or "")
+
+
+def measured_number(res: subprocess.CompletedProcess) -> float | None:
+    on_stdout = last_number(res.stdout)
+    return on_stdout if on_stdout is not None else last_number(res.stderr)
 
 
 def attempt_prompt(run: LoopRun, goal: str, history: list[str], files: list[str]) -> str:
@@ -711,8 +720,8 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
     files = loops.as_list(spec.get("files"))
 
     def measure(wt: Path) -> float | None:
-        code, text = shell(run, spec["measure"], wt)
-        return last_number(text) if code == 0 else None
+        res = shell_result(run, spec["measure"], wt)
+        return measured_number(res) if res.returncode == 0 else None
 
     ws = open_workspace(run)
     kept, stopped = False, ""
