@@ -7,7 +7,7 @@ import sys
 from collections import Counter, defaultdict
 from datetime import timedelta
 
-from . import config, devices, emits, loops, paths, record, sources, state, util
+from . import config, devices, emits, hooks, loops, paths, record, sources, state, util
 from .loops import Loop
 
 BEAT_FILE = paths.STATE_DIR / "serve.json"
@@ -44,6 +44,13 @@ def find_loop(name: str, cfg: config.Config | None = None) -> Loop:
         return loops.find(name, cfg)
     except loops.LoopError as e:
         raise NotFound(str(e)) from e
+
+
+def working_loop(name: str, cfg: config.Config | None = None) -> Loop:
+    loop = find_loop(name, cfg)
+    if loop.error:
+        raise Refused(f"{loop.name} is broken: {loop.error}")
+    return loop
 
 
 def stop_run(run_id: str) -> dict:
@@ -113,12 +120,12 @@ def loop_detail(name: str) -> dict:
             "findings": state.findings(loop.name, 40),
             "waiting": [i for i in state.pending() if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors() if c["source"] in source_ids],
-            "webhook_path": f"/hook/{loop.name}" if loop.trigger.webhook else "",
+            "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "digests": digests(loop), "metrics": loop_metrics(loop)}
 
 
 def digests(loop: Loop) -> list[dict]:
-    folder = emits.DIGESTS_DIR / loop.name.replace("/", ".")
+    folder = emits.digest_folder(loop.name)
     files = sorted(folder.glob("*.md"), reverse=True)[:DIGEST_DAYS] if folder.is_dir() else []
     return [{"day": f.stem, "text": f.read_text()[-DIGEST_CHARS:]} for f in files]
 
@@ -133,9 +140,7 @@ def loop_metrics(loop: Loop) -> list[dict]:
 
 
 def switch(name: str, enabled: bool) -> dict:
-    loop = find_loop(name)
-    if loop.error and enabled:
-        raise Refused(f"{name} is broken: {loop.error}")
+    loop = working_loop(name) if enabled else find_loop(name)
     loops.set_enabled(loop, enabled)
     return {"name": loop.name, "enabled": enabled}
 
@@ -163,7 +168,8 @@ def fleet() -> list[dict]:
         return [{**devices.LOCAL.view(), "probe": None, "error": str(e)}]
 
 
-def costs(days: float = COST_DAYS) -> dict:
+def costs(days: float | None = None) -> dict:
+    days = COST_DAYS if days is None else days
     since = util.iso(util.now() - timedelta(days=days))
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0

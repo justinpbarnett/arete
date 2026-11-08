@@ -34,7 +34,7 @@ arete loop enable NAME
 
 Every run of every kind, pipeline, loop, session, chat and draft, is a row in one runs table with its trigger, model, runner, device, cost and tokens. Each model call is a step under its run. A run's live feed holds its steps, the tools the agent calls, and a command loop's output as it prints.
 
-An emit that changes something outside arete, a ticket or a PR, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it. A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
+An emit that changes something outside arete, a ticket or a PR, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it. A delivery that fails stays listed with its error, and approving it again tries the delivery again. A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
 
 ## Runners, devices and sessions
 
@@ -322,7 +322,7 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 `arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone. It listens only on the machine's tailnet addresses. A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 
 - Live: the runs going now, with their start time, the last log line and the cost so far; the labeled tickets the pipeline skips; the tickets waiting on review comments; and the last 25 runs of every kind. A run's log opens below the table.
-- Loops: what waits for your approval, with Approve and Reject; then every loop with its switch, kind, trigger, last run, next fire and spend in the last 24 hours, and a broken loop with what is wrong. Open shows a loop's facts, runs, findings, sources, memory, digests and metrics. Start runs it now and follows its live feed, where Stop ends the run.
+- Loops: what waits for your approval, with Approve and Reject, and a failed delivery with its error and Try again; then every loop with its switch, kind, trigger, last run, next fire and spend in the last 24 hours, and a broken loop with what is wrong. Open shows a loop's facts, runs, findings, sources, memory, digests and metrics. Start runs it now and follows its live feed, where Stop ends the run.
 - Launch: start a session on a device, model, runner, tool set, repo and budget, then talk to it and follow its feed.
 - Fleet: serve's beat, and each device with its last probe and tools; Probe checks one again.
 - Health: the heartbeat checks, the probes, the loops that report on their own, and the open alerts.

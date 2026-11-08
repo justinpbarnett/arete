@@ -1548,18 +1548,9 @@ def record_feedback(r: dict, urls: list[str], prs: list[dict], seen: dict, fresh
             print(f"{util.iso()} {url}: {util.count(added, 'new comment')} from you")
 
 
-def reads_pr_comments(r: dict) -> bool:
-    if not r.get("pr_url"):
-        return False
-    rejected_lately = r["status"] == "rejected" and (r.get("finished") or "") >= util.iso(util.now() - REJECTED_PR_LISTEN)
-    return state.has_open_pr(r) or rejected_lately
-
-
 def sync_outcomes(cfg: config.Config) -> None:
     seen, fresh = util.read_json(PR_SEEN_FILE, {}), {}
-    for r in state.runs(kind="pipeline", limit=200):
-        if not reads_pr_comments(r):
-            continue
+    for r in state.runs_reading_pr_comments(util.iso(util.now() - REJECTED_PR_LISTEN)):
         urls = r["pr_url"].split()
         try:
             prs = [gh.pr_view(url) for url in urls]

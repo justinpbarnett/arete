@@ -20,6 +20,10 @@ class HookRefused(Exception):
         self.status = status
 
 
+def hook_path(name: str) -> str:
+    return HOOK_PATH + name
+
+
 def secret_file(name: str):
     return HOOKS_DIR / f"{name.replace('/', '.')}.secret"
 

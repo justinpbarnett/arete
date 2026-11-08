@@ -202,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/sessions":
                 return {"sessions": sessions.views(), "choices": sessions.choices()}
             if path == "/api/costs":
-                return control.costs(float(whole_number(query.get("days", str(control.COST_DAYS))) or 1))
+                return control.costs(float(whole_number(query["days"]) or 1) if "days" in query else None)
         if method == "POST":
             if path == "/api/settings":
                 return settings.save(self.body())

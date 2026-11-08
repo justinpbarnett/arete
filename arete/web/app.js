@@ -604,9 +604,11 @@ function serveLine(serve) {
 function approvalRow(a) {
   return el("tr", {},
     cell(a.loop, "nb"),
-    cell([a.what, a.detail ? fold(`approval:${a.id}`, "Show the body", el("pre", { class: "fold-text", text: a.detail })) : null]),
+    cell([a.what,
+      a.failed ? el("div", {}, stateChip("fault"), ` Delivery failed: ${a.failed}`) : null,
+      a.detail ? fold(`approval:${a.id}`, "Show the body", el("pre", { class: "fold-text", text: a.detail })) : null]),
     cell(clock(a.created)),
-    cell([button("Approve", `approve:${a.id}`, (b) => decide(a.id, true, b)), " ",
+    cell([button(a.failed ? "Try again" : "Approve", `approve:${a.id}`, (b) => decide(a.id, true, b)), " ",
       button("Reject", `reject:${a.id}`, (b) => decide(a.id, false, b))], "nb"));
 }
 

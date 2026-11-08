@@ -569,6 +569,9 @@ def cmd_approve(args) -> int:
             pending = emits.waiting()
             for a in pending:
                 print(f"#{a['id']:<4} {a['loop']:<20} {when(a['created'])}  {a['what']}"[:240])
+                if a["failed"]:
+                    print(f"      delivery failed: {a['failed']}"[:240])
+                    print(f"      `arete approve {a['id']}` tries again, `--reject` drops it")
             if not pending:
                 print("nothing waiting for approval")
             return 0
@@ -592,7 +595,7 @@ def cmd_webhook(args) -> int:
     key = hooks.secret(loop.name)
     node = dashboard.this_node(config.load().dashboard_owner)
     host = node.addresses[0] if node else "<this machine's tailnet address>"
-    print(f"POST http://{host}:{config.load().dashboard_port}{hooks.HOOK_PATH}{loop.name}")
+    print(f"POST http://{host}:{config.load().dashboard_port}{hooks.hook_path(loop.name)}")
     print(f"X-Arete-Token: {key}")
     print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
     return 0
@@ -602,7 +605,7 @@ def cmd_costs(args) -> int:
     from . import control
 
     c = control.costs(args.days)
-    print(f"${c['total_usd']:.2f} in the last {args.days:g} days")
+    print(f"${c['total_usd']:.2f} in the last {c['days']:g} days")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
         for row in c[f"by_{group}"][:12]:
@@ -610,7 +613,6 @@ def cmd_costs(args) -> int:
             print(f"  {row['name']:<36} ${row['cost_usd']:>8.2f}  {row['steps']:>5} {steps}  "
                   f"{row['tokens_in']:>10,} in  {row['tokens_out']:>9,} out")
     return 0
-
 
 
 def cmd_loop_args(args) -> int:
@@ -722,7 +724,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--attach", action="store_true", help="start: follow it at once")
     p.set_defaults(fn=cmd_session_args)
 
-    p = sub.add_parser("approve", help="list emits waiting for approval, or approve one by id")
+    p = sub.add_parser("approve", help="list emits waiting for approval, or approve one by id; "
+                                       "approving a failed one tries the delivery again")
     p.add_argument("id", type=int, nargs="?", default=None)
     p.add_argument("--reject", action="store_true")
     p.set_defaults(fn=cmd_approve)
@@ -733,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_webhook)
 
     p = sub.add_parser("costs", help="model spend by model, runner and loop")
-    p.add_argument("--days", type=float, default=7)
+    p.add_argument("--days", type=float, default=None)
     p.set_defaults(fn=cmd_costs)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")

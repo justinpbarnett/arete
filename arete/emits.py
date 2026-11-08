@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 from . import alerts, config, gh, paths, sources, state, util
-from .loops import Loop
+from .loops import Loop, as_list, worktree_kinds
 
 DIGESTS_DIR = paths.STATE_DIR / "digests"
 SEVERITIES = ("low", "medium", "high", "critical")
@@ -27,6 +27,10 @@ FINDING_SCHEMA = {
     },
     "required": ["title", "summary", "fingerprint"],
 }
+
+
+def digest_folder(loop_name: str) -> Path:
+    return DIGESTS_DIR / loop_name.replace("/", ".")
 
 
 def plain(text, n: int) -> str:
@@ -56,6 +60,9 @@ class Failed(RuntimeError):
 
 
 class Emit:
+    def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        return []
+
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [findings] if findings or outcome.get("branch") else []
 
@@ -76,6 +83,9 @@ class Emit:
 
 
 class Ticket(Emit):
+    def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        return sources.repo_problems(cfg, [spec.get("repo", "")], "ticket emit")
+
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [[f] for f in findings]
 
@@ -83,7 +93,7 @@ class Ticket(Emit):
         f = findings[0]
         return {"repo": spec["repo"], "title": plain(spec.get("prefix", "") + f["title"], 120),
                 "body": ticket_body(loop, run_id, f, outcome.get("trust", "")),
-                "labels": list(spec.get("labels", ["agent"]))}
+                "labels": as_list(spec.get("labels", ["agent"]))}
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         repo = sources.github_name(cfg, item["repo"])
@@ -102,6 +112,13 @@ class Ticket(Emit):
 
 
 class PullRequest(Emit):
+    def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        if loop.kind not in worktree_kinds():
+            return [f"only {' and '.join(worktree_kinds())} loops emit a pr"]
+        if loop.repo and not loop.work_repo(cfg).github:
+            return [f"a pr emit needs a GitHub repo; '{loop.repo}' has no github in the config or GitHub remote"]
+        return []
+
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [findings] if outcome.get("branch") else []
 
@@ -113,7 +130,7 @@ class PullRequest(Emit):
         return {"repo": outcome.get("github", ""), "branch": outcome.get("branch", ""), "base": outcome.get("base", ""),
                 "workdir": outcome.get("workdir", ""), "title": plain(spec.get("title") or title, 120),
                 "body": gh.marked(f"Made by the `{loop.name}` loop, run `{run_id}`.\n\n{plain(told, 6000)}"),
-                "draft": bool(spec.get("draft", True)), "labels": list(spec.get("labels", []))}
+                "draft": bool(spec.get("draft", True)), "labels": as_list(spec.get("labels"))}
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         util.git(["push", "-u", "origin", item["branch"]], Path(item["workdir"]), timeout=300)
@@ -138,7 +155,7 @@ class Digest(Emit):
                   + (f" [{plain(f.get('location'), 200)}]" if f.get("location") else "") for f in findings]
         if outcome.get("summary"):
             lines.append(f"- {plain(outcome['summary'], 600)}")
-        return {"file": str(DIGESTS_DIR / loop.name.replace("/", ".") / f"{util.now().astimezone():%Y-%m-%d}.md"),
+        return {"file": str(digest_folder(loop.name) / f"{util.now().astimezone():%Y-%m-%d}.md"),
                 "text": "\n".join(lines) + "\n\n"}
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
@@ -169,6 +186,9 @@ class Notify(Emit):
 
 
 class Metric(Emit):
+    def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        return [] if spec.get("name") else ["a metric emit needs name"]
+
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [findings]
 
@@ -217,6 +237,7 @@ def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -
 
 def waiting() -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "what": a["summary"],
+             "failed": a["result"] if a["status"] == "failed" else "",
              "detail": EMITS[a["emit"]["type"]].detail(a["emit"]["item"])} for a in state.approvals()]
 
 

@@ -231,9 +231,7 @@ class NeverBegan(control.Refused):
 def launch(name: str, *, item: int | None = None, events: list[dict] | None = None, trial: bool = False,
            detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
     cfg = cfg or config.load()
-    loop = control.find_loop(name, cfg)
-    if loop.error:
-        raise control.Refused(f"{loop.name} is broken: {loop.error}")
+    loop = control.working_loop(name, cfg)
     fire = state.queue_item(item) if item else None
     if item and not fire:
         raise control.NotFound(f"queue item {item} is gone")
@@ -294,7 +292,7 @@ def carry(run: LoopRun) -> str:
     try:
         signal.signal(signal.SIGTERM, stop_on_term)
         with devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device:
-            status, summary = KINDS[run.loop.kind](run)
+            status, summary = loops.KINDS[run.loop.kind].run(run)
     except OverBudget as e:
         status, summary = "skipped", f"budget: {e}"
     except Stopped:
@@ -343,6 +341,7 @@ def reports(row: dict) -> bool:
     return bool(row.get("title") and row.get("fingerprint")) or isinstance(row.get("value"), int | float)
 
 
+@loops.runs_kind("command")
 def command_loop(run: LoopRun) -> tuple[str, str]:
     loop = run.loop
     env = {"ARETE_RUN_ID": run.id, "ARETE_LOOP": loop.name, "ARETE_LOOP_DIR": str(loop.dir),
@@ -444,6 +443,7 @@ def watch_prompt(run: LoopRun, events: list[dict], memory: dict) -> str:
     return "\n\n".join(parts)
 
 
+@loops.runs_kind("watch")
 def watch_loop(run: LoopRun) -> tuple[str, str]:
     loop = run.loop
     events = watch_input(run)
@@ -546,8 +546,9 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     return idea, ""
 
 
+@loops.runs_kind("climb")
 def climb_loop(run: LoopRun) -> tuple[str, str]:
-    spec = run.loop.climb
+    spec = run.loop.spec
     higher = str(spec.get("goal", "max")).lower() not in ("min", "lower", "down")
     files = loops.as_list(spec.get("files"))
 
@@ -565,7 +566,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         run.log("measure", f"baseline {baseline:g}")
         goal = (f"Make `{spec['measure']}` print a {'higher' if higher else 'lower'} number. It prints "
                 f"{baseline:g} now.")
-        for i in range(1, int(spec.get("iterations", 5)) + 1):
+        for i in range(1, run.loop.tries + 1):
             try:
                 idea, why_not = try_once(run, ws, i, goal + f" Best so far: {best:g}.", history, files)
             except OverBudget as e:
@@ -600,8 +601,9 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         close_workspace(ws, keep_branch=kept and not run.trial)
 
 
+@loops.runs_kind("search")
 def search_loop(run: LoopRun) -> tuple[str, str]:
-    spec = run.loop.search
+    spec = run.loop.spec
     files = loops.as_list(spec.get("files"))
     ws = open_workspace(run)
     hit = False
@@ -611,7 +613,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             return "done", f"`{spec['check']}` already passes on {ws.base}"
         history = [f"- base: exit {code}: {util.last_line(text, 300)}"]
         goal = f"Make `{spec['check']}` exit 0. It exits {code} now, ending with:\n\n```\n{util.tail(text, 1500)}\n```"
-        for i in range(1, int(spec.get("iterations", 5)) + 1):
+        for i in range(1, run.loop.tries + 1):
             try:
                 idea, why_not = try_once(run, ws, i, goal, history, files)
             except OverBudget as e:
@@ -644,6 +646,3 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
         return "done", summary
     finally:
         close_workspace(ws, keep_branch=hit and not run.trial)
-
-
-KINDS = {"command": command_loop, "watch": watch_loop, "climb": climb_loop, "search": search_loop}

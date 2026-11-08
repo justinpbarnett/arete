@@ -8,6 +8,7 @@ from datetime import timedelta
 from . import paths, util
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
+DECIDABLE = ("pending", "failed")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -282,8 +283,11 @@ def runs_since(since: str, connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
 
 
-def has_open_pr(r: dict) -> bool:
-    return r["status"] == "pr" or (r["status"] == "failed" and bool(r.get("pr_url")))
+def runs_reading_pr_comments(rejected_since: str, limit: int = 200) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND pr_url != '' "
+                                           f"AND ({OPEN_PR_RUN} OR (status = 'rejected' AND finished >= ?)) "
+                                           "ORDER BY started DESC LIMIT ?", (rejected_since, limit))]
 
 
 def open_runs(repo: str, issue: int | str) -> list[dict]:
@@ -497,7 +501,8 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str) -> int:
 def approvals() -> list[dict]:
     with db() as c:
         return [{**dict(r), "emit": json.loads(r["emit"] or "{}")}
-                for r in c.execute("SELECT * FROM approvals WHERE status = 'pending' ORDER BY id DESC LIMIT 100")]
+                for r in c.execute(f"SELECT * FROM approvals WHERE status IN ({','.join('?' * len(DECIDABLE))}) "
+                                   "ORDER BY id DESC LIMIT 100", DECIDABLE)]
 
 
 def approval(approval_id: int) -> dict | None:
@@ -507,10 +512,11 @@ def approval(approval_id: int) -> dict | None:
 
 
 def decide_approval(approval_id: int, status: str, result: str = "") -> bool:
+    came_from = ("approved",) if status in ("done", "failed") else DECIDABLE
     with db() as c:
         before = c.total_changes
-        c.execute("UPDATE approvals SET status = ?, result = ?, decided = ? WHERE id = ? AND status IN ('pending', ?)",
-                  (status, result[:1000], util.iso(), approval_id, "approved" if status in ("done", "failed") else ""))
+        c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ? WHERE id = ? AND status IN "
+                  f"({','.join('?' * len(came_from))})", (status, result[:1000], util.iso(), approval_id, *came_from))
         return c.total_changes > before
 
 

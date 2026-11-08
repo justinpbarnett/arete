@@ -4,6 +4,7 @@ import json
 import re
 import shlex
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,8 +12,7 @@ from . import config, cron, devices, paths, runner, util
 
 ENGINE_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
-KINDS = ("command", "watch", "climb", "search")
-SOURCE_TYPES = ("github", "jira", "log", "command")
+TRIES = 5
 METRIC_RULE = re.compile(r"^\s*([\w.\-/]+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?)\s*$")
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
@@ -86,8 +86,7 @@ class Loop:
     stale_hours: float | None = None
     classify: dict = field(default_factory=dict)
     emits: list[dict] = field(default_factory=list)
-    climb: dict = field(default_factory=dict)
-    search: dict = field(default_factory=dict)
+    spec: dict = field(default_factory=dict)
     error: str = ""
 
     @property
@@ -108,7 +107,11 @@ class Loop:
 
     @property
     def agent(self) -> bool:
-        return self.kind != "command"
+        return self.kind in KINDS and KINDS[self.kind].agent
+
+    @property
+    def tries(self) -> int:
+        return int(self.spec.get("iterations", TRIES))
 
     def model_for(self, cfg: config.Config) -> str:
         return self.model or cfg.model("loop")
@@ -131,6 +134,59 @@ class Loop:
                 "budget_usd": self.budget_usd, "daily_budget_usd": self.daily_budget_usd,
                 "emits": [e.get("type") + (" (approve)" if e.get("approve") else "") for e in self.emits],
                 "dir": paths.short_path(self.dir), "error": self.error}
+
+
+@dataclass
+class Kind:
+    name: str
+    table: str = ""
+    needs: str = ""
+    means: str = ""
+    agent: bool = True
+    worktree: bool = False
+    run: Callable[..., tuple[str, str]] | None = None
+
+    def problems(self, loop: Loop, remote: bool) -> list[str]:
+        problems = []
+        if self.agent and not loop.prompt_file.is_file():
+            problems.append(f"a {self.name} loop needs prompt.md")
+        if self.needs and blank(loop.spec.get(self.needs)):
+            problems.append(f"a {self.name} loop needs [{self.table}] "
+                            + ", ".join(filter(None, (self.needs, self.means))))
+        if self.worktree:
+            iterations = str(loop.spec.get("iterations", TRIES))
+            if not iterations.isdigit() or int(iterations) < 1:
+                problems.append(f"[{self.table}] iterations '{iterations}' must be a whole number above 0")
+            if remote:
+                problems.append(f"a {self.name} loop keeps or reverts each try in a local worktree, so it runs on "
+                                "local")
+            if not loop.repo:
+                problems.append(f"a {self.name} loop needs [run] repo, a repo name from the config or a path to a git "
+                                "repo")
+        return problems
+
+
+KINDS = {kind.name: kind for kind in (
+    Kind("command", table="run", needs="command", agent=False),
+    Kind("watch"),
+    Kind("climb", table="climb", needs="measure", means="a command that prints a number", worktree=True),
+    Kind("search", table="search", needs="check", means="a command that exits 0 on a hit", worktree=True),
+)}
+
+
+def runs_kind(name: str):
+    def bind(run: Callable[..., tuple[str, str]]) -> Callable[..., tuple[str, str]]:
+        KINDS[name].run = run
+        return run
+    return bind
+
+
+def worktree_kinds() -> list[str]:
+    return [kind.name for kind in KINDS.values() if kind.worktree]
+
+
+def blank(value) -> bool:
+    return not (value.strip() if isinstance(value, str) else value)
 
 
 class LoopError(ValueError):
@@ -198,7 +254,8 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
     if not NAME.match(folder.name):
         raise LoopError(f"folder name '{folder.name}' must be lowercase letters, digits and dashes")
     run, trig = data.get("run", {}), data.get("trigger", {})
-    kind = data.get("kind", "watch")
+    kind = str(data.get("kind", "watch"))
+    known = KINDS.get(kind)
     loop = Loop(
         name=f"{repo}/{folder.name}" if repo else folder.name,
         dir=folder,
@@ -213,7 +270,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         script=as_argv(run.get("script")),
         model=str(run.get("model", "")),
         runner=str(run.get("runner", "")),
-        tools=list(run.get("tools", runner.EDIT_TOOLS if kind in ("climb", "search") else runner.READ_TOOLS)),
+        tools=list(run.get("tools", runner.EDIT_TOOLS if known and known.worktree else runner.READ_TOOLS)),
         device=str(run.get("device", "local")),
         timeout_minutes=float(run.get("timeout_minutes", 30)),
         budget_usd=float(run["budget_usd"]) if run.get("budget_usd") else None,
@@ -222,8 +279,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         stale_hours=float(run["stale_hours"]) if run.get("stale_hours") else None,
         classify=dict(data.get("classify", {})),
         emits=[dict(e) for e in data.get("emit", [])],
-        climb=dict(data.get("climb", {})),
-        search=dict(data.get("search", {})),
+        spec=dict(data.get(known.table, {})) if known and known.table else {},
     )
     loop.trigger = Trigger(
         cron=cron.parse(trig["cron"]) if trig.get("cron") else None,
@@ -260,66 +316,42 @@ def metric_rule(text: str) -> tuple[str, str, float]:
 
 def validate(loop: Loop, cfg: config.Config) -> None:
     from .emits import EMITS
-    from .sources import metric_event
+    from .sources import SOURCES, metric_event
 
     problems = []
-    if loop.kind not in KINDS:
+    kind = KINDS.get(loop.kind)
+    if not kind:
         problems.append(f"kind '{loop.kind}' is not one of {', '.join(KINDS)}")
+    try:
+        remote, device_problem = devices.get(loop.device).remote, ""
+    except devices.DeviceError as e:
+        remote, device_problem = False, str(e)
     if loop.trigger.cron and loop.trigger.every:
         problems.append("[trigger] takes cron or every, not both")
     if loop.trigger.trust not in TRUST_ORDER:
         problems.append(f"[trigger] trust '{loop.trigger.trust}' is not one of {', '.join(TRUST_ORDER)}")
     elif loop.trigger.metric and (why := loop.trigger.refusal(metric_event(loop, 0))):
         problems.append(f"[trigger] metric would never fire: the loop {why}")
-    if loop.kind == "command" and not loop.command:
-        problems.append("a command loop needs [run] command")
-    if loop.agent and not loop.prompt_file.is_file():
-        problems.append(f"a {loop.kind} loop needs prompt.md")
+    if kind:
+        problems += kind.problems(loop, remote)
     problems += runner.agent_problems(loop.runner, loop.tools)
-    try:
-        remote = devices.get(loop.device).remote
-    except devices.DeviceError as e:
-        problems.append(str(e))
-        remote = False
+    problems += [device_problem] if device_problem else []
     if loop.agent:
         problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
                      for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, remote).items()]
     if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")
-    if loop.kind == "climb" and not loop.climb.get("measure"):
-        problems.append("a climb loop needs [climb] measure, a command that prints a number")
-    if loop.kind == "search" and not loop.search.get("check"):
-        problems.append("a search loop needs [search] check, a command that exits 0 on a hit")
-    if loop.kind in ("climb", "search") and remote:
-        problems.append(f"a {loop.kind} loop keeps or reverts each try in a local worktree, so it runs on local")
-    if loop.kind in ("climb", "search") and not loop.repo:
-        problems.append(f"a {loop.kind} loop needs [run] repo, a repo name from the config or a path to a git repo")
-    repos = {r.name for r in cfg.repos}
     for s in loop.sources:
-        if s.get("type") not in SOURCE_TYPES:
-            problems.append(f"source type '{s.get('type')}' is not one of {', '.join(SOURCE_TYPES)}")
-        if s.get("every"):
-            cron.seconds(s["every"])
-        if s.get("type") == "log" and not s.get("path"):
-            problems.append("a log source needs path")
-        if s.get("type") == "jira" and not s.get("jql"):
-            problems.append("a jira source needs jql")
-        if s.get("type") == "command" and not s.get("command"):
-            problems.append("a command source needs command")
+        if s.get("type") not in SOURCES:
+            problems.append(f"source type '{s.get('type')}' is not one of {', '.join(SOURCES)}")
+        else:
+            problems += SOURCES[s["type"]].problems(s, loop, cfg)
     for e in loop.emits:
-        kind = e.get("type")
-        if kind not in EMITS:
-            problems.append(f"emit type '{kind}' is not one of {', '.join(EMITS)}")
-        if kind == "ticket" and e.get("repo") not in repos and "/" not in str(e.get("repo", "")):
-            problems.append(f"ticket emit repo '{e.get('repo', '')}' is not a repo in the config or owner/name")
-        if kind == "pr" and loop.kind not in ("climb", "search"):
-            problems.append("only climb and search loops emit a pr")
-        elif kind == "pr" and loop.repo and not loop.work_repo(cfg).github:
-            problems.append(f"a pr emit needs a GitHub repo; '{loop.repo}' has no github in the config or GitHub "
-                            "remote")
-        if kind == "metric" and not e.get("name"):
-            problems.append("a metric emit needs name")
+        if e.get("type") not in EMITS:
+            problems.append(f"emit type '{e.get('type')}' is not one of {', '.join(EMITS)}")
+        else:
+            problems += EMITS[e["type"]].problems(e, loop, cfg)
     if loop.classify and not loop.classify.get("prompt"):
         problems.append("[classify] needs prompt, the yes or no question")
     if problems:
