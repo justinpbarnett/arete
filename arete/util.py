@@ -9,6 +9,7 @@ import re
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -293,6 +294,7 @@ def read_json(p: Path, default):
 
 def write_json(p: Path, data) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str))
-    tmp.replace(p)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(data, indent=2, default=str))
+    os.replace(tmp, p)

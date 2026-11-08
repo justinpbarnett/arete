@@ -136,9 +136,10 @@ def probe(device: Device | str, timeout: float = 20) -> dict:
                 "gpus": [line[4:].strip() for line in lines if line.startswith("gpu:")],
                 "detail": "" if res.returncode == 0 else util.first_line(res.stderr or res.stdout, 300)}
     info.update(name=d.name, kind=d.kind, seconds=round(time.monotonic() - started, 1), at=util.iso())
-    cache = util.read_json(CACHE_FILE, {})
-    cache[d.name] = info
-    util.write_json(CACHE_FILE, cache)
+    with util.lock("devices", wait=True):
+        cache = util.read_json(CACHE_FILE, {})
+        cache[d.name] = info
+        util.write_json(CACHE_FILE, cache)
     return info
 
 
