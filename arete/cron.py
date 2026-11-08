@@ -72,7 +72,12 @@ def parse(text: str) -> Cron:
         raise BadSchedule(f"cron '{text}' needs 5 fields: minute hour day month weekday")
     values = [field_values(p, *f) for p, f in zip(parts, FIELDS, strict=True)]
     weekdays = frozenset(d % 7 for d in values[4])
-    return Cron(text, *map(frozenset, values[:4]), weekdays, parts[2] == "*", parts[4] == "*")
+    return must_fire(Cron(text, *map(frozenset, values[:4]), weekdays, parts[2] == "*", parts[4] == "*"))
+
+
+def must_fire(schedule: Cron) -> Cron:
+    schedule.next_after(datetime(2000, 1, 1))
+    return schedule
 
 
 def seconds(text: str | float) -> float:
