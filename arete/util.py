@@ -48,6 +48,7 @@ def sh(
             shell=isinstance(cmd, str),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             env=full_env,
             input=input,

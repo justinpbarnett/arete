@@ -61,7 +61,7 @@ def tailscale(*args: str) -> dict:
     if not exe:
         return {}
     try:
-        proc = subprocess.run([exe, *args], capture_output=True, text=True, timeout=10, check=False,
+        proc = subprocess.run([exe, *args], capture_output=True, text=True, errors="replace", timeout=10, check=False,
                               env={**os.environ, **TAILSCALE_AS_CLI})
         return json.loads(proc.stdout) if proc.returncode == 0 else {}
     except (subprocess.TimeoutExpired, json.JSONDecodeError):

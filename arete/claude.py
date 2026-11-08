@@ -71,7 +71,7 @@ def run(
     try:
         proc = subprocess.run(
             cmd, cwd=None if remote else str(cwd), input=prompt, capture_output=True, text=True, timeout=timeout,
-            env=env, check=False,
+            errors="replace", env=env, check=False,
         )
     except subprocess.TimeoutExpired:
         return Result(ok=False, session=resume, error=f"timed out after {timeout}s")

@@ -195,7 +195,7 @@ def mcp_servers(mcp_config: str) -> dict:
 def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float,
            max_budget_usd: float | None) -> tuple[subprocess.CompletedProcess, str]:
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=env)
+                            text=True, errors="replace", env=env)
     stderr: list[str] = []
     reader = threading.Thread(target=lambda: stderr.append(proc.stderr.read()), daemon=True)
     reader.start()
