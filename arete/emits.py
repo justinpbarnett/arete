@@ -9,6 +9,7 @@ from .loops import FINDING_EVENT, Loop, as_list, check_env, find, worktree_kinds
 DIGESTS_DIR = paths.STATE_DIR / "digests"
 SEVERITIES = ("low", "medium", "high", "critical")
 PUSH_RULES = ("lines", "deletes", "paths")
+PATCH_SHOWN = 12000
 FENCE = re.compile(r"`{3,}")
 TAGS = re.compile(r"<[^>]{0,200}>")
 LINKS = re.compile(r"!?\[([^\]]{0,200})\]\([^)]{0,500}\)")
@@ -179,7 +180,9 @@ class Push(Emit):
                 "check": spec.get("check") or loop.spec.get("check", ""), "env": check_env(loop, run_id),
                 "timeout": loop.timeout_minutes * 60, "lines": diff.lines, "files": diff.files, "deleted": deleted,
                 "title": plain(f"{loop.name}: run {run_id}" if public else outcome.get("title", ""), 120),
-                "report": plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000)}
+                "report": plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000),
+                "about": plain(outcome.get("title", ""), 120), "story": plain(outcome.get("report", ""), 6000),
+                "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src), start, branch)}
 
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
         try:
@@ -222,10 +225,18 @@ class Push(Emit):
                 f"({item['lines']} lines in {util.count(len(item['files']), 'file')})")
 
     def detail(self, item: dict) -> str:
-        return f"{item['title']}\n\nFiles: {', '.join(item['files'])}\n\n{item['report']}"
+        return "\n\n".join(filter(None, [item.get("about") or item["title"], f"Files: {', '.join(item['files'])}",
+                                          item.get("story") or item["report"], item.get("patch", "")]))
 
     def rejected(self, item: dict) -> None:
         util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+
+
+def shown_patch(patch: str, start: str, branch: str) -> str:
+    patch = alerts.redact(patch)
+    if len(patch) <= PATCH_SHOWN:
+        return patch
+    return f"{patch[:PATCH_SHOWN]}\n\ncut at {PATCH_SHOWN} characters; git diff {start[:10]} {branch} shows the rest"
 
 
 def landed_diff(src: Path, start: str, branch: str) -> diffguard.Diff:
