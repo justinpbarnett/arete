@@ -16,7 +16,7 @@ AUDIT_DIR = paths.STATE_DIR / "audit"
 MAX_SKILL_LINES = 500
 MAX_DESCRIPTION = 1024
 
-LINK = re.compile(r"\]\(([^)\s#]+)(?:#[^)]*)?\)")
+LINK = re.compile(r"\]\(([^)\s#]+)(?:#[^)\s]*)?(?:\s[^)]*)?\)")
 HOOK_PATHS = [
     (re.compile(r"(?:\$HOME|\$\{HOME\}|~)(/[^\s\"';|&)]+)"), lambda m: paths.HOME / m.group(1).lstrip("/")),
     (re.compile(r"(?<![\w$}~./-])(/(?:Users|opt|usr/local)/[^\s\"';|&)]+)"), lambda m: Path(m.group(1))),
@@ -83,7 +83,7 @@ def check_skills(cfg: config.Config) -> tuple[list[Finding], list[str]]:
             out.append(Finding("skills", "warn", rel, f"description is {len(fm['description'])} chars (limit {MAX_DESCRIPTION})"))
         if fm.get("name") and fm["name"] != f.parent.name:
             out.append(Finding("skills", "warn", rel, f"name `{fm['name']}` differs from its folder `{f.parent.name}`"))
-        lines = text.count("\n")
+        lines = len(text.splitlines())
         if lines > MAX_SKILL_LINES:
             out.append(Finding("skills", "warn", rel, f"{lines} lines; move detail into reference files"))
         for target in _dead_links(text, f.parent):
