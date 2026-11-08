@@ -328,6 +328,7 @@ def carry(run: LoopRun) -> str:
     if spent := spent_limit(run.loop, run.cfg):
         state.release_claimed_items(run.id)
         return settle(run, "skipped", f"budget: {spent} is spent, so its input waits in the queue")
+    run.scratch.mkdir(parents=True, exist_ok=True)
     try:
         signal.signal(signal.SIGTERM, stop_on_term)
         with devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device:
@@ -681,7 +682,6 @@ def stop_reason(idea: str) -> str:
 
 
 def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str], files: list[str]) -> tuple[str, str]:
-    run.scratch.mkdir(parents=True, exist_ok=True)
     res = run.agent(f"try {i}", attempt_prompt(run, goal, history, files), ws.wt, tools=run.loop.tools,
                     add_dirs=[run.scratch])
     idea = util.last_line(res.text or res.error or "", 200)
