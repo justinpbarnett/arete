@@ -23,10 +23,13 @@ MAX_ISSUE_CHARS = 60000
 META_FILE = paths.STATE_DIR / "triage.json"
 TICKET_RECORDS_DIR = paths.STATE_DIR / "triage"
 NO_MCP_SERVERS = json.dumps({"mcpServers": {}})
-SEARCH_FIELDS = ["summary", "updated", "labels"]
+SEARCH_FIELDS = ["summary", "updated", "labels", "parent"]
 SPRINT_JQL = "sprint in openSprints() OR (sprint in closedSprints() AND sprint not in futureSprints())"
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent"]
 MAX_ASSUMPTIONS = 8
+THIN_WORDS = 6
+MARKUP = re.compile(r"\[[^\]]*\]|\{[^}]*\}|https?://\S+")
+WORDS = re.compile(r"[^\W\d_]{2,}")
 SENT_DAYS = 7
 SIZES = ("S", "M", "L")
 FIX, FEATURE, RESEARCH, PERSON = "fix", "feature", "research", "person"
@@ -70,6 +73,24 @@ class Candidate:
     url: str
     updated: str
     in_sprint: bool | None = None
+    parent: str = ""
+
+
+@dataclass
+class TicketText:
+    facts: str
+    body: str
+    comments: str
+
+    @property
+    def text(self) -> str:
+        return "\n\n".join(p for p in (self.facts, self.body or "(no description)", self.comments) if p)
+
+    def said(self, title: str) -> str:
+        return "\n\n".join(p for p in (title, self.body, self.comments) if p)
+
+    def thin(self) -> bool:
+        return len(WORDS.findall(MARKUP.sub(" ", self.body))) < THIN_WORDS
 
 
 @dataclass
@@ -86,6 +107,9 @@ class Source:
 
     def by_name(self) -> dict[str, config.Repo]:
         return {r.name: r for r in self.repos}
+
+    def ticket_text(self, c: Candidate) -> str:
+        return self.ticket(c).text
 
 
 @dataclass
@@ -112,7 +136,7 @@ class JiraSource(Source):
             f = i.get("fields") or {}
             if tracker.LABEL not in (f.get("labels") or []):
                 out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
-                                     f.get("updated") or ""))
+                                     f.get("updated") or "", parent=(f.get("parent") or {}).get("key") or ""))
         if self.jira_cfg.sprint_only:
             scoped = {i["key"] for i in client.search(f"{mine} AND ({SPRINT_JQL}) ORDER BY updated DESC", ["updated"],
                                                       limit=PER_SOURCE)}
@@ -120,7 +144,7 @@ class JiraSource(Source):
                 c.in_sprint = c.ref in scoped
         return out
 
-    def ticket_text(self, c: Candidate) -> str:
+    def ticket(self, c: Candidate) -> TicketText:
         client = self.client
         f = client.issue(c.id, JIRA_FIELDS).get("fields") or {}
         facts = [f"Type: {(f.get('issuetype') or {}).get('name', '')}",
@@ -131,8 +155,11 @@ class JiraSource(Source):
             facts.append(f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}")
         comments = [((cm.get("author") or {}).get("displayName", "someone"), cm.get("created", ""), cm.get("body") or "")
                     for cm in client.comments(c.id)]
-        parts = ["\n".join(facts), f.get("description") or "(no description)", tracker.comments_text(comments)]
-        return "\n\n".join(p for p in parts if p)
+        return TicketText("\n".join(facts), (f.get("description") or "").strip(), tracker.comments_text(comments))
+
+    def brief(self, key: str) -> str:
+        f = self.client.issue(key, ["summary", "description"]).get("fields") or {}
+        return f"{key}: {(f.get('summary') or '').strip()}\n\n{(f.get('description') or '').strip() or '(no description)'}"
 
     def route_note(self, r: config.Repo) -> str:
         return f", route label `{tracker.route_label(r)}`"
@@ -178,9 +205,12 @@ class GitHubSource(Source):
                                  i.get("url", ""), i.get("updatedAt") or ""))
         return out
 
-    def ticket_text(self, c: Candidate) -> str:
+    def ticket(self, c: Candidate) -> TicketText:
         t = self.issues.get(c.id)
-        return "\n\n".join(p for p in (f"Labels: {', '.join(t.labels) or 'none'}", t.body, t.comments) if p)
+        return TicketText(f"Labels: {', '.join(t.labels) or 'none'}", (t.body or "").strip(), t.comments)
+
+    def brief(self, key: str) -> str:
+        return ""
 
     def route_note(self, r: config.Repo) -> str:
         return ""
@@ -305,13 +335,14 @@ def row(src: TriageSource, c: Candidate, **fields) -> dict:
     base = {"ref": c.ref, "source": src.name, "tracker": src.tracker, "repo": "", "route": "", "title": c.title,
             "url": c.url, "updated": "", "ready": None, "code": None, "kind": "", "size": "", "repos": [],
             "questions": [], "assumptions": [], "plan": [], "why": "", "cost": 0.0, "ts": util.iso(),
-            "in_sprint": c.in_sprint}
+            "in_sprint": c.in_sprint, "parent": c.parent}
     return {**base, **fields}
 
 
 def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dict:
     if prev and prev["ready"] is not None:
-        return {**prev, "source": src.name, "title": c.title, "url": c.url, "in_sprint": c.in_sprint}
+        return {**prev, "source": src.name, "title": c.title, "url": c.url, "in_sprint": c.in_sprint,
+                "parent": c.parent}
     return row(src, c, why=reason)
 
 
@@ -535,12 +566,14 @@ def research_note(r: dict, report: dict | None) -> str:
         return "queued for research" if in_sprint(r) else by_hand
     if report["status"] == "running":
         return f"researching since {stamp(report['ts'])}"
-    again = ((", and the ticket changed since, so it runs again" if in_sprint(r) else f", and the ticket changed since; "
-              f"{by_hand} again") if research_due(r, report) else "")
+    again = ((", and the ticket changed since, so the loop checks it again" if in_sprint(r)
+              else f", and the ticket changed since; {by_hand} again") if research_due(r, report) else "")
     if report["status"] == "done":
         return f"report ready {stamp(report['ts'])}{again}"
     if report["status"] == "held":
         return f"held: {report['error']}{again}"
+    if report["status"] in ("parent", "answered"):
+        return f"not researched: {report['error']}{again}"
     return f"research failed: {report['error']}{again}"
 
 

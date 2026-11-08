@@ -192,8 +192,9 @@ CREATE TABLE IF NOT EXISTS feedback (
     at_once INTEGER DEFAULT 0,
     created TEXT,
     pr_state TEXT,                 -- OPEN | MERGED | CLOSED when recorded
-    status TEXT,                   -- new | taken | done | failed | recorded
+    status TEXT,                   -- new | taken | done | failed | recorded | skipped
     run_id TEXT,
+    asks REAL,
     PRIMARY KEY (pr_url, kind, gh_id)
 );
 CREATE TABLE IF NOT EXISTS mined (
@@ -226,7 +227,8 @@ CREATE TABLE IF NOT EXISTS triage (
     kind TEXT DEFAULT '',
     repos TEXT DEFAULT '[]',
     assumptions TEXT DEFAULT '[]',
-    in_sprint INTEGER DEFAULT 0
+    in_sprint INTEGER DEFAULT 0,
+    parent TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS triage_approvals (
     ref TEXT PRIMARY KEY,
@@ -264,13 +266,16 @@ CREATE TABLE IF NOT EXISTS research (
     title TEXT,
     url TEXT,
     updated TEXT,
-    status TEXT,                   -- running | done | failed | held
+    status TEXT,                   -- running | done | failed | held | parent | answered
     summary TEXT,
     report TEXT,
     error TEXT,
     run_id TEXT,
     cost REAL DEFAULT 0,
-    ts TEXT
+    ts TEXT,
+    ticket TEXT DEFAULT '',
+    basis TEXT DEFAULT '',
+    answered_by TEXT DEFAULT ''
 );
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
@@ -280,6 +285,10 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               ("triage", "repos", "ALTER TABLE triage ADD COLUMN repos TEXT DEFAULT '[]'"),
               ("triage", "assumptions", "ALTER TABLE triage ADD COLUMN assumptions TEXT DEFAULT '[]'"),
               ("triage", "in_sprint", "ALTER TABLE triage ADD COLUMN in_sprint INTEGER DEFAULT 0"),
+              ("triage", "parent", "ALTER TABLE triage ADD COLUMN parent TEXT DEFAULT ''"),
+              ("feedback", "asks", "ALTER TABLE feedback ADD COLUMN asks REAL"),
+              *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
+                for col in ("ticket", "basis", "answered_by")],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
@@ -812,7 +821,13 @@ def evals_since(since: str, connect=db) -> list[dict]:
 
 
 FEEDBACK_COLUMNS = ("pr_url", "kind", "gh_id", "repo", "issue", "body", "path", "line", "hunk", "thread", "at_once",
-                    "created", "pr_state", "status")
+                    "created", "pr_state", "status", "asks")
+
+
+def feedback_keys(pr_url: str) -> set[tuple[str, int]]:
+    with db() as c:
+        return {(r["kind"], r["gh_id"]) for r in c.execute("SELECT kind, gh_id FROM feedback WHERE pr_url = ?",
+                                                           (pr_url,))}
 
 
 def add_feedback(rows: list[dict]) -> int:
@@ -885,12 +900,12 @@ def mined_urls() -> set[str]:
 
 
 TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
-                  "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint")
+                  "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint", "parent")
 TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions")
 APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "plan", "assumptions", "why", "ts")
 APPROVAL_LISTS = ("plan", "assumptions")
 RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
-                    "cost", "ts")
+                    "cost", "ts", "ticket", "basis", "answered_by")
 
 
 def lists_read(row: dict, keys: tuple[str, ...]) -> dict:
@@ -963,6 +978,12 @@ def research_set(ref: str, **fields) -> None:
     with db() as c:
         c.execute(insert_sql("research", RESEARCH_COLUMNS, "INSERT OR REPLACE"),
                   tuple(row.get(k) for k in RESEARCH_COLUMNS))
+
+
+def research_keep(ref: str, **fields) -> None:
+    with db() as c:
+        c.execute(f"UPDATE research SET {', '.join(f'{k} = ?' for k in fields)} WHERE ref = ? COLLATE NOCASE",
+                  (*fields.values(), ref))
 
 
 def research_prune(refs: list[str]) -> None:

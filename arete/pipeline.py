@@ -30,6 +30,7 @@ from . import (
     state,
     tracker,
     util,
+    verdicts,
     verify,
 )
 from .agent import Result, Session
@@ -42,6 +43,7 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
+FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
 LEFT_FOR_A_PERSON = re.compile(rf"{re.escape(LEFT_START)}\n{LEFT_HEADING}\n\n(.*?)\n\n{re.escape(LEFT_END)}\n*", re.DOTALL)
@@ -1562,14 +1564,50 @@ def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[
     return rows
 
 
-def record_feedback(r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict) -> None:
+def feedback_text(row: dict) -> str:
+    kind = (f"Kind: line comment on {row.get('path')} line {row.get('line')}\n\nCode:\n```\n{row.get('hunk') or ''}\n```"
+            if row["kind"] == "line" else f"Kind: {row['kind']}")
+    return f"A comment from the repo's owner on a pull request an agent opened.\n\n{kind}\n\nComment:\n{row['body']}"
+
+
+def judge_feedback(cfg: config.Config, repo_name: str, url: str, rows: list[dict]) -> None:
+    known = state.feedback_keys(url)
+    fresh = [row for row in rows if row["status"] == "new" and (row["kind"], row["gh_id"]) not in known]
+    try:
+        repo = cfg.repo(repo_name)
+    except config.UnknownRepo:
+        return
+    if not fresh or not jev.ready(cfg, [repo]):
+        return
+    trace = ("", f"feedback {url} jev")
+    replies = jev.ask_many([(feedback_text(row), {"asks": jev.yes_no(FEEDBACK_ASKS)}) for row in fresh], cfg,
+                           trace=trace)
+    for row, reply in zip(fresh, replies, strict=True):
+        if (a := reply.answers.get("asks")) is None:
+            continue
+        score = verdicts.scored(a.yes, cfg.jev.feedback_skip, over=False)
+        skip = verdicts.holds(score)
+        row["asks"] = score["p"]
+        if skip:
+            row["status"] = "skipped"
+        verdicts.record(jev.traced_run(trace), "feedback", f"{url} {row['kind']} {row['gh_id']}", row["body"] or "",
+                        {"asks": score}, f"asks for no change and no answer (p {a.yes:.2f})" if skip else "",
+                        "skipped" if skip else "went on")
+        print(f"{util.iso()} {url}: JEV reads your {row['kind']} comment {row['gh_id']} as asking for a change or an "
+              f"answer at p {a.yes:.2f}" + (f", under the {cfg.jev.feedback_skip:g} skip line, so no run takes it"
+                                           if skip else ""))
+
+
+def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict) -> None:
     for url, pr in zip(urls, prs):
         updated = pr.get("updatedAt", "")
         fresh[url] = seen.get(url, "")
         if updated and seen.get(url) == updated:
             continue
         try:
-            added = state.add_feedback(owner_feedback(url, pr.get("state", ""), r["repo"], str(r["issue"])))
+            rows = owner_feedback(url, pr.get("state", ""), r["repo"], str(r["issue"]))
+            judge_feedback(cfg, r["repo"], url, rows)
+            added = state.add_feedback(rows)
         except gh.GhError as e:
             print(f"{util.iso()} {url}: could not read the review comments: {util.first_line(str(e), 300)}")
             continue
@@ -1586,7 +1624,7 @@ def sync_outcomes(cfg: config.Config) -> None:
             prs = [gh.pr_view(url) for url in urls]
         except gh.GhError:
             continue
-        record_feedback(r, urls, prs, seen, fresh)
+        record_feedback(cfg, r, urls, prs, seen, fresh)
         closed = all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs)
         if r["status"] == "rejected":
             if not closed:

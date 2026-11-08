@@ -73,6 +73,9 @@ class JevConfig:
     screen_reach: float = 0.6
     proof_hold: float = 0.5
     fixed_skip: float = 0.7
+    research_rerun: float = 0.4
+    research_answered: float = 0.8
+    feedback_skip: float = 0.0
     risk_weights: dict[str, float] = field(default_factory=lambda: {"blast": 0.4, "sensitivity": 0.4, "surprise": 0.2})
     guard: bool = True
     compact_tokens: int = 120_000
@@ -207,6 +210,9 @@ def load(path: Path | None = None) -> Config:
         screen_reach=float(jv.get("screen_reach", JevConfig.screen_reach)),
         proof_hold=float(jv.get("proof_hold", JevConfig.proof_hold)),
         fixed_skip=float(jv.get("fixed_skip", JevConfig.fixed_skip)),
+        research_rerun=float(jv.get("research_rerun", JevConfig.research_rerun)),
+        research_answered=float(jv.get("research_answered", JevConfig.research_answered)),
+        feedback_skip=float(jv.get("feedback_skip", JevConfig.feedback_skip)),
         risk_weights={**JevConfig().risk_weights, **{str(k): float(v) for k, v in (jv.get("risk_weights") or {}).items()}},
         guard=bool(jv.get("guard", True)),
         compact_tokens=int(jv.get("compact_tokens", JevConfig.compact_tokens)),

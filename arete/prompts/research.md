@@ -9,6 +9,10 @@ $repos
 
 $ticket
 
+## Related tickets and reports
+
+$related
+
 ## The report
 
 Answer what the ticket asks. Lead with the answer or the recommendation, then the evidence for it.

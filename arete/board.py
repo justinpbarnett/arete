@@ -148,6 +148,8 @@ def triage_board() -> dict:
 
 def triage_entry(r: dict, v: dict, standing: str) -> dict:
     report = v["research"].get(r["ref"]) if standing == triage.RESEARCH_WORK else None
+    if report and report.get("answered_by"):
+        report = v["research"].get(report["answered_by"])
     return {"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "", "url": r["url"] or "",
             "kind": r["kind"] or "", "size": r["size"] or "",
             "verdict": triage.sent_note(r, False) if standing == triage.SENT else triage.verdict(r, v["research"]),

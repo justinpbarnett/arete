@@ -246,7 +246,8 @@ def render_events(cfg: config.Config, hours: float) -> str:
 
 
 FEEDBACK_STATUS = {"new": "waiting for a revision", "taken": "being revised", "done": "revised",
-                   "failed": "revision failed", "recorded": "not revised"}
+                   "failed": "revision failed", "recorded": "not revised",
+                   "skipped": "not revised, JEV read it as asking nothing"}
 
 
 def render_feedback(rows: list[dict], limit: int = 8000) -> str:
