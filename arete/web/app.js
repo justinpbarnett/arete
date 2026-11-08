@@ -20,6 +20,8 @@ const openQuestions = new Set();
 const drafts = new Map();
 const sendSaid = new Map();
 const sending = new Set();
+const HELD = Symbol("held");
+let redrawTriage = false;
 
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
@@ -61,10 +63,13 @@ function fill(id, ...nodes) {
   const focused = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.focus : "";
   const scrolled = [...scrollersByPlace(box)].filter(([, node]) => node.scrollLeft || node.scrollTop)
     .map(([place, node]) => [place, node.scrollLeft, node.scrollTop]);
-  box.replaceChildren(...nodes.flat(Infinity).filter(Boolean));
+  const old = [...box.childNodes];
+  box.append(...nodes.flat(Infinity).filter(Boolean));
+  // Focus moves to the copy while the old element is still there, so a keyboard focus ring carries over.
+  if (focused) [...box.querySelectorAll(`[data-focus="${CSS.escape(focused)}"]`)].at(-1)?.focus({ preventScroll: true });
+  for (const node of old) node.remove();
   const fresh = scrolled.length ? scrollersByPlace(box) : new Map();
   for (const [place, left, top] of scrolled) fresh.get(place)?.scrollTo(left, top);
-  if (focused) box.querySelector(`[data-focus="${CSS.escape(focused)}"]`)?.focus();
 }
 
 function heading(n, title) {
@@ -76,8 +81,17 @@ function stateChip(state) {
   return word ? el("span", { class: `state ${state}`, text: word }) : null;
 }
 
+function sayParts(state, sentence) {
+  return [stateChip(state), stateChip(state) ? " " : "", sentence].filter(Boolean);
+}
+
+function sayIn(line, state, sentence) {
+  line.replaceChildren(...sayParts(state, sentence));
+  line.hidden = false;
+}
+
 function fault(sentence) {
-  return el("p", {}, stateChip("fault"), " ", sentence);
+  return el("p", {}, sayParts("fault", sentence));
 }
 
 function quiet(sentence) {
@@ -296,6 +310,10 @@ function draftKey(ref, part) {
   return `${ref}\n${part}`;
 }
 
+function isRepoQuestion(r, q) {
+  return q === r.send.repo_question;
+}
+
 function pickedRepo(r) {
   return r.send.pick ? drafts.get(draftKey(r.ref, "repo")) || "" : r.repo;
 }
@@ -303,7 +321,7 @@ function pickedRepo(r) {
 function sendWords(r) {
   const choice = r.send.choices.find((c) => c.repo === pickedRepo(r));
   const labels = choice ? `${choice.labels.length === 1 ? "the label" : "the labels"} ${choice.labels.join(" and ")}` : "the labels of the repo you pick";
-  return r.questions.some((q) => q !== r.send.repo_question)
+  return r.questions.some((q) => !isRepoQuestion(r, q))
     ? `Send posts your answers to the ticket as one comment from you, leaving out blank ones. Then it adds ${labels} and starts a poll to build it.`
     : `Send adds ${labels} to the ticket and starts a poll to build it.`;
 }
@@ -320,21 +338,21 @@ function sendForm(r) {
     input: (e) => drafts.set(draftKey(r.ref, q), e.target.value),
     keydown: (e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.target.form.requestSubmit(),
   } });
-  const fields = r.questions.map((q, i) => field(r.send.pick && q === r.send.repo_question ? picker : box(q, i), q));
+  const fields = r.questions.map((q, i) => field(isRepoQuestion(r, q) ? picker : box(q, i), q));
   if (r.send.pick && !r.send.repo_question) fields.push(field(picker, "The repo to build it in"));
   const said = sendSaid.get(r.ref);
   return el("form", { class: "send", "aria-label": `Send ${r.ref} to the pipeline`, on: { submit: (e) => sendTicket(e, r) } },
     fields,
     el("p", { class: "muted send-about", text: sendWords(r) }),
     el("div", { class: "actions" }, el("button", { type: "submit", "data-focus": id("go"), disabled: sending.has(r.ref), text: "Send to the pipeline" })),
-    el("p", { class: "send-said", "aria-live": "polite", hidden: !said }, said ? [stateChip(said[0]), said[0] ? " " : "", said[1]] : null));
+    el("p", { class: "send-said", "aria-live": "polite", tabindex: "-1", "data-focus": id("said"), hidden: !said }, said ? sayParts(...said) : null));
 }
 
 function sendSay(form, r, state, sentence) {
   sendSaid.set(r.ref, [state, sentence]);
   const line = form.querySelector(".send-said");
-  line.replaceChildren(...[stateChip(state), state ? " " : "", sentence].filter(Boolean));
-  line.hidden = false;
+  sayIn(line, state, sentence);
+  line.focus();
 }
 
 async function sendTicket(event, r) {
@@ -345,25 +363,34 @@ async function sendTicket(event, r) {
     sendSay(form, r, "caution", "Pick the repo it is for first.");
     return form.querySelector("select").focus();
   }
-  document.getElementById("triage-result").hidden = true;
+  const result = document.getElementById("triage-result");
+  result.hidden = true;
   sending.add(r.ref);
-  form.querySelector("button[type=submit]").disabled = true;
   sendSay(form, r, null, `Sending ${r.ref}. It screens the ticket and writes to it, so it can take a few seconds.`);
+  form.querySelector("button[type=submit]").disabled = true;
+  let failed = "";
   try {
-    const answers = r.questions.map((q) => (r.send.pick && q === r.send.repo_question ? "" : drafts.get(draftKey(r.ref, q)) || ""));
+    const answers = r.questions.map((q) => (isRepoQuestion(r, q) ? "" : drafts.get(draftKey(r.ref, q)) || ""));
     const done = await call(`/api/triage/${encodeURIComponent(r.ref)}/send`, { questions: r.questions, answers, repo });
     for (const key of drafts.keys()) if (key.startsWith(draftKey(r.ref, ""))) drafts.delete(key);
     sendSaid.delete(r.ref);
     openQuestions.delete(`triage:q:${r.ref}`);
     say("triage-result", "ok", done.said);
-    document.getElementById("triage-result").focus();
+    result.focus();
   } catch (e) {
-    sendSay(form, r, "fault", e.message);
+    failed = e.message;
+    sendSay(form, r, "fault", failed);
   } finally {
     sending.delete(r.ref);
     form.querySelector("button[type=submit]").disabled = false;
   }
-  refresh();
+  redrawTriage = true;
+  await refresh();
+  if (failed && view === "triage" && !document.querySelector(`[data-focus="${CSS.escape(`send:${r.ref}:said`)}"]`)) {
+    sendSaid.delete(r.ref);
+    say("triage-result", "fault", failed);
+    result.focus();
+  }
 }
 
 function niceMax(value, whole) {
@@ -501,9 +528,7 @@ function settingsChanges() {
 }
 
 function say(id, state, sentence) {
-  const line = document.getElementById(id);
-  line.replaceChildren(...[stateChip(state), " ", sentence].filter(Boolean));
-  line.hidden = false;
+  sayIn(document.getElementById(id), state, sentence);
 }
 
 async function saveSettings(event) {
@@ -593,7 +618,7 @@ function button(text, focus, onClick, disabled = false) {
 }
 
 function runStatus(status) {
-  return [stateChip(RUN_STATE[status]), RUN_STATE[status] ? " " : "", status];
+  return sayParts(RUN_STATE[status], status);
 }
 
 function secondsBetween(start, end) {
@@ -1025,7 +1050,9 @@ const LOADERS = {
   health: async () => drawHealth(await call("/api/state")),
   triage: async () => {
     const snapshot = await call("/api/state");
-    if (!sending.size && !document.activeElement?.closest("#triage form")) drawTriage(snapshot);
+    if (!redrawTriage && (sending.size || document.activeElement?.closest("#triage form"))) return HELD;
+    redrawTriage = false;
+    drawTriage(snapshot);
   },
   trends: async () => {
     trendsData = await call("/api/trends");
@@ -1034,7 +1061,8 @@ const LOADERS = {
   },
   settings: async () => {
     const fresh = await call("/api/settings");
-    if (!settingsData || !Object.keys(settingsChanges()).length) drawSettings(fresh);
+    if (settingsData && Object.keys(settingsChanges()).length) return HELD;
+    drawSettings(fresh);
   },
   chat: async () => drawChat(await call("/api/chat")),
 };
@@ -1053,7 +1081,7 @@ function schedule(ms) {
 
 function status(state, sentence) {
   const line = document.getElementById("status");
-  line.replaceChildren(`${dateWords(new Date())} · `, ...[stateChip(state), state ? " " : "", sentence].filter(Boolean));
+  line.replaceChildren(`${dateWords(new Date())} · `, ...sayParts(state, sentence));
 }
 
 async function refresh() {
@@ -1061,11 +1089,12 @@ async function refresh() {
   const mine = ++refreshCount;
   if (document.hidden) return;
   try {
-    await LOADERS[view]();
+    const held = (await LOADERS[view]()) === HELD;
     if (mine !== refreshCount) return;
-    lastGood = clock(new Date().toISOString());
+    if (!held) lastGood = clock(new Date().toISOString());
     const label = document.querySelector(`.views [data-view="${view}"]`).textContent;
-    status("", `${label} · updated ${new Date().toLocaleTimeString([], { hour12: false })}${nextDelay() ? ` · refreshes every ${nextDelay() / 1000} s` : ""}`);
+    const shown = held ? "held while you edit" : `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
+    status("", `${label} · ${shown}${nextDelay() ? ` · refreshes every ${nextDelay() / 1000} s` : ""}`);
     document.querySelectorAll(".readout").forEach((r) => r.classList.remove("stale"));
   } catch (e) {
     if (mine !== refreshCount) return;

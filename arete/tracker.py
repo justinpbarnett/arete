@@ -14,8 +14,8 @@ APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
 STATE_COLORS = {"running": "fbca04", "pr": "0e8a16", "failed": "d93f0b", "needs-info": "c5def5"}
 FIX_LABELS = {"bug", "fix"}
 FIX_TYPES = {"bug", "fire", "incident", "problem"}
-JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "created", "creator", "reporter", "assignee",
-               "parent", "attachment"]
+JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "created", "updated", "creator", "reporter",
+               "assignee", "parent", "attachment"]
 JIRA_STATE_LABELS = {f"agent-{s}" for s in config.STATES}
 SEARCH_FIELDS = ["summary", "created", "labels"]
 MAX_COMMENTS = 10
@@ -50,6 +50,7 @@ class Ticket:
     kind: Literal["feat", "fix"] = "feat"
     url: str = ""
     created: str = ""
+    updated: str = ""
     labels: list[str] = field(default_factory=list)
     blocker: str = ""
     images: list[Image] = field(default_factory=list)
@@ -159,8 +160,8 @@ class GitHubTracker:
             "" if LABEL in labels else f"it has no `{LABEL}` label")
         return Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
-                      kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""), labels=labels,
-                      blocker=blocker)
+                      kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
+                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker)
 
     def prepare(self) -> list[str]:
         made = [gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE),
@@ -266,8 +267,8 @@ class JiraTracker:
         return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments),
                       open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
-                      url=self.client.browse_url(tid), created=f.get("created", ""), labels=labels, blocker=blocker,
-                      images=images)
+                      url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
+                      labels=labels, blocker=blocker, images=images)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         out = SavedImages()

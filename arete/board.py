@@ -161,8 +161,7 @@ def triage_entry(r: dict, v: dict, standing: str, srcs: dict[str, triage.TriageS
 
 
 def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:
-    names = list(src.by_name()) if src else []
-    choices = [n for n in ([r["repo"]] if r["repo"] else names) if n in names]
+    choices = triage.repo_choices(src, r) if src else []
     if not choices:
         return None
     return {"pick": not r["repo"], "repo_question": triage.repo_question(r),

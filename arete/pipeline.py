@@ -43,6 +43,7 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
+TRIAGE_ANSWERS = "Answers to triage's questions"
 FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
@@ -713,15 +714,16 @@ def triage_notes(approval: dict | None) -> str:
     if not approval:
         return ""
     assumed = "".join(f"\n- {a}" for a in approval["assumptions"]) or "\n- nothing it named"
-    keep = ("Keep an assumption only where the ticket still leaves it open. End `plan` with an \"Assumed\" list of every "
-            "choice the ticket leaves open, these and your own, so the owner can check them in the pull request.")
+    assumption_rule = ("Keep an assumption only where the ticket still leaves it open. End `plan` with an \"Assumed\" list "
+                       "of every choice the ticket leaves open, these and your own, so the owner can check them in the "
+                       "pull request.")
     if approval["sent_by"] == "owner":
         return (f"## Sent by its owner after triage\n\nIts owner sent this ticket to the pipeline from arete's triage "
                 f"board at {approval['ts']}, after reading triage's questions and assumptions. Any answers they gave are "
-                "in the comments, under \"Answers to triage's questions\", and an answer wins over what triage "
-                f"assumed. Triage assumed:{assumed}\n\n{keep}")
+                f"in their own comment that starts \"{TRIAGE_ANSWERS}\", and an answer wins over what triage assumed. "
+                f"Triage assumed:{assumed}\n\n{assumption_rule}")
     return (f"## Approved by triage, not by a person\n\nArete's triage approved this ticket on its own at "
-            f"{approval['ts']}, so its owner has not read it closely. Triage assumed:{assumed}\n\n{keep}")
+            f"{approval['ts']}, so its owner has not read it closely. Triage assumed:{assumed}\n\n{assumption_rule}")
 
 
 def triage_block(approval: dict | None) -> str:
