@@ -108,7 +108,7 @@ A command loop, a watch loop's `[run] script`, and a climb or search check run w
 | `ARETE_REPO_DIR` | the watch script: the checkout of `[run] repo`, empty without one |
 | `ARETE_TRIAL` | a command loop: `1` under `arete loop try` |
 
-A climb or search agent that finds the goal cannot or should not be met changes nothing and ends with a line that starts `Stop:` and says why. The run ends as done with that reason, and nothing is emitted.
+A climb or search agent that finds the goal cannot or should not be met changes nothing and ends with a line that starts `Stop:` and says why. The run ends as done with that reason, and nothing is emitted. The one exception is a search agent that stops while it narrows a fix the push screen held: that fix goes to a person as an approval, with the reason in its report.
 
 ## Findings from another loop
 
@@ -128,6 +128,8 @@ A push waits for approval in these cases:
 - When a rule in the `approve` table matches. `lines` holds a change over that many lines, `deletes` holds any file deletion, and `paths` holds a change to any file that matches one of its patterns.
 - With JEV on, when JEV reads the diff as more than a narrow fix: a chance of `[jev] screen_hold` (0.4) or more that it weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses; a chance of `irreversible_hold` (0.5) or more that it does harm a revert will not undo; or a reach past the fix it names of `screen_reach` (0.6) or more.
 - With JEV on, when the diff runs past the 12000 characters JEV reads, or when the JEV call fails.
+
+In a search loop, the JEV screen runs as soon as a try makes the check pass, and a hold goes back to the agent before it reaches a person. The agent's next try gets JEV's reason and the diff so far, and adjusts the change so the check still passes and only the fix remains. Each adjusted change that passes the check is screened again, and a try that fails the check goes back to the held change. The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for a person when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds. Only a JEV hold goes back to the agent. A rule in the list above, a diff past 12000 characters, and a failed JEV call go to a person at once, and a climb run's push is screened only when it is delivered.
 
 The approval says which rule held it. Approving it lands it then, and rejecting it deletes the branch. A push that fails to land, because it no longer rebases or the check fails after the rebase, stays listed as a failed approval with its error, so you can try it again or reject it.
 

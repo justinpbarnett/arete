@@ -774,21 +774,39 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         close_workspace(ws, keep_branch=kept and not run.trial)
 
 
+def search_outcome(run: LoopRun, ws: Workspace, history: list[str], tries: int, fix: str) -> dict:
+    check = run.loop.spec["check"]
+    return {**ws.outcome_fields(), "value": tries, "summary": f"`{check}` passes: {fix}",
+            "facts": f"`{check}` passes after {util.count(tries, 'try', 'tries')}",
+            "title": f"{run.loop.name}: {fix.split(': ', 2)[-1]}",
+            "report": f"Searched for a change that makes `{check}` pass.\n\n" + "\n".join(history)}
+
+
+def narrowing_goal(goal: str, ws: Workspace, held: str) -> str:
+    patch = util.git(["diff", "--no-renames", ws.start, "HEAD"], ws.wt)
+    return (f"{goal}\n\nThe change below makes the check exit 0, but the push screen holds it for a person: "
+            f"{held}\n\n```diff\n{patch}\n```\n\nAdjust the change so the check still exits 0 and the screen "
+            f"has nothing to hold: fix only the failure above, and leave alone every protection, name and behavior "
+            f"the fix does not need. When the fix needs what the screen holds, change nothing and end with one line "
+            f"that starts `{STOP_WORD}` and says why; a person then reviews the change as it stands.")
+
+
 @loops.runs_kind("search")
 def search_loop(run: LoopRun) -> tuple[str, str]:
     spec = run.loop.spec
     files = loops.as_list(spec.get("files"))
     ws = open_workspace(run)
-    hit, stopped = False, ""
+    fix, held, stopped, tries = "", "", "", 0
     try:
         code, text = shell(run, spec["check"], ws.wt)
         if code == 0:
             return "done", f"`{spec['check']}` already passes on {ws.base}"
         history = [f"- base: exit {code}: {util.last_line(text, 300)}"]
-        goal = f"Make `{spec['check']}` exit 0. It exits {code} now, ending with:\n\n```\n{util.tail(text, 1500)}\n```"
+        goal = (f"Make `{spec['check']}` exit 0. It exits {code} on {ws.base}, ending with:\n\n"
+                f"```\n{util.tail(text, 1500)}\n```")
         for i in range(1, run.loop.tries + 1):
             try:
-                idea, why_not = try_once(run, ws, i, goal, history, files)
+                idea, why_not = try_once(run, ws, i, narrowing_goal(goal, ws, held) if held else goal, history, files)
             except OverBudget as e:
                 if i == 1:
                     raise
@@ -797,32 +815,35 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             except StoppedByAgent as e:
                 history.append(f"- try {i}: stopped: {e}")
                 run.log("stop", f"try {i}: the agent stopped the run: {e}")
-                stopped = str(e)
+                stopped, tries = str(e), i
                 break
+            tries = i
             if not idea:
                 history.append(f"- try {i}: {why_not}")
                 run.log("try", f"try {i}: {why_not}")
                 continue
             code, text = shell(run, spec["check"], ws.wt)
-            if code == 0:
-                commit(ws.wt, commit_message(run, ws, idea[:72]))
-                history.append(f"- try {i}: hit: {idea}")
-                run.log("hit", f"try {i}: {idea}")
-                hit = True
+            if code != 0:
+                revert(ws.wt)
+                history.append(f"- try {i}: miss, exit {code}: {util.last_line(text, 200)}: {idea}")
+                run.log("miss", f"try {i}: exit {code}: {idea}")
+                continue
+            commit(ws.wt, commit_message(run, ws, idea[:72]))
+            fix = f"try {i}: hit: {idea}"
+            history.append(f"- {fix}")
+            run.log("hit", f"try {i}: {idea}")
+            held = "" if run.trial else emits.objection(run.loop, run.id, search_outcome(run, ws, history, i, fix),
+                                                        run.cfg)
+            if not held:
                 break
-            revert(ws.wt)
-            history.append(f"- try {i}: miss, exit {code}: {util.last_line(text, 200)}: {idea}")
-            run.log("miss", f"try {i}: exit {code}: {idea}")
-        if not hit:
+            history.append(f"- try {i}: held by the push screen: {held}")
+            run.log("held", f"try {i}: {held}")
+        if not fix:
             return "done", f"the agent stopped the run: {stopped}" if stopped else \
-                f"no hit in {util.count(len(history) - 1, 'try', 'tries')}"
-        summary = f"`{spec['check']}` passes: {history[-1][2:]}"
-        outcome = {**ws.outcome_fields(), "value": len(history) - 1, "summary": summary,
-                   "facts": f"`{spec['check']}` passes after {util.count(len(history) - 1, 'try', 'tries')}",
-                   "title": f"{run.loop.name}: {history[-1].split(': ', 2)[-1]}",
-                   "report": f"Searched for a change that makes `{spec['check']}` pass.\n\n" + "\n".join(history)}
+                f"no hit in {util.count(tries, 'try', 'tries')}"
+        outcome = search_outcome(run, ws, history, tries, fix)
         drop_worktree(ws)
         emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
-        return "done", summary
+        return "done", outcome["summary"]
     finally:
-        close_workspace(ws, keep_branch=hit and not run.trial)
+        close_workspace(ws, keep_branch=bool(fix) and not run.trial)

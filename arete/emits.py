@@ -201,7 +201,7 @@ class Push(Emit):
                 "about": plain(outcome.get("title", ""), 120), "story": plain(outcome.get("report", ""), 6000),
                 "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src), start, branch)}
 
-    def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
+    def ruled(self, spec: dict, item: dict, cfg: config.Config) -> str:
         repo = config_repo(cfg, item["repo"])
         layer = config.load_layer(repo.layer_dir if repo else Path(item["workdir"]) / ".agents")
         if layer.trust_level != "automerge":
@@ -218,12 +218,24 @@ class Push(Emit):
             return f"deletes {', '.join(item['deleted'][:5])}"
         if touched := [f for f in item["files"] if util.matches_any(f, as_list(rules.get("paths")))]:
             return f"touches {', '.join(touched[:5])}"
-        if not jev.ready(cfg, [repo]):
-            return ""
-        if len(patch := item.get("patch", "")) > PATCH_SHOWN:
+        if jev.ready(cfg, [repo]) and len(item.get("patch", "")) > PATCH_SHOWN:
             return f"the diff runs past the {PATCH_SHOWN} characters JEV reads, so a person reads it whole"
-        return jev.screen(patch, item.get("about") or item["title"], cfg,
-                          trace=(item.get("env", {}).get("ARETE_RUN_ID", ""), "push screen jev"))
+        return ""
+
+    def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
+        if why := self.ruled(spec, item, cfg):
+            return why
+        try:
+            return self.objection(item, cfg)
+        except jev.Unjudged as e:
+            return f"JEV could not judge the diff, so a person decides: {e}"
+
+    def objection(self, item: dict, cfg: config.Config) -> str:
+        if not jev.ready(cfg, [config_repo(cfg, item["repo"])]):
+            return ""
+        found = jev.screen(item.get("patch", ""), item.get("about") or item["title"], cfg,
+                           trace=(item.get("env", {}).get("ARETE_RUN_ID", ""), "push screen jev"))
+        return f"JEV holds it: {'; '.join(found)}" if found else ""
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         src, base = Path(item["workdir"]), item["base"]
@@ -405,6 +417,20 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                     if emit.kept_when_failed:
                         log("emit", f"kept as approval #{state.add_approval(loop.name, run_id, delivery, what, str(e))}"
                                     f" to try again or reject")
+
+
+def objection(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> str:
+    push = EMITS["push"]
+    for spec in loop.emits:
+        if spec["type"] != "push" or not push.batches([], outcome):
+            continue
+        item = push.render(loop, run_id, spec, [], outcome)
+        try:
+            if not push.ruled(spec, item, cfg) and (why := push.objection(item, cfg)):
+                return why
+        except jev.Unjudged:
+            continue
+    return ""
 
 
 def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -> str:
