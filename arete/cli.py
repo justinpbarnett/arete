@@ -194,7 +194,7 @@ def cmd_events(args) -> int:
 
     evs = hook.read_events(args.hours)
     if args.raw:
-        for e in evs[-args.limit:]:
+        for e in evs[max(len(evs) - args.limit, 0):]:
             print(json.dumps(e))
         return 0
     c = Counter(f"{e.get('kind')}/{e.get('cls')}" for e in evs)
