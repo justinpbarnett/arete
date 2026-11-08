@@ -207,8 +207,8 @@ def check_events(cfg: config.Config, skill_names: list[str]) -> list[Finding]:
     if month:
         span = (util.now() - util.parse_iso(month[0]["ts"])).days
         if span >= 21:
-            used = {e.get("detail") for e in month if e.get("kind") == "skill"}
-            idle = sorted(n for n in set(skill_names) if not any(n in (u or "") for u in used))
+            used = {(e.get("detail") or "").lstrip("/").rsplit(":", 1)[-1] for e in month if e.get("kind") == "skill"}
+            idle = sorted(set(skill_names) - used)
             if idle:
                 out.append(Finding("skills", "info", "unused", f"not invoked in {span} days: {', '.join(idle)}"))
     return out
