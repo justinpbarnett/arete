@@ -140,11 +140,14 @@ def check_hooks(cfg: config.Config) -> list[Finding]:
     for f, plugin_root in settings_files(cfg):
         rel = paths.short_path(f)
         try:
-            data = json.loads(f.read_text())
+            commands = hook_commands(json.loads(f.read_text()))
         except (json.JSONDecodeError, OSError) as e:
             out.append(Finding("hooks", "fail", rel, f"does not parse: {e}"))
             continue
-        for event, cmd in hook_commands(data):
+        except (AttributeError, TypeError) as e:
+            out.append(Finding("hooks", "fail", rel, f"hooks are not in the shape Claude Code reads: {e}"))
+            continue
+        for event, cmd in commands:
             missing = []
             for rx, resolve in HOOK_PATHS:
                 for m in rx.finditer(cmd):

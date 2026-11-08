@@ -6,6 +6,8 @@ import sys
 from . import gh, state, util
 
 LABEL = "arete-alert"
+NOTIFY_SCRIPT = ("-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+                 "-e", "end run")
 SECRETISH = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
 
 
@@ -18,11 +20,11 @@ def sanitize(text: str, n: int = 200) -> str:
 
 
 def notify(title: str, message: str) -> None:
-    msg, title = message.replace('"', "'")[:200], title.replace('"', "'")[:100]
+    msg, title = message[:200], title[:100]
     if sys.platform == "darwin":
-        util.sh(["osascript", "-e", f'display notification "{msg}" with title "{title}"'], timeout=10)
+        util.sh(["osascript", *NOTIFY_SCRIPT, "--", msg, title], timeout=10)
     else:
-        util.sh(["notify-send", title, msg], timeout=10)
+        util.sh(["notify-send", "--", title, msg], timeout=10)
 
 
 def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = False) -> str:
