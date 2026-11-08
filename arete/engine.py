@@ -211,9 +211,12 @@ def weakest_trust(events: list[dict]) -> str:
     return loops.TRUST_ORDER[min((loops.trust_rank(e.get("trust")) for e in events), default=loops.trust_rank("internal"))]
 
 
+def fingerprint_text(f: dict) -> str:
+    return " ".join(str(f.get("fingerprint") or f.get("title") or "").split())
+
+
 def fingerprint_key(loop: Loop, f: dict) -> str:
-    text = re.sub(r"\s+", " ", str(f.get("fingerprint") or f.get("title") or "")).strip().lower()
-    return hashlib.sha1(f"{loop.name}\n{text}".encode()).hexdigest()[:20]
+    return hashlib.sha1(f"{loop.name}\n{fingerprint_text(f).lower()}".encode()).hexdigest()[:20]
 
 
 def last_number(text: str) -> float | None:
@@ -389,8 +392,8 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
         if run.trial:
             is_new = not state.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
-            is_new = state.record_finding(run.loop.name, f["fingerprint_key"], emits.plain(f.get("title"), 200), "",
-                                          run.id)
+            is_new = state.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
+                                          emits.plain(f.get("title"), 200), "", run.id)
         run.log("finding", f"{'new' if is_new else 'seen before'}: {emits.plain(f.get('title'), 200)}")
         if is_new:
             fresh.append(f)
@@ -433,6 +436,11 @@ def classify(run: LoopRun, events: list[dict]) -> list[dict]:
     return kept
 
 
+def known_finding(row: dict) -> str:
+    title = emits.plain(row["title"], 160)
+    return f"- `{row['fingerprint_text']}`: {title}" if row.get("fingerprint_text") else f"- {title}"
+
+
 def watch_prompt(run: LoopRun, events: list[dict], memory: dict) -> str:
     loop = run.loop
     known = state.findings(loop.name, KNOWN_FINDINGS_SHOWN)
@@ -441,8 +449,9 @@ def watch_prompt(run: LoopRun, events: list[dict], memory: dict) -> str:
     parts.append("## Memory from the last run\n\n" + (fenced(memory) if memory else "Nothing yet; this is the first "
                                                                                    "run."))
     if known:
-        parts.append("## Findings already reported\n\nReuse the same fingerprint when you find one of these again, so "
-                     "it is not reported twice.\n\n" + "\n".join(f"- {emits.plain(k['title'], 160)}" for k in known))
+        parts.append("## Findings already reported\n\nWhen you find one of these again, give it the fingerprint in "
+                     "backticks here, word for word, so it is not reported twice.\n\n"
+                     + "\n".join(known_finding(k) for k in known))
     if events:
         sources_seen = sorted({e.get("type", "") for e in events})
         parts.append(f"## Input\n\nThe {util.count(len(events), 'event')} below ({', '.join(sources_seen)}) came from "

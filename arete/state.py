@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS loop_state (
 CREATE TABLE IF NOT EXISTS findings (
     loop TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
+    fingerprint_text TEXT DEFAULT '',
     title TEXT,
     url TEXT,
     run_id TEXT,
@@ -221,6 +222,7 @@ CREATE TABLE IF NOT EXISTS triage (
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
               ("triage", "code", "ALTER TABLE triage ADD COLUMN code INTEGER"),
+              ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
@@ -362,11 +364,12 @@ def finding_seen(loop: str, fingerprint: str) -> bool:
             is not None
 
 
-def record_finding(loop: str, fingerprint: str, title: str, url: str, run_id: str) -> bool:
+def record_finding(loop: str, fingerprint: str, fingerprint_text: str, title: str, url: str, run_id: str) -> bool:
     with db() as c:
         before = c.total_changes
-        c.execute("INSERT OR IGNORE INTO findings (loop, fingerprint, title, url, run_id, first_seen, last_seen) "
-                  "VALUES (?,?,?,?,?,?,?)", (loop, fingerprint, title, url, run_id, util.iso(), util.iso()))
+        c.execute("INSERT OR IGNORE INTO findings (loop, fingerprint, fingerprint_text, title, url, run_id, first_seen, "
+                  "last_seen) VALUES (?,?,?,?,?,?,?,?)",
+                  (loop, fingerprint, fingerprint_text, title, url, run_id, util.iso(), util.iso()))
         fresh = c.total_changes > before
         if not fresh:
             c.execute("UPDATE findings SET seen = seen + 1, last_seen = ? WHERE loop = ? AND fingerprint = ?",
