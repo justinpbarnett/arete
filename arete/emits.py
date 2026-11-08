@@ -220,9 +220,10 @@ class Push(Emit):
             return f"touches {', '.join(touched[:5])}"
         if not jev.ready(cfg, [repo]):
             return ""
-        risk = jev.risk(item.get("patch", ""), item.get("about") or item["title"], cfg,
-                        trace=(item.get("env", {}).get("ARETE_RUN_ID", ""), "push risk jev"))
-        return risk.hold if risk else ""
+        if len(patch := item.get("patch", "")) > PATCH_SHOWN:
+            return f"the diff runs past the {PATCH_SHOWN} characters JEV reads, so a person reads it whole"
+        return jev.screen(patch, item.get("about") or item["title"], cfg,
+                          trace=(item.get("env", {}).get("ARETE_RUN_ID", ""), "push screen jev"))
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         src, base = Path(item["workdir"]), item["base"]

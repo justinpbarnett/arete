@@ -126,7 +126,8 @@ A push waits for approval in these cases:
 - Always, when it touches a path the repo denies: `.agents/config.toml`, `.github/workflows/`, `.env` files, `.claude/`, and the layer's `limits.deny`.
 - When `approve = true`.
 - When a rule in the `approve` table matches. `lines` holds a change over that many lines, `deletes` holds any file deletion, and `paths` holds a change to any file that matches one of its patterns.
-- With JEV on, when JEV rates the diff at or over `[jev] risk_hold`, or reads it as a change a revert will not undo.
+- With JEV on, when JEV reads the diff as more than a narrow fix: a chance of `[jev] screen_hold` (0.4) or more that it weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses; a chance of `irreversible_hold` (0.5) or more that it does harm a revert will not undo; or a reach past the fix it names of `screen_reach` (0.6) or more.
+- With JEV on, when the diff runs past the 12000 characters JEV reads, or when the JEV call fails.
 
 The approval says which rule held it. Approving it lands it then, and rejecting it deletes the branch. A push that fails to land, because it no longer rebases or the check fails after the rebase, stays listed as a failed approval with its error, so you can try it again or reject it.
 
