@@ -16,6 +16,7 @@ TRIES = 5
 METRIC_RULE = re.compile(r"^\s*([\w.\-/]+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?)\s*$")
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
+CLIMB_GOALS = {"max": True, "higher": True, "up": True, "min": False, "lower": False, "down": False}
 FINDING_EVENT = "finding"
 GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 
@@ -318,6 +319,10 @@ def as_argv(value) -> list[str]:
     return shlex.split(value) if isinstance(value, str) else [str(v) for v in value]
 
 
+def climb_goal(spec: dict) -> str:
+    return str(spec.get("goal", "max")).strip().lower()
+
+
 def as_list(value) -> list[str]:
     if not value:
         return []
@@ -351,6 +356,8 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append(f"[trigger] metric would never fire: the loop {why}")
     if kind:
         problems += kind.problems(loop, remote)
+    if loop.kind == "climb" and (goal := climb_goal(loop.spec)) not in CLIMB_GOALS:
+        problems.append(f"[climb] goal '{goal}' is not one of {', '.join(CLIMB_GOALS)}")
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
     if loop.agent:

@@ -716,7 +716,7 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
 @loops.runs_kind("climb")
 def climb_loop(run: LoopRun) -> tuple[str, str]:
     spec = run.loop.spec
-    higher = str(spec.get("goal", "max")).lower() not in ("min", "lower", "down")
+    higher = loops.CLIMB_GOALS[loops.climb_goal(spec)]
     files = loops.as_list(spec.get("files"))
 
     def measure(wt: Path) -> float | None:
