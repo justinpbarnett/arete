@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import alerts, config, diffguard, gh, paths, sources, state, util
+from . import alerts, config, diffguard, gh, jev, paths, sources, state, util
 from .loops import FINDING_EVENT, Loop, as_list, check_env, find, worktree_kinds
 
 DIGESTS_DIR = paths.STATE_DIR / "digests"
@@ -60,6 +60,13 @@ class Failed(RuntimeError):
     pass
 
 
+def config_repo(cfg: config.Config, name: str) -> config.Repo | None:
+    try:
+        return cfg.repo(name)
+    except config.UnknownRepo:
+        return next((r for r in cfg.repos if r.github == name), None)
+
+
 class Emit:
     kept_when_failed = False
 
@@ -99,7 +106,17 @@ class Ticket(Emit):
         f = findings[0]
         return {"repo": spec["repo"], "title": plain(spec.get("prefix", "") + f["title"], 120),
                 "body": ticket_body(loop, run_id, f, outcome.get("trust", "")),
-                "labels": as_list(spec.get("labels", ["agent"]))}
+                "labels": as_list(spec.get("labels", ["agent"])), "trust": outcome.get("trust", ""), "run": run_id}
+
+    def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
+        if why := super().held(spec, item, cfg):
+            return why
+        if item.get("trust") != "untrusted" or not jev.ready(cfg, [config_repo(cfg, item["repo"])]):
+            return ""
+        a = jev.injection(f"{item['title']}\n\n{item['body']}", cfg, trace=(item.get("run", ""), "ticket screen jev"))
+        if a and a.yes >= cfg.jev.injection:
+            return f"it came from outside text and JEV reads it as instructions to an agent ({a.note()})"
+        return ""
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         repo = sources.github_name(cfg, item["repo"])
@@ -185,11 +202,8 @@ class Push(Emit):
                 "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src), start, branch)}
 
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
-        try:
-            layer_dir = cfg.repo(item["repo"]).layer_dir
-        except config.UnknownRepo:
-            layer_dir = Path(item["workdir"]) / ".agents"
-        layer = config.load_layer(layer_dir)
+        repo = config_repo(cfg, item["repo"])
+        layer = config.load_layer(repo.layer_dir if repo else Path(item["workdir"]) / ".agents")
         if layer.trust_level != "automerge":
             return f"the trust level of {item['repo']} is pr, so a person lands each push"
         if denied := [f for f in item["files"] if util.matches_any(f, diffguard.denied_paths(layer))]:
@@ -204,7 +218,11 @@ class Push(Emit):
             return f"deletes {', '.join(item['deleted'][:5])}"
         if touched := [f for f in item["files"] if util.matches_any(f, as_list(rules.get("paths")))]:
             return f"touches {', '.join(touched[:5])}"
-        return ""
+        if not jev.ready(cfg, [repo]):
+            return ""
+        risk = jev.risk(item.get("patch", ""), item.get("about") or item["title"], cfg,
+                        trace=(item.get("env", {}).get("ARETE_RUN_ID", ""), "push risk jev"))
+        return risk.hold if risk else ""
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         src, base = Path(item["workdir"]), item["base"]

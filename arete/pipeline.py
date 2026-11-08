@@ -22,6 +22,7 @@ from . import (
     config,
     diffguard,
     gh,
+    jev,
     jira,
     paths,
     record,
@@ -938,8 +939,14 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
                 + ("" if not opened else draft_note(draft_why, verified)))
     if not draft_why and layer.trust_level == "automerge":
+        risk = jev.risk(staged.patch, f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,
+                        trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [repo]) else None
         for c in opened:
             try:
+                if risk and risk.hold:
+                    run.log(f"automerge left off on {c.pr}: {risk.hold}")
+                    gh.pr_comment(c.pr, f"Automerge stays off for this PR: {risk.hold}. A person merges it.")
+                    continue
                 gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
                 run.log(f"automerge enabled on {c.pr}")
             except gh.GhError as e:

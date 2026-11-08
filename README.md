@@ -68,6 +68,20 @@ arete session attach ID | stop ID | list
 
 `arete costs` shows model spend by model, runner and loop.
 
+## JEV
+
+JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads text and answers a yes or no question, picks one of a few labels, or rates on a scale, each with a confidence, fast and for $0.042 per million input tokens. Arete asks it first where a classifier can settle the question, and leaves the question to the model only when JEV is unsure:
+
+- Loops: a loop fed by outside text drops each event JEV reads as instructions to an agent before the agent sees it, and a ticket emit drawn from outside text waits for approval on the same check. A `[classify]` step asks JEV first and sends only the events it is unsure of to the model. A finding JEV matches to a known one, even worded another way, counts as that finding, not a new one.
+- Risk: a `push` emit under `automerge`, and the automerge of a pipeline PR, wait for a person when JEV rates the diff risky (how much depends on what it changes, how near it comes to credentials, money or data, and how far it strays from its description), or reads it as a change a revert will not undo.
+- Triage: a ticket JEV is sure asks for no change to a repo settles as not code work with no model call.
+- Miner: the digest leaves out the transcripts JEV is sure hold nothing to learn from, so it has room for the ones that do.
+- Sessions: when a session's context passes `compact_tokens` and JEV is sure the new message starts a different task, the session compacts before it takes the turn.
+- Guard: each local claude agent that can read files, write files or run commands runs `arete guard` as a PreToolUse hook. With no JEV call, it keeps the agent out of secret files (`.env`, keys, `~/.ssh`, cloud credentials), whether the agent reads or writes one or names one in a command. With JEV it also stops a command that would do harm git cannot undo (throw away uncommitted work, delete outside the working folder, force push, publish, drop data, send a message) and a command that would show or send a credential. A plain push or a new pull request goes through. When anything goes wrong, it lets the call through. `[jev] guard = false` turns it off.
+- `arete ask QUESTION [PATHS] [--choice A B] [--score LOW HIGH] [-r] [--only ANSWER] [--json]` asks JEV about piped text, or about each file, sixteen at a time. Agents that can run commands get it, with a short note on when it pays: sort files before reading them, sort a test failure before digging in, check a diff against its task. An agent may ask only about files inside its working folder, and never about secret files.
+
+JEV uses the OpenRouter key the pi runner uses: `OPENROUTER_API_KEY` in `~/.config/arete/pi.env`, or in arete's environment. With no key, with JEV off, or when a call fails, each step does what it did before JEV. Each call is a step of its run on the `jev` runner, priced at what OpenRouter charged; a guard check is a step only when it stops something. JEV sends the text it judges to OpenRouter and TypeSafe: events, tickets, diffs, transcripts, commands and files. Set `jev = false` on a repo whose code or tickets must not leave the machine.
+
 ## Runs, sleep and the network
 
 Poll does not wait for a run. It starts each run as its own detached `arete run` process and returns in about a second, so a long run never holds up the next poll. `max_parallel` sets how many runs go at once on the machine, manual runs included. A run frees its slot while it waits on its PR's CI, and takes one back before a CI fix step. A run that waits to take its slot back goes ahead of new runs: while it waits, no new run starts, even on a free slot. It reads `max_parallel` again every 30 seconds, so a raised limit lets it go at once. `arete status` lists it as waiting for a run slot, and a run in its CI wait as waiting on CI without a run slot. Poll takes tickets round robin across repos, and a repo with a run going gets no second one.
@@ -108,6 +122,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
+| `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the second also the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost. |
 
 | Repo field | Default | Meaning |
@@ -118,6 +133,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `tracker` | `"github"` | `github` for issues in the repo, `jira` for tickets in Jira. PRs are on GitHub either way. |
 | `jira_project` | `[jira] project` | Jira project for this repo. |
 | `jira_label` | `repo-<github repo name>` | Route label that sends a Jira ticket to this repo. |
+| `jev` | `true` | JEV may read this repo's events, tickets, diffs, transcripts and files. `false` keeps them off OpenRouter and TypeSafe. See [JEV](#jev). |
 | `layer` | `<path>/.agents` | Folder that holds the repo's layer. Point it outside the repo to keep arete files out of a shared repo. |
 | `[[repo.part]]` | none | One per git repo under `path`, for a product split over several repos: `dir` (relative to `path`) and `github`. See [Parts](#parts). |
 
@@ -318,7 +334,7 @@ Arete then runs each eval suite twice on the same day, once with main's prompts 
 - The repo it belongs in, and a plan of up to 6 steps.
 - Not code work: a meeting, research, a decision, an account, a check done by hand. One line with why, and nothing more.
 
-The step may read only inside the repos it is given, has no MCP servers, and costs at most $0.30 a ticket. A ticket gets a new call only when its updated time changes, at most 20 calls a refresh; the rest wait for the next. `--refresh` triages what changed, then shows the board; `--refresh --dry-run` lists what it would triage with no model call and no writes; `arete triage REF` shows one ticket in full. The `triage` loop refreshes hourly under serve.
+The step may read only inside the repos it is given, has no MCP servers, and costs at most $0.30 a ticket. A ticket gets a new call only when its updated time changes, at most 20 calls a refresh; the rest wait for the next. With [JEV](#jev) on, a ticket JEV is sure asks for no change to a repo settles as not code work with no model call, and does not count toward the 20. `--refresh` triages what changed, then shows the board; `--refresh --dry-run` lists what it would triage with no model call and no writes; `arete triage REF` shows one ticket in full. The `triage` loop refreshes hourly under serve.
 
 When `alert_repo` is set and private, the board is also one issue there, "[arete] triage", labeled `arete-triage`, edited only when the board changes. A public or unreadable `alert_repo` gets nothing, and the output says why. Triage never adds `agent` and never writes to a ticket: the label is your approval, and the board only tells you where it would pay off.
 
@@ -346,3 +362,4 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 - PRs to public repos cite run ids, never transcript text.
 - Triage reads tickets and never writes to them. Its board goes only to a private repo.
 - Each verifier server runs on its own port and is stopped with its whole process group after the step.
+- A JEV answer settles a question alone only at or over `confidence`; under it, the model decides. A hold or a guard stop, which a person can undo, takes a lower line.

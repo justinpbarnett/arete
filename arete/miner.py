@@ -14,6 +14,7 @@ from . import (
     evals,
     gh,
     hook,
+    jev,
     paths,
     record,
     runner,
@@ -31,6 +32,9 @@ from .util import git
 MAX_PROPOSALS = 8
 MIN_CONFIDENCE = 0.6
 HEADLESS_ENTRYPOINT = "sdk-cli"
+LEARNABLE = ("In this digest of a person working with a coding agent, does the person correct the agent, interrupt it, "
+             "reject a tool call, repeat an instruction they gave before, or state a lasting preference or fact about "
+             "themselves, or does the agent hit the same failure more than once?")
 MAX_MINER_DIFF = 200
 GLOBAL_GLOBS = ["skills/**", "CLAUDE.md", "AGENTS.md"]
 NEVER = ["**/settings.json", "**/settings.local.json", ".github/**", ".agents/config.toml", "**/.env*"]
@@ -184,6 +188,19 @@ def collect(hours: float) -> list[dict]:
         if d:
             out.append(d)
     return sorted(out, key=lambda d: -d["signal"])
+
+
+def worth_mining(cfg: config.Config, run_id: str, sessions: list[dict]) -> list[dict]:
+    asked = [s for s in sessions if cfg.jev_allowed([cfg.repo_for_path(s["cwd"]) if s["cwd"] else None])]
+    if not asked or not jev.ready(cfg):
+        return sessions
+    replies = jev.ask_many([("\n".join(s["items"]), {"learn": jev.yes_no(LEARNABLE)}) for s in asked], cfg,
+                           trace=(run_id, "miner jev"))
+    quiet = {s["session"] for s, r in zip(asked, replies, strict=True)
+             if (a := r.answers.get("learn")) and a.value is False and a.sure(cfg.jev.confidence)}
+    if quiet:
+        print(f"{util.iso()} miner: JEV set aside {util.count(len(quiet), 'session')} with nothing to learn from")
+    return [s for s in sessions if s["session"] not in quiet]
 
 
 def render_digest(cfg: config.Config, sessions: list[dict], limit: int) -> tuple[str, int]:
@@ -434,7 +451,7 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
 def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bool) -> int:
     if not dry_run:
         sync_feedback()
-    sessions = collect(hours)
+    sessions = worth_mining(cfg, run_id, collect(hours))
     digest, used = render_digest(cfg, sessions, cfg.miner_max_digest_chars)
     print(f"{util.iso()} miner: {len(sessions)} sessions with signal, {used} in digest, {len(digest)} chars")
     audit_wants_fixes = not auditor.latest_findings().startswith("(")

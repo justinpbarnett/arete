@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import alerts, config, gh, jira, paths, runner, state, tracker, util
+from . import alerts, config, gh, jev, jira, paths, runner, state, tracker, util
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import prompt
 
@@ -41,6 +41,7 @@ SCHEMA = {
     "required": ["asks_for", "ready", "questions", "size", "repo", "plan", "why"],
 }
 WAITING = f"waiting: more than {MAX_CALLS} tickets were due in one refresh"
+ASKS_FOR_CODE = "Does this ticket ask for a change to code, configuration or documentation in a software repository?"
 EARLIEST = datetime.min.replace(tzinfo=UTC)
 READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED = "Ready", "With questions", "Not code work", "Not triaged"
 STANDINGS = (READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED)
@@ -208,8 +209,24 @@ def record_file(ref: str) -> Path:
     return TICKET_RECORDS_DIR / f"{tracker.safe_filename(ref)}.md"
 
 
-def triage_one(cfg: config.Config, src: TriageSource, c: Candidate) -> tuple[dict | None, float, str]:
-    text = prompt("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=src.ticket_text(c),
+def not_code_by_jev(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str) -> dict | None:
+    if not jev.ready(cfg, list(src.repos)):
+        return None
+    reply = jev.ask(f"{c.title}\n\n{ticket}", {"code": jev.yes_no(ASKS_FOR_CODE)}, cfg, trace=("", f"triage {c.ref} jev"))
+    a = reply.answers.get("code")
+    if not a or a.value or not a.sure(cfg.jev.confidence):
+        return None
+    cost = reply.cost_usd
+    answer = {"asks_for": NOT_CODE, "ready": False, "questions": [], "plan": [], "repo": "",
+              "why": f"JEV is sure it asks for no change to a repo ({a.note()})"}
+    TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+    record_file(c.ref).write_text(f"{ticket}\n\n## Triage result (${cost:.5f})\n\n```json\n"
+                                  f"{json.dumps(answer, indent=2)}\n```\n")
+    return settle(src, c, answer, cost)
+
+
+def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str) -> tuple[dict | None, float, str]:
+    text = prompt("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=ticket,
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -286,18 +303,35 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
             print(f"{util.iso()} {errors[-1]}")
     todo = sorted(((src, c) for src in srcs for c in read.get(src.name, []) if due(c, old.get(c.ref))),
                   key=lambda sc: moment(sc[1].updated), reverse=True)
-    now, later = todo[:MAX_CALLS], todo[MAX_CALLS:]
     if dry_run:
-        preview(srcs, read, old, now, later)
+        preview(srcs, read, old, todo[:MAX_CALLS], todo[MAX_CALLS:])
         return 1 if errors else 0
 
     answered: dict[str, dict] = {}
     failed: dict[str, str] = {}
+    waiting: list[str] = []
     spent = 0.0
-    for src, c in now:
+    calls = 0
+    for src, c in todo:
+        if calls >= MAX_CALLS:
+            waiting.append(c.ref)
+            continue
         print(f"{util.iso()} {c.ref}: triaging", flush=True)
         try:
-            answer, cost, error = triage_one(cfg, src, c)
+            ticket = src.ticket_text(c)
+        except tracker.ERRORS as e:
+            calls += 1
+            failed[c.ref] = f"could not read it: {e}"
+            print(f"{util.iso()} {c.ref}: triage failed: {failed[c.ref]}")
+            continue
+        if settled := not_code_by_jev(cfg, src, c, ticket):
+            answered[c.ref] = settled
+            spent += settled["cost"]
+            print(f"{util.iso()} {c.ref}: {verdict(settled)} by JEV, no model call")
+            continue
+        calls += 1
+        try:
+            answer, cost, error = triage_one(cfg, src, c, ticket)
         except tracker.ERRORS as e:
             answer, cost, error = None, 0.0, f"could not read it: {e}"
         spent += cost
@@ -307,7 +341,6 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         else:
             failed[c.ref] = error
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
-    waiting = [c.ref for _, c in later]
     for src in srcs:
         if src.name in read:
             state.triage_replace(src.name, [
@@ -330,7 +363,7 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         posted = f"not posted: {e}"
     meta.update(posted=posted)
     util.write_json(META_FILE, meta)
-    print(f"{util.iso()} triage: {util.count(len(now), 'model call')} (${spent:.3f}), "
+    print(f"{util.iso()} triage: {util.count(calls, 'model call')} (${spent:.3f}), "
           f"{len(failed)} failed, {len(waiting)} waiting; board {posted}")
     if waiting:
         print(f"waiting for the next refresh: {', '.join(waiting)}")

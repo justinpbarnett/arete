@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from . import devices, util
+from . import devices, paths, util
 from .agent import NO_SESSION, Result, Session, json_from_text
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -37,6 +37,8 @@ def run(
     add_dirs: list[Path] | None = None,
     mcp_config: str = "",
     remote: devices.Device | None = None,
+    settings: dict | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> Result:
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
     cmd = ["claude" if remote else binary(), "-p", "--output-format", "json", "--permission-mode", permission_mode]
@@ -62,10 +64,13 @@ def run(
         cmd += ["--add-dir", *map(str, add_dirs)]
     if mcp_config:
         cmd += ["--strict-mcp-config", "--mcp-config", mcp_config]
+    if settings:
+        cmd += ["--settings", json.dumps(settings)]
 
     env = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
     env["ARETE_AGENT"] = "1"
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    env.update(extra_env or {})
     if remote:
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
     try:
@@ -139,3 +144,16 @@ def scoped_to(roots: list[str], rules: list[str]) -> list[str]:
         family = PATH_RULE_OF.get(rule)
         scoped += [f"{family}({root}/**)" for root in roots] if family else [rule]
     return list(dict.fromkeys(scoped))
+
+
+def context_tokens(session_id: str) -> int:
+    for f in paths.CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
+        for line in reversed(f.read_text(errors="replace").splitlines()):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("type") == "assistant" and (usage := (entry.get("message") or {}).get("usage")):
+                return sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens",
+                                                             "cache_creation_input_tokens"))
+    return 0

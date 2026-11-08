@@ -216,6 +216,18 @@ def cmd_hook(args) -> int:
     return hook.main()
 
 
+def cmd_guard(args) -> int:
+    from . import guard
+
+    return guard.main()
+
+
+def cmd_ask(args) -> int:
+    from . import ask
+
+    return ask.main(args)
+
+
 def cmd_install(args) -> int:
     from . import install
 
@@ -683,6 +695,20 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
+
+    p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: keeps them out of secret files and, with JEV, "
+                                     "stops shell commands git cannot undo (reads a payload on stdin)")
+    p.set_defaults(fn=cmd_guard)
+
+    p = sub.add_parser("ask", help="put a yes or no question, a choice or a rating to JEV over piped text or files")
+    p.add_argument("question")
+    p.add_argument("paths", nargs="*", help="files, folders or globs; each file gets its own answer (default: stdin)")
+    p.add_argument("--choice", nargs="+", metavar="LABEL[=ABOUT]", help="answer with one of these labels")
+    p.add_argument("--score", nargs="+", metavar="LEVEL", help="rate on these levels, lowest first")
+    p.add_argument("-r", "--recursive", action="store_true", help="look inside folders all the way down")
+    p.add_argument("--only", metavar="ANSWER", help="print only the rows with this answer")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.set_defaults(fn=cmd_ask)
 
     p = sub.add_parser("install", help="run arete serve at login: one launchd agent on a Mac, one systemd user unit on "
                                        "Linux; retires the old per loop agents")

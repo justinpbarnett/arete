@@ -67,7 +67,8 @@ stale_hours = 3                # heartbeat alerts when the last good run is olde
 
 [classify]                     # a cheap yes or no per event before the main agent reads it
 prompt = "Is this error new and worth a look?"
-model = "haiku"
+model = "haiku"                # decides the events JEV is unsure of
+jev = true                     # false sends every event to the model
 
 [climb]
 measure = "python bench.py"    # prints a number
@@ -125,6 +126,7 @@ A push waits for approval in these cases:
 - Always, when it touches a path the repo denies: `.agents/config.toml`, `.github/workflows/`, `.env` files, `.claude/`, and the layer's `limits.deny`.
 - When `approve = true`.
 - When a rule in the `approve` table matches. `lines` holds a change over that many lines, `deletes` holds any file deletion, and `paths` holds a change to any file that matches one of its patterns.
+- With JEV on, when JEV rates the diff at or over `[jev] risk_hold`, or reads it as a change a revert will not undo.
 
 The approval says which rule held it. Approving it lands it then, and rejecting it deletes the branch. A push that fails to land, because it no longer rebases or the check fails after the rebase, stays listed as a failed approval with its error, so you can try it again or reject it.
 
@@ -132,6 +134,7 @@ The approval says which rule held it. Approving it lands it then, and rejecting 
 
 A watch loop fed by a source or a webhook reads text from outside, so it may only have the reading tools Read, Glob, Grep and LS.
 Its events reach the agent fenced as data, and a ticket it files is built from the finding fields, not from the event text.
+With JEV on, an event JEV reads as instructions to an agent is dropped before the agent sees it, and a ticket drawn from outside text that reads that way waits for approval.
 To act on what it finds, it emits a ticket labeled `agent` and the pipeline does the work under its own gates.
 Agents never run git writes; climb and search commit in their own worktree, and a `pr` or `push` emit pushes.
 

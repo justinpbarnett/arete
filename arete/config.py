@@ -36,6 +36,7 @@ class Repo:
     jira_label: str = ""
     layer: Path | None = None
     parts: list[Part] = field(default_factory=list)
+    jev: bool = True
 
     @property
     def layer_dir(self) -> Path:
@@ -52,6 +53,20 @@ class JiraConfig:
     project: str = ""
     transitions: dict[str, str] = field(default_factory=dict)
     landed: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class JevConfig:
+    enabled: bool = True
+    model: str = "jev-latest"
+    confidence: float = 0.8
+    injection: float = 0.5
+    risk_hold: float = 0.5
+    irreversible_hold: float = 0.5
+    secrets_hold: float = 0.55
+    risk_weights: dict[str, float] = field(default_factory=lambda: {"blast": 0.4, "sensitivity": 0.4, "surprise": 0.2})
+    guard: bool = True
+    compact_tokens: int = 120_000
 
 
 @dataclass
@@ -81,6 +96,7 @@ class Config:
     jobs: list[Job] = field(default_factory=list)
     probes: list[Probe] = field(default_factory=list)
     jira: JiraConfig = field(default_factory=JiraConfig)
+    jev: JevConfig = field(default_factory=JevConfig)
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
@@ -108,6 +124,18 @@ class Config:
             if holds_path and (best is None or len(str(rp)) > len(str(best.path.resolve()))):
                 best = r
         return best
+
+    def repo_for_work_dir(self, p: str | Path) -> Repo | None:
+        if found := self.repo_for_path(p):
+            return found
+        p, root = Path(p).resolve(), paths.WORKTREES_DIR.resolve()
+        if root not in p.parents:
+            return None
+        top = p.relative_to(root).parts[0]
+        return max((r for r in self.repos if top.startswith(f"{r.name}-")), key=lambda r: len(r.name), default=None)
+
+    def jev_allowed(self, repos: list[Repo | None]) -> bool:
+        return self.jev.enabled and all(r is None or r.jev for r in repos)
 
     def model(self, role: str) -> str:
         return self.models.get(role) or MODEL_FALLBACKS.get(role, "")
@@ -153,6 +181,22 @@ def load(path: Path | None = None) -> Config:
         transitions=transitions,
         landed={str(branch): str(target) for branch, target in (j.get("landed") or {}).items() if target},
     )
+    jv = data.get("jev", {})
+    cfg.jev = JevConfig(
+        enabled=bool(jv.get("enabled", True)),
+        model=str(jv.get("model", JevConfig.model)),
+        confidence=float(jv.get("confidence", JevConfig.confidence)),
+        injection=float(jv.get("injection", JevConfig.injection)),
+        risk_hold=float(jv.get("risk_hold", JevConfig.risk_hold)),
+        irreversible_hold=float(jv.get("irreversible_hold", JevConfig.irreversible_hold)),
+        secrets_hold=float(jv.get("secrets_hold", JevConfig.secrets_hold)),
+        risk_weights={**JevConfig().risk_weights, **{str(k): float(v) for k, v in (jv.get("risk_weights") or {}).items()}},
+        guard=bool(jv.get("guard", True)),
+        compact_tokens=int(jv.get("compact_tokens", JevConfig.compact_tokens)),
+    )
+    if bad := sorted(set(cfg.jev.risk_weights) - set(JevConfig().risk_weights)):
+        raise ValueError(f"[jev.risk_weights]: unknown weight {', '.join(bad)}; use "
+                         f"{', '.join(JevConfig().risk_weights)}")
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")
         if tracker not in ("github", "jira"):
@@ -175,6 +219,7 @@ def load(path: Path | None = None) -> Config:
                 jira_label=r.get("jira_label", ""),
                 layer=paths.expand(r["layer"]) if r.get("layer") else None,
                 parts=parts or ([Part("", github)] if github else []),
+                jev=bool(r.get("jev", True)),
             )
         )
     for j in data.get("job", []):

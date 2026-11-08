@@ -8,9 +8,11 @@ from datetime import timedelta
 from pathlib import Path
 
 from . import (
+    claude,
     config,
     control,
     devices,
+    jev,
     paths,
     record,
     runner,
@@ -26,6 +28,9 @@ TURN_TIMEOUT_SECONDS = 3600
 INBOX_POLL_SECONDS = 2
 SESSION_LOG = "sessions.log"
 SEEN_MODEL_DAYS = 30
+RECENT_CHARS = 8000
+SWITCHES_TASK = ("Does the new message start a different task from the recent work, so that the details of the recent "
+                 "work no longer matter for it?")
 
 
 @dataclass
@@ -164,6 +169,8 @@ def session_lock(session_id: str) -> str:
 
 def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, turn: int,
               resume: Session) -> Session:
+    log = SESSIONS_DIR / spec.id / "session.log"
+    recent = util.tail(log.read_text(errors="replace"), RECENT_CHARS) if log.exists() else ""
     log_line(spec, "you", prompt)
     left = None
     if spec.budget_usd:
@@ -171,6 +178,7 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
         if left <= runner.BUDGET_FLOOR_USD:
             log_line(spec, "error", f"the session budget of ${spec.budget_usd:g} is spent")
             return resume
+    resume = compacted(spec, cfg, device, prompt, recent, turn, resume)
     res = runner.run(prompt, spec.cwd, model=spec.model, runner=spec.runner, trace=(spec.id, f"turn {turn}"),
                      resume=resume, cfg=cfg, device=device, tools=spec.tools, allowed_tools=spec.tools,
                      disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left, timeout=TURN_TIMEOUT_SECONDS)
@@ -179,6 +187,27 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     log_line(spec, "reply" if res.ok else "error", (res.text.strip() or "(no text)") + f"\n{note}" if res.ok
              else f"{res.error.strip()} {note}")
     return res.session if res.session.id else resume
+
+
+def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, recent: str, turn: int,
+              resume: Session) -> Session:
+    if not resume.id or resume.runner != "claude" or device.remote or not recent:
+        return resume
+    if not jev.ready(cfg, [cfg.repo_for_work_dir(spec.cwd)]):
+        return resume
+    if (tokens := claude.context_tokens(resume.id)) < cfg.jev.compact_tokens:
+        return resume
+    switch = jev.ask(f"Recent work in this session:\n{recent}\n\nNew message:\n{prompt}",
+                     {"switch": jev.yes_no(SWITCHES_TASK)}, cfg, trace=(spec.id, f"turn {turn} switch jev")
+                     ).answers.get("switch")
+    if not switch or switch.value is not True or not switch.sure(cfg.jev.confidence):
+        return resume
+    res = runner.run("/compact", spec.cwd, model=spec.model, runner="claude", trace=(spec.id, f"turn {turn} compact"),
+                     resume=resume, cfg=cfg, device=device, timeout=TURN_TIMEOUT_SECONDS)
+    log_line(spec, "compact" if res.ok else "error",
+             f"compacted {tokens:,} tokens of context before a new task (JEV {switch.note()}) {runner.cost_note(res)}"
+             if res.ok else f"compaction failed: {util.first_line(res.error)}")
+    return res.session if res.ok and res.session.id else resume
 
 
 def execute(session_id: str) -> str:

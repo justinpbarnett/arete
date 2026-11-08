@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from . import claude, config, devices, pi, record, util
+from . import ask, claude, config, devices, guard, jev, pi, record, util
 from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, Result, Session
 
 RUNNERS = ("claude", "pi")
@@ -95,13 +95,31 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if target.remote:
         kw["remote"] = target
     which, name = route(model, runner or resume.runner)
+    run_id, step = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
+    if which == "claude" and not target.remote:
+        kw = local_claude(kw, cwd, cfg, run_id)
     started = time.monotonic()
     res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, **kw)
     res.runner = which
     res.model = res.model or name
     res.provider = res.provider or provider_of(res.model)
     res.cost_usd = priced(res, cfg)
-    run_id, step = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     if run_id:
         record.step(run_id, step, res, time.monotonic() - started)
     return res
+
+
+def local_claude(kw: dict, cwd: Path | str, cfg: config.Config, run_id: str) -> dict:
+    kw = {**kw, "extra_env": {"ARETE_RUN_ID": run_id} if run_id else {}}
+    if cfg.jev.guard and guard.wanted(kw.get("tools")):
+        kw["settings"] = guard.settings()
+    if runs_bash(kw) and jev.ready(cfg, [cfg.repo_for_work_dir(cwd)]):
+        kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), ask.rule()]
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), ask.note()]))
+    return kw
+
+
+def runs_bash(kw: dict) -> bool:
+    if (tools := kw.get("tools")) is not None:
+        return "Bash" in tools
+    return any(r == "Bash" or r.startswith("Bash(") for r in kw.get("allowed_tools") or [])
