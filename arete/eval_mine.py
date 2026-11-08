@@ -246,7 +246,7 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
         commit_layer(c.layer.dir, f"{c.repo.name}: eval {name}\n\n{summary}\n\nArete-Run: {run.id}")
         run.log(f"saved {paths.short_path(f)}")
         return paths.short_path(f)
-    base = gh.default_branch(c.repo.github)
+    base = c.layer.base_branch or gh.default_branch(c.repo.github)
     merged = set(Source(c.repo, f"origin/{base}").files(EVALS))
     pushed = set(git(["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/arete"], c.repo.path).split())
     name = free_name(wanted, lambda n: f"{EVALS}/{n}.toml" in merged or f"arete/evals-{n}" in pushed)
