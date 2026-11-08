@@ -735,19 +735,17 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
 
     def measure(wt: Path) -> tuple[float | None, str]:
         res = shell_result(run, spec["measure"], wt)
-        value = measured_number(res) if res.returncode == 0 else None
-        if value is not None:
-            return value, ""
-        failure = f"exited {res.returncode}" if res.returncode else "did not print a number"
-        last = util.last_line((res.stdout or "") + (res.stderr or ""), 200)
-        return None, f"{failure}: {last}" if last else failure
+        if res.returncode != 0:
+            return None, f"exited {res.returncode}"
+        value = measured_number(res)
+        return value, "" if value is not None else "did not print a number"
 
     ws = open_workspace(run)
     kept, stopped = False, ""
     try:
         baseline, why = measure(ws.wt)
         if baseline is None:
-            return "failed", f"on the base branch, `{spec['measure']}` {why}"
+            return "failed", f"`{spec['measure']}` {why} on the base branch"
         best, history = baseline, [f"- baseline: {number_text(baseline)}"]
         run.log("measure", f"baseline {number_text(baseline)}")
         goal = (f"Make `{spec['measure']}` print a {'higher' if higher else 'lower'} number. It prints "
