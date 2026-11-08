@@ -667,8 +667,15 @@ def commit(wt: Path, message: str) -> None:
     util.git([*identity, "commit", "-q", "--no-verify", "-m", message], wt)
 
 
+def drop_unstaged(wt: Path) -> None:
+    util.git(["checkout", "-q", "--", "."], wt, check=False)
+    util.git(["clean", "-fdq"], wt, check=False)
+
+
 def shell_result(run: LoopRun, command: str, wt: Path) -> subprocess.CompletedProcess:
-    return util.sh(command, cwd=wt, timeout=run.loop.timeout_minutes * 60, env=loops.check_env(run.loop, run.id))
+    res = util.sh(command, cwd=wt, timeout=run.loop.timeout_minutes * 60, env=loops.check_env(run.loop, run.id))
+    drop_unstaged(wt)
+    return res
 
 
 def shell(run: LoopRun, command: str, wt: Path) -> tuple[int, str]:
