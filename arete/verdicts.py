@@ -75,12 +75,21 @@ def report(days: float, cfg: config.Config) -> dict:
     reverted = [{"run_id": r["run_id"], "loop": r["loop"] or "", "about": r["about"] or "", "sha": full,
                  "approval": r["approval"], "reverted_by": by}
                 for sha, by in reverts.items() for full, r in landed.items() if full.startswith(sha)]
+    cleared: dict[str, dict] = {}
+    for r in rows:
+        if r["outcome"] != "rejected" or r["held"]:
+            continue
+        x = cleared.setdefault(r["run_id"], {"run_id": r["run_id"], "loop": r["loop"] or "", "about": r["about"] or "",
+                                             "approval": r["approval"], "sha": r["sha"] or "", "closest": None})
+        for name, score in r["answers"].items():
+            if x["closest"] is None or distance(score) < x["closest"]["distance"]:
+                x["closest"] = scored_row(r, name, score) | {"distance": round(distance(score), 4)}
     return {"since": since, "days": days,
             "kinds": {k: {**v, "outcomes": dict(v["outcomes"])} for k, v in sorted(kinds.items())},
             "questions": {k: {**v, "outcomes": dict(v["outcomes"])} for k, v in sorted(questions.items())},
             "close_holds": sorted(close, key=lambda x: (x["kind"], x["question"], x["p"])),
             "near_misses": sorted(near, key=lambda x: (x["kind"], x["question"], x["p"])),
-            "reverted": reverted}
+            "reverted": reverted, "cleared_rejected": list(cleared.values())}
 
 
 def counted(outcomes: dict[str, int]) -> str:
@@ -96,6 +105,11 @@ def where(x: dict) -> str:
     if x.get("subject"):
         parts.append(x["subject"])
     return ", ".join(parts)
+
+
+def titled(x: dict) -> str:
+    about = x["about"] or "no title"
+    return about if not x["loop"] or about.startswith(f"{x['loop']}:") else f"{x['loop']}: {about}"
 
 
 def scored_line(x: dict) -> str:
@@ -121,6 +135,10 @@ def render(data: dict) -> str:
     for title, key in ((f"Close holds (held within {NEAR:g} of the line):", "close_holds"),
                        (f"Near misses (passed within {NEAR:g} of the line):", "near_misses")):
         out += ["", title] + ([scored_line(x) for x in data[key]] or ["  none"])
-    out += ["", "Landed, then reverted:"] + ([f"  {x['loop']}: {x['about'] or 'no title'} ({where(x)}) reverted by "
+    out += ["", "Cleared, then rejected by a person:"] + (
+        [f"  {titled(x)} ({where(x)})" + (
+            f"; closest: {x['closest']['kind']} {x['closest']['question']} p {x['closest']['p']:.2f} of "
+            f"{x['closest']['line']:g}" if x["closest"] else "") for x in data["cleared_rejected"]] or ["  none"])
+    out += ["", "Landed, then reverted:"] + ([f"  {titled(x)} ({where(x)}) reverted by "
                                               f"{x['reverted_by'][:10]}" for x in data["reverted"]] or ["  none"])
     return "\n".join(out)
