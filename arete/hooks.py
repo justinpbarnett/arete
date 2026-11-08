@@ -49,12 +49,12 @@ def check(name: str, headers, body: bytes) -> None:
     token = headers.get("X-Arete-Token", "") or headers.get("Authorization", "").removeprefix("Bearer ").strip()
     if signature:
         expected = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected):
+        if not hmac.compare_digest(signature.encode(), expected.encode()):
             raise HookRefused(403, "The signature does not match the webhook secret.")
         return
     if not token:
         raise HookRefused(401, "A webhook needs the X-Arete-Token header, a Bearer token, or a GitHub signature.")
-    if not hmac.compare_digest(token, key):
+    if not hmac.compare_digest(token.encode(), key.encode()):
         raise HookRefused(403, "The token does not match the webhook secret.")
 
 
