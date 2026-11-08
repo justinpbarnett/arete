@@ -260,6 +260,8 @@ def shown_patch(patch: str, start: str, branch: str) -> str:
 def land(item: dict, wt: Path, src: Path, base: str) -> str:
     for attempt in (1, 2):
         util.git(["fetch", "-q", "origin", base], src)
+        util.git(["reset", "-q", "--hard"], wt)
+        util.git(["clean", "-qfd"], wt)
         try:
             util.git(["rebase", "-q", f"origin/{base}"], wt)
         except RuntimeError as e:
