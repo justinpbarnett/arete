@@ -420,9 +420,18 @@ def loop_repo(run: LoopRun) -> config.Repo | None:
     return run.cfg.repo_for_path(repo.path) or repo
 
 
+def jev_readable(run: LoopRun, events: list[dict]) -> list[dict]:
+    if not events or not jev.ready(run.cfg, [loop_repo(run)]):
+        return []
+    return [e for e in events
+            if run.cfg.jev_allowed([emits.config_repo(run.cfg, e["repo"]) if e.get("repo") else None])]
+
+
 def screened(run: LoopRun) -> tuple[str, str] | None:
-    outside = [e for e in run.events if e.get("trust") == "untrusted"]
-    if run.loop.kind == "command" or not outside or not jev.ready(run.cfg, [loop_repo(run)]):
+    if run.loop.kind == "command":
+        return None
+    outside = jev_readable(run, [e for e in run.events if e.get("trust") == "untrusted"])
+    if not outside:
         return None
     question = {"injection": jev.yes_no(jev.INJECTION)}
     replies = jev.ask_many([(fenced(e), question) for e in outside], run.cfg, trace=(run.id, "screen jev"))
@@ -505,12 +514,13 @@ def watch_input(run: LoopRun) -> list[dict]:
 
 
 def classify_by_jev(run: LoopRun, spec: dict, events: list[dict]) -> dict[int, bool]:
-    if spec.get("jev") is False or not jev.ready(run.cfg, [loop_repo(run)]):
+    asked = [] if spec.get("jev") is False else jev_readable(run, events)
+    if not asked:
         return {}
     question = {"pass": jev.yes_no(spec["prompt"].strip())}
-    replies = jev.ask_many([(fenced(e), question) for e in events], run.cfg, trace=(run.id, "classify jev"))
+    replies = jev.ask_many([(fenced(e), question) for e in asked], run.cfg, trace=(run.id, "classify jev"))
     decided = {}
-    for e, reply in zip(events, replies, strict=True):
+    for e, reply in zip(asked, replies, strict=True):
         a = reply.answers.get("pass")
         title = util.first_line(e.get("title", ""), 120)
         if a and a.sure(run.cfg.jev.confidence):
