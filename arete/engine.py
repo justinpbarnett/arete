@@ -733,16 +733,21 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
     higher = loops.CLIMB_GOALS[loops.climb_goal(spec)]
     files = loops.as_list(spec.get("files"))
 
-    def measure(wt: Path) -> float | None:
+    def measure(wt: Path) -> tuple[float | None, str]:
         res = shell_result(run, spec["measure"], wt)
-        return measured_number(res) if res.returncode == 0 else None
+        value = measured_number(res) if res.returncode == 0 else None
+        if value is not None:
+            return value, ""
+        failure = f"exited {res.returncode}" if res.returncode else "did not print a number"
+        last = util.last_line((res.stdout or "") + (res.stderr or ""), 200)
+        return None, f"{failure}: {last}" if last else failure
 
     ws = open_workspace(run)
     kept, stopped = False, ""
     try:
-        baseline = measure(ws.wt)
+        baseline, why = measure(ws.wt)
         if baseline is None:
-            return "failed", f"`{spec['measure']}` did not print a number on the base branch"
+            return "failed", f"on the base branch, `{spec['measure']}` {why}"
         best, history = baseline, [f"- baseline: {number_text(baseline)}"]
         run.log("measure", f"baseline {number_text(baseline)}")
         goal = (f"Make `{spec['measure']}` print a {'higher' if higher else 'lower'} number. It prints "
@@ -764,7 +769,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                 history.append(f"- try {i}: {why_not}")
                 run.log("try", f"try {i}: {why_not}")
                 continue
-            value = measure(ws.wt)
+            value, why = measure(ws.wt)
             if value is not None and (value > best if higher else value < best):
                 change = f"{number_text(best)} -> {number_text(value)}"
                 commit(ws.wt, commit_message(run, ws, f"{idea[:60]} ({change})"))
@@ -773,7 +778,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                 best, kept = value, True
             else:
                 revert(ws.wt)
-                result = "measure failed" if value is None else \
+                result = f"measure {why}" if value is None else \
                     f"{number_text(value)}, not better than {number_text(best)}"
                 history.append(f"- try {i}: reverted, {result}: {idea}")
                 run.log("revert", f"try {i}: {result}: {idea}")
