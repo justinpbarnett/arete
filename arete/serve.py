@@ -197,6 +197,8 @@ class Server:
                 why = str(control.Busy(loop.name))
             elif per_queue[item["queue"]] >= size:
                 why = f"queue {item['queue']} is full at {util.count(size, 'run')}"
+            elif spent := engine.spent_limit(loop, self.cfg):
+                why = f"its {spent} is spent"
             else:
                 try:
                     run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)

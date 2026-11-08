@@ -463,6 +463,11 @@ def drop_queue_item(item_id: int) -> None:
         c.execute("DELETE FROM queue WHERE id = ?", (item_id,))
 
 
+def release_claimed_items(run_id: str) -> None:
+    with db() as c:
+        c.execute("UPDATE queue SET run_id = NULL WHERE run_id = ?", (run_id,))
+
+
 def drop_claimed_items(run_id: str) -> None:
     with db() as c:
         c.execute("DELETE FROM queue WHERE run_id = ?", (run_id,))

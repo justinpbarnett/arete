@@ -61,6 +61,23 @@ class OverBudget(Exception):
     pass
 
 
+def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) -> tuple[str, float] | None:
+    day_ago = util.iso(util.now() - timedelta(days=1))
+    limits = []
+    if loop.budget_usd:
+        limits.append(("run budget", loop.budget_usd - spent_this_run))
+    if loop.daily_budget_usd:
+        limits.append(("daily loop budget", loop.daily_budget_usd - state.loop_spent_since(day_ago, loop.name)))
+    if cfg.daily_budget_usd:
+        limits.append(("daily budget for all loops", cfg.daily_budget_usd - state.loop_spent_since(day_ago)))
+    return min(limits, key=lambda x: x[1]) if limits else None
+
+
+def spent_limit(loop: Loop, cfg: config.Config) -> str:
+    tightest = tightest_limit(loop, cfg) if loop.agent else None
+    return tightest[0] if tightest and tightest[1] <= runner.BUDGET_FLOOR_USD else ""
+
+
 class StoppedByAgent(Exception):
     pass
 
@@ -114,17 +131,10 @@ class LoopRun:
         return record.spent(self.id)
 
     def room(self) -> float | None:
-        day_ago = util.iso(util.now() - timedelta(days=1))
-        limits = []
-        if self.loop.budget_usd:
-            limits.append(("run budget", self.loop.budget_usd - self.spent()))
-        if self.loop.daily_budget_usd:
-            limits.append(("daily loop budget", self.loop.daily_budget_usd - state.loop_spent_since(day_ago, self.loop.name)))
-        if self.cfg.daily_budget_usd:
-            limits.append(("daily budget for all loops", self.cfg.daily_budget_usd - state.loop_spent_since(day_ago)))
-        if not limits:
+        tightest = tightest_limit(self.loop, self.cfg, self.spent())
+        if not tightest:
             return None
-        name, left = min(limits, key=lambda x: x[1])
+        name, left = tightest
         if left <= runner.BUDGET_FLOOR_USD:
             raise OverBudget(f"{name} is spent")
         return round(left, 2)
@@ -312,6 +322,9 @@ def carry_opened(run_id: str) -> str:
 
 
 def carry(run: LoopRun) -> str:
+    if spent := spent_limit(run.loop, run.cfg):
+        state.release_claimed_items(run.id)
+        return settle(run, "skipped", f"budget: {spent} is spent, so its input waits in the queue")
     try:
         signal.signal(signal.SIGTERM, stop_on_term)
         with devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device:
