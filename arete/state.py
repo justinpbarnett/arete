@@ -222,12 +222,45 @@ CREATE TABLE IF NOT EXISTS triage (
     plan TEXT,
     why TEXT,
     cost REAL DEFAULT 0,
+    ts TEXT,
+    kind TEXT DEFAULT '',
+    repos TEXT DEFAULT '[]',
+    assumptions TEXT DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS triage_approvals (
+    ref TEXT PRIMARY KEY,
+    repo TEXT,
+    route TEXT,
+    title TEXT,
+    url TEXT,
+    kind TEXT,
+    size TEXT,
+    plan TEXT,
+    assumptions TEXT,
+    why TEXT,
+    ts TEXT
+);
+CREATE TABLE IF NOT EXISTS research (
+    ref TEXT PRIMARY KEY,
+    source TEXT,
+    title TEXT,
+    url TEXT,
+    updated TEXT,
+    status TEXT,                   -- running | done | failed | held
+    summary TEXT,
+    report TEXT,
+    error TEXT,
+    run_id TEXT,
+    cost REAL DEFAULT 0,
     ts TEXT
 );
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
               ("triage", "code", "ALTER TABLE triage ADD COLUMN code INTEGER"),
+              ("triage", "kind", "ALTER TABLE triage ADD COLUMN kind TEXT DEFAULT ''"),
+              ("triage", "repos", "ALTER TABLE triage ADD COLUMN repos TEXT DEFAULT '[]'"),
+              ("triage", "assumptions", "ALTER TABLE triage ADD COLUMN assumptions TEXT DEFAULT '[]'"),
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
@@ -585,8 +618,8 @@ def runs_marked_running(connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
-def ticket_runs(repo: str, issue: int | str, limit: int = 10) -> list[dict]:
-    with db() as c:
+def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db) -> list[dict]:
+    with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                                            "ORDER BY started DESC LIMIT ?", (repo, issue, limit))]
 
@@ -802,16 +835,29 @@ def mined_urls() -> set[str]:
 
 
 TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
-                  "questions", "plan", "why", "cost", "ts")
+                  "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions")
+TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions")
+APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "plan", "assumptions", "why", "ts")
+APPROVAL_LISTS = ("plan", "assumptions")
+RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
+                    "cost", "ts")
+
+
+def lists_read(row: dict, keys: tuple[str, ...]) -> dict:
+    return {**row, **{k: json.loads(row.get(k) or "[]") for k in keys}}
+
+
+def lists_written(row: dict, columns: tuple[str, ...], keys: tuple[str, ...]) -> tuple:
+    return tuple(json.dumps(row.get(k) or []) if k in keys else row.get(k) for k in columns)
+
+
+def insert_sql(table: str, columns: tuple[str, ...], verb: str = "INSERT") -> str:
+    return f"{verb} INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})"
 
 
 def triage_rows(connect=db) -> list[dict]:
     with connect() as c:
-        rows = [dict(r) for r in c.execute("SELECT * FROM triage")]
-    for r in rows:
-        r["questions"] = json.loads(r["questions"] or "[]")
-        r["plan"] = json.loads(r["plan"] or "[]")
-    return rows
+        return [lists_read(dict(r), TRIAGE_LISTS) for r in c.execute("SELECT * FROM triage")]
 
 
 def triage_replace(source: str, rows: list[dict]) -> None:
@@ -819,9 +865,59 @@ def triage_replace(source: str, rows: list[dict]) -> None:
     with db() as c:
         c.execute("DELETE FROM triage WHERE source = ?", (source,))
         c.executemany("DELETE FROM triage WHERE ref = ?", [(ref,) for ref in refs])
-        c.executemany(f"INSERT INTO triage ({', '.join(TRIAGE_COLUMNS)}) VALUES ({', '.join('?' * len(TRIAGE_COLUMNS))})",
-                      [tuple(json.dumps(r[k]) if k in ("questions", "plan") else r[k] for k in TRIAGE_COLUMNS)
-                       for r in rows])
+        c.executemany(insert_sql("triage", TRIAGE_COLUMNS),
+                      [lists_written(r, TRIAGE_COLUMNS, TRIAGE_LISTS) for r in rows])
+
+
+def triage_put(row: dict) -> None:
+    with db() as c:
+        c.execute(insert_sql("triage", TRIAGE_COLUMNS, "INSERT OR REPLACE"), lists_written(row, TRIAGE_COLUMNS, TRIAGE_LISTS))
+
+
+def triage_drop(ref: str) -> None:
+    with db() as c:
+        c.execute("DELETE FROM triage WHERE ref = ?", (ref,))
+
+
+def triage_approve(row: dict) -> None:
+    with db() as c:
+        c.execute(insert_sql("triage_approvals", APPROVAL_COLUMNS, "INSERT OR REPLACE"),
+                  lists_written({**row, "ts": util.iso()}, APPROVAL_COLUMNS, APPROVAL_LISTS))
+
+
+def triage_approvals(since: str = "", connect=db) -> list[dict]:
+    with connect() as c:
+        rows = c.execute("SELECT * FROM triage_approvals WHERE ts >= ? ORDER BY ts DESC", (since,))
+        return [lists_read(dict(r), APPROVAL_LISTS) for r in rows]
+
+
+def triage_approval(ref: str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM triage_approvals WHERE ref = ? COLLATE NOCASE", (ref,)).fetchone()
+    return lists_read(dict(r), APPROVAL_LISTS) if r else None
+
+
+def research_rows(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM research ORDER BY ts DESC")]
+
+
+def research_get(ref: str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM research WHERE ref = ? COLLATE NOCASE", (ref,)).fetchone()
+    return dict(r) if r else None
+
+
+def research_set(ref: str, **fields) -> None:
+    row = {**(research_get(ref) or {"ref": ref, "cost": 0.0}), **fields, "ts": util.iso()}
+    with db() as c:
+        c.execute(insert_sql("research", RESEARCH_COLUMNS, "INSERT OR REPLACE"),
+                  tuple(row.get(k) for k in RESEARCH_COLUMNS))
+
+
+def research_prune(refs: list[str]) -> None:
+    with db() as c:
+        c.execute(f"DELETE FROM research WHERE status != 'running' AND ref NOT IN ({','.join('?' * len(refs))})", refs)
 
 
 def triage_prune(sources: list[str]) -> None:

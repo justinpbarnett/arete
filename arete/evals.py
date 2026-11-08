@@ -290,7 +290,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         commands = code_list(layer.builder_bash)
         workspace = workspace_note("eval", [Checkout("", repo.github, repo.path, wt, base)])
         res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
-                                        body=task.prompt, comments="", attachments="", expertise=expertise,
+                                        body=task.prompt, comments="", attachments="", triage="", expertise=expertise,
                                         commands=commands, denied=code_list(denied_paths(layer)),
                                         max_lines=layer.max_diff_lines, checks=checks),
                         wt, model=cfg.model("plan"), allowed_tools=runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),

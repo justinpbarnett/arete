@@ -707,12 +707,31 @@ def resolve_layer(run: Run, ws: Path) -> config.RepoLayer:
     return config.load_layer(repo.path / ".agents")
 
 
+def triage_notes(approval: dict | None) -> str:
+    if not approval:
+        return ""
+    assumed = "".join(f"\n- {a}" for a in approval["assumptions"]) or "\n- nothing it named"
+    return (f"## Approved by triage, not by a person\n\nArete's triage approved this ticket on its own at "
+            f"{approval['ts']}, so its owner has not read it closely. Triage assumed:{assumed}\n\nKeep an assumption "
+            "only where the ticket still leaves it open. End `plan` with an \"Assumed\" list of every choice the ticket "
+            "leaves open, these and your own, so the owner can check them in the pull request.")
+
+
+def triage_block(approval: dict | None) -> str:
+    if not approval:
+        return ""
+    assumed = "".join(f"\n- {a}" for a in approval["assumptions"])
+    return ("## Approved by triage\n\nArete's triage approved this ticket on its own, so check the choices it made"
+            + (f". It assumed:{assumed}" if assumed else "; the plan below lists them.") + "\n\n")
+
+
 def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     repo, tk = run.repo, run.tracker
     try:
         t = tk.get(run.tid)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
+    approval = state.triage_approval(t.ref) if repo.tracker == "jira" else None
     if run.feedback:
         closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
         if closed:
@@ -795,8 +814,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     else:
         res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                         body=t.body, comments=t.comments, attachments=attachments,
-                                        expertise=expertise, commands=commands, denied=code_list(deny), max_lines=limit,
-                                        checks=checks),
+                                        triage=triage_notes(approval), expertise=expertise, commands=commands,
+                                        denied=code_list(deny), max_lines=limit, checks=checks),
                         ws, model=cfg.model("plan"), allowed_tools=read_tools, json_schema=PLAN_SCHEMA,
                         timeout=step_timeout)
         if not res.ok or not isinstance(res.structured, dict):
@@ -883,6 +902,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     images = evidence_images(run, staged.changed[0], verified)
     report_body = (
         f"## Summary\n\n{build_summary.strip()[:3000]}\n\n"
+        + ("" if run.feedback else triage_block(approval))
         + left_block(left_for_a_person)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
@@ -939,7 +959,9 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
                 + ("" if not opened else draft_note(draft_why, verified)))
-    if not draft_why and layer.trust_level == "automerge":
+    if not draft_why and layer.trust_level == "automerge" and approval:
+        run.log("automerge left off: triage approved the ticket, so a person merges it")
+    elif not draft_why and layer.trust_level == "automerge":
         risk = jev.risk(staged.patch, f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,
                         trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [repo]) else None
         for c in opened:

@@ -135,16 +135,25 @@ def alerts() -> dict:
 
 
 def triage_board() -> dict:
-    rows = sorted(state.triage_rows(connect=state.reader), key=lambda r: triage.natural(r["ref"]))
+    v = triage.view(connect=state.reader)
     meta = util.read_json(triage.META_FILE, {})
     return {
         "refreshed": meta.get("refreshed", ""), "posted": meta.get("posted", ""), "errors": meta.get("errors", []),
-        "summary": triage.summary(rows),
-        "groups": [{"standing": name, "rows": [{"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "",
-                                                "url": r["url"] or "", "verdict": triage.verdict(r),
-                                                "questions": r["questions"]} for r in members]}
-                   for name, members in triage.groups(rows).items()],
+        "approved": meta.get("approved", []), "held": meta.get("held", {}),
+        "summary": triage.summary(v),
+        "groups": [{"standing": name, "rows": [triage_entry(r, v, name) for r in members]}
+                   for name, members in triage.groups(v).items()],
     }
+
+
+def triage_entry(r: dict, v: dict, standing: str) -> dict:
+    report = v["research"].get(r["ref"]) if standing == triage.RESEARCH_WORK else None
+    return {"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "", "url": r["url"] or "",
+            "kind": r["kind"] or "", "size": r["size"] or "",
+            "verdict": triage.sent_note(r, False) if standing == triage.SENT else triage.verdict(r, v["research"]),
+            "prs": " ".join(triage.sent_prs(r)) if standing == triage.SENT else "",
+            "questions": r.get("questions") or [], "assumptions": r["assumptions"] or [], "plan": r["plan"] or [],
+            "summary": report["summary"] if report else "", "report": report["report"] if report else ""}
 
 
 def proposals() -> dict:

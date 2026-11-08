@@ -254,19 +254,14 @@ function drawHealth(snapshot) {
       : el("p", {}, stateChip("ok"), " No alert is open.")));
 }
 
-function questionFold(ref, questions) {
-  return el("details", {
-    open: openQuestions.has(ref),
-    on: { toggle: (e) => (e.target.open ? openQuestions.add(ref) : openQuestions.delete(ref)) },
-  }, el("summary", { text: "Show the questions" }), el("ol", { class: "questions" }, questions.map((q) => el("li", { text: q }))));
-}
-
 function drawTriage(snapshot) {
   fill("triage", panelParts(snapshot.triage, "Triage", triageParts));
 }
 
 function triageParts(t) {
-  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${clock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket and says what each one needs.`)];
+  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${clock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent.`)];
+  if (t.approved && t.approved.length) parts.push(quiet(`Sent to the pipeline on the last run: ${t.approved.join(", ")}.`));
+  Object.entries(t.held || {}).forEach(([ref, why]) => parts.push(quiet(`Not sent this time: ${ref}: ${why}`)));
   t.groups.forEach((g, i) => {
     parts.push(heading(i + 1, g.standing));
     parts.push(g.rows.length
@@ -274,11 +269,22 @@ function triageParts(t) {
         table("", [["Ticket", "c-ref"], ["Title"], ["Verdict", "c-verdict"]],
           g.rows.map((r) => el("tr", {},
             cell(link(r.url, r.ref), "nb"),
-            cell([r.title, r.questions.length ? questionFold(r.ref, r.questions) : null]),
-            cell(wholeWords(r.verdict)))))]
+            cell([r.title, ...triageFolds(r)]),
+            cell(r.prs ? [...wholeWords(r.verdict), el("br"), ...pullLinks(r.prs)] : wholeWords(r.verdict)))))]
       : quiet("None."));
   });
   return parts;
+}
+
+function triageFolds(r) {
+  const list = (items) => el("ol", { class: "questions" }, items.map((q) => el("li", { text: q })));
+  return [
+    r.summary ? el("p", { class: "muted", text: r.summary }) : null,
+    r.questions.length ? fold(`triage:q:${r.ref}`, "Show the questions", list(r.questions)) : null,
+    r.assumptions.length ? fold(`triage:a:${r.ref}`, "Show what the build assumes", list(r.assumptions)) : null,
+    r.plan.length ? fold(`triage:p:${r.ref}`, "Show the plan", list(r.plan)) : null,
+    r.report ? fold(`triage:r:${r.ref}`, "Show the report", el("pre", { class: "fold-text", text: r.report })) : null,
+  ];
 }
 
 function niceMax(value, whole) {

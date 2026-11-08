@@ -1,0 +1,11 @@
+kind = "command"
+description = "Research the next research ticket on the triage board and write its report"
+
+[trigger]
+every = "10m"
+
+[run]
+command = "arete research --next"
+try_command = "arete research --dry-run"
+timeout_minutes = 60
+stale_hours = 2

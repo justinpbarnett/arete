@@ -323,6 +323,24 @@ def cmd_triage(args) -> int:
     return code
 
 
+def cmd_research(args) -> int:
+    from . import research
+
+    if args.next or (args.dry_run and not args.ref):
+        return research.next_due(dry_run=args.dry_run)
+    if args.ref and args.run:
+        return research.run_now(args.ref, force=args.force)
+    if args.ref:
+        shown = research.shown(args.ref)
+        if shown is None:
+            print(f"no research for {args.ref}; `arete research` lists them", file=sys.stderr)
+            return 1
+        print(shown)
+        return 0
+    print(research.listing())
+    return 0
+
+
 def cmd_dashboard(args) -> int:
     from . import dashboard
 
@@ -815,6 +833,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--refresh", action="store_true", help="triage what changed, then show the board")
     p.add_argument("--dry-run", action="store_true", help="list what a refresh would triage; no model calls, no writes")
     p.set_defaults(fn=cmd_triage)
+
+    p = sub.add_parser("research", help="the reports arete writes for research tickets on the triage board")
+    p.add_argument("ref", nargs="?", default="", metavar="REF", help="print one ticket's report")
+    p.add_argument("--run", action="store_true", help="with REF: research it now")
+    p.add_argument("--force", action="store_true", help="with --run: skip the JEV injection screen")
+    p.add_argument("--next", action="store_true", help="research the next ticket due; what the research loop runs")
+    p.add_argument("--dry-run", action="store_true", help="say which ticket is due next; no model calls, no writes")
+    p.set_defaults(fn=cmd_research)
 
     p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")
     p.add_argument("--port", type=int, default=None, help="the port to listen on; the config's [dashboard] port by default")

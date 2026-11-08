@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import alerts, config, gh, jev, jira, paths, runner, state, tracker, util
@@ -25,26 +25,40 @@ TICKET_RECORDS_DIR = paths.STATE_DIR / "triage"
 NO_MCP_SERVERS = json.dumps({"mcpServers": {}})
 SEARCH_FIELDS = ["summary", "updated", "labels"]
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent"]
+MAX_ASSUMPTIONS = 8
+SENT_DAYS = 7
 SIZES = ("S", "M", "L")
-CODE_CHANGE, NOT_CODE = "a code change", "something else"
+FIX, FEATURE, RESEARCH, PERSON = "fix", "feature", "research", "person"
+KINDS = (FIX, FEATURE, RESEARCH, PERSON)
 SCHEMA = {
     "type": "object",
     "properties": {
-        "asks_for": {"type": "string", "enum": [CODE_CHANGE, NOT_CODE]},
+        "kind": {"type": "string", "enum": list(KINDS)},
         "ready": {"type": "boolean"},
         "questions": {"type": "array", "items": {"type": "string"}},
+        "assumptions": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ASSUMPTIONS},
         "size": {"type": "string", "enum": list(SIZES)},
-        "repo": {"type": "string"},
+        "repos": {"type": "array", "items": {"type": "string"}},
         "plan": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_PLAN_STEPS},
         "why": {"type": "string"},
     },
-    "required": ["asks_for", "ready", "questions", "size", "repo", "plan", "why"],
+    "required": ["kind", "ready", "questions", "assumptions", "size", "repos", "plan", "why"],
 }
 WAITING = f"waiting: more than {MAX_CALLS} tickets were due in one refresh"
 ASKS_FOR_CODE = "Does this ticket ask for a change to code, configuration or documentation in a software repository?"
+KIND_QUESTION = "What does this ticket ask for?"
+KIND_OPTIONS = {
+    RESEARCH: ("finding something out: investigate, compare options, estimate or recommend, where the answer is a "
+               "written report"),
+    PERSON: ("work only a person can do: a meeting, a decision, access or an account, a test or check done by hand, "
+             "data entry, a purchase, or settings in an outside tool"),
+    FIX: "a repair to software that is broken or wrong: a bug, an error, a crash, or wrong data shown",
+    FEATURE: "a new or changed screen, field, behavior, report, setting or document in a software repository",
+}
 EARLIEST = datetime.min.replace(tzinfo=UTC)
-READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED = "Ready", "With questions", "Not code work", "Not triaged"
-STANDINGS = (READY, WITH_QUESTIONS, NOT_CODE_WORK, NOT_TRIAGED)
+READY, SENT, RESEARCH_WORK, WITH_QUESTIONS, NEEDS_PERSON, NOT_TRIAGED = (
+    "Ready to build", "Sent to the pipeline", "Research", "With questions", "Needs a person", "Not triaged")
+STANDINGS = (READY, SENT, RESEARCH_WORK, WITH_QUESTIONS, NEEDS_PERSON, NOT_TRIAGED)
 
 
 @dataclass
@@ -118,13 +132,15 @@ class JiraSource(Source):
 
     def repo_rule(self) -> str:
         names = ", ".join(f"`{r.name}`" for r in self.repos)
-        return (f"the one repository the change belongs in, one of {names}, or an empty string when the ticket and the "
-                "code do not settle it. A ticket that already carries a route label belongs to that label's "
-                "repository.")
+        return (f"the repositories the change belongs in, from {names}. Usually one. List more than one only when the "
+                "change cannot land without edits in each. Empty when the ticket and the code do not settle it. A "
+                "ticket that already carries a route label belongs to that label's repository. For `research`, the "
+                "repositories the research has to read, which may be none.")
 
-    def chosen_repo(self, answer: dict) -> str:
-        repo = str(answer.get("repo") or "").strip().strip("`")
-        return repo if repo in self.by_name() else ""
+    def chosen_repos(self, answer: dict) -> list[str]:
+        names = self.by_name()
+        picked = (str(r).strip().strip("`") for r in answer.get("repos") or [])
+        return list(dict.fromkeys(r for r in picked if r in names))
 
     def route(self, repo: str) -> str:
         return tracker.route_label(self.by_name()[repo]) if repo else ""
@@ -163,10 +179,10 @@ class GitHubSource(Source):
         return ""
 
     def repo_rule(self) -> str:
-        return f"always `{self.repos[0].name}`."
+        return f"always `[\"{self.repos[0].name}\"]`."
 
-    def chosen_repo(self, answer: dict) -> str:
-        return self.repos[0].name
+    def chosen_repos(self, answer: dict) -> list[str]:
+        return [self.repos[0].name]
 
     def route(self, repo: str) -> str:
         return ""
@@ -212,13 +228,25 @@ def record_file(ref: str) -> Path:
 def not_code_by_jev(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str) -> dict | None:
     if not jev.ready(cfg, list(src.repos)):
         return None
-    reply = jev.ask(f"{c.title}\n\n{ticket}", {"code": jev.yes_no(ASKS_FOR_CODE)}, cfg, trace=("", f"triage {c.ref} jev"))
-    a = reply.answers.get("code")
-    if not a or a.yes > cfg.jev.triage_skip:
+    reply = jev.ask(f"{c.title}\n\n{ticket}",
+                    {"code": jev.yes_no(ASKS_FOR_CODE), "kind": jev.pick(KIND_QUESTION, KIND_OPTIONS)}, cfg,
+                    trace=("", f"triage {c.ref} jev"))
+    code, kind = reply.answers.get("code"), reply.answers.get("kind")
+    if not code:
         return None
+    sure = str(kind.value) if kind and kind.value in (RESEARCH, PERSON) and kind.sure(cfg.jev.confidence) else ""
+    if code.yes <= cfg.jev.triage_skip:
+        settled = RESEARCH if sure == RESEARCH else PERSON
+        why = f"JEV reads it as asking for no change to a repo ({code.note()}, at or under {cfg.jev.triage_skip:g})"
+    elif code.yes < 0.5 and sure:
+        settled = sure
+        why = f"JEV reads it as asking for no change to a repo ({code.note()})"
+    else:
+        return None
+    why += f" and as {settled} work ({kind.note()})" if kind and kind.value == settled else ""
     cost = reply.cost_usd
-    answer = {"asks_for": NOT_CODE, "ready": False, "questions": [], "plan": [], "repo": "",
-              "why": f"JEV reads it as asking for no change to a repo ({a.note()}, at or under {cfg.jev.triage_skip:g})"}
+    answer = {"kind": settled, "ready": False, "questions": [], "assumptions": [], "plan": [], "repos": [],
+              "size": "", "why": why}
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     record_file(c.ref).write_text(f"{ticket}\n\n## Triage result (${cost:.5f})\n\n```json\n"
                                   f"{json.dumps(answer, indent=2)}\n```\n")
@@ -240,27 +268,36 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
     return answer, res.cost_usd, "" if answer else util.first_line(res.error or "no answer")
 
 
+def lines_of(items) -> list[str]:
+    cleaned = (re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", str(item)).strip() for item in items or [])
+    return [item for item in cleaned if item]
+
+
 def settle(src: TriageSource, c: Candidate, answer: dict, cost: float) -> dict:
-    repo = src.chosen_repo(answer)
+    kind = answer.get("kind") if answer.get("kind") in KINDS else FEATURE
+    repos = src.chosen_repos(answer)
+    repo = repos[0] if len(repos) == 1 else ""
     why = str(answer.get("why") or "").strip()
-    questions = [q.strip() for q in answer.get("questions") or [] if q.strip()]
-    plan = [re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", step).strip() for step in answer.get("plan") or []]
-    plan = [p for p in plan if p][:MAX_PLAN_STEPS]
-    if answer.get("asks_for") == NOT_CODE and not (answer.get("ready") or questions or plan):
-        return row(src, c, updated=c.updated, ready=0, code=0, repo=repo, why=why, cost=cost)
+    if kind in (RESEARCH, PERSON):
+        return row(src, c, updated=c.updated, ready=0, code=0, kind=kind, repo=repo, repos=repos, why=why, cost=cost)
+    questions = lines_of(answer.get("questions"))
     size = answer.get("size") if answer.get("size") in SIZES else "M"
-    if not repo:
+    if not repos:
         questions.append(f"Which repo is it for: {', '.join(src.by_name())}?")
+    elif len(repos) > 1:
+        questions.append(f"It needs changes in {' and '.join(repos)}. Can you split it into one ticket per repo?")
     if size == "L":
         questions.append("It is too big for one pull request. Can you split it into smaller tickets?")
-    return row(src, c, updated=c.updated, ready=int(bool(answer.get("ready")) and not questions), code=1, repo=repo,
-               route=src.route(repo), size=size, questions=questions, plan=plan, why=why, cost=cost)
+    return row(src, c, updated=c.updated, ready=int(bool(answer.get("ready")) and not questions), code=1, kind=kind,
+               repo=repo, repos=repos, route=src.route(repo), size=size, questions=questions,
+               assumptions=lines_of(answer.get("assumptions"))[:MAX_ASSUMPTIONS],
+               plan=lines_of(answer.get("plan"))[:MAX_PLAN_STEPS], why=why, cost=cost)
 
 
 def row(src: TriageSource, c: Candidate, **fields) -> dict:
     base = {"ref": c.ref, "source": src.name, "tracker": src.tracker, "repo": "", "route": "", "title": c.title,
-            "url": c.url, "updated": "", "ready": None, "code": None, "size": "", "questions": [], "plan": [], "why": "",
-            "cost": 0.0, "ts": util.iso()}
+            "url": c.url, "updated": "", "ready": None, "code": None, "kind": "", "size": "", "repos": [],
+            "questions": [], "assumptions": [], "plan": [], "why": "", "cost": 0.0, "ts": util.iso()}
     return {**base, **fields}
 
 
@@ -271,11 +308,7 @@ def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dic
 
 
 def due(c: Candidate, prev: dict | None) -> bool:
-    return not prev or prev["ready"] is None or prev["updated"] != c.updated
-
-
-def rows_now() -> list[dict]:
-    return sorted(state.triage_rows(), key=lambda r: natural(r["ref"]))
+    return not prev or prev["ready"] is None or prev["updated"] != c.updated or not prev["kind"]
 
 
 def run(dry_run: bool = False) -> int:
@@ -305,6 +338,9 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
                   key=lambda sc: moment(sc[1].updated), reverse=True)
     if dry_run:
         preview(srcs, read, old, todo[:MAX_CALLS], todo[MAX_CALLS:])
+        ready = ", ".join(r["ref"] for r in approvable(srcs, list(old.values()))) or "none"
+        print(f"would approve up to {cfg.jira.auto_per_refresh} now ready: {ready}" if cfg.jira.auto
+              else f"ready now, approved only with `[jira] auto = true`: {ready}")
         return 1 if errors else 0
 
     answered: dict[str, dict] = {}
@@ -348,27 +384,81 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
                                             f"triage failed: {failed[c.ref]}" if c.ref in failed else WAITING)
                 for c in read[src.name]])
     state.triage_prune([s.name for s in srcs])
+    approved, held = approve_ready(cfg, srcs)
     keep = {record_file(r["ref"]).name for r in state.triage_rows()}
     for f in TICKET_RECORDS_DIR.glob("*.md"):
         if f.name not in keep:
             f.unlink()
 
     meta = util.read_json(META_FILE, {})
-    meta.update(refreshed=util.iso(), errors=errors, waiting=waiting, failed=failed)
+    meta.update(refreshed=util.iso(), errors=errors, waiting=waiting, failed=failed, approved=approved, held=held)
     problems = list(errors)
     try:
-        posted = publish(cfg, rows_now(), meta)
+        posted = publish(cfg, view(), meta)
     except (gh.GhError, BoardRefused) as e:
         problems.append(f"posting the board: {e}")
         posted = f"not posted: {e}"
     meta.update(posted=posted)
     util.write_json(META_FILE, meta)
     print(f"{util.iso()} triage: {util.count(calls, 'model call')} (${spent:.3f}), "
-          f"{len(failed)} failed, {len(waiting)} waiting; board {posted}")
+          f"{len(failed)} failed, {len(waiting)} waiting, {len(approved)} approved; board {posted}")
     if waiting:
         print(f"waiting for the next refresh: {', '.join(waiting)}")
     mark_loop("triage", not problems, "; ".join(problems))
     return 1 if problems else 0
+
+
+def approvable(srcs: list[TriageSource], rows: list[dict]) -> list[dict]:
+    jira_sources = {s.name for s in srcs if isinstance(s, JiraSource)}
+    ready = [r for r in rows if r["source"] in jira_sources and standing(r) == READY and r["route"]]
+    return sorted(ready, key=lambda r: moment(r["updated"]), reverse=True)
+
+
+def approve_ready(cfg: config.Config, srcs: list[TriageSource]) -> tuple[list[str], dict[str, str]]:
+    approved: list[str] = []
+    held: dict[str, str] = {}
+    if not cfg.jira.auto:
+        return approved, held
+    by_name = {s.name: s for s in srcs}
+    for r in approvable(srcs, state.triage_rows()):
+        if len(approved) >= cfg.jira.auto_per_refresh:
+            break
+        try:
+            why = approve(cfg, by_name[r["source"]], r)
+        except tracker.ERRORS as e:
+            why = f"could not approve it: {e}"
+        if why:
+            held[r["ref"]] = why
+            print(f"{util.iso()} {r['ref']}: not approved: {why}")
+        else:
+            approved.append(r["ref"])
+            print(f"{util.iso()} {r['ref']}: approved, added {' '.join(labels_to_add(r))}")
+    return approved, held
+
+
+def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
+    repo = src.by_name().get(r["repo"])
+    if not repo:
+        return f"{r['repo'] or 'no repo'} is not a pipeline repo of {src.name}"
+    if not jev.ready(cfg, [repo]):
+        return "JEV is not on for it, so nothing screens the ticket; add the labels by hand"
+    c = Candidate(r["ref"], r["ref"], r["title"], r["url"], r["updated"])
+    screened = jev.injection(f"{r['title']}\n\n{src.ticket_text(c)}", cfg, trace=("", f"triage {r['ref']} injection jev"))
+    if screened is None:
+        return "JEV could not screen it this time"
+    if screened.yes >= cfg.jev.injection:
+        labels = " and ".join(f"`{lb}`" for lb in labels_to_add(r))
+        state.triage_put({**r, "ready": 0, "questions": [
+            f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f}). Check the ticket, then add {labels} "
+            "by hand to approve it."]})
+        return f"held for the injection screen (p {screened.yes:.2f})"
+    now = (src.client.issue(r["ref"], ["updated"]).get("fields") or {}).get("updated") or ""
+    if now != r["updated"]:
+        return "it changed since triage, so the next refresh triages it again"
+    src.client.edit_labels(r["ref"], labels_to_add(r))
+    state.triage_approve(r)
+    state.triage_drop(r["ref"])
+    return ""
 
 
 def preview(srcs: list[TriageSource], read: dict[str, list[Candidate]], old: dict[str, dict],
@@ -380,7 +470,7 @@ def preview(srcs: list[TriageSource], read: dict[str, list[Candidate]], old: dic
         for c in read[src.name]:
             prev = old.get(c.ref)
             seen = ("new" if not prev else "waiting" if prev["why"] == WAITING else "retry" if prev["ready"] is None
-                    else "changed" if due(c, prev) else "unchanged")
+                    else "changed" if prev["updated"] != c.updated else "no kind" if not prev["kind"] else "unchanged")
             print(f"  {c.ref:<14} {seen:<9} {c.updated[:19]:<19}  {c.title}"[:160])
     print(f"would triage {len(now)}: {', '.join(c.ref for _, c in now) or 'none'}")
     if later:
@@ -392,139 +482,249 @@ def standing(r: dict) -> str:
     if r["ready"] is None:
         return NOT_TRIAGED
     if r["code"] == 0:
-        return NOT_CODE_WORK
+        return RESEARCH_WORK if r["kind"] == RESEARCH else NEEDS_PERSON
     return READY if r["ready"] else WITH_QUESTIONS
 
 
-def groups(rows: list[dict]) -> dict[str, list[dict]]:
-    return {s: [r for r in rows if standing(r) == s] for s in STANDINGS}
+def sent(connect=state.db) -> list[dict]:
+    out = []
+    for a in state.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
+        runs = [r for r in state.ticket_runs(a["repo"], a["ref"], limit=1, connect=connect) if r["started"] >= a["ts"]]
+        out.append({**a, "tracker": "jira", "run": runs[0] if runs else None})
+    return out
+
+
+def view(connect=state.db) -> dict:
+    return {"rows": sorted(state.triage_rows(connect), key=lambda r: natural(r["ref"])), "sent": sent(connect),
+            "research": {r["ref"]: r for r in state.research_rows(connect)}}
+
+
+def groups(v: dict) -> dict[str, list[dict]]:
+    out = {s: [r for r in v["rows"] if standing(r) == s] for s in STANDINGS}
+    out[SENT] = v["sent"]
+    return out
 
 
 def labels_to_add(r: dict) -> list[str]:
     return [tracker.LABEL, r["route"]] if r["route"] else [tracker.LABEL]
 
 
-def verdict(r: dict) -> str:
+def research_due(r: dict, report: dict | None) -> bool:
+    return not report or report["status"] != "running" and report["updated"] != r["updated"]
+
+
+def stamp(ts: str) -> str:
+    return f"{ts[:16].replace('T', ' ')} UTC" if ts else ""
+
+
+def research_note(r: dict, report: dict | None) -> str:
+    if not report:
+        return "queued for research"
+    if report["status"] == "running":
+        return f"researching since {stamp(report['ts'])}"
+    again = ", and the ticket changed since, so it runs again" if research_due(r, report) else ""
+    if report["status"] == "done":
+        return f"report ready {stamp(report['ts'])}{again}"
+    if report["status"] == "held":
+        return f"held: {report['error']}{again}"
+    return f"research failed: {report['error']}{again}"
+
+
+def sent_prs(a: dict) -> list[str]:
+    return ((a.get("run") or {}).get("pr_url") or "").split()
+
+
+def sent_note(a: dict, with_prs: bool = True) -> str:
+    run = a.get("run")
+    if not run:
+        return f"approved {stamp(a['ts'])}, waiting for the pipeline"
+    prs = sent_prs(a) if with_prs else []
+    return f"pipeline {run['status']}" + (f": {', '.join(prs)}" if prs else "")
+
+
+def verdict(r: dict, reports: dict | None = None) -> str:
     kind = standing(r)
     if kind == READY:
-        return f"ready, {r['size']}, add {' '.join(labels_to_add(r))}"
+        return ", ".join(p for p in (f"ready {r['kind']}".strip(), r["size"], f"add {' '.join(labels_to_add(r))}") if p)
     if kind == WITH_QUESTIONS:
-        return f"not ready, {r['size']}, {util.count(len(r['questions']), 'question')}"
+        return ", ".join(p for p in ("not ready", r["kind"], r["size"], util.count(len(r["questions"]), "question")) if p)
+    if kind == RESEARCH_WORK:
+        return "research" if reports is None else research_note(r, reports.get(r["ref"]))
     return kind.lower()
 
 
-def summary(rows: list[dict]) -> str:
-    g = groups(rows)
-    return f"{util.count(len(rows), 'ticket')}: " + ", ".join(f"{len(g[s])} {s.lower()}" for s in STANDINGS)
+def summary(v: dict) -> str:
+    g = groups(v)
+    return f"{util.count(len(v['rows']), 'open ticket')}: " + ", ".join(f"{len(g[s])} {s.lower()}" for s in STANDINGS)
+
+
+def auto_note(cfg: config.Config) -> str:
+    if cfg.jira.auto:
+        return (f"arete adds the labels to up to {cfg.jira.auto_per_refresh} Jira tickets each refresh; add them "
+                "yourself to approve sooner")
+    return "add the labels to approve"
 
 
 def board() -> str:
     meta = util.read_json(META_FILE, {})
-    rows = rows_now()
+    v = view()
+    rows = v["rows"]
     if not meta.get("refreshed") and not rows:
         return "no triage yet; run `arete triage --refresh`"
-    lines = [f"Triage of {summary(rows)}. Refreshed {meta.get('refreshed', 'never')}."]
+    lines = [f"Triage of {summary(v)}. Refreshed {meta.get('refreshed', 'never')}."]
     lines += [f"Not read this time: {e}" for e in meta.get("errors", [])]
     if meta.get("waiting"):
         lines.append(f"Waiting for the next refresh: {', '.join(meta['waiting'])}")
-    g = groups(rows)
-    width = max(len(r["ref"]) for r in rows) if rows else 0
-    repo_width = max((len(r["repo"]) for r in rows), default=0)
+    lines += [f"Not approved this time: {ref}: {why}" for ref, why in (meta.get("held") or {}).items()]
+    g = groups(v)
+    width = max((len(r["ref"]) for r in rows + v["sent"]), default=0)
+    repo_width = max((len(r["repo"] or "") for r in rows + v["sent"]), default=0)
     if g[READY]:
-        lines += ["", "Ready: add the labels to approve"]
+        lines += ["", f"Ready to build: {auto_note(config.load())}"]
         lines += [f"  {r['ref']:<{width}}  {r['size']}  {r['repo']:<{repo_width}}  {' '.join(labels_to_add(r)):<16}  "
                   f"{r['title']}" for r in g[READY]]
+    if g[SENT]:
+        lines += ["", f"Sent to the pipeline in the last {SENT_DAYS} days"]
+        for a in g[SENT]:
+            lines += [f"  {a['ref']:<{width}}  {a['size']}  {a['repo']:<{repo_width}}  {a['title']}",
+                      f"      {sent_note(a)}"]
+    if g[RESEARCH_WORK]:
+        lines += ["", "Research: arete writes a report for each one"]
+        for r in g[RESEARCH_WORK]:
+            report = v["research"].get(r["ref"])
+            lines += [f"  {r['ref']:<{width}}  {r['title']}", f"      {research_note(r, report)}"]
+            if report and report["summary"]:
+                lines.append(f"      {report['summary']}")
     if g[WITH_QUESTIONS]:
         lines += ["", "With questions"]
         for r in g[WITH_QUESTIONS]:
             lines.append(f"  {r['ref']:<{width}}  {r['size']}  {r['repo'] or '?':<{repo_width}}  {r['title']}")
             lines += [f"      - {q}" for q in r["questions"]] or [f"      {r['why']}"]
-    if g[NOT_CODE_WORK]:
-        lines += ["", "Not code work: nothing for the pipeline to build"]
-        for r in g[NOT_CODE_WORK]:
+    if g[NEEDS_PERSON]:
+        lines += ["", "Needs a person: nothing for arete to build or research"]
+        for r in g[NEEDS_PERSON]:
             lines += [f"  {r['ref']:<{width}}  {r['title']}", f"      {r['why']}"]
     if g[NOT_TRIAGED]:
         lines += ["", "Not triaged"]
         lines += [f"  {r['ref']:<{width}}  {r['title']}  ({r['why']})" for r in g[NOT_TRIAGED]]
-    lines += ["", "`arete triage REF` shows one ticket in full."]
+    lines += ["", "`arete triage REF` shows one ticket in full; `arete research REF` prints its report."]
     return "\n".join(lines)
 
 
 def ticket(ref: str) -> str | None:
-    r = next((r for r in state.triage_rows() if r["ref"].lower() == ref.strip().lower()), None)
+    want = ref.strip().lower()
+    r = next((r for r in state.triage_rows() if r["ref"].lower() == want), None)
     if not r:
-        return None
+        a = next((a for a in sent() if a["ref"].lower() == want), None) or state.triage_approval(want)
+        if not a:
+            return None
+        lines = [f"{a['ref']}: {a['title']}", a["url"], f"Sent to the pipeline {stamp(a['ts'])} for `{a['repo']}`.",
+                 sent_note(a) if "run" in a else ""]
+        lines += ["Assumed:"] + [f"  - {x}" for x in a["assumptions"]] if a["assumptions"] else []
+        return "\n".join(x for x in lines if x)
     lines = [f"{r['ref']}: {r['title']}", r["url"], f"{r['source']}, updated {r['updated'] or 'unknown'}"]
     kind = standing(r)
     if kind == NOT_TRIAGED:
         return "\n".join(lines + [f"Not triaged: {r['why']}"])
     lines[-1] += f", triaged {r['ts']} for ${r['cost'] or 0:.3f}"
-    if kind == NOT_CODE_WORK:
-        return "\n".join(lines + ["Not code work: nothing for the pipeline to build.", f"Why: {r['why']}"])
+    if kind == NEEDS_PERSON:
+        return "\n".join(lines + ["Needs a person: nothing for arete to build or research.", f"Why: {r['why']}"])
+    if kind == RESEARCH_WORK:
+        report = state.research_get(r["ref"])
+        lines += [f"Research: {research_note(r, report)}.", f"Why: {r['why']}"]
+        if report and report["summary"]:
+            lines += [f"Summary: {report['summary']}", f"`arete research {r['ref']}` prints the report."]
+        return "\n".join(lines)
     lines.append(f"Ready. Approve it: add {' and '.join(f'`{lb}`' for lb in labels_to_add(r))}." if kind == READY
                  else "Not ready.")
-    lines += [f"Size {r['size']}, repo {r['repo'] or 'not settled'}", f"Why: {r['why']}"]
-    if r["questions"]:
-        lines += ["Questions:"] + [f"  - {q}" for q in r["questions"]]
+    lines += [f"{r['kind'].capitalize()}, size {r['size']}, repo {r['repo'] or ' and '.join(r['repos']) or 'not settled'}",
+              f"Why: {r['why']}"]
+    for heading, items in (("Questions", r["questions"]), ("Assumes", r["assumptions"])):
+        if items:
+            lines += [f"{heading}:"] + [f"  - {q}" for q in items]
     if r["plan"]:
         lines += ["Plan:"] + [f"  {n}. {step}" for n, step in enumerate(r["plan"], 1)]
     return "\n".join(lines)
 
 
-def issue_header(changed: str) -> str:
-    return (f"Last change {changed}. Arete refreshes this every hour from your open tickets that have no "
-            f"`{tracker.LABEL}` label, and edits it only when something changes. To approve a ready ticket, add the "
-            "labels it names. `arete triage REF` on the Mac shows one ticket in full.")
+def issue_header(cfg: config.Config, changed: str) -> str:
+    approving = (f" Arete adds the labels to up to {cfg.jira.auto_per_refresh} ready Jira tickets each refresh and lists "
+                 "them under Sent to the pipeline." if cfg.jira.auto else "")
+    return (f"Last change {changed}. Arete refreshes this every 15 minutes from your open tickets that have no "
+            f"`{tracker.LABEL}` label, and edits it only when something changes.{approving} To approve a ready ticket "
+            "yourself, add the labels it names. Research tickets get a report here for your review. `arete triage "
+            "REF` on the Mac shows one ticket in full.")
 
 
 def quiet(text: str) -> str:
-    return re.sub(r"(@|#|GH-|github\.com/)(?=\w)", "\\1\u200b", " ".join(text.split()), flags=re.IGNORECASE)
+    return quiet_block(" ".join(text.split()))
+
+
+def quiet_block(text: str) -> str:
+    text = re.sub(r"(@|#|GH-|github\.com/)(?=\w)", "\\1\u200b", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?m)^#{1,3} ", "#### ", text)
+    return re.sub(r"</?details", lambda m: m.group(0).replace("<", "&lt;"), text, flags=re.IGNORECASE)
 
 
 def issue_link(r: dict) -> str:
     return f"[{r['ref']}]({r['url']})" if r["tracker"] == "jira" and r["url"] else f"`{r['ref']}`"
 
 
-def issue_block(r: dict, with_plan: bool) -> str:
+def fold(summary: str, body: str) -> str:
+    return f"\n  <details><summary>{summary}</summary>\n\n{body}\n\n  </details>\n"
+
+
+def issue_block(r: dict, v: dict, kind: str, with_plan: bool) -> str:
     title = quiet(r["title"])
-    kind = standing(r)
-    if kind in (NOT_TRIAGED, NOT_CODE_WORK):
+    if kind == SENT:
+        return f"- {issue_link(r)} **{r['size']}** in `{r['repo']}`: {title}\n  {quiet(sent_note(r))}"
+    if kind == RESEARCH_WORK:
+        report = v["research"].get(r["ref"])
+        lines = [f"- {issue_link(r)}: {title}", f"  {quiet(research_note(r, report))}"]
+        if report and report["summary"]:
+            lines.append(f"  {quiet(report['summary'])}")
+        if with_plan and report and report["report"]:
+            lines.append(fold("Report", quiet_block(report["report"])))
+        return "\n".join(lines)
+    if kind in (NOT_TRIAGED, NEEDS_PERSON):
         return f"- {issue_link(r)}: {title} ({quiet(r['why'])})"
-    lines = [f"- {issue_link(r)} **{r['size']}** in `{r['repo'] or '?'}`: {title}"]
+    lines = [f"- {issue_link(r)} **{r['size']}** {r['kind']} in `{r['repo'] or ' and '.join(r['repos']) or '?'}`: {title}"]
     if kind == READY:
         lines.append(f"  Add {' and '.join(f'`{lb}`' for lb in labels_to_add(r))}.")
     else:
         lines += [f"  - {quiet(q)}" for q in r["questions"]] or [f"  {quiet(r['why'])}"]
+    if with_plan and r["assumptions"]:
+        lines.append(fold("Assumes", "\n".join(f"  - {quiet(x)}" for x in r["assumptions"])))
     if with_plan and r["plan"]:
-        steps = "\n".join(f"  {n}. {quiet(step)}" for n, step in enumerate(r["plan"], 1))
-        lines.append(f"\n  <details><summary>Plan</summary>\n\n{steps}\n\n  </details>\n")
+        lines.append(fold("Plan", "\n".join(f"  {n}. {quiet(step)}" for n, step in enumerate(r["plan"], 1))))
     return "\n".join(lines)
 
 
-def issue_sections(rows: list[dict], with_plan: bool = True, limit: int | None = None) -> str:
-    g = groups(rows)
+def issue_sections(v: dict, with_plan: bool = True, limit: int | None = None) -> str:
+    g = groups(v)
+    total = sum(len(part) for part in g.values())
     shown = 0
     out = []
     for heading, part in g.items():
-        blocks = [issue_block(r, with_plan) for r in part]
+        blocks = [issue_block(r, v, heading, with_plan) for r in part]
         if limit is not None:
             blocks = blocks[:max(0, limit - shown)]
         shown += len(blocks)
         if blocks:
             out.append(f"## {heading} ({len(part)})\n\n" + "\n".join(blocks))
-    if shown < len(rows):
-        out.append(f"({len(rows) - shown} more tickets left out to fit; `arete triage` on the Mac lists them all.)")
+    if shown < total:
+        out.append(f"({total - shown} more tickets left out to fit; `arete triage` on the Mac lists them all.)")
     return "\n\n".join(out) or "No open tickets without the `agent` label."
 
 
-def fitted_sections(rows: list[dict]) -> str:
-    text = issue_sections(rows)
+def fitted_sections(v: dict) -> str:
+    text = issue_sections(v)
     if len(text) > MAX_ISSUE_CHARS:
-        text = issue_sections(rows, with_plan=False)
-    keep = len(rows)
+        text = issue_sections(v, with_plan=False)
+    keep = sum(len(part) for part in groups(v).values())
     while len(text) > MAX_ISSUE_CHARS and keep > 0:
         keep = keep * 9 // 10
-        text = issue_sections(rows, with_plan=False, limit=keep)
+        text = issue_sections(v, with_plan=False, limit=keep)
     return text
 
 
@@ -532,7 +732,7 @@ class BoardRefused(Exception):
     pass
 
 
-def publish(cfg: config.Config, rows: list[dict], meta: dict) -> str:
+def publish(cfg: config.Config, v: dict, meta: dict) -> str:
     repo = cfg.alert_repo
     if not repo:
         return "local only: alert_repo is empty"
@@ -541,14 +741,14 @@ def publish(cfg: config.Config, rows: list[dict], meta: dict) -> str:
         raise BoardRefused(f"cannot read {repo}")
     if not private:
         raise BoardRefused(f"{repo} is public and the board is private")
-    sections = fitted_sections(rows)
+    sections = fitted_sections(v)
     digest = hashlib.sha256(sections.encode()).hexdigest()[:16]
     if meta.get("repo") != repo:
         meta.update(repo=repo, issue=None, digest="")
     changed = digest != meta.get("digest")
     if changed or not meta.get("changed"):
         meta["changed"] = util.iso()
-    body = f"{issue_header(meta['changed'])}\n\n{sections}\n"
+    body = f"{issue_header(cfg, meta['changed'])}\n\n{sections}\n"
     number = meta.get("issue") or find_issue(repo)
     issue_state = gh.issue_state(repo, number) if number else ""
     if not issue_state:

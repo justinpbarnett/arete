@@ -10,6 +10,8 @@ $comments
 
 $attachments
 
+$triage
+
 ## What this repo's agents have learned so far
 
 $expertise

@@ -2,7 +2,7 @@ kind = "command"
 description = "Triage your open tickets that do not carry the agent label onto the triage board"
 
 [trigger]
-every = "1h"
+every = "15m"
 
 [run]
 command = "arete triage --refresh"

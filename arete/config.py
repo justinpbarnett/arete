@@ -8,8 +8,9 @@ from typing import Literal
 from . import paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session")
-MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet"}
+               "classify", "loop", "session", "research")
+MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
+                   "research": "opus"}
 
 
 class UnknownRepo(KeyError):
@@ -53,6 +54,8 @@ class JiraConfig:
     project: str = ""
     transitions: dict[str, str] = field(default_factory=dict)
     landed: dict[str, str] = field(default_factory=dict)
+    auto: bool = False
+    auto_per_refresh: int = 3
 
 
 @dataclass
@@ -183,6 +186,8 @@ def load(path: Path | None = None) -> Config:
         project=j.get("project", ""),
         transitions=transitions,
         landed={str(branch): str(target) for branch, target in (j.get("landed") or {}).items() if target},
+        auto=bool(j.get("auto", False)),
+        auto_per_refresh=max(0, int(j.get("auto_per_refresh", JiraConfig.auto_per_refresh))),
     )
     jv = data.get("jev", {})
     cfg.jev = JevConfig(
