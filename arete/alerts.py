@@ -16,7 +16,7 @@ def redact(text: str) -> str:
 
 
 def sanitize(text: str, n: int = 200) -> str:
-    return redact(util.first_line(text, n))
+    return util.first_line(redact(text), n)
 
 
 def notify(title: str, message: str) -> None:
