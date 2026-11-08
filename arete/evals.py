@@ -187,9 +187,10 @@ def remove_empty_parents(d: Path, stop: Path) -> None:
 
 def remove_base_harness(wt: Path, globs: list[str]) -> None:
     for f in util.git_records(["ls-files"], wt):
-        if util.matches_any(f, globs) and not f.startswith(EVALS):
-            (wt / f).unlink(missing_ok=True)
-            remove_empty_parents((wt / f).parent, wt)
+        p = wt / f
+        if util.matches_any(f, globs) and not f.startswith(EVALS) and (p.is_symlink() or p.is_file()):
+            p.unlink()
+            remove_empty_parents(p.parent, wt)
 
 
 def overlay_harness(src: Source, wt: Path) -> list[str]:
