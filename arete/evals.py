@@ -496,7 +496,12 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
         if any(p.dir for p in repo.parts):
             skipped.append((repo, "it has parts"))
             continue
-        tasks = load_tasks(*task_source(repo, Source(repo)))
+        try:
+            tasks = load_tasks(*task_source(repo, Source(repo)))
+        except (tomllib.TOMLDecodeError, ValueError, TypeError, KeyError) as e:
+            print(f"{repo.name}: eval tasks do not load: {type(e).__name__}: {e}")
+            skipped.append((repo, "its eval tasks do not load"))
+            continue
         if not tasks:
             continue
         with util.lock(state.run_lock("eval", repo.name)) as got:
