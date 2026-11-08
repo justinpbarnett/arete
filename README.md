@@ -43,9 +43,9 @@ A model name picks its runner. A claude alias or a `claude-*` id runs on the `cl
 `~/.config/arete/devices.toml` lists the machines loops and sessions run on, besides `local`:
 
 ```toml
-[device.virgil]
+[device.buildbox]
 kind = "ssh"
-host = "virgil"
+host = "buildbox"
 dir = "/root"
 note = "Hetzner box"
 ```
@@ -55,7 +55,7 @@ note = "Hetzner box"
 A session is an agent you start by hand and talk to, on any device, model and tool set:
 
 ```
-arete session start "look at why the nightly build is slow" --device virgil --model sonnet --tools Read,Grep,Bash --attach
+arete session start "look at why the nightly build is slow" --device buildbox --model sonnet --tools Read,Grep,Bash --attach
 arete session send ID "now try the cache"
 arete session attach ID | stop ID | list
 ```
