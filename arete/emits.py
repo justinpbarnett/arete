@@ -123,7 +123,7 @@ class Ticket(Emit):
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         repo = sources.github_name(cfg, item["repo"])
         for label in item["labels"]:
-            gh.ensure_label(repo, label)
+            gh.ensure_label(repo, label, restyle=False)
         url = gh.issue_url(repo, gh.issue_create(repo, item["title"], item["body"], item["labels"]))
         for f in batch:
             state.set_finding_url(loop_name, f["fingerprint_key"], url)

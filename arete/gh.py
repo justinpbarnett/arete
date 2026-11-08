@@ -34,11 +34,14 @@ def gh_json(args: list[str], cwd=None, timeout: float = 120):
     return json.loads(out) if out.strip() else None
 
 
-def ensure_label(repo: str, name: str, color: str = "5319e7", description: str = "") -> str:
+def ensure_label(repo: str, name: str, color: str = "5319e7", description: str = "", restyle: bool = True) -> str:
+    args = ["label", "create", name, "--repo", repo, "--color", color, "--description", description]
     try:
-        gh(["label", "create", name, "--repo", repo, "--color", color, "--description", description, "--force"])
+        gh([*args, "--force"] if restyle else args)
         return ""
     except GhError as e:
+        if not restyle and "already exists" in str(e):
+            return ""
         return f"{name}: {e}"
 
 
