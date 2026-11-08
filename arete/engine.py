@@ -33,11 +33,12 @@ from . import (
 from .agent import Result
 from .loops import Loop
 
-NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:e-?\d+)?")
+NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 KNOWN_FINDINGS_SHOWN = 30
 OUTPUT_TAIL = 6000
 FEED_OUTPUT_LINES = 2000
 FEED_LINE_CHARS = 500
+OUTPUT_GRACE_SECONDS = 5
 START_WAIT_SECONDS = 15
 STOP_WORD = "Stop:"
 CLASSIFY_SCHEMA = {
@@ -156,43 +157,53 @@ def kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], on_line) -> None:
+    with open(output or os.devnull, "a") as out:
+        for line in proc.stdout:
+            out.write(line)
+            out.flush()
+            lines.append(line)
+            if on_line:
+                on_line(line.rstrip("\n"))
+
+
+def exits_by(proc: subprocess.Popen, deadline: float) -> bool:
+    try:
+        proc.wait(max(0.0, deadline - time.monotonic()))
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
 def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, device: devices.Device,
                 stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
     local = not device.remote
     if argv and argv[0] == "arete" and local:
         argv = [sys.executable, "-m", "arete.cli", *argv[1:]]
     full = devices.wrap(device, argv, cwd, env)
+    deadline = time.monotonic() + timeout
     proc = subprocess.Popen(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, env={**os.environ, **env} if local else None,
                             **util.own_group_args())
-    expired = threading.Event()
-
-    def stop_at_deadline() -> None:
-        expired.set()
-        kill_group(proc)
-
-    timer = threading.Timer(timeout, stop_at_deadline)
-    timer.start()
     threading.Thread(target=feed_stdin, args=(proc, stdin), daemon=True).start()
     lines: list[str] = []
+    copier = threading.Thread(target=copy_output, args=(proc, output, lines, on_line), daemon=True)
+    copier.start()
+    expired = True
     try:
-        with open(output or os.devnull, "a") as out:
-            for line in proc.stdout:
-                out.write(line)
-                out.flush()
-                lines.append(line)
-                if on_line:
-                    on_line(line.rstrip("\n"))
-            proc.wait()
-            if expired.is_set():
-                note = f"\n[arete] stopped after {timeout:g}s\n"
-                out.write(note)
-                lines.append(note)
+        copier.join(max(0.0, deadline - time.monotonic()))
+        expired = copier.is_alive() or not exits_by(proc, deadline)
     finally:
-        timer.cancel()
-        if proc.poll() is None:
+        if expired:
             kill_group(proc)
-    return 124 if expired.is_set() else proc.returncode, "".join(lines)
+    if not expired:
+        return proc.returncode, "".join(lines)
+    copier.join(OUTPUT_GRACE_SECONDS)
+    exits_by(proc, time.monotonic() + OUTPUT_GRACE_SECONDS)
+    note = f"\n[arete] stopped after {timeout:g}s\n"
+    with open(output or os.devnull, "a") as out:
+        out.write(note)
+    return 124, "".join(lines) + note
 
 
 def work_dir(run: LoopRun) -> Path | str:
