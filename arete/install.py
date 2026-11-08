@@ -190,6 +190,7 @@ def rotate_logs(max_bytes: int = 5_000_000) -> None:
     for f in paths.LOG_DIR.glob("*.log"):
         try:
             if f.stat().st_size > max_bytes:
-                f.replace(f.with_suffix(".log.1"))
+                shutil.copyfile(f, f.with_suffix(".log.1"))
+                os.truncate(f, 0)
         except OSError:
             pass
