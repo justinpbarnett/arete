@@ -131,6 +131,12 @@ def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
     return [r for r in git([args[0], "-z", *args[1:]], cwd, **kw).split("\0") if r]
 
 
+def origin_default_branch(src: Path) -> str:
+    head = git(["ls-remote", "--symref", "origin", "HEAD"], src, check=False)
+    found = re.search(r"^ref: refs/heads/(\S+)\s+HEAD$", head, re.MULTILINE)
+    return found.group(1) if found else "main"
+
+
 def git_error(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     errors = [line for line in lines if line.startswith(("fatal:", "error:"))]

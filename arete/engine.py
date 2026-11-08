@@ -610,8 +610,9 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
 def open_workspace(run: LoopRun) -> Workspace:
     repo = run.loop.work_repo(run.cfg)
     src, github = repo.path, repo.github
+    layer = config.load_layer(repo.layer_dir)
     if "origin" in util.git(["remote"], src, check=False).split():
-        base = gh.default_branch(github) if github else "main"
+        base = layer.base_branch or (gh.default_branch(github) if github else util.origin_default_branch(src))
         util.git(["fetch", "origin", base], src)
         start = f"origin/{base}"
     else:
@@ -621,7 +622,6 @@ def open_workspace(run: LoopRun) -> Workspace:
     wt = paths.WORKTREES_DIR / f"loop-{run.id}"
     util.git(["worktree", "add", "-q", "-b", branch, str(wt), start], src)
     run.log("start", f"worktree {paths.short_path(wt)} on {branch} from {start}")
-    layer = config.load_layer(repo.layer_dir)
     public = repo.public or (bool(github) and gh.repo_private(github) is not True)
     return Workspace(src, wt, branch, base, github, start=util.git(["rev-parse", "HEAD"], wt).strip(),
                      deny=diffguard.denied_paths(layer), max_diff_lines=layer.max_diff_lines, public=public)
