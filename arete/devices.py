@@ -189,7 +189,7 @@ def lease(device: Device | str, label: str, log=lambda text: None):
         pve(d, f"qm start {vmid}")
         address = clone_address(d, vmid)
         log(f"VM {vmid} is up at {address}")
-        yield replace(d, kind="ssh", host=f"{d.user}@{address}", port=None,
+        yield replace(d, name=f"{d.name} clone", kind="ssh", host=f"{d.user}@{address}", port=None,
                       jump=",".join(filter(None, [d.jump, f"{d.host}:{d.port}" if d.port else d.host])))
     finally:
         if d.keep:
