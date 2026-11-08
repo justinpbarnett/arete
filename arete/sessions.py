@@ -187,6 +187,8 @@ def execute(session_id: str) -> str:
     with util.lock(session_lock(session_id)) as free:
         if not free:
             return "busy"
+        if (ended := (state.run_get(session_id) or {}).get("status", "gone")) != "running":
+            return ended
         record.note(session_id, pid=os.getpid())
         signal.signal(signal.SIGTERM, stop_on_term)
         status, summary = "done", ""
