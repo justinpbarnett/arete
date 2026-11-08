@@ -181,6 +181,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         return 0
     cfg = config.load()
     checks: list[Check] = []
+    ran_fine = set()
     for fn in (
         lambda: check_jobs(cfg),
         lambda: check_probes(cfg, force_probes),
@@ -190,10 +191,12 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         check_serve,
         lambda: check_loops(cfg),
     ):
+        crash_key = f"heartbeat:{getattr(fn, '__name__', 'check')}"
         try:
             checks += fn()
+            ran_fine.add(crash_key)
         except Exception as e:
-            checks.append(Check(f"heartbeat:{getattr(fn, '__name__', 'check')}", False, f"check crashed: {e}"))
+            checks.append(Check(crash_key, False, f"check crashed: {e}"))
 
     actions = []
     for c in checks:
@@ -203,6 +206,10 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
             msg = alerts.raise_alert(cfg.alert_repo, c.key, f"{c.key} failing", c.detail, dry_run)
         else:
             msg = None
+        if msg:
+            actions.append(msg)
+    for crash_key in sorted(ran_fine - {c.key for c in checks}):
+        msg = alerts.clear_alert(cfg.alert_repo, crash_key, dry_run)
         if msg:
             actions.append(msg)
 
