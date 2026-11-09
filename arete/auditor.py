@@ -185,6 +185,9 @@ def check_repos(cfg: config.Config) -> list[Finding]:
                                        f"research dir {research_dir} is not a folder in {paths.short_path(r.path)}"))
             except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
                 out.append(Finding("agents-config", "fail", paths.short_path(f), f"does not parse: {e}"))
+            except (ValueError, TypeError, AttributeError) as e:
+                out.append(Finding("agents-config", "fail", paths.short_path(f),
+                                   f"is not in the shape arete reads: {type(e).__name__}: {e}"))
         elif r.pipeline:
             out.append(Finding("agents-config", "fail", r.name, f"pipeline is on but {paths.short_path(f)} is missing"))
         for doc in ["CLAUDE.md", "AGENTS.md"]:
