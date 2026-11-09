@@ -1017,7 +1017,7 @@ def publish(cfg: config.Config, v: dict, meta: dict) -> str:
     if not private:
         raise BoardRefused(f"{repo} is public and the board is private")
     sections = fitted_sections(v)
-    digest = hashlib.sha256(sections.encode()).hexdigest()[:16]
+    digest = hashlib.sha256(f"{issue_header(cfg, '')}\n\n{sections}".encode()).hexdigest()[:16]
     if meta.get("repo") != repo:
         meta.update(repo=repo, issue=None, digest="")
     changed = digest != meta.get("digest")
