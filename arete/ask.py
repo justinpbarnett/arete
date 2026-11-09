@@ -80,7 +80,7 @@ def main(args) -> int:
     if args.only:
         rows = [r for r in rows if r.get("answer") == args.only or "error" in r]
     if args.json:
-        print(json.dumps(rows if args.paths else rows[0], indent=2))
+        print(json.dumps(rows if args.paths else next(iter(rows), None), indent=2))
     else:
         for r in rows:
             print("\t".join(filter(None, [r["path"], shown(r)])))
