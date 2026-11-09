@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import textwrap
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -935,7 +936,7 @@ def issue_link(r: dict) -> str:
 
 
 def fold(summary: str, body: str) -> str:
-    return f"\n  <details><summary>{summary}</summary>\n\n{body}\n\n  </details>\n"
+    return f"\n  <details><summary>{summary}</summary>\n\n{textwrap.indent(body, '  ')}\n\n  </details>\n"
 
 
 def issue_block(r: dict, v: dict, kind: str, with_plan: bool) -> str:
@@ -958,9 +959,9 @@ def issue_block(r: dict, v: dict, kind: str, with_plan: bool) -> str:
     else:
         lines += [f"  - {quiet(q)}" for q in r["questions"]] or [f"  {quiet(r['why'])}"]
     if with_plan and r["assumptions"]:
-        lines.append(fold("Assumes", "\n".join(f"  - {quiet(x)}" for x in r["assumptions"])))
+        lines.append(fold("Assumes", "\n".join(f"- {quiet(x)}" for x in r["assumptions"])))
     if with_plan and r["plan"]:
-        lines.append(fold("Plan", "\n".join(f"  {n}. {quiet(step)}" for n, step in enumerate(r["plan"], 1))))
+        lines.append(fold("Plan", "\n".join(f"{n}. {quiet(step)}" for n, step in enumerate(r["plan"], 1))))
     return "\n".join(lines)
 
 
