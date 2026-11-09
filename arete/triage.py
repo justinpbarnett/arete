@@ -376,7 +376,8 @@ def row(src: TriageSource, c: Candidate, **fields) -> dict:
 
 def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dict:
     if prev and prev["ready"] is not None:
-        return {**prev, "source": src.name, "title": c.title, "url": c.url, "in_sprint": c.in_sprint,
+        route = src.route(prev["repo"]) if prev["route"] and prev["repo"] in src.by_name() else prev["route"]
+        return {**prev, "source": src.name, "route": route, "title": c.title, "url": c.url, "in_sprint": c.in_sprint,
                 "parent": c.parent}
     return row(src, c, why=reason)
 
