@@ -63,7 +63,8 @@ td.wrap-cell { overflow-wrap: anywhere; }
 p.said:not([hidden]) { margin-top: 0; }
 #loop-new textarea { width: 100%; }
 th.c-model { width: 210px; }
-th.c-probe { width: 110px; }
+th.c-probe { width: 134px; }
+td.probe-cell button { min-width: 120px; }
 th.c-loop { min-width: 238px; }
 #launch-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0 18px; }
 th.c-device { min-width: 220px; }

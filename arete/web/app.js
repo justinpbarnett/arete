@@ -1369,7 +1369,7 @@ function deviceRow(d) {
     cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted" }, liveAgo(p.at))] : "not probed", "nb"),
     cell(probeWords(p) || (d.error ? d.error : ""), "muted-cell"),
     cell([p ? (p.tools || []).join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
-    cell(button("Probe", `probe:${d.name}`, (b) => probe(d.name, b))));
+    cell(button("Probe", `probe:${d.name}`, (b) => probe(d.name, b)), "probe-cell"));
 }
 
 async function probe(name, btn) {
@@ -1381,6 +1381,7 @@ async function probe(name, btn) {
   } catch (e) {
     say("fleet-result", "fault", e.message);
   }
+  document.getElementById("fleet-result").focus();
   refresh();
 }
 
