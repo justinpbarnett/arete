@@ -164,7 +164,7 @@ def write_log(spec: Spec, kind: str, text: str) -> None:
 
 
 def stop_on_term(*_) -> None:
-    raise SessionStopped("stopped by request")
+    raise SessionStopped
 
 
 def session_lock(session_id: str) -> str:
@@ -242,8 +242,8 @@ def execute(session_id: str) -> str:
                         summary = f"closed after {cfg.session_idle_hours:g}h with no message"
                         break
                     time.sleep(INBOX_POLL_SECONDS)
-        except SessionStopped as e:
-            status, summary = "stopped", str(e)
+        except SessionStopped:
+            status, summary = "stopped", record.STOPPED if record.stop_asked(session_id) else "stopped by a signal"
         except Exception as e:
             status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
         finally:
