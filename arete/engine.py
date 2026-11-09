@@ -228,7 +228,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     note = f"\n[arete] stopped after {timeout:g}s\n"
     with open(output or os.devnull, "a") as out:
         out.write(note)
-    return 124, "".join(lines) + note
+    return util.TIMED_OUT, "".join(lines) + note
 
 
 def work_dir(run: LoopRun) -> Path | str:

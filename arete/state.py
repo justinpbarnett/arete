@@ -309,6 +309,14 @@ CREATE TABLE IF NOT EXISTS usage (
     ms INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS usage_at ON usage (at);
+CREATE TABLE IF NOT EXISTS vms (
+    name TEXT PRIMARY KEY,         -- a VM arete asked for and has not yet seen deleted
+    run_id TEXT NOT NULL,          -- '' for a probe
+    device TEXT NOT NULL,          -- JSON of the device that asked, so its host stays reachable if devices.toml changes
+    vmid INTEGER,                  -- proxmox only
+    made TEXT NOT NULL,
+    failing_since TEXT             -- when a delete of it first failed
+);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
@@ -766,10 +774,34 @@ def runs_marked_running(connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
-def settled_run_ids(devices: list[str], connect=db) -> list[str]:
+def add_vm(name: str, run_id: str, device: dict, vmid: int | None = None, connect=db) -> None:
     with connect() as c:
-        return [r["id"] for r in c.execute(f"SELECT id FROM runs WHERE status != 'running' AND device IN "
-                                           f"({', '.join('?' * len(devices))})", devices)]
+        c.execute("INSERT OR REPLACE INTO vms (name, run_id, device, vmid, made) VALUES (?,?,?,?,?)",
+                  (name, run_id, json.dumps(device), vmid, util.iso()))
+
+
+def forget_vm(name: str, connect=db) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM vms WHERE name = ?", (name,))
+
+
+def note_delete_failed(name: str, connect=db) -> None:
+    with connect() as c:
+        c.execute("UPDATE vms SET failing_since = COALESCE(failing_since, ?) WHERE name = ?", (util.iso(), name))
+
+
+def vms_of_run(run_id: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [{**dict(r), "device": json.loads(r["device"])}
+                for r in c.execute("SELECT * FROM vms WHERE run_id = ? ORDER BY made", (run_id,))]
+
+
+def vms_left_over(probes_made_before: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [{**dict(r), "device": json.loads(r["device"])} for r in c.execute(
+            "SELECT * FROM vms v WHERE (v.run_id = '' AND v.made < ?) OR (v.run_id != '' AND NOT EXISTS "
+            "(SELECT 1 FROM runs r WHERE r.id = v.run_id AND r.status = 'running')) ORDER BY made",
+            (probes_made_before,))]
 
 
 def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db) -> list[dict]:

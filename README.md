@@ -84,15 +84,39 @@ Arete reaches exe.dev as `ssh exe.dev` with your own ssh key, so it stores no ex
 [device.sandbox]
 kind = "exe"
 template = "arete-template"   # a VM to copy for each run; leave it out to start from exe.dev's own image
-egress = "integrations"       # integrations | all; leave it out for exe.dev's default
+egress = "integrations"       # integrations | all; leave it out for "all", or for the template's own policy on a copy
 note = "a fresh sandbox per run"
 ```
 
 A sandbox is named `arete-` and its run id, and is tagged `arete`; a copy of a template also keeps the template's tags.
 `keep = true` leaves the sandbox up after the run and logs the `ssh exe.dev rm NAME` that deletes it; exe.dev bills it until then.
-When a run dies before it can delete its sandbox, `arete loop stop`, `arete session stop` or the next reap deletes it.
-A probe of an `exe` device makes a real sandbox, tagged `arete-probe` as well, checks that it answers, and deletes it.
-Every 5 minutes, `arete serve` deletes any sandbox that a finished run left behind, and any probe sandbox older than 10 minutes.
+A probe of an `exe` device makes a real sandbox, checks that it answers, and deletes it.
+
+Arete writes each sandbox and proxmox clone to its state database before it asks for one, and strikes it off once the delete is confirmed.
+When a run dies before it can delete its VM, `arete loop stop`, `arete session stop` or the next reap deletes it.
+Every 5 minutes, `arete serve` deletes any VM still on that list whose run has ended, and any probe VM older than 10 minutes.
+That catches a delete that failed, a create that got no answer or was stopped, and a probe that was killed.
+A create that exe.dev refuses leaves nothing to delete, but ssh cannot tell a lobby it never reached from a connection that dropped after the VM was made, so a create with no answer stays on the list until a delete settles it.
+After 7 days of failed deletes, `arete serve` logs the command that deletes the VM and stops trying.
+A VM of a `keep = true` device leaves the list once it is up, so arete never deletes it.
+
+A device of kind `proxmox` clones a template VM on a Proxmox VE host for each run:
+
+```toml
+[device.pve]
+kind = "proxmox"
+host = "root@pve.lan"         # the Proxmox VE host, reached over ssh
+template = "9000"             # the VM id of the template to clone
+user = "root"                 # the login on the clone; root when left out
+note = "a linked clone per run"
+```
+
+Each run gets a linked clone of the template, named `arete-` and its run id.
+Arete starts the clone, asks the QEMU guest agent for its address, and reaches it over ssh with the Proxmox host as the jump host.
+So the template needs `qemu-guest-agent` running and your ssh key in the login's `authorized_keys`.
+Arete destroys the clone when the run ends, unless the device sets `keep = true`.
+Before it destroys a clone, arete checks that the VM id still holds a VM of that name.
+A probe of a `proxmox` device reads the template's config and makes no clone.
 
 Agents in a sandbox run on pi, which reads `~/.pi/agent/models.json` on the VM; a loop or session that would run claude there is refused.
 Make the template a regular VM with `ssh exe.dev new --name=arete-template`, and give it a `models.json` whose providers go through exe.dev integrations:
@@ -109,10 +133,11 @@ Make the template a regular VM with `ssh exe.dev new --name=arete-template`, and
 
 exe.dev adds the real key at the integration, so the VM holds none, and `egress = "integrations"` lets the sandbox reach the integrations alone.
 `exe-llm` is exe.dev's own LLM gateway, which every VM can reach; a loop or session asks for it as `exe-llm/gpt-5.4-mini`.
-OpenRouter needs an integration that holds your key, attached to the `arete` tag:
+OpenRouter needs an integration that holds your key, attached to the `arete` tag.
+This command reads the key from `~/.config/arete/pi.env` and hands it to exe.dev on stdin, so the key stays out of your shell history:
 
 ```
-printf '%s' "$OPENROUTER_API_KEY" | ssh exe.dev integrations add openrouter --name=openrouter --key=- --attach tag:arete
+sed -nE 's/^(export )?OPENROUTER_API_KEY=//p' ~/.config/arete/pi.env | tr -d "\"'\n" | ssh exe.dev integrations add openrouter --name=openrouter --key=- --attach tag:arete
 ```
 
 A model is then `openrouter/` and an OpenRouter model id.

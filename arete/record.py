@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import timedelta
 
 from . import devices, paths, state, util
 
@@ -112,8 +113,7 @@ def dead(row: dict):
 def interrupt(row: dict) -> dict | None:
     if not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
-    if row.get("device"):
-        devices.release(row["device"], row["id"], lambda text: state.add_feed(row["id"], "device", text))
+    devices.release(row["id"], lambda text: state.add_feed(row["id"], "device", text))
     status = dead_status(row)
     summary = STOPPED if status == "stopped" else INTERRUPTED
     settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
@@ -134,21 +134,11 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
     return settled
 
 
-def sweep_sandboxes(say: Callable[[str], None]) -> None:
-    sandbox_devices = [d for d in devices.known() if d.sandbox]
-    for lobby in {d.host: d for d in sandbox_devices}.values():
-        try:
-            vms = devices.vms_on(lobby)
-        except devices.DeviceError as e:
-            say(f"cannot look for sandboxes that runs left behind: {e}")
-            continue
-        disposable = [d.name for d in sandbox_devices if d.host == lobby.host and not d.keep]
-        run_of = {devices.vm_name(run_id): run_id for run_id in state.settled_run_ids(disposable)}
-        for vm in vms:
-            if run_id := run_of.get(vm["vm_name"]):
-                devices.drop_sandbox(lobby, vm["vm_name"], feed_and_say(run_id, say))
-            elif devices.is_stale_probe(vm):
-                devices.drop_sandbox(lobby, vm["vm_name"], say)
+def sweep_vms(say: Callable[[str], None]) -> None:
+    probes_made_before = util.iso(util.now() - timedelta(minutes=devices.PROBE_SANDBOX_MINUTES))
+    failing_before = util.iso(util.now() - timedelta(days=devices.SWEEP_GIVES_UP_DAYS))
+    for vm in state.vms_left_over(probes_made_before):
+        devices.sweep(vm, failing_before, feed_and_say(vm["run_id"], say) if vm["run_id"] else say)
 
 
 def feed_and_say(run_id: str, say: Callable[[str], None]) -> Callable[[str], None]:

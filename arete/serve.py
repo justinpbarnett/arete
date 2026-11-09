@@ -101,6 +101,7 @@ class Server:
         self.cfg = config.load()
         self.started = util.now()
         self.polls: dict[str, Future] = {}
+        self.sweep: Future | None = None
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
@@ -139,8 +140,8 @@ class Server:
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             state.prune()
             self.pruned = time.monotonic()
-        if time.monotonic() - self.swept > SWEEP_SECONDS:
-            record.sweep_sandboxes(self.say)
+        if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
+            self.sweep = self.pool.submit(self.sweep_vms)
             self.swept = time.monotonic()
         self.ticks += 1
         self.beat(every_loop, live)
@@ -195,6 +196,15 @@ class Server:
         polled = {sources.source_id(loop, i) for loop in live for i in range(len(loop.sources))}
         for sid in set(self.errors) - polled:
             self.errors.pop(sid, None)
+
+    def sweeping(self) -> bool:
+        return bool(self.sweep) and not self.sweep.done()
+
+    def sweep_vms(self) -> None:
+        try:
+            record.sweep_vms(self.say)
+        except Exception as e:
+            self.say(f"sweeping left-over VMs failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
@@ -307,6 +317,8 @@ class Server:
             return "a source poll is still running"
         if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
             return running[0]
+        if self.sweeping():
+            return "a sweep of left-over VMs is still running"
         if dashboard.POSTS_IN_FLIGHT.count:
             return "the dashboard is still answering a request"
         if chat.history()["busy"]:

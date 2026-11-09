@@ -4,16 +4,17 @@ import ipaddress
 import json
 import re
 import shlex
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
-from . import paths, util
+from . import paths, state, util
 
 DEVICES_FILE = paths.CONFIG_DIR / "devices.toml"
 CACHE_FILE = paths.STATE_DIR / "devices.json"
@@ -34,10 +35,11 @@ VM_PREFIX = "arete-"
 EXE_LOBBY = "exe.dev"
 EXE_VM_DOMAIN = ".exe.xyz"
 EXE_TAG = "arete"
-EXE_PROBE_TAG = "arete-probe"
 EXE_EGRESS = ("integrations", "all")
 EXE_BOOT_SECONDS = 120
 PROBE_SANDBOX_MINUTES = 10
+SWEEP_GIVES_UP_DAYS = 7
+PROBE_RUN = ""
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,10 @@ LOCAL = Device("local", note="this machine")
 
 
 class DeviceError(RuntimeError):
+    pass
+
+
+class NoAnswer(DeviceError):
     pass
 
 
@@ -202,27 +208,26 @@ def probe_sandbox(d: Device, timeout: float) -> dict:
     from . import record
 
     name = vm_name(record.new_id(f"probe-{d.name}"))
-    tags = [EXE_TAG, EXE_PROBE_TAG]
     started = time.monotonic()
     try:
-        vm = create_sandbox(d, name, tags, lambda text: None)
+        vm = create_sandbox(d, name, PROBE_RUN, lambda text: None)
     except DeviceError as e:
         return {"ok": False, "detail": str(e)}
     try:
-        boot_sandbox(d, vm, name, tags)
+        boot_sandbox(d, vm, name)
         seconds_to_ssh = time.monotonic() - started
         info = probe_shell(vm, timeout)
     except DeviceError as e:
         info = {"ok": False, "detail": str(e)}
     finally:
-        not_deleted = drop_sandbox(d, name, lambda text: None)
+        not_deleted = delete_and_forget(d, name, None, lambda text: None)
     if not_deleted:
         return {**info, "ok": False, "detail": util.first_line("; ".join(filter(None, [info["detail"], not_deleted])),
                                                                 300)}
     if info["detail"]:
         return info
     sandbox_words = f"a copy of {d.template}" if d.template else "a fresh sandbox"
-    return {**info, "detail": f"{sandbox_words} answered in {seconds_to_ssh:.1f} s and was deleted"}
+    return {**info, "detail": f"{sandbox_words} was up in {seconds_to_ssh:.1f} s and was deleted"}
 
 
 def cached() -> dict:
@@ -245,7 +250,8 @@ def failure(res) -> str:
 def pve(d: Device, command: str, timeout: float = 300) -> str:
     res = util.sh([*ssh_argv(d), command], timeout=timeout)
     if res.returncode != 0:
-        raise DeviceError(f"{d.name}: `{command}` failed: {failure(res)}")
+        raise (NoAnswer if res.returncode == util.TIMED_OUT else DeviceError)(
+            f"{d.name}: `{command}` failed: {failure(res)}")
     return res.stdout
 
 
@@ -256,10 +262,12 @@ def exe(d: Device, *command: str, timeout: float = 120) -> dict:
         reply = json.loads(lines[-1]) if lines else None
     except json.JSONDecodeError:
         reply = None
-    if res.returncode == 0 and isinstance(reply, dict) and not reply.get("error"):
+    if isinstance(reply, dict) and not reply.get("error"):
         return reply
-    why = (reply.get("error") if isinstance(reply, dict) else "") or failure(res)
-    raise DeviceError(f"{d.name}: `ssh {d.host} {command[0]}` failed: {why}")
+    failed = f"{d.name}: `ssh {d.host} {command[0]}` failed: "
+    if isinstance(reply, dict):
+        raise DeviceError(failed + str(reply["error"]))
+    raise NoAnswer(failed + failure(res))
 
 
 def vm_name(label: str) -> str:
@@ -359,23 +367,27 @@ def wait_for_ssh(vm: Device) -> None:
 
 
 @contextmanager
-def lease(device: Device | str, label: str, log=lambda text: None):
+def lease(device: Device | str, run_id: str, log=lambda text: None):
     d = resolve(device)
     if d.kind == "proxmox":
-        with proxmox_clone(d, label, log) as clone:
+        with proxmox_clone(d, run_id, log) as clone:
             yield clone
     elif d.kind == "exe":
-        with sandbox(d, label, log) as vm:
+        with sandbox(d, run_id, log) as vm:
             yield vm
     else:
         yield d
 
 
 @contextmanager
-def proxmox_clone(d: Device, label: str, log):
+def proxmox_clone(d: Device, run_id: str, log):
+    name = vm_name(run_id)
     vmid = int(pve(d, "pvesh get /cluster/nextid").strip())
     log(f"cloning template {d.template} to VM {vmid} on {d.name}")
-    pve(d, f"qm clone {d.template} {vmid} --name {vm_name(label)} --full 0")
+    with recorded(d, name, run_id, log, vmid):
+        pve(d, f"qm clone {d.template} {vmid} --name {name} --full 0")
+    if d.keep:
+        state.forget_vm(name)
     try:
         pve(d, f"qm start {vmid}")
         boot = BootingClone(d, vmid)
@@ -387,51 +399,108 @@ def proxmox_clone(d: Device, label: str, log):
             yield clone
     finally:
         if d.keep:
-            log(f"keeping VM {vmid}")
+            log(f"keeping VM {vmid} ({name}) until {delete_command(d, name, vmid)} deletes it")
         else:
-            res = util.sh([*ssh_argv(d), f"qm stop {vmid} --skiplock 1; qm destroy {vmid} --purge 1"], timeout=300)
-            log(f"destroyed VM {vmid}" if res.returncode == 0 else
-                f"could not destroy VM {vmid} on {d.name}, so it is still there: {failure(res)}")
+            delete_and_forget(d, name, vmid, log)
 
 
 @contextmanager
-def sandbox(d: Device, label: str, log):
-    name = vm_name(label)
+def sandbox(d: Device, run_id: str, log):
+    name = vm_name(run_id)
     started = time.monotonic()
-    vm = create_sandbox(d, name, [EXE_TAG], log)
+    vm = create_sandbox(d, name, run_id, log)
+    if d.keep:
+        state.forget_vm(name)
     try:
-        boot_sandbox(d, vm, name, [EXE_TAG])
+        boot_sandbox(d, vm, name)
         log(f"sandbox {name} is up at {vm.host} in {time.monotonic() - started:.1f} s")
         yield vm
     finally:
         if d.keep:
-            log(f"keeping sandbox {name}, which is billed until `ssh {d.host} rm {name}` deletes it")
+            log(f"keeping sandbox {name}, which is billed until {delete_command(d, name, None)} deletes it")
         else:
-            drop_sandbox(d, name, log)
+            delete_and_forget(d, name, None, log)
 
 
-def create_sandbox(d: Device, name: str, tags: list[str], log) -> Device:
-    egress = [f"--egress={d.egress}"] if d.egress else []
+@contextmanager
+def recorded(d: Device, name: str, run_id: str, log, vmid: int | None = None):
+    state.add_vm(name, run_id, asdict(d), vmid)
     try:
+        yield
+    except BaseException as e:
+        if delete_vm(d, name, vmid, log):
+            state.note_delete_failed(name)
+        elif isinstance(e, DeviceError) and not isinstance(e, NoAnswer):
+            state.forget_vm(name)
+        # Otherwise the row stays: a create that got no answer, or was cut short, may still finish on the host.
+        raise
+
+
+def create_sandbox(d: Device, name: str, run_id: str, log) -> Device:
+    egress = [f"--egress={d.egress}"] if d.egress else []
+    with recorded(d, name, run_id, log):
         if d.template:
             log(f"copying {d.template} to sandbox {name} on exe.dev")
             created = exe(d, "cp", d.template, name, "--sandbox", *egress)
         else:
             log(f"creating sandbox {name} on exe.dev")
-            created = exe(d, "new", f"--name={name}", "--sandbox", "--no-email", f"--tag={','.join(tags)}", *egress)
-    except DeviceError:
-        raise
-    except BaseException:
-        # exe.dev answering with an error made nothing, but a stop or ^C mid-create may leave a sandbox behind.
-        drop_sandbox(d, name, log)
-        raise
+            created = exe(d, "new", f"--name={name}", "--sandbox", "--no-email", f"--tag={EXE_TAG}", *egress)
     return replace(d, kind="ssh", host=created.get("ssh_dest") or f"{name}{EXE_VM_DOMAIN}", port=None)
 
 
-def boot_sandbox(d: Device, vm: Device, name: str, tags: list[str]) -> None:
+def boot_sandbox(d: Device, vm: Device, name: str) -> None:
     if d.template:
-        exe(d, "tag", name, *tags)
+        exe(d, "tag", name, EXE_TAG)
     wait_for_ssh(vm)
+
+
+def delete_and_forget(d: Device, name: str, vmid: int | None, log) -> str:
+    not_deleted = delete_vm(d, name, vmid, log)
+    if not not_deleted:
+        state.forget_vm(name)
+        return ""
+    state.note_delete_failed(name)
+    not_deleted += f"; arete serve tries again, and {delete_command(d, name, vmid)} deletes it now"
+    log(not_deleted)
+    return not_deleted
+
+
+def delete_command(d: Device, name: str, vmid: int | None) -> str:
+    if d.kind == "exe":
+        return f"`ssh {d.host} rm {name}`"
+    return f"`qm stop {vmid}; qm destroy {vmid} --purge 1` on {d.host}"
+
+
+def delete_vm(d: Device, name: str, vmid: int | None, log) -> str:
+    with ignoring_stops():
+        return drop_sandbox(d, name, log) if d.kind == "exe" else destroy_clone(d, name, vmid, log)
+
+
+@contextmanager
+def ignoring_stops():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def destroy_clone(d: Device, name: str, vmid: int, log) -> str:
+    found = util.sh([*ssh_argv(d), f"qm config {vmid}"], timeout=60)
+    if found.returncode == 0 and f"name: {name}" in found.stdout.splitlines():
+        res = util.sh([*ssh_argv(d), f"qm stop {vmid} --skiplock 1; qm destroy {vmid} --purge 1"], timeout=300)
+    elif found.returncode == 0 or "does not exist" in found.stderr:
+        # The clone is gone, and proxmox may have given its vmid to another VM since.
+        return ""
+    else:
+        res = found
+    if res.returncode == 0:
+        log(f"destroyed VM {vmid}")
+        return ""
+    return f"could not destroy VM {vmid} ({name}) on {d.name}: {failure(res)}"
 
 
 def drop_sandbox(d: Device, name: str, log) -> str:
@@ -444,25 +513,30 @@ def drop_sandbox(d: Device, name: str, log) -> str:
         return ""
     if name in reply.get("not_found", []):
         return ""
-    not_deleted = (f"could not delete sandbox {name}: {reply.get('errors', {}).get(name) or 'exe.dev gave no reason'}"
-                   f"; arete serve tries again, and `ssh {d.host} rm {name}` deletes it now and stops its bill")
-    log(not_deleted)
-    return not_deleted
+    return f"could not delete sandbox {name}: {reply.get('errors', {}).get(name) or 'exe.dev gave no reason'}"
 
 
-def release(device: str, label: str, log=lambda text: None) -> None:
-    d = next((x for x in known() if x.name == device), LOCAL)
-    if d.sandbox and not d.keep:
-        drop_sandbox(d, vm_name(label), log)
+def release(run_id: str, log=lambda text: None) -> None:
+    for vm in state.vms_of_run(run_id):
+        delete_and_forget(saved_device(vm), vm["name"], vm["vmid"], log)
 
 
-def vms_on(lobby: Device) -> list[dict]:
-    return exe(lobby, "ls", timeout=30).get("vms", [])
+def sweep(vm: dict, failing_before: str, log) -> None:
+    d = saved_device(vm)
+    not_deleted = delete_vm(d, vm["name"], vm["vmid"], log)
+    if not not_deleted:
+        state.forget_vm(vm["name"])
+    elif vm["failing_since"] and vm["failing_since"] < failing_before:
+        state.forget_vm(vm["name"])
+        log(f"{not_deleted}; arete serve stops trying after {SWEEP_GIVES_UP_DAYS} days, and "
+            f"{delete_command(d, vm['name'], vm['vmid'])} deletes it if it is still there")
+    else:
+        state.note_delete_failed(vm["name"])
 
 
-def is_stale_probe(vm: dict) -> bool:
-    created = util.parse_iso(vm.get("created_at") or util.iso())
-    return EXE_PROBE_TAG in vm.get("tags", []) and util.now() - created > timedelta(minutes=PROBE_SANDBOX_MINUTES)
+def saved_device(vm: dict) -> Device:
+    saved = vm["device"]
+    return Device(**{f.name: saved[f.name] for f in fields(Device) if f.name in saved})
 
 
 def known() -> list[Device]:
