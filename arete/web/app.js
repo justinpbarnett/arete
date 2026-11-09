@@ -16,7 +16,7 @@ let costData = null;
 let settingsData = null;
 const RUN_LIMITS = [["max-parallel", "max_parallel"], ["max-parallel-per-repo", "max_parallel_per_repo"]];
 let chatSeen = "";
-let lastGood = "";
+const lastGood = new Map();
 const openQuestions = new Set();
 const drafts = new Map();
 const sendSaid = new Map();
@@ -1277,14 +1277,15 @@ async function refresh() {
   try {
     const held = (await LOADERS[view]()) === HELD;
     if (mine !== refreshCount) return;
-    if (!held) lastGood = clock(new Date());
+    if (!held) lastGood.set(view, new Date());
     const label = document.querySelector(`.views [data-view="${view}"]`).textContent;
     const shown = held ? "held while you edit" : `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
     status("", `${label} · ${shown}${nextDelay() ? ` · refreshes every ${nextDelay() / 1000} s` : ""}`);
     document.querySelectorAll(".readout").forEach((r) => r.classList.remove("stale"));
   } catch (e) {
     if (mine !== refreshCount) return;
-    status("fault", `Arete did not answer: ${e.message}${lastGood ? ` What shows came at ${lastGood}.` : ""}`);
+    const shownAt = clock(lastGood.get(view));
+    status("fault", `Arete did not answer: ${e.message}${shownAt ? ` What shows came at ${shownAt}.` : ""}`);
     document.querySelectorAll(".readout").forEach((r) => r.classList.add("stale"));
   }
   if (mine === refreshCount) schedule(nextDelay());
