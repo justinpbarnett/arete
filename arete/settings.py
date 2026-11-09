@@ -30,7 +30,7 @@ def instead_of(text: str) -> str:
 
 def run_limit_from(key: str, value) -> int:
     text = value.strip() if isinstance(value, str) else json.dumps(value)
-    if not text.isdigit() or not 1 <= int(text) <= PARALLEL_MAX:
+    if not text.isdecimal() or len(text) > len(str(PARALLEL_MAX)) or not 1 <= int(text) <= PARALLEL_MAX:
         raise Refused(f"{RUN_LIMITS[key]} takes a whole number from 1 to {PARALLEL_MAX}{instead_of(text)}")
     return int(text)
 
