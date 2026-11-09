@@ -1656,7 +1656,8 @@ def sync_outcomes(cfg: config.Config) -> None:
             continue
         record_feedback(cfg, r, urls, prs, seen, fresh)
         closed = all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs)
-        if r["status"] == "rejected":
+        merged = all(pr.get("mergedAt") for pr in prs)
+        if r["status"] == "rejected" and not merged:
             if not closed:
                 record.note(r["id"], status="pr")
             continue
@@ -1664,7 +1665,6 @@ def sync_outcomes(cfg: config.Config) -> None:
             continue
         for url, pr in zip(urls, prs):
             state.close_feedback(url, pr["state"])
-        merged = all(pr.get("mergedAt") for pr in prs)
         closed_at = max(pr.get("closedAt") or "" for pr in prs) or util.iso()
         record.note(r["id"], status="merged" if merged else "rejected", finished=closed_at)
     util.write_json(PR_SEEN_FILE, fresh)
