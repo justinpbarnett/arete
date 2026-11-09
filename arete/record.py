@@ -98,7 +98,7 @@ def failed_on_crash(run_id: str):
 
 
 def dead_status(row: dict) -> str:
-    if row.get("stop_asked"):
+    if stop_asked(row["id"]):
         return "stopped"
     if row["kind"] == "pipeline":
         earlier = [r for r in state.ticket_runs(row["repo"], row["issue"], limit=3) if r["id"] != row["id"]]
