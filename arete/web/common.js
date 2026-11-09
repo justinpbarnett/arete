@@ -2,7 +2,7 @@
 
 const VIEWS = {
   live: { label: "Live", group: "Work", key: "l", sub: "What runs now, and what waits for you." },
-  runs: { label: "Runs", group: "Work", key: "r", sub: "Every run, the running ones first, with the one you open beside the list." },
+  runs: { label: "Runs", group: "Work", key: "r", sub: "Every run of every kind, the running ones first, then the newest." },
   sessions: { label: "Sessions", group: "Work", key: "s", sub: "Agents you talk to, on the device and model you pick." },
   loops: { label: "Loops", group: "Work", key: "o", sub: "The jobs serve fires on a schedule, from a source, or from a webhook." },
   triage: { label: "Triage", group: "Work", key: "t", sub: "Every open ticket, grouped by what it needs before it can be built." },
