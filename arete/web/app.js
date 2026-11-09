@@ -26,6 +26,7 @@ let redrawTriage = false;
 const lastSaid = new Map();
 const going = { health: false, triage: false };
 let loopNewKey = "";
+const handlersOf = new WeakMap();
 
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
@@ -33,7 +34,7 @@ function el(tag, props = {}, ...kids) {
     if (value === undefined || value === null || value === false) continue;
     if (key === "text") node.textContent = value;
     else if (key === "class") node.className = value;
-    else if (key === "on") for (const [event, fn] of Object.entries(value)) node.addEventListener(event, fn);
+    else if (key === "on") listen(node, value);
     else node.setAttribute(key, value === true ? "" : value);
   }
   node.append(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false));
@@ -47,12 +48,72 @@ function svg(tag, attrs = {}, text) {
   return node;
 }
 
+function listen(node, handlers) {
+  handlersOf.set(node, handlers);
+  for (const event of Object.keys(handlers)) node.addEventListener(event, (e) => handlersOf.get(node)[event](e));
+}
+
+function elementsIn(nodes) {
+  return nodes.flatMap((node) => (node instanceof Element ? [node, ...node.querySelectorAll("*")] : []));
+}
+
+function marked(nodes, key) {
+  const mark = `[data-focus="${CSS.escape(key)}"]`;
+  return nodes.flatMap((node) => (node instanceof Element ? [...(node.matches(mark) ? [node] : []), ...node.querySelectorAll(mark)] : []));
+}
+
+function markOf(node, nodes) {
+  const key = node?.dataset?.focus;
+  return key ? [key, marked(nodes, key).indexOf(node)] : null;
+}
+
+function tickClocks(box) {
+  for (const time of box.querySelectorAll("time.ago")) {
+    const now = ago(time.dateTime);
+    if (time.textContent !== now) time.textContent = now;
+  }
+}
+
+function reuseShown(shown, fresh) {
+  if (shown.length !== fresh.length || shown.some((node, i) => !node.isEqualNode(fresh[i]))) return false;
+  const [olds, news] = [elementsIn(shown), elementsIn(fresh)];
+  const handled = (node) => Object.keys(handlersOf.get(node) || {}).join();
+  if (olds.some((node, i) => node.value !== news[i].value || node.checked !== news[i].checked || handled(node) !== handled(news[i]))) return false;
+  olds.forEach((node, i) => handlersOf.has(news[i]) && handlersOf.set(node, handlersOf.get(news[i])));
+  return true;
+}
+
+function viewRank(rect) {
+  return rect.top >= 0 ? rect.top : innerHeight - rect.top;
+}
+
+function pagePlace(box, shown) {
+  if (!box.getClientRects().length) return null;
+  const place = { x: scrollX, y: scrollY, anchor: null, top: 0 };
+  if (box.getBoundingClientRect().top >= 0) return place;
+  let nearest = null;
+  for (const node of box.querySelectorAll("[data-focus]")) {
+    const rect = node.getClientRects()[0];
+    if (rect && (!nearest || viewRank(rect) < viewRank(nearest.rect))) nearest = { node, rect };
+  }
+  if (nearest) [place.anchor, place.top] = [markOf(nearest.node, shown), nearest.rect.top];
+  return place;
+}
+
+function keepPlace(box, place) {
+  if (!place) return;
+  if (scrollX !== place.x || scrollY !== place.y) scrollTo(place.x, place.y);
+  const anchor = place.anchor && marked([...box.childNodes], place.anchor[0])[place.anchor[1]];
+  const drift = (anchor?.getClientRects()[0]?.top ?? place.top) - place.top;
+  if (drift) scrollBy(0, drift);
+}
+
 function scrollersByPlace(box) {
   const found = new Map();
   let under = "";
   for (const node of box.querySelectorAll("h2, h3, summary, .wide, pre")) {
     if (!node.matches(".wide, pre")) {
-      under = node.textContent;
+      under = node.dataset.focus || node.textContent;
       continue;
     }
     let place = `${under}|${node.className}`;
@@ -64,16 +125,21 @@ function scrollersByPlace(box) {
 
 function fill(id, ...nodes) {
   const box = document.getElementById(id);
-  const focused = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.focus : "";
+  const fresh = nodes.flat(Infinity).filter(Boolean).map((node) => (node instanceof Node ? node : document.createTextNode(node)));
+  const shown = [...box.childNodes];
+  tickClocks(box);
+  if (reuseShown(shown, fresh)) return;
+  const place = pagePlace(box, shown);
+  const focused = box.contains(document.activeElement) ? markOf(document.activeElement, shown) : null;
   const scrolled = [...scrollersByPlace(box)].filter(([, node]) => node.scrollLeft || node.scrollTop)
     .map(([place, node]) => [place, node.scrollLeft, node.scrollTop]);
-  const old = [...box.childNodes];
-  box.append(...nodes.flat(Infinity).filter(Boolean));
+  box.append(...fresh);
   // Focus moves to the copy while the old element is still there, so a keyboard focus ring carries over.
-  if (focused) [...box.querySelectorAll(`[data-focus="${CSS.escape(focused)}"]`)].at(-1)?.focus({ preventScroll: true });
-  for (const node of old) node.remove();
-  const fresh = scrolled.length ? scrollersByPlace(box) : new Map();
-  for (const [place, left, top] of scrolled) fresh.get(place)?.scrollTo(left, top);
+  if (focused) marked(fresh, focused[0])[focused[1]]?.focus({ preventScroll: true });
+  for (const node of shown) node.remove();
+  const rebuilt = scrolled.length ? scrollersByPlace(box) : new Map();
+  for (const [place, left, top] of scrolled) rebuilt.get(place)?.scrollTo(left, top);
+  keepPlace(box, place);
 }
 
 function heading(n, title) {
@@ -112,8 +178,8 @@ function fault(sentence) {
   return el("p", {}, sayParts("fault", sentence));
 }
 
-function quiet(sentence) {
-  return el("p", { class: "muted", text: sentence });
+function quiet(...parts) {
+  return el("p", { class: "muted" }, ...parts);
 }
 
 function link(href, text) {
@@ -168,6 +234,10 @@ function ago(ts) {
   if (minutes < 60) return `${minutes} min ago`;
   if (minutes < 48 * 60) return `${Math.round(minutes / 60)} h ago`;
   return `${Math.round(minutes / 1440)} d ago`;
+}
+
+function since(ts) {
+  return ts ? el("time", { class: "ago", datetime: ts, text: ago(ts) }) : ago(ts);
 }
 
 function duration(seconds) {
@@ -321,7 +391,7 @@ function checksSummary(h) {
   const failing = h.checks.filter((c) => !c.ok).length;
   const state = !failing ? "ok" : h.checks.some((c) => c.state === "fault") ? "fault" : "caution";
   return el("p", {}, stateChip(state), " ",
-    `${h.checks.length} checks, ${failing} failing. The last heartbeat came ${ago(h.heartbeat)} (${clock(h.heartbeat)}).`);
+    `${h.checks.length} checks, ${failing} failing. The last heartbeat came `, since(h.heartbeat), ` (${clock(h.heartbeat)}).`);
 }
 
 function drawHealth(snapshot) {
@@ -336,17 +406,17 @@ function drawHealth(snapshot) {
     heading(2, "Loops"),
     panelParts(snapshot.checks, "The loops", (h) => h.loops.length
       ? table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail"]],
-        h.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(ago(l.ts)), cell(l.detail || ""))))
+        h.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(since(l.ts)), cell(l.detail || ""))))
       : quiet("No loop has reported yet.")),
     heading(3, "Probes"),
     panelParts(snapshot.alerts, "The probes", (a) => a.probes.length
       ? table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time"], ["Detail"]],
-        a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(ago(p.last_run)), cell(ago(p.last_ok)), cell(p.detail || ""))))
+        a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(since(p.last_run)), cell(since(p.last_ok)), cell(p.detail || ""))))
       : quiet("No probe has run yet.")),
     heading(4, "Alerts"),
     panelParts(snapshot.alerts, "The alerts", (a) => a.alerts.length
       ? table("Open alerts", [["Alert"], ["Opened", "c-time"], ["Last seen", "c-time"], ["Issue"]],
-        a.alerts.map((x) => el("tr", {}, cell(x.key), cell(clock(x.opened)), cell(ago(x.last_seen)), cell(x.url ? link(x.url, `#${x.issue}`) : ""))))
+        a.alerts.map((x) => el("tr", {}, cell(x.key), cell(clock(x.opened)), cell(since(x.last_seen)), cell(x.url ? link(x.url, `#${x.issue}`) : ""))))
       : el("p", {}, stateChip("ok"), " No alert is open.")));
 }
 
@@ -371,7 +441,8 @@ function researchTicket(r, btn) {
 
 function triageParts(t) {
   going.triage = t.refreshing || t.researching;
-  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${zonedClock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent.`),
+  const lastRan = t.refreshed ? ["Triage last ran ", since(t.refreshed), ` (${zonedClock(t.refreshed)}).`] : ["Triage has not run yet."];
+  const parts = [quiet(...lastRan, " It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent."),
     el("div", { class: "actions" }, button(t.refreshing ? "Triage running" : "Refresh triage now", "triage-refresh", refreshTriage, t.refreshing)),
     saidLine("triage-refresh")];
   if (t.researching) parts.push(quiet("The research loop is running, so the research buttons wait until it ends."));
@@ -748,7 +819,7 @@ function fold(key, summary, ...content) {
   return el("details", {
     open: openQuestions.has(key),
     on: { toggle: (e) => (e.target.open ? openQuestions.add(key) : openQuestions.delete(key)) },
-  }, el("summary", { text: summary }), ...content);
+  }, el("summary", { "data-focus": `fold:${key}`, text: summary }), ...content);
 }
 
 function feedLine(line) {
@@ -833,7 +904,7 @@ function serveLine(serve) {
 
 function serveState(serve) {
   if (!serve.at) return el("p", {}, stateChip("fault"), " Serve has never run on this machine, so no loop fires on its own. Installing it starts it and keeps it running.");
-  if (!serve.alive) return el("p", {}, stateChip("fault"), ` Serve last beat ${ago(serve.at)} (${clock(serve.at)}), so no loop fires on its own until it runs again.`);
+  if (!serve.alive) return el("p", {}, stateChip("fault"), " Serve last beat ", since(serve.at), ` (${clock(serve.at)}), so no loop fires on its own until it runs again.`);
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
   return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),
@@ -875,7 +946,7 @@ async function decide(id, yes, btn) {
 function lastRun(l) {
   if (l.running) return ["running", el("br"), button("Feed", `feed:${l.running}`, () => openFeed("loop", l.running))];
   if (!l.last) return "never";
-  return [...runStatus(l.last.status), el("br"), el("span", { class: "muted", text: ago(l.last.started) })];
+  return [...runStatus(l.last.status), el("br"), el("span", { class: "muted" }, since(l.last.started))];
 }
 
 function loopRow(l) {
@@ -1018,7 +1089,7 @@ function loopRuns(d) {
 function loopSources(d) {
   return d.cursors.length
     ? table("", [["Source"], ["Polled", "c-time"], ["State", "c-status"], ["Detail"]],
-      d.cursors.map((c) => el("tr", {}, cell(c.source, "muted-cell"), cell(ago(c.polled), "nb"),
+      d.cursors.map((c) => el("tr", {}, cell(c.source, "muted-cell"), cell(since(c.polled), "nb"),
         cell(stateChip(c.ok ? "ok" : "fault")), cell(c.detail || (c.ok ? "reading" : "")))))
     : quiet(d.sources.length ? "Serve has not polled its sources yet." : "It has no source.");
 }
@@ -1166,7 +1237,7 @@ function deviceRow(d) {
   return el("tr", {},
     cell([el("span", { class: "nb", text: d.name }), d.note ? el("div", { class: "muted", text: d.note }) : null]),
     cell(d.kind), cell(d.host || "this machine", "muted-cell"),
-    cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted", text: ago(p.at) })] : "not probed", "nb"),
+    cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted" }, since(p.at))] : "not probed", "nb"),
     cell(probeWords(p) || (d.error ? d.error : ""), "muted-cell"),
     cell([p ? (p.tools || []).join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
     cell(button("Probe", `probe:${d.name}`, (b) => probe(d.name, b))));
@@ -1191,7 +1262,7 @@ function drawFleet(loops, devices) {
   fill("fleet",
     heading(1, "Serve"),
     serveLine(s),
-    s.at ? el("dl", { class: "w" }, fact("Process", String(s.pid)), fact("Last beat", `${ago(s.at)} (${clock(s.at)})`),
+    s.at ? el("dl", { class: "w" }, fact("Process", String(s.pid)), fact("Last beat", [since(s.at), ` (${clock(s.at)})`]),
       fact("Ticks", `${s.ticks}, one every ${s.tick_seconds} s`), fact("Started", clock(s.started))) : null,
     errors.length ? table("Sources that fail to poll", [["Source"], ["Error"]], errors.map(([k, v]) => el("tr", {}, cell(k), cell(v, "muted-cell")))) : null,
     broken.length ? table("Loops that do not load", [["Loop"], ["Why"]], broken.map(([k, v]) => el("tr", {}, cell(k), cell(v, "muted-cell")))) : null,
