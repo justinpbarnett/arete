@@ -726,6 +726,7 @@ const feeds = {
 let openLoop = "";
 let launchKey = "";
 let remoteDevices = [];
+let sessionSending = false;
 
 function button(text, focus, onClick, disabled = false) {
   return el("button", { type: "button", "data-focus": focus, disabled, text, on: { click: (e) => onClick(e.currentTarget) } });
@@ -1135,16 +1136,24 @@ async function launch(event) {
 
 async function sendSession(event) {
   event.preventDefault();
+  if (sessionSending) return;
   const box = document.getElementById("session-text");
-  if (!box.value.trim()) return say("session-result", "caution", "Write a message first.");
+  const text = box.value.trim();
+  if (!text) return say("session-result", "caution", "Write a message first.");
+  const btn = document.getElementById("session-go");
+  sessionSending = true;
+  btn.disabled = true;
   try {
-    await call(`/api/sessions/${encodeURIComponent(feeds.session.run)}/send`, { text: box.value.trim() });
+    await call(`/api/sessions/${encodeURIComponent(feeds.session.run)}/send`, { text });
     box.value = "";
     say("session-result", "ok", "Sent. The answer shows in the feed when it comes.");
-    await refreshFeed("session");
   } catch (e) {
     say("session-result", "fault", e.message);
+  } finally {
+    sessionSending = false;
+    btn.disabled = false;
   }
+  await refreshFeed("session");
 }
 
 function probeWords(p) {
