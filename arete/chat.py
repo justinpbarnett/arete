@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import threading
 
-from . import board, config, gh, paths, pipeline, runner, util
+from . import board, config, gh, paths, pipeline, runner, state, util
 from .agent import NO_SESSION, Result, Session
 
-CHAT_FILE = paths.STATE_DIR / "chat.json"
 CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
+OLD_CHAT_FILE = paths.STATE_DIR / "chat.json"
+MOVED_CHAT_FILE = paths.STATE_DIR / "chat.json.moved"
 BUDGET_USD = 2
 TIMEOUT_SECONDS = 900
+TITLE_CHARS = 120
 RESTARTED = "The dashboard restarted before this answer came back. Send the message again."
-EMPTY = {"session": "", "spent": 0.0, "messages": [], "busy": False, "draft": None}
 REPLY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -20,7 +21,8 @@ REPLY_SCHEMA = {
     },
     "required": ["reply", "issue_title", "issue_body"],
 }
-chat_file_lock = threading.Lock()
+filing = threading.Lock()
+moving = threading.Lock()
 
 
 class Busy(RuntimeError):
@@ -31,49 +33,83 @@ class NoDraft(RuntimeError):
     pass
 
 
-def history() -> dict:
-    return {**EMPTY, **util.read_json(CHAT_FILE, {})}
+class NoChat(LookupError):
+    pass
 
 
-def view() -> dict:
-    h = history()
-    return {"messages": h["messages"], "busy": h["busy"], "draft": h["draft"]}
+class BadProject(ValueError):
+    pass
 
 
-def message(sender: str, text: str, cost: float = 0.0) -> dict:
-    return {"from": sender, "text": text, "ts": util.iso(), "cost": round(cost, 2)}
+def summary(row: dict) -> dict:
+    return {"id": row["id"], "title": row["title"], "project": row["project"], "created": row["created"],
+            "updated": row["updated"], "spent": row["spent"], "busy": bool(row["busy"]),
+            "drafted": bool(row["draft_title"])}
 
 
-def settle_after_restart() -> None:
-    with chat_file_lock:
-        h = history()
-        if h["busy"]:
-            util.write_json(CHAT_FILE, {**h, "busy": False, "messages": [*h["messages"], message("arete", RESTARTED)]})
+def listing() -> dict:
+    move_old_chat()
+    return {"chats": [summary(r) for r in state.chats()], "projects": [r.name for r in config.load().repos]}
 
 
-def send(text: str) -> dict:
-    with chat_file_lock:
-        h = history()
-        if h["busy"]:
-            raise Busy("The last message is still running. Wait for its answer.")
-        h = {**h, "busy": True, "messages": [*h["messages"], message("you", text)]}
-        util.write_json(CHAT_FILE, h)
-    threading.Thread(target=answer, args=(text, Session(h["session"], h["spent"], h.get("runner", ""))), daemon=True).start()
-    return view()
+def chat_row(chat_id: int) -> dict:
+    row = state.chat_get(chat_id)
+    if not row:
+        raise NoChat(f"There is no chat {chat_id}")
+    return row
 
 
-def new() -> dict:
-    with chat_file_lock:
-        if history()["busy"]:
-            raise Busy("The last message is still running. Wait for its answer, then start a new chat.")
-        util.write_json(CHAT_FILE, EMPTY)
-    return view()
+def view(chat_id: int) -> dict:
+    row = chat_row(chat_id)
+    return {**summary(row), "folder": folder(row["project"]),
+            "draft": {"title": row["draft_title"], "body": row["draft_body"]} if row["draft_title"] else None,
+            "messages": state.chat_messages(chat_id)}
 
 
-def answer(text: str, session: Session) -> None:
+def folder(project: str) -> str:
+    cfg = config.load()
+    try:
+        return paths.short_path(cfg.repo(project).path if project else arete_repo(cfg).path)
+    except config.UnknownRepo:
+        return ""
+
+
+def new(project: str) -> dict:
+    project = project.strip()
+    if project:
+        cfg = config.load()
+        try:
+            repo = cfg.repo(project)
+        except config.UnknownRepo:
+            names = [r.name for r in cfg.repos]
+            pick = f"pick one of {', '.join(names)}, or none" if names else "the config has no repo, so pick none"
+            raise BadProject(f"'{project}' is not a repo in the config; {pick}") from None
+        if not repo.path.is_dir():
+            raise BadProject(f"{project}'s folder {paths.short_path(repo.path)} is not there")
+    return view(state.chat_add(project))
+
+
+def title_of(text: str) -> str:
+    line = util.first_line(text, len(text))
+    if len(line) <= TITLE_CHARS:
+        return line
+    return (line[:TITLE_CHARS + 1].rpartition(" ")[0] or line[:TITLE_CHARS]).rstrip() + "…"
+
+
+def send(chat_id: int, text: str) -> dict:
+    chat_row(chat_id)
+    if not state.chat_claim(chat_id, text, title_of(text)):
+        raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
+    row = chat_row(chat_id)
+    session = Session(row["session"], row["session_spent"], row["runner"])
+    threading.Thread(target=answer, args=(chat_id, text, session, row["project"]), daemon=True).start()
+    return view(chat_id)
+
+
+def answer(chat_id: int, text: str, session: Session, project: str) -> None:
     reply, cost, draft = "", 0.0, None
     try:
-        result = ask(text, session)
+        result = ask(chat_id, text, session, project)
         session, cost = result.session, result.cost_usd
         if result.ok:
             reply, draft = reply_and_draft(result)
@@ -81,12 +117,8 @@ def answer(text: str, session: Session) -> None:
             reply = f"The agent stopped: {result.error or result.text}"
     except Exception as e:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
-    with chat_file_lock:
-        h = history()
-        util.write_json(CHAT_FILE, {**h, "session": session.id, "spent": session.spent_usd,
-                                    "runner": session.runner, "busy": False,
-                                    "draft": draft or h["draft"],
-                                    "messages": [*h["messages"], message("arete", reply, cost)]})
+    state.chat_say(chat_id, "arete", reply, round(cost, 2), busy=0, session=session.id, session_spent=session.spent_usd,
+                   runner=session.runner, **({"draft_title": draft["title"], "draft_body": draft["body"]} if draft else {}))
 
 
 def reply_and_draft(result: Result) -> tuple[str, dict | None]:
@@ -95,24 +127,59 @@ def reply_and_draft(result: Result) -> tuple[str, dict | None]:
     return drafted.get("reply") or result.text, {"title": title, "body": body} if title else None
 
 
-def file_draft() -> dict:
-    with chat_file_lock:
-        h = history()
-        if not h["draft"]:
+def file_draft(chat_id: int) -> dict:
+    with filing:
+        row = chat_row(chat_id)
+        if not row["draft_title"]:
             raise NoDraft("There is no drafted issue to file.")
         github = arete_repo(config.load()).github
         if not github:
             raise NoDraft("The config names no GitHub repo for arete, so the draft stays unfiled.")
-        number = gh.issue_create(github, h["draft"]["title"], h["draft"]["body"])
-        util.write_json(CHAT_FILE, {**h, "draft": None,
-                                    "messages": [*h["messages"], message("arete", f"Filed {gh.issue_url(github, number)}")]})
-    return view()
+        number = gh.issue_create(github, row["draft_title"], row["draft_body"])
+        state.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
+        state.chat_say(chat_id, "arete", f"Filed {gh.issue_url(github, number)}")
+    return view(chat_id)
 
 
-def drop_draft() -> dict:
-    with chat_file_lock:
-        util.write_json(CHAT_FILE, {**history(), "draft": None})
-    return view()
+def drop_draft(chat_id: int) -> dict:
+    row = chat_row(chat_id)
+    state.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
+    return view(chat_id)
+
+
+def move_old_chat() -> None:
+    with moving:
+        if not OLD_CHAT_FILE.exists():
+            return
+        old = util.read_json(OLD_CHAT_FILE, {})
+        old = old if isinstance(old, dict) else {}
+        messages = [m for m in old.get("messages") or [] if isinstance(m, dict)]
+        draft = old.get("draft") if isinstance(old.get("draft"), dict) else {}
+        if messages or draft.get("title"):
+            if old.get("busy"):
+                messages.append({"from": "arete", "text": RESTARTED, "ts": util.iso()})
+            asked = next((m for m in messages if m.get("from") == "you"), {})
+            state.chat_import(
+                {"title": title_of(str(asked.get("text") or "")), "project": "",
+                 "created": messages[0].get("ts") if messages else util.iso(),
+                 "updated": messages[-1].get("ts") if messages else util.iso(),
+                 "spent": round(sum(float(m.get("cost") or 0) for m in messages), 2), "busy": 0,
+                 "session": old.get("session") or "", "session_spent": float(old.get("spent") or 0),
+                 "runner": old.get("runner") or "", "draft_title": draft.get("title") or "",
+                 "draft_body": draft.get("body") or ""},
+                [(m.get("from") or "arete", str(m.get("text") or ""), float(m.get("cost") or 0), m.get("ts") or util.iso())
+                 for m in messages])
+        OLD_CHAT_FILE.replace(MOVED_CHAT_FILE)
+
+
+def recover() -> None:
+    move_old_chat()
+    for chat_id in state.busy_chats():
+        state.chat_say(chat_id, "arete", RESTARTED, busy=0)
+
+
+def any_busy() -> bool:
+    return bool(state.busy_chats())
 
 
 def arete_repo(cfg: config.Config) -> config.Repo:
@@ -122,18 +189,26 @@ def arete_repo(cfg: config.Config) -> config.Repo:
         return config.Repo(name=cfg.arete_repo, path=paths.PACKAGE_DIR.parent)
 
 
-def ask(text: str, session: Session) -> Result:
+def project_section(repo: config.Repo) -> str:
+    layer = config.load_layer(repo.layer_dir)
+    expertise = layer.expertise_file.read_text().strip() if layer.expertise_file.exists() else ""
+    return pipeline.prompt("chat_project", repo=repo.name, path=repo.path, layer=layer.dir,
+                           checks=pipeline.check_list(layer), expertise=expertise or "(none yet)")
+
+
+def ask(chat_id: int, text: str, session: Session, project: str) -> Result:
     cfg = config.load()
     model = cfg.model("chat")
     if session.runner and session.runner != runner.route(model)[0]:
         session = NO_SESSION
     util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends()})
-    repo = arete_repo(cfg)
-    github = repo.github
+    arete = arete_repo(cfg)
+    work = cfg.repo(project) if project else arete
+    github = arete.github
     reads_issues = [f"Bash(gh issue list --repo {github}*)", f"Bash(gh issue view * --repo {github}*)"] if github else []
     return runner.run(
-        text, repo.path,
-        trace=("chat", "chat"),
+        text, work.path,
+        trace=("chat", f"chat {chat_id}"),
         cfg=cfg,
         model=model,
         tools=[*runner.READ_TOOLS, "Bash"],
@@ -141,11 +216,12 @@ def ask(text: str, session: Session) -> Result:
                        "Bash(git show*)", *reads_issues],
         json_schema=REPLY_SCHEMA,
         resume=session,
-        system=pipeline.prompt("chat", code=repo.path, config=paths.CONFIG_FILE, state=paths.STATE_DIR,
-                               context=CONTEXT_FILE, logs=paths.LOG_DIR, github=github or "(no GitHub repo set)"),
+        system=pipeline.prompt("chat", code=arete.path, workdir=work.path, config=paths.CONFIG_FILE,
+                               state=paths.STATE_DIR, context=CONTEXT_FILE, logs=paths.LOG_DIR,
+                               github=github or "(no GitHub repo set)",
+                               project=project_section(work) if project else ""),
         max_budget_usd=BUDGET_USD,
         timeout=TIMEOUT_SECONDS,
         wait_out_limits=False,
-        add_dirs=[paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR],
+        add_dirs=[paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR, *([arete.path] if project else [])],
     )
-

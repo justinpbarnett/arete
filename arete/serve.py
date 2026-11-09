@@ -253,7 +253,7 @@ class Server:
             return "a source poll is still running"
         if dashboard.POSTS_IN_FLIGHT.count:
             return "the dashboard is still answering a request"
-        if chat.history()["busy"]:
+        if chat.any_busy():
             return "a chat message is still running"
         return ""
 

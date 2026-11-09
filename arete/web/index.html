@@ -200,8 +200,9 @@
 </section>
 
 <section data-view="chat" hidden>
-  <h2><span class="n">01</span>Console</h2>
-  <p>Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here.</p>
+  <h2 id="console"><span class="n">01</span>Console</h2>
+  <p>Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here. A chat on a project works in that repo's folder and knows its checks and what arete's agents learned there.</p>
+  <p id="chat-about" class="muted"></p>
   <div id="messages" aria-live="polite"></div>
   <p id="working" class="muted" hidden></p>
   <div id="draft" class="draft" hidden>
@@ -224,11 +225,25 @@
     </div>
     <div class="actions">
       <button type="submit" data-act id="chat-send">Send</button>
-      <button type="button" id="chat-new">New chat</button>
       <span class="muted keys">Ctrl or Cmd with Enter sends</span>
     </div>
   </form>
   <p id="chat-result" aria-live="polite" hidden></p>
+  <h2><span class="n">02</span>Chats</h2>
+  <p>Every chat stays here, newest first, and Open shows one above. A new chat has no project, as arete's console, or one repo from the config.</p>
+  <form id="chat-new-form" novalidate>
+    <div class="fields one-row">
+      <div class="field">
+        <label for="chat-project">Project</label>
+        <select id="chat-project"><option value="">None</option></select>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit" id="chat-new">New chat</button>
+    </div>
+  </form>
+  <p id="chat-new-result" aria-live="polite" hidden></p>
+  <div id="chats"></div>
 </section>
 
 </main>

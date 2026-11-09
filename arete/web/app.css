@@ -18,6 +18,7 @@ th.c-status { width: 150px; }
 th.c-ref { width: 140px; }
 th.c-verdict { width: 250px; }
 th.c-result { min-width: 260px; }
+th.c-title { min-width: 260px; }
 td .state { margin-right: 2px; }
 td button { padding-top: 3px; padding-bottom: 2px; white-space: nowrap; }
 td.muted-cell { color: var(--muted); overflow-wrap: anywhere; }

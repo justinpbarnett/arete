@@ -288,6 +288,29 @@ CREATE TABLE IF NOT EXISTS research (
     moved TEXT DEFAULT '',         -- the state arete last moved the ticket into: running | failed | pr | done
     delivered TEXT DEFAULT ''      -- when arete moved the ticket to its done status
 );
+CREATE TABLE IF NOT EXISTS chats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT DEFAULT '',
+    project TEXT DEFAULT '',       -- a repo name from the config, or '' for none
+    created TEXT,
+    updated TEXT,
+    spent REAL DEFAULT 0,
+    busy INTEGER DEFAULT 0,
+    session TEXT DEFAULT '',
+    session_spent REAL DEFAULT 0,
+    runner TEXT DEFAULT '',
+    draft_title TEXT DEFAULT '',
+    draft_body TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    sender TEXT NOT NULL,          -- you | arete
+    text TEXT,
+    cost REAL DEFAULT 0,
+    ts TEXT
+);
+CREATE INDEX IF NOT EXISTS chat_messages_chat ON chat_messages (chat_id, id);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
@@ -667,6 +690,71 @@ def take_messages(run_id: str) -> list[str]:
                          (run_id,)).fetchall()
         c.executemany("UPDATE messages SET taken = ? WHERE id = ?", [(util.iso(), r["id"]) for r in rows])
         return [r["text"] for r in rows]
+
+
+CHAT_COLUMNS = ("title", "project", "created", "updated", "spent", "busy", "session", "session_spent", "runner",
+                "draft_title", "draft_body")
+
+
+def chat_add(project: str) -> int:
+    ts = util.iso()
+    with db() as c:
+        return c.execute("INSERT INTO chats (project, created, updated) VALUES (?,?,?)", (project, ts, ts)).lastrowid
+
+
+def chat_get(chat_id: int) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        return dict(r) if r else None
+
+
+def chats() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM chats ORDER BY created DESC, id DESC")]
+
+
+def chat_messages(chat_id: int) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT sender, text, cost, ts FROM chat_messages WHERE chat_id = ? "
+                                           "ORDER BY id", (chat_id,))]
+
+
+def chat_claim(chat_id: int, text: str, title: str) -> bool:
+    ts = util.iso()
+    with db() as c:
+        claimed = c.execute("UPDATE chats SET busy = 1, updated = ?, title = CASE WHEN title = '' THEN ? ELSE title END "
+                            "WHERE id = ? AND busy = 0", (ts, title, chat_id)).rowcount
+        if claimed:
+            c.execute("INSERT INTO chat_messages (chat_id, sender, text, ts) VALUES (?,?,?,?)", (chat_id, "you", text, ts))
+        return bool(claimed)
+
+
+def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, **fields) -> None:
+    ts = util.iso()
+    with db() as c:
+        c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, ts) VALUES (?,?,?,?,?)",
+                  (chat_id, sender, text, cost, ts))
+        c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = ROUND(spent + ?, 2) WHERE id = ?",
+                  (*fields.values(), ts, cost, chat_id))
+
+
+def chat_drop_draft(chat_id: int, title: str, body: str) -> None:
+    with db() as c:
+        c.execute("UPDATE chats SET draft_title = '', draft_body = '' WHERE id = ? AND draft_title = ? AND draft_body = ?",
+                  (chat_id, title, body))
+
+
+def busy_chats() -> list[int]:
+    with db() as c:
+        return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
+
+
+def chat_import(chat: dict, messages: list[tuple]) -> int:
+    with db() as c:
+        chat_id = c.execute(insert_sql("chats", CHAT_COLUMNS), tuple(chat.get(k) for k in CHAT_COLUMNS)).lastrowid
+        c.executemany("INSERT INTO chat_messages (chat_id, sender, text, cost, ts) VALUES (?,?,?,?,?)",
+                      [(chat_id, *m) for m in messages])
+        return chat_id
 
 
 def loop_spent_since(since: str, loop: str | None = None) -> float:

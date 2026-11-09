@@ -400,7 +400,15 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.
 - Trends: 30 days of cost and outcomes by day, runs by repo, eval pass rate by repo, and where the money went, by model, by runner and by loop.
 - Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`. A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use. An empty model removes its line, so the role goes back to its default.
-- Chat: a console agent on the `chat` model. It reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues. It never edits a file. Ask it for a change and it drafts an issue. The draft shows under the chat, and nothing reaches GitHub until you press File this issue (Drop discards it). Each call to the model stops at $2, and each reply shows what it cost. Messages continue one session until New chat.
+- Chat: console agents on the `chat` model.
+  Every chat is kept in `arete.db` and listed newest first, and Open shows any of them.
+  New chat starts one with no project, which works in arete's folder as the console, or on one repo from the config, which works in that repo's folder and gets its layer's checks and expertise file in its prompt.
+  A chat reads arete's code, config, state and logs, and its project's code when it has one, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues.
+  It never edits a file.
+  Ask it for a change to arete and it drafts an issue on arete, which shows under that chat; nothing reaches GitHub until you press File this issue, and Drop discards it.
+  Each call to the model stops at $2, and each reply shows what it cost.
+  Each chat continues its own session and waits on its own answer, so several chats can wait at once.
+  On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
 
 ## Rules
 

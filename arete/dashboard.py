@@ -61,6 +61,7 @@ DEVICE_PATH = "/api/devices/"
 TRIAGE_PATH = "/api/triage/"
 SKIPPED_PATH = "/api/skipped/"
 PROPOSAL_PATH = "/api/proposals/"
+CHAT_PATH = "/api/chats/"
 INSTALL_SECONDS = 120
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -144,7 +145,8 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502,
+STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, chat.NoChat: 404,
+                     chat.BadProject: 400, gh.GhError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
                      triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409}
@@ -220,8 +222,10 @@ class Handler(BaseHTTPRequestHandler):
                 return board.trends()
             if path == "/api/settings":
                 return settings.current()
-            if path == "/api/chat":
-                return chat.view()
+            if path == "/api/chats":
+                return chat.listing()
+            if path.startswith(CHAT_PATH):
+                return chat.view(whole_number(unquote(path[len(CHAT_PATH):])))
             if path.startswith(LOG_PATH):
                 run_id = unquote(path[len(LOG_PATH):])
                 return {"id": run_id, "lines": board.run_log(run_id)}
@@ -244,14 +248,16 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST":
             if path == "/api/settings":
                 return settings.save(self.body())
-            if path == "/api/chat":
-                return chat.send(self.chat_text())
-            if path == "/api/chat/new":
-                return chat.new()
-            if path == "/api/chat/file":
-                return chat.file_draft()
-            if path == "/api/chat/drop":
-                return chat.drop_draft()
+            if path == "/api/chats/new":
+                return chat.new(str(self.body().get("project") or ""))
+            if path.startswith(CHAT_PATH):
+                chat_id, action = last_part(path, CHAT_PATH)
+                if action == "send":
+                    return chat.send(whole_number(chat_id), self.chat_text())
+                if action == "file":
+                    return chat.file_draft(whole_number(chat_id))
+                if action == "drop":
+                    return chat.drop_draft(whole_number(chat_id))
             if path == "/api/loops/new":
                 return self.draft_loop()
             if path.startswith(LOOP_PATH):
@@ -454,7 +460,7 @@ def say(text: str) -> None:
 def serve(port: int | None = None) -> NoReturn:
     cfg = config.load()
     port = port or cfg.dashboard_port
-    chat.settle_after_restart()
+    chat.recover()
     logins = Logins()
     waiting_for = ""
     while True:

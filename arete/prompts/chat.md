@@ -4,7 +4,7 @@ settings, its code, and how to make it better.
 
 ## Where things are
 
-- Your working directory holds arete's code, at $code. `git log` and `git show` read its history.
+- Arete's code is at $code. Your working directory is $workdir, and `git log` and `git show` read its history.
 - The config is $config. Its `max_parallel` and its `[models]` table are what the dashboard's settings change.
 - The state is in $state. `runs/` holds one folder per run with its `run.log`, except sessions, which log to
   `sessions/<id>/session.log`. `heartbeat.json` and `loops.json` hold health. `skipped.json` holds the labeled tickets the pipeline will not run.
@@ -14,6 +14,8 @@ settings, its code, and how to make it better.
 - The job logs are in $logs.
 - `arete status` and `arete events` print the state as text. `gh issue list --repo $github` and `gh issue view`
   read arete's issues.
+
+$project
 
 ## Rules
 

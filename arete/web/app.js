@@ -16,6 +16,10 @@ let costData = null;
 let settingsData = null;
 const RUN_LIMITS = [["max-parallel", "max_parallel"], ["max-parallel-per-repo", "max_parallel_per_repo"]];
 let chatSeen = "";
+let openChat = 0;
+const unsent = new Map();
+let chatsBusy = false;
+let chatProjectsKey = "";
 const lastGood = new Map();
 const openQuestions = new Set();
 const drafts = new Map();
@@ -668,53 +672,130 @@ function withLinks(text) {
   return text.split(URL_IN_TEXT).map((part, i) => (i % 2 ? link(part, part) : document.createTextNode(part)));
 }
 
-function drawChat(data) {
-  const seen = `${JSON.stringify(data.messages)}:${data.busy}`;
-  const send = document.getElementById("chat-send");
-  send.disabled = data.busy;
-  document.getElementById("chat-new").disabled = data.busy;
-  const working = document.getElementById("working");
-  working.hidden = !data.busy;
-  document.getElementById("draft").hidden = !data.draft;
-  if (!data.draft) document.getElementById("draft-result").hidden = true;
-  if (data.draft) {
-    document.getElementById("draft-title").textContent = data.draft.title;
-    document.getElementById("draft-body").textContent = data.draft.body;
+function drawChats(list) {
+  const projectsKey = JSON.stringify(list.projects);
+  if (projectsKey !== chatProjectsKey) {
+    chatProjectsKey = projectsKey;
+    options("chat-project", "None", list.projects, document.getElementById("chat-project").value);
   }
-  if (data.busy) {
-    const asked = [...data.messages].reverse().find((m) => m.from === "you");
+  chatsBusy = list.chats.some((c) => c.busy);
+  fill("chats", list.chats.length
+    ? table("Newest first", [["Started", "c-time"], ["Project", "c-ref"], ["First message", "c-title"], ["Last message", "c-time nb"], ["Cost", "num c-cost"], ["", "c-log"]],
+      list.chats.map(chatRow))
+    : quiet("No chat yet."));
+}
+
+function chatRow(c) {
+  const note = c.busy ? "waiting on an answer" : c.drafted ? "a drafted issue waits" : "";
+  return el("tr", {},
+    cell(clock(c.created), "nb"),
+    c.project ? cell(c.project) : cell("none", "muted-cell"),
+    cell([c.title || "Nothing asked yet", note ? el("div", { class: "muted", text: note }) : null], "wrap-cell"),
+    cell(c.title ? clock(c.updated) : "", "nb"),
+    cell(money(c.spent), "num"),
+    cell(button(c.id === openChat ? "Shown" : "Open", `chat:${c.id}`, () => showChat(c.id), c.id === openChat)));
+}
+
+function switchChat(id) {
+  const box = document.getElementById("chat-text");
+  unsent.set(openChat, box.value);
+  box.value = unsent.get(id) || "";
+  openChat = id;
+  chatSeen = "";
+  for (const line of ["chat-result", "draft-result"]) document.getElementById(line).hidden = true;
+}
+
+function showChat(id) {
+  switchChat(id);
+  document.getElementById("console").scrollIntoView({ block: "start" });
+  refresh();
+}
+
+function chatAbout(c) {
+  const where = c.project ? `on ${c.project}, ${c.folder ? `in ${c.folder}` : "which left the config"}` : `no project, in arete's folder ${c.folder}`;
+  return `Started ${clock(c.created)} · ${where} · ${money(c.spent)} so far`;
+}
+
+function drawChat(c) {
+  const about = document.getElementById("chat-about");
+  const working = document.getElementById("working");
+  document.getElementById("chat").hidden = !c;
+  about.hidden = !c;
+  working.hidden = !c?.busy;
+  document.getElementById("draft").hidden = !c?.draft;
+  if (!c?.draft) document.getElementById("draft-result").hidden = true;
+  if (!c) {
+    chatSeen = "";
+    return fill("messages", quiet("No chat yet. Pick a project, or none, under Chats and press New chat."));
+  }
+  about.textContent = chatAbout(c);
+  document.getElementById("chat-send").disabled = c.busy;
+  if (c.draft) {
+    document.getElementById("draft-title").textContent = c.draft.title;
+    document.getElementById("draft-body").textContent = c.draft.body;
+  }
+  if (c.busy) {
+    const asked = [...c.messages].reverse().find((m) => m.sender === "you");
     working.textContent = `Working on it · sent ${clock(asked?.ts)} · the answer shows here when it comes`;
   }
+  const seen = `${c.id}:${JSON.stringify(c.messages)}:${c.busy}`;
   if (seen === chatSeen) return;
+  if (chatSeen) document.getElementById("chat-result").hidden = true;
   chatSeen = seen;
-  fill("messages", data.messages.length ? data.messages.map((m) => el("div", { class: `msg from-${m.from}` },
-    el("div", { class: "who", text: [m.from === "you" ? "You" : "Arete", clock(m.ts), m.cost ? money(m.cost) : ""].filter(Boolean).join(" · ") }),
+  fill("messages", c.messages.length ? c.messages.map((m) => el("div", { class: `msg from-${m.sender}` },
+    el("div", { class: "who", text: [m.sender === "you" ? "You" : "Arete", clock(m.ts), m.cost ? money(m.cost) : ""].filter(Boolean).join(" · ") }),
     el("p", {}, withLinks(m.text))))
-    : quiet("No messages yet. Ask what is running, why a run failed, or what to change."));
+    : quiet(c.project ? `No messages yet. Ask about ${c.project}'s code, its checks, or how arete works on it.`
+      : "No messages yet. Ask what is running, why a run failed, or what to change."));
   document.querySelector("#messages .msg:last-child")?.scrollIntoView({ block: "nearest" });
 }
 
 async function sendChat(event) {
   event.preventDefault();
+  const id = openChat;
+  if (!id) return say("chat-result", "caution", "Start a chat first.");
   const box = document.getElementById("chat-text");
   const text = box.value.trim();
   if (!text) return say("chat-result", "caution", "Write a message first.");
   document.getElementById("chat-result").hidden = true;
   try {
-    drawChat(await call("/api/chat", { text }));
-    box.value = "";
-    schedule(CHAT_BUSY_MS);
+    await call(`/api/chats/${id}/send`, { text });
+    if (id === openChat) box.value = "";
+    else unsent.delete(id);
   } catch (e) {
-    say("chat-result", "fault", e.message);
+    if (id === openChat) say("chat-result", "fault", e.message);
+  }
+  refresh();
+}
+
+async function newChat(event) {
+  event.preventDefault();
+  const btn = document.getElementById("chat-new");
+  btn.disabled = true;
+  document.getElementById("chat-new-result").hidden = true;
+  try {
+    const c = await call("/api/chats/new", { project: document.getElementById("chat-project").value });
+    switchChat(c.id);
+    await refresh();
+    document.getElementById("console").scrollIntoView({ block: "start" });
+    document.getElementById("chat-text").focus();
+  } catch (e) {
+    say("chat-new-result", "fault", e.message);
+  } finally {
+    btn.disabled = false;
   }
 }
 
-async function chatAction(path, button, resultId) {
-  document.getElementById(resultId).hidden = true;
-  button.disabled = true;
-  const answered = await call(path, {}).catch((e) => say(resultId, "fault", e.message));
-  button.disabled = false;
-  if (answered) drawChat(answered);
+async function draftAction(action, btn) {
+  document.getElementById("draft-result").hidden = true;
+  btn.disabled = true;
+  try {
+    await call(`/api/chats/${openChat}/${action}`, {});
+  } catch (e) {
+    say("draft-result", "fault", e.message);
+  }
+  btn.disabled = false;
+  refresh();
 }
 
 const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
@@ -1250,13 +1331,21 @@ const LOADERS = {
     if (settingsData && Object.keys(settingsChanges()).length) return HELD;
     drawSettings(fresh);
   },
-  chat: async () => drawChat(await call("/api/chat")),
+  chat: async () => {
+    const list = await call("/api/chats");
+    if (!list.chats.some((c) => c.id === openChat)) openChat = list.chats[0]?.id || 0;
+    const id = openChat;
+    const shown = id ? await call(`/api/chats/${id}`) : null;
+    if (id !== openChat) return;
+    drawChats(list);
+    drawChat(shown);
+  },
 };
 
 function nextDelay() {
   if (view === "live" || view === "loops" || going[view]) return LIVE_MS;
   if (view === "launch") return feeds.session.run && feeds.session.status === "running" ? CHAT_BUSY_MS : SLOW_MS;
-  if (view === "chat") return chatSeen.endsWith(":true") ? CHAT_BUSY_MS : SLOW_MS;
+  if (view === "chat") return chatsBusy ? CHAT_BUSY_MS : SLOW_MS;
   return SLOW_MS;
 }
 
@@ -1342,9 +1431,9 @@ document.addEventListener("DOMContentLoaded", () => {
     box.querySelector(".feed-close").addEventListener("click", () => closeFeed(which));
     box.querySelector(".feed-stop").addEventListener("click", (event) => stopFeedRun(which, event.currentTarget, resultId));
   }
-  for (const [id, path, resultId] of [["chat-new", "/api/chat/new", "chat-result"],
-    ["draft-file", "/api/chat/file", "draft-result"], ["draft-drop", "/api/chat/drop", "draft-result"]]) {
-    document.getElementById(id).addEventListener("click", (event) => chatAction(path, event.currentTarget, resultId));
+  document.getElementById("chat-new-form").addEventListener("submit", newChat);
+  for (const [id, action] of [["draft-file", "file"], ["draft-drop", "drop"]]) {
+    document.getElementById(id).addEventListener("click", (event) => draftAction(action, event.currentTarget));
   }
   document.getElementById("chat-text").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) document.getElementById("chat").requestSubmit();
