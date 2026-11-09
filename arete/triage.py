@@ -772,8 +772,9 @@ def research_command(r: dict, report: dict | None) -> str:
     return ""
 
 
-def research_note(r: dict, report: dict | None) -> str:
-    return "; ".join(x for x in (research_progress(r, report), research_command(r, report)) if x)
+def research_note(r: dict, report: dict | None, for_issue: bool = False) -> str:
+    progress = research_progress(r, report)
+    return "; ".join(x for x in (quiet(progress) if for_issue else progress, research_command(r, report)) if x)
 
 
 def research_offer(r: dict, report: dict | None) -> dict | None:
@@ -945,7 +946,7 @@ def issue_block(r: dict, v: dict, kind: str, with_plan: bool) -> str:
         return f"- {issue_link(r)} **{r['size']}** in `{r['repo']}`: {title}\n  {quiet(sent_note(r))}"
     if kind == RESEARCH_WORK:
         report = v["research"].get(r["ref"])
-        lines = [f"- {issue_link(r)}: {title}", f"  {quiet(research_note(r, report))}"]
+        lines = [f"- {issue_link(r)}: {title}", f"  {research_note(r, report, for_issue=True)}"]
         if report and report["summary"]:
             lines.append(f"  {quiet(report['summary'])}")
         if with_plan and report and report["report"]:
