@@ -106,6 +106,7 @@ class Server:
             self.schedule(loop, st, now)
             self.watch_metric(loop, st)
             self.poll(loop)
+        self.forget_unpolled_errors(live)
         self.loaded = True
         self.dispatch({x.name: x for x in reversed(every_loop)})
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
@@ -159,6 +160,11 @@ class Server:
                 continue
             self.tried[sid] = time.monotonic()
             self.polls[sid] = self.pool.submit(self.poll_source, loop, i)
+
+    def forget_unpolled_errors(self, live: list[Loop]) -> None:
+        polled = {sources.source_id(loop, i) for loop in live for i in range(len(loop.sources))}
+        for sid in set(self.errors) - polled:
+            self.errors.pop(sid, None)
 
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
