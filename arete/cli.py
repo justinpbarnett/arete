@@ -596,7 +596,7 @@ def cmd_session(args) -> int:
 
     try:
         if args.action == "start":
-            tools = [t for t in args.tools.split(",") if t] if args.tools is not None else None
+            tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
             s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
                                 tools=tools, repo=args.repo, budget_usd=args.budget)
             print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
