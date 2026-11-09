@@ -75,12 +75,14 @@ def stop_asked(run_id: str) -> bool:
     return bool(r and r["stop_asked"])
 
 
-def settle(run_id: str, status: str, **fields) -> dict | None:
+def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | None:
     fields = {"status": status, "finished": util.iso(), **fields}
     with state.db() as c:
         if not c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ? AND status = 'running'",
                          (*fields.values(), run_id)).rowcount:
             return None
+        if end_line:
+            state.insert_feed(c, run_id, "end", end_line)
         return dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
 
 
@@ -89,7 +91,8 @@ def failed_on_crash(run_id: str):
     try:
         yield
     except BaseException as e:
-        settle(run_id, "failed", summary=util.first_line(f"crashed: {type(e).__name__}: {e}", 300))
+        why = util.first_line(f"crashed: {type(e).__name__}: {e}", 300)
+        settle(run_id, "failed", end_line=f"failed: {why}", summary=why)
         raise
 
 
@@ -118,10 +121,7 @@ def interrupt(row: dict) -> dict | None:
         util.end_session(row.get("pid"))
     status = dead_status(row)
     summary = STOPPED if status == "stopped" else INTERRUPTED
-    done = settle(row["id"], status, summary=summary)
-    if done:
-        state.add_feed(row["id"], "end", f"{status}: {summary}")
-    return done
+    return settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
 
 
 def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> list[dict]:

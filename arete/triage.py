@@ -704,7 +704,7 @@ def research_due(r: dict, report: dict | None) -> bool:
 
 
 def stamp(ts: str) -> str:
-    return f"{ts[:16].replace('T', ' ')} UTC" if ts else ""
+    return util.parse_iso(ts).astimezone().strftime("%Y-%m-%d %H:%M %Z") if ts else ""
 
 
 def filed_words(report: dict) -> str:
@@ -801,7 +801,7 @@ def board() -> str:
     rows = v["rows"]
     if not meta.get("refreshed") and not rows:
         return "no triage yet; run `arete triage --refresh`"
-    lines = [f"Triage of {summary(v)}. Refreshed {meta.get('refreshed', 'never')}."]
+    lines = [f"Triage of {summary(v)}. Refreshed {stamp(meta.get('refreshed', '')) or 'never'}."]
     lines += [f"Not read this time: {e}" for e in meta.get("errors", [])]
     if meta.get("waiting"):
         lines.append(f"Waiting for the next refresh: {', '.join(meta['waiting'])}")
@@ -882,7 +882,7 @@ def ticket(ref: str) -> str | None:
 def issue_header(cfg: config.Config, changed: str) -> str:
     approving = (f" Arete adds the labels to up to {cfg.jira.auto_per_refresh} ready Jira tickets each refresh and lists "
                  "them under Sent to the pipeline." if cfg.jira.auto else "")
-    return (f"Last change {changed}. Arete refreshes this every 15 minutes from your open tickets that have no "
+    return (f"Last change {stamp(changed)}. Arete refreshes this every 15 minutes from your open tickets that have no "
             f"`{tracker.LABEL}` label, and edits it only when something changes.{approving} To approve a ready ticket "
             "yourself, add the labels it names. Research tickets get a report here for your review. `arete triage "
             "REF` on the Mac shows one ticket in full.")

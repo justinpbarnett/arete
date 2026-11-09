@@ -118,7 +118,7 @@ def print_checks(h: dict) -> None:
         print("heartbeat: never run")
         return
     bad = [c for c in h["checks"] if not c["ok"]]
-    print(f"heartbeat {h['heartbeat']}: {f'{len(bad)} failing' if bad else 'all ok'}")
+    print(f"heartbeat {when(h['heartbeat'])}: {f'{len(bad)} failing' if bad else 'all ok'}")
     for c in bad:
         print(f"  {c['severity'].upper():<5} {c['key']:<38} {c['detail']}")
 
@@ -152,7 +152,7 @@ def print_skipped(skipped: list[dict]) -> None:
     if skipped:
         print("labeled tickets the pipeline will not run (`arete run REPO ID --force` runs one anyway):")
     for s in skipped:
-        print(f"  {s['ticket']:<24} {s['why']}  since {s['since']}"[:220])
+        print(f"  {s['ticket']:<24} {s['why']}  since {when(s['since'])}"[:220])
 
 
 def print_waiting(w: dict) -> None:
@@ -167,11 +167,13 @@ def print_waiting(w: dict) -> None:
 
 
 def print_triage(t: dict) -> None:
+    from . import triage
+
     if not t["refreshed"]:
         print("triage: never refreshed (`arete triage --refresh`)")
         return
     errors = f"; FAILED {'; '.join(t['errors'])}" if t["errors"] else ""
-    print(f"triage: {t['summary']}; refreshed {t['refreshed']}; board {t['posted']}{errors}"[:300])
+    print(f"triage: {t['summary']}; refreshed {triage.stamp(t['refreshed'])}; board {t['posted']}{errors}"[:300])
 
 
 def print_live(live: dict) -> None:
@@ -479,7 +481,9 @@ def cmd_loop(args) -> int:
             return 0 if result["status"] in ("done", "skipped") else 1
         if args.action in ("enable", "disable"):
             done = control.switch(args.name, args.action == "enable")
-            print(f"{done['name']}: {'on' if done['enabled'] else 'off'}")
+            print(f"{done['name']}: {'on' if done['enabled'] else 'off'}"
+                  + ("; serve is down, so it fires once serve runs again" if done["enabled"] and not done["serve_up"]
+                     else ""))
             return 0
         if args.action == "start":
             r = engine.launch(args.name, events=read_events(args.events))

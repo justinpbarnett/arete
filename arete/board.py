@@ -96,8 +96,8 @@ def slot_note(r: dict, in_slots: set[str], waiting_for_slot: set[str]) -> str:
 def skipped() -> list[dict]:
     running = {(r["repo"], str(r["issue"])) for r in state.runs_marked_running(connect=state.reader) if r["issue"]}
     return [{"ticket": name, "why": v["why"], "since": v.get("since", ""), "url": v.get("url", ""),
-             "can_run": bool(v.get("repo")), "running": (v.get("repo"), v.get("id")) in running}
-            for name, v in sorted(pipeline.skipped_tickets().items())]
+             "can_run": bool(v.get("repo"))}
+            for name, v in sorted(pipeline.skipped_tickets().items()) if (v.get("repo"), v.get("id")) not in running]
 
 
 def waiting() -> dict:

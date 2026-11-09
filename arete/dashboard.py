@@ -226,19 +226,20 @@ class Handler(BaseHTTPRequestHandler):
                 run_id = unquote(path[len(LOG_PATH):])
                 return {"id": run_id, "lines": board.run_log(run_id)}
             if path == "/api/loops":
-                return {"loops": control.loop_views(), "serve": control.serve_beat(), "draft": draft_choices()}
+                return {"loops": control.loop_views(connect=state.reader), "serve": control.serve_beat(),
+                        "draft": draft_choices()}
             if path.startswith(LOOP_PATH):
-                return control.loop_detail(unquote(path[len(LOOP_PATH):]))
+                return control.loop_detail(unquote(path[len(LOOP_PATH):]), state.reader)
             if path.startswith(FEED_PATH):
                 return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
             if path == "/api/approvals":
-                return {"approvals": emits.waiting()}
+                return {"approvals": emits.waiting(state.reader)}
             if path == "/api/devices":
                 return {"devices": control.fleet()}
             if path == "/api/sessions":
-                return {"sessions": sessions.views(), "choices": sessions.choices()}
+                return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
             if path == "/api/costs":
-                return control.costs(float(whole_number(query["days"]) or 1) if "days" in query else None)
+                return control.costs(float(whole_number(query["days"]) or 1) if "days" in query else None, state.reader)
         if method == "POST":
             if path == "/api/settings":
                 return settings.save(self.body())

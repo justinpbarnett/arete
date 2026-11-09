@@ -399,7 +399,11 @@ def steps_since(since: str, connect=db) -> list[dict]:
 
 def add_feed(run_id: str, kind: str, text: str) -> None:
     with db() as c:
-        c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)", (run_id, util.iso(), kind, text[:4000]))
+        insert_feed(c, run_id, kind, text)
+
+
+def insert_feed(c: sqlite3.Connection, run_id: str, kind: str, text: str) -> None:
+    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)", (run_id, util.iso(), kind, text[:4000]))
 
 
 def feed(run_id: str, after: int = 0, connect=db) -> list[dict]:
@@ -580,8 +584,8 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str =
         return cur.lastrowid
 
 
-def approvals() -> list[dict]:
-    with db() as c:
+def approvals(connect=db) -> list[dict]:
+    with connect() as c:
         return [{**dict(r), "emit": json.loads(r["emit"] or "{}")}
                 for r in c.execute(f"SELECT * FROM approvals WHERE status IN ({','.join('?' * len(DECIDABLE))}) "
                                    "ORDER BY id DESC LIMIT 100", DECIDABLE)]

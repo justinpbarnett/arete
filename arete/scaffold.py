@@ -164,12 +164,10 @@ def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
                 made = write_draft(run_id, request, cfg, tell)
             except (control.Refused, engine.Stopped) as e:
                 status, why = ("stopped", record.STOPPED) if isinstance(e, engine.Stopped) else ("failed", str(e))
-                state.add_feed(run_id, "end", f"{status}: {why}")
-                record.settle(run_id, status, summary=why[:500])
+                record.settle(run_id, status, end_line=f"{status}: {why}", summary=why[:500])
                 raise control.Refused(why) from None
             drafted = f"drafted {made['name']} in {paths.short_path(made['dir'])}"
-            state.add_feed(run_id, "end", f"done: {drafted}, off. Try it, then turn it on.")
-            record.settle(run_id, "done", summary=drafted)
+            record.settle(run_id, "done", end_line=f"done: {drafted}, off. Try it, then turn it on.", summary=drafted)
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
     return {**made, "cost_usd": record.spent(run_id)}
@@ -181,6 +179,29 @@ def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) ->
     prompt = draft_prompt(request, cfg, taken)
     work = DRAFTS_DIR / run_id
     work.mkdir(parents=True, exist_ok=True)
+    try:
+        folder, answer = valid_draft(run_id, request, cfg, taken, prompt, work, tell)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    dest = private_dir(cfg) / folder.name
+    if dest.exists():
+        raise control.Refused(f"a loop named {folder.name} appeared while this one drafted; its draft stays in "
+                              f"{paths.short_path(folder)}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(folder), dest)
+    shutil.rmtree(work, ignore_errors=True)
+    loop = loops.find(folder.name)
+    loops.set_enabled(loop, False)
+    loop_toml = (dest / "loop.toml").read_text()
+    state.add_feed(run_id, "toml", loop_toml.rstrip())
+    if note := str(answer.get("note") or "").strip():
+        state.add_feed(run_id, "note", note)
+    return {"name": loop.name, "dir": str(dest), "note": note, "run": run_id, "loop_toml": loop_toml}
+
+
+def valid_draft(run_id: str, request: DraftRequest, cfg: config.Config, taken: set[str], prompt: str, work: Path,
+                tell) -> tuple[Path, dict]:
     problem, folder, answer = "", Path(), {}
     for attempt in range(1, DRAFT_TRIES + 1):
         tell("draft", f"drafting, try {attempt} of {DRAFT_TRIES}")
@@ -203,20 +224,7 @@ def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) ->
                    f"{answer.get('loop_toml', '')}\n```\n\nFix it and return the whole draft again.")
     if problem:
         raise control.Refused(f"no valid draft after {DRAFT_TRIES} tries: {problem}")
-    dest = private_dir(cfg) / folder.name
-    if dest.exists():
-        raise control.Refused(f"a loop named {folder.name} appeared while this one drafted; its draft stays in "
-                              f"{paths.short_path(folder)}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(folder), dest)
-    shutil.rmtree(work, ignore_errors=True)
-    loop = loops.find(folder.name)
-    loops.set_enabled(loop, False)
-    loop_toml = (dest / "loop.toml").read_text()
-    state.add_feed(run_id, "toml", loop_toml.rstrip())
-    if note := str(answer.get("note") or "").strip():
-        state.add_feed(run_id, "note", note)
-    return {"name": loop.name, "dir": str(dest), "note": note, "run": run_id, "loop_toml": loop_toml}
+    return folder, answer
 
 
 def try_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:

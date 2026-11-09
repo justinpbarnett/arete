@@ -479,10 +479,10 @@ def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -
     return done
 
 
-def waiting() -> list[dict]:
+def waiting(connect=state.db) -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "what": a["summary"],
              "failed": a["result"] if a["status"] == "failed" else "",
-             "detail": EMITS[a["emit"]["type"]].detail(a["emit"]["item"])} for a in state.approvals()]
+             "detail": EMITS[a["emit"]["type"]].detail(a["emit"]["item"])} for a in state.approvals(connect)]
 
 
 def decide(approval_id: int, yes: bool) -> str:

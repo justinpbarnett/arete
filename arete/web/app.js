@@ -152,7 +152,7 @@ function clock(ts) {
   if (!ts) return "";
   const d = new Date(ts);
   const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  return d.toDateString() === new Date().toDateString() ? time : `${pad(d.getMonth() + 1)} ${pad(d.getDate())} ${time}`;
+  return d.toDateString() === new Date().toDateString() ? time : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${time}`;
 }
 
 function ago(ts) {
@@ -213,7 +213,7 @@ function drawLive(snapshot) {
     heading(2, "Skipped"),
     panelParts(snapshot.skipped, "The skipped tickets", (skipped) => [skipped.length
       ? table("Labeled tickets the pipeline will not run on its own", [["Ticket"], ["Why"], ["Since", "c-time"], ["", "c-run-anyway"]],
-        skipped.map((s) => el("tr", {}, cell(link(s.url, s.ticket)), cell(s.why), cell(clock(s.since)), cell(skippedAction(s), "nb"))))
+        skipped.map((s) => el("tr", {}, cell(link(s.url, s.ticket), "nb"), cell(s.why), cell(clock(s.since)), cell(skippedAction(s), "nb"))))
       : quiet("No labeled ticket is skipped."), saidLine("skipped")]),
     heading(3, "By hand"),
     panelParts(snapshot.proposals, "The fixes to make by hand", (p) => [handParts(p), saidLine("hand")]),
@@ -256,8 +256,8 @@ function stopLiveRun(run, btn) {
 }
 
 function skippedAction(s) {
-  if (s.running) return el("span", { class: "muted", text: "running" });
-  return s.can_run ? button("Run anyway", `run-anyway:${s.ticket}`, (b) => runSkipped(s.ticket, b)) : null;
+  return s.can_run ? button("Run anyway", `run-anyway:${s.ticket}`, (b) => runSkipped(s.ticket, b))
+    : el("span", { class: "muted", text: "no repo to run in yet" });
 }
 
 function runSkipped(ticket, btn) {
@@ -876,12 +876,11 @@ function loopRow(l) {
     cell(lastRun(l), "nb"),
     cell(l.next_due ? clock(l.next_due) : "", "nb"),
     cell(money(l.spent_24h), "num"),
-    cell([
-      button("Open", `open:${l.name}`, () => openLoopDetail(l.name)), " ",
-      button("Start", `start:${l.name}`, (b) => loopAction(l.name, "start", b), Boolean(l.error || l.running)), " ",
-      button("Try", `try:${l.name}`, (b) => loopAction(l.name, "try", b), Boolean(l.error || l.running)), " ",
-      button(l.enabled ? "Turn off" : "Turn on", `switch:${l.name}`, (b) => loopAction(l.name, l.enabled ? "disable" : "enable", b), Boolean(l.error && !l.enabled)),
-    ], "nb"));
+    cell(el("div", { class: "loop-buttons" },
+      button("Open", `open:${l.name}`, () => openLoopDetail(l.name)),
+      button("Start", `start:${l.name}`, (b) => loopAction(l.name, "start", b), Boolean(l.error || l.running)),
+      button("Try", `try:${l.name}`, (b) => loopAction(l.name, "try", b), Boolean(l.error || l.running)),
+      button(l.enabled ? "Turn off" : "Turn on", `switch:${l.name}`, (b) => loopAction(l.name, l.enabled ? "disable" : "enable", b), Boolean(l.error && !l.enabled)))));
 }
 
 function drawLoops(data, approvals) {
@@ -893,7 +892,7 @@ function drawLoops(data, approvals) {
     heading(2, "Loops"),
     serveLine(data.serve),
     data.loops.length
-      ? table("Spent counts the last 24 hours", [["Loop", "c-loop"], ["On", "c-on"], ["Kind"], ["Trigger"], ["Last run", "c-status"], ["Next", "c-time"], ["Spent", "num"], ["", "c-loop-buttons"]],
+      ? table("Spent counts the last 24 hours", [["Loop", "c-loop"], ["On", "c-on"], ["Kind"], ["Trigger"], ["Last run", "c-status"], ["Next", "c-time"], ["Spent", "num"], [""]],
         data.loops.map(loopRow))
       : quiet("No loop is installed. Draft one from a sentence below."));
   fillLoopNew(data.draft);
@@ -940,7 +939,8 @@ async function loopAction(name, action, btn) {
         : `Started a try of ${name} at ${clock(r.started)}. Its feed, open below, shows what each emit would do, and none is sent.`);
       await openFeed("loop", r.id);
     } else {
-      say("loops-result", "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`);
+      if (r.enabled && !r.serve_up) say("loops-result", "caution", `${name} is on, but serve is down, so it fires once serve runs again.`);
+      else say("loops-result", "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`);
     }
   } catch (e) {
     say("loops-result", "fault", e.message);

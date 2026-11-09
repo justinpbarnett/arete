@@ -92,18 +92,18 @@ def day_ago() -> str:
     return util.iso(util.now() - timedelta(days=1))
 
 
-def loop_views(cfg: config.Config | None = None) -> list[dict]:
+def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]:
     cfg = cfg or config.load()
     every_loop = loops.load_all(cfg)
-    states = state.loop_states()
-    running = {r["loop"]: r["id"] for r in state.runs_marked_running() if r["kind"] == "loop"}
-    waiting = Counter(item["loop"] for item in state.pending())
+    states = state.loop_states(connect)
+    running = {r["loop"]: r["id"] for r in state.runs_marked_running(connect) if r["kind"] == "loop"}
+    waiting = Counter(item["loop"] for item in state.pending(connect))
     spent: dict[str, float] = defaultdict(float)
-    for s in state.steps_since(day_ago()):
+    for s in state.steps_since(day_ago(), connect):
         spent[s.get("loop") or ""] += s["cost_usd"] or 0
     out = []
     for loop in every_loop:
-        last = next(iter(state.runs(kind="loop", loop=loop.name, limit=1, firings=True)), None)
+        last = next(iter(state.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=connect)), None)
         st = states.get(loop.name) or {}
         out.append({**loop.view(), "running": running.get(loop.name, ""), "pending": waiting[loop.name],
                     "next_due": st.get("next_due") if loop.enabled else None, "last_fire": st.get("last_fire"),
@@ -113,19 +113,19 @@ def loop_views(cfg: config.Config | None = None) -> list[dict]:
     return out
 
 
-def loop_detail(name: str) -> dict:
+def loop_detail(name: str, connect=state.db) -> dict:
     cfg = config.load()
     loop = find_loop(name, cfg)
-    view = next(v for v in loop_views(cfg) if v["name"] == loop.name)
+    view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
     source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
-    return {**view, "prompt": loops.prompt_text(loop), "state": state.loop_state(loop.name)["data"],
-            "runs": state.runs(kind="loop", loop=loop.name, limit=25, firings=True),
-            "findings": state.findings(loop.name, 40),
-            "waiting": [i for i in state.pending() if i["loop"] == loop.name],
-            "cursors": [c for c in state.cursors() if c["source"] in source_ids],
+    return {**view, "prompt": loops.prompt_text(loop), "state": state.loop_state(loop.name, connect)["data"],
+            "runs": state.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect),
+            "findings": state.findings(loop.name, 40, connect),
+            "waiting": [i for i in state.pending(connect) if i["loop"] == loop.name],
+            "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
             "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
-            "digests": digests(loop), "metrics": loop_metrics(loop), "metered": loop.meters_spend(cfg) if loop.agent else None,
-            "held": loop.usage_hold(cfg)}
+            "digests": digests(loop), "metrics": loop_metrics(loop, connect),
+            "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg)}
 
 
 def digests(loop: Loop) -> list[dict]:
@@ -134,9 +134,9 @@ def digests(loop: Loop) -> list[dict]:
     return [{"day": f.stem, "text": f.read_text()[-DIGEST_CHARS:]} for f in files]
 
 
-def loop_metrics(loop: Loop) -> list[dict]:
+def loop_metrics(loop: Loop, connect=state.db) -> list[dict]:
     latest: dict[str, dict] = {}
-    for m in state.metrics_since(util.iso(util.now() - timedelta(days=METRIC_DAYS))):
+    for m in state.metrics_since(util.iso(util.now() - timedelta(days=METRIC_DAYS)), connect):
         if m["loop"] == loop.name:
             seen = latest.setdefault(m["name"], {"name": m["name"], "points": 0})
             seen.update(value=m["value"], ts=m["ts"], points=seen["points"] + 1)
@@ -146,14 +146,16 @@ def loop_metrics(loop: Loop) -> list[dict]:
 def switch(name: str, enabled: bool) -> dict:
     loop = working_loop(name) if enabled else find_loop(name)
     loops.set_enabled(loop, enabled)
-    return {"name": loop.name, "enabled": enabled}
+    return {"name": loop.name, "enabled": enabled, "serve_up": bool(serve_beat().get("alive"))}
 
 
 def feed(run_id: str, after: int = 0) -> dict:
-    r = state.run_get(run_id)
+    # a run settles in the same write as its end line, so reading the lines first never pairs that line with "running"
+    lines = state.feed(run_id, after, connect=state.reader)
+    r = state.run_get(run_id, connect=state.reader)
     if not r:
         raise NotFound(f"no run {run_id}")
-    return {"run": r, "lines": state.feed(run_id, after)}
+    return {"run": r, "lines": lines}
 
 
 def decide(approval_id: int, yes: bool) -> dict:
@@ -172,7 +174,7 @@ def fleet() -> list[dict]:
         return [{**devices.LOCAL.view(), "probe": None, "error": str(e)}]
 
 
-def costs(days: float | None = None) -> dict:
+def costs(days: float | None = None, connect=state.db) -> dict:
     days = COST_DAYS if days is None else days
     try:
         since = util.iso(util.now() - timedelta(days=days))
@@ -180,7 +182,7 @@ def costs(days: float | None = None) -> dict:
         raise Refused(f"cannot look back {days:g} days: {e}") from e
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
-    for s in state.steps_since(since):
+    for s in state.steps_since(since, connect):
         cost = s["cost_usd"] or 0
         total += cost
         keys = {"model": s["model"] or "?", "runner": s["runner"] or "?",

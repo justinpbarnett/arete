@@ -51,7 +51,8 @@ pre.fold-text { max-height: 420px; overflow: auto; white-space: pre-wrap; overfl
 td div.muted { font-size: 13px; margin-top: 2px; }
 th.c-on { width: 70px; }
 th.c-decide { width: 210px; }
-th.c-loop-buttons { width: 215px; }
+.loop-buttons { display: grid; grid-template-columns: repeat(2, minmax(min-content, 1fr)); gap: 6px 8px; }
+.loop-buttons button { min-width: 120px; }
 th.c-run-buttons { width: 150px; }
 th.c-run-anyway { width: 150px; }
 th.c-done { width: 150px; }
@@ -63,7 +64,7 @@ p.said:not([hidden]) { margin-top: 0; }
 #loop-new textarea { width: 100%; }
 th.c-model { width: 210px; }
 th.c-probe { width: 110px; }
-th.c-loop { min-width: 250px; }
+th.c-loop { min-width: 238px; }
 #launch-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0 18px; }
 th.c-device { min-width: 220px; }
 #triage > p:first-child { margin-top: 30px; }

@@ -130,10 +130,13 @@ class LoopRun:
         return paths.scratch_dir(self.id)
 
     def log(self, kind: str, text: str) -> None:
+        self.write_log(text)
+        state.add_feed(self.id, kind, text)
+
+    def write_log(self, text: str) -> None:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_file, "a") as f:
             f.write(f"{util.iso()} [{self.loop.name}] {text}\n")
-        state.add_feed(self.id, kind, text)
 
     def spent(self) -> float:
         return record.spent(self.id)
@@ -357,8 +360,9 @@ def carry(run: LoopRun) -> str:
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:
-    run.log("end", f"{status}: {summary} (${run.spent():.2f})")
-    record.settle(run.id, status, summary=summary[:500])
+    end_line = f"{status}: {summary} (${run.spent():.2f})"
+    run.write_log(end_line)
+    record.settle(run.id, status, end_line=end_line, summary=summary[:500])
     return status
 
 

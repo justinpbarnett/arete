@@ -152,11 +152,15 @@ def send(session_id: str, text: str) -> dict:
 
 
 def log_line(spec: Spec, kind: str, text: str) -> None:
+    write_log(spec, kind, text)
+    state.add_feed(spec.id, kind, text)
+
+
+def write_log(spec: Spec, kind: str, text: str) -> None:
     f = SESSIONS_DIR / spec.id / "session.log"
     f.parent.mkdir(parents=True, exist_ok=True)
     with open(f, "a") as out:
         out.write(f"{util.iso()} [{kind}] {text}\n")
-    state.add_feed(spec.id, kind, text)
 
 
 def stop_on_term(*_) -> None:
@@ -245,14 +249,15 @@ def execute(session_id: str) -> str:
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
         kept = f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else ""
-        log_line(spec, "end", f"{status}: {summary}{kept} (${record.spent(session_id):.2f})")
-        record.settle(session_id, status, summary=f"{summary}{kept}"[:500])
+        end_line = f"{status}: {summary}{kept} (${record.spent(session_id):.2f})"
+        write_log(spec, "end", end_line)
+        record.settle(session_id, status, end_line=end_line, summary=f"{summary}{kept}"[:500])
         return status
 
 
-def views(limit: int = 30) -> list[dict]:
+def views(limit: int = 30, connect=state.db) -> list[dict]:
     out = []
-    for r in state.runs(kind="session", limit=limit):
+    for r in state.runs(kind="session", limit=limit, connect=connect):
         spec = util.read_json(spec_file(r["id"]), {})
         out.append({k: r.get(k) for k in ("id", "status", "started", "finished", "model", "runner", "device",
                                           "cost_usd", "summary", "branch")}
