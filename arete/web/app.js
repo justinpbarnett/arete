@@ -669,7 +669,7 @@ function withLinks(text) {
 }
 
 function drawChat(data) {
-  const seen = `${data.messages.length}:${data.busy}`;
+  const seen = `${JSON.stringify(data.messages)}:${data.busy}`;
   const send = document.getElementById("chat-send");
   send.disabled = data.busy;
   document.getElementById("chat-new").disabled = data.busy;
