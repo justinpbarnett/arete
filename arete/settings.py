@@ -7,6 +7,7 @@ import stat
 from . import config, paths, util
 
 PARALLEL_MAX = 8
+RUN_LIMITS = {"max_parallel": "Runs at once", "max_parallel_per_repo": "Runs per repo"}
 MODEL_ALIASES = ("opus", "sonnet", "haiku")
 MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+/[A-Za-z0-9._:-]+")
 TABLE_HEADER = re.compile(r"\s*\[")
@@ -18,7 +19,7 @@ class Refused(ValueError):
 
 def current() -> dict:
     cfg = config.load()
-    return {"max_parallel": cfg.max_parallel, "parallel_max": PARALLEL_MAX, "aliases": MODEL_ALIASES,
+    return {**{key: getattr(cfg, key) for key in RUN_LIMITS}, "parallel_max": PARALLEL_MAX, "aliases": MODEL_ALIASES,
             "models": {role: cfg.models.get(role, "") for role in config.MODEL_ROLES},
             "defaults": {role: config.MODEL_FALLBACKS.get(role, "") for role in config.MODEL_ROLES}}
 
@@ -27,10 +28,10 @@ def instead_of(text: str) -> str:
     return f", not '{util.first_line(text, 40)}'." if text else "."
 
 
-def parallel_from(value) -> int:
+def run_limit_from(key: str, value) -> int:
     text = value.strip() if isinstance(value, str) else json.dumps(value)
     if not text.isdigit() or not 1 <= int(text) <= PARALLEL_MAX:
-        raise Refused(f"Runs at once takes a whole number from 1 to {PARALLEL_MAX}{instead_of(text)}")
+        raise Refused(f"{RUN_LIMITS[key]} takes a whole number from 1 to {PARALLEL_MAX}{instead_of(text)}")
     return int(text)
 
 
@@ -45,25 +46,25 @@ def model_from(role, value) -> str:
 
 
 def save(values: dict) -> dict:
-    wanted_parallel = parallel_from(values["max_parallel"]) if "max_parallel" in values else None
+    wanted_limits = {key: run_limit_from(key, values[key]) for key in RUN_LIMITS if key in values}
     models = values.get("models") or {}
     if not isinstance(models, dict):
         raise Refused("Models takes an object that maps each role to its model.")
     wanted_models = {role: model_from(role, m) for role, m in models.items()}
     with util.lock("config", wait=True):
         lines = paths.CONFIG_FILE.read_text().splitlines(keepends=True)
-        if wanted_parallel is not None:
-            set_key(lines, None, "max_parallel", str(wanted_parallel))
+        for key, limit in wanted_limits.items():
+            set_key(lines, None, key, str(limit))
         for role, model in wanted_models.items():
             if model:
                 set_key(lines, "models", role, f'"{model}"')
             else:
                 drop_key(lines, "models", role)
-        replace_config("".join(lines), wanted_parallel, wanted_models)
+        replace_config("".join(lines), wanted_limits, wanted_models)
     return current()
 
 
-def replace_config(text: str, wanted_parallel: int | None, wanted_models: dict[str, str]) -> None:
+def replace_config(text: str, wanted_limits: dict[str, int], wanted_models: dict[str, str]) -> None:
     draft = paths.CONFIG_FILE.with_suffix(".toml.tmp")
     mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
     draft.touch(mode=mode)
@@ -74,7 +75,7 @@ def replace_config(text: str, wanted_parallel: int | None, wanted_models: dict[s
     except Exception as e:
         draft.unlink()
         raise Refused(f"The new config would not load ({util.first_line(str(e), 120)}), so config.toml is unchanged.") from e
-    if (wanted_parallel is not None and cfg.max_parallel != wanted_parallel) or any(
+    if any(getattr(cfg, key) != limit for key, limit in wanted_limits.items()) or any(
             cfg.models.get(role, "") != model for role, model in wanted_models.items()):
         draft.unlink()
         raise Refused("The new config read back other values than the ones saved, so config.toml is unchanged.")

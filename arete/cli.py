@@ -77,7 +77,7 @@ def cmd_status(args) -> int:
     views = control.loop_views(cfg)
     snap = board.snapshot(recent_runs=args.limit)
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
-    print(f"max_parallel {cfg.max_parallel}")
+    print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
     print("models:" + "".join(f"\n  {role:<10} {cfg.model(role) or 'claude default'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")

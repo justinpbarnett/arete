@@ -14,6 +14,7 @@ let openLog = "";
 let trendsData = null;
 let costData = null;
 let settingsData = null;
+const RUN_LIMITS = [["max-parallel", "max_parallel"], ["max-parallel-per-repo", "max_parallel_per_repo"]];
 let chatSeen = "";
 let lastGood = "";
 const openQuestions = new Set();
@@ -504,8 +505,10 @@ function defaultModel(data, role) {
 
 function drawSettings(data) {
   settingsData = data;
-  const parallel = document.getElementById("max-parallel");
-  if (parallel.value !== String(data.max_parallel)) parallel.value = data.max_parallel;
+  for (const [id, key] of RUN_LIMITS) {
+    const input = document.getElementById(id);
+    if (input.value !== String(data[key])) input.value = data[key];
+  }
   document.getElementById("model-hint").textContent =
     `Each role takes ${data.aliases.join(", ")}, or a full claude model id. An empty role uses its default.`;
   fill("model-names", data.aliases.map((alias) => el("option", { value: alias })));
@@ -517,8 +520,10 @@ function drawSettings(data) {
 
 function settingsChanges() {
   const changes = {};
-  const parallel = document.getElementById("max-parallel").value.trim();
-  if (parallel !== String(settingsData.max_parallel)) changes.max_parallel = parallel;
+  for (const [id, key] of RUN_LIMITS) {
+    const value = document.getElementById(id).value.trim();
+    if (value !== String(settingsData[key])) changes[key] = value;
+  }
   const models = {};
   for (const input of document.querySelectorAll("#model-fields input")) {
     if (input.value.trim() !== settingsData.models[input.dataset.role]) models[input.dataset.role] = input.value.trim();
@@ -541,6 +546,7 @@ async function saveSettings(event) {
     const saved = await call("/api/settings", changes);
     drawSettings(saved);
     const words = [changes.max_parallel ? `runs at once ${saved.max_parallel}` : "",
+      changes.max_parallel_per_repo ? `runs per repo ${saved.max_parallel_per_repo}` : "",
       ...Object.keys(changes.models || {}).map((role) => saved.models[role] ? `${role} ${saved.models[role]}`
         : `${role} back to its default (${saved.defaults[role] || "claude default"})`)].filter(Boolean);
     say("settings-result", "ok", `Saved ${words.join(", ")}. The pipeline takes it at its next poll.`);

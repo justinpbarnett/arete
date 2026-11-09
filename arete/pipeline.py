@@ -1977,7 +1977,7 @@ def poll(dry_run: bool = False) -> int:
                 sync_outcomes(cfg)
             except Exception as e:
                 failed("syncing PR outcomes", e)
-        busy = {r["repo"] for r in live_pipeline_runs()}
+        going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)
         starts = state.last_pipeline_starts()
         pipeline_repos = [r for r in cfg.repos if r.pipeline and r.parts]
@@ -1997,15 +1997,15 @@ def poll(dry_run: bool = False) -> int:
                     continue
                 tid, why = pick
                 name = tracker.ticket_name(repo.name, tk.ref(tid))
-                if repo.name in busy:
-                    print(f"{util.iso()} {name}: waiting, {repo.name} already has a run going")
+                if going[repo.name] >= cfg.max_parallel_per_repo:
+                    print(f"{util.iso()} {name}: waiting, {repo.name} already has {util.count(going[repo.name], 'run')} "
+                          f"going (max_parallel_per_repo {cfg.max_parallel_per_repo})")
                 elif slots <= 0:
                     print(f"{util.iso()} {name}: waiting, {no_free_slot(cfg.max_parallel)}")
                 else:
                     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
                     if not dry_run:
                         spawn_run(repo.name, tid)
-                    busy.add(repo.name)
                     slots -= 1
             except Exception as e:
                 failed(repo.name, e)
