@@ -389,7 +389,7 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
             return 1 if asked else 0
         unfiled = file_unfiled(cfg)
         if asked:
-            return research_asked(cfg, asked)
+            return research_asked(cfg, asked, unfiled)
         todo = due()
         if not todo:
             mark_loop("research", not unfiled, unfiled[0] if unfiled else "nothing due")
@@ -399,11 +399,12 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
             print(f"{util.iso()} {r['ref']}: {outcome}: {why}", flush=True)
             if outcome not in NO_RUN:
                 break
-        mark_loop("research", outcome in (DONE, *NO_RUN), why)
-        return 1 if outcome in (FAILED, LATER) else 0
+        ok = outcome in (DONE, *NO_RUN)
+        mark_loop("research", ok and not unfiled, unfiled[0] if ok and unfiled else why)
+        return 1 if outcome in (FAILED, LATER) or unfiled else 0
 
 
-def research_asked(cfg: config.Config, asked: list[dict]) -> int:
+def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) -> int:
     rows = {r["ref"].lower(): r for r in tickets()}
     outcomes = []
     for event in asked:
@@ -415,8 +416,9 @@ def research_asked(cfg: config.Config, asked: list[dict]) -> int:
             outcome, why = research(cfg, r, force=event.get("force") is True, asked=True)
         print(f"{util.iso()} {ref}: {outcome}: {why}", flush=True)
         outcomes.append(outcome)
-    mark_loop("research", FAILED not in outcomes and LATER not in outcomes, why)
-    return 1 if FAILED in outcomes or LATER in outcomes else 0
+    ok = FAILED not in outcomes and LATER not in outcomes
+    mark_loop("research", ok and not unfiled, unfiled[0] if ok and unfiled else why)
+    return 1 if FAILED in outcomes or LATER in outcomes or unfiled else 0
 
 
 def run_now(ref: str, force: bool = False) -> int:
