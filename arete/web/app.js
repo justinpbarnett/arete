@@ -777,13 +777,15 @@ async function refreshFeed(which) {
   const lines = box.querySelector(".feed-lines");
   box.hidden = false;
   try {
-    const data = await call(`/api/feed/${encodeURIComponent(feed.run)}?after=${feed.after}`);
-    if (feeds[which].run !== data.run.id) return;
+    const asked = feed.after;
+    const data = await call(`/api/feed/${encodeURIComponent(feed.run)}?after=${asked}`);
+    if (feeds[which].run !== data.run.id || asked > feed.after) return;
     const stick = lines.scrollTop + lines.clientHeight >= lines.scrollHeight - 4;
-    if (data.lines.length) {
-      const text = data.lines.map(feedLine).join("\n");
+    const fresh = data.lines.filter((line) => line.id > feed.after);
+    if (fresh.length) {
+      const text = fresh.map(feedLine).join("\n");
       lines.textContent = feed.after ? `${lines.textContent}\n${text}` : text;
-      feed.after = data.lines[data.lines.length - 1].id;
+      feed.after = fresh[fresh.length - 1].id;
     } else if (!feed.after) {
       lines.textContent = "Nothing in the feed yet.";
     }
