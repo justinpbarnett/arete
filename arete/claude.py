@@ -220,7 +220,9 @@ def context_tokens(session_id: str) -> int:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if entry.get("type") == "assistant" and (usage := (entry.get("message") or {}).get("usage")):
-                return sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens",
-                                                             "cache_creation_input_tokens"))
+            if entry.get("type") != "assistant" or not (usage := (entry.get("message") or {}).get("usage")):
+                continue
+            if tokens := sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens",
+                                                               "cache_creation_input_tokens")):
+                return tokens
     return 0
