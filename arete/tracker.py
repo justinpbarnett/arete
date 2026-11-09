@@ -42,6 +42,14 @@ class SavedImages:
 
 
 @dataclass
+class Moved:
+    error: str = ""
+    before: str = ""
+    after: str = ""
+    moved: bool = False
+
+
+@dataclass
 class Ticket:
     id: str
     ref: str
@@ -302,14 +310,21 @@ class JiraTracker:
             return str(e)
 
     def move_to(self, tid: str, target: str) -> str:
+        return self.shift(tid, target).error
+
+    def shift(self, tid: str, target: str, stamps: bool = False) -> Moved:
         if not target:
-            return ""
-        status = (self.client.issue(tid, ["status"]).get("fields", {}).get("status") or {}).get("name", "")
+            return Moved()
+        f = self.client.issue(tid, ["status", "updated"]).get("fields") or {}
+        status = (f.get("status") or {}).get("name", "")
         if status.lower() == target.lower():
-            return ""
-        if self.client.transition(tid, target):
-            return ""
-        return f"{tid} has no transition to '{target}' from '{status}'"
+            return Moved(before=f.get("updated") or "")
+        if not self.client.transition(tid, target):
+            return Moved(f"{tid} has no transition to '{target}' from '{status}'")
+        after = ""
+        if stamps:
+            after = (self.client.issue(tid, ["updated"]).get("fields") or {}).get("updated") or ""
+        return Moved(before=f.get("updated") or "", after=after, moved=True)
 
     def pr_title(self, subject: str, t: Ticket) -> str:
         return with_ref(subject, t.ref)

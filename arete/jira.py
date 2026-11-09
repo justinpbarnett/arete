@@ -134,6 +134,10 @@ class Client:
     def issue(self, key: str, fields: list[str]) -> dict:
         return self.get(f"/rest/api/2/issue/{_path_segment(key)}", fields=",".join(fields)) or {}
 
+    def statuses(self, project: str) -> set[str]:
+        types = self.get(f"/rest/api/3/project/{_path_segment(project)}/statuses") or []
+        return {st.get("name", "") for t in types for st in t.get("statuses") or []}
+
     def changelog(self, key: str) -> list[dict]:
         return self._paged(f"/rest/api/2/issue/{_path_segment(key)}/changelog")
 

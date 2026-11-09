@@ -134,6 +134,87 @@ def file_in_home(cfg: config.Config, h: Home, r: dict) -> tuple[bool, str]:
     return True, f"report filed in {h.repo.name} as {report['filed_path']}: {url}"
 
 
+def jira_target(cfg: config.Config, r: dict, to: str) -> str:
+    return cfg.jira.transitions.get(to, "") if r["tracker"] == "jira" else ""
+
+
+def move(cfg: config.Config, r: dict, to: str) -> None:
+    target = jira_target(cfg, r, to)
+    src = source_of(cfg, r)
+    if not target or r.get("closed") or not isinstance(src, triage.JiraSource):
+        return
+    try:
+        m = tracker.JiraTracker(src.repos[0], cfg.jira).shift(r["ref"], target, stamps=True)
+    except tracker.ERRORS as e:
+        print(f"{util.iso()} {r['ref']}: could not move it to {target}, trying next tick: "
+              f"{util.first_line(str(e), 300)}", flush=True)
+        return
+    if m.error:
+        print(f"{util.iso()} {r['ref']}: not moved: {util.first_line(m.error, 300)}", flush=True)
+    elif m.moved:
+        print(f"{util.iso()} {r['ref']}: moved to {target}", flush=True)
+        own_move(r, m)
+    fields = {"moved": to}
+    if to in ("pr", config.DELIVERED):
+        fields["error"] = f"not moved: {m.error}" if m.error else ""
+    if to == config.DELIVERED and not m.error:
+        fields["delivered"] = util.iso()
+    state.research_keep(r["ref"], **fields)
+
+
+def own_move(r: dict, m: tracker.Moved) -> None:
+    if not (m.before and m.after):
+        return
+    with util.lock(triage.BOARD_LOCK, wait=True):
+        row = triage.board_row(r["ref"])
+        if not row or triage.moment(row["updated"]) != triage.moment(m.before):
+            return
+        state.triage_put({**row, "updated": m.after})
+        state.research_keep(r["ref"], updated=m.after)
+    r["updated"] = m.after
+
+
+def wanted(r: dict, report: dict) -> str:
+    if report["status"] != DONE:
+        return ""
+    if not report["filed_path"]:
+        return config.DELIVERED
+    url = report["filed_url"]
+    if not url:
+        return ""
+    if "/pull/" not in url:
+        return config.DELIVERED
+    pr = gh.pr_view(url)
+    if pr.get("mergedAt"):
+        return config.DELIVERED
+    return "pr" if pr.get("state") == "OPEN" else ""
+
+
+def settle_status(cfg: config.Config, r: dict) -> None:
+    report = state.research_get(r["ref"])
+    if not report or report["status"] != DONE or report.get("moved") == config.DELIVERED or r.get("closed"):
+        return
+    if not (jira_target(cfg, r, "pr") or jira_target(cfg, r, config.DELIVERED)):
+        return
+    try:
+        to = wanted(r, report)
+    except gh.GhError as e:
+        print(f"{util.iso()} {r['ref']}: could not read {report['filed_url']}: {util.first_line(str(e), 300)}",
+              flush=True)
+        return
+    if not to or to == report.get("moved"):
+        return
+    if not jira_target(cfg, r, to):
+        state.research_keep(r["ref"], moved=to)
+        return
+    move(cfg, r, to)
+
+
+def settle_statuses(cfg: config.Config) -> None:
+    for r in tickets():
+        settle_status(cfg, r)
+
+
 def file_unfiled(cfg: config.Config) -> list[str]:
     rows = {r["ref"]: r for r in tickets()}
     failed = []
@@ -159,7 +240,8 @@ def ticket(ref: str) -> dict | None:
 
 
 def due() -> list[dict]:
-    return [r for r in tickets() if triage.in_sprint(r) and triage.research_due(r, state.research_get(r["ref"]))]
+    return [r for r in tickets() if not r.get("closed") and triage.in_sprint(r)
+            and triage.research_due(r, state.research_get(r["ref"]))]
 
 
 def tidy() -> None:
@@ -225,6 +307,8 @@ def change_matters(cfg: config.Config, r: dict, prior: dict, said: str) -> float
 
 
 def still_stands(cfg: config.Config, r: dict, prior: dict | None, said: str, basis: str, judged: bool) -> str:
+    if prior and prior["status"] == FAILED and prior["basis"] and basis == prior["basis"]:
+        return "the last try failed and its text has not changed since"
     if not prior or prior["status"] not in (DONE, PARENT, ANSWERED):
         return ""
     if basis == prior["basis"] or prior["status"] == DONE and said == prior["ticket"]:
@@ -332,7 +416,9 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
             why = f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f})"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
-    state.research_set(ref, **base, status=RUNNING, error="")
+    state.research_set(ref, **base, status=RUNNING, error="", basis=basis,
+                       **({} if r.get("closed") else {"moved": "", "delivered": ""}))
+    move(cfg, r, "running")
     named = set(r["repos"])
     repos = sorted(src.repos, key=lambda repo: repo.name not in named)
     dirs = list(dict.fromkeys(repo.path for repo in repos if repo.path.is_dir()))
@@ -351,6 +437,7 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     if not report:
         why = util.first_line(res.error or "the agent gave no report")
         state.research_set(ref, status=FAILED, error=why, cost=res.cost_usd)
+        move(cfg, r, "failed")
         return FAILED, why
     summary = " ".join(str(answer.get("summary") or "").split())
     if not h:
@@ -358,17 +445,20 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
                                     f"${res.cost_usd:.2f}.\n\n**Summary:** {summary}\n\n{report}\n")
         state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=res.cost_usd,
                            ticket=said, basis=basis, filed_path="", filed_url="")
+        settle_status(cfg, r)
         return DONE, f"report written to {paths.short_path(report_file(ref))} (${res.cost_usd:.2f})"
     titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
     try:
         filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
     except RuntimeError as e:
         state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.cost_usd)
+        move(cfg, r, "failed")
         return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
     report_file(ref).write_text(f"{titled.rstrip()}\n")
     state.research_set(ref, status=DONE, summary=summary, report=TITLE_LINE.sub("", titled, count=1), error="",
                        cost=res.cost_usd, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
     ok, why = file_in_home(cfg, h, r)
+    settle_status(cfg, r)
     return DONE if ok else FAILED, f"{why} (${res.cost_usd:.2f})"
 
 
@@ -388,6 +478,7 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
         if not network_up_or_skip("research", dry_run):
             return 1 if asked else 0
         unfiled = file_unfiled(cfg)
+        settle_statuses(cfg)
         if asked:
             return research_asked(cfg, asked, unfiled)
         todo = due()

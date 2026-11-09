@@ -232,7 +232,8 @@ CREATE TABLE IF NOT EXISTS triage (
     repos TEXT DEFAULT '[]',
     assumptions TEXT DEFAULT '[]',
     in_sprint INTEGER DEFAULT 0,
-    parent TEXT DEFAULT ''
+    parent TEXT DEFAULT '',
+    closed TEXT DEFAULT ''         -- delivery time of a research ticket shown for 7 days after it left the open ones
 );
 CREATE TABLE IF NOT EXISTS triage_approvals (
     ref TEXT PRIMARY KEY,
@@ -283,7 +284,9 @@ CREATE TABLE IF NOT EXISTS research (
     basis TEXT DEFAULT '',
     answered_by TEXT DEFAULT '',
     filed_path TEXT DEFAULT '',
-    filed_url TEXT DEFAULT ''
+    filed_url TEXT DEFAULT '',
+    moved TEXT DEFAULT '',         -- the state arete last moved the ticket into: running | failed | pr | done
+    delivered TEXT DEFAULT ''      -- when arete moved the ticket to its done status
 );
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
@@ -298,7 +301,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               ("triage_approvals", "tracker", "ALTER TABLE triage_approvals ADD COLUMN tracker TEXT DEFAULT 'jira'"),
               ("triage_approvals", "sent_by", "ALTER TABLE triage_approvals ADD COLUMN sent_by TEXT DEFAULT 'triage'"),
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
-                for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url")],
+                for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")],
+              ("triage", "closed", "ALTER TABLE triage ADD COLUMN closed TEXT DEFAULT ''"),
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
@@ -931,13 +935,14 @@ def mined_urls() -> set[str]:
 
 
 TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
-                  "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint", "parent")
+                  "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint", "parent",
+                  "closed")
 TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions")
 APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "plan", "assumptions", "why", "ts", "tracker",
                     "sent_by")
 APPROVAL_LISTS = ("plan", "assumptions")
 RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
-                    "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url")
+                    "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")
 
 
 def lists_read(row: dict, keys: tuple[str, ...]) -> dict:
