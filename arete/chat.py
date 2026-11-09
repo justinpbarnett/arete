@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 
 from . import board, config, gh, paths, pipeline, runner, util
-from .agent import Result, Session
+from .agent import NO_SESSION, Result, Session
 
 CHAT_FILE = paths.STATE_DIR / "chat.json"
 CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
@@ -124,6 +124,9 @@ def arete_repo(cfg: config.Config) -> config.Repo:
 
 def ask(text: str, session: Session) -> Result:
     cfg = config.load()
+    model = cfg.model("chat")
+    if session.runner and session.runner != runner.route(model)[0]:
+        session = NO_SESSION
     util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends()})
     repo = arete_repo(cfg)
     github = repo.github
@@ -132,7 +135,7 @@ def ask(text: str, session: Session) -> Result:
         text, repo.path,
         trace=("chat", "chat"),
         cfg=cfg,
-        model=cfg.model("chat"),
+        model=model,
         tools=[*runner.READ_TOOLS, "Bash"],
         allowed_tools=[*runner.READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",
                        "Bash(git show*)", *reads_issues],
