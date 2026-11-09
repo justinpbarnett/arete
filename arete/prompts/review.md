@@ -42,5 +42,5 @@ Read whatever code you need to judge the change (read only tools). Then decide:
 Judge the evidence too: a check that did not exercise the change, or a `saw` that does not match its `passed`, is
 a problem. When the check in use was blocked or not set up, judge the diff on its own and say so in `summary`.
 
-List each problem with the file, what is wrong, and severity: blocker, major, or minor.
+List each problem with the file, what is wrong, and severity: blocker, major, or minor. List only what must be fixed before merge, and any listed problem, minor included, means `request_changes`, never `approve`.
 Do not request changes for style preferences. Keep `summary` to three sentences.
