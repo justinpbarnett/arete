@@ -39,9 +39,9 @@ from . import (
 WEB_DIR = paths.PACKAGE_DIR / "web"
 STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/pattern.css": ("pattern.css", "text/css; charset=utf-8"),
+    **{f"/{script.name}": (script.name, "text/javascript; charset=utf-8") for script in sorted(WEB_DIR.glob("*.js"))},
 }
 TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
                   "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
