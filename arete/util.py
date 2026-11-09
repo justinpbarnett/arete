@@ -158,6 +158,15 @@ def _s(b) -> str:
     return b.decode(errors="replace") if isinstance(b, bytes) else b
 
 
+def money(usd: float, places: int = 2) -> str:
+    least = 10 ** -places
+    return f"<${least:.{places}f}" if 0 < usd < least / 2 else f"${usd:.{places}f}"
+
+
+def paid_note(usd: float, places: int = 2) -> str:
+    return f"{money(usd, places)} paid" if usd else "nothing paid"
+
+
 def count(n: int, word: str, plural: str = "") -> str:
     return f"{n} {word if n == 1 else plural or word + 's'}"
 

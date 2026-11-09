@@ -6,10 +6,11 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 from . import paths, util
+from .agent import SUBSCRIPTION_RUNNER
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
-PAID_STEP = "COALESCE(steps.runner, '') != 'claude'"
+PAID_STEP = f"COALESCE(steps.runner, '') != '{SUBSCRIPTION_RUNNER}'"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -298,7 +299,7 @@ CREATE TABLE IF NOT EXISTS usage (
     kind TEXT,                     -- visit | action
     view TEXT,
     name TEXT,                     -- the action's name; empty on a visit
-    via TEXT,                      -- how a visit began: start | sidebar | key | palette | link | back | return
+    via TEXT,                      -- how a visit began: start | sidebar | key | palette | link | back | close | step | return
     ms INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS usage_at ON usage (at);
@@ -341,6 +342,11 @@ def db():
         conn.close()
 
 
+def ensure_schema() -> None:
+    with db():
+        pass
+
+
 @contextmanager
 def reader():
     conn = sqlite3.connect(f"{paths.DB_FILE.absolute().as_uri()}?mode=ro", uri=True, timeout=30)
@@ -356,36 +362,18 @@ FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status I
 
 
 def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=db, loop: str | None = None,
-         firings: bool = False) -> list[dict]:
+         firings: bool = False, statuses: tuple[str, ...] = (), running_first: bool = False) -> list[dict]:
     q, args = "SELECT * FROM runs WHERE 1=1", []
     if not firings:
         q += f" AND NOT {FIRINGS}"
-    if kind:
-        q += " AND kind = ?"
-        args.append(kind)
-    if loop:
-        q += " AND loop = ?"
-        args.append(loop)
-    if repo:
-        q += " AND repo = ?"
-        args.append(repo)
-    q += " ORDER BY started DESC, rowid DESC LIMIT ?"
-    args.append(limit)
-    with connect() as c:
-        return [dict(r) for r in c.execute(q, args)]
-
-
-def runs_page(statuses: tuple[str, ...] = (), kind: str = "", repo: str = "", loop: str = "", limit: int = 25,
-              connect=db) -> list[dict]:
-    q, args = f"SELECT * FROM runs WHERE NOT {FIRINGS}", []
-    for column, value in (("kind", kind), ("repo", repo), ("loop", loop)):
+    for column, value in (("kind", kind), ("loop", loop), ("repo", repo)):
         if value:
             q += f" AND {column} = ?"
             args.append(value)
     if statuses:
         q += f" AND status IN ({','.join('?' * len(statuses))})"
         args.extend(statuses)
-    q += " ORDER BY status = 'running' DESC, started DESC, rowid DESC LIMIT ?"
+    q += " ORDER BY " + ("status = 'running' DESC, " if running_first else "") + "started DESC, rowid DESC LIMIT ?"
     args.append(limit)
     with connect() as c:
         return [dict(r) for r in c.execute(q, args)]
@@ -404,7 +392,7 @@ def paid_by_run(run_ids: list[str], connect=db) -> dict[str, float]:
     with connect() as c:
         rows = c.execute(f"SELECT run_id, SUM(cost_usd) FROM steps WHERE run_id IN ({','.join('?' * len(run_ids))}) "
                          f"AND {PAID_STEP} GROUP BY run_id", run_ids)
-        return {r[0]: float(r[1] or 0) for r in rows}
+        return {r[0]: round(float(r[1] or 0), 6) for r in rows}
 
 
 def runs_since(since: str, connect=db) -> list[dict]:

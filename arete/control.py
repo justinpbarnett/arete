@@ -124,7 +124,7 @@ def loop_detail(name: str, connect=state.db) -> dict:
     runs = state.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
     paid = state.paid_by_run([r["id"] for r in runs], connect)
     return {**view, "prompt": loops.prompt_text(loop), "state": state.loop_state(loop.name, connect)["data"],
-            "runs": [{**r, "paid": round(paid.get(r["id"], 0), 4)} for r in runs],
+            "runs": [{**r, "paid": paid.get(r["id"], 0)} for r in runs],
             "findings": state.findings(loop.name, 40, connect),
             "waiting": [i for i in state.pending(connect) if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
@@ -180,15 +180,19 @@ def fleet() -> list[dict]:
         return [{**devices.LOCAL.view(), "probe": None, "error": str(e)}]
 
 
-def costs(days: float | None = None, connect=state.db, paid_only: bool = False) -> dict:
+def costs(days: float | None = None, connect=state.db) -> dict:
     days = COST_DAYS if days is None else days
     try:
         since = util.iso(util.now() - timedelta(days=days))
     except (OverflowError, ValueError) as e:
         raise Refused(f"cannot look back {days:g} days: {e}") from e
+    return {"days": days, **paid_since(since, connect)}
+
+
+def paid_since(since: str, connect=state.db) -> dict:
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
-    for s in state.steps_since(since, connect, paid_only):
+    for s in state.steps_since(since, connect, paid_only=True):
         cost = s["cost_usd"] or 0
         total += cost
         keys = {"model": s["model"] or "no model", "runner": s["runner"] or "no runner",
@@ -201,6 +205,6 @@ def costs(days: float | None = None, connect=state.db, paid_only: bool = False) 
             row["steps"] += 1
             row["tokens_in"] += s["tokens_in"] or 0
             row["tokens_out"] += s["tokens_out"] or 0
-    return {"days": days, "since": since, "total_usd": round(total, 4),
+    return {"since": since, "total_usd": round(total, 4),
             **{f"by_{group}": sorted(({**r, "cost_usd": round(r["cost_usd"], 4)} for r in rows.values()),
                                      key=lambda r: (-r["cost_usd"], r["name"])) for group, rows in groups.items()}}

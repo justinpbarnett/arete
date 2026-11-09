@@ -11,33 +11,9 @@
 </head>
 <body>
 <button type="button" class="skip" id="skip">Skip to the content</button>
-<div class="wrap frame">
+<div class="wrap sidebar-page">
 
 <nav class="side" aria-label="Views">
-  <div class="group">
-    <div class="group-name kicker" id="group-work">Work</div>
-    <ul class="links" aria-labelledby="group-work">
-      <li><a class="btn" href="#live" data-view="live"><span>Live</span><span class="count" id="count-live"></span></a></li>
-      <li><a class="btn" href="#runs" data-view="runs"><span>Runs</span><span class="count" id="count-runs"></span></a></li>
-      <li><a class="btn" href="#sessions" data-view="sessions"><span>Sessions</span><span class="count"></span></a></li>
-      <li><a class="btn" href="#loops" data-view="loops"><span>Loops</span><span class="count"></span></a></li>
-      <li><a class="btn" href="#triage" data-view="triage"><span>Triage</span><span class="count" id="count-triage"></span></a></li>
-    </ul>
-  </div>
-  <div class="group">
-    <div class="group-name kicker" id="group-watch">Watch</div>
-    <ul class="links" aria-labelledby="group-watch">
-      <li><a class="btn" href="#outcomes" data-view="outcomes"><span>Outcomes</span><span class="count"></span></a></li>
-      <li><a class="btn" href="#health" data-view="health"><span>Health</span><span class="count" id="count-health"></span></a></li>
-    </ul>
-  </div>
-  <div class="group">
-    <div class="group-name kicker" id="group-settings">Settings</div>
-    <ul class="links" aria-labelledby="group-settings">
-      <li><a class="btn" href="#settings" data-view="settings"><span>Settings</span><span class="count"></span></a></li>
-      <li><a class="btn" href="#usage" data-view="usage"><span>Usage</span><span class="count"></span></a></li>
-    </ul>
-  </div>
   <div class="group tools">
     <button type="button" id="find-open" aria-haspopup="dialog">Find</button>
     <button type="button" id="console-open" aria-expanded="false" aria-controls="console"><span>Console</span><span class="count" id="count-console"></span></button>
@@ -260,17 +236,7 @@
   <dl class="w keys-list">
     <dt><kbd>Ctrl</kbd> or <kbd>Cmd</kbd> <kbd>K</kbd></dt><dd>Find a view, loop, run, session, ticket or action</dd>
     <dt><kbd>/</kbd></dt><dd>Find, outside a field</dd>
-    <dt><kbd>G</kbd> then <kbd>L</kbd></dt><dd>Live</dd>
-    <dt><kbd>G</kbd> then <kbd>R</kbd></dt><dd>Runs</dd>
-    <dt><kbd>G</kbd> then <kbd>S</kbd></dt><dd>Sessions</dd>
-    <dt><kbd>G</kbd> then <kbd>O</kbd></dt><dd>Loops</dd>
-    <dt><kbd>G</kbd> then <kbd>T</kbd></dt><dd>Triage</dd>
-    <dt><kbd>G</kbd> then <kbd>M</kbd></dt><dd>Outcomes</dd>
-    <dt><kbd>G</kbd> then <kbd>H</kbd></dt><dd>Health</dd>
-    <dt><kbd>G</kbd> then <kbd>E</kbd></dt><dd>Settings</dd>
-    <dt><kbd>G</kbd> then <kbd>U</kbd></dt><dd>Usage</dd>
-    <dt><kbd>J</kbd> and <kbd>K</kbd></dt><dd>The next and the previous row, or item when one is open</dd>
-    <dt><kbd>C</kbd></dt><dd>Open or close the console</dd>
+    <dt id="keys-console"><kbd>C</kbd></dt><dd>Open or close the console</dd>
     <dt><kbd>Esc</kbd></dt><dd>Close the open item, then the console</dd>
     <dt><kbd>?</kbd></dt><dd>This list</dd>
   </dl>

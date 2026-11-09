@@ -41,7 +41,7 @@ An emit that changes something outside arete, a ticket, a PR or a push, can wait
 
 ## Runners, devices and sessions
 
-A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, for display only. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
+A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, though every sum arete shows you counts only what you pay. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
 
 `claude -p` stays open after its answer until each command the agent started in the background ends, so a server left running holds a step to its time limit and loses its answer.
 Each claude step that can run commands is told to stop with TaskStop each background command that does not end on its own before it answers, even when its task asks to keep one running.
@@ -70,9 +70,9 @@ arete session send ID "now try the cache"
 arete session attach ID | stop ID | list
 ```
 
-`--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Launch view starts one with the same choices.
+`--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Sessions view starts one with the same choices, under New session.
 
-`arete costs` shows model spend by model, runner and loop.
+`arete costs` shows what you paid for model calls, by model, runner and loop. A step on the claude CLI rides the subscription and counts nothing there.
 
 ## JEV
 
@@ -347,7 +347,7 @@ The grader is the pipeline's verifier, started on the layer's `[verify]`. It get
 
 Arete's own step prompts, `arete/prompts/*.md`, are harness too. When the miner sees the same problem in how arete's steps do their job across repos, it proposes a change to the plan, build, fix, verify, review or other step prompts in the `arete_repo`. The grader, the eval writer, the miner and apply prompts stay human edited. Apply refuses a change that adds or drops a `$placeholder`, or adds or deletes a prompt file.
 
-Arete then runs each eval suite twice on the same day, once with main's prompts and once with the PR's, and comments on the PR with the pass rate of each, the tasks that changed, cost and run ids, and the changed prompts the evals do not exercise. Private repos show as "private repo N", never by name. These runs do not count toward the nightly baseline. The pipeline reads its prompts from this checkout, so pull it after you merge one of these PRs.
+Arete then runs each eval suite twice on the same day, once with main's prompts and once with the PR's, and comments on the PR with the pass rate of each, the tasks that changed, what was paid and run ids, and the changed prompts the evals do not exercise. Private repos show as "private repo N", never by name. These runs do not count toward the nightly baseline. The pipeline reads its prompts from this checkout, so pull it after you merge one of these PRs.
 
 ## Triage
 
@@ -380,27 +380,55 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 
 ## Dashboard
 
-`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone. It listens only on the machine's tailnet addresses. A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
+`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+It listens only on the machine's tailnet addresses.
+A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 
-- Live: the runs going now, with their start time, the last log line and the cost so far, and Stop for each; the labeled tickets the pipeline skips, with Run anyway to start one past what holds it; the harness fixes and memory facts the miner leaves for you to make by hand, each with Mark done; the tickets waiting on review comments; and the last 25 runs of every kind.
-  A run's log opens below the table.
-- Loops: what waits for your approval, with Approve and Reject, and a failed delivery with its error and Try again; then every loop with its switch, kind, trigger, last run, next fire and spend in the last 24 hours, and a broken loop with what is wrong.
-  Open shows a loop's facts, runs, findings, sources, memory, digests and metrics.
+A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find and Console.
+It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
+Below 1040 px the sidebar wraps into a block above the page.
+Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME` and `#ticket/REF`, so reload, Back and Forward put you where you were.
+Close or Escape on an open item goes back to where you opened it, with focus on its row.
+Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, ticket or action.
+`g` and a letter goes to a view, `c` opens or closes the console, and `?` lists the keys.
+
+- Live: Running now, with each run's start, last step and time, and Stop; then Needs you: the pushes waiting for approval with Approve and Reject, a failed delivery with Try again, the ready tickets one press sends to the pipeline, the skipped tickets with Run anyway, the console's drafted issue, and the harness fixes and memory facts the miner leaves for you to make by hand, each with Mark done.
+  None of these buttons asks you to confirm.
+  Below them are the tickets waiting on review comments.
+- Runs: every run, the running ones first and then the newest, filtered by status, kind, repo and loop, with Show 25 more.
+  A run's page has its facts, its log, Stop, its pull request and a message box.
+- Sessions: the sessions, newest first.
+  New session starts one on a device, model, runner, tool set, repo and budget, and a session's page follows its feed and takes your messages.
+- Loops: every loop with its switch, kind, trigger, last run, next fire and what it paid in the last 24 hours, and a broken loop with what is wrong.
+  A loop's page shows its facts, runs, findings, sources, memory, digests and metrics.
   Start runs it now and follows its live feed, where Stop ends the run.
   Try runs it the way `arete loop try NAME` does, so its feed shows what each emit would do and sends none.
-  Below the loops, a sentence drafts a new loop the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
-  The serve line has Install serve or Restart serve when serve is not running.
-- Launch: start a session on a device, model, runner, tool set, repo and budget, then talk to it and follow its feed.
-- Fleet: serve's beat, with Install serve or Restart serve when serve is not running, and each device with its last probe and tools; Probe checks one again.
-- Health: the heartbeat checks, the probes, the loops that report on their own, and the open alerts.
-  Run the checks now starts the heartbeat.
-- Triage: the triage board, with each ticket's questions, assumptions and plan folded under it, each research report in full, and each sent ticket's pipeline status and PR.
+  New loop drafts a loop from a sentence the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
+  The approvals a loop waits for show on Live.
+- Triage: the triage board, one group at a time, behind buttons that show each group's count.
+  A ticket's page shows its questions, assumptions, plan, research report and pull requests.
   Answer a ticket's questions there and send it to the pipeline, which starts a poll.
   Refresh triage now starts a refresh.
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.
-- Trends: 30 days of cost and outcomes by day, runs by repo, eval pass rate by repo, and where the money went, by model, by runner and by loop.
-- Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`. A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use. An empty model removes its line, so the role goes back to its default.
-- Chat: a console agent on the `chat` model. It reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues. It never edits a file. Ask it for a change and it drafts an issue. The draft shows under the chat, and nothing reaches GitHub until you press File this issue (Drop discards it). Each call to the model stops at $2, and each reply shows what it cost. Messages continue one session until New chat.
+- Outcomes: for the last 30 days, the pipeline runs that shipped and failed each day, the decisions that went without you against the ones you made, what you paid by day, model, runner and loop, the runs by repo, and the eval pass rate by repo.
+- Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, and the loops that report on their own.
+- Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`.
+  A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use.
+  An empty model removes its line, so the role goes back to its default.
+- Usage: the views you open, how you get to them, and the buttons and keys you press, on desktop and phone, over 7, 30 or 90 days.
+  The page sends view, way and button names with counts and times only, never an id, typed text or page content, and the dashboard drops rows older than 90 days.
+
+The console is a side panel that opens from any view with its button or `c` and stays open from view to view; on a phone it fills the screen.
+It talks to a console agent on the `chat` model.
+The agent reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues.
+It never edits a file.
+Ask it for a change and it drafts an issue.
+The draft shows in the panel and on Live, and nothing reaches GitHub until you press File this issue (Drop discards it).
+Each call to the model stops at $2, and a reply on a paid runner shows what it cost.
+Messages continue one session until New chat.
+
+Money counts only what you pay, on the dashboard and everywhere else arete shows a sum: the CLI, a run's end line in its feed, PR bodies, research reports and eval results.
+A step on the `claude` CLI rides the subscription, so every paid sum leaves it out, a run's page says "subscription" for its claude models, and a run that paid nothing ends its feed with "nothing paid".
 
 ## Rules
 

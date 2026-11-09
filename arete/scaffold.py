@@ -172,7 +172,7 @@ def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
             record.settle(run_id, "done", end_line=f"done: {drafted}, off. Try it, then turn it on.", summary=drafted)
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    return {**made, "cost_usd": record.spent(run_id)}
+    return {**made, "paid": record.metered_spent(run_id)}
 
 
 def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) -> dict:

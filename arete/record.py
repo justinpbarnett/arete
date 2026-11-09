@@ -47,13 +47,8 @@ def step(run_id: str, name: str, res, seconds: float) -> None:
                   (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
 
 
-def spent(run_id: str) -> float:
-    r = state.run_get(run_id)
-    return round(r["cost_usd"] or 0, 6) if r else 0.0
-
-
 def metered_spent(run_id: str) -> float:
-    return round(state.paid_by_run([run_id]).get(run_id, 0.0), 6)
+    return state.paid_by_run([run_id]).get(run_id, 0.0)
 
 
 def note(run_id: str, **fields) -> None:

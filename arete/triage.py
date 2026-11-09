@@ -328,7 +328,7 @@ def not_code_by_jev(cfg: config.Config, src: TriageSource, c: Candidate, ticket:
     answer = {"kind": settled, "ready": False, "questions": [], "assumptions": [], "plan": [], "repos": [],
               "size": "", "why": why}
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-    record_file(c.ref).write_text(f"{ticket}\n\n## Triage result (${cost:.5f})\n\n```json\n"
+    record_file(c.ref).write_text(f"{ticket}\n\n## Triage result ({util.paid_note(cost, 5)})\n\n```json\n"
                                   f"{json.dumps(answer, indent=2)}\n```\n")
     return settle(src, c, answer, cost)
 
@@ -343,9 +343,9 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
                      max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
                      trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None
-    record_file(c.ref).write_text(f"{text}\n\n## Triage result (${res.cost_usd:.3f})\n\n```json\n"
+    record_file(c.ref).write_text(f"{text}\n\n## Triage result ({util.paid_note(res.paid_usd, 3)})\n\n```json\n"
                                   f"{json.dumps(answer or {'error': res.error}, indent=2)}\n```\n")
-    return answer, res.cost_usd, "" if answer else util.first_line(res.error or "no answer")
+    return answer, res.paid_usd, "" if answer else util.first_line(res.error or "no answer")
 
 
 def lines_of(items) -> list[str]:
@@ -474,7 +474,7 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         spent += cost
         if answer:
             answered[c.ref] = settle(src, c, answer, cost)
-            print(f"{util.iso()} {c.ref}: {verdict(answered[c.ref])} (${cost:.3f})")
+            print(f"{util.iso()} {c.ref}: {verdict(answered[c.ref])} ({util.paid_note(cost, 3)})")
         else:
             failed[c.ref] = error
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
@@ -506,7 +506,7 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         posted = f"not posted: {e}"
     meta.update(posted=posted)
     util.write_json(META_FILE, meta)
-    print(f"{util.iso()} triage: {util.count(calls, 'model call')} (${spent:.3f}), "
+    print(f"{util.iso()} triage: {util.count(calls, 'model call')} ({util.paid_note(spent, 3)}), "
           f"{len(failed)} failed, {len(waiting)} waiting, {len(approved)} approved; board {posted}")
     if waiting:
         print(f"waiting for the next refresh: {', '.join(waiting)}")
@@ -894,7 +894,7 @@ def ticket(ref: str) -> str | None:
     kind = standing(r)
     if kind == NOT_TRIAGED:
         return "\n".join(lines + [f"Not triaged: {r['why']}"])
-    lines[-1] += f", triaged {stamp(r['ts'])} for ${r['cost'] or 0:.3f}"
+    lines[-1] += f", triaged {stamp(r['ts'])} ({util.paid_note(r['cost'] or 0, 3)})"
     if kind == NEEDS_PERSON:
         return "\n".join(lines + ["Needs a person: nothing for arete to build or research.", f"Why: {r['why']}"])
     if kind == RESEARCH_WORK:

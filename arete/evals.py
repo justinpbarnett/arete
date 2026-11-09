@@ -86,8 +86,8 @@ class Arm:
         return f"{sum(r['passed'] for r in self.results)}/{len(self.results)}"
 
     @property
-    def cost(self) -> float:
-        return sum(r["cost"] for r in self.results)
+    def paid(self) -> float:
+        return sum(r["paid"] for r in self.results)
 
 
 class Source:
@@ -284,7 +284,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
     base = task.base or f"origin/{gh.default_branch(repo.github) if repo.github else 'main'}"
     wt = paths.WORKTREES_DIR / f"eval-{repo.name}-{task.name}"
     started = time.time()
-    result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "seconds": 0.0}
+    result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "paid": 0.0, "seconds": 0.0}
     try:
         if not task.check and not task.verify:
             raise RunFailed("the task has neither `check` nor `verify`")
@@ -364,7 +364,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         run.log(f"crashed: {result['why']}")
         return result
     finally:
-        result["cost"] = run.cost
+        result["cost"], result["paid"] = run.cost, run.paid
         result["seconds"] = round(time.time() - started, 1)
         shutil.rmtree(wt, ignore_errors=True)
 
@@ -414,9 +414,9 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
         arm = Arm(run_id, results)
         summary = f"{arm.score} passed on {label}"
         record.settle(run_id, "done", summary=summary)
-    print(f"{repo.name}: {summary}, ${record.spent(run_id):.2f}")
+    print(f"{repo.name}: {summary}, {util.paid_note(record.metered_spent(run_id))}")
     for r in results:
-        print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s ${r['cost']:.2f} {r['why']}"
+        print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s {util.paid_note(r['paid']):>12} {r['why']}"
               + ("  REGRESSED" if r["regressed"] else ""))
     (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, label, results))
     return arm
@@ -425,13 +425,13 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
 def results_md(repo: str, source: str, results: list[dict]) -> str:
     passed = sum(r["passed"] for r in results)
     lines = [f"Evals for {repo} on `{source}`: {passed}/{len(results)} passed.", "",
-             "| task | result | time | cost |", "|---|---|---|---|"]
+             "| task | result | time | paid |", "|---|---|---|---|"]
     for r in results:
         why = r["why"].replace("|", "\\|")
         res = "pass" if r["passed"] else f"fail ({why})"
         if r.get("regressed"):
             res += ", passed the three runs before"
-        lines.append(f"| {r['task']} | {res} | {r['seconds']:.0f}s | ${r['cost']:.2f} |")
+        lines.append(f"| {r['task']} | {res} | {r['seconds']:.0f}s | ${r['paid']:.2f} |")
     return "\n".join(lines) + "\n"
 
 
@@ -547,7 +547,7 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
         totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in arms}
         lines += [f"| all | {totals['main'].score} | {totals['pr'].score} | |", ""]
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
-        lines.append(f"Cost ${totals['main'].cost + totals['pr'].cost:.2f}."
+        lines.append(f"{util.paid_note(totals['main'].paid + totals['pr'].paid).capitalize()}."
                      + (f" Runs {code_list(ids)}." if ids else ""))
     else:
         lines.append("No eval suite ran.")

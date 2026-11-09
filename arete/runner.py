@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import ask, claude, config, devices, guard, jev, pi, record, state, util
-from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, Result, Session
+from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, SUBSCRIPTION_RUNNER, Result, Session
 
 RUNNERS = ("claude", "pi")
 BUDGET_FLOOR_USD = 0.005
@@ -37,7 +37,7 @@ def route(model: str, runner: str = "") -> tuple[str, str]:
 
 
 def metered(model: str, run_with: str = "") -> bool:
-    return route(model, run_with)[0] != "claude"
+    return route(model, run_with)[0] != SUBSCRIPTION_RUNNER
 
 
 def limit_applies(scope: str, model: str) -> bool:
@@ -112,7 +112,7 @@ def claude_login() -> tuple[bool, str]:
 
 
 def cost_note(res: Result) -> str:
-    paid = "subscription" if res.runner == "claude" else f"${res.cost_usd:.2f}"
+    paid = "subscription" if res.runner == SUBSCRIPTION_RUNNER else util.paid_note(res.cost_usd)
     return f"({util.count(res.turns, 'turn')}, {paid})"
 
 

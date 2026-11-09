@@ -1,20 +1,20 @@
 "use strict";
 
 const VIEWS = {
-  live: { label: "Live", sub: "What runs now, and what waits for you." },
-  runs: { label: "Runs", sub: "Every run, the running ones first, with the one you open beside the list." },
-  sessions: { label: "Sessions", sub: "Agents you talk to, on the device and model you pick." },
-  loops: { label: "Loops", sub: "The jobs serve fires on a schedule, from a source, or from a webhook." },
-  triage: { label: "Triage", sub: "Every open ticket, grouped by what it needs before it can be built." },
-  outcomes: { label: "Outcomes", sub: "What shipped, what went without you, and what you paid." },
-  health: { label: "Health", sub: "Alerts and failures first, then serve, the devices, the checks and the loops." },
-  settings: { label: "Settings", sub: "How many runs go at once, and the model for each role." },
-  usage: { label: "Usage", sub: "Which views you open, how you reach them, and what you press." },
+  live: { label: "Live", group: "Work", key: "l", sub: "What runs now, and what waits for you." },
+  runs: { label: "Runs", group: "Work", key: "r", sub: "Every run, the running ones first, with the one you open beside the list." },
+  sessions: { label: "Sessions", group: "Work", key: "s", sub: "Agents you talk to, on the device and model you pick." },
+  loops: { label: "Loops", group: "Work", key: "o", sub: "The jobs serve fires on a schedule, from a source, or from a webhook." },
+  triage: { label: "Triage", group: "Work", key: "t", sub: "Every open ticket, grouped by what it needs before it can be built." },
+  outcomes: { label: "Outcomes", group: "Watch", key: "m", sub: "What shipped, what went without you, and what you paid." },
+  health: { label: "Health", group: "Watch", key: "h", sub: "Alerts and failures first, then serve, the devices, the checks and the loops." },
+  settings: { label: "Settings", group: "Settings", key: "e", sub: "How many runs go at once, and the model for each role." },
+  usage: { label: "Usage", group: "Settings", key: "u", sub: "Which views you open, how you reach them, and what you press." },
 };
 const ITEM_LABELS = { run: "Run", session: "Session", loop: "Loop", ticket: "Ticket" };
 const DETAIL_VIEW = { run: "runs", session: "sessions", loop: "loops", ticket: "triage" };
 const OLD_HASHES = { launch: "#sessions", fleet: "#health", trends: "#outcomes", chat: "#live" };
-const GO_KEYS = { l: "live", r: "runs", s: "sessions", o: "loops", t: "triage", m: "outcomes", h: "health", e: "settings", u: "usage" };
+const GO_KEYS = Object.fromEntries(Object.entries(VIEWS).map(([view, meta]) => [meta.key, view]));
 const WAYS_IN = {
   start: "Opening the dashboard", sidebar: "The sidebar", link: "A link or a row on a page", palette: "Find",
   key: "G then a letter", back: "Back or Forward", close: "Closing an open item", step: "Previous or Next",
@@ -36,6 +36,15 @@ const ACTION_WORDS = {
 };
 const USAGE_WINDOWS = ["7", "30", "90"];
 const DEFAULT_USAGE_WINDOW = "30";
+const STATUS_FILTERS = [["", "All"], ["running", "Running"], ["failed", "Failed"]];
+const QUERY_RULES = {
+  runs: {
+    status: (v) => STATUS_FILTERS.some(([value]) => value === v), kind: Boolean, repo: Boolean, loop: Boolean,
+    limit: (v) => /^[1-9]\d{0,2}$/.test(v),
+  },
+  triage: { group: Boolean },
+  usage: { days: (v) => USAGE_WINDOWS.includes(v) },
+};
 const LIVE_MS = 5000;
 const SLOW_MS = 30000;
 const CHAT_BUSY_MS = 3000;
@@ -46,6 +55,7 @@ const FEED_KEEP_LINES = 2000;
 const PALETTE_MOST = 40;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const FIRST_MESSAGE_CHARS = 160;
+const TITLE_CHARS = 90;
 const PHONE = matchMedia("(pointer: coarse) and (max-width: 1040px)");
 const COARSE = matchMedia("(pointer: coarse)");
 const SVG = "http://www.w3.org/2000/svg";
@@ -436,16 +446,21 @@ function wholeWords(text) {
   return text.split(" ").flatMap((word, i) => [i ? " " : null, el("span", { class: "nb", text: word })]).filter(Boolean);
 }
 
+function wrapAtSlashes(text) {
+  return text.split(/(?<=\/)/).flatMap((part, i) => [i ? el("wbr") : null, el("span", { class: "id-part", text: part })]);
+}
+
 function pullLinks(urls) {
-  return urls.split(/\s+/).filter(Boolean).flatMap((url, i) => [i ? el("br") : null, link(url, url.replace("https://github.com/", ""))]).filter(Boolean);
+  const shortName = (url) => url.replace(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)$/, "$1#$2").replace("https://github.com/", "");
+  return urls.split(/\s+/).filter(Boolean).flatMap((url, i) => [i ? el("br") : null, link(url, shortName(url))]).filter(Boolean);
 }
 
 function table(caption, heads, rows, { stack = false } = {}) {
   const head = el("tr", {}, heads.map(([label, cls]) => el("th", { class: cls, scope: "col", text: label })));
   const carried = heads.map(([, cls]) => {
     const classes = (cls || "").split(" ");
-    const short = classes.includes("c-time") || classes.includes("c-status");
-    return [...classes.filter((c) => c === "x" || c === "beside"), ...(short ? ["nb"] : [])];
+    const short = ["c-time", "c-duration", "c-status"].some((c) => classes.includes(c));
+    return [...classes.filter((c) => c === "wide-only" || c === "beside"), ...(short ? ["nb"] : [])];
   });
   for (const row of [rows].flat()) {
     [...row.children].forEach((td, i) => {
@@ -473,7 +488,15 @@ function linkedRow(href, ...cells) {
 
 function rowLink(kind, id, text) {
   const open = route?.detail?.kind === kind && route.detail.id === id;
-  return el("a", { href: detailHash(kind, id), "data-focus": `row:${kind}:${id}`, "data-row": kind, "data-id": id, "aria-current": open ? "true" : null, text });
+  return el("a", { href: detailHash(kind, id), "data-focus": `row:${kind}:${id}`, "data-row": kind, "data-id": id, "aria-current": open ? "true" : null }, text);
+}
+
+function runName(r) {
+  return r.ticket ? wholeWords(r.ticket) : r.id;
+}
+
+function clampedSummary(text) {
+  return text ? el("span", { class: "clamp", title: text, text }) : "";
 }
 
 function itemLink(kind, id, text, focus) {
@@ -526,6 +549,15 @@ function paidMoney(n) {
   return n > 0 ? money(n) : "";
 }
 
+function paidColumn(rows, { onPhone = false } = {}) {
+  const shown = rows.some((r) => r.paid > 0);
+  return { head: shown ? [["Paid", onPhone ? "num c-cost" : "num c-cost wide-only"]] : [], cell: (r) => (shown ? cell(paidMoney(r.paid), "num") : null) };
+}
+
+function submitOnCtrlEnter(event) {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) event.target.form.requestSubmit();
+}
+
 function count(n, one, many) {
   return `${n} ${n === 1 ? one : many}`;
 }
@@ -547,13 +579,17 @@ function settle(promise) {
   return promise.then((value) => ({ value }), (e) => ({ error: e.message }));
 }
 
-function panelParts(panel, what, draw) {
-  return panel && "rows" in panel ? draw(panel.rows) : fault(`${what} could not be read: ${panel?.error || "no answer"}.`);
+function unreadFault(what, panel) {
+  return fault(`${what} could not be read: ${panel?.error || "no answer"}.`);
 }
 
-function button(text, focus, onClick, disabled = false) {
-  return el("button", { type: "button", "data-focus": focus, disabled, text, on: { click: (e) => {
-    trackAction(focus.split(":")[0]);
+function panelParts(panel, what, draw) {
+  return panel && "rows" in panel ? draw(panel.rows) : unreadFault(what, panel);
+}
+
+function button(text, action, onClick, { of = "", disabled = false } = {}) {
+  return el("button", { type: "button", "data-focus": of === "" ? action : `${action}:${of}`, disabled, text, on: { click: (e) => {
+    trackAction(action);
     onClick(e.currentTarget);
   } } });
 }
@@ -571,17 +607,21 @@ function figure(n) {
   return el("span", { class: "digits", text: String(n) });
 }
 
+function withCurrent(values, current) {
+  return current && !values.includes(current) ? [...values, current] : values;
+}
+
 function picker(label, id, values, current, onPick) {
   const select = el("select", { id, "data-focus": id, on: { change: (e) => {
     trackAction(`filter-${label.toLowerCase()}`);
     onPick(e.target.value);
-  } } }, el("option", { value: "", text: `Any ${label.toLowerCase()}` }), values.map((v) => el("option", { value: v, text: v })));
-  select.value = values.includes(current) ? current : "";
+  } } }, el("option", { value: "", text: `Any ${label.toLowerCase()}` }), withCurrent(values, current).map((v) => el("option", { value: v, text: v })));
+  select.value = current || "";
   return el("div", { class: "field" }, el("label", { for: id, text: label }), select);
 }
 
 function jumps(titles) {
-  return el("nav", { class: "jumps", "aria-label": "Sections" }, titles.map((title) => button(title, `jump:${title}`, () => jumpTo(title))));
+  return el("nav", { class: "jumps", "aria-label": "Sections" }, titles.map((title) => button(title, "jump", () => jumpTo(title), { of: title })));
 }
 
 function jumpTo(title) {
@@ -650,12 +690,28 @@ function listHash(view) {
   return viewHash(view, lastQuery[view] || {});
 }
 
+function rememberQuery(view, query) {
+  lastQuery[view] = query;
+  document.querySelector(`nav.side a[data-view="${view}"]`).href = listHash(view);
+}
+
+function settleQuery(query) {
+  if (route.detail) return;
+  const hash = viewHash(route.view, query);
+  if (hash === route.hash) return;
+  history.replaceState(history.state, "", hash);
+  route = { ...route, query, hash };
+  rememberQuery(route.view, query);
+}
+
 function parseRoute(hash) {
   const raw = (hash || "").replace(/^#/, "") || "live";
   const cut = raw.indexOf("?");
   const path = cut < 0 ? raw : raw.slice(0, cut);
   if (VIEWS[path]) {
-    const query = Object.fromEntries(new URLSearchParams(cut < 0 ? "" : raw.slice(cut + 1)));
+    const rules = QUERY_RULES[path] ?? {};
+    const query = Object.fromEntries([...new URLSearchParams(cut < 0 ? "" : raw.slice(cut + 1))]
+      .filter(([key, value]) => Object.hasOwn(rules, key) && rules[key](value)));
     return { view: path, query, detail: null, hash: viewHash(path, query) };
   }
   const slash = path.indexOf("/");
@@ -704,7 +760,9 @@ function onHistory(event) {
 
 function applyRoute(next, way) {
   const viewChanged = !route || next.view !== route.view;
-  if (!next.detail) lastQuery[next.view] = next.query;
+  const closing = route?.detail && !next.detail && !viewChanged && (way === "close" || way === "back");
+  if (closing) focusAfterDraw ||= `row:${route.detail.kind}:${route.detail.id}`;
+  if (!next.detail) rememberQuery(next.view, next.query);
   route = next;
   if (stint?.name !== stintName()) {
     endStint();
@@ -728,7 +786,6 @@ function show(viewChanged, way) {
   document.getElementById("title").textContent = meta.label;
   document.getElementById("sub").textContent = meta.sub;
   for (const a of document.querySelectorAll("nav.side a[data-view]")) {
-    a.href = listHash(a.dataset.view);
     if (a.dataset.view === view) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   }
@@ -764,10 +821,7 @@ function show(viewChanged, way) {
 
 function closeDetail() {
   if (!route.detail) return;
-  const { kind, id } = route.detail;
-  focusAfterDraw = `row:${kind}:${id}`;
-  const from = parseRoute(history.state?.from || "");
-  if (from && from.view === route.view && !from.detail) {
+  if (history.state?.from && parseRoute(history.state.from)) {
     pendingWay = "close";
     history.back();
   } else {
@@ -798,8 +852,8 @@ function detailHead(pane, kind, id, title, extra = [], neighbors = neighborsIn(r
     id !== title ? el("p", { class: "item-id muted", text: id }) : null,
     el("div", { class: "actions row-buttons" },
       button("Close", "close", closeDetail),
-      button("Previous", "previous", () => step(-1), !neighbors[0]),
-      button("Next", "next", () => step(1), !neighbors[1]),
+      button("Previous", "previous", () => step(-1), { disabled: !neighbors[0] }),
+      button("Next", "next", () => step(1), { disabled: !neighbors[1] }),
       extra),
   ];
 }
@@ -860,9 +914,9 @@ async function refresh() {
   const at = route;
   const label = VIEWS[at.view].label;
   try {
-    const [draw, frame] = await Promise.all([LOADERS[at.view](at), call("/api/frame").catch(() => null)]);
+    const [draw, sidebar] = await Promise.all([LOADERS[at.view](at), call("/api/sidebar").catch(() => null)]);
     if (mine !== refreshCount) return;
-    if (frame) drawFrame(frame);
+    if (sidebar) drawSidebar(sidebar);
     const drawn = draw();
     const held = drawn === HELD;
     const delay = held ? SLOW_MS : drawn || SLOW_MS;
@@ -890,7 +944,7 @@ function setCount(view, n, words) {
   else a.removeAttribute("aria-label");
 }
 
-function drawFrame(f) {
+function drawSidebar(f) {
   setCount("live", f.needs_you, (n) => `${n} ${n === 1 ? "needs" : "need"} you`);
   setCount("runs", f.running, (n) => `${n} running`);
   setCount("triage", f.questions, (n) => `${count(n, "ticket", "tickets")} with questions`);
@@ -927,14 +981,14 @@ function drawLive(d) {
 
 function runningParts(live) {
   if (!live.runs.length) return [quiet("Nothing is running."), saidLine("running")];
-  const anyPaid = live.runs.some((r) => r.paid > 0);
+  const paid = paidColumn(live.runs, { onPhone: true });
   return [
     el("p", { class: "readout" }, String(live.slots), el("small", { text: `of ${live.max_parallel} pipeline slots busy${live.waiting ? `, ${live.waiting} waiting for one` : ""}` })),
-    table("", [["Work", "c-work"], ["Kind", "c-kind x"], ["Started", "c-time"], ["Last step"], ["Time", "num c-time x"], ...(anyPaid ? [["Paid", "num c-cost"]] : []), ["", "c-run-buttons"]],
+    table("", [["Work", "c-work"], ["Kind", "c-kind wide-only"], ["Started", "c-time"], ["Last step"], ["Time", "num c-duration wide-only"], ...paid.head, ["", "c-run-buttons"]],
       live.runs.map((r) => linkedRow(detailHash("run", r.id),
-        cell(rowLink("run", r.id, r.ticket || r.id)), cell(r.kind), cell(clock(r.started), "nb"), cell(r.slot || r.step || "starting", "muted-cell"),
-        cell(duration(r.seconds), "num"), anyPaid ? cell(paidMoney(r.paid), "num") : null,
-        cell(button(r.stopping ? "Stopping" : "Stop", `stop:${r.id}`, (b) => stopLiveRun(r, b), r.stopping)))), { stack: true }),
+        cell(rowLink("run", r.id, runName(r))), cell(r.kind), cell(clock(r.started), "nb"), cell(r.slot || r.step || "starting", "muted-cell"),
+        cell(duration(r.seconds), "num"), paid.cell(r),
+        cell(button(r.stopping ? "Stopping" : "Stop", "stop", (b) => stopLiveRun(r, b), { of: r.id, disabled: r.stopping })))), { stack: true }),
     saidLine("running"),
   ];
 }
@@ -964,7 +1018,7 @@ function needsParts(n) {
   const faults = [];
   const take = (panel, what, toRows) => {
     if (panel && "rows" in panel) rows.push(...toRows(panel.rows));
-    else faults.push(fault(`${what} could not be read: ${panel?.error || "no answer"}.`));
+    else faults.push(unreadFault(what, panel));
   };
   take(n.approvals, "The approvals", (approvals) => approvals.map((a) => approvalRow(a, "needs")));
   take(n.ready, "The ready tickets", (ready) => ready.map(readyRow));
@@ -997,8 +1051,8 @@ function approvalRow(a, place) {
       a.run_id && place === "needs" ? el("div", {}, itemLink("run", a.run_id, "Open the run that asked", `asked:${a.id}`)) : null]),
     cell(liveAgo(a.created), "nb"),
     cell(el("div", { class: "row-buttons" },
-      button(a.failed ? "Try again" : "Approve", `approve:${a.id}`, (b) => decide(a.id, true, b, place)),
-      button("Reject", `reject:${a.id}`, (b) => decide(a.id, false, b, place)))));
+      button(a.failed ? "Try again" : "Approve", "approve", (b) => decide(a.id, true, b, place), { of: a.id }),
+      button("Reject", "reject", (b) => decide(a.id, false, b, place), { of: a.id }))));
 }
 
 function decide(id, yes, btn, place) {
@@ -1012,7 +1066,7 @@ function readyRow(r) {
     cell(kindTag("Ready")),
     cell([el("div", {}, rowLink("ticket", r.ref, r.ref.replace(/^[^/#\s]+\//, "")), `: ${r.title}`), el("div", { class: "muted", text: r.verdict })]),
     cell(""),
-    cell(el("div", { class: "row-buttons" }, button("Send", `send-ready:${r.ref}`, (b) => sendReady(r, b)))));
+    cell(el("div", { class: "row-buttons" }, button("Send", "send-ready", (b) => sendReady(r, b), { of: r.ref }))));
 }
 
 function sendReady(r, btn) {
@@ -1026,7 +1080,7 @@ function skippedRow(s) {
     cell(kindTag("Skipped")),
     cell([el("div", {}, link(s.url, s.ticket)), el("div", { class: "muted", text: s.why })]),
     cell(liveAgo(s.since), "nb"),
-    cell(s.can_run ? el("div", { class: "row-buttons" }, button("Run anyway", `run-anyway:${s.ticket}`, (b) => runSkipped(s.ticket, b)))
+    cell(s.can_run ? el("div", { class: "row-buttons" }, button("Run anyway", "run-anyway", (b) => runSkipped(s.ticket, b), { of: s.ticket }))
       : el("span", { class: "muted", text: "no repo to run in yet" })));
 }
 
@@ -1066,7 +1120,7 @@ function proposalRow(x, kind, where, what) {
     cell(kindTag(kind)),
     cell([el("div", { class: "wrap-cell", text: where }), el("div", { class: "muted", text: x.change })]),
     cell(""),
-    cell(el("div", { class: "row-buttons" }, button("Mark done", `done:${x.id}`, (b) => markDone(x.id, what, b)))));
+    cell(el("div", { class: "row-buttons" }, button("Mark done", "done", (b) => markDone(x.id, what, b), { of: x.id }))));
 }
 
 function markDone(id, what, btn) {
@@ -1102,9 +1156,9 @@ function paidWords(r, models) {
 }
 
 function modelTable(models) {
-  return table("", [["Model"], ["Runner", "c-kind"], ["Calls", "num c-n"], ["Tokens in", "num c-rate x"], ["Tokens out", "num c-rate x"], ["Paid", "num c-cost"]],
-    models.map((m) => el("tr", {}, cell(m.model), cell(m.runner), cell(m.steps, "num"), cell(m.tokens_in.toLocaleString(), "num"),
-      cell(m.tokens_out.toLocaleString(), "num"), cell(m.paid ? money(m.cost_usd) : "subscription", "num"))), { stack: true });
+  return table("", [["Model"], ["Runner", "c-kind"], ["Calls", "num c-n"], ["Tokens in", "num c-rate wide-only"], ["Tokens out", "num c-rate wide-only"], ["Paid", "num c-cost"]],
+    models.map((m) => el("tr", {}, cell(wrapAtSlashes(m.model)), cell(m.runner), cell(m.steps, "num"), cell(m.tokens_in.toLocaleString(), "num"),
+      cell(m.tokens_out.toLocaleString(), "num"), cell(m.metered ? money(m.cost_usd) : "subscription", "num"))), { stack: true });
 }
 
 function drawRunDetail(pane, result, kind) {
@@ -1122,9 +1176,9 @@ function drawRunDetail(pane, result, kind) {
   const lines = feed ? mergeFeed(id, feed) : log.lines;
   const shownLines = document.querySelector(`#${pane}-body pre.lines`);
   const stick = !shownLines || shownLines.scrollTop + shownLines.clientHeight >= shownLines.scrollHeight - 4;
-  fill(`${pane}-head`, detailHead(pane, kind, id, r.ticket || id,
-    running ? button(r.stop_asked ? "Stopping" : "Stop", `stop:${id}`, (b) => stopRun(id, place, b), Boolean(r.stop_asked)) : null));
   const s = board.session;
+  fill(`${pane}-head`, detailHead(pane, kind, id, s?.prompt ? firstMessage(s.prompt, TITLE_CHARS) : r.ticket || id,
+    running ? button(r.stop_asked ? "Stopping" : "Stop", "stop", (b) => stopRun(id, place, b), { of: id, disabled: Boolean(r.stop_asked) }) : null));
   fill(`${pane}-body`,
     saidLine(place),
     el("dl", { class: "w" },
@@ -1142,8 +1196,8 @@ function drawRunDetail(pane, result, kind) {
     s.prompt ? foldText(`prompt:${id}`, "Show the first message", s.prompt) : null] : null,
     board.models.length ? [el("h3", { text: "Models" }), modelTable(board.models)] : null,
     el("h3", { text: feed ? "Feed" : "Log" }),
-    el("pre", { class: "lines", tabindex: "0", "data-focus": "lines", "aria-label": feed ? "The feed" : "The log",
-      text: lines.length ? lines.join("\n") : feed ? "Nothing in the feed yet." : "This run has no log yet." }));
+    el("pre", { class: `lines ${feed ? "feed" : "log"}`, tabindex: "0", "data-focus": "lines", "aria-label": feed ? "The feed" : "The log" },
+      lines.length ? lines.map((text) => el("span", { text })) : feed ? "Nothing in the feed yet." : "This run has no log yet."));
   if (stick) {
     const fresh = document.querySelector(`#${pane}-body pre.lines`);
     fresh.scrollTop = fresh.scrollHeight;
@@ -1161,7 +1215,7 @@ function talkForm(pane, id) {
   const textId = `${pane}-text`;
   const text = el("textarea", { id: textId, rows: "3", spellcheck: "true", "data-focus": textId, on: {
     input: (e) => talkDrafts.set(id, e.target.value),
-    keydown: (e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.target.form.requestSubmit(),
+    keydown: submitOnCtrlEnter,
   } });
   text.value = talkDrafts.get(id) || "";
   return el("form", { class: "talk", novalidate: true, "aria-label": "Send the session a message", on: { submit: (e) => sendSession(e, id) } },
@@ -1201,21 +1255,21 @@ function drawRuns(data, q) {
   const limit = Number(q.limit) || PAGE_SIZE;
   const filter = (key, value) => go(viewHash("runs", { ...q, [key]: value, limit: "" }), "link", { replace: true });
   const filtered = ["status", "kind", "repo", "loop"].some((key) => q[key]);
-  const anyPaid = data.runs.some((r) => r.paid > 0);
+  const paid = paidColumn(data.runs);
   fill("runs-list",
     el("div", { class: "filters" },
-      seg("Status", [["", "All"], ["running", "Running"], ["failed", "Failed"]], q.status || "", (v) => filter("status", v)),
-      seg("Kind", [["", "Every kind"], ...data.facets.kind.map((k) => [k, k])], q.kind || "", (v) => filter("kind", v)),
+      seg("Status", STATUS_FILTERS, q.status || "", (v) => filter("status", v)),
+      seg("Kind", [["", "Every kind"], ...withCurrent(data.facets.kind, q.kind).map((k) => [k, k])], q.kind || "", (v) => filter("kind", v)),
       el("div", { class: "fields" },
         picker("Repo", "runs-repo", data.facets.repo, q.repo, (v) => filter("repo", v)),
         picker("Loop", "runs-loop", data.facets.loop, q.loop, (v) => filter("loop", v)))),
     data.runs.length
       ? table("Running first, then newest first",
-        [["Work", "c-work"], ["Kind", "c-kind x"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-time x"], ...(anyPaid ? [["Paid", "num c-cost x"]] : []), ["Result", "c-result x"]],
+        [["Work", "c-work"], ["Kind", "c-kind wide-only"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-duration wide-only"], ...paid.head, ["Result", "c-result wide-only"]],
         data.runs.map((r) => linkedRow(detailHash("run", r.id),
-          cell(rowLink("run", r.id, r.ticket || r.id)), cell(r.kind), cell(runStatus(r.status), "nb"), cell(clock(r.started), "nb"),
-          cell(duration(r.seconds), "num"), anyPaid ? cell(paidMoney(r.paid), "num") : null,
-          cell(r.pr_url ? pullLinks(r.pr_url) : r.summary, "muted-cell"))))
+          cell(rowLink("run", r.id, runName(r))), cell(r.kind), cell(runStatus(r.status), "nb"), cell(clock(r.started), "nb"),
+          cell(duration(r.seconds), "num"), paid.cell(r),
+          cell(r.pr_url ? pullLinks(r.pr_url) : clampedSummary(r.summary), "muted-cell"))))
       : quiet(filtered ? "No run matches these filters." : "No run has started yet."),
     data.more ? el("div", { class: "actions" },
       button(`Show ${PAGE_SIZE} more`, "runs-more", () => go(viewHash("runs", { ...q, limit: String(limit + PAGE_SIZE) }), "link", { replace: true }))) : null);
@@ -1223,8 +1277,7 @@ function drawRuns(data, q) {
 }
 
 function runsQuery(q) {
-  const wanted = Object.fromEntries(["status", "kind", "repo", "loop"].map((key) => [key, q[key] || ""]).filter(([, v]) => v));
-  return new URLSearchParams({ ...wanted, limit: String(Number(q.limit) || PAGE_SIZE) });
+  return new URLSearchParams({ ...q, limit: q.limit || String(PAGE_SIZE) });
 }
 
 /* Sessions */
@@ -1269,22 +1322,22 @@ function repoFollowsDevice() {
   repo.disabled = remote;
 }
 
-function firstMessage(text) {
+function firstMessage(text, chars = FIRST_MESSAGE_CHARS) {
   const flat = (text || "").replace(/\s+/g, " ").trim();
-  return flat.length > FIRST_MESSAGE_CHARS ? `${flat.slice(0, FIRST_MESSAGE_CHARS - 1).trimEnd()}…` : flat || "no message";
+  return flat.length > chars ? `${flat.slice(0, chars - 1).trimEnd()}…` : flat || "no message";
 }
 
 function drawSessions(data) {
   fillChoices(data.choices);
-  const anyPaid = data.sessions.some((s) => s.paid > 0);
+  const paid = paidColumn(data.sessions);
   fill("sessions-list",
     data.sessions.length
-      ? table("Newest first", [["First message"], ["Status", "c-status"], ["Started", "c-time"], ["Model", "c-model x"], ...(anyPaid ? [["Paid", "num c-cost x"]] : [])],
+      ? table("Newest first", [["Message"], ["Status", "c-status"], ["Started", "c-time"], ["Model", "c-model wide-only"], ...paid.head],
         data.sessions.map((s) => linkedRow(detailHash("session", s.id),
           cell([rowLink("session", s.id, firstMessage(s.prompt)), s.repo ? el("div", { class: "muted", text: `${s.repo}${s.branch ? ` · ${s.branch}` : ""}` }) : null], "wrap-cell"),
           cell(runStatus(s.status), "nb"), cell(clock(s.started), "nb"),
           cell([s.model || "", el("div", { class: "muted", text: [s.runner, s.device].filter(Boolean).join(" on ") })]),
-          anyPaid ? cell(paidMoney(s.paid), "num") : null)), { stack: true })
+          paid.cell(s))), { stack: true })
       : quiet("No session yet. New session starts one."));
   return data.sessions.some((s) => s.status === "running") ? LIVE_MS : SLOW_MS;
 }
@@ -1366,9 +1419,9 @@ function loopLastRun(l) {
 
 function loopButtons(l, place) {
   return [
-    button("Start", `start:${l.name}`, (b) => loopAction(l.name, "start", b, place), Boolean(l.error || l.running)),
-    button("Try", `try:${l.name}`, (b) => loopAction(l.name, "try", b, place), Boolean(l.error || l.running)),
-    button(l.enabled ? "Turn off" : "Turn on", `switch:${l.name}`, (b) => loopAction(l.name, l.enabled ? "disable" : "enable", b, place), Boolean(l.error && !l.enabled)),
+    button("Start", "start", (b) => loopAction(l.name, "start", b, place), { of: l.name, disabled: Boolean(l.error || l.running) }),
+    button("Try", "try", (b) => loopAction(l.name, "try", b, place), { of: l.name, disabled: Boolean(l.error || l.running) }),
+    button(l.enabled ? "Turn off" : "Turn on", "switch", (b) => loopAction(l.name, l.enabled ? "disable" : "enable", b, place), { of: l.name, disabled: Boolean(l.error && !l.enabled) }),
   ];
 }
 
@@ -1389,7 +1442,7 @@ function drawLoops(data) {
     serveLine(data.serve),
     saidLine("loops"),
     data.loops.length
-      ? table("", [["Loop", "c-loop"], ["On", "c-on"], ["Kind", "x"], ["Trigger", "x"], ["Last run", "c-status"], ["Next", "c-time x"], ["Paid 24 h", "num x"], ["", "c-loop-buttons beside"]],
+      ? table("", [["Loop", "c-loop"], ["On", "c-on"], ["Kind", "wide-only"], ["Trigger", "wide-only"], ["Last run", "c-status"], ["Next", "c-time wide-only"], ["Paid 24 h", "num nb wide-only"], ["", "c-loop-buttons beside"]],
         data.loops.map(loopRow), { stack: true })
       : quiet("No loop is installed. New loop drafts one from a sentence."));
   fillLoopNew(data.draft);
@@ -1467,12 +1520,12 @@ function loopFacts(d) {
 
 function loopRuns(d) {
   if (!d.runs.length) return quiet("It has not run yet.");
-  const anyPaid = d.runs.some((r) => r.paid > 0);
-  return table("Newest first", [["Started", "c-time"], ["Trigger", "c-kind x"], ["Status", "c-status"], ["Time", "num c-time x"], ...(anyPaid ? [["Paid", "num c-cost"]] : []), ["Result", "c-result x"]],
+  const paid = paidColumn(d.runs, { onPhone: true });
+  return table("Newest first", [["Started", "c-time"], ["Trigger", "c-kind wide-only"], ["Status", "c-status"], ["Time", "num c-duration wide-only"], ...paid.head, ["Result", "c-result wide-only"]],
     d.runs.map((r) => linkedRow(detailHash("run", r.id),
       cell(itemLink("run", r.id, clock(r.started), `loop-run:${r.id}`), "nb"), cell(r.trigger || ""), cell(runStatus(r.status), "nb"),
-      cell(duration(secondsBetween(r.started, r.finished)), "num"), anyPaid ? cell(paidMoney(r.paid), "num") : null,
-      cell(r.pr_url ? pullLinks(r.pr_url) : r.summary || "", "muted-cell"))));
+      cell(duration(secondsBetween(r.started, r.finished)), "num"), paid.cell(r),
+      cell(r.pr_url ? pullLinks(r.pr_url) : clampedSummary(r.summary), "muted-cell"))));
 }
 
 function loopSources(d) {
@@ -1506,12 +1559,12 @@ function drawLoopDetail(result) {
   const sections = [
     ["Runs", loopRuns(d)],
     ["Findings", d.findings.length
-      ? table("Each finding is reported once, by its fingerprint", [["Finding"], ["Seen", "num c-n"], ["First", "c-time x"], ["Last", "c-time"]],
+      ? table("Each finding is reported once, by its fingerprint", [["Finding"], ["Seen", "num c-n"], ["First", "c-time wide-only"], ["Last", "c-time"]],
         d.findings.map((f) => el("tr", {}, cell(f.url ? link(f.url, f.title || f.fingerprint) : f.title || f.fingerprint), cell(f.seen, "num"),
           cell(clock(f.first_seen), "nb"), cell(clock(f.last_seen), "nb"))))
       : quiet("No finding yet.")],
     ["Sources", loopSources(d)],
-    d.metrics.length ? ["Metrics", table("The last 30 days", [["Metric"], ["Latest", "num c-cost"], ["When", "c-time"], ["Points", "num c-n x"]],
+    d.metrics.length ? ["Metrics", table("The last 30 days", [["Metric"], ["Latest", "num c-cost"], ["When", "c-time"], ["Points", "num c-n wide-only"]],
       d.metrics.map((m) => el("tr", {}, cell(m.name), cell(Number(m.value).toLocaleString(undefined, { maximumFractionDigits: 20 }), "num"), cell(clock(m.ts), "nb"), cell(m.points, "num"))))] : null,
     d.emits.some((e) => e.startsWith("digest")) ? ["Digests", loopDigests(d)] : null,
     ["Memory", memory ? foldText(`memory:${d.name}`, "Show what it keeps between runs", memory) : quiet("It keeps nothing between runs yet.")],
@@ -1542,7 +1595,7 @@ function researchTicket(r, btn) {
 function researchOffer(r, researching) {
   return [
     r.research ? el("div", { class: "actions offer" },
-      button(r.research.label, `research:${r.ref}`, (b) => researchTicket(r, b), researching),
+      button(r.research.label, "research", (b) => researchTicket(r, b), { of: r.ref, disabled: researching }),
       r.research.force ? el("span", { class: "muted", text: "This skips JEV's screen for instructions aimed at an agent, so read the ticket first." }) : null) : null,
     r.research || lastSaid.has(`research:${r.ref}`) ? saidLine(`research:${r.ref}`) : null,
   ];
@@ -1579,7 +1632,7 @@ function sendForm(r) {
   const box = (q, i) => {
     const answer = el("textarea", { id: id(i), "data-focus": id(i), on: {
       input: (e) => drafts.set(draftKey(r.ref, q), e.target.value),
-      keydown: (e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.target.form.requestSubmit(),
+      keydown: submitOnCtrlEnter,
     } });
     answer.value = drafts.get(draftKey(r.ref, q)) || "";
     return answer;
@@ -1645,30 +1698,33 @@ function shortRef(ref) {
 
 function drawTriage(panel, r) {
   if (!("rows" in panel)) {
-    fill("triage-list", fault(`Triage could not be read: ${panel.error || "no answer"}.`));
+    fill("triage-list", unreadFault("Triage", panel));
     if (r.detail) {
       fill("triage-detail-head", detailHead("triage-detail", "ticket", r.detail.id, r.detail.id, [], [null, null]));
-      fill("triage-detail-body", fault(`Triage could not be read: ${panel.error || "no answer"}.`));
+      fill("triage-detail-body", unreadFault("Triage", panel));
     }
     return SLOW_MS;
   }
   const t = panel.rows;
   const groups = t.groups.map((g) => ({ ...g, slug: groupSlug(g.standing) }));
+  const holder = r.detail && groups.find((g) => g.rows.some((row) => row.ref === r.detail.id));
+  if (holder) rememberQuery("triage", { group: holder.slug });
   const q = r.detail ? lastQuery.triage || {} : r.query;
   const picked = groups.find((g) => g.slug === q.group) ?? defaultGroup(groups);
+  if (picked) settleQuery({ group: picked.slug });
   const lastRan = t.refreshed ? ["Triage last ran ", liveAgo(t.refreshed), ` (${zonedClock(t.refreshed)}).`] : ["Triage has not run yet."];
   fill("triage-list",
     quiet(...lastRan, " It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent."),
-    el("div", { class: "actions" }, button(t.refreshing ? "Triage running" : "Refresh triage now", "triage-refresh", refreshTriage, t.refreshing)),
+    el("div", { class: "actions" }, button(t.refreshing ? "Triage running" : "Refresh triage now", "triage-refresh", refreshTriage, { disabled: t.refreshing })),
     saidLine("triage-refresh"),
     t.researching ? quiet("The research loop is running, so the research buttons wait until it ends.") : null,
     t.approved?.length ? quiet(`Sent to the pipeline on the last run: ${t.approved.join(", ")}.`) : null,
     Object.entries(t.held || {}).map(([ref, why]) => quiet(`Not sent this time: ${ref}: ${why}`)),
     seg("Groups", groups.map((g) => [g.slug, [g.standing, " ", figure(g.rows.length)]]), picked?.slug ?? "",
-      (slug) => go(viewHash("triage", { group: slug === defaultGroup(groups)?.slug ? "" : slug }), "link", { replace: true })),
+      (slug) => go(viewHash("triage", { group: slug }), "link", { replace: true })),
     picked ? [heading(groups.indexOf(picked) + 1, picked.standing),
       picked.rows.length
-        ? table(count(picked.rows.length, "ticket", "tickets"), [["Ticket", "c-ref"], ["Title"], ["Verdict", "c-verdict x"]],
+        ? table(count(picked.rows.length, "ticket", "tickets"), [["Ticket", "c-ref"], ["Title"], ["Verdict", "c-verdict wide-only"]],
           picked.rows.map((row) => linkedRow(detailHash("ticket", row.ref),
             cell(rowLink("ticket", row.ref, shortRef(row.ref)), "nb"),
             cell([row.title, row.summary ? el("div", { class: "muted", text: row.summary }) : null]),
@@ -1717,37 +1773,37 @@ function dayLabel(day) {
 }
 
 function dayChart(days, width, height, top, label, dayTickGap) {
-  const frame = { left: 58, right: width - 16, top, bottom: height - 32 };
-  frame.pitch = (frame.right - frame.left) / days.length;
-  frame.X = (i) => frame.left + i * frame.pitch;
-  frame.chart = svg("svg", { class: "chart", viewBox: `0 0 ${width} ${height}`, width, height, role: "img", "aria-label": label });
+  const plot = { left: 58, right: width - 16, top, bottom: height - 32 };
+  plot.pitch = (plot.right - plot.left) / days.length;
+  plot.X = (i) => plot.left + i * plot.pitch;
+  plot.chart = svg("svg", { class: "chart", viewBox: `0 0 ${width} ${height}`, width, height, role: "img", "aria-label": label });
   days.forEach((d, i) => {
     if (i % 7 !== (days.length - 1) % 7) return;
-    const x = frame.X(i) + frame.pitch / 2, y = frame.bottom + dayTickGap;
-    frame.chart.append(svg("line", { class: "tick", x1: x, y1: y, x2: x, y2: y + 5 }));
-    frame.chart.append(svg("text", { class: "fig", x, y: y + 20, "text-anchor": i === days.length - 1 ? "end" : "middle" }, dayLabel(d.day)));
+    const x = plot.X(i) + plot.pitch / 2, y = plot.bottom + dayTickGap;
+    plot.chart.append(svg("line", { class: "tick", x1: x, y1: y, x2: x, y2: y + 5 }));
+    plot.chart.append(svg("text", { class: "fig", x, y: y + 20, "text-anchor": i === days.length - 1 ? "end" : "middle" }, dayLabel(d.day)));
   });
-  return frame;
+  return plot;
 }
 
-function valueTicks(frame, values, Y, words) {
+function valueTicks(plot, values, Y, words) {
   for (const v of values) {
-    frame.chart.append(svg("line", { class: "tick", x1: frame.left - 5, y1: Y(v), x2: frame.left, y2: Y(v) }));
-    frame.chart.append(svg("text", { class: "fig", x: frame.left - 9, y: Y(v) + 4, "text-anchor": "end" }, words(v)));
+    plot.chart.append(svg("line", { class: "tick", x1: plot.left - 5, y1: Y(v), x2: plot.left, y2: Y(v) }));
+    plot.chart.append(svg("text", { class: "fig", x: plot.left - 9, y: Y(v) + 4, "text-anchor": "end" }, words(v)));
   }
 }
 
-function bar(frame, i, cls, y, height) {
-  frame.chart.append(svg("rect", { class: cls, x: frame.X(i) + frame.pitch * 0.18, y, width: Math.max(1, frame.pitch * 0.64), height }));
+function bar(plot, i, cls, y, height) {
+  plot.chart.append(svg("rect", { class: cls, x: plot.X(i) + plot.pitch * 0.18, y, width: Math.max(1, plot.pitch * 0.64), height }));
 }
 
 function paidChart(days, width) {
-  const frame = dayChart(days, width, 230, 30, `Paid per day for the last ${days.length} days, with today's bar filled`, 0);
-  const { chart, left, right, top, bottom, pitch, X } = frame;
+  const plot = dayChart(days, width, 230, 30, `Paid per day for the last ${days.length} days, with today's bar filled`, 0);
+  const { chart, left, right, top, bottom, pitch, X } = plot;
   const max = niceMax(Math.max(...days.map((d) => d.paid)), false);
   const Y = (v) => bottom - (v / max) * (bottom - top);
-  valueTicks(frame, [0, max / 2, max], Y, (v) => money(v).replace(".00", ""));
-  days.forEach((d, i) => d.paid > 0 && bar(frame, i, i === days.length - 1 ? "frame this" : "frame", Y(d.paid), bottom - Y(d.paid)));
+  valueTicks(plot, [0, max / 2, max], Y, (v) => money(v).replace(".00", ""));
+  days.forEach((d, i) => d.paid > 0 && bar(plot, i, i === days.length - 1 ? "frame this" : "frame", Y(d.paid), bottom - Y(d.paid)));
   const today = days[days.length - 1];
   const label = `Today ${money(today.paid)}`;
   const under = days.slice(-Math.ceil((label.length * 7.4) / pitch) - 1);
@@ -1762,15 +1818,15 @@ function paidChart(days, width) {
 }
 
 function outcomeChart(days, width) {
-  const frame = dayChart(days, width, 240, 22, `Runs shipped above the line and runs failed below it, per day for the last ${days.length} days`, 6);
-  const { chart, left, right, top, bottom } = frame;
+  const plot = dayChart(days, width, 240, 22, `Runs shipped above the line and runs failed below it, per day for the last ${days.length} days`, 6);
+  const { chart, left, right, top, bottom } = plot;
   const max = niceMax(Math.max(1, ...days.map((d) => Math.max(d.shipped, d.failed))), true);
   const mid = (top + bottom) / 2;
   const Y = (v) => mid - (v / max) * (mid - top);
-  valueTicks(frame, [-max, 0, max], Y, (v) => String(Math.abs(v)));
+  valueTicks(plot, [-max, 0, max], Y, (v) => String(Math.abs(v)));
   days.forEach((d, i) => {
-    if (d.shipped) bar(frame, i, "frame", Y(d.shipped), mid - Y(d.shipped));
-    if (d.failed) bar(frame, i, "frame below", mid, Y(-d.failed) - mid);
+    if (d.shipped) bar(plot, i, "frame", Y(d.shipped), mid - Y(d.shipped));
+    if (d.failed) bar(plot, i, "frame below", mid, Y(-d.failed) - mid);
   });
   chart.append(svg("line", { class: "axis", x1: left, y1: top - 4, x2: left, y2: bottom + 4 }));
   chart.append(svg("line", { class: "axis", x1: left, y1: mid, x2: right, y2: mid }));
@@ -1801,8 +1857,8 @@ function decisionParts(d, days) {
 }
 
 function paidTable(rows) {
-  return rows.length ? table("", [["Name"], ["Calls", "num c-n"], ["Tokens in", "num c-rate x"], ["Tokens out", "num c-rate x"], ["Paid", "num c-cost"]],
-    rows.map((r) => el("tr", {}, cell(r.name), cell(r.steps, "num"), cell(r.tokens_in.toLocaleString(), "num"),
+  return rows.length ? table("", [["Name"], ["Calls", "num c-n"], ["Tokens in", "num c-rate wide-only"], ["Tokens out", "num c-rate wide-only"], ["Paid", "num c-cost"]],
+    rows.map((r) => el("tr", {}, cell(wrapAtSlashes(r.name)), cell(r.steps, "num"), cell(r.tokens_in.toLocaleString(), "num"),
       cell(r.tokens_out.toLocaleString(), "num"), cell(money(r.cost_usd), "num")))) : quiet("No paid model call in this window.");
 }
 
@@ -1824,7 +1880,7 @@ function drawOutcomes() {
   const panel = outcomesData;
   if (!panel) return SLOW_MS;
   if (!("rows" in panel)) {
-    fill("outcomes", fault(`Outcomes could not be read: ${panel.error || "no answer"}.`));
+    fill("outcomes", unreadFault("Outcomes", panel));
     return SLOW_MS;
   }
   const t = panel.rows;
@@ -1832,7 +1888,7 @@ function drawOutcomes() {
   const shipped = t.days.reduce((n, d) => n + d.shipped, 0);
   const failed = t.days.reduce((n, d) => n + d.failed, 0);
   const other = t.days.reduce((n, d) => n + d.other, 0);
-  const anyPaid = t.repos.some((r) => r.paid > 0);
+  const paid = paidColumn(t.repos);
   const titles = ["Outcomes per day", "Without you or by you", "What you paid", "By repo", "Evals"];
   fill("outcomes",
     jumps(titles),
@@ -1846,12 +1902,12 @@ function drawOutcomes() {
     paidParts(t, width),
     heading(4, titles[3]),
     t.repos.length ? table("",
-      [["Repo"], ["Runs", "num c-n"], ["Shipped", "num c-n"], ["Failed", "num c-n x"], ["Pass rate", "num c-rate"], ["Median time", "num c-time x"], ...(anyPaid ? [["Paid", "num c-cost x"]] : [])],
+      [["Repo"], ["Runs", "num c-n"], ["Shipped", "num c-n"], ["Failed", "num c-n wide-only"], ["Pass rate", "num c-rate"], ["Median time", "num c-duration wide-only"], ...paid.head],
       t.repos.map((r) => el("tr", {}, cell(r.repo), cell(r.runs, "num"), cell(r.shipped, "num"), cell(r.failed, "num"),
-        cell(percent(r.pass_rate), "num"), cell(duration(r.median_seconds), "num"), anyPaid ? cell(paidMoney(r.paid), "num") : null)))
+        cell(percent(r.pass_rate), "num"), cell(duration(r.median_seconds), "num"), paid.cell(r))))
       : quiet("No pipeline run finished in this window."),
     heading(5, titles[4]),
-    t.evals.length ? table("Mined eval tasks", [["Repo"], ["Tasks", "num c-n"], ["Passed", "num c-n"], ["Pass rate", "num c-rate"], ["Last", "c-time x"]],
+    t.evals.length ? table("Mined eval tasks", [["Repo"], ["Tasks", "num c-n"], ["Passed", "num c-n"], ["Pass rate", "num c-rate"], ["Last", "c-time wide-only"]],
       t.evals.map((e) => el("tr", {}, cell(e.repo), cell(e.tasks, "num"), cell(e.passed, "num"), cell(percent(e.pass_rate), "num"), cell(clock(e.last)))))
       : quiet("No eval ran in this window."));
   return SLOW_MS;
@@ -1886,7 +1942,7 @@ function deviceRow(d) {
     cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted" }, liveAgo(p.at))] : "not probed", "nb"),
     cell(probeWords(p) || d.error || "", "muted-cell"),
     cell([p ? (p.tools || []).join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
-    cell(button("Probe", `probe:${d.name}`, (b) => probe(d.name, b)), "probe-cell"));
+    cell(button("Probe", "probe", (b) => probe(d.name, b), { of: d.name }), "probe-cell"));
 }
 
 async function probe(name, btn) {
@@ -1942,23 +1998,23 @@ function drawHealth(h) {
     heading(3, titles[2]),
     el("p", { text: "Loops and sessions run on these. A probe checks the device answers and lists its tools; devices.toml in the config folder adds one." }),
     saidLine("devices"),
-    panelParts(h.devices, "The devices", (devices) => table("", [["Device", "c-device"], ["Kind", "c-kind x"], ["Host", "c-ref x"], ["State", "c-status"], ["System", "x"], ["Tools", "x"], ["", "c-probe"]], devices.map(deviceRow), { stack: true })),
+    panelParts(h.devices, "The devices", (devices) => table("", [["Device", "c-device"], ["Kind", "c-kind wide-only"], ["Host", "c-ref wide-only"], ["State", "c-status"], ["System", "wide-only"], ["Tools", "wide-only"], ["", "c-probe"]], devices.map(deviceRow), { stack: true })),
     heading(4, titles[3]),
     panelParts(h.checks, "The heartbeat", (c) => [checksSummary(c),
-      el("div", { class: "actions" }, button(c.running ? "Checks running" : "Run the checks now", "checks-run", runChecks, c.running)),
+      el("div", { class: "actions" }, button(c.running ? "Checks running" : "Run the checks now", "checks-run", runChecks, { disabled: c.running })),
       saidLine("checks"),
       c.checks.length ? fold("health:checks", `Show all ${c.checks.length} checks`, table("", [["Check"], ["State", "c-status"], ["Detail"]],
         c.checks.map((x) => el("tr", {}, cell(x.key), cell(stateChip(x.state)), cell(x.detail || ""))))) : null]),
     heading(5, titles[4]),
     panelParts(h.checks, "The loops", (c) => (c.loops.length
       ? [tally(c.loops.filter((l) => !l.ok).length, count(c.loops.length, "loop", "loops"), " Each one reports on its own runs."),
-        fold("health:loops", `Show all ${c.loops.length} loops`, table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail", "x"]],
+        fold("health:loops", `Show all ${c.loops.length} loops`, table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail", "wide-only"]],
           c.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(liveAgo(l.ts)), cell(l.detail || "")))))]
       : quiet("No loop has reported yet."))),
     heading(6, titles[5]),
     panelParts(h.alerts, "The probes", (a) => (a.probes.length
       ? [tally(a.probes.filter((p) => !p.ok).length, count(a.probes.length, "probe", "probes")),
-        fold("health:probes", `Show all ${a.probes.length} probes`, table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time x"], ["Detail", "x"]],
+        fold("health:probes", `Show all ${a.probes.length} probes`, table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time wide-only"], ["Detail", "wide-only"]],
           a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(liveAgo(p.last_run)), cell(liveAgo(p.last_ok)), cell(p.detail || "")))))]
       : quiet("No probe has run yet."))));
   return h.checks.rows?.running ? LIVE_MS : SLOW_MS;
@@ -2038,7 +2094,7 @@ function drawUsage(u) {
     quiet(u.first ? ["Counted since ", zonedClock(u.first), `, over the last ${u.days} days. A visit is one stay on a view or an open item; time counts only while the tab shows.`]
       : `Nothing was counted in the last ${u.days} days.`),
     heading(1, "Views"),
-    u.views.length ? table("Most visited first", [["View"], ["Visits", "num c-n"], ["Desktop", "num c-n"], ["Phone", "num c-n"], ["Time", "num c-time x"], ["Median stay", "num c-time"]],
+    u.views.length ? table("Most visited first, with the median stay", [["View"], ["Visits", "num c-n"], ["Desktop", "num c-n wide-only"], ["Phone", "num c-n"], ["Time", "num c-duration wide-only"], ["Stay", "num c-duration"]],
       u.views.map((v) => el("tr", {}, cell(viewWords(v.view)), cell(v.visits, "num"), cell(v.desktop, "num"), cell(v.phone, "num"),
         cell(msWords(v.ms), "num"), cell(msWords(v.median_ms), "num"))))
       : quiet("No visit yet."),
@@ -2047,10 +2103,10 @@ function drawUsage(u) {
       u.ways_in.map((w) => el("tr", {}, cell(WAYS_IN[w.via] ?? w.via), cell(w.visits, "num"))))
       : quiet("No visit yet."),
     heading(3, "Actions"),
-    u.actions.length ? table("Buttons and keys you pressed", [["Action"], ["Count", "num c-n"], ["Desktop", "num c-n"], ["Phone", "num c-n"]],
+    u.actions.length ? table("Buttons and keys you pressed", [["Action"], ["Count", "num c-n"], ["Desktop", "num c-n wide-only"], ["Phone", "num c-n"]],
       u.actions.map((a) => el("tr", {}, cell(ACTION_WORDS[a.name] ?? el("code", { text: a.name })), cell(a.count, "num"), cell(a.desktop, "num"), cell(a.phone, "num"))))
       : quiet("No action yet."),
-    quiet("Usage keeps view and button names with counts and times only, never what you type or what a page shows, and drops anything older than 90 days."));
+    quiet(`Usage keeps view and button names with counts and times only, never what you type or what a page shows, and drops anything older than ${u.keep_days} days.`));
   return SLOW_MS;
 }
 
@@ -2156,7 +2212,7 @@ function drawChat(data) {
   chatSeen = seen;
   chatLength = data.messages.length;
   fill("messages", data.messages.length ? data.messages.map((m) => el("div", { class: `msg from-${m.from}` },
-    el("div", { class: "who" }, withFigures([m.from === "you" ? "You" : "Arete", clock(m.ts), data.paid && m.cost ? money(m.cost) : ""].filter(Boolean).join(" · "))),
+    el("div", { class: "who" }, withFigures([m.from === "you" ? "You" : "Arete", clock(m.ts), data.metered && m.cost ? money(m.cost) : ""].filter(Boolean).join(" · "))),
     el("p", {}, withLinks(m.text))))
     : quiet("No messages yet. Ask what is running, why a run failed, or what to change."));
   if (grew) {
@@ -2218,7 +2274,7 @@ function paletteItems() {
     ...views, ...actions,
     ...found.loops.map((l) => ({ kind: "Loop", text: l.name, note: l.description, run: () => go(detailHash("loop", l.name), "palette") })),
     ...found.runs.map((r) => ({ kind: "Run", text: r.ticket || r.id, note: `${r.kind} · ${r.status} · ${r.id}`, run: () => go(detailHash("run", r.id), "palette") })),
-    ...found.sessions.map((s) => ({ kind: "Session", text: firstMessage(s.prompt).slice(0, 90), note: `${s.status} · ${s.id}`, run: () => go(detailHash("session", s.id), "palette") })),
+    ...found.sessions.map((s) => ({ kind: "Session", text: firstMessage(s.prompt, TITLE_CHARS), note: `${s.status} · ${s.id}`, run: () => go(detailHash("session", s.id), "palette") })),
     ...found.tickets.map((t) => ({ kind: "Ticket", text: `${shortRef(t.ref)} ${t.title}`, note: t.standing, run: () => go(detailHash("ticket", t.ref), "palette") })),
   ];
 }
@@ -2305,15 +2361,6 @@ function inField(node) {
   return Boolean(node?.closest?.("input, textarea, select, [contenteditable]"));
 }
 
-function moveRow(delta) {
-  if (route.detail) return step(delta);
-  const links = [...currentSection().querySelectorAll("a[data-row]")].filter((a) => a.checkVisibility());
-  if (!links.length) return;
-  const at = links.indexOf(document.activeElement);
-  const next = links[at < 0 ? (delta > 0 ? 0 : links.length - 1) : Math.max(0, Math.min(links.length - 1, at + delta))];
-  next.focus();
-}
-
 function openKeys() {
   keysReturn = focusMark(document.activeElement);
   document.getElementById("keys").showModal();
@@ -2363,8 +2410,6 @@ function onKey(event) {
       setConsole(open, { focus: open });
     },
     "?": openKeys,
-    j: () => moveRow(1),
-    k: () => moveRow(-1),
   };
   const run = keys[event.key];
   if (!run) return;
@@ -2385,7 +2430,7 @@ function onClick(event) {
   go(row.dataset.href, "link");
 }
 
-/* Loaders: each fetches, then hands back the function that draws and says when to refresh next. */
+/* Loaders */
 
 const LOADERS = {
   live: async () => {
@@ -2435,8 +2480,7 @@ const LOADERS = {
     };
   },
   usage: async (r) => {
-    const days = USAGE_WINDOWS.includes(r.query.days) ? r.query.days : DEFAULT_USAGE_WINDOW;
-    const data = await call(`/api/usage?days=${days}`);
+    const data = await call(`/api/usage?days=${r.query.days || DEFAULT_USAGE_WINDOW}`);
     return () => drawUsage(data);
   },
 };
@@ -2470,11 +2514,7 @@ function wireForms() {
       say("launch-result", "fault", e.message);
     }
   });
-  for (const [fieldId, formId] of [["loop-new-sentence", "loop-new"], ["chat-text", "chat"], ["launch-prompt", "launch"]]) {
-    document.getElementById(fieldId).addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) document.getElementById(formId).requestSubmit();
-    });
-  }
+  for (const id of ["loop-new-sentence", "chat-text", "launch-prompt"]) document.getElementById(id).addEventListener("keydown", submitOnCtrlEnter);
 }
 
 function wireConsole() {
@@ -2525,6 +2565,20 @@ function wireDialogs() {
   keys.addEventListener("close", () => refocus(keysReturn));
 }
 
+function makeNav() {
+  const groups = [...new Set(Object.values(VIEWS).map((meta) => meta.group))];
+  document.querySelector("nav.side").prepend(...groups.map((group) => {
+    const id = `group-${group.toLowerCase()}`;
+    return el("div", { class: "group" },
+      el("div", { class: "group-name kicker", id, text: group }),
+      el("ul", { class: "links", "aria-labelledby": id },
+        Object.entries(VIEWS).filter(([, meta]) => meta.group === group).map(([view, meta]) => el("li", {},
+          el("a", { class: "btn", href: `#${view}`, "data-view": view }, el("span", { text: meta.label }), el("span", { class: "count", id: `count-${view}` }))))));
+  }));
+  document.getElementById("keys-console").before(...Object.values(VIEWS).flatMap((meta) => [
+    el("dt", {}, el("kbd", { text: "G" }), " then ", el("kbd", { text: meta.key.toUpperCase() })), el("dd", { text: meta.label })]));
+}
+
 function makePanes() {
   for (const pane of document.querySelectorAll(".detail")) {
     pane.setAttribute("aria-labelledby", `${pane.id}-title`);
@@ -2553,6 +2607,7 @@ document.addEventListener("visibilitychange", () => {
 
 document.addEventListener("DOMContentLoaded", () => {
   history.scrollRestoration = "manual";
+  makeNav();
   makePanes();
   wireForms();
   wireConsole();
@@ -2564,7 +2619,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("skip").addEventListener("click", () => document.getElementById("main").focus());
   const asked = location.hash.replace(/^#/, "");
   const first = knownRoute(location.hash);
-  history.replaceState({ from: "" }, "", first.hash);
+  history.replaceState({ from: history.state?.from ?? "" }, "", first.hash);
   if (asked === "chat") setConsole(true, { focus: true, track: false });
   else {
     try {

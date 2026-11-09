@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
 READ_ONLY_TOOLS = frozenset({*READ_TOOLS, "LS"})
+SUBSCRIPTION_RUNNER = "claude"
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,10 @@ class Result:
     model: str = ""
     provider: str = ""
     runner: str = ""
+
+    @property
+    def paid_usd(self) -> float:
+        return 0.0 if self.runner == SUBSCRIPTION_RUNNER else self.cost_usd
 
 
 NO_SESSION = Session()

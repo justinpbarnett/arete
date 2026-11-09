@@ -138,9 +138,6 @@ class LoopRun:
         with open(self.log_file, "a") as f:
             f.write(f"{util.iso()} [{self.loop.name}] {text}\n")
 
-    def spent(self) -> float:
-        return record.spent(self.id)
-
     def room(self) -> float | None:
         tightest = tightest_limit(self.loop, self.cfg, record.metered_spent(self.id))
         if not tightest:
@@ -360,7 +357,7 @@ def carry(run: LoopRun) -> str:
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:
-    end_line = f"{status}: {summary} (${run.spent():.2f})"
+    end_line = f"{status}: {summary} ({util.paid_note(record.metered_spent(run.id))})"
     run.write_log(end_line)
     record.settle(run.id, status, end_line=end_line, summary=summary[:500])
     return status

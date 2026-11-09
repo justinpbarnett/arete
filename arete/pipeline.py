@@ -197,6 +197,7 @@ class AgentRun:
     dir: Path
     dry_run: bool = False
     cost: float = 0.0
+    paid: float = 0.0
     add_dirs: list[Path] = field(default_factory=list)
     story: list[str] = field(default_factory=list)
 
@@ -226,6 +227,7 @@ class AgentRun:
             self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
             if util.wait_for_network():
                 self.cost += res.cost_usd
+                self.paid += res.paid_usd
                 self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                 if res.session.id and res.turns > 1 and kw.get("persist", True):
                     res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
@@ -233,6 +235,7 @@ class AgentRun:
                 else:
                     res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
         self.cost += res.cost_usd
+        self.paid += res.paid_usd
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
@@ -946,7 +949,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else f"<details><summary>Plan</summary>\n\n{plan_text[:6000]}\n\n</details>\n\n")
-        + f"Run `{run.id}`, {size}, ${record.spent(run.id):.2f}."
+        + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
     )
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)

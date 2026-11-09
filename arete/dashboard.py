@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -62,10 +63,11 @@ SKIPPED_PATH = "/api/skipped/"
 PROPOSAL_PATH = "/api/proposals/"
 INSTALL_SECONDS = 120
 USAGE_KINDS = ("visit", "action")
-USAGE_TEXT_FIELDS = ("tab", "device", "view", "name", "via")
-USAGE_TEXT_CHARS = 80
+USAGE_DEVICES = ("desktop", "phone")
+USAGE_NEEDS = {"visit": ("view", "via"), "action": ("view", "name")}
+USAGE_NAME = re.compile(r"[a-z]{1,20}(?:-[a-z]{1,20}){0,3}")
+USAGE_TAB = re.compile(r"[0-9a-f]{16}")
 USAGE_MOST_MS = 24 * 60 * 60 * 1000
-KEEP_USAGE_DAYS = 90
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
@@ -219,25 +221,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, method: str, path: str, query: dict):
         if method == "GET":
-            if path == "/api/frame":
-                return board.frame(chat.view())
+            if path == "/api/sidebar":
+                return board.sidebar(chat.view())
             if path == "/api/live":
                 return board.live_board(chat.view()["draft"])
             if path == "/api/runs":
-                return board.runs_board(*(query.get(k, "") for k in ("status", "kind", "repo", "loop")),
-                                        limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
+                return board.runs_board(query, limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
             if path.startswith(RUN_PATH):
                 return board.run_board(unquote(path[len(RUN_PATH):]))
             if path == "/api/health":
                 return board.health_board()
             if path == "/api/triage":
-                return board.triage_view()
+                return board.panel(board.triage_board)
             if path == "/api/outcomes":
                 return board.panel(board.outcomes)
             if path == "/api/find":
                 return board.find()
             if path == "/api/usage":
-                return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))) or 1)
+                return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))))
             if path == "/api/settings":
                 return settings.current()
             if path == "/api/chat":
@@ -256,7 +257,7 @@ class Handler(BaseHTTPRequestHandler):
                 return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
         if method == "POST":
             if path == "/api/usage":
-                state.add_usage(self.usage_row(), KEEP_USAGE_DAYS)
+                state.add_usage(self.usage_row(), board.KEEP_USAGE_DAYS)
                 return {}
             if path == "/api/settings":
                 return settings.save(self.body())
@@ -349,13 +350,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def usage_row(self) -> dict:
         b = self.body()
-        if b.get("kind") not in USAGE_KINDS:
-            raise Refusal(400, f"kind is one of {', '.join(USAGE_KINDS)}.")
+        kind = b.get("kind")
+        if kind not in USAGE_KINDS:
+            raise Refusal(400, f"The kind is one of {', '.join(USAGE_KINDS)}.")
+        if b.get("device") not in USAGE_DEVICES:
+            raise Refusal(400, f"The device is one of {', '.join(USAGE_DEVICES)}.")
+        if not isinstance(b.get("tab"), str) or not USAGE_TAB.fullmatch(b["tab"]):
+            raise Refusal(400, "The tab is the page's mark of 16 hex digits.")
+        names = {k: b.get(k) or "" for k in ("view", "name", "via")}
+        if any(not isinstance(v, str) or (v or k in USAGE_NEEDS[kind]) and not USAGE_NAME.fullmatch(v)
+               for k, v in names.items()):
+            raise Refusal(400, f"The {' and '.join(USAGE_NEEDS[kind])} of each {kind} are lowercase words joined by "
+                               "hyphens, so usage keeps names and never ids or text.")
         ms = b.get("ms", 0)
         if isinstance(ms, bool) or not isinstance(ms, int) or not 0 <= ms <= USAGE_MOST_MS:
-            raise Refusal(400, "ms is a whole number of milliseconds, at most a day.")
-        return {"at": util.iso(), "kind": b["kind"], "ms": ms,
-                **{k: str(b.get(k) or "")[:USAGE_TEXT_CHARS] for k in USAGE_TEXT_FIELDS}}
+            raise Refusal(400, "The time is a whole number of milliseconds, at most a day.")
+        return {"at": util.iso(), "kind": kind, "device": b["device"], "tab": b["tab"], "ms": ms, **names}
 
     def chat_text(self) -> str:
         text = str(self.body().get("text", "")).strip()
@@ -482,8 +492,7 @@ def say(text: str) -> None:
 def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     cfg = config.load()
     port = port or cfg.dashboard_port
-    with state.db():
-        pass
+    state.ensure_schema()
     chat.settle_after_restart()
     logins = Logins()
     waiting_for = ""

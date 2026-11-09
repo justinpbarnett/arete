@@ -304,5 +304,5 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
                 tally[o.status] = tally.get(o.status, 0) + 1
             summary = f"mined {util.count(len(picked), 'merged PR')}: " + ", ".join(f"{n} {s}" for s, n in tally.items())
             record.settle(run_id, "done", summary=summary)
-        print(f"{summary}, ${record.spent(run_id):.2f}")
+        print(f"{summary}, {util.paid_note(record.metered_spent(run_id))}")
         return 1 if "crashed" in tally else 0

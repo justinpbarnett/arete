@@ -103,7 +103,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
     subject = tk.pr_title(fill_template(h.layer.subject, config.RepoLayer.subject, kind="docs(research)", id=t.id,
                                         title=r["title"]), t)
     body = (f"{tk.pr_link(t, whole=True)}\n\n**Summary:** {report['summary']}\n\n"
-            f"Arete researched [{r['ref']}]({r['url']}) for ${report['cost']:.2f} and files the report as `{path}`. "
+            f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
             "When the ticket changes, arete researches it again and pushes the new report here.")
     base = h.base
     wt = make_worktree(h.repo, base, branch, key)
@@ -436,30 +436,30 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     report = str(answer.get("report") or "").strip()
     if not report:
         why = util.first_line(res.error or "the agent gave no report")
-        state.research_set(ref, status=FAILED, error=why, cost=res.cost_usd)
+        state.research_set(ref, status=FAILED, error=why, cost=res.paid_usd)
         move(cfg, r, "failed")
         return FAILED, why
     summary = " ".join(str(answer.get("summary") or "").split())
     if not h:
         report_file(ref).write_text(f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} for "
-                                    f"${res.cost_usd:.2f}.\n\n**Summary:** {summary}\n\n{report}\n")
-        state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=res.cost_usd,
+                                    f"({util.paid_note(res.paid_usd)}).\n\n**Summary:** {summary}\n\n{report}\n")
+        state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=res.paid_usd,
                            ticket=said, basis=basis, filed_path="", filed_url="")
         settle_status(cfg, r)
-        return DONE, f"report written to {paths.short_path(report_file(ref))} (${res.cost_usd:.2f})"
+        return DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(res.paid_usd)})"
     titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
     try:
         filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
     except RuntimeError as e:
-        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.cost_usd)
+        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.paid_usd)
         move(cfg, r, "failed")
         return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
     report_file(ref).write_text(f"{titled.rstrip()}\n")
     state.research_set(ref, status=DONE, summary=summary, report=TITLE_LINE.sub("", titled, count=1), error="",
-                       cost=res.cost_usd, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
+                       cost=res.paid_usd, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
     ok, why = file_in_home(cfg, h, r)
     settle_status(cfg, r)
-    return DONE if ok else FAILED, f"{why} (${res.cost_usd:.2f})"
+    return DONE if ok else FAILED, f"{why} ({util.paid_note(res.paid_usd)})"
 
 
 def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 from . import config, control, emits, gh, loops, paths, pipeline, sessions, state, tracker, triage, util
+from .agent import SUBSCRIPTION_RUNNER
 
 RECENT_RUNS = 25
 TREND_DAYS = 30
@@ -22,6 +23,7 @@ MOST_RUNS_SHOWN = 500
 RUNS_TO_FIND = 40
 SESSIONS_TO_FIND = 30
 USAGE_DAYS = 30
+KEEP_USAGE_DAYS = 90
 LANDED = ("landed", "replaced", "approved")
 
 
@@ -41,7 +43,7 @@ def snapshot(recent_runs: int = RECENT_RUNS) -> dict:
         "live": panel(lambda: live(running())),
         "skipped": panel(lambda: skipped(running())),
         "waiting": panel(waiting),
-        "recent": panel(lambda: [recent(r) for r in state.runs(limit=recent_runs, connect=state.reader)]),
+        "recent": panel(lambda: run_rows(state.runs(limit=recent_runs, connect=state.reader))),
         "checks": panel(checks),
         "alerts": panel(alerts),
         "triage": panel(triage_board),
@@ -92,7 +94,7 @@ def live(running: list[dict]) -> dict:
             "started": r["started"], "seconds": seconds_between(r["started"], None),
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
             "slot": slot_note(r, in_slots, waiting_for_slot),
-            "paid": round(paid.get(r["id"], 0), 4), "stopping": bool(r["stop_asked"]),
+            "paid": paid.get(r["id"], 0), "stopping": bool(r["stop_asked"]),
         })
     return {"runs": rows, "slots": len(in_slots), "waiting": len(waiting_for_slot),
             "max_parallel": config.load().max_parallel}
@@ -118,15 +120,6 @@ def waiting() -> dict:
         "tickets": [{"ticket": tracker.run_ticket_name(w), "comments": w["n"], "at_once": bool(w["at_once"]),
                      "submitted": w["submitted"], "last": w["last"]} for w in state.feedback_waiting(connect=state.reader)],
         "quiet_minutes": pipeline.FEEDBACK_QUIET_MINUTES,
-    }
-
-
-def recent(r: dict) -> dict:
-    return {
-        "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"], "started": r["started"],
-        "seconds": seconds_between(r["started"], r["finished"]),
-        "cost": round(r["cost_usd"] or 0, 2),
-        "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
     }
 
 
@@ -202,12 +195,12 @@ def run_log(run_id: str) -> list[str]:
     return log_lines(state.run_get(run_id, connect=state.reader) or {"id": run_id})[-LOG_TAIL_LINES:]
 
 
-def frame(talk: dict) -> dict:
+def sidebar(talk: dict) -> dict:
     running = state.runs_marked_running(connect=state.reader)
     board = functools.cache(lambda: triage.view(connect=state.reader))
     beat = control.serve_beat()
     asks = needs_you(running, board, talk["draft"])
-    with_questions = panel(lambda: [r for r in triage.groups(board())[triage.WITH_QUESTIONS] if not r.get("closed")])
+    with_questions = panel(lambda: triage.groups(board())[triage.WITH_QUESTIONS])
     return {"now": util.iso(), "needs_you": needs_you_count(asks), "running": len(running),
             "questions": len(with_questions.get("rows", [])), "health": health_word(beat, checks_and_alerts()),
             "serve": beat, "chat": {"busy": talk["busy"], "draft": bool(talk["draft"])}}
@@ -258,21 +251,23 @@ def health_board() -> dict:
             "devices": panel(control.fleet)}
 
 
-def runs_board(status: str = "", kind: str = "", repo: str = "", loop: str = "", limit: int = RECENT_RUNS) -> dict:
+def runs_board(filters: dict[str, str], limit: int = RECENT_RUNS) -> dict:
+    status = filters.get("status", "")
     if status and status not in STATUSES_OF_FILTER:
         raise UnknownFilter(f"Runs filter by {', '.join(STATUSES_OF_FILTER)}, not '{status}'.")
     limit = max(1, min(limit, MOST_RUNS_SHOWN))
-    rows = state.runs_page(STATUSES_OF_FILTER.get(status, ()), kind, repo, loop, limit + 1, connect=state.reader)
-    paid = state.paid_by_run([r["id"] for r in rows], connect=state.reader)
-    return {"now": util.iso(), "runs": [run_row(r, paid) for r in rows[:limit]], "more": len(rows) > limit,
+    rows = state.runs(kind=filters.get("kind"), repo=filters.get("repo"), loop=filters.get("loop"),
+                      statuses=STATUSES_OF_FILTER.get(status, ()), running_first=True, limit=limit + 1, connect=state.reader)
+    return {"now": util.iso(), "runs": run_rows(rows[:limit]), "more": len(rows) > limit,
             "facets": state.run_facets(state.reader)}
 
 
-def run_row(r: dict, paid: dict[str, float]) -> dict:
-    return {"id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"], "started": r["started"],
-            "finished": r["finished"], "seconds": seconds_between(r["started"], r["finished"]),
-            "paid": round(paid.get(r["id"], 0), 4), "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
-            "loop": r.get("loop") or "", "repo": r["repo"] or ""}
+def run_rows(rows: list[dict]) -> list[dict]:
+    paid = state.paid_by_run([r["id"] for r in rows], connect=state.reader)
+    return [{"id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"], "started": r["started"],
+             "finished": r["finished"], "seconds": seconds_between(r["started"], r["finished"]),
+             "paid": paid.get(r["id"], 0), "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
+             "loop": r.get("loop") or "", "repo": r["repo"] or ""} for r in rows]
 
 
 def run_board(run_id: str) -> dict:
@@ -284,25 +279,21 @@ def run_board(run_id: str) -> dict:
     models: dict[tuple[str, str], dict] = {}
     for s in state.steps(run_id, connect=state.reader):
         key = (s["model"] or "no model", s["runner"] or "no runner")
-        row = models.setdefault(key, {"model": key[0], "runner": key[1], "paid": s["runner"] != "claude", "steps": 0,
-                                      "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
+        row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": s["runner"] != SUBSCRIPTION_RUNNER,
+                                      "steps": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
         row["steps"] += 1
         row["tokens_in"] += s["tokens_in"] or 0
         row["tokens_out"] += s["tokens_out"] or 0
         row["cost_usd"] += s["cost_usd"] or 0
     spec = util.read_json(sessions.spec_file(run_id), {}) if r["kind"] == "session" else {}
     return {"now": util.iso(),
-            "run": {**r, "ticket": ticket(r), "paid": round(state.paid_by_run([run_id], state.reader).get(run_id, 0), 4)},
+            "run": {**r, "ticket": ticket(r), "paid": state.paid_by_run([run_id], state.reader).get(run_id, 0)},
             "models": sorted(({**m, "cost_usd": round(m["cost_usd"], 4)} for m in models.values()),
                              key=lambda m: (-m["cost_usd"], m["model"])),
             "approvals": [a for a in emits.waiting(connect=state.reader) if a["run_id"] == run_id],
             "lines_from": "feed" if r["kind"] in FEED_KINDS else "log",
             "session": {"prompt": spec.get("prompt", ""), "tools": spec.get("tools", []),
                         "cwd": paths.short_path(spec.get("cwd", "")), "repo": spec.get("repo", "")} if spec else None}
-
-
-def triage_view() -> dict:
-    return panel(triage_board)
 
 
 def find() -> dict:
@@ -320,9 +311,7 @@ def find() -> dict:
 
 def outcomes() -> dict:
     figures = trend_figures()
-    paid = control.costs(TREND_DAYS, connect=state.reader, paid_only=True)
-    return {**figures, "decisions": decisions(figures["since"]),
-            **{group: paid[group] for group in ("by_model", "by_runner", "by_loop")}}
+    return {**figures, "decisions": decisions(figures["since"])}
 
 
 def decisions(since: str) -> dict:
@@ -341,6 +330,7 @@ def push_decision(v: dict) -> str:
 
 
 def usage_board(days: int = USAGE_DAYS) -> dict:
+    days = max(1, min(days, KEEP_USAGE_DAYS))
     rows = state.usage_since(util.iso(util.now() - timedelta(days=days)), connect=state.reader)
     visits = whole_visits([r for r in rows if r["kind"] == "visit"])
     by_view: dict[str, list[dict]] = defaultdict(list)
@@ -351,7 +341,7 @@ def usage_board(days: int = USAGE_DAYS) -> dict:
         if r["kind"] == "action":
             actions[r["name"]][r["device"]] += 1
     return {
-        "now": util.iso(), "days": days, "first": rows[0]["at"] if rows else "",
+        "now": util.iso(), "days": days, "keep_days": KEEP_USAGE_DAYS, "first": rows[0]["at"] if rows else "",
         "views": sorted(({"view": name, "visits": len(vs), "desktop": sum(v["device"] == "desktop" for v in vs),
                           "phone": sum(v["device"] == "phone" for v in vs), "ms": sum(v["ms"] for v in vs),
                           "median_ms": int(statistics.median(v["ms"] for v in vs))}
@@ -390,10 +380,9 @@ def trend_figures() -> dict:
     runs = state.runs_since(since, connect=state.reader)
     evals = state.evals_since(since, connect=state.reader)
 
-    by_day = {d: {"day": d, "paid": 0.0, "shipped": 0, "failed": 0, "other": 0} for d in days}
-    for s in state.steps_since(since, connect=state.reader, paid_only=True):
-        if day := by_day.get(local_day(s["ts"])):
-            day["paid"] += s["cost_usd"] or 0
+    spend = control.paid_since(since, state.reader)
+    paid_on = {d["name"]: d["cost_usd"] for d in spend["by_day"]}
+    by_day = {d: {"day": d, "paid": paid_on.get(d, 0.0), "shipped": 0, "failed": 0, "other": 0} for d in days}
     by_repo: dict[str, list[dict]] = defaultdict(list)
     for r in runs:
         if r["kind"] != "pipeline" or r["status"] == "running":
@@ -408,10 +397,11 @@ def trend_figures() -> dict:
         eval_repos[e["repo"]].append(e)
     return {
         "since": since,
-        "days": [{**d, "paid": round(d["paid"], 4)} for d in by_day.values()],
+        "days": list(by_day.values()),
         "repos": [repo_trend(name, rows, paid) for name, rows in sorted(by_repo.items())],
         "evals": [eval_trend(name, rows) for name, rows in sorted(eval_repos.items())],
-        "total_paid": round(sum(d["paid"] for d in by_day.values()), 4),
+        "total_paid": spend["total_usd"],
+        **{group: spend[group] for group in ("by_model", "by_runner", "by_loop")},
     }
 
 

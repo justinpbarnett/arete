@@ -38,7 +38,7 @@ def history() -> dict:
 def view() -> dict:
     h = history()
     return {"messages": h["messages"], "busy": h["busy"], "draft": h["draft"],
-            "paid": runner.metered(config.load().model("chat"), h.get("runner", ""))}
+            "metered": runner.metered(config.load().model("chat"), h.get("runner", ""))}
 
 
 def message(sender: str, text: str, cost: float = 0.0) -> dict:

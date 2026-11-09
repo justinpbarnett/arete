@@ -131,9 +131,11 @@ def print_alerts(a: dict) -> None:
 
 
 def print_recent(runs: list[dict]) -> None:
+    from . import util
+
     if runs:
         print("recent runs:")
-        print_table([(r["id"], r["kind"], r["ticket"], r["status"], f"${r['cost']:.2f}", r["pr_url"] or r["summary"])
+        print_table([(r["id"], r["kind"], r["ticket"], r["status"], util.money(r["paid"]), r["pr_url"] or r["summary"])
                      for r in runs], 200)
 
 
@@ -177,10 +179,12 @@ def print_triage(t: dict) -> None:
 
 
 def print_live(live: dict) -> None:
+    from . import util
+
     print(f"runs live: {len(live['runs'])}, in {live['slots']} of {live['max_parallel']} run slots"
           + (f", {live['waiting']} waiting for one" if live["waiting"] else ""))
     if live["runs"]:
-        print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", f"${r['cost']:.2f}",
+        print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", util.money(r["paid"]),
                       r["slot"] or r["step"]) for r in live["runs"]], 200)
 
 
@@ -399,6 +403,8 @@ def serve_line(beat: dict) -> str:
 
 
 def loop_line(v: dict) -> str:
+    from . import util
+
     switch = "BROKEN" if v["error"] else ("on" if v["enabled"] else "off")
     last = v["last"] or {}
     what = (f"running {v['running']}" if v["running"] else
@@ -406,7 +412,7 @@ def loop_line(v: dict) -> str:
             else "never ran")
     due = f"next {when(v['next_due'])}" if v.get("next_due") else ""
     return (f"{v['name']:<22} {switch:<6} {v['kind']:<7} {v['trigger']:<22} {what:<26} {due:<17}"
-            f" ${v['spent_24h']:.2f}/24h" + (f"\n    {v['error']}" if v["error"] else ""))
+            f" {util.money(v['spent_24h'])}/24h" + (f"\n    {v['error']}" if v["error"] else ""))
 
 
 def print_feed_line(line: dict) -> None:
@@ -484,7 +490,7 @@ def cmd_loop(args) -> int:
         if args.action == "new":
             made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
                                   run_id=args.run_id)
-            print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, ${made['cost_usd']:.2f})\n")
+            print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
             print(made["loop_toml"])
             if made["note"]:
                 print(f"note: {made['note']}")
@@ -547,7 +553,7 @@ def cmd_loop(args) -> int:
             if d["state"]:
                 print(f"  memory: {json.dumps(d['state'])[:300]}")
             for r in d["runs"][:8]:
-                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} ${r['cost_usd'] or 0:.2f} "
+                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} {util.money(r['paid'])} "
                       f"{util.first_line(r['summary'] or '', 90)}")
             for f in d["findings"][:8]:
                 print(f"  finding {f['title'][:90]} {f['url'] or ''}")
@@ -592,7 +598,7 @@ def cmd_session(args) -> int:
     import select
     import threading
 
-    from . import control, sessions, state
+    from . import control, sessions, state, util
 
     try:
         if args.action == "start":
@@ -637,7 +643,7 @@ def cmd_session(args) -> int:
             return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
         for s in sessions.views():
             print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
-                  f"{s['device'] or '':<10} ${s['cost_usd'] or 0:.2f}  {s['prompt'][:70]}")
+                  f"{s['device'] or '':<10} {util.money(s['paid'])}  {s['prompt'][:70]}")
         if not state.runs(kind="session", limit=1):
             print("no sessions yet; `arete session start \"what to do\"`")
         return 0
@@ -686,13 +692,13 @@ def cmd_webhook(args) -> int:
 
 
 def cmd_costs(args) -> int:
-    from . import control
+    from . import control, util
 
     try:
         c = control.costs(args.days)
     except control.Refused as e:
         return refused(e)
-    print(f"${c['total_usd']:.2f} in the last {c['days']:g} days")
+    print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; claude CLI steps ride the subscription and count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
         for row in c[f"by_{group}"][:12]:
@@ -846,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.set_defaults(fn=cmd_webhook)
 
-    p = sub.add_parser("costs", help="model spend by model, runner and loop")
+    p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop")
     p.add_argument("--days", type=float, default=None)
     p.set_defaults(fn=cmd_costs)
 
