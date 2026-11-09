@@ -40,12 +40,26 @@ def skill_files(cfg: config.Config) -> list[Path]:
     for root in roots:
         if not root.is_dir():
             continue
-        for f in sorted(root.rglob("SKILL.md")):
+        for f in sorted(_skill_md_under(root)):
             real = f.resolve()
             if real not in seen and not {"node_modules", "synced"} & set(f.parts) and "retired" not in str(f):
                 seen.add(real)
                 out.append(f)
     return out
+
+
+def _skill_md_under(root: Path) -> list[Path]:
+    found, walked = [], set()
+    for folder, dirs, files in root.walk(follow_symlinks=True):
+        real = folder.resolve()
+        if real in walked:
+            dirs.clear()
+            continue
+        walked.add(real)
+        dirs.sort()
+        if "SKILL.md" in files:
+            found.append(folder / "SKILL.md")
+    return found
 
 
 def frontmatter(text: str) -> dict | None:
