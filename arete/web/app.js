@@ -290,6 +290,7 @@ function markDone(id, what, btn) {
 
 async function showLog(id) {
   openLog = id;
+  document.getElementById("log-lines").textContent = "";
   await refreshLog();
   document.getElementById("log").scrollIntoView({ block: "nearest" });
 }
