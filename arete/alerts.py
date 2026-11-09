@@ -8,7 +8,8 @@ from . import gh, state, util
 LABEL = "arete-alert"
 NOTIFY_SCRIPT = ("-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
                  "-e", "end run")
-SECRETISH = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
+SECRETISH = re.compile(r"((?:(?<![A-Za-z])|(?=sk-[a-z-]*[A-Z0-9_]))sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}"
+                       r"|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
 
 
 def redact(text: str) -> str:
