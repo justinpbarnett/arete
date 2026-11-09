@@ -38,7 +38,7 @@ def next_due(loop: Loop, after: datetime) -> str:
     t = loop.trigger
     if t.every:
         return util.iso(after + timedelta(seconds=t.every))
-    return util.iso(t.cron.next_after(after.astimezone()).astimezone(after.tzinfo)) if t.cron else ""
+    return util.iso(t.cron.next_fire(after).astimezone(after.tzinfo)) if t.cron else ""
 
 
 def code_stamp() -> frozenset:
@@ -69,7 +69,7 @@ def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     last = util.parse_iso(last_fire)
     if loop.trigger.every:
         return (now - last).total_seconds() >= loop.trigger.every
-    return loop.trigger.cron.next_after(last.astimezone()) <= now.astimezone()
+    return loop.trigger.cron.next_fire(last) <= now.astimezone()
 
 
 class Server:

@@ -48,6 +48,11 @@ class Cron:
                 return t
         raise BadSchedule(f"cron '{self.text}' never fires")
 
+    def next_fire(self, after: datetime) -> datetime:
+        wall = self.next_after(after.astimezone().replace(tzinfo=None))
+        earlier = wall.astimezone()
+        return earlier if earlier > after else wall.replace(fold=1).astimezone()
+
 
 def field_values(spec: str, name: str, low: int, high: int) -> set[int]:
     out: set[int] = set()
