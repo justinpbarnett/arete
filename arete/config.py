@@ -59,6 +59,7 @@ class JiraConfig:
     auto: bool = False
     auto_per_refresh: int = 3
     sprint_only: bool = True
+    skip_types: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -199,6 +200,7 @@ def load(path: Path | None = None) -> Config:
         auto=bool(j.get("auto", False)),
         auto_per_refresh=max(0, int(j.get("auto_per_refresh", JiraConfig.auto_per_refresh))),
         sprint_only=bool(j.get("sprint_only", JiraConfig.sprint_only)),
+        skip_types=[str(t) for t in j.get("skip_types") or [] if str(t).strip()],
     )
     jv = data.get("jev", {})
     cfg.jev = JevConfig(
