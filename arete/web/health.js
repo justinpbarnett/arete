@@ -1,11 +1,19 @@
 "use strict";
 
+function countStates(states) {
+  return { faults: states.filter((s) => s === "fault").length, cautions: states.filter((s) => s === "caution").length };
+}
+
+function showAll(n, one, many) {
+  return n === 1 ? `Show the ${one}` : `Show all ${n} ${many}`;
+}
+
 function checksSummary(h) {
   if (!h.heartbeat) return el("p", {}, stateChip("caution"), " The heartbeat has not run yet, so no check has a result.");
-  const failing = h.checks.filter((c) => !c.ok).length;
-  const state = !failing ? "ok" : h.checks.some((c) => c.state === "fault") ? "fault" : "caution";
-  return el("p", {}, stateChip(state), " ",
-    `${h.checks.length} checks, ${failing} failing. The last heartbeat came `, liveAgo(h.heartbeat), ` (${clock(h.heartbeat)}).`);
+  const { faults, cautions } = countStates(h.checks.map((c) => c.state));
+  const warnings = cautions ? `, ${cautions} with a warning` : "";
+  return el("p", {}, stateChip(faults ? "fault" : cautions ? "caution" : "ok"), " ",
+    `${h.checks.length} checks, ${faults} failing${warnings}. The last heartbeat came `, liveAgo(h.heartbeat), ` (${clock(h.heartbeat)}).`);
 }
 
 function runChecks(btn) {
@@ -44,7 +52,7 @@ async function probe(name, btn) {
 
 function failures(h) {
   const rows = [];
-  const add = (state, what, name, detail) => rows.push(el("tr", {}, cell(stateChip(state)), cell([el("span", { class: "muted", text: `${what} ` }), name]), cell(detail || "", "muted-cell")));
+  const add = (state, what, name, detail) => rows.push({ state, row: el("tr", {}, cell(stateChip(state)), cell([el("span", { class: "muted", text: `${what} ` }), name]), cell(detail || "", "muted-cell")) });
   for (const a of h.alerts.rows?.alerts ?? []) add("fault", "Alert", a.key, [`opened ${clock(a.opened)}, last seen `, liveAgo(a.last_seen), a.url ? [" · ", link(a.url, `#${a.issue}`)] : null]);
   for (const c of h.checks.rows?.checks ?? []) if (c.state !== "ok") add(c.state, "Check", c.key, c.detail);
   for (const p of h.alerts.rows?.probes ?? []) if (!p.ok) add("fault", "Probe", p.name, p.detail);
@@ -52,13 +60,15 @@ function failures(h) {
   for (const [name, why] of Object.entries(h.serve.broken || {})) add("fault", "Loop file", name, why);
   for (const [source, error] of Object.entries(h.serve.poll_errors || {})) add("caution", "Source", source, error);
   for (const d of h.devices.rows ?? []) if (d.probe && !d.probe.ok) add("fault", "Device", d.name, probeWords(d.probe));
-  return rows;
+  return rows.sort((a, b) => (a.state === "fault" ? 0 : 1) - (b.state === "fault" ? 0 : 1));
 }
 
-function healthSummary(h, rows) {
+function healthSummary(h, failed) {
   const unread = [h.checks, h.alerts, h.devices].filter((p) => !("rows" in p)).length;
   const serveDown = !h.serve.at ? "serve has never run" : !h.serve.alive ? "serve is down" : "";
-  const parts = [serveDown, rows.length ? `${count(rows.length, "thing fails", "things fail")}` : "", unread ? `${count(unread, "part", "parts")} could not be read` : ""].filter(Boolean);
+  const { faults, cautions } = countStates(failed.map((f) => f.state));
+  const parts = [serveDown, faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",
+    unread ? `${count(unread, "part", "parts")} could not be read` : ""].filter(Boolean);
   return el("p", { class: "summary" }, stateChip(h.state), parts.length ? ` ${parts.join(", ")}.`.replace(/^ ./, (s) => s.toUpperCase()) : " Every alert, check, probe, device and loop answers.");
 }
 
@@ -74,7 +84,7 @@ function drawHealth(h) {
     healthSummary(h, failed),
     jumps(titles),
     heading(1, titles[0]),
-    failed.length ? table("Worst first", [["State", "c-status"], ["What"], ["Detail"]], failed, { stack: true })
+    failed.length ? table("Worst first", [["State", "c-status"], ["What"], ["Detail"]], failed.map((f) => f.row), { stack: true })
       : el("p", {}, stateChip("ok"), " No alert is open and nothing fails."),
     heading(2, titles[1]),
     serveLine(s),
@@ -88,18 +98,18 @@ function drawHealth(h) {
     panelParts(h.checks, "The heartbeat", (c) => [checksSummary(c),
       el("div", { class: "actions" }, button(c.running ? "Checks running" : "Run the checks now", "checks-run", runChecks, { disabled: c.running })),
       saidLine("checks"),
-      c.checks.length ? fold("health:checks", `Show all ${c.checks.length} checks`, table("", [["Check"], ["State", "c-status"], ["Detail"]],
+      c.checks.length ? fold("health:checks", showAll(c.checks.length, "check", "checks"), table("", [["Check"], ["State", "c-status"], ["Detail"]],
         c.checks.map((x) => el("tr", {}, cell(x.key), cell(stateChip(x.state)), cell(x.detail || ""))))) : null]),
     heading(5, titles[4]),
     panelParts(h.checks, "The loops", (c) => (c.loops.length
       ? [tally(c.loops.filter((l) => !l.ok).length, count(c.loops.length, "loop", "loops"), " Each one reports on its own runs."),
-        fold("health:loops", `Show all ${c.loops.length} loops`, table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail", "wide-only"]],
+        fold("health:loops", showAll(c.loops.length, "loop", "loops"), table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail", "wide-only"]],
           c.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(liveAgo(l.ts)), cell(l.detail || "")))))]
       : quiet("No loop has reported yet."))),
     heading(6, titles[5]),
     panelParts(h.alerts, "The probes", (a) => (a.probes.length
       ? [tally(a.probes.filter((p) => !p.ok).length, count(a.probes.length, "probe", "probes")),
-        fold("health:probes", `Show all ${a.probes.length} probes`, table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time wide-only"], ["Detail", "wide-only"]],
+        fold("health:probes", showAll(a.probes.length, "probe", "probes"), table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time wide-only"], ["Detail", "wide-only"]],
           a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(liveAgo(p.last_run)), cell(liveAgo(p.last_ok)), cell(p.detail || "")))))]
       : quiet("No probe has run yet."))));
   return h.checks.rows?.running ? LIVE_MS : SLOW_MS;
