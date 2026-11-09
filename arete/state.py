@@ -308,7 +308,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
                   ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
-                  ("stop_asked", "TEXT"))]]
+                  ("stop_asked", "TEXT"), ("moved", "TEXT"))]]
 
 
 @contextmanager
