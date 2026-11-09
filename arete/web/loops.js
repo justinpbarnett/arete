@@ -165,7 +165,7 @@ function drawLoopDetail(result) {
   const place = `detail:loop:${name}`;
   if (result.error) {
     fill("loops-detail-head", detailHead("loops-detail", "loop", name, name));
-    fill("loops-detail-body", fault(`The loop could not be read: ${result.error}`));
+    fill("loops-detail-body", unreadFault("The loop", result));
     return SLOW_MS;
   }
   const d = result.value;

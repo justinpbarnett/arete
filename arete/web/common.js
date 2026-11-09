@@ -233,8 +233,9 @@ async function call(path, body) {
   return data;
 }
 
-function unreadFault(what, panel) {
-  return fault(`${what} could not be read: ${panel?.error || "no answer"}.`);
+function unreadFault(what, failed) {
+  const why = failed?.error || "no answer";
+  return fault(`${what} could not be read: ${why}${why.endsWith(".") ? "" : "."}`);
 }
 
 function panelParts(panel, what, draw) {

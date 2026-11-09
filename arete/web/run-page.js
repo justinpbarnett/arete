@@ -42,7 +42,7 @@ function drawRunDetail(pane, result, kind) {
   const place = `detail:${kind}:${id}`;
   if (result.error) {
     fill(`${pane}-head`, detailHead(pane, kind, id, id));
-    fill(`${pane}-body`, fault(`This ${kind} could not be read: ${result.error}`));
+    fill(`${pane}-body`, unreadFault(`This ${kind}`, result));
     fill(`${pane}-talk`);
     return SLOW_MS;
   }
