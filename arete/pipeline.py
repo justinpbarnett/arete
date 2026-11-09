@@ -183,7 +183,7 @@ def slug(text: str, n: int = 40) -> str:
 def fill_template(template: str, default: str, **values) -> str:
     try:
         return template.format(**values)
-    except (KeyError, IndexError, ValueError):
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError):
         return default.format(**values)
 
 
