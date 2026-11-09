@@ -80,6 +80,7 @@ def claim_path(h: Home, name: str, title: str) -> str:
     base = h.base
     util.git(["fetch", "-q", "origin", base], h.repo.path)
     taken = set(util.git(["ls-tree", "--name-only", f"origin/{base}", f"{h.folder}/"], h.repo.path).split())
+    taken |= {report["filed_path"] for report in state.research_rows()}
     stem = slug(name or title, 60)
     return next(path for n in range(1, 100)
                 if (path := f"{h.folder}/{stem if n == 1 else f'{stem}-{n}'}.md") not in taken)
