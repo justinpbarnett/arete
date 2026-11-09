@@ -1044,7 +1044,7 @@ function drawLoopDetail(d) {
     el("h3", { text: "Sources" }), loopSources(d),
     d.metrics.length ? [el("h3", { text: "Metrics" }),
       table("The last 30 days", [["Metric"], ["Latest", "num c-cost"], ["When", "c-time"], ["Points", "num c-n"]],
-        d.metrics.map((m) => el("tr", {}, cell(m.name), cell(Number(m.value).toLocaleString(), "num"), cell(clock(m.ts), "nb"), cell(m.points, "num"))))] : null,
+        d.metrics.map((m) => el("tr", {}, cell(m.name), cell(Number(m.value).toLocaleString(undefined, { maximumFractionDigits: 20 }), "num"), cell(clock(m.ts), "nb"), cell(m.points, "num"))))] : null,
     d.emits.some((e) => e.startsWith("digest")) ? [el("h3", { text: "Digests" }), loopDigests(d)] : null,
     el("h3", { text: "Memory" }),
     memory ? fold(`memory:${d.name}`, "Show what it keeps between runs", el("pre", { class: "fold-text", text: memory })) : quiet("It keeps nothing between runs yet."),
