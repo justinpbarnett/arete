@@ -8,7 +8,7 @@ import re
 import shlex
 
 from . import config, cron, gh, jira, paths, state, util
-from .loops import Loop, as_list, blank
+from .loops import Loop, as_list, blank, github_remote
 
 DEFAULT_EVERY = 300
 GITHUB_WATCH = ("ci_red", "issue", "advisory")
@@ -55,6 +55,8 @@ def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
 
 
 def github_name(cfg: config.Config, name: str) -> str:
+    if (path := paths.expand(name)).is_absolute():
+        return github_remote(path)
     if "/" in name:
         return name
     return cfg.repo(name).github
@@ -84,7 +86,7 @@ def repo_problems(cfg: config.Config, names: list, what: str) -> list[str]:
     for name in names:
         try:
             if not github_name(cfg, str(name)):
-                problems.append(f"{what} repo '{name}' has no github in the config")
+                problems.append(f"{what} repo '{name}' has no github in the config or GitHub remote")
         except config.UnknownRepo:
             problems.append(f"{what} repo '{name}' is not a repo in the config or owner/name")
     return problems

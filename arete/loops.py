@@ -140,8 +140,7 @@ class Loop:
             if r.name == self.repo:
                 return r
         path = paths.expand(self.repo)
-        m = GITHUB_REMOTE.search(util.git(["remote", "get-url", "origin"], path, check=False).strip())
-        return config.Repo(name=self.repo, path=path, github=m.group(1) if m else "")
+        return config.Repo(name=self.repo, path=path, github=github_remote(path))
 
     def view(self) -> dict:
         return {"name": self.name, "origin": self.origin, "kind": self.kind, "description": self.description,
@@ -206,6 +205,11 @@ def worktree_kinds() -> list[str]:
 
 def blank(value) -> bool:
     return not (value.strip() if isinstance(value, str) else value)
+
+
+def github_remote(path: Path) -> str:
+    m = GITHUB_REMOTE.search(util.git(["remote", "get-url", "origin"], path, check=False).strip())
+    return m.group(1) if m else ""
 
 
 class LoopError(ValueError):
