@@ -57,6 +57,7 @@ class Client:
         self.base = base_url.rstrip("/")
         self._auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
         self._me: dict | None = None
+        self._statuses: dict[str, set[str]] = {}
 
     @classmethod
     def from_env(cls, env_file: Path | None) -> Client:
@@ -135,8 +136,10 @@ class Client:
         return self.get(f"/rest/api/2/issue/{_path_segment(key)}", fields=",".join(fields)) or {}
 
     def statuses(self, project: str) -> set[str]:
-        types = self.get(f"/rest/api/3/project/{_path_segment(project)}/statuses") or []
-        return {st.get("name", "") for t in types for st in t.get("statuses") or []}
+        if project not in self._statuses:
+            types = self.get(f"/rest/api/3/project/{_path_segment(project)}/statuses") or []
+            self._statuses[project] = {st.get("name", "") for t in types for st in t.get("statuses") or []}
+        return self._statuses[project]
 
     def changelog(self, key: str) -> list[dict]:
         return self._paged(f"/rest/api/2/issue/{_path_segment(key)}/changelog")
@@ -152,14 +155,16 @@ class Client:
         if ops:
             self.request("PUT", f"/rest/api/2/issue/{_path_segment(key)}", body={"update": {"labels": ops}})
 
-    def transition(self, key: str, name: str) -> bool:
+    def transition(self, key: str, name: str, by_name: bool = True) -> bool:
         want = name.strip().lower()
-        res = self.get(f"/rest/api/2/issue/{_path_segment(key)}/transitions") or {}
-        for t in res.get("transitions", []):
-            if want in (t.get("name", "").lower(), ((t.get("to") or {}).get("name") or "").lower()):
-                self.request("POST", f"/rest/api/2/issue/{_path_segment(key)}/transitions", body={"transition": {"id": t["id"]}})
-                return True
-        return False
+        found = (self.get(f"/rest/api/2/issue/{_path_segment(key)}/transitions") or {}).get("transitions", [])
+        pick = next((t for t in found if ((t.get("to") or {}).get("name") or "").lower() == want), None)
+        if pick is None and by_name:
+            pick = next((t for t in found if t.get("name", "").lower() == want), None)
+        if pick is None:
+            return False
+        self.request("POST", f"/rest/api/2/issue/{_path_segment(key)}/transitions", body={"transition": {"id": pick["id"]}})
+        return True
 
 
 def _path_segment(key: str) -> str:

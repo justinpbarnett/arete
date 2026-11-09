@@ -320,12 +320,18 @@ class JiraTracker:
         done = ((f.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
         if status.lower() == target.lower() or keep_done and done:
             return Moved(before=f.get("updated") or "")
-        if not self.client.transition(tid, target):
+        if not self.client.transition(tid, target, by_name=not self.is_status(tid, target)):
             return Moved(f"{tid} has no transition to '{target}' from '{status}'")
         after = ""
         if stamps:
             after = (self.client.issue(tid, ["updated"]).get("fields") or {}).get("updated") or ""
         return Moved(before=f.get("updated") or "", after=after, moved=True)
+
+    def is_status(self, tid: str, name: str) -> bool:
+        try:
+            return name.lower() in {s.lower() for s in self.client.statuses(tid.rsplit("-", 1)[0])}
+        except jira.JiraError:
+            return False
 
     def pr_title(self, subject: str, t: Ticket) -> str:
         return with_ref(subject, t.ref)

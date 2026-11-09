@@ -104,6 +104,10 @@ class TicketText:
         return len(WORDS.findall(MARKUP.sub(" ", self.body))) < THIN_WORDS
 
 
+def jql_list(names: list[str]) -> str:
+    return ", ".join('"' + n.replace("\\", "\\\\").replace('"', '\\"') + '"' for n in names)
+
+
 def issue_id(kind: str, ref: str) -> str:
     return ref.rpartition("#")[2] if kind == "github" else ref
 
@@ -153,6 +157,8 @@ class JiraSource(Source):
         client = self.client
         mine = (f'project = "{self.key}" AND assignee = currentUser() AND statusCategory != Done '
                 f'AND (labels is EMPTY OR labels not in ("{tracker.LABEL}"))')
+        if self.jira_cfg.skip_types:
+            mine += f" AND issuetype not in ({jql_list(self.jira_cfg.skip_types)})"
         out = []
         for i in client.search(f"{mine} ORDER BY updated DESC", SEARCH_FIELDS, limit=PER_SOURCE):
             f = i.get("fields") or {}
