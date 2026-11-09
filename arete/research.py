@@ -79,7 +79,7 @@ def filing(h: Home | None, path: str) -> dict[str, str]:
 def claim_path(h: Home, name: str, title: str) -> str:
     base = h.base
     util.git(["fetch", "-q", "origin", base], h.repo.path)
-    taken = set(util.git(["ls-tree", "--name-only", f"origin/{base}", f"{h.folder}/"], h.repo.path).split())
+    taken = set(util.git_records(["ls-tree", "--name-only", f"origin/{base}", f"{h.folder}/"], h.repo.path))
     taken |= {report["filed_path"] for report in state.research_rows()}
     stem = slug(name or title, 60)
     return next(path for n in range(1, 100)
