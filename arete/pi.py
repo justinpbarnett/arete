@@ -239,10 +239,17 @@ def usage_totals(usages: list[dict]) -> dict:
 
 
 def cut_short(proc: subprocess.CompletedProcess, resume: Session, model: str, reason: str) -> Result:
-    replies = [e["message"] for e in events(proc.stdout)
+    stream = events(proc.stdout)
+    replies = [e["message"] for e in stream
                if e.get("type") == "message_end" and (e.get("message") or {}).get("role") == "assistant"]
-    return Result(ok=False, session=resume, error=reason, turns=len(replies), runner="pi", model=model,
-                  **usage_totals([m.get("usage") or {} for m in replies]))
+    totals = usage_totals([m.get("usage") or {} for m in replies])
+    return Result(ok=False, session=session_after(stream, resume, totals["cost_usd"]), error=reason,
+                  turns=len(replies), runner="pi", model=model, **totals)
+
+
+def session_after(stream: list[dict], resume: Session, cost_usd: float) -> Session:
+    session_id = next((e.get("id", "") for e in stream if e.get("type") == "session"), "") or resume.id
+    return Session(session_id, resume.spent_usd + cost_usd, "pi") if session_id else resume
 
 
 def events(stdout: str) -> list[dict]:
@@ -259,7 +266,6 @@ def events(stdout: str) -> list[dict]:
 
 def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None) -> Result:
     stream = events(proc.stdout)
-    session_id = next((e.get("id", "") for e in stream if e.get("type") == "session"), "")
     end = next((e for e in reversed(stream) if e.get("type") == "agent_end"), {})
     replies = [m for m in end.get("messages", []) if m.get("role") == "assistant"]
     if not replies:
@@ -272,12 +278,10 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     totals = usage_totals(usages)
     failed = last.get("stopReason") == "error" or proc.returncode != 0
     error = (last.get("errorMessage") or util.first_line(proc.stderr, 1500) or "pi stopped on an error") if failed else ""
-    session = (Session(session_id or resume.id, resume.spent_usd + totals["cost_usd"], "pi") if session_id or resume.id
-               else resume)
     return Result(
         ok=not failed,
         text=text,
-        session=session,
+        session=session_after(stream, resume, totals["cost_usd"]),
         structured=json_from_text(text) if json_schema and not failed else None,
         turns=len(replies),
         error=error,
