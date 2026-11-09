@@ -518,8 +518,8 @@ def cmd_loop(args) -> int:
         if args.action == "stop":
             target = args.name
             if not state.run_get(target):
-                running = [r for r in state.runs_marked_running()
-                           if r["kind"] == "loop" and r["loop"] == control.find_loop(target).name]
+                loop = control.find_loop(target)
+                running = [r for r in state.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
                 if not running:
                     raise control.Refused(f"{target} has no run going")
                 target = running[0]["id"]
