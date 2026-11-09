@@ -274,9 +274,12 @@ class Run(AgentRun):
         if self.dry_run:
             return
         others = [s for s in config.STATES if s != status]
-        for err in (self.tracker.label(self.tid, add=[status], remove=others), self.tracker.move(self.tid, status)):
+        labeled, moved = self.tracker.label(self.tid, add=[status], remove=others), self.tracker.move(self.tid, status)
+        for err in (labeled, moved):
             if err:
                 self.log(f"tracker: {util.first_line(err, 300)}")
+        if not moved and isinstance(self.tracker, tracker.JiraTracker) and self.tracker.cfg.transitions.get(status):
+            record.note(self.id, moved=status)
 
     def leave(self, status: str) -> None:
         if not self.dry_run and (err := self.tracker.label(self.tid, remove=[status])):
@@ -1684,6 +1687,41 @@ def sync_outcomes(cfg: config.Config) -> None:
                 print(f"{util.iso()} {repo.name}: trust proposal failed: {util.first_line(str(e), 300)}")
 
 
+CATCH_UP = ("pr", "needs-info", "failed")
+
+
+def sync_moves(cfg: config.Config) -> None:
+    if not any(cfg.jira.transitions.get(s) for s in CATCH_UP):
+        return
+    seen: set[tuple[str, str]] = set()
+    for r in state.runs(kind="pipeline", limit=200):
+        key = (r["repo"] or "", str(r["issue"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        status = r["status"]
+        target = cfg.jira.transitions.get(status, "") if status in CATCH_UP else ""
+        if not target or r.get("moved") == status:
+            continue
+        try:
+            repo = cfg.repo(r["repo"])
+        except KeyError:
+            continue
+        tk = tracker.for_repo(cfg, repo)
+        if not isinstance(tk, tracker.JiraTracker):
+            continue
+        try:
+            m = tk.shift(str(r["issue"]), target, keep_done=True)
+        except jira.JiraError as e:
+            print(f"{util.iso()} {tracker.run_ticket_name(r)}: could not move it to {target}, trying next poll: "
+                  f"{util.first_line(str(e), 300)}")
+            continue
+        record.note(r["id"], moved=status)
+        if m.error or m.moved:
+            print(f"{util.iso()} {tracker.run_ticket_name(r)}: "
+                  + (f"not moved: {util.first_line(m.error, 300)}" if m.error else f"{status}, moved to {target}"))
+
+
 def sync_landings(cfg: config.Config) -> None:
     branches = list(cfg.jira.landed)
     if not branches:
@@ -2101,6 +2139,10 @@ def poll(dry_run: bool = False) -> int:
             except Exception as e:
                 failed(f"jira {project}", e)
         if not dry_run:
+            try:
+                sync_moves(cfg)
+            except Exception as e:
+                failed("moving tickets", e)
             try:
                 util.write_json(SKIPPED_FILE, skips.current)
                 sync_landings(cfg)

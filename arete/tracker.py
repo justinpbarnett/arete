@@ -312,12 +312,13 @@ class JiraTracker:
     def move_to(self, tid: str, target: str) -> str:
         return self.shift(tid, target).error
 
-    def shift(self, tid: str, target: str, stamps: bool = False) -> Moved:
+    def shift(self, tid: str, target: str, stamps: bool = False, keep_done: bool = False) -> Moved:
         if not target:
             return Moved()
         f = self.client.issue(tid, ["status", "updated"]).get("fields") or {}
         status = (f.get("status") or {}).get("name", "")
-        if status.lower() == target.lower():
+        done = ((f.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
+        if status.lower() == target.lower() or keep_done and done:
             return Moved(before=f.get("updated") or "")
         if not self.client.transition(tid, target):
             return Moved(f"{tid} has no transition to '{target}' from '{status}'")
