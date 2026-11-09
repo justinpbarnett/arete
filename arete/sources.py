@@ -154,7 +154,7 @@ class GitHub(Source):
                 for a in gh.open_dependabot_alerts(repo):
                     adv, dep = a.get("security_advisory") or {}, a.get("dependency") or {}
                     pkg = (dep.get("package") or {}).get("name", "")
-                    out.append(event("github.advisory", sid, f"{repo}#{a['number']}",
+                    out.append(event("github.advisory", sid, f"advisory:{repo}#{a['number']}",
                                      f"{pkg}: {adv.get('summary', '')}", repo=repo, url=a.get("html_url", ""),
                                      trust="untrusted",
                                      data={"package": pkg, "severity": adv.get("severity"), "ghsa": adv.get("ghsa_id"),
