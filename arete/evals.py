@@ -494,7 +494,9 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
     arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
             "pr": Prompts(root / "pr", f"origin/{branch}")}
     main, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
-    changed = sorted(name for name in main.keys() | pr.keys() if main.get(name) != pr.get(name))
+    fork = git(["merge-base", arms["main"].label, arms["pr"].label], arete.path).strip()
+    before = export_prompts(arete, fork, root / "fork")
+    changed = sorted(name for name in before.keys() | pr.keys() if before.get(name) != pr.get(name))
     unmeasured = [name for name in changed if Path(name).stem not in BUILDER_PROMPTS]
     if not changed:
         return ""
