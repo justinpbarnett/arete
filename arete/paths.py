@@ -30,7 +30,10 @@ def expand(p: str | Path) -> Path:
 
 def short_path(p: str | Path) -> str:
     s, home = str(p), str(HOME)
-    return "~" + s[len(home):] if s.startswith(home) else s
+    if s == home:
+        return "~"
+    below_home = home.rstrip(os.sep) + os.sep
+    return "~/" + s[len(below_home):] if s.startswith(below_home) else s
 
 
 def scratch_dir(run_id: str) -> Path:
