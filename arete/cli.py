@@ -606,6 +606,9 @@ def cmd_session(args) -> int:
                 return 0
             args.id = s["id"]
         if args.action in ("start", "attach"):
+            r = state.run_get(args.id)
+            if not r or r["kind"] != "session":
+                raise control.NotFound(f"no session {args.id}")
             stop = threading.Event()
             print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
 
