@@ -325,6 +325,7 @@ class RepoLayer:
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
     verify: Verify | None = None
+    research_dir: str = ""
 
     @property
     def builder_bash(self) -> list[str]:
@@ -343,7 +344,7 @@ class RepoLayer:
         return self.dir / "evals"
 
 
-LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify"}
+LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research"}
 
 
 def load_layer(layer_dir: Path) -> RepoLayer:
@@ -369,6 +370,7 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.base_branch = g.get("base", "")
     layer.subject = g.get("subject", layer.subject)
     layer.branch = g.get("branch", layer.branch)
+    layer.research_dir = str(data.get("research", {}).get("dir", "")).strip().strip("/")
     if "verify" in data:
         v = data["verify"]
         layer.verify = Verify(start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),

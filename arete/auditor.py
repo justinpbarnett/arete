@@ -179,6 +179,10 @@ def check_repos(cfg: config.Config) -> list[Finding]:
                     out.append(Finding("agents-config", "warn", paths.short_path(f), f"unknown sections: {', '.join(sorted(extra))}"))
                 if r.pipeline and not data.get("checks"):
                     out.append(Finding("agents-config", "warn", paths.short_path(f), "pipeline is on but no checks are set"))
+                research_dir = config.load_layer(r.layer_dir).research_dir
+                if research_dir and not (r.path / research_dir).is_dir():
+                    out.append(Finding("agents-config", "warn", paths.short_path(f),
+                                       f"research dir {research_dir} is not a folder in {paths.short_path(r.path)}"))
             except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
                 out.append(Finding("agents-config", "fail", paths.short_path(f), f"does not parse: {e}"))
         elif r.pipeline:

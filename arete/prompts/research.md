@@ -23,10 +23,15 @@ Answer what the ticket asks. Lead with the answer or the recommendation, then th
 - Cite each outside fact with its link.
 - Say plainly what you could not find out, and what a person must check or decide.
 
+## Where the report goes
+
+$filing
+
 Return:
 
 - `summary`: two sentences at most: the answer, and how sure you are.
-- `report`: the full report in Markdown, under 1,500 words, with no title line. Start with the answer.
+- `report`: the full report in Markdown, under 1,500 words. $shape
+- `name`: $file_name
 
 Rules:
 

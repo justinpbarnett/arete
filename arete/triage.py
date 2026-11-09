@@ -703,6 +703,13 @@ def stamp(ts: str) -> str:
     return f"{ts[:16].replace('T', ' ')} UTC" if ts else ""
 
 
+def filed_words(report: dict) -> str:
+    if not report.get("filed_path"):
+        return ""
+    name = report["filed_path"].rpartition("/")[2]
+    return f", filed as {name}" if report.get("filed_url") else f", not filed as {name} yet; the research loop tries again"
+
+
 def research_note(r: dict, report: dict | None) -> str:
     by_hand = f"it is outside the sprint, so `arete research {r['ref']} --run` researches it"
     if not report:
@@ -712,7 +719,7 @@ def research_note(r: dict, report: dict | None) -> str:
     again = ((", and the ticket changed since, so the loop checks it again" if in_sprint(r)
               else f", and the ticket changed since; {by_hand} again") if research_due(r, report) else "")
     if report["status"] == "done":
-        return f"report ready {stamp(report['ts'])}{again}"
+        return f"report ready {stamp(report['ts'])}{filed_words(report)}{again}"
     if report["status"] == "held":
         return f"held: {report['error']}{again}"
     if report["status"] in ("parent", "answered"):

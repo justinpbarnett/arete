@@ -277,7 +277,9 @@ CREATE TABLE IF NOT EXISTS research (
     ts TEXT,
     ticket TEXT DEFAULT '',
     basis TEXT DEFAULT '',
-    answered_by TEXT DEFAULT ''
+    answered_by TEXT DEFAULT '',
+    filed_path TEXT DEFAULT '',
+    filed_url TEXT DEFAULT ''
 );
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
@@ -292,7 +294,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               ("triage_approvals", "tracker", "ALTER TABLE triage_approvals ADD COLUMN tracker TEXT DEFAULT 'jira'"),
               ("triage_approvals", "sent_by", "ALTER TABLE triage_approvals ADD COLUMN sent_by TEXT DEFAULT 'triage'"),
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
-                for col in ("ticket", "basis", "answered_by")],
+                for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url")],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
@@ -910,7 +912,7 @@ APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "pla
                     "sent_by")
 APPROVAL_LISTS = ("plan", "assumptions")
 RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
-                    "cost", "ts", "ticket", "basis", "answered_by")
+                    "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url")
 
 
 def lists_read(row: dict, keys: tuple[str, ...]) -> dict:

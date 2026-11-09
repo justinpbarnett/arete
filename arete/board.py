@@ -154,7 +154,7 @@ def triage_entry(r: dict, v: dict, standing: str, srcs: dict[str, triage.TriageS
     return {"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "", "url": r["url"] or "",
             "kind": r["kind"] or "", "size": r["size"] or "",
             "verdict": triage.sent_note(r, False) if standing == triage.SENT else triage.verdict(r, v["research"]),
-            "prs": " ".join(triage.sent_prs(r)) if standing == triage.SENT else "",
+            "prs": " ".join(triage.sent_prs(r)) if standing == triage.SENT else (report or {}).get("filed_url") or "",
             "questions": r.get("questions") or [], "assumptions": r["assumptions"] or [], "plan": r["plan"] or [],
             "summary": report["summary"] if report else "", "report": report["report"] if report else "",
             "send": send_form(r, srcs.get(r.get("source", ""))) if standing in triage.SENDABLE else None}

@@ -285,7 +285,7 @@ function triageParts(t) {
       ? [el("p", { text: `${g.rows.length} ${g.rows.length === 1 ? "ticket" : "tickets"}.` }),
         table("", [["Ticket", "c-ref"], ["Title"], ["Verdict", "c-verdict"]],
           g.rows.map((r) => el("tr", {},
-            cell(link(r.url, r.ref), "nb"),
+            cell(link(r.url, r.ref.replace(/^[^/#\s]+\//, "")), "nb"),
             cell([r.title, ...triageFolds(r)]),
             cell(r.prs ? [...wholeWords(r.verdict), el("br"), ...pullLinks(r.prs)] : wholeWords(r.verdict)))))]
       : quiet("None."));
