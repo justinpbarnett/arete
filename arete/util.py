@@ -316,8 +316,16 @@ def read_env_file(path: Path) -> dict[str, str]:
             continue
         k, sep, v = line.removeprefix("export ").partition("=")
         if sep:
-            out[k.strip()] = v.strip().strip('"').strip("'")
+            out[k.strip()] = env_value(v)
     return out
+
+
+def env_value(raw: str) -> str:
+    stripped = raw.strip()
+    quote = stripped[:1]
+    if quote in ("'", '"') and quote in stripped[1:]:
+        return stripped[1:stripped.index(quote, 1)]
+    return re.split(r"\s#", raw, maxsplit=1)[0].strip().strip('"').strip("'")
 
 
 def read_json(p: Path, default):
