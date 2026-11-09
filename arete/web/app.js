@@ -22,6 +22,7 @@ const drafts = new Map();
 const sendSaid = new Map();
 const sending = new Set();
 const HELD = Symbol("held");
+const MARKS = "[data-focus], h2, h3";
 let redrawTriage = false;
 const lastSaid = new Map();
 const going = { health: false, triage: false };
@@ -48,64 +49,181 @@ function svg(tag, attrs = {}, text) {
   return node;
 }
 
+// A redraw that changes nothing keeps the shown node and hands it the fresh handlers,
+// so a handler must reach its node through the event, never through a closure.
 function listen(node, handlers) {
   handlersOf.set(node, handlers);
   for (const event of Object.keys(handlers)) node.addEventListener(event, (e) => handlersOf.get(node)[event](e));
 }
 
-function elementsIn(nodes) {
-  return nodes.flatMap((node) => (node instanceof Element ? [node, ...node.querySelectorAll("*")] : []));
+function asNode(value) {
+  return value instanceof Node ? value : document.createTextNode(String(value));
 }
 
-function marked(nodes, key) {
-  const mark = `[data-focus="${CSS.escape(key)}"]`;
-  return nodes.flatMap((node) => (node instanceof Element ? [...(node.matches(mark) ? [node] : []), ...node.querySelectorAll(mark)] : []));
+function elementsIn(nodes, selector = "*") {
+  return nodes.flatMap((node) => (node instanceof Element ? [...(node.matches(selector) ? [node] : []), ...node.querySelectorAll(selector)] : []));
 }
 
-function markOf(node, nodes) {
-  const key = node?.dataset?.focus;
-  return key ? [key, marked(nodes, key).indexOf(node)] : null;
-}
-
-function tickClocks(box) {
-  for (const time of box.querySelectorAll("time.ago")) {
-    const now = ago(time.dateTime);
-    if (time.textContent !== now) time.textContent = now;
+function tickLiveAgos(times) {
+  for (const time of times) {
+    const text = ago(time.dateTime);
+    if (time.textContent !== text) time.textContent = text;
   }
 }
 
-function reuseShown(shown, fresh) {
+function listenedEvents(node) {
+  return Object.keys(handlersOf.get(node) || {}).join();
+}
+
+function sameLiveState(shownNode, freshNode) {
+  return shownNode.value === freshNode.value && shownNode.checked === freshNode.checked
+    && listenedEvents(shownNode) === listenedEvents(freshNode);
+}
+
+function keepShownIfUnchanged(shown, fresh) {
   if (shown.length !== fresh.length || shown.some((node, i) => !node.isEqualNode(fresh[i]))) return false;
-  const [olds, news] = [elementsIn(shown), elementsIn(fresh)];
-  const handled = (node) => Object.keys(handlersOf.get(node) || {}).join();
-  if (olds.some((node, i) => node.value !== news[i].value || node.checked !== news[i].checked || handled(node) !== handled(news[i]))) return false;
-  olds.forEach((node, i) => handlersOf.has(news[i]) && handlersOf.set(node, handlersOf.get(news[i])));
+  const shownElements = elementsIn(shown);
+  const freshElements = elementsIn(fresh);
+  if (!shownElements.every((node, i) => sameLiveState(node, freshElements[i]))) return false;
+  shownElements.forEach((node, i) => {
+    if (handlersOf.has(freshElements[i])) handlersOf.set(node, handlersOf.get(freshElements[i]));
+  });
   return true;
 }
 
-function viewRank(rect) {
-  return rect.top >= 0 ? rect.top : innerHeight - rect.top;
+function placeKey(node) {
+  return node.dataset.focus || node.textContent;
 }
 
-function pagePlace(box, shown) {
-  if (!box.getClientRects().length) return null;
-  const place = { x: scrollX, y: scrollY, anchor: null, top: 0 };
-  if (box.getBoundingClientRect().top >= 0) return place;
-  let nearest = null;
-  for (const node of box.querySelectorAll("[data-focus]")) {
-    const rect = node.getClientRects()[0];
-    if (rect && (!nearest || viewRank(rect) < viewRank(nearest.rect))) nearest = { node, rect };
+class Marks {
+  constructor(nodes) {
+    this.nodes = elementsIn(nodes, MARKS);
+    const seen = new Map();
+    this.ids = this.nodes.map((node) => {
+      const key = placeKey(node);
+      seen.set(key, (seen.get(key) ?? -1) + 1);
+      return `${key}#${seen.get(key)}`;
+    });
   }
-  if (nearest) [place.anchor, place.top] = [markOf(nearest.node, shown), nearest.rect.top];
-  return place;
+
+  idOf(node) {
+    return this.ids[this.nodes.indexOf(node)];
+  }
+
+  nodeOf(id) {
+    return this.nodes[this.ids.indexOf(id)];
+  }
 }
 
-function keepPlace(box, place) {
-  if (!place) return;
-  if (scrollX !== place.x || scrollY !== place.y) scrollTo(place.x, place.y);
-  const anchor = place.anchor && marked([...box.childNodes], place.anchor[0])[place.anchor[1]];
-  const drift = (anchor?.getClientRects()[0]?.top ?? place.top) - place.top;
-  if (drift) scrollBy(0, drift);
+function idsKeptInOrder(before, after) {
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) start++;
+  let beforeEnd = before.length;
+  let afterEnd = after.length;
+  while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+    beforeEnd--;
+    afterEnd--;
+  }
+  const kept = new Set([...before.slice(0, start), ...before.slice(beforeEnd)]);
+  const changedBefore = before.slice(start, beforeEnd);
+  const changedAfter = after.slice(start, afterEnd);
+  const width = changedAfter.length + 1;
+  const longestFrom = new Uint32Array((changedBefore.length + 1) * width);
+  for (let i = changedBefore.length - 1; i >= 0; i--) {
+    for (let j = changedAfter.length - 1; j >= 0; j--) {
+      longestFrom[i * width + j] = changedBefore[i] === changedAfter[j]
+        ? longestFrom[(i + 1) * width + j + 1] + 1
+        : Math.max(longestFrom[(i + 1) * width + j], longestFrom[i * width + j + 1]);
+    }
+  }
+  for (let i = 0, j = 0; i < changedBefore.length && j < changedAfter.length;) {
+    if (changedBefore[i] === changedAfter[j]) {
+      kept.add(changedBefore[i]);
+      i++;
+      j++;
+    } else if (longestFrom[(i + 1) * width + j] >= longestFrom[i * width + j + 1]) i++;
+    else j++;
+  }
+  return kept;
+}
+
+function markHolding(node) {
+  const element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  return element?.closest?.(MARKS) ?? null;
+}
+
+function marksInUse() {
+  const selection = getSelection();
+  return [document.activeElement, selection.isCollapsed ? null : selection.anchorNode].map(markHolding).filter(Boolean);
+}
+
+function placeIn(box, marks) {
+  const view = box.closest("main > section") ?? document.body;
+  const laidOut = [...view.querySelectorAll(MARKS)].filter((node) => node.checkVisibility()).map((node) => {
+    const { top, bottom } = node.getBoundingClientRect();
+    return { node, top, bottom };
+  });
+  const inUse = marksInUse();
+  const inView = laidOut.filter(({ top, bottom }) => bottom > 0 && top < innerHeight)
+    .sort((a, b) => inUse.includes(b.node) - inUse.includes(a.node));
+  const anchors = !scrollY ? [] : inView.length ? inView : laidOut.filter(({ bottom }) => bottom <= 0).slice(-1);
+  return { x: scrollX, y: scrollY, anchors: anchors.map(({ node, top }) => ({ node, id: box.contains(node) ? marks.idOf(node) : null, top })) };
+}
+
+function followAnchor(anchor, freshMarks, keptIds) {
+  const node = anchor.id ? freshMarks.nodeOf(anchor.id) : anchor.node.isConnected ? anchor.node : null;
+  if (!node?.checkVisibility()) return null;
+  return { drift: node.getBoundingClientRect().top - anchor.top, stayed: !anchor.id || keptIds.has(anchor.id) };
+}
+
+function keepPlace(place, shownMarks, freshMarks) {
+  const keptIds = idsKeptInOrder(shownMarks.ids, freshMarks.ids);
+  const followed = place.anchors.map((anchor) => followAnchor(anchor, freshMarks, keptIds)).filter(Boolean);
+  const anchor = followed.find(({ stayed }) => stayed) ?? followed[0];
+  const y = anchor ? scrollY + anchor.drift : place.y;
+  if (scrollX !== place.x || scrollY !== y) scrollTo(place.x, y);
+}
+
+function textPoint(box, marks, node, offset) {
+  const point = document.createRange();
+  point.setStart(node, offset);
+  const mark = marks.nodes.findLast((m) => point.comparePoint(m, 0) <= 0);
+  const before = document.createRange();
+  before.setStart(mark ?? box, 0);
+  before.setEnd(node, offset);
+  return { id: mark ? marks.idOf(mark) : null, chars: before.toString().length };
+}
+
+function textPointNode(box, marks, point) {
+  const from = point.id ? marks.nodeOf(point.id) : box;
+  if (!from) return null;
+  const texts = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+  texts.currentNode = from;
+  let left = point.chars;
+  for (let text = texts.nextNode(); text; text = texts.nextNode()) {
+    if (left <= text.length) return [text, left];
+    left -= text.length;
+  }
+  return null;
+}
+
+function selectionIn(box, marks) {
+  const selection = getSelection();
+  if (selection.isCollapsed || !box.contains(selection.anchorNode) || !box.contains(selection.focusNode)) return null;
+  return {
+    text: selection.toString(),
+    anchor: textPoint(box, marks, selection.anchorNode, selection.anchorOffset),
+    focus: textPoint(box, marks, selection.focusNode, selection.focusOffset),
+  };
+}
+
+function keepSelection(box, kept, marks) {
+  const anchor = kept && textPointNode(box, marks, kept.anchor);
+  const focus = kept && textPointNode(box, marks, kept.focus);
+  if (!anchor || !focus) return;
+  const selection = getSelection();
+  selection.setBaseAndExtent(...anchor, ...focus);
+  if (selection.toString() !== kept.text) selection.removeAllRanges();
 }
 
 function scrollersByPlace(box) {
@@ -113,7 +231,7 @@ function scrollersByPlace(box) {
   let under = "";
   for (const node of box.querySelectorAll("h2, h3, summary, .wide, pre")) {
     if (!node.matches(".wide, pre")) {
-      under = node.dataset.focus || node.textContent;
+      under = placeKey(node);
       continue;
     }
     let place = `${under}|${node.className}`;
@@ -125,21 +243,25 @@ function scrollersByPlace(box) {
 
 function fill(id, ...nodes) {
   const box = document.getElementById(id);
-  const fresh = nodes.flat(Infinity).filter(Boolean).map((node) => (node instanceof Node ? node : document.createTextNode(node)));
+  const fresh = nodes.flat(Infinity).filter(Boolean).map(asNode);
   const shown = [...box.childNodes];
-  tickClocks(box);
-  if (reuseShown(shown, fresh)) return;
-  const place = pagePlace(box, shown);
-  const focused = box.contains(document.activeElement) ? markOf(document.activeElement, shown) : null;
+  tickLiveAgos(elementsIn([...shown, ...fresh], "time.ago"));
+  if (keepShownIfUnchanged(shown, fresh)) return;
+  const shownMarks = new Marks(shown);
+  const place = placeIn(box, shownMarks);
+  const focusedId = shownMarks.idOf(document.activeElement);
+  const selected = selectionIn(box, shownMarks);
   const scrolled = [...scrollersByPlace(box)].filter(([, node]) => node.scrollLeft || node.scrollTop)
-    .map(([place, node]) => [place, node.scrollLeft, node.scrollTop]);
+    .map(([key, node]) => [key, node.scrollLeft, node.scrollTop]);
   box.append(...fresh);
+  const freshMarks = new Marks(fresh);
   // Focus moves to the copy while the old element is still there, so a keyboard focus ring carries over.
-  if (focused) marked(fresh, focused[0])[focused[1]]?.focus({ preventScroll: true });
+  freshMarks.nodeOf(focusedId)?.focus({ preventScroll: true });
   for (const node of shown) node.remove();
   const rebuilt = scrolled.length ? scrollersByPlace(box) : new Map();
-  for (const [place, left, top] of scrolled) rebuilt.get(place)?.scrollTo(left, top);
-  keepPlace(box, place);
+  for (const [key, left, top] of scrolled) rebuilt.get(key)?.scrollTo(left, top);
+  keepSelection(box, selected, freshMarks);
+  keepPlace(place, shownMarks, freshMarks);
 }
 
 function heading(n, title) {
@@ -202,7 +324,7 @@ function table(caption, heads, rows) {
 
 function cell(content, cls) {
   const td = el("td", { class: cls });
-  td.append(...[content].flat().filter((c) => c !== null && c !== undefined).map((c) => (c instanceof Node ? c : document.createTextNode(String(c)))));
+  td.append(...[content].flat().filter((c) => c !== null && c !== undefined).map(asNode));
   return td;
 }
 
@@ -236,8 +358,8 @@ function ago(ts) {
   return `${Math.round(minutes / 1440)} d ago`;
 }
 
-function since(ts) {
-  return ts ? el("time", { class: "ago", datetime: ts, text: ago(ts) }) : ago(ts);
+function liveAgo(ts) {
+  return ts ? el("time", { class: "ago", datetime: ts, text: ago(ts) }) : "never";
 }
 
 function duration(seconds) {
@@ -391,7 +513,7 @@ function checksSummary(h) {
   const failing = h.checks.filter((c) => !c.ok).length;
   const state = !failing ? "ok" : h.checks.some((c) => c.state === "fault") ? "fault" : "caution";
   return el("p", {}, stateChip(state), " ",
-    `${h.checks.length} checks, ${failing} failing. The last heartbeat came `, since(h.heartbeat), ` (${clock(h.heartbeat)}).`);
+    `${h.checks.length} checks, ${failing} failing. The last heartbeat came `, liveAgo(h.heartbeat), ` (${clock(h.heartbeat)}).`);
 }
 
 function drawHealth(snapshot) {
@@ -406,17 +528,17 @@ function drawHealth(snapshot) {
     heading(2, "Loops"),
     panelParts(snapshot.checks, "The loops", (h) => h.loops.length
       ? table("", [["Loop"], ["State", "c-status"], ["Last run", "c-time"], ["Detail"]],
-        h.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(since(l.ts)), cell(l.detail || ""))))
+        h.loops.map((l) => el("tr", {}, cell(l.name), cell(stateChip(l.ok ? "ok" : "fault")), cell(liveAgo(l.ts)), cell(l.detail || ""))))
       : quiet("No loop has reported yet.")),
     heading(3, "Probes"),
     panelParts(snapshot.alerts, "The probes", (a) => a.probes.length
       ? table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time"], ["Detail"]],
-        a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(since(p.last_run)), cell(since(p.last_ok)), cell(p.detail || ""))))
+        a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(liveAgo(p.last_run)), cell(liveAgo(p.last_ok)), cell(p.detail || ""))))
       : quiet("No probe has run yet.")),
     heading(4, "Alerts"),
     panelParts(snapshot.alerts, "The alerts", (a) => a.alerts.length
       ? table("Open alerts", [["Alert"], ["Opened", "c-time"], ["Last seen", "c-time"], ["Issue"]],
-        a.alerts.map((x) => el("tr", {}, cell(x.key), cell(clock(x.opened)), cell(since(x.last_seen)), cell(x.url ? link(x.url, `#${x.issue}`) : ""))))
+        a.alerts.map((x) => el("tr", {}, cell(x.key), cell(clock(x.opened)), cell(liveAgo(x.last_seen)), cell(x.url ? link(x.url, `#${x.issue}`) : ""))))
       : el("p", {}, stateChip("ok"), " No alert is open.")));
 }
 
@@ -441,7 +563,7 @@ function researchTicket(r, btn) {
 
 function triageParts(t) {
   going.triage = t.refreshing || t.researching;
-  const lastRan = t.refreshed ? ["Triage last ran ", since(t.refreshed), ` (${zonedClock(t.refreshed)}).`] : ["Triage has not run yet."];
+  const lastRan = t.refreshed ? ["Triage last ran ", liveAgo(t.refreshed), ` (${zonedClock(t.refreshed)}).`] : ["Triage has not run yet."];
   const parts = [quiet(...lastRan, " It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent."),
     el("div", { class: "actions" }, button(t.refreshing ? "Triage running" : "Refresh triage now", "triage-refresh", refreshTriage, t.refreshing)),
     saidLine("triage-refresh")];
@@ -479,7 +601,7 @@ function triageFolds(r, researching) {
     r.questions.length && !answerable ? fold(`triage:q:${r.ref}`, "Show the questions", list(r.questions)) : null,
     r.assumptions.length ? fold(`triage:a:${r.ref}`, "Show what the build assumes", list(r.assumptions)) : null,
     r.plan.length ? fold(`triage:p:${r.ref}`, "Show the plan", list(r.plan)) : null,
-    r.report ? fold(`triage:r:${r.ref}`, "Show the report", el("pre", { class: "fold-text", text: r.report })) : null,
+    r.report ? foldText(`triage:r:${r.ref}`, "Show the report", r.report) : null,
     answerable ? fold(`triage:q:${r.ref}`, "Answer the questions", sendForm(r)) : r.send ? sendForm(r) : null,
     ...researchOffer(r, researching),
   ];
@@ -513,10 +635,14 @@ function sendForm(r) {
     e.target.form.querySelector(".send-about").textContent = sendWords(r);
   } } }, el("option", { value: "", text: "Pick a repo" }), r.send.choices.map((c) => el("option", { value: c.repo, text: c.repo })));
   picker.value = pickedRepo(r);
-  const box = (q, i) => el("textarea", { id: id(i), "data-focus": id(i), text: drafts.get(draftKey(r.ref, q)) || "", on: {
-    input: (e) => drafts.set(draftKey(r.ref, q), e.target.value),
-    keydown: (e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.target.form.requestSubmit(),
-  } });
+  const box = (q, i) => {
+    const answer = el("textarea", { id: id(i), "data-focus": id(i), on: {
+      input: (e) => drafts.set(draftKey(r.ref, q), e.target.value),
+      keydown: (e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && e.target.form.requestSubmit(),
+    } });
+    answer.value = drafts.get(draftKey(r.ref, q)) || "";
+    return answer;
+  };
   const fields = r.questions.map((q, i) => field(isRepoQuestion(r, q) ? picker : box(q, i), q));
   if (r.send.pick && !r.send.repo_question) fields.push(field(picker, "The repo to build it in"));
   const said = sendSaid.get(r.ref);
@@ -687,8 +813,7 @@ function drawSettings(data) {
     const input = document.getElementById(id);
     if (input.value !== String(data[key])) input.value = data[key];
   }
-  document.getElementById("model-hint").textContent =
-    `Each role takes ${data.aliases.join(", ")}, or a full claude model id. An empty role uses its default.`;
+  fill("model-hint", `Each role takes ${data.aliases.join(", ")}, or a full claude model id. An empty role uses its default.`);
   fill("model-names", data.aliases.map((alias) => el("option", { value: alias })));
   fill("model-fields", Object.entries(data.models).map(([role, model]) => el("div", { class: "field" },
     el("label", { for: `model-${role}`, text: role.replace("_", " ") }),
@@ -822,6 +947,10 @@ function fold(key, summary, ...content) {
   }, el("summary", { "data-focus": `fold:${key}`, text: summary }), ...content);
 }
 
+function foldText(key, summary, text) {
+  return fold(key, summary, el("pre", { class: "fold-text", "data-focus": `text:${key}`, text }));
+}
+
 function feedLine(line) {
   return `${clock(line.ts).padStart(5)}  ${line.kind.padEnd(7)}  ${line.text}`;
 }
@@ -904,7 +1033,7 @@ function serveLine(serve) {
 
 function serveState(serve) {
   if (!serve.at) return el("p", {}, stateChip("fault"), " Serve has never run on this machine, so no loop fires on its own. Installing it starts it and keeps it running.");
-  if (!serve.alive) return el("p", {}, stateChip("fault"), " Serve last beat ", since(serve.at), ` (${clock(serve.at)}), so no loop fires on its own until it runs again.`);
+  if (!serve.alive) return el("p", {}, stateChip("fault"), " Serve last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so no loop fires on its own until it runs again.`);
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
   return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),
@@ -924,7 +1053,7 @@ function approvalRow(a) {
     cell(a.loop, "nb"),
     cell([a.what,
       a.failed ? el("div", {}, stateChip("fault"), ` Delivery failed: ${a.failed}`) : null,
-      a.detail ? fold(`approval:${a.id}`, "Show the body", el("pre", { class: "fold-text", text: a.detail })) : null]),
+      a.detail ? foldText(`approval:${a.id}`, "Show the body", a.detail) : null]),
     cell(clock(a.created)),
     cell([button(a.failed ? "Try again" : "Approve", `approve:${a.id}`, (b) => decide(a.id, true, b)), " ",
       button("Reject", `reject:${a.id}`, (b) => decide(a.id, false, b))], "nb"));
@@ -946,7 +1075,7 @@ async function decide(id, yes, btn) {
 function lastRun(l) {
   if (l.running) return ["running", el("br"), button("Feed", `feed:${l.running}`, () => openFeed("loop", l.running))];
   if (!l.last) return "never";
-  return [...runStatus(l.last.status), el("br"), el("span", { class: "muted" }, since(l.last.started))];
+  return [...runStatus(l.last.status), el("br"), el("span", { class: "muted" }, liveAgo(l.last.started))];
 }
 
 function loopRow(l) {
@@ -1089,14 +1218,14 @@ function loopRuns(d) {
 function loopSources(d) {
   return d.cursors.length
     ? table("", [["Source"], ["Polled", "c-time"], ["State", "c-status"], ["Detail"]],
-      d.cursors.map((c) => el("tr", {}, cell(c.source, "muted-cell"), cell(since(c.polled), "nb"),
+      d.cursors.map((c) => el("tr", {}, cell(c.source, "muted-cell"), cell(liveAgo(c.polled), "nb"),
         cell(stateChip(c.ok ? "ok" : "fault")), cell(c.detail || (c.ok ? "reading" : "")))))
     : quiet(d.sources.length ? "Serve has not polled its sources yet." : "It has no source.");
 }
 
 function loopDigests(d) {
   return d.digests.length
-    ? d.digests.map((g) => fold(`digest:${d.name}:${g.day}`, g.day, el("pre", { class: "fold-text", text: g.text })))
+    ? d.digests.map((g) => foldText(`digest:${d.name}:${g.day}`, g.day, g.text))
     : quiet("No digest yet.");
 }
 
@@ -1119,8 +1248,8 @@ function drawLoopDetail(d) {
         d.metrics.map((m) => el("tr", {}, cell(m.name), cell(Number(m.value).toLocaleString(undefined, { maximumFractionDigits: 20 }), "num"), cell(clock(m.ts), "nb"), cell(m.points, "num"))))] : null,
     d.emits.some((e) => e.startsWith("digest")) ? [el("h3", { text: "Digests" }), loopDigests(d)] : null,
     el("h3", { text: "Memory" }),
-    memory ? fold(`memory:${d.name}`, "Show what it keeps between runs", el("pre", { class: "fold-text", text: memory })) : quiet("It keeps nothing between runs yet."),
-    d.prompt ? [el("h3", { text: "Prompt" }), fold(`prompt:${d.name}`, "Show the prompt", el("pre", { class: "fold-text", text: d.prompt }))] : null,
+    memory ? foldText(`memory:${d.name}`, "Show what it keeps between runs", memory) : quiet("It keeps nothing between runs yet."),
+    d.prompt ? [el("h3", { text: "Prompt" }), foldText(`prompt:${d.name}`, "Show the prompt", d.prompt)] : null,
     closeLoopButton());
 }
 
@@ -1237,7 +1366,7 @@ function deviceRow(d) {
   return el("tr", {},
     cell([el("span", { class: "nb", text: d.name }), d.note ? el("div", { class: "muted", text: d.note }) : null]),
     cell(d.kind), cell(d.host || "this machine", "muted-cell"),
-    cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted" }, since(p.at))] : "not probed", "nb"),
+    cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted" }, liveAgo(p.at))] : "not probed", "nb"),
     cell(probeWords(p) || (d.error ? d.error : ""), "muted-cell"),
     cell([p ? (p.tools || []).join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
     cell(button("Probe", `probe:${d.name}`, (b) => probe(d.name, b))));
@@ -1262,7 +1391,7 @@ function drawFleet(loops, devices) {
   fill("fleet",
     heading(1, "Serve"),
     serveLine(s),
-    s.at ? el("dl", { class: "w" }, fact("Process", String(s.pid)), fact("Last beat", [since(s.at), ` (${clock(s.at)})`]),
+    s.at ? el("dl", { class: "w" }, fact("Process", String(s.pid)), fact("Last beat", [liveAgo(s.at), ` (${clock(s.at)})`]),
       fact("Ticks", `${s.ticks}, one every ${s.tick_seconds} s`), fact("Started", clock(s.started))) : null,
     errors.length ? table("Sources that fail to poll", [["Source"], ["Error"]], errors.map(([k, v]) => el("tr", {}, cell(k), cell(v, "muted-cell")))) : null,
     broken.length ? table("Loops that do not load", [["Loop"], ["Why"]], broken.map(([k, v]) => el("tr", {}, cell(k), cell(v, "muted-cell")))) : null,
@@ -1348,6 +1477,7 @@ async function refresh() {
   try {
     const held = (await LOADERS[view]()) === HELD;
     if (mine !== refreshCount) return;
+    if (held) tickLiveAgos(document.querySelectorAll("main > section:not([hidden]) time.ago"));
     if (!held) lastGood.set(view, new Date());
     const label = document.querySelector(`.views [data-view="${view}"]`).textContent;
     const shown = held ? "held while you edit" : `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
