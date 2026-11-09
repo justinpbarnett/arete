@@ -264,12 +264,12 @@ def injection(text: str | dict | list, cfg: config.Config, trace: tuple[str, str
     return ask(text, {"injection": yes_no(INJECTION)}, cfg, trace=trace).answers.get("injection")
 
 
-def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> Risk | None:
+def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> Risk:
     questions = {name: rate(q, levels) for name, (q, levels) in RISK.items()}
     questions["irreversible"] = yes_no(IRREVERSIBLE)
     reply = ask(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace=trace)
     if set(reply.answers) != set(questions):
-        return None
+        raise Unjudged(reply.error or "its reply left questions out")
     weights = cfg.jev.risk_weights
     parts = {name: float(reply.answers[name].value) for name in RISK}
     score = sum(weights[n] * parts[n] for n in RISK) / (sum(weights.values()) or 1)

@@ -996,13 +996,18 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     if not draft_why and layer.trust_level == "automerge" and approval and approval["sent_by"] == "triage":
         run.log("automerge left off: triage approved the ticket, so a person merges it")
     elif not draft_why and layer.trust_level == "automerge":
-        risk = jev.risk(patch_from_base(opened), f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,
-                        trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [repo]) else None
+        try:
+            risk = jev.risk(patch_from_base(opened), f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,
+                            trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [repo]) else None
+            hold = risk.hold if risk else ""
+        except jev.Unjudged as e:
+            run.log(f"automerge risk: JEV could not judge the diff: {e}")
+            hold = "JEV could not judge the diff"
         for c in opened:
             try:
-                if risk and risk.hold:
-                    run.log(f"automerge left off on {c.pr}: {risk.hold}")
-                    gh.pr_comment(c.pr, f"Automerge stays off for this PR: {risk.hold}. A person merges it.")
+                if hold:
+                    run.log(f"automerge left off on {c.pr}: {hold}")
+                    gh.pr_comment(c.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
                     continue
                 gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
                 run.log(f"automerge enabled on {c.pr}")
