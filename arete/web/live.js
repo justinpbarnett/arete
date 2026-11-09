@@ -1,7 +1,7 @@
 "use strict";
 
 function drawLive(d) {
-  fill("live",
+  fill("live-body",
     heading(1, "Running now"),
     panelParts(d.live, "The live runs", runningParts),
     panelParts(d.waiting, "The review feedback", upNextParts),

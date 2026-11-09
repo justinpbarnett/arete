@@ -44,7 +44,7 @@ nav.side #console-open[aria-expanded="true"] { background: var(--ink); color: va
 
 main:focus { outline: 0; }
 main h2 { margin-top: 44px; }
-#live > h2:first-child, #settings > h2:first-child, #usage > .seg + p + h2 { margin-top: 8px; }
+#live-body > h2:first-child, #settings-form > h2:first-child, #usage-body > .seg + p + h2 { margin-top: 8px; }
 .jumps { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 0; }
 .jumps button { font-size: 12.5px; line-height: 18px; padding: 5px 10px 4px; }
 .jumps + h2, .jumps + h3 { margin-top: 28px; }

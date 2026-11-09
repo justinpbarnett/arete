@@ -121,17 +121,17 @@ function drawOutcomes() {
   const panel = outcomesData;
   if (!panel) return SLOW_MS;
   if (!("rows" in panel)) {
-    fill("outcomes", unreadFault("Outcomes", panel));
+    fill("outcomes-body", unreadFault("Outcomes", panel));
     return SLOW_MS;
   }
   const t = panel.rows;
-  const width = Math.max(300, Math.floor(document.getElementById("outcomes").clientWidth || 300));
+  const width = Math.max(300, Math.floor(document.getElementById("outcomes-body").clientWidth || 300));
   const shipped = t.days.reduce((n, d) => n + d.shipped, 0);
   const failed = t.days.reduce((n, d) => n + d.failed, 0);
   const other = t.days.reduce((n, d) => n + d.other, 0);
   const paid = paidColumn(t.repos);
   const titles = ["Outcomes per day", "Without you or by you", "What you paid", "By repo", "Evals"];
-  fill("outcomes",
+  fill("outcomes-body",
     jumps(titles),
     heading(1, titles[0]),
     el("p", {}, `${shipped} pipeline runs shipped a pull request and ${failed} failed in ${t.days.length} days.` +

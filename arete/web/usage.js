@@ -32,7 +32,7 @@ function msWords(ms) {
 
 function drawUsage(u) {
   const windowDays = String(u.days);
-  fill("usage",
+  fill("usage-body",
     seg("Window", USAGE_WINDOWS.map((d) => [d, [figure(d), " days"]]), windowDays,
       (d) => go(viewHash("usage", { days: d === DEFAULT_USAGE_WINDOW ? "" : d }), "link", { replace: true })),
     quiet(u.first ? ["Counted since ", zonedClock(u.first), `, over the last ${u.days} days. A visit is one stay on a view or an open item; time counts only while the tab shows.`]

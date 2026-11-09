@@ -33,7 +33,7 @@ function newCodeWaitsFor() {
 }
 
 function unsentText() {
-  const typed = (field) => field.value.trim() && !field.closest("#settings, dialog");
+  const typed = (field) => field.value.trim() && !field.closest("#settings-form, dialog");
   const messages = [...document.querySelectorAll("textarea")];
   // a send clears its message but keeps the form's other fields for the next one
   const otherFieldsOnScreen = [...document.querySelectorAll("input[type=text]")].filter((field) => field.checkVisibility());

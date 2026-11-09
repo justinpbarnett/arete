@@ -1,7 +1,7 @@
 "use strict";
 
 function wireForms() {
-  document.getElementById("settings").addEventListener("submit", saveSettings);
+  document.getElementById("settings-form").addEventListener("submit", saveSettings);
   document.getElementById("settings-undo").addEventListener("click", () => {
     if (settingsData) drawSettings(settingsData);
     document.getElementById("settings-result").hidden = true;

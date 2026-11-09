@@ -54,7 +54,7 @@
 <main id="main" tabindex="-1">
 
 <section data-view="live">
-  <div id="live"></div>
+  <div id="live-body"></div>
 </section>
 
 <section data-view="runs" hidden>
@@ -161,15 +161,15 @@
 </section>
 
 <section data-view="outcomes" hidden>
-  <div id="outcomes"></div>
+  <div id="outcomes-body"></div>
 </section>
 
 <section data-view="health" hidden>
-  <div id="health"></div>
+  <div id="health-body"></div>
 </section>
 
 <section data-view="settings" hidden>
-  <form id="settings" novalidate>
+  <form id="settings-form" novalidate>
     <h2><span class="n">01</span>Run limits</h2>
     <p>A save writes <code>config.toml</code> on the Mac. The pipeline reads it at its next poll, and a run already going keeps the models it started with.</p>
     <div class="fields one-row">
@@ -195,7 +195,7 @@
 </section>
 
 <section data-view="usage" hidden>
-  <div id="usage"></div>
+  <div id="usage-body"></div>
 </section>
 
 </main>

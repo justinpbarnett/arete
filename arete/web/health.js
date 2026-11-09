@@ -80,7 +80,7 @@ function drawHealth(h) {
   const failed = failures(h);
   const s = h.serve;
   const titles = ["Alerts and failures", "Serve", "Devices", "Checks", "Loops", "Probes"];
-  fill("health",
+  fill("health-body",
     healthSummary(h, failed),
     jumps(titles),
     heading(1, titles[0]),
