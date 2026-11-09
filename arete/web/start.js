@@ -7,7 +7,7 @@ function wireForms() {
     document.getElementById("settings-result").hidden = true;
     refresh();
   });
-  for (const [toggleId, formId, focusId] of [["launch-toggle", "launch", "launch-prompt"], ["loop-new-toggle", "loop-new", "loop-new-sentence"]]) {
+  for (const [toggleId, formId, focusId] of TOGGLE_FORMS) {
     const toggle = document.getElementById(toggleId);
     toggle.dataset.label = toggle.textContent;
     toggle.addEventListener("click", () => {
@@ -134,6 +134,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const first = knownRoute(location.hash);
   history.replaceState({ from: history.state?.from ?? "" }, "", first.hash);
   if (asked === "chat") setConsole(true, { focus: true, track: false });
+  else if (CARRIED) setConsole(CARRIED.console, { track: false });
   else {
     try {
       if (!PHONE.matches && localStorage.getItem("arete.console") === "open") setConsole(true, { track: false });
@@ -141,5 +142,6 @@ document.addEventListener("DOMContentLoaded", () => {
       // without storage the console starts closed
     }
   }
-  applyRoute(first, "start");
+  resumeCarried();
+  applyRoute(first, CARRIED ? "reload" : "start");
 });

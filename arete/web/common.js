@@ -20,6 +20,7 @@ const PHONE = matchMedia("(pointer: coarse) and (max-width: 1040px)");
 const SVG = "http://www.w3.org/2000/svg";
 const URL_IN_TEXT = /(https:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
 const HELD = Symbol("held");
+const TOGGLE_FORMS = [["launch-toggle", "launch", "launch-prompt"], ["loop-new-toggle", "loop-new", "loop-new-sentence"]];
 const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 
 let route = null;
@@ -225,9 +226,14 @@ function count(n, one, many) {
 }
 
 async function call(path, body) {
-  const options = body === undefined ? { cache: "no-store" }
-    : { method: "POST", headers: { "Content-Type": "application/json", "X-Arete": "1" }, body: JSON.stringify(body) };
-  const response = await fetch(path, options).catch(() => { throw new Error("The connection to arete failed."); });
+  const changes = body !== undefined;
+  const options = changes ? { method: "POST", headers: { "Content-Type": "application/json", "X-Arete": "1" }, body: JSON.stringify(body) }
+    : { cache: "no-store" };
+  if (changes) changesInFlight++;
+  const response = await fetch(path, options)
+    .catch(() => { throw new Error("The connection to arete failed."); })
+    .finally(() => { if (changes) changesInFlight--; });
+  noteServedCode(response);
   const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
   if (!response.ok) throw new Error(data.error || `The server answered ${response.status}.`);
   return data;
@@ -313,12 +319,14 @@ async function act(btn, place, path, body, saying) {
   refresh();
 }
 
-function toggleForm(toggleId, formId, focusId, open) {
+function toggleForm(toggleId, formId, focusId, open = document.getElementById(formId).hidden) {
+  showForm(toggleId, formId, open);
+  if (open) document.getElementById(focusId).focus();
+}
+
+function showForm(toggleId, formId, open) {
   const toggle = document.getElementById(toggleId);
-  const form = document.getElementById(formId);
-  const opening = open ?? form.hidden;
-  form.hidden = !opening;
-  toggle.setAttribute("aria-expanded", String(opening));
-  toggle.textContent = opening ? "Close the form" : toggle.dataset.label;
-  if (opening) document.getElementById(focusId).focus();
+  document.getElementById(formId).hidden = !open;
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.textContent = open ? "Close the form" : toggle.dataset.label;
 }

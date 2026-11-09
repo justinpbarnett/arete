@@ -2,7 +2,7 @@
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 let stint = null;
-const TAB = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
+const TAB = CARRIED?.tab ?? [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 function deviceKind() {
   return PHONE.matches ? "phone" : "desktop";
@@ -18,7 +18,7 @@ function report(row) {
 }
 
 function startStint(via) {
-  stint = { name: stintName(), via, at: performance.now() };
+  stint = { name: stintName(), via: via === "reload" ? "return" : via, at: performance.now() };
 }
 
 function endStint() {

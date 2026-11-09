@@ -9,8 +9,8 @@ function schedule(ms) {
   if (ms) timer = setTimeout(refresh, ms);
 }
 
-function status(state, sentence) {
-  document.getElementById("status").replaceChildren(`${dateWords(new Date())} · `, ...sayParts(state, sentence));
+function status(state, sentence, nextLine = "") {
+  document.getElementById("status").replaceChildren(`${dateWords(new Date())} · `, ...sayParts(state, sentence), ...(nextLine ? [el("br"), nextLine] : []));
 }
 
 async function refresh() {
@@ -21,7 +21,7 @@ async function refresh() {
   const label = VIEWS[at.view].label;
   try {
     const [draw, sidebar] = await Promise.all([LOADERS[at.view](at), call("/api/sidebar").catch(() => null)]);
-    if (mine !== refreshCount) return;
+    if (mine !== refreshCount || reloadsForNewCode()) return;
     if (sidebar) drawSidebar(sidebar);
     const drawn = draw();
     const held = drawn === HELD;
@@ -29,12 +29,12 @@ async function refresh() {
     if (held) tickLiveAgos(currentSection().querySelectorAll("time.ago"));
     else lastGood.set(at.view, new Date());
     const shown = held ? "held while you edit" : `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
-    status("", `${label} · ${shown} · refreshes every ${delay / 1000} s`);
+    status("", [label, shown, `refreshes every ${delay / 1000} s`].join(" · "), newCodeNote());
     document.querySelectorAll(".readout").forEach((r) => r.classList.remove("stale"));
     afterDraw();
     schedule(delay);
   } catch (e) {
-    if (mine !== refreshCount) return;
+    if (mine !== refreshCount || reloadsForNewCode()) return;
     const shownAt = clock(lastGood.get(at.view));
     status("fault", `Arete did not answer: ${e.message}${shownAt ? ` What shows came at ${shownAt}.` : ""}`);
     document.querySelectorAll(".readout").forEach((r) => r.classList.add("stale"));

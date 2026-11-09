@@ -8,7 +8,7 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 
 `arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted, and serve picks up its queues again when it starts.
 
-Serve restarts itself when its own code changes. On each tick it looks at the `.py` files of the arete package, and once a change has held still for one tick and serve has no source poll, dashboard request or chat message of its own in flight, it checks that the new code imports and then replaces itself with a fresh serve in the same process. Runs and sessions are processes of their own, so they keep going across the restart, and the fresh serve reaps each one when it ends. New code that does not import is named in the serve log, and serve keeps the code it started with. A self restart is not a start, so loops with `run_at_load` do not fire again. So a push to arete's own main, followed by a fast forward of the checkout serve runs from, reaches serve with no restart by hand.
+Serve restarts itself when its own code changes. On each tick it looks at the `.py` files of the arete package and the dashboard's web files, and once a change has held still for one tick and serve has no source poll, dashboard request or chat message of its own in flight, it checks that the new code imports and then replaces itself with a fresh serve in the same process. Runs and sessions are processes of their own, so they keep going across the restart, and the fresh serve reaps each one when it ends. New code that does not import is named in the serve log, and serve keeps the code it started with. A self restart is not a start, so loops with `run_at_load` do not fire again. So a push to arete's own main, followed by a fast forward of the checkout serve runs from, reaches serve with no restart by hand.
 
 ## Loops
 
@@ -388,6 +388,8 @@ A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), W
 It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
 Below 1040 px the sidebar wraps into a block above the page.
 Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME` and `#ticket/REF`, so reload, Back and Forward put you where you were.
+An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find or the key list open, text selected or an action still going.
+Then the status line says what the new version waits for.
 Close or Escape on an open item goes back to where you opened it, with focus on its row.
 Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, ticket or action.
 `g` and a letter goes to a view, `c` opens or closes the console, and `?` lists the keys.

@@ -144,7 +144,7 @@ function show(viewChanged, way) {
       document.getElementById(`${pane.id}-body`).replaceChildren(detail ? quiet("Loading") : "");
       document.getElementById(`${pane.id}-talk`).replaceChildren();
       pane.scrollTop = 0;
-      pendingDetailFocus = Boolean(detail) && way !== "start";
+      pendingDetailFocus = Boolean(detail) && way !== "start" && way !== "reload";
     }
   }
   for (const a of section.querySelectorAll("a[data-row]")) {
@@ -216,6 +216,7 @@ function refocus(mark, fallback = null) {
 }
 
 function afterDraw() {
+  putBackPlace();
   if (restoreAfterDraw) {
     const { scroll, focus } = restoreAfterDraw;
     restoreAfterDraw = null;

@@ -233,6 +233,20 @@ function scrollersByPlace(box) {
   return found;
 }
 
+function scrolledIn(box) {
+  return [...scrollersByPlace(box)].filter(([, node]) => node.scrollLeft || node.scrollTop)
+    .map(([key, node]) => [key, node.scrollLeft, node.scrollTop, node.scrollTop + node.clientHeight >= node.scrollHeight - 4]);
+}
+
+function scrollBack(box, scrolled) {
+  if (!scrolled.length) return;
+  const rebuilt = scrollersByPlace(box);
+  for (const [key, left, top, atEnd] of scrolled) {
+    const node = rebuilt.get(key);
+    node?.scrollTo(left, atEnd ? node.scrollHeight : top);
+  }
+}
+
 function fill(id, ...nodes) {
   const box = document.getElementById(id);
   const fresh = nodes.flat(Infinity).filter(Boolean).map(asNode);
@@ -244,8 +258,7 @@ function fill(id, ...nodes) {
   const focusedId = shownMarks.idOf(document.activeElement);
   const caret = focusedId ? caretIn(document.activeElement) : null;
   const selected = selectionIn(box, shownMarks);
-  const scrolled = [...scrollersByPlace(box)].filter(([, node]) => node.scrollLeft || node.scrollTop)
-    .map(([key, node]) => [key, node.scrollLeft, node.scrollTop]);
+  const scrolled = scrolledIn(box);
   box.append(...fresh);
   const freshMarks = new Marks(fresh);
   // Focus moves to the copy while the old element is still there, so a keyboard focus ring carries over.
@@ -253,8 +266,7 @@ function fill(id, ...nodes) {
   refocused?.focus({ preventScroll: true });
   keepCaret(refocused, caret);
   for (const node of shown) node.remove();
-  const rebuilt = scrolled.length ? scrollersByPlace(box) : new Map();
-  for (const [key, left, top] of scrolled) rebuilt.get(key)?.scrollTo(left, top);
+  scrollBack(box, scrolled);
   keepSelection(box, selected, freshMarks);
   keepPlace(place, shownMarks, freshMarks);
 }

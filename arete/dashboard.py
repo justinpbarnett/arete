@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -37,12 +39,8 @@ from . import (
 )
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
-STATIC = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/app.css": ("app.css", "text/css; charset=utf-8"),
-    "/pattern.css": ("pattern.css", "text/css; charset=utf-8"),
-    **{f"/{script.name}": (script.name, "text/javascript; charset=utf-8") for script in sorted(WEB_DIR.glob("*.js"))},
-}
+WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
+CODE_MARK = b'<meta name="arete-code" content="">'
 TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
                   "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
 TAILSCALE_AS_CLI = {"TAILSCALE_BE_CLI": "1"}
@@ -70,6 +68,31 @@ USAGE_TAB = re.compile(r"[0-9a-f]{16}")
 USAGE_MOST_MS = 24 * 60 * 60 * 1000
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+
+
+def web_files() -> list[Path]:
+    return sorted(f for f in WEB_DIR.iterdir() if f.suffix in WEB_TYPES)
+
+
+def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
+    bodies = {f: f.read_bytes() for f in web_files()}
+    digest = hashlib.sha256()
+    for f, body in bodies.items():
+        digest.update(f"{f.name}\0{len(body)}\0".encode())
+        digest.update(body)
+    code = digest.hexdigest()[:12]
+    served = {}
+    for f, body in bodies.items():
+        if f.name == "index.html":
+            if CODE_MARK not in body:
+                raise RuntimeError(f"index.html lost {CODE_MARK.decode()}, so an open page could not tell when its code is old.")
+            served["/"] = (body.replace(CODE_MARK, f'<meta name="arete-code" content="{code}">'.encode()), WEB_TYPES[f.suffix])
+        else:
+            served[f"/{f.name}"] = (body, WEB_TYPES[f.suffix])
+    return code, served
+
+
+WEB_CODE, WEB = web_snapshot()
 
 
 def tailscale(*args: str) -> dict:
@@ -194,8 +217,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
-            if method == "GET" and path in STATIC:
-                return self.send_static(*STATIC[path])
+            if method == "GET" and path in WEB:
+                return self.send(200, *WEB[path], "no-cache")
             if method == "POST" and path.startswith(hooks.HOOK_PATH):
                 got = hooks.receive(unquote(path[len(hooks.HOOK_PATH):]), self.headers, self.raw_body())
                 return self.send_json(202 if got["queued"] else 200, got)
@@ -391,9 +414,6 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(400, "The request body is not a JSON object.")
         return data
 
-    def send_static(self, name: str, kind: str) -> None:
-        self.send(200, (WEB_DIR / name).read_bytes(), kind, "no-cache")
-
     def send_json(self, status: int, data) -> None:
         self.send(status, json.dumps(data, default=str).encode(), "application/json", "no-store")
 
@@ -402,6 +422,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", cache)
+        self.send_header("X-Arete-Code", WEB_CODE)
         self.send_header("Content-Security-Policy", PAGE_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
