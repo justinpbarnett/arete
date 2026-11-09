@@ -41,7 +41,6 @@ nav.side #console-open[aria-expanded="true"] { background: var(--ink); color: va
   .page h1 { font-size: 32px; }
 }
 
-/* sections */
 main:focus { outline: 0; }
 main h2 { margin-top: 44px; }
 #live > h2:first-child, #settings > h2:first-child, #usage > .seg + p + h2 { margin-top: 8px; }
@@ -71,7 +70,6 @@ tr:has(a[aria-current="true"]) > td, tr:has(+ tr a[aria-current="true"]) > td { 
 #launch h2, #loop-new h2 { margin-top: 0; }
 #launch textarea, #loop-new textarea, form.talk textarea, #chat textarea { width: 100%; }
 
-/* open item */
 .split.has-detail > .list { display: none; }
 .split > .list, .split > .detail { container-type: inline-size; }
 .detail-head .kicker { font-size: 12.5px; }
@@ -99,7 +97,6 @@ form.talk .actions { margin: 6px 0 10px; }
   .split.has-detail:not(.full) .detail > [id$="-talk"]:not(:empty) { position: sticky; bottom: 0; background: var(--ground); border-top: 1px solid var(--rule); padding-top: 12px; }
 }
 
-/* narrow */
 @container (max-width: 719.98px) {
   .wide-only { display: none; }
   .wide > table { min-width: 0; }
@@ -118,7 +115,6 @@ form.talk .actions { margin: 6px 0 10px; }
   tr:has(a[aria-current="true"]) { border-bottom-color: var(--ink); }
 }
 
-/* console */
 .console { position: fixed; top: 0; right: 0; bottom: 0; z-index: 20; width: 440px; max-width: 100vw; display: flex; flex-direction: column;
   background: var(--ground); border-left: 1px solid var(--ink); padding: 0 20px; }
 .console-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0 12px; border-bottom: 1px solid var(--rule); }
@@ -147,7 +143,6 @@ form.talk .actions { margin: 6px 0 10px; }
 .draft h3 { margin-top: 12px; }
 #draft-body { margin: 0; padding: 0; border: 0; max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-/* find and keys */
 dialog { background: var(--ground); color: var(--ink); border: 1px solid var(--ink); padding: 20px 24px 8px; width: min(680px, calc(100vw - 32px)); max-height: calc(100vh - 64px); }
 dialog::backdrop { background: var(--ground); opacity: .85; }
 #palette { margin: 10vh auto auto; }
@@ -169,7 +164,6 @@ dl.keys-list { grid-template-columns: max-content 1fr; gap: 8px 18px; font-size:
   dl.keys-list dd { margin-bottom: 8px; }
 }
 
-/* charts */
 .chart { display: block; max-width: 100%; height: auto; margin: 18px 0 30px; overflow: visible; }
 .chart .frame { fill: var(--ground); stroke: var(--ink); stroke-width: 1; shape-rendering: crispEdges; }
 .chart .frame.this { fill: var(--ink); }
@@ -178,7 +172,6 @@ dl.keys-list { grid-template-columns: max-content 1fr; gap: 8px 18px; font-size:
 .chart .fig { font-family: var(--read); font-size: 12px; fill: var(--ink); }
 .chart .name { font-family: var(--mark); font-size: 12px; letter-spacing: .14em; fill: var(--ink); }
 
-/* table columns */
 th.c-kind { width: 110px; }
 th.c-cost { width: 90px; }
 th.c-n { width: 90px; }
@@ -221,7 +214,6 @@ td details[open] > summary { margin-bottom: 8px; }
 .detail-head .actions button { min-width: 0; }
 td.probe-cell button { min-width: 110px; }
 
-/* the rest */
 ol.questions { margin: 0 0 14px; padding-left: 20px; }
 ol.questions li { margin: 0 0 6px; }
 pre.fold-text { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
