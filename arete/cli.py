@@ -276,6 +276,7 @@ def cmd_jira_check(args) -> int:
         print(f"jira {client.base} as {me.get('displayName') or me.get('emailAddress') or '?'}")
         routes = pipeline.jira_routes_by_project(cfg)
         targets = [(f"[jira.transitions] {k}", k, v) for k, v in cfg.jira.transitions.items()]
+        targets += [(f"[jira.research] {k}", f"research {k}", v) for k, v in cfg.jira.research.items()]
         targets += [(f"[jira.landed] {k}", f"landed on {k}", v) for k, v in cfg.jira.landed.items()]
         for project, labels in sorted(routes.items()):
             jql = tracker.candidates_jql(project)

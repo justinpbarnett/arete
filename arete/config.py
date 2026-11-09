@@ -46,7 +46,7 @@ class Repo:
 
 STATES = ("running", "pr", "failed", "needs-info")
 DELIVERED = "done"
-MOVES = (*STATES, DELIVERED)
+RESEARCH_MOVES = ("running", "pr", "failed", DELIVERED)
 DASHBOARD_PORT = 8796
 
 
@@ -55,6 +55,7 @@ class JiraConfig:
     env_file: Path | None = None
     project: str = ""
     transitions: dict[str, str] = field(default_factory=dict)
+    research: dict[str, str] = field(default_factory=dict)
     landed: dict[str, str] = field(default_factory=dict)
     auto: bool = False
     auto_per_refresh: int = 3
@@ -160,6 +161,14 @@ class Config:
         return sorted(set(self.models) - set(MODEL_ROLES))
 
 
+def moves_table(jira: dict, table: str, states: tuple[str, ...], hints: dict[str, str] | None = None) -> dict[str, str]:
+    moves = {str(k): str(v) for k, v in (jira.get(table) or {}).items() if v}
+    if bad := sorted(set(moves) - set(states)):
+        raise ValueError(f"[jira.{table}]: unknown state {', '.join(bad)}; use {', '.join(states)}"
+                         + "".join(f"; {hints[b]}" for b in bad if b in (hints or {})))
+    return moves
+
+
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
     if not path.exists():
@@ -188,14 +197,12 @@ def load(path: Path | None = None) -> Config:
     cfg.pricing = {str(m): (float(r.get("input", 0)), float(r.get("output", 0)))
                    for m, r in (pricing.get("models") or {}).items()}
     j = data.get("jira", {})
-    transitions = {k: str(v) for k, v in (j.get("transitions") or {}).items() if v}
-    if bad := sorted(set(transitions) - set(MOVES)):
-        raise ValueError(f"[jira.transitions]: unknown state {', '.join(bad)}; use {', '.join(MOVES)}"
-                         + ("; merges move tickets through [jira.landed]" if "merged" in bad else ""))
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
         project=j.get("project", ""),
-        transitions=transitions,
+        transitions=moves_table(j, "transitions", STATES, {"merged": "merges move tickets through [jira.landed]",
+                                                            DELIVERED: "research tickets move through [jira.research]"}),
+        research=moves_table(j, "research", RESEARCH_MOVES),
         landed={str(branch): str(target) for branch, target in (j.get("landed") or {}).items() if target},
         auto=bool(j.get("auto", False)),
         auto_per_refresh=max(0, int(j.get("auto_per_refresh", JiraConfig.auto_per_refresh))),

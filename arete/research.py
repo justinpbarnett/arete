@@ -135,7 +135,7 @@ def file_in_home(cfg: config.Config, h: Home, r: dict) -> tuple[bool, str]:
 
 
 def jira_target(cfg: config.Config, r: dict, to: str) -> str:
-    return cfg.jira.transitions.get(to, "") if r["tracker"] == "jira" else ""
+    return cfg.jira.research.get(to, "") if r["tracker"] == "jira" else ""
 
 
 def move(cfg: config.Config, r: dict, to: str) -> None:
