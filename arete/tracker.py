@@ -129,7 +129,8 @@ class GitHubTracker:
         return sorted(out, key=lambda t: t.created)
 
     def by_owner(self, item: dict) -> bool:
-        return (item.get("author") or {}).get("login") == self.owner
+        login = (item.get("author") or {}).get("login") or ""
+        return bool(login) and login.lower() == self.owner.lower()
 
     def blocker(self, tid: str) -> str:
         return ""
