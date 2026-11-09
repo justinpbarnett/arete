@@ -88,8 +88,8 @@ def draft_prompt(request: DraftRequest, cfg: config.Config, taken: set[str]) -> 
     return "\n\n".join(parts)
 
 
-def check_draft(draft: dict, cfg: config.Config, taken: set[str], work: Path) -> tuple[Path, str]:
-    name = str(draft.get("name") or "").strip()
+def check_draft(draft: dict, wanted: str, cfg: config.Config, taken: set[str], work: Path) -> tuple[Path, str]:
+    name = wanted or str(draft.get("name") or "").strip()
     if not loops.NAME.match(name):
         return Path(), f"the name '{name}' must be lowercase letters, digits and dashes"
     if name in taken:
@@ -216,7 +216,7 @@ def draft_until_valid(run_id: str, request: DraftRequest, cfg: config.Config, ta
                 break
             continue
         answer = res.structured or {}
-        folder, problem = check_draft(answer, cfg, taken, work)
+        folder, problem = check_draft(answer, request.name, cfg, taken, work)
         if not problem:
             break
         tell("draft", f"  the draft did not validate: {problem}")
