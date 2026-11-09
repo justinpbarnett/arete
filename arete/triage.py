@@ -479,15 +479,16 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
             failed[c.ref] = error
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
     with util.lock(BOARD_LOCK, wait=True):
+        board = {r["ref"]: r for r in state.triage_rows()}
         sent = {a["ref"]: a["ts"] for a in state.triage_approvals()}
         delivered = delivered_since()
         for src in srcs:
             if src.name in read:
                 state.triage_replace(src.name, [
-                    answered.get(c.ref) or kept(src, c, old.get(c.ref),
+                    answered.get(c.ref) or kept(src, c, board.get(c.ref),
                                                 f"triage failed: {failed[c.ref]}" if c.ref in failed else WAITING)
                     for c in read[src.name] if not sent_since_read(c, sent)]
-                    + still_shown(src, read[src.name], old, delivered))
+                    + still_shown(src, read[src.name], board, delivered))
         state.triage_prune([s.name for s in srcs])
     approved, held = approve_ready(cfg, srcs)
     keep = {record_file(r["ref"]).name for r in state.triage_rows()}
