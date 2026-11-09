@@ -117,7 +117,7 @@ function quiet(sentence) {
 }
 
 function link(href, text) {
-  return /^https:\/\//.test(href || "") ? el("a", { href, rel: "noreferrer", target: "_blank", text }) : document.createTextNode(text);
+  return /^https:\/\//.test(href || "") ? el("a", { href, rel: "noreferrer", target: "_blank", "data-focus": `link:${href}`, text }) : document.createTextNode(text);
 }
 
 function wholeWords(text) {
