@@ -669,8 +669,8 @@ def cmd_webhook(args) -> int:
     from . import control, dashboard, hooks
 
     try:
-        loop = control.find_loop(args.name)
-    except control.NotFound as e:
+        loop = control.working_loop(args.name)
+    except (control.NotFound, control.Refused) as e:
         return refused(e)
     if not loop.trigger.webhook:
         print(f"{loop.name} has no webhook; set `webhook = true` under [trigger] in {paths.short_path(loop.file)}",
