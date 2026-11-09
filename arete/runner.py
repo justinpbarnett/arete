@@ -112,7 +112,8 @@ def claude_login() -> tuple[bool, str]:
 
 
 def cost_note(res: Result) -> str:
-    return f"({util.count(res.turns, 'turn')}, ${res.cost_usd:.2f})"
+    paid = "subscription" if res.runner == "claude" else f"${res.cost_usd:.2f}"
+    return f"({util.count(res.turns, 'turn')}, {paid})"
 
 
 def priced(res: Result, cfg: config.Config) -> float:

@@ -53,10 +53,7 @@ def spent(run_id: str) -> float:
 
 
 def metered_spent(run_id: str) -> float:
-    with state.db() as c:
-        total = c.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM steps WHERE run_id = ? "
-                          "AND COALESCE(runner, '') != 'claude'", (run_id,)).fetchone()[0]
-    return round(float(total), 6)
+    return round(state.paid_by_run([run_id]).get(run_id, 0.0), 6)
 
 
 def note(run_id: str, **fields) -> None:

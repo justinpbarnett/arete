@@ -9,6 +9,8 @@ from . import paths, util
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
+PAID_STEP = "COALESCE(steps.runner, '') != 'claude'"
+USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -288,6 +290,18 @@ CREATE TABLE IF NOT EXISTS research (
     moved TEXT DEFAULT '',         -- the state arete last moved the ticket into: running | failed | pr | done
     delivered TEXT DEFAULT ''      -- when arete moved the ticket to its done status
 );
+CREATE TABLE IF NOT EXISTS usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    tab TEXT,                      -- one browser tab's random id
+    device TEXT,                   -- desktop | phone
+    kind TEXT,                     -- visit | action
+    view TEXT,
+    name TEXT,                     -- the action's name; empty on a visit
+    via TEXT,                      -- how a visit began: start | sidebar | key | palette | link | back | return
+    ms INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS usage_at ON usage (at);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
@@ -361,6 +375,38 @@ def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, conn
         return [dict(r) for r in c.execute(q, args)]
 
 
+def runs_page(statuses: tuple[str, ...] = (), kind: str = "", repo: str = "", loop: str = "", limit: int = 25,
+              connect=db) -> list[dict]:
+    q, args = f"SELECT * FROM runs WHERE NOT {FIRINGS}", []
+    for column, value in (("kind", kind), ("repo", repo), ("loop", loop)):
+        if value:
+            q += f" AND {column} = ?"
+            args.append(value)
+    if statuses:
+        q += f" AND status IN ({','.join('?' * len(statuses))})"
+        args.extend(statuses)
+    q += " ORDER BY status = 'running' DESC, started DESC, rowid DESC LIMIT ?"
+    args.append(limit)
+    with connect() as c:
+        return [dict(r) for r in c.execute(q, args)]
+
+
+def run_facets(connect=db) -> dict[str, list[str]]:
+    with connect() as c:
+        return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "
+                                                 f"AND COALESCE({column}, '') != '' ORDER BY 1")]
+                for column in ("kind", "repo", "loop")}
+
+
+def paid_by_run(run_ids: list[str], connect=db) -> dict[str, float]:
+    if not run_ids:
+        return {}
+    with connect() as c:
+        rows = c.execute(f"SELECT run_id, SUM(cost_usd) FROM steps WHERE run_id IN ({','.join('?' * len(run_ids))}) "
+                         f"AND {PAID_STEP} GROUP BY run_id", run_ids)
+        return {r[0]: float(r[1] or 0) for r in rows}
+
+
 def runs_since(since: str, connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
@@ -399,10 +445,12 @@ def steps(run_id: str, connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
 
 
-def steps_since(since: str, connect=db) -> list[dict]:
+def steps_since(since: str, connect=db, paid_only: bool = False) -> list[dict]:
+    paid = f" AND {PAID_STEP}" if paid_only else ""
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT s.*, r.loop, r.kind, r.repo FROM steps s LEFT JOIN runs r "
-                                           "ON r.id = s.run_id WHERE s.ts >= ? ORDER BY s.ts", (since,))]
+        return [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind, r.repo FROM steps LEFT JOIN runs r "
+                                           f"ON r.id = steps.run_id WHERE steps.ts >= ?{paid} ORDER BY steps.ts",
+                                           (since,))]
 
 
 def add_feed(run_id: str, kind: str, text: str) -> None:
@@ -670,8 +718,8 @@ def take_messages(run_id: str) -> list[str]:
 
 
 def loop_spent_since(since: str, loop: str | None = None) -> float:
-    q = ("SELECT COALESCE(SUM(s.cost_usd), 0) FROM steps s JOIN runs r ON r.id = s.run_id "
-         "WHERE s.ts >= ? AND r.kind = 'loop' AND COALESCE(s.runner, '') != 'claude'")
+    q = ("SELECT COALESCE(SUM(steps.cost_usd), 0) FROM steps JOIN runs r ON r.id = steps.run_id "
+         f"WHERE steps.ts >= ? AND r.kind = 'loop' AND {PAID_STEP}")
     args: list = [since]
     if loop:
         q += " AND r.loop = ?"
@@ -1032,3 +1080,14 @@ def research_prune(refs: list[str]) -> None:
 def triage_prune(sources: list[str]) -> None:
     with db() as c:
         c.execute(f"DELETE FROM triage WHERE source NOT IN ({','.join('?' * len(sources))})", sources)
+
+
+def add_usage(row: dict, keep_days: float) -> None:
+    with db() as c:
+        c.execute(insert_sql("usage", USAGE_COLUMNS), tuple(row.get(k) for k in USAGE_COLUMNS))
+        c.execute("DELETE FROM usage WHERE at < ?", (util.iso(util.now() - timedelta(days=keep_days)),))
+
+
+def usage_since(since: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM usage WHERE at >= ? ORDER BY at", (since,))]

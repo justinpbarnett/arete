@@ -102,7 +102,7 @@ def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]
     running = {r["loop"]: r["id"] for r in state.runs_marked_running(connect) if r["kind"] == "loop"}
     waiting = Counter(item["loop"] for item in state.pending(connect))
     spent: dict[str, float] = defaultdict(float)
-    for s in state.steps_since(day_ago(), connect):
+    for s in state.steps_since(day_ago(), connect, paid_only=True):
         spent[s.get("loop") or ""] += s["cost_usd"] or 0
     out = []
     for loop in every_loop:
@@ -121,8 +121,10 @@ def loop_detail(name: str, connect=state.db) -> dict:
     loop = find_loop(name, cfg)
     view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
     source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
+    runs = state.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
+    paid = state.paid_by_run([r["id"] for r in runs], connect)
     return {**view, "prompt": loops.prompt_text(loop), "state": state.loop_state(loop.name, connect)["data"],
-            "runs": state.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect),
+            "runs": [{**r, "paid": round(paid.get(r["id"], 0), 4)} for r in runs],
             "findings": state.findings(loop.name, 40, connect),
             "waiting": [i for i in state.pending(connect) if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
@@ -178,7 +180,7 @@ def fleet() -> list[dict]:
         return [{**devices.LOCAL.view(), "probe": None, "error": str(e)}]
 
 
-def costs(days: float | None = None, connect=state.db) -> dict:
+def costs(days: float | None = None, connect=state.db, paid_only: bool = False) -> dict:
     days = COST_DAYS if days is None else days
     try:
         since = util.iso(util.now() - timedelta(days=days))
@@ -186,11 +188,11 @@ def costs(days: float | None = None, connect=state.db) -> dict:
         raise Refused(f"cannot look back {days:g} days: {e}") from e
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
-    for s in state.steps_since(since, connect):
+    for s in state.steps_since(since, connect, paid_only):
         cost = s["cost_usd"] or 0
         total += cost
-        keys = {"model": s["model"] or "?", "runner": s["runner"] or "?",
-                "loop": s.get("loop") or s.get("kind") or s.get("run_id") or "?",
+        keys = {"model": s["model"] or "no model", "runner": s["runner"] or "no runner",
+                "loop": s.get("loop") or s.get("kind") or s.get("run_id") or "no loop",
                 "day": util.parse_iso(s["ts"]).astimezone().strftime("%Y-%m-%d")}
         for group, key in keys.items():
             row = groups[group].setdefault(key, {"name": key, "cost_usd": 0.0, "steps": 0, "tokens_in": 0,

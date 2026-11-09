@@ -20,7 +20,6 @@ from . import (
     config,
     control,
     devices,
-    emits,
     engine,
     gh,
     hooks,
@@ -62,6 +61,11 @@ TRIAGE_PATH = "/api/triage/"
 SKIPPED_PATH = "/api/skipped/"
 PROPOSAL_PATH = "/api/proposals/"
 INSTALL_SECONDS = 120
+USAGE_KINDS = ("visit", "action")
+USAGE_TEXT_FIELDS = ("tab", "device", "view", "name", "via")
+USAGE_TEXT_CHARS = 80
+USAGE_MOST_MS = 24 * 60 * 60 * 1000
+KEEP_USAGE_DAYS = 90
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
@@ -145,7 +149,7 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502,
+STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
                      triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409}
@@ -215,10 +219,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, method: str, path: str, query: dict):
         if method == "GET":
-            if path == "/api/state":
-                return board.snapshot()
-            if path == "/api/trends":
-                return board.trends()
+            if path == "/api/frame":
+                return board.frame(chat.view())
+            if path == "/api/live":
+                return board.live_board(chat.view()["draft"])
+            if path == "/api/runs":
+                return board.runs_board(*(query.get(k, "") for k in ("status", "kind", "repo", "loop")),
+                                        limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
+            if path.startswith(RUN_PATH):
+                return board.run_board(unquote(path[len(RUN_PATH):]))
+            if path == "/api/health":
+                return board.health_board()
+            if path == "/api/triage":
+                return board.triage_view()
+            if path == "/api/outcomes":
+                return board.panel(board.outcomes)
+            if path == "/api/find":
+                return board.find()
+            if path == "/api/usage":
+                return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))) or 1)
             if path == "/api/settings":
                 return settings.current()
             if path == "/api/chat":
@@ -233,16 +252,12 @@ class Handler(BaseHTTPRequestHandler):
                 return control.loop_detail(unquote(path[len(LOOP_PATH):]), connect=state.reader)
             if path.startswith(FEED_PATH):
                 return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
-            if path == "/api/approvals":
-                return {"approvals": emits.waiting(connect=state.reader)}
-            if path == "/api/devices":
-                return {"devices": control.fleet()}
             if path == "/api/sessions":
                 return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
-            if path == "/api/costs":
-                return control.costs(float(whole_number(query["days"]) or 1) if "days" in query else None,
-                                     connect=state.reader)
         if method == "POST":
+            if path == "/api/usage":
+                state.add_usage(self.usage_row(), KEEP_USAGE_DAYS)
+                return {}
             if path == "/api/settings":
                 return settings.save(self.body())
             if path == "/api/chat":
@@ -332,6 +347,16 @@ class Handler(BaseHTTPRequestHandler):
         said = triage.send(config.load(), ref, questions, answers, str(b.get("repo") or ""))
         return {"ref": ref, "said": f"{said} {start_poll()}"}
 
+    def usage_row(self) -> dict:
+        b = self.body()
+        if b.get("kind") not in USAGE_KINDS:
+            raise Refusal(400, f"kind is one of {', '.join(USAGE_KINDS)}.")
+        ms = b.get("ms", 0)
+        if isinstance(ms, bool) or not isinstance(ms, int) or not 0 <= ms <= USAGE_MOST_MS:
+            raise Refusal(400, "ms is a whole number of milliseconds, at most a day.")
+        return {"at": util.iso(), "kind": b["kind"], "ms": ms,
+                **{k: str(b.get(k) or "")[:USAGE_TEXT_CHARS] for k in USAGE_TEXT_FIELDS}}
+
     def chat_text(self) -> str:
         text = str(self.body().get("text", "")).strip()
         if not text:
@@ -370,8 +395,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", PAGE_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def log_request(self, code="-", size="-") -> None:
         if self.command == "GET" and isinstance(code, int) and 200 <= code < 300:
@@ -454,6 +482,8 @@ def say(text: str) -> None:
 def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     cfg = config.load()
     port = port or cfg.dashboard_port
+    with state.db():
+        pass
     chat.settle_after_restart()
     logins = Logins()
     waiting_for = ""
