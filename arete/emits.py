@@ -167,6 +167,8 @@ class PullRequest(Emit):
                 "draft": bool(spec.get("draft", True)), "labels": as_list(spec.get("labels"))}
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
+        for label in item["labels"]:
+            gh.ensure_label(item["repo"], label, restyle=False)
         util.git(["push", "-u", "origin", item["branch"]], Path(item["workdir"]), timeout=300)
         return gh.pr_create(item["repo"], item["branch"], item["base"], item["title"], item["body"], item["labels"],
                             draft=item["draft"])
