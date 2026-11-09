@@ -120,8 +120,9 @@ def sh_with_network(cmd: list[str] | str, **kw) -> subprocess.CompletedProcess:
     return sh(cmd, **kw) if wait_for_network() else res
 
 
-def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None) -> str:
-    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input)
+def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None,
+        env: dict | None = None) -> str:
+    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env)
     if check and res.returncode != 0:
         raise RuntimeError(f"git {' '.join(args[:2])}: {git_error(res.stderr or res.stdout)}")
     return res.stdout

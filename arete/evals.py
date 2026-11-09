@@ -222,6 +222,14 @@ def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
                 "eval base"], staging).strip()
 
 
+def write_files_through_repo(repo_path: Path, snapshot: str, dest: Path) -> None:
+    env = {"GIT_DIR": git(["rev-parse", "--absolute-git-dir"], repo_path).strip(), "GIT_WORK_TREE": str(dest),
+           "GIT_INDEX_FILE": str(dest / ".git" / "index"),
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(dest / ".git" / "objects")}
+    git(["read-tree", snapshot], dest, env=env)
+    git(["checkout-index", "-a"], dest, timeout=600, env=env)
+
+
 def isolated_checkout(repo_path: Path, base: str, dest: Path) -> None:
     # Not a worktree: a worktree shares the remote refs, so the agent could read the real fix from origin/main.
     shutil.rmtree(dest, ignore_errors=True)
@@ -231,6 +239,7 @@ def isolated_checkout(repo_path: Path, base: str, dest: Path) -> None:
     with tempfile.TemporaryDirectory(prefix=f"{dest.name}-base-", dir=dest.parent) as staging:
         snapshot = commit_without_evals(repo_path, sha, Path(staging))
         git(["fetch", "-q", "--no-tags", staging, snapshot], dest, timeout=600)
+    write_files_through_repo(repo_path, snapshot, dest)
     git(["checkout", "-q", "-B", "main", "FETCH_HEAD"], dest)
 
 
