@@ -58,6 +58,10 @@ class Candidate:
     def name(self) -> str:
         return tracker.run_ticket_name(self.run)
 
+    @property
+    def job(self) -> str:
+        return f"{slug(self.name)}-pr-{gh.pr_number(self.pr_url)}"
+
 
 @dataclass
 class Outcome:
@@ -293,7 +297,7 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
         tally = {}
         with record.failed_on_crash(run_id):
             for c in picked:
-                job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / slug(c.name), task=slug(c.name))
+                job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / c.job, task=c.job)
                 try:
                     o = mine_one(cfg, job, c)
                 except Exception as e:
