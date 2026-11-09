@@ -38,8 +38,8 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
         state.alert_set(key, (prev or {}).get("issue"))
         return f"notified {key}"
     try:
-        if prev and prev.get("issue") and gh.issue_state(repo, prev["issue"]) == "OPEN":
-            state.alert_set(key, prev["issue"])
+        if prev and prev.get("issue") and prev.get("repo") in ("", repo) and gh.issue_state(repo, prev["issue"]) == "OPEN":
+            state.alert_set(key, prev["issue"], repo)
             return f"alert {key} still open (#{prev['issue']})"
         gh.ensure_label(repo, LABEL, "d93f0b", "Opened by arete heartbeat")
         body = (
@@ -49,7 +49,7 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
             "Arete closes this issue when the check passes again. Details: `arete status` on the Mac."
         )
         num = gh.issue_create(repo, f"[arete] {title}", body, [LABEL])
-        state.alert_set(key, num)
+        state.alert_set(key, num, repo)
         return f"opened #{num} for {key}"
     except gh.GhError as e:
         if not prev:
@@ -64,7 +64,7 @@ def clear_alert(repo: str, key: str, dry_run: bool = False) -> str | None:
         return None
     if dry_run:
         return f"would close alert {key}"
-    if repo and prev.get("issue"):
+    if repo and prev.get("issue") and prev.get("repo") in ("", repo):
         try:
             gh.issue_close(repo, prev["issue"], f"Recovered at {util.iso()}.")
         except gh.GhError as e:

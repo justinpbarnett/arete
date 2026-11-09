@@ -161,7 +161,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     key TEXT PRIMARY KEY,
     issue INTEGER,
     opened TEXT,
-    last_seen TEXT
+    last_seen TEXT,
+    repo TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS proposals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -323,6 +324,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("approvals", col, f"ALTER TABLE approvals ADD COLUMN {col} TEXT DEFAULT ''")
                 for col in ("plain_summary", "plain_summary_tried")],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
+              ("alerts", "repo", "ALTER TABLE alerts ADD COLUMN repo TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
@@ -808,12 +810,12 @@ def alert_get(key: str) -> dict | None:
         return dict(r) if r else None
 
 
-def alert_set(key: str, issue: int | None) -> None:
+def alert_set(key: str, issue: int | None, repo: str = "") -> None:
     prev = alert_get(key)
     with db() as c:
         c.execute(
-            "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen) VALUES (?,?,?,?)",
-            (key, issue, (prev or {}).get("opened") or util.iso(), util.iso()),
+            "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen, repo) VALUES (?,?,?,?,?)",
+            (key, issue, (prev or {}).get("opened") or util.iso(), util.iso(), repo or (prev or {}).get("repo") or ""),
         )
 
 
