@@ -800,6 +800,7 @@ async function refreshFeed(which) {
     if (which === "session") document.getElementById("session-go").disabled = data.run.status !== "running";
     if (stick) lines.scrollTop = lines.scrollHeight;
   } catch (e) {
+    feed.after = 0;
     lines.textContent = `The feed could not be read: ${e.message}`;
   }
 }
