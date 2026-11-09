@@ -295,7 +295,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
     server = Server()
     server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
     if with_dashboard:
-        threading.Thread(target=dashboard.serve, name="dashboard", daemon=True).start()
+        threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
     while True:
         started = time.monotonic()
         try:

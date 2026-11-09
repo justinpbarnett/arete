@@ -295,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "done":
                     return forget_proposal(whole_number(proposal_id))
             if path == "/api/serve/install":
-                return install_serve()
+                return install_serve(self.server.inside_serve)
         raise Refusal(404, f"Nothing at {method} {path}.")
 
     def loop_action(self, name: str, action: str):
@@ -386,9 +386,9 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: str, port: int, node: Node, logins: Logins):
+    def __init__(self, address: str, port: int, node: Node, logins: Logins, inside_serve: bool):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
-        self.node, self.logins = node, logins
+        self.node, self.logins, self.inside_serve = node, logins, inside_serve
         super().__init__((address, port), Handler)
 
 
@@ -410,11 +410,10 @@ def forget_proposal(proposal_id: int) -> dict:
     return {"id": proposal_id}
 
 
-def install_serve() -> dict:
-    beat = control.serve_beat()
-    if beat.get("alive"):
+def install_serve(inside_serve: bool) -> dict:
+    if control.serve_beat().get("alive"):
         raise Refusal(409, "Serve is already up, so it needs no install")
-    if beat.get("pid") == os.getpid():
+    if inside_serve:
         control.detach(["install"], "install.log")
         return {"restarting": True}
     res = util.sh([sys.executable, "-m", "arete.cli", "install"], timeout=INSTALL_SECONDS)
@@ -436,11 +435,11 @@ def start_poll() -> str:
     return "Started a poll to build it."
 
 
-def open_servers(node: Node, port: int, logins: Logins) -> list[Server]:
+def open_servers(node: Node, port: int, logins: Logins, inside_serve: bool) -> list[Server]:
     servers: list[Server] = []
     try:
         for address in node.addresses:
-            servers.append(Server(address, port, node, logins))
+            servers.append(Server(address, port, node, logins, inside_serve))
     except OSError:
         for s in servers:
             s.server_close()
@@ -452,7 +451,7 @@ def say(text: str) -> None:
     print(f"{util.iso()} {text}", flush=True)
 
 
-def serve(port: int | None = None) -> NoReturn:
+def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     cfg = config.load()
     port = port or cfg.dashboard_port
     chat.settle_after_restart()
@@ -463,7 +462,7 @@ def serve(port: int | None = None) -> NoReturn:
         try:
             if node is None:
                 raise OSError("tailscale is not running or reports no address")
-            servers = open_servers(node, port, logins)
+            servers = open_servers(node, port, logins, inside_serve)
         except OSError as e:
             if str(e) != waiting_for:
                 say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
