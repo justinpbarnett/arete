@@ -430,11 +430,22 @@ def stage(checkouts: list[Checkout], deny: list[str]) -> Staged:
             continue
         out += diff
         out.changed.append(c)
-        out.patch += git(["diff", "--cached", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
-                          "--", ".", *(f":(exclude){name.removeprefix(c.prefix)}" for name in diff.locks)], c.wt)
-        if diff.locks:
-            out.patch += f"\n(lockfile changes not shown: {', '.join(diff.locks)})\n"
+        out.patch += checkout_patch(c, diff.locks, "--cached")
     return out
+
+
+def checkout_patch(c: Checkout, locks: list[str], *revs: str) -> str:
+    patch = git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}", *revs,
+                 "--", ".", *(f":(exclude){name.removeprefix(c.prefix)}" for name in locks)], c.wt)
+    return patch + (f"\n(lockfile changes not shown: {', '.join(locks)})\n" if locks else "")
+
+
+def patch_from_base(checkouts: list[Checkout]) -> str:
+    patch = ""
+    for c in checkouts:
+        since_base = f"{c.origin_base}...HEAD"
+        patch += checkout_patch(c, diffguard.between(c.wt, since_base, prefix=c.prefix).locks, since_base)
+    return patch
 
 
 def lines_by_file(staged: Staged, top: int = 12) -> str:
@@ -980,7 +991,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     if not draft_why and layer.trust_level == "automerge" and approval and approval["sent_by"] == "triage":
         run.log("automerge left off: triage approved the ticket, so a person merges it")
     elif not draft_why and layer.trust_level == "automerge":
-        risk = jev.risk(staged.patch, f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,
+        risk = jev.risk(patch_from_base(opened), f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,
                         trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [repo]) else None
         for c in opened:
             try:
