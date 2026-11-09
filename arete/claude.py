@@ -23,6 +23,10 @@ EVERY_MODEL = "claude"
 LIMIT_SLACK_SECONDS = 60
 LIMIT_RECHECK_SECONDS = 1800
 MILLISECOND_STAMPS = 1e12
+BACKGROUND_TASK_CLEANUP_SECONDS = 30
+BACKGROUND_NOTE = ("A command you run in the background keeps this session open after your final answer until it ends. "
+                   "Before you answer, stop with TaskStop each background command you started that does not end on its "
+                   "own, such as a server or a watcher. This is housekeeping, so leave it out of your answer.")
 
 
 def binary() -> str:
@@ -55,7 +59,8 @@ def run(
     cmd = ["claude" if remote else binary(), "-p", "--output-format", "json", "--permission-mode", permission_mode]
     if model:
         cmd += ["--model", model]
-    cmd += ["--tools", ",".join(tool_set(tools, allowed_tools or []))]
+    tool_names = tool_set(tools, allowed_tools or [])
+    cmd += ["--tools", ",".join(tool_names)]
     if allowed_tools:
         roots = [remote_root(cwd)] if remote else local_roots([cwd, *add_dirs])
         cmd += ["--allowedTools", *scoped_to(roots, allowed_tools)]
@@ -66,6 +71,7 @@ def run(
         cmd += ["--resume", resume.id]
     if fresh_session:
         cmd += ["--session-id", fresh_session]
+    system = "\n\n".join(filter(None, [system, BACKGROUND_NOTE if "Bash" in tool_names else ""]))
     if system:
         cmd += ["--append-system-prompt", system]
     if max_budget_usd:
@@ -87,10 +93,7 @@ def run(
         cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd,
                            {"ARETE_AGENT": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
     try:
-        proc = subprocess.run(
-            cmd, cwd=None if remote else str(cwd), input=prompt, capture_output=True, text=True, timeout=timeout,
-            errors="replace", env=env, check=False,
-        )
+        proc = run_with_graceful_timeout(cmd, None if remote else str(cwd), prompt, env, timeout)
     except subprocess.TimeoutExpired:
         session = Session(fresh_session, 0.0, "claude") if fresh_session else resume
         return Result(ok=False, session=session, error=f"timed out after {timeout}s")
@@ -142,6 +145,23 @@ def run(
         model=next(iter(data.get("modelUsage") or {}), model),
         provider="anthropic",
     )
+
+
+def run_with_graceful_timeout(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str],
+                              timeout: float) -> subprocess.CompletedProcess:
+    child = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors="replace", env=env)
+    try:
+        out, err = child.communicate(prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        child.terminate()
+        try:
+            child.communicate(timeout=BACKGROUND_TASK_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, child.returncode, out, err)
 
 
 def tool_set(tools: list[str] | None, rules: list[str]) -> list[str]:
