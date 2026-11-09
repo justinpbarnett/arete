@@ -139,6 +139,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             kw = local_claude(kw, cwd, cfg, trace[0])
     else:
         kw["price"] = lambda reply: priced(reply, cfg)
+    limited: list[Result] = []
     while True:
         if wait_out_limits and (held := usage_hold(name, which)):
             say(hold_words(held))
@@ -149,16 +150,24 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         if not res.usage_limit:
             if which == "claude" and res.ok:
                 state.clear_holds([s for s in LIMIT_SCOPES if limit_applies(s, res.model)], set_before=started)
-            return res
+            return with_spent(res, limited)
         limit = res.usage_limit
         state.hold(limit.scope, limit.until, f"claude {limit.kind or 'usage'} limit reached")
         if not wait_out_limits:
             return res
+        limited.append(res)
         say(hold_words({"why": f"claude {limit.kind or 'usage'} limit reached", "until": limit.until}))
         wait_out(limit.scope)
         say("the claude usage limit has lifted, going on")
         if res.session.id and res.turns > 1 and kw.get("persist", True):
             prompt, resume = CONTINUE_AFTER_LIMIT, res.session
+
+
+def with_spent(res: Result, earlier: list[Result]) -> Result:
+    res.cost_usd += sum(r.cost_usd for r in earlier)
+    res.tokens_in += sum(r.tokens_in for r in earlier)
+    res.tokens_out += sum(r.tokens_out for r in earlier)
+    return res
 
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
