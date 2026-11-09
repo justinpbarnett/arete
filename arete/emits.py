@@ -197,6 +197,12 @@ class Push(Emit):
             return [f"a push emit's approve table takes {', '.join(PUSH_RULES)}, not {', '.join(unknown)}"]
         if not isinstance(approve, bool | dict):
             return ["a push emit's approve is true, false, or a table of lines, deletes and paths"]
+        rules = approve if isinstance(approve, dict) else {}
+        lines, globs = rules.get("lines", 0), rules.get("paths", [])
+        if isinstance(lines, bool) or not isinstance(lines, int):
+            return [f"a push emit's approve lines is a whole number of lines, such as 80, not {lines!r}"]
+        if not isinstance(globs, str | list) or not all(isinstance(g, str) for g in globs):
+            return [f"a push emit's approve paths is a list of path patterns, such as [\"src/auth/*\"], not {globs!r}"]
         return []
 
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
