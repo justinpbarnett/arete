@@ -745,7 +745,7 @@ def research_progress(r: dict, report: dict | None) -> str:
         return "queued for research" if in_sprint(r) else OUTSIDE_SPRINT
     if report["status"] == "running":
         return f"researching since {stamp(report['ts'])}"
-    if r.get("closed"):
+    if r.get("closed") and report["status"] == "done":
         return (f"report delivered {stamp(report.get('delivered') or r['closed'])}{filed_words(report)}, and arete "
                 "moved the ticket to done")
     again = ((", and the ticket changed since, so the loop checks it again" if in_sprint(r)
