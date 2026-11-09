@@ -24,14 +24,15 @@ nav.side #console-open[aria-expanded="true"] { background: var(--ink); color: va
 
 @media (max-width: 1039.98px) {
   .wrap.sidebar-page { display: block; }
-  nav.side { position: static; max-height: none; overflow: visible; margin: 0; padding: 16px 0 14px; border-bottom: 1px solid var(--rule);
-    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; }
-  nav.side .group { margin: 0; display: flex; align-items: baseline; gap: 6px 8px; }
-  nav.side .tools { flex-wrap: wrap; }
-  nav.side .group-name { flex: none; min-width: 6.4em; margin: 0 4px 0 0; }
-  nav.side ul.links { display: flex; flex-wrap: wrap; gap: 6px; }
-  nav.side .btn, nav.side .tools button { width: auto; padding: 7px 12px 6px; }
-  .side-foot { flex-basis: 100%; margin: 0; }
+  nav.side { position: static; max-height: none; overflow: visible; margin: 0; padding: 14px 0 12px; border-bottom: 1px solid var(--rule);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  nav.side .group, nav.side ul.links, nav.side .tools { display: contents; }
+  nav.side .group-name { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  nav.side li, nav.side .tools button { flex: 1 1 auto; }
+  nav.side .btn, nav.side .tools button { padding: 7px 9px 6px; font-size: 12px; }
+  nav.side .tools button { width: auto; }
+  .side-foot { margin: 0; }
+  .side-foot.hints { flex-basis: 100%; margin: 2px 0 0; }
   .page > header { padding-top: 24px; }
 }
 @media (pointer: coarse) {
