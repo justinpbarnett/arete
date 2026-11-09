@@ -238,7 +238,8 @@ def load_all(cfg: config.Config | None = None) -> list[Loop]:
         name = f"{repo}/{folder.name}" if repo else folder.name
         try:
             loop = load(folder, origin, repo, cfg)
-        except (LoopError, cron.BadSchedule, tomllib.TOMLDecodeError, ValueError, TypeError, KeyError) as e:
+        except (LoopError, cron.BadSchedule, tomllib.TOMLDecodeError, ValueError, TypeError, KeyError,
+                AttributeError) as e:
             loop = broken(name, folder, origin, str(e) if isinstance(e, LoopError | cron.BadSchedule)
                           else f"{type(e).__name__}: {e}")
         if not loop.error and name in switched:
