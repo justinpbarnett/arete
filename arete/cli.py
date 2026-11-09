@@ -275,10 +275,19 @@ def cmd_jira_check(args) -> int:
         me = client.me()
         print(f"jira {client.base} as {me.get('displayName') or me.get('emailAddress') or '?'}")
         routes = pipeline.jira_routes_by_project(cfg)
+        targets = [(f"[jira.transitions] {k}", k, v) for k, v in cfg.jira.transitions.items()]
+        targets += [(f"[jira.landed] {k}", f"landed on {k}", v) for k, v in cfg.jira.landed.items()]
         for project, labels in sorted(routes.items()):
             jql = tracker.candidates_jql(project)
             n = len(client.search(jql, ["labels"], limit=100))
             print(f"  {project}: {n} labeled `{tracker.LABEL}` and waiting; routes {', '.join(sorted(labels))}")
+            known = {s.lower() for s in client.statuses(project)}
+            for key, _, name in targets:
+                if name.lower() not in known:
+                    print(f"  {project}: no status named '{name}' for {key}; it moves a ticket only where a "
+                          "transition has that name")
+            if targets:
+                print(f"  {project}: moves " + ", ".join(f"{when} to {name}" for _, when, name in targets))
     except jira.JiraError as e:
         print(f"jira failed: {e}")
         return 1

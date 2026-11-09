@@ -370,7 +370,7 @@ def row(src: TriageSource, c: Candidate, **fields) -> dict:
     base = {"ref": c.ref, "source": src.name, "tracker": src.tracker, "repo": "", "route": "", "title": c.title,
             "url": c.url, "updated": "", "ready": None, "code": None, "kind": "", "size": "", "repos": [],
             "questions": [], "assumptions": [], "plan": [], "why": "", "cost": 0.0, "ts": util.iso(),
-            "in_sprint": c.in_sprint, "parent": c.parent}
+            "in_sprint": c.in_sprint, "parent": c.parent, "closed": ""}
     return {**base, **fields}
 
 
@@ -378,8 +378,22 @@ def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dic
     if prev and prev["ready"] is not None:
         route = src.route(prev["repo"]) if prev["route"] and prev["repo"] in src.by_name() else prev["route"]
         return {**prev, "source": src.name, "route": route, "title": c.title, "url": c.url, "in_sprint": c.in_sprint,
-                "parent": c.parent}
+                "parent": c.parent, "closed": ""}
     return row(src, c, why=reason)
+
+
+def delivered_since() -> dict[str, dict]:
+    since = util.iso(util.now() - timedelta(days=SENT_DAYS))
+    return {x["ref"]: x for x in state.research_rows() if (x.get("delivered") or "") >= since}
+
+
+def still_shown(src: TriageSource, read: list[Candidate], old: dict[str, dict],
+                delivered: dict[str, dict]) -> list[dict]:
+    open_refs = {c.ref for c in read}
+    return [{**old[ref], "closed": old[ref].get("closed") or x["delivered"],
+             "updated": x["updated"] or old[ref]["updated"]}
+            for ref, x in delivered.items()
+            if ref in old and old[ref]["source"] == src.name and ref not in open_refs]
 
 
 def sent_since_read(c: Candidate, sent: dict[str, str]) -> bool:
@@ -458,12 +472,14 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
     with util.lock(BOARD_LOCK, wait=True):
         sent = {a["ref"]: a["ts"] for a in state.triage_approvals()}
+        delivered = delivered_since()
         for src in srcs:
             if src.name in read:
                 state.triage_replace(src.name, [
                     answered.get(c.ref) or kept(src, c, old.get(c.ref),
                                                 f"triage failed: {failed[c.ref]}" if c.ref in failed else WAITING)
-                    for c in read[src.name] if not sent_since_read(c, sent)])
+                    for c in read[src.name] if not sent_since_read(c, sent)]
+                    + still_shown(src, read[src.name], old, delivered))
         state.triage_prune([s.name for s in srcs])
     approved, held = approve_ready(cfg, srcs)
     keep = {record_file(r["ref"]).name for r in state.triage_rows()}
@@ -721,11 +737,15 @@ def research_progress(r: dict, report: dict | None) -> str:
         return "queued for research" if in_sprint(r) else OUTSIDE_SPRINT
     if report["status"] == "running":
         return f"researching since {stamp(report['ts'])}"
+    if r.get("closed"):
+        return (f"report delivered {stamp(report.get('delivered') or r['closed'])}{filed_words(report)}, and arete "
+                "moved the ticket to done")
     again = ((", and the ticket changed since, so the loop checks it again" if in_sprint(r)
               else f", and the ticket changed since; {OUTSIDE_SPRINT}") if research_due(r, report) else "")
     why = OLD_RESEARCH_HINT.sub("", report["error"] or "")
     if report["status"] == "done":
-        return f"report ready {stamp(report['ts'])}{filed_words(report)}{again}"
+        unmoved = f"; {report['error']}" if report["error"] else ""
+        return f"report ready {stamp(report['ts'])}{filed_words(report)}{unmoved}{again}"
     if report["status"] == "held":
         return f"held: {why}{again}"
     if report["status"] in ("parent", "answered"):
@@ -738,6 +758,8 @@ def research_command(r: dict, report: dict | None) -> str:
     if report and report["status"] in NEEDS_FORCE:
         check = "check the ticket, then " if report["status"] == "held" else ""
         return f"{check}`arete research {ref} --run --force` researches it anyway"
+    if report and report["status"] == "failed" and not (in_sprint(r) and research_due(r, report)):
+        return f"`arete research {ref} --run` tries again"
     if not in_sprint(r) and research_due(r, report):
         return f"`arete research {ref} --run` researches it{' again' if report else ''}"
     return ""
@@ -784,9 +806,11 @@ def verdict(r: dict) -> str:
 
 def summary(v: dict) -> str:
     g = groups(v)
-    on_board = ", ".join(f"{len(g[s])} {s.lower()}" for s in STANDINGS if s != SENT)
-    return (f"{util.count(len(v['rows']), 'open ticket')}: {on_board}; {len(g[SENT])} sent to the pipeline in the last "
-            f"{SENT_DAYS} days")
+    shut = sum(1 for r in v["rows"] if r.get("closed"))
+    on_board = ", ".join(f"{sum(1 for r in g[s] if not r.get('closed'))} {s.lower()}" for s in STANDINGS if s != SENT)
+    delivered = f"; {shut} research delivered in the last {SENT_DAYS} days" if shut else ""
+    return (f"{util.count(len(v['rows']) - shut, 'open ticket')}: {on_board}; {len(g[SENT])} sent to the pipeline in "
+            f"the last {SENT_DAYS} days{delivered}")
 
 
 def auto_note(cfg: config.Config) -> str:

@@ -45,6 +45,8 @@ class Repo:
 
 
 STATES = ("running", "pr", "failed", "needs-info")
+DELIVERED = "done"
+MOVES = (*STATES, DELIVERED)
 DASHBOARD_PORT = 8796
 
 
@@ -186,8 +188,8 @@ def load(path: Path | None = None) -> Config:
                    for m, r in (pricing.get("models") or {}).items()}
     j = data.get("jira", {})
     transitions = {k: str(v) for k, v in (j.get("transitions") or {}).items() if v}
-    if bad := sorted(set(transitions) - set(STATES)):
-        raise ValueError(f"[jira.transitions]: unknown state {', '.join(bad)}; use {', '.join(STATES)}"
+    if bad := sorted(set(transitions) - set(MOVES)):
+        raise ValueError(f"[jira.transitions]: unknown state {', '.join(bad)}; use {', '.join(MOVES)}"
                          + ("; merges move tickets through [jira.landed]" if "merged" in bad else ""))
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
