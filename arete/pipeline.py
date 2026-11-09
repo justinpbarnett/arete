@@ -1264,7 +1264,8 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     logs.mkdir(exist_ok=True)
     if logs not in run.add_dirs:
         run.add_dirs.append(logs)
-    failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{slug(r.label)}.log") for r in reds)
+    failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{i}-{slug(r.label)}.log")
+                           for i, r in enumerate(reds, 1))
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
     left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""
     res = b.resume(b.next_step("ci_fix"), prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures,
