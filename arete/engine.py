@@ -90,6 +90,10 @@ class StoppedByAgent(Exception):
     pass
 
 
+class AgentFailed(Exception):
+    pass
+
+
 @dataclass
 class Workspace:
     src: Path
@@ -726,6 +730,14 @@ def stop_reason(idea: str) -> str:
     return idea[len(STOP_WORD):].strip() if idea.lower().startswith(STOP_WORD.lower()) else ""
 
 
+def empty_handed(stopped: str, unanswered_error: str, missed: str) -> tuple[str, str]:
+    if stopped:
+        return "done", f"the agent stopped the run: {stopped}"
+    if unanswered_error:
+        return "failed", f"agent failed on every try: {unanswered_error}"
+    return "done", missed
+
+
 def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str], files: list[str],
              keep_empty: bool = False) -> tuple[str, str]:
     res = run.agent(f"try {i}", attempt_prompt(run, goal, history, files), ws.wt, tools=run.loop.tools,
@@ -733,7 +745,7 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     idea = util.last_line(res.text or res.error or "", 200)
     if not res.ok:
         revert(ws.wt)
-        return "", f"the agent failed: {util.first_line(res.error, 200)}"
+        raise AgentFailed(util.first_line(res.error, 200) or "it gave no error text")
     if why := stop_reason(idea):
         revert(ws.wt)
         raise StoppedByAgent(why)
@@ -764,7 +776,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         return value, "" if value is not None else "did not print a number"
 
     ws = open_workspace(run)
-    kept, stopped = False, ""
+    kept, stopped, answered, agent_error = False, "", False, ""
     try:
         baseline, why = measure(ws.wt)
         if baseline is None:
@@ -776,6 +788,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         for i in range(1, run.loop.tries + 1):
             try:
                 idea, why_not = try_once(run, ws, i, goal + f" Best so far: {number_text(best)}.", history, files)
+                answered = True
             except OverBudget as e:
                 if i == 1:
                     raise
@@ -786,6 +799,8 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                 run.log("stop", f"try {i}: the agent stopped the run: {e}")
                 stopped = str(e)
                 break
+            except AgentFailed as e:
+                idea, why_not, agent_error = "", f"the agent failed: {e}", str(e)
             if not idea:
                 history.append(f"- try {i}: {why_not}")
                 run.log("try", f"try {i}: {why_not}")
@@ -804,8 +819,8 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                 history.append(f"- try {i}: reverted, {result}: {idea}")
                 run.log("revert", f"try {i}: {result}: {idea}")
         if not kept:
-            return "done", (f"the agent stopped the run: {stopped}" if stopped
-                            else f"no try beat the baseline {number_text(baseline)}")
+            return empty_handed(stopped, "" if answered else agent_error,
+                                f"no try beat the baseline {number_text(baseline)}")
         climbed = f"{number_text(baseline)} -> {number_text(best)}"
         summary = f"{spec['measure']}: {climbed}"
         outcome = {**ws.outcome_fields(), "value": best, "facts": summary, "summary": summary,
@@ -924,7 +939,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
     spec = run.loop.spec
     files = loops.as_list(spec.get("files"))
     ws = open_workspace(run)
-    fix, stopped, tries = "", "", 0
+    fix, stopped, tries, answered, agent_error = "", "", 0, False, ""
     held: dict[str, str] = {}
     held_proof: bytes | None = None
     try:
@@ -941,6 +956,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             try:
                 idea, why_not = try_once(run, ws, i, narrowing_goal(goal, ws, held, spec.get("proof", "")) if held
                                          else goal, history, files, keep_empty="proof" in held)
+                answered = True
             except OverBudget as e:
                 if i == 1:
                     raise
@@ -953,6 +969,8 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
                 run.log("stop", f"try {i}: the agent stopped the run: {e}")
                 stopped, tries = str(e), i
                 break
+            except AgentFailed as e:
+                idea, why_not, agent_error = "", f"the agent failed: {e}", str(e)
             tries = i
             if not idea:
                 if fix:
@@ -984,8 +1002,8 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             if not held:
                 break
         if not fix:
-            return "done", f"the agent stopped the run: {stopped}" if stopped else \
-                f"no hit in {util.count(tries, 'try', 'tries')}"
+            return empty_handed(stopped, "" if answered else agent_error,
+                                f"no hit in {util.count(tries, 'try', 'tries')}")
         outcome = search_outcome(run, ws, history, tries, fix)
         drop_worktree(ws)
         emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
