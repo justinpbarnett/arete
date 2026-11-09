@@ -514,14 +514,15 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     if dry_run:
         print(f"miner: dry run, {len(props)} proposals, cost ${res.cost_usd:.2f}")
         return 0
-    opened = []
+    opened, failures = [], []
     branch = miner_branch()
     for name, ps in by_repo.items():
         url, landed = "", []
         try:
             url, landed = apply_repo(cfg, run_id, cfg.repo(name), ps, branch)
         except Exception as e:
-            print(f"{name}: apply failed: {e}")
+            failures.append(f"{name}: apply failed: {type(e).__name__}: {util.first_line(str(e), 200)}")
+            print(failures[-1])
         for p in ps:
             if p in landed:
                 state.add_proposal(run_id, p, "applied", url)
@@ -532,6 +533,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             print(f"{name}: {url}")
             if name != cfg.global_repo:
                 eval_pr(cfg, cfg.repo(name), url, branch)
-    record.settle(run_id, "pr" if opened else "noop", summary=f"{len(props)} proposals, {len(opened)} PRs",
+    summary = "; ".join([f"{len(props)} proposals, {len(opened)} PRs", *failures])
+    record.settle(run_id, "failed" if failures else "pr" if opened else "noop", summary=summary[:300],
                   pr_url=" ".join(opened))
-    return 0
+    return 1 if failures else 0
