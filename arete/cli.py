@@ -324,8 +324,8 @@ def cmd_eval(args) -> int:
         print("usage: arete eval [REPO] or arete eval mine [REPO]", file=sys.stderr)
         return 2
     if not words:
-        if args.prompts:
-            print("arete eval --prompts DIR needs a REPO", file=sys.stderr)
+        if given := [flag for flag, value in (("--task", args.task), ("--ref", args.ref), ("--prompts", args.prompts)) if value]:
+            print(f"arete eval {' '.join(given)} needs a REPO", file=sys.stderr)
             return 2
         return evals.run_all(dry_run=args.dry_run)
     prompts_dir = paths.expand(args.prompts).resolve() if args.prompts else None
