@@ -269,6 +269,34 @@ def end_session(pid) -> None:
             pass
 
 
+def process_tree(root: int) -> list[tuple[int, int]]:
+    listed = sh(["ps", "-A", "-o", "pid=,ppid=,pgid="], timeout=10).stdout
+    group_of: dict[int, int] = {}
+    children: dict[int, list[int]] = {}
+    for pid, parent, group in (map(int, line.split()) for line in listed.splitlines()):
+        group_of[pid] = group
+        children.setdefault(parent, []).append(pid)
+    tree, todo = [], [root]
+    while todo:
+        pid = todo.pop()
+        if pid in group_of:
+            tree.append((pid, group_of[pid]))
+        todo += children.get(pid, [])
+    return tree
+
+
+def kill_tree(root: int) -> None:
+    own_group = os.getpgid(0)
+    for pid, group in process_tree(root):
+        try:
+            if group == own_group:
+                os.kill(pid, signal.SIGKILL)
+            else:
+                os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 def lock_is_held(name: str) -> bool:
     with lock_file(name) as f:
         try:

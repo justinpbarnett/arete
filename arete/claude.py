@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import devices, paths, util
+from . import background, devices, paths, util
 from .agent import NO_SESSION, Result, Session, UsageLimit, json_from_text
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -23,10 +23,7 @@ EVERY_MODEL = "claude"
 LIMIT_SLACK_SECONDS = 60
 LIMIT_RECHECK_SECONDS = 1800
 MILLISECOND_STAMPS = 1e12
-BACKGROUND_TASK_CLEANUP_SECONDS = 30
-BACKGROUND_NOTE = ("A command you run in the background keeps this session open after your final answer until it ends. "
-                   "Before you answer, stop with TaskStop each background command you started that does not end on its "
-                   "own, such as a server or a watcher. This is housekeeping, so leave it out of your answer.")
+STOP_GRACE_SECONDS = 30
 
 
 def binary() -> str:
@@ -71,7 +68,10 @@ def run(
         cmd += ["--resume", resume.id]
     if fresh_session:
         cmd += ["--session-id", fresh_session]
-    system = "\n\n".join(filter(None, [system, BACKGROUND_NOTE if "Bash" in tool_names else ""]))
+    if "Bash" in tool_names:
+        system = "\n\n".join(filter(None, [system, background.NOTE]))
+        if not remote:
+            settings = background.with_stop_hook(settings)
     if system:
         cmd += ["--append-system-prompt", system]
     if max_budget_usd:
@@ -149,19 +149,23 @@ def run(
 
 def run_with_graceful_timeout(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str],
                               timeout: float) -> subprocess.CompletedProcess:
-    child = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, errors="replace", env=env)
-    try:
-        out, err = child.communicate(prompt, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        child.terminate()
+    with subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, errors="replace", env=env) as child:
         try:
-            child.communicate(timeout=BACKGROUND_TASK_CLEANUP_SECONDS)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait()
-        raise
+            out, err = child.communicate(prompt, timeout=timeout)
+        except BaseException:
+            stop(child)
+            raise
     return subprocess.CompletedProcess(cmd, child.returncode, out, err)
+
+
+def stop(child: subprocess.Popen) -> None:
+    child.terminate()
+    try:
+        child.communicate(timeout=STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        util.kill_tree(child.pid)
+        child.wait()
 
 
 def tool_set(tools: list[str] | None, rules: list[str]) -> list[str]:

@@ -226,6 +226,12 @@ def cmd_guard(args) -> int:
     return guard.main()
 
 
+def cmd_background(args) -> int:
+    from . import background
+
+    return background.main()
+
+
 def cmd_ask(args) -> int:
     from . import ask
 
@@ -743,6 +749,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: keeps them out of secret files and, with JEV, "
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
     p.set_defaults(fn=cmd_guard)
+
+    p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
+                                          "started in the background still run is told to stop them and answer again "
+                                          "(reads a payload on stdin)")
+    p.set_defaults(fn=cmd_background)
 
     p = sub.add_parser("ask", help="put a yes or no question, a choice or a rating to JEV over piped text or files")
     p.add_argument("question")

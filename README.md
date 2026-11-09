@@ -43,6 +43,11 @@ An emit that changes something outside arete, a ticket, a PR or a push, can wait
 
 A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, for display only. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
 
+`claude -p` stays open after its answer until each command the agent started in the background ends, so a server left running holds a step to its time limit and loses its answer.
+Each claude step that can run commands is told to stop with TaskStop each background command that does not end on its own before it answers, even when its task asks to keep one running.
+On a local step, `arete background` runs as a Stop hook: when the agent answers while a background command still runs, it names the command and has the agent stop it and answer again, or end its turn again when it waits for a command that will end.
+A step that times out gets SIGTERM, and what is left of its processes 30 seconds later gets SIGKILL.
+
 Arete runs pi with a pi folder of its own, `~/.local/share/arete/pi-agent/`. It links `models.json` and `settings.json` from `~/.pi/agent/` and holds no logins. Keys for pi's providers go in `~/.config/arete/pi.env` as `NAME=value` lines, such as `OPENROUTER_API_KEY=...`. A loop then spends on a key you give arete, such as one with a weekly limit, and never on your own pi logins. A provider with no key there falls back to a key set in arete's own environment, and fails the step when there is none; the launchd serve sets no keys. A device other than `local` runs its own pi with its own logins.
 
 `~/.config/arete/devices.toml` lists the machines loops and sessions run on, besides `local`:
