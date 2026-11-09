@@ -6,7 +6,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -58,7 +57,7 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
 SLOTS_LOCK = "run-slots"
-RUNS_LOG = paths.LOG_DIR / "runs.log"
+RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
@@ -1932,10 +1931,7 @@ def no_free_slot(max_parallel: int) -> str:
 
 
 def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen:
-    with open(RUNS_LOG, "a") as log:
-        return subprocess.Popen([sys.executable, "-m", "arete.cli", "run", repo_name, tid,
-                                 *(["--force"] if force else [])],
-                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    return control.detach(["run", repo_name, tid, *(["--force"] if force else [])], RUNS_LOG)
 
 
 class NoFreeSlot(RuntimeError):
@@ -1947,7 +1943,8 @@ def run_skipped(name: str) -> dict:
     if not entry:
         raise control.NotFound(f"{name} is not on the skipped list; the last poll either ran it or no longer skips it")
     if not entry.get("repo"):
-        raise control.Refused(f"{name} names no repo to run in yet; the next poll adds it")
+        raise control.Refused(f"{name} names no repo to run in; a ticket the pipeline routes to a repo gets one at "
+                              "the next poll")
     cfg = config.load()
     if state.issue_running(entry["repo"], entry["id"]):
         raise control.Busy(name)
@@ -1958,7 +1955,8 @@ def run_skipped(name: str) -> dict:
     give_up = time.monotonic() + RUN_START_SECONDS
     while not state.issue_running(entry["repo"], entry["id"]) and time.monotonic() < give_up:
         if run.poll() is not None:
-            raise control.Refused(f"{name} did not start; the end of {paths.short_path(RUNS_LOG)} says why")
+            raise control.Refused(f"{name} ended before it showed as running; the end of "
+                                  f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
         time.sleep(0.1)
     return {"ticket": name, "repo": entry["repo"], "id": entry["id"]}
 

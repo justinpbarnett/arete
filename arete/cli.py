@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 
@@ -415,7 +416,7 @@ def follow(run_id: str, alive=None, after: int = 0, send=None) -> int:
 
 
 def piped_events() -> list[dict]:
-    if sys.stdin is None or sys.stdin.isatty():
+    if not os.environ.get("ARETE_LOOP") or sys.stdin is None:
         return []
     return [json.loads(line) for line in sys.stdin if line.strip()]
 
@@ -455,7 +456,7 @@ def cmd_loop(args) -> int:
                 print(loop_line(v))
             return 0
         if args.action == "new":
-            made = scaffold.draft(" ".join(args.words), name=args.name, repo=args.repo, model=args.model,
+            made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
                                   run_id=args.run_id)
             print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, ${made['cost_usd']:.2f})\n")
             print(made["loop_toml"])

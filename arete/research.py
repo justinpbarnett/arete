@@ -144,6 +144,11 @@ def tickets() -> list[dict]:
     return sorted(rows, key=lambda r: triage.moment(r["updated"]), reverse=True)
 
 
+def ticket(ref: str) -> dict | None:
+    r = triage.board_row(ref)
+    return r if r and triage.standing(r) == triage.RESEARCH_WORK else None
+
+
 def due() -> list[dict]:
     return [r for r in tickets() if triage.in_sprint(r) and triage.research_due(r, state.research_get(r["ref"]))]
 
@@ -273,7 +278,7 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
             + "\n\n".join(parts))
 
 
-def research(cfg: config.Config, r: dict, force: bool = False) -> tuple[str, str]:
+def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = False) -> tuple[str, str]:
     ref = r["ref"]
     base = {"source": r["source"], "title": r["title"], "url": r["url"], "updated": r["updated"],
             "run_id": os.environ.get("ARETE_RUN_ID", ""), "answered_by": ""}
@@ -294,7 +299,7 @@ def research(cfg: config.Config, r: dict, force: bool = False) -> tuple[str, str
             if o["ref"] in reports and reports[o["ref"]]["status"] == DONE and reports[o["ref"]]["report"]]
     if not force:
         judged = jev.ready(cfg, list(src.repos))
-        if why := still_stands(cfg, r, prior, said, basis, judged):
+        if not asked and (why := still_stands(cfg, r, prior, said, basis, judged)):
             state.research_keep(ref, title=r["title"], url=r["url"], updated=r["updated"], basis=basis)
             return KEPT, why
         fresh = not (prior and prior["status"] == DONE)
@@ -398,7 +403,7 @@ def research_asked(cfg: config.Config, asked: list[dict]) -> int:
             outcome, why = FAILED, "it is no longer a research ticket on the triage board"
         else:
             ref = r["ref"]
-            outcome, why = research(cfg, r, force=event.get("force") is True)
+            outcome, why = research(cfg, r, force=event.get("force") is True, asked=True)
         print(f"{util.iso()} {ref}: {outcome}: {why}", flush=True)
         outcomes.append(outcome)
     mark_loop("research", FAILED not in outcomes and LATER not in outcomes, why)
@@ -408,7 +413,7 @@ def research_asked(cfg: config.Config, asked: list[dict]) -> int:
 def run_now(ref: str, force: bool = False) -> int:
     paths.ensure_dirs()
     cfg = config.load()
-    r = next((r for r in tickets() if r["ref"].lower() == ref.strip().lower()), None)
+    r = ticket(ref)
     if not r:
         print(f"{ref} is not a research ticket on the triage board; `arete research` lists them", flush=True)
         return 1
@@ -417,7 +422,7 @@ def run_now(ref: str, force: bool = False) -> int:
             print("a research run is going; try again when it ends")
             return 1
         tidy()
-        outcome, why = research(cfg, r, force=force)
+        outcome, why = research(cfg, r, force=force, asked=True)
     print(f"{r['ref']}: {outcome}: {why}")
     return 0 if outcome in (DONE, KEPT) else 1
 
@@ -445,7 +450,7 @@ def shown(ref: str) -> str | None:
             return text
         where = report["filed_url"] or "not filed yet; the research loop tries again"
         return f"{report['ref']}: {report['filed_path']}: {where}\n\n{text}"
-    r = next((r for r in tickets() if r["ref"].lower() == ref.strip().lower()), None)
+    r = ticket(ref)
     if not r and not report:
         return None
     return f"{ref}: {triage.research_note(r, report) if r else report['status']}"

@@ -6,6 +6,7 @@ import shutil
 import signal
 import threading
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import (
@@ -45,15 +46,27 @@ DRAFT_SCHEMA = {
 }
 
 
+@dataclass
+class DraftRequest:
+    sentence: str
+    name: str = ""
+    repo: str = ""
+    model: str = ""
+
+    def __post_init__(self) -> None:
+        self.sentence, self.name, self.repo, self.model = (
+            x.strip() for x in (self.sentence, self.name, self.repo, self.model))
+
+
 def private_dir(cfg: config.Config) -> Path:
     return cfg.loop_dirs[0] if cfg.loop_dirs else paths.CONFIG_DIR / "loops"
 
 
-def draft_prompt(sentence: str, cfg: config.Config, name: str, repo: str, taken: set[str]) -> str:
+def draft_prompt(request: DraftRequest, cfg: config.Config, taken: set[str]) -> str:
     repos = "\n".join(f"- {r.name}: {r.github or 'no GitHub remote'}{', pipeline' if r.pipeline else ''}"
                       for r in cfg.repos)
     parts = [
-        f"Draft one new arete loop from this sentence:\n\n> {sentence}",
+        f"Draft one new arete loop from this sentence:\n\n> {request.sentence}",
         "The reference below is the whole loop folder format. Use only what it describes.",
         "<reference>\n" + REFERENCE.read_text() + "\n</reference>",
         f"Repos in the config:\n{repos}",
@@ -66,10 +79,10 @@ def draft_prompt(sentence: str, cfg: config.Config, name: str, repo: str, taken:
          "stale_hours on a scheduled loop. Prefer emits that need no approval only for digest, notify and metric; "
          "a ticket or pr emit on a repo you cannot see should set approve = true."),
     ]
-    if name:
-        parts.append(f"Name the loop `{name}`.")
-    if repo:
-        parts.append(f"The loop works on the repo `{repo}`.")
+    if request.name:
+        parts.append(f"Name the loop `{request.name}`.")
+    if request.repo:
+        parts.append(f"The loop works on the repo `{request.repo}`.")
     parts.append("Return JSON: `name`, `loop_toml` (the whole file), `prompt_md` (the whole prompt for an agent "
                  "loop, empty for a command loop), `files` (each script the loop calls, with its whole text; call it "
                  "as `./NAME` in loop.toml), and `note`.")
@@ -106,38 +119,39 @@ def check_draft(draft: dict, cfg: config.Config, taken: set[str], work: Path) ->
     return folder, ""
 
 
-def check_request(sentence: str, name: str, repo: str, cfg: config.Config) -> set[str]:
-    if not sentence:
+def loop_names(cfg: config.Config) -> set[str]:
+    return {x.name for x in loops.load_all(cfg)}
+
+
+def check_request(request: DraftRequest, cfg: config.Config, taken: set[str]) -> None:
+    if not request.sentence:
         raise control.Refused("say in one sentence what the loop should do")
-    taken = {x.name for x in loops.load_all(cfg)}
-    if name and not loops.NAME.match(name):
-        raise control.Refused(f"the name '{name}' must be lowercase letters, digits and dashes")
-    if name in taken:
-        raise control.Refused(f"a loop named {name} already exists")
-    if repo and repo not in {r.name for r in cfg.repos} and not paths.expand(repo).is_dir():
-        raise control.Refused(f"'{repo}' is neither a repo in the config nor a folder")
-    return taken
+    if request.name and not loops.NAME.match(request.name):
+        raise control.Refused(f"the name '{request.name}' must be lowercase letters, digits and dashes")
+    if request.name in taken:
+        raise control.Refused(f"a loop named {request.name} already exists")
+    if request.repo and request.repo not in {r.name for r in cfg.repos} and not paths.expand(request.repo).is_dir():
+        raise control.Refused(f"'{request.repo}' is neither a repo in the config nor a folder")
 
 
-def start_draft(sentence: str, *, name: str = "", repo: str = "", model: str = "") -> dict:
-    sentence, name, repo, model = (x.strip() for x in (sentence, name, repo, model))
-    check_request(sentence, name, repo, config.load())
-    run_id = record.start("draft", trigger="manual", pid=None, summary=util.first_line(sentence, 200))
+def start_draft(request: DraftRequest) -> dict:
+    cfg = config.load()
+    check_request(request, cfg, loop_names(cfg))
+    run_id = record.start("draft", trigger="manual", pid=None, summary=util.first_line(request.sentence, 200))
     with record.failed_on_crash(run_id):
-        proc = control.detach(["loop", "new", "--name", name, "--repo", repo, "--model", model, "--run-id", run_id,
-                               "--", sentence], DRAFTS_LOG)
+        proc = control.detach(["loop", "new", "--name", request.name, "--repo", request.repo, "--model", request.model,
+                               "--run-id", run_id, "--", request.sentence], DRAFTS_LOG)
     record.note(run_id, pid=proc.pid)
     return state.run_get(run_id)
 
 
-def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", run_id: str = "", say=print) -> dict:
-    sentence = sentence.strip()
+def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
     cfg = config.load()
     if run_id:
         record.note(run_id, pid=os.getpid())
     else:
-        check_request(sentence, name, repo, cfg)
-        run_id = record.start("draft", trigger="manual", summary=util.first_line(sentence, 200))
+        check_request(request, cfg, loop_names(cfg))
+        run_id = record.start("draft", trigger="manual", summary=util.first_line(request.sentence, 200))
 
     def tell(kind: str, text: str) -> None:
         say(text)
@@ -147,7 +161,7 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", run
     try:
         with record.failed_on_crash(run_id):
             try:
-                made = write_draft(run_id, sentence, name, repo, model, cfg, tell)
+                made = write_draft(run_id, request, cfg, tell)
             except (control.Refused, engine.Stopped) as e:
                 status, why = ("stopped", record.STOPPED) if isinstance(e, engine.Stopped) else ("failed", str(e))
                 state.add_feed(run_id, "end", f"{status}: {why}")
@@ -161,15 +175,16 @@ def draft(sentence: str, *, name: str = "", repo: str = "", model: str = "", run
     return {**made, "cost_usd": record.spent(run_id)}
 
 
-def write_draft(run_id: str, sentence: str, name: str, repo: str, model: str, cfg: config.Config, tell) -> dict:
-    taken = check_request(sentence, name, repo, cfg)
-    prompt = draft_prompt(sentence, cfg, name, repo, taken)
+def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) -> dict:
+    taken = loop_names(cfg)
+    check_request(request, cfg, taken)
+    prompt = draft_prompt(request, cfg, taken)
     work = DRAFTS_DIR / run_id
     work.mkdir(parents=True, exist_ok=True)
     problem, folder, answer = "", Path(), {}
     for attempt in range(1, DRAFT_TRIES + 1):
         tell("draft", f"drafting, try {attempt} of {DRAFT_TRIES}")
-        res = runner.run(prompt, work, model=model or cfg.model("loop"), trace=(run_id, f"draft {attempt}"),
+        res = runner.run(prompt, work, model=request.model or cfg.model("loop"), trace=(run_id, f"draft {attempt}"),
                          cfg=cfg, tools=[], json_schema=DRAFT_SCHEMA, persist=False, timeout=600,
                          wait_out_limits=False)
         record.note(run_id, model=res.model, runner=res.runner)
@@ -207,15 +222,15 @@ def write_draft(run_id: str, sentence: str, name: str, repo: str, model: str, cf
 def try_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
     if not loop.fed_by_events or loop.error:
         return []
-    taken, refused = [], []
+    taken, refusals = [], []
     for i in range(len(loop.sources)):
-        found = sources.peek(loop, i, cfg)
-        taken += [e for e in found if not loop.trigger.refusal(e)][-SAMPLE_EVENTS:]
-        refused += [e for e in found if loop.trigger.refusal(e)]
+        judged = [(e, loop.trigger.refusal(e)) for e in sources.peek(loop, i, cfg)]
+        taken += [e for e, refusal in judged if not refusal][-SAMPLE_EVENTS:]
+        refusals += [refusal for _, refusal in judged if refusal]
     if taken:
         return taken
-    if refused:
-        raise control.Refused(f"{loop.name}'s sources hold events, but its trigger {loop.trigger.refusal(refused[-1])}")
+    if refusals:
+        raise control.Refused(f"{loop.name}'s sources hold events, but its trigger {refusals[-1]}")
     raise control.Refused(f"{loop.name} found no events to try on yet")
 
 

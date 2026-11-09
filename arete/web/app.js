@@ -23,7 +23,7 @@ const sendSaid = new Map();
 const sending = new Set();
 const HELD = Symbol("held");
 let redrawTriage = false;
-const saidIn = new Map();
+const lastSaid = new Map();
 const going = { health: false, triage: false };
 let loopNewKey = "";
 
@@ -95,13 +95,13 @@ function sayIn(line, state, sentence) {
 }
 
 function saidLine(place) {
-  const said = saidIn.get(place);
+  const said = lastSaid.get(place);
   return el("p", { class: "said", "aria-live": "polite", tabindex: "-1", "data-focus": `said:${place}`, "data-said": place, hidden: !said },
     said ? sayParts(...said) : null);
 }
 
 function sayAt(place, state, sentence) {
-  saidIn.set(place, [state, sentence]);
+  lastSaid.set(place, [state, sentence]);
   const line = document.querySelector("main > section:not([hidden])")?.querySelector(`[data-said="${CSS.escape(place)}"]`);
   if (!line) return;
   sayIn(line, state, sentence);
@@ -240,14 +240,19 @@ function stopWords(what, r, after) {
   return r.ticket ? `${what} had already ended; the next pipeline poll marks it stopped and tells its ticket.` : `${what} had already ended, so it is marked stopped.`;
 }
 
-async function stopLiveRun(run, btn) {
+async function act(btn, place, path, body, saying) {
   btn.disabled = true;
   try {
-    sayAt("running", "ok", stopWords(run.ticket, await call(`/api/runs/${encodeURIComponent(run.id)}/stop`, {}), "It moves to Recent runs once it has."));
+    sayAt(place, "ok", saying(await call(path, body)));
   } catch (e) {
-    sayAt("running", "fault", e.message);
+    sayAt(place, "fault", e.message);
   }
   refresh();
+}
+
+function stopLiveRun(run, btn) {
+  return act(btn, "running", `/api/runs/${encodeURIComponent(run.id)}/stop`, {},
+    (r) => stopWords(run.ticket, r, "It moves to Recent runs once it has."));
 }
 
 function skippedAction(s) {
@@ -255,15 +260,9 @@ function skippedAction(s) {
   return s.can_run ? button("Run anyway", `run-anyway:${s.ticket}`, (b) => runSkipped(s.ticket, b)) : null;
 }
 
-async function runSkipped(ticket, btn) {
-  btn.disabled = true;
-  try {
-    await call(`/api/skipped/${encodeURIComponent(ticket)}/run`, {});
-    sayAt("skipped", "ok", `Started ${ticket} past its blocker at ${clock(new Date().toISOString())}. It shows under Running now while it runs.`);
-  } catch (e) {
-    sayAt("skipped", "fault", e.message);
-  }
-  refresh();
+function runSkipped(ticket, btn) {
+  return act(btn, "skipped", `/api/skipped/${encodeURIComponent(ticket)}/run`, {},
+    () => `Started ${ticket} past its blocker at ${clock(new Date())}. It shows under Running now while it runs.`);
 }
 
 function handParts(p) {
@@ -279,15 +278,8 @@ function handParts(p) {
   ];
 }
 
-async function markDone(id, what, btn) {
-  btn.disabled = true;
-  try {
-    await call(`/api/proposals/${id}/done`, {});
-    sayAt("hand", "ok", `${what} is marked done, so it leaves this list.`);
-  } catch (e) {
-    sayAt("hand", "fault", e.message);
-  }
-  refresh();
+function markDone(id, what, btn) {
+  return act(btn, "hand", `/api/proposals/${id}/done`, {}, () => `${what} is marked done, so it leaves this list.`);
 }
 
 async function showLog(id) {
@@ -351,41 +343,23 @@ function drawHealth(snapshot) {
       : el("p", {}, stateChip("ok"), " No alert is open.")));
 }
 
-async function runChecks(btn) {
-  btn.disabled = true;
-  try {
-    await call("/api/checks/run", {});
-    sayAt("checks", "ok", `Started the checks at ${clock(new Date().toISOString())}. Their results show here when they end.`);
-  } catch (e) {
-    sayAt("checks", "fault", e.message);
-  }
-  refresh();
+function runChecks(btn) {
+  return act(btn, "checks", "/api/checks/run", {},
+    () => `Started the checks at ${clock(new Date())}. Their results show here when they end.`);
 }
 
 function drawTriage(snapshot) {
   fill("triage", panelParts(snapshot.triage, "Triage", triageParts));
 }
 
-async function refreshTriage(btn) {
-  btn.disabled = true;
-  try {
-    await call("/api/triage/refresh", {});
-    sayAt("triage-refresh", "ok", `Started triage at ${clock(new Date().toISOString())}. It reads every open ticket, so it can take a few minutes; the verdicts here change when it ends.`);
-  } catch (e) {
-    sayAt("triage-refresh", "fault", e.message);
-  }
-  refresh();
+function refreshTriage(btn) {
+  return act(btn, "triage-refresh", "/api/triage/refresh", {},
+    () => `Started triage at ${clock(new Date())}. It reads every open ticket, so it can take a few minutes; the verdicts here change when it ends.`);
 }
 
-async function researchTicket(r, btn) {
-  btn.disabled = true;
-  try {
-    await call(`/api/triage/${encodeURIComponent(r.ref)}/research`, { force: r.research.force });
-    sayAt(`research:${r.ref}`, "ok", `Asked the research loop at ${clock(new Date().toISOString())} to research ${r.ref}. Its verdict follows the research.`);
-  } catch (e) {
-    sayAt(`research:${r.ref}`, "fault", e.message);
-  }
-  refresh();
+function researchTicket(r, btn) {
+  return act(btn, `research:${r.ref}`, `/api/triage/${encodeURIComponent(r.ref)}/research`, { force: r.research.force },
+    () => `Asked the research loop at ${clock(new Date())} to research ${r.ref}. Its verdict follows the research.`);
 }
 
 function triageParts(t) {
@@ -415,7 +389,7 @@ function researchOffer(r, researching) {
     r.research ? el("div", { class: "actions offer" },
       button(r.research.label, `research:${r.ref}`, (b) => researchTicket(r, b), researching),
       r.research.force ? el("span", { class: "muted", text: "This skips JEV's screen for instructions aimed at an agent, so read the ticket first." }) : null) : null,
-    r.research || saidIn.has(`research:${r.ref}`) ? saidLine(`research:${r.ref}`) : null,
+    r.research || lastSaid.has(`research:${r.ref}`) ? saidLine(`research:${r.ref}`) : null,
   ];
 }
 
@@ -856,17 +830,11 @@ function serveState(serve) {
     (broken ? ` ${broken} broken.` : "") + (errors ? ` ${errors} sources fail to poll; Fleet lists them.` : ""));
 }
 
-async function installServe(btn) {
-  btn.disabled = true;
+function installServe(btn) {
   sayAt("serve", null, "Installing serve. It loads the background job and readies each repo's labels, so it can take a minute.");
-  try {
-    const r = await call("/api/serve/install", {});
-    sayAt("serve", "ok", r.restarting ? "Serve is restarting. This page stops answering for a few seconds and comes back once serve is up."
-      : `Installed serve${r.said ? `: ${r.said}` : ""}.`);
-  } catch (e) {
-    sayAt("serve", "fault", e.message);
-  }
-  refresh();
+  return act(btn, "serve", "/api/serve/install", {}, (r) => r.restarting
+    ? "Serve is restarting. This page stops answering for a few seconds and comes back once serve is up."
+    : `Installed serve${r.said ? `: ${r.said}` : ""}.`);
 }
 
 function approvalRow(a) {
@@ -1286,7 +1254,7 @@ async function refresh() {
   try {
     const held = (await LOADERS[view]()) === HELD;
     if (mine !== refreshCount) return;
-    if (!held) lastGood = clock(new Date().toISOString());
+    if (!held) lastGood = clock(new Date());
     const label = document.querySelector(`.views [data-view="${view}"]`).textContent;
     const shown = held ? "held while you edit" : `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
     status("", `${label} · ${shown}${nextDelay() ? ` · refreshes every ${nextDelay() / 1000} s` : ""}`);

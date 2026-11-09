@@ -263,7 +263,7 @@ def views(limit: int = 30) -> list[dict]:
 
 def known_models(cfg: config.Config) -> list[str]:
     since = util.iso(util.now() - timedelta(days=SEEN_MODEL_DAYS))
-    seen = {s["model"] for s in state.steps_since(since) if s["model"]}
+    seen = {s["model"] for s in state.steps_since(since, connect=state.reader) if s["model"]}
     return sorted({*settings.MODEL_ALIASES, *(m for m in cfg.models.values() if m), *cfg.pricing, *seen})
 
 

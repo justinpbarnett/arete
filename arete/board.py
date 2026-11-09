@@ -156,19 +156,17 @@ def triage_board() -> dict:
 
 
 def triage_entry(r: dict, v: dict, standing: str, srcs: dict[str, triage.TriageSource]) -> dict:
-    report = v["research"].get(r["ref"]) if standing == triage.RESEARCH_WORK else None
-    offer = triage.research_offer(r, report) if standing == triage.RESEARCH_WORK else None
-    if report and report.get("answered_by"):
-        report = v["research"].get(report["answered_by"])
+    own = v["research"].get(r["ref"]) if standing == triage.RESEARCH_WORK else None
+    report = v["research"].get(own["answered_by"]) if own and own.get("answered_by") else own
+    verdict = (triage.sent_note(r, False) if standing == triage.SENT
+               else triage.research_progress(r, own) if standing == triage.RESEARCH_WORK else triage.verdict(r))
     return {"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "", "url": r["url"] or "",
-            "kind": r["kind"] or "", "size": r["size"] or "",
-            "verdict": triage.sent_note(r, False) if standing == triage.SENT
-            else triage.verdict(r, v["research"], commands=False),
+            "kind": r["kind"] or "", "size": r["size"] or "", "verdict": verdict,
             "prs": " ".join(triage.sent_prs(r)) if standing == triage.SENT else (report or {}).get("filed_url") or "",
             "questions": r.get("questions") or [], "assumptions": r["assumptions"] or [], "plan": r["plan"] or [],
             "summary": report["summary"] if report else "", "report": report["report"] if report else "",
             "send": send_form(r, srcs.get(r.get("source", ""))) if standing in triage.SENDABLE else None,
-            "research": offer}
+            "research": triage.research_offer(r, own) if standing == triage.RESEARCH_WORK else None}
 
 
 def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:

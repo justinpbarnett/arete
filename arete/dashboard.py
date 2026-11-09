@@ -306,8 +306,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def draft_loop(self) -> dict:
         b = self.body()
-        return scaffold.start_draft(str(b.get("sentence") or ""), name=str(b.get("name") or ""),
-                                    repo=str(b.get("repo") or ""), model=str(b.get("model") or ""))
+        return scaffold.start_draft(scaffold.DraftRequest(
+            *(str(b.get(field) or "") for field in ("sentence", "name", "repo", "model"))))
 
     def launch_session(self) -> dict:
         b = self.body()
@@ -395,7 +395,7 @@ def draft_choices() -> dict:
 
 
 def research_ticket(ref: str, force: bool) -> dict:
-    r = next((r for r in research.tickets() if r["ref"].lower() == ref.strip().lower()), None)
+    r = research.ticket(ref)
     if not r:
         raise control.NotFound(f"{ref} is not a research ticket on the triage board")
     return {"ref": r["ref"], "run": engine.launch("research", events=[{"ref": r["ref"], "force": force}])["id"]}
@@ -408,7 +408,10 @@ def forget_proposal(proposal_id: int) -> dict:
 
 
 def install_serve() -> dict:
-    if control.serve_beat().get("pid") == os.getpid():
+    beat = control.serve_beat()
+    if beat.get("alive"):
+        raise Refusal(409, "Serve is already up, so it needs no install")
+    if beat.get("pid") == os.getpid():
         control.detach(["install"], "install.log")
         return {"restarting": True}
     res = util.sh([sys.executable, "-m", "arete.cli", "install"], timeout=INSTALL_SECONDS)
