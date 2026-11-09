@@ -788,6 +788,12 @@ def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> 
         return [dict(r) for r in c.execute(q, args)]
 
 
+def forget_proposal(proposal_id: int) -> bool:
+    with db() as c:
+        return c.execute("UPDATE proposals SET status = 'filed' WHERE id = ? AND status IN ('memory', 'hand')",
+                         (proposal_id,)).rowcount > 0
+
+
 def set_proposal_status_by_pr(pr_url: str, status: str) -> None:
     with db() as c:
         c.execute("UPDATE proposals SET status = ? WHERE pr_url = ?", (status, pr_url))

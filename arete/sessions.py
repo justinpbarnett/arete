@@ -261,13 +261,16 @@ def views(limit: int = 30) -> list[dict]:
     return out
 
 
-def choices() -> dict:
-    cfg = config.load()
+def known_models(cfg: config.Config) -> list[str]:
     since = util.iso(util.now() - timedelta(days=SEEN_MODEL_DAYS))
     seen = {s["model"] for s in state.steps_since(since) if s["model"]}
-    models = sorted({*settings.MODEL_ALIASES, *(m for m in cfg.models.values() if m), *cfg.pricing, *seen})
+    return sorted({*settings.MODEL_ALIASES, *(m for m in cfg.models.values() if m), *cfg.pricing, *seen})
+
+
+def choices() -> dict:
+    cfg = config.load()
     fleet = devices.known()
     return {"devices": [d.name for d in fleet], "remote_devices": [d.name for d in fleet if d.remote],
-            "repos": [r.name for r in cfg.repos], "models": models, "runners": list(runner.RUNNERS),
+            "repos": [r.name for r in cfg.repos], "models": known_models(cfg), "runners": list(runner.RUNNERS),
             "tools": sorted(runner.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
             "idle_hours": cfg.session_idle_hours}

@@ -115,7 +115,7 @@ def check_serve() -> list[Check]:
 
     beat = control.serve_beat()
     if not beat and not install.serve_installed():
-        return [Check("serve:beat", True, "not installed yet; the launchd jobs run the loops until `arete install`")]
+        return [Check("serve:beat", True, "not installed yet; the launchd jobs run the loops until serve is installed")]
     if not beat:
         return [Check("serve:beat", False, "arete serve is installed but has never run; see its log")]
     if not beat["alive"]:

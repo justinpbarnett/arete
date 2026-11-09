@@ -29,6 +29,8 @@ SPRINT_JQL = "sprint in openSprints() OR (sprint in closedSprints() AND sprint n
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent", "updated"]
 MAX_ASSUMPTIONS = 8
 THIN_WORDS = 6
+# reasons stored before the dashboard could research a ticket end in the CLI command that does it
+OLD_RESEARCH_HINT = re.compile(r"; (check the ticket, then )?`arete research \S+ --run --force`( researches it anyway)?$")
 MARKUP = re.compile(r"\[[^\]]*\]|\{[^}]*\}|https?://\S+")
 WORDS = re.compile(r"[^\W\d_]{2,}")
 SENT_DAYS = 7
@@ -710,21 +712,36 @@ def filed_words(report: dict) -> str:
     return f", filed as {name}" if report.get("filed_url") else f", not filed as {name} yet; the research loop tries again"
 
 
-def research_note(r: dict, report: dict | None) -> str:
-    by_hand = f"it is outside the sprint, so `arete research {r['ref']} --run` researches it"
+def research_note(r: dict, report: dict | None, commands: bool = True) -> str:
+    ref = r["ref"]
+    outside = "it is outside the sprint, so " + (f"`arete research {ref} --run` researches it" if commands
+                                                  else "the research loop leaves it to you")
     if not report:
-        return "queued for research" if in_sprint(r) else by_hand
+        return "queued for research" if in_sprint(r) else outside
     if report["status"] == "running":
         return f"researching since {stamp(report['ts'])}"
     again = ((", and the ticket changed since, so the loop checks it again" if in_sprint(r)
-              else f", and the ticket changed since; {by_hand} again") if research_due(r, report) else "")
+              else f", and the ticket changed since; {outside}{' again' if commands else ''}")
+             if research_due(r, report) else "")
+    why = OLD_RESEARCH_HINT.sub("", report["error"] or "")
+    anyway = f"`arete research {ref} --run --force` researches it anyway"
     if report["status"] == "done":
         return f"report ready {stamp(report['ts'])}{filed_words(report)}{again}"
     if report["status"] == "held":
-        return f"held: {report['error']}{again}"
+        return f"held: {why}{f'; check the ticket, then {anyway}' if commands else ''}{again}"
     if report["status"] in ("parent", "answered"):
-        return f"not researched: {report['error']}{again}"
-    return f"research failed: {report['error']}{again}"
+        return f"not researched: {why}{f'; {anyway}' if commands else ''}{again}"
+    return f"research failed: {why}{again}"
+
+
+def research_offer(r: dict, report: dict | None) -> dict | None:
+    if not report:
+        return {"label": "Research it now", "force": False}
+    if report["status"] == "running":
+        return None
+    if report["status"] in ("held", "parent", "answered"):
+        return {"label": "Research it anyway", "force": True}
+    return {"label": "Research it again", "force": report["status"] == "done" and not research_due(r, report)}
 
 
 def sent_prs(a: dict) -> list[str]:
@@ -740,7 +757,7 @@ def sent_note(a: dict, with_prs: bool = True) -> str:
     return ("sent by you, " if by_you else "") + f"pipeline {run['status']}" + (f": {', '.join(prs)}" if prs else "")
 
 
-def verdict(r: dict, reports: dict | None = None) -> str:
+def verdict(r: dict, reports: dict | None = None, commands: bool = True) -> str:
     kind = standing(r)
     if kind == READY:
         return ", ".join(p for p in (f"ready {r['kind']}".strip(), r["size"], f"add {' '.join(labels_to_add(r))}",
@@ -748,7 +765,7 @@ def verdict(r: dict, reports: dict | None = None) -> str:
     if kind == WITH_QUESTIONS:
         return ", ".join(p for p in ("not ready", r["kind"], r["size"], util.count(len(r["questions"]), "question")) if p)
     if kind == RESEARCH_WORK:
-        return "research" if reports is None else research_note(r, reports.get(r["ref"]))
+        return "research" if reports is None else research_note(r, reports.get(r["ref"]), commands)
     return kind.lower()
 
 

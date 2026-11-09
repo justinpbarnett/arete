@@ -184,8 +184,9 @@ def print_live(live: dict) -> None:
 def cmd_forget(args) -> int:
     from . import state
 
-    with state.db() as c:
-        c.execute("UPDATE proposals SET status = 'filed' WHERE id = ? AND status IN ('memory', 'hand')", (args.id,))
+    if not state.forget_proposal(args.id):
+        print(f"no open proposal #{args.id}")
+        return 1
     return 0
 
 
@@ -337,7 +338,7 @@ def cmd_research(args) -> int:
     from . import research
 
     if args.next or (args.dry_run and not args.ref):
-        return research.next_due(dry_run=args.dry_run)
+        return research.next_due(dry_run=args.dry_run, asked=piped_events())
     if args.ref and args.run:
         return research.run_now(args.ref, force=args.force)
     if args.ref:
@@ -413,6 +414,12 @@ def follow(run_id: str, alive=None, after: int = 0, send=None) -> int:
         time.sleep(1)
 
 
+def piped_events() -> list[dict]:
+    if sys.stdin is None or sys.stdin.isatty():
+        return []
+    return [json.loads(line) for line in sys.stdin if line.strip()]
+
+
 def read_events(file: str) -> list[dict] | None:
     if not file:
         return None
@@ -448,7 +455,8 @@ def cmd_loop(args) -> int:
                 print(loop_line(v))
             return 0
         if args.action == "new":
-            made = scaffold.draft(" ".join(args.words), name=args.name, repo=args.repo, model=args.model)
+            made = scaffold.draft(" ".join(args.words), name=args.name, repo=args.repo, model=args.model,
+                                  run_id=args.run_id)
             print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, ${made['cost_usd']:.2f})\n")
             print(made["loop_toml"])
             if made["note"]:

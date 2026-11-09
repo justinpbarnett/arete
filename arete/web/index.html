@@ -47,8 +47,7 @@
 
 <section data-view="loops" hidden>
   <div id="loops"></div>
-  <p id="loops-result" aria-live="polite" hidden></p>
-  <div id="loop-detail" hidden></div>
+  <p id="loops-result" aria-live="polite" tabindex="-1" hidden></p>
   <div id="loop-feed" class="feed" hidden>
     <h3 class="feed-title">Feed</h3>
     <pre class="feed-lines"></pre>
@@ -56,7 +55,46 @@
       <button type="button" class="feed-stop">Stop this run</button>
       <button type="button" class="feed-close">Close the feed</button>
     </div>
+    <p class="feed-said" id="loop-feed-result" aria-live="polite" tabindex="-1" hidden></p>
   </div>
+  <h2><span class="n">03</span>Draft a loop</h2>
+  <p>Say in a sentence what the loop should do. A model drafts the loop folder, checks that it loads, and saves it turned off, so nothing fires until you try it and turn it on.</p>
+  <form id="loop-new" novalidate>
+    <div class="field">
+      <label for="loop-new-sentence">What it should do</label>
+      <textarea id="loop-new-sentence" rows="3" spellcheck="true"></textarea>
+    </div>
+    <div class="fields">
+      <div class="field">
+        <label for="loop-new-name">Name</label>
+        <input id="loop-new-name" type="text" autocomplete="off" spellcheck="false" placeholder="the model picks one">
+      </div>
+      <div class="field">
+        <label for="loop-new-repo">Repo</label>
+        <select id="loop-new-repo"><option value="">None</option></select>
+      </div>
+      <div class="field">
+        <label for="loop-new-model">Model that drafts it</label>
+        <input id="loop-new-model" type="text" list="loop-new-models" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <datalist id="loop-new-models"></datalist>
+    <div class="actions">
+      <button type="submit" id="loop-new-go">Draft it</button>
+      <span class="muted keys">Ctrl or Cmd with Enter drafts</span>
+    </div>
+  </form>
+  <p id="loop-new-result" aria-live="polite" tabindex="-1" hidden></p>
+  <div id="draft-feed" class="feed" hidden>
+    <h3 class="feed-title">Draft</h3>
+    <pre class="feed-lines"></pre>
+    <div class="actions">
+      <button type="button" class="feed-stop">Stop this draft</button>
+      <button type="button" class="feed-close">Close the feed</button>
+    </div>
+    <p class="feed-said" id="draft-feed-result" aria-live="polite" tabindex="-1" hidden></p>
+  </div>
+  <div id="loop-detail" hidden></div>
 </section>
 
 <section data-view="launch" hidden>
@@ -112,7 +150,7 @@
         <button type="button" class="feed-close">Close</button>
       </div>
     </form>
-    <p id="session-result" aria-live="polite" hidden></p>
+    <p id="session-result" aria-live="polite" tabindex="-1" hidden></p>
   </div>
   <div id="sessions"></div>
 </section>

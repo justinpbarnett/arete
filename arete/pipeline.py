@@ -20,6 +20,7 @@ from typing import TextIO
 from . import (
     ci,
     config,
+    control,
     diffguard,
     gh,
     jev,
@@ -57,6 +58,8 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
 SLOTS_LOCK = "run-slots"
+RUNS_LOG = paths.LOG_DIR / "runs.log"
+RUN_START_SECONDS = 10
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
 
@@ -1820,11 +1823,11 @@ class SkipLog:
         self.before = before
         self.current: dict[str, dict] = {}
 
-    def note(self, name: str, t: tracker.Ticket, blocker: str) -> None:
+    def note(self, name: str, t: tracker.Ticket, blocker: str, repo: str = "") -> None:
         old = self.before.get(name) or {}
         same = old.get("why") == blocker
-        self.current[name] = {"why": blocker, "title": t.title, "url": t.url,
-                          "since": old.get("since") if same else util.iso()}
+        self.current[name] = {"why": blocker, "title": t.title, "url": t.url, "repo": repo, "id": str(t.id),
+                              "since": old.get("since") if same else util.iso()}
         if not same:
             print(f"{util.iso()} {name}: not run, {blocker}")
 
@@ -1928,10 +1931,36 @@ def no_free_slot(max_parallel: int) -> str:
     return f"no run slot is free (max_parallel {max_parallel})"
 
 
-def spawn_run(repo_name: str, tid: str) -> None:
-    with open(paths.LOG_DIR / "runs.log", "a") as log:
-        subprocess.Popen([sys.executable, "-m", "arete.cli", "run", repo_name, tid], stdin=subprocess.DEVNULL,
-                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen:
+    with open(RUNS_LOG, "a") as log:
+        return subprocess.Popen([sys.executable, "-m", "arete.cli", "run", repo_name, tid,
+                                 *(["--force"] if force else [])],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+class NoFreeSlot(RuntimeError):
+    pass
+
+
+def run_skipped(name: str) -> dict:
+    entry = skipped_tickets().get(name)
+    if not entry:
+        raise control.NotFound(f"{name} is not on the skipped list; the last poll either ran it or no longer skips it")
+    if not entry.get("repo"):
+        raise control.Refused(f"{name} names no repo to run in yet; the next poll adds it")
+    cfg = config.load()
+    if state.issue_running(entry["repo"], entry["id"]):
+        raise control.Busy(name)
+    if slots_free_to_start(cfg.max_parallel) <= 0:
+        raise NoFreeSlot(f"{name} was not started: {no_free_slot(cfg.max_parallel)}; wait for a run to finish or "
+                         "raise max_parallel in Settings")
+    run = spawn_run(entry["repo"], entry["id"], force=True)
+    give_up = time.monotonic() + RUN_START_SECONDS
+    while not state.issue_running(entry["repo"], entry["id"]) and time.monotonic() < give_up:
+        if run.poll() is not None:
+            raise control.Refused(f"{name} did not start; the end of {paths.short_path(RUNS_LOG)} says why")
+        time.sleep(0.1)
+    return {"ticket": name, "repo": entry["repo"], "id": entry["id"]}
 
 
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
@@ -1940,7 +1969,7 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
         if other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
             continue
         if blocker := tk.blocker(t.id):
-            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker)
+            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
             continue
         return t
     return None
@@ -1967,7 +1996,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
         if state.issue_running(repo.name, t.id):
             continue
         if blocker := tk.blocker(t.id):
-            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker)
+            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
             continue
         return t.id, f"{t.title} (you replied to the question)"
     return (fresh.id, fresh.title) if fresh else None

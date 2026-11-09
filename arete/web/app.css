@@ -19,7 +19,7 @@ th.c-ref { width: 140px; }
 th.c-verdict { width: 250px; }
 th.c-result { min-width: 260px; }
 td .state { margin-right: 2px; }
-td button { padding-top: 3px; padding-bottom: 2px; }
+td button { padding-top: 3px; padding-bottom: 2px; white-space: nowrap; }
 td.muted-cell { color: var(--muted); overflow-wrap: anywhere; }
 
 ol.questions { margin: 0; padding-left: 20px; }
@@ -51,8 +51,16 @@ pre.fold-text { max-height: 420px; overflow: auto; white-space: pre-wrap; overfl
 td div.muted { font-size: 13px; margin-top: 2px; }
 th.c-on { width: 70px; }
 th.c-decide { width: 210px; }
-th.c-loop-buttons { width: 195px; }
-td.c-buttons button { margin-bottom: 6px; }
+th.c-loop-buttons { width: 215px; }
+th.c-run-buttons { width: 150px; }
+th.c-run-anyway { width: 150px; }
+th.c-done { width: 150px; }
+th.c-file { width: 300px; }
+td.wrap-cell { overflow-wrap: anywhere; }
+.actions.offer { margin: 8px 0; gap: 8px 12px; }
+.actions.offer > span { font-size: 13px; }
+p.said:not([hidden]) { margin-top: 0; }
+#loop-new textarea { width: 100%; }
 th.c-model { width: 210px; }
 th.c-probe { width: 110px; }
 th.c-loop { min-width: 250px; }

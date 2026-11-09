@@ -73,11 +73,10 @@ def poll(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
     return [] if first else fresh
 
 
-def peek(loop: Loop, index: int, cfg: config.Config, limit: int = 5) -> list[dict]:
+def peek(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
     source = loop.sources[index]
-    sid = source_id(loop, index)
-    found, _ = SOURCES[source["type"]].fetch(loop, source, cfg, sid, "{}")
-    return [e for e in found if not loop.trigger.refusal(e)][-limit:]
+    found, _ = SOURCES[source["type"]].fetch(loop, source, cfg, source_id(loop, index), "{}")
+    return found
 
 
 def repo_problems(cfg: config.Config, names: list, what: str) -> list[str]:

@@ -23,6 +23,9 @@ const sendSaid = new Map();
 const sending = new Set();
 const HELD = Symbol("held");
 let redrawTriage = false;
+const saidIn = new Map();
+const going = { health: false, triage: false };
+let loopNewKey = "";
 
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
@@ -89,6 +92,20 @@ function sayParts(state, sentence) {
 function sayIn(line, state, sentence) {
   line.replaceChildren(...sayParts(state, sentence));
   line.hidden = false;
+}
+
+function saidLine(place) {
+  const said = saidIn.get(place);
+  return el("p", { class: "said", "aria-live": "polite", tabindex: "-1", "data-focus": `said:${place}`, "data-said": place, hidden: !said },
+    said ? sayParts(...said) : null);
+}
+
+function sayAt(place, state, sentence) {
+  saidIn.set(place, [state, sentence]);
+  const line = document.querySelector("main > section:not([hidden])")?.querySelector(`[data-said="${CSS.escape(place)}"]`);
+  if (!line) return;
+  sayIn(line, state, sentence);
+  line.focus();
 }
 
 function fault(sentence) {
@@ -161,7 +178,7 @@ function money(n) {
 async function call(path, body) {
   const options = body === undefined ? { cache: "no-store" }
     : { method: "POST", headers: { "Content-Type": "application/json", "X-Arete": "1" }, body: JSON.stringify(body) };
-  const response = await fetch(path, options);
+  const response = await fetch(path, options).catch(() => { throw new Error("The connection to arete failed."); });
   const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
   if (!response.ok) throw new Error(data.error || `The server answered ${response.status}.`);
   return data;
@@ -183,27 +200,31 @@ function drawLive(snapshot) {
   fill("live-now", heading(1, "Running now"), panelParts(snapshot.live, "The live runs", (live) => [
     el("p", { class: "readout" }, String(live.slots), el("small", { text: `of ${live.max_parallel} slots busy${live.waiting ? `, ${live.waiting} waiting for one` : ""}` })),
     live.runs.length
-      ? table("", [["Work"], ["Kind", "c-kind"], ["Started", "c-time"], ["Last step"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["", "c-log"]],
+      ? table("", [["Work"], ["Kind", "c-kind"], ["Started", "c-time"], ["Last step"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["", "c-run-buttons"]],
         live.runs.map((r) => el("tr", {},
           cell(wholeWords(r.ticket)), cell(r.kind), cell(clock(r.started)), cell(r.slot || r.step || "starting"),
-          cell(duration(r.seconds), "num"), cell(money(r.cost), "num"), cell(logButton(r.id)))))
+          cell(duration(r.seconds), "num"), cell(money(r.cost), "num"),
+          cell([logButton(r.id), " ", button(r.stopping ? "Stopping" : "Stop", `stop:${r.id}`, (b) => stopLiveRun(r, b), r.stopping)], "nb"))))
       : quiet("Nothing is running."),
+    saidLine("running"),
   ]));
 
   fill("live-rest",
     heading(2, "Skipped"),
-    panelParts(snapshot.skipped, "The skipped tickets", (skipped) => skipped.length
-      ? table("Labeled tickets the pipeline will not run", [["Ticket"], ["Why"], ["Since", "c-time"]],
-        skipped.map((s) => el("tr", {}, cell(link(s.url, s.ticket)), cell(s.why), cell(clock(s.since)))))
-      : quiet("No labeled ticket is skipped.")),
-    heading(3, "Review feedback"),
+    panelParts(snapshot.skipped, "The skipped tickets", (skipped) => [skipped.length
+      ? table("Labeled tickets the pipeline will not run on its own", [["Ticket"], ["Why"], ["Since", "c-time"], ["", "c-run-anyway"]],
+        skipped.map((s) => el("tr", {}, cell(link(s.url, s.ticket)), cell(s.why), cell(clock(s.since)), cell(skippedAction(s), "nb"))))
+      : quiet("No labeled ticket is skipped."), saidLine("skipped")]),
+    heading(3, "By hand"),
+    panelParts(snapshot.proposals, "The fixes to make by hand", (p) => [handParts(p), saidLine("hand")]),
+    heading(4, "Review feedback"),
     panelParts(snapshot.waiting, "The review feedback", (waiting) => waiting.tickets.length
       ? [el("p", {}, `Review feedback runs ${waiting.quiet_minutes} min after the last comment, or at once when a review is submitted.`),
         table("Waiting", [["Ticket"], ["Comments", "num c-time"], ["When"]],
           waiting.tickets.map((w) => el("tr", {}, cell(w.ticket), cell(w.comments, "num"),
             cell(`${w.at_once ? "review submitted" : "last comment"} ${clock(w.last)}`))))]
       : quiet("No review feedback is waiting.")),
-    heading(4, "Recent runs"),
+    heading(5, "Recent runs"),
     panelParts(snapshot.recent, "Recent runs", (recent) => recent.length
       ? table("Newest first", [["Work"], ["Kind", "c-kind"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-time"], ["Cost", "num c-cost"], ["Result", "c-result"], ["", "c-log"]],
         recent.map((r) => el("tr", {},
@@ -212,6 +233,61 @@ function drawLive(snapshot) {
           cell(r.pr_url ? pullLinks(r.pr_url) : r.summary, "muted-cell"),
           cell(logButton(r.id)))))
       : quiet("No run has started yet.")));
+}
+
+function stopWords(what, r, after) {
+  if (r.was !== "gone") return `Asked ${what} to stop. ${after}`;
+  return r.ticket ? `${what} had already ended; the next pipeline poll marks it stopped and tells its ticket.` : `${what} had already ended, so it is marked stopped.`;
+}
+
+async function stopLiveRun(run, btn) {
+  btn.disabled = true;
+  try {
+    sayAt("running", "ok", stopWords(run.ticket, await call(`/api/runs/${encodeURIComponent(run.id)}/stop`, {}), "It moves to Recent runs once it has."));
+  } catch (e) {
+    sayAt("running", "fault", e.message);
+  }
+  refresh();
+}
+
+function skippedAction(s) {
+  if (s.running) return el("span", { class: "muted", text: "running" });
+  return s.can_run ? button("Run anyway", `run-anyway:${s.ticket}`, (b) => runSkipped(s.ticket, b)) : null;
+}
+
+async function runSkipped(ticket, btn) {
+  btn.disabled = true;
+  try {
+    await call(`/api/skipped/${encodeURIComponent(ticket)}/run`, {});
+    sayAt("skipped", "ok", `Started ${ticket} past its blocker at ${clock(new Date().toISOString())}. It shows under Running now while it runs.`);
+  } catch (e) {
+    sayAt("skipped", "fault", e.message);
+  }
+  refresh();
+}
+
+function handParts(p) {
+  if (!p.hand.length && !p.memory.length) return quiet("Nothing waits for you to do by hand.");
+  const done = (x, what) => cell(button("Mark done", `done:${x.id}`, (b) => markDone(x.id, what, b)));
+  return [
+    p.hand.length ? [el("p", { text: "Claude Code will not let an agent write under .claude/, so the miner leaves these harness fixes to you. Make each one, then mark it done." }),
+      table("Harness fixes", [["File", "c-file"], ["Change"], ["", "c-done"]],
+        p.hand.map((x) => el("tr", {}, cell(`${x.repo}/${x.file}`, "wrap-cell"), cell(x.change), done(x, `The fix to ${x.repo}/${x.file}`))))] : null,
+    p.memory.length ? [el("p", { text: "The miner noticed these facts for an agent's memory. File each one by hand, then mark it done." }),
+      table("Memory facts", [["Repo", "c-kind"], ["Fact"], ["", "c-done"]],
+        p.memory.map((x) => el("tr", {}, cell(x.repo), cell(x.change), done(x, `The ${x.repo} fact`))))] : null,
+  ];
+}
+
+async function markDone(id, what, btn) {
+  btn.disabled = true;
+  try {
+    await call(`/api/proposals/${id}/done`, {});
+    sayAt("hand", "ok", `${what} is marked done, so it leaves this list.`);
+  } catch (e) {
+    sayAt("hand", "fault", e.message);
+  }
+  refresh();
 }
 
 async function showLog(id) {
@@ -250,9 +326,12 @@ function checksSummary(h) {
 }
 
 function drawHealth(snapshot) {
+  going.health = Boolean(snapshot.checks?.rows?.running);
   fill("health",
     heading(1, "Checks"),
     panelParts(snapshot.checks, "The heartbeat", (h) => [checksSummary(h),
+      el("div", { class: "actions" }, button(h.running ? "Checks running" : "Run the checks now", "checks-run", runChecks, h.running)),
+      saidLine("checks"),
       h.checks.length ? table("", [["Check"], ["State", "c-status"], ["Detail"]],
         h.checks.map((c) => el("tr", {}, cell(c.key), cell(stateChip(c.state)), cell(c.detail || "")))) : ""]),
     heading(2, "Loops"),
@@ -272,12 +351,49 @@ function drawHealth(snapshot) {
       : el("p", {}, stateChip("ok"), " No alert is open.")));
 }
 
+async function runChecks(btn) {
+  btn.disabled = true;
+  try {
+    await call("/api/checks/run", {});
+    sayAt("checks", "ok", `Started the checks at ${clock(new Date().toISOString())}. Their results show here when they end.`);
+  } catch (e) {
+    sayAt("checks", "fault", e.message);
+  }
+  refresh();
+}
+
 function drawTriage(snapshot) {
   fill("triage", panelParts(snapshot.triage, "Triage", triageParts));
 }
 
+async function refreshTriage(btn) {
+  btn.disabled = true;
+  try {
+    await call("/api/triage/refresh", {});
+    sayAt("triage-refresh", "ok", `Started triage at ${clock(new Date().toISOString())}. It reads every open ticket, so it can take a few minutes; the verdicts here change when it ends.`);
+  } catch (e) {
+    sayAt("triage-refresh", "fault", e.message);
+  }
+  refresh();
+}
+
+async function researchTicket(r, btn) {
+  btn.disabled = true;
+  try {
+    await call(`/api/triage/${encodeURIComponent(r.ref)}/research`, { force: r.research.force });
+    sayAt(`research:${r.ref}`, "ok", `Asked the research loop at ${clock(new Date().toISOString())} to research ${r.ref}. Its verdict follows the research.`);
+  } catch (e) {
+    sayAt(`research:${r.ref}`, "fault", e.message);
+  }
+  refresh();
+}
+
 function triageParts(t) {
-  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${clock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent.`)];
+  going.triage = t.refreshing || t.researching;
+  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${clock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent.`),
+    el("div", { class: "actions" }, button(t.refreshing ? "Triage running" : "Refresh triage now", "triage-refresh", refreshTriage, t.refreshing)),
+    saidLine("triage-refresh")];
+  if (t.researching) parts.push(quiet("The research loop is running, so the research buttons wait until it ends."));
   if (t.approved && t.approved.length) parts.push(quiet(`Sent to the pipeline on the last run: ${t.approved.join(", ")}.`));
   Object.entries(t.held || {}).forEach(([ref, why]) => parts.push(quiet(`Not sent this time: ${ref}: ${why}`)));
   t.groups.forEach((g, i) => {
@@ -287,14 +403,23 @@ function triageParts(t) {
         table("", [["Ticket", "c-ref"], ["Title"], ["Verdict", "c-verdict"]],
           g.rows.map((r) => el("tr", {},
             cell(link(r.url, r.ref.replace(/^[^/#\s]+\//, "")), "nb"),
-            cell([r.title, ...triageFolds(r)]),
+            cell([r.title, ...triageFolds(r, t.researching)]),
             cell(r.prs ? [...wholeWords(r.verdict), el("br"), ...pullLinks(r.prs)] : wholeWords(r.verdict)))))]
       : quiet("None."));
   });
   return parts;
 }
 
-function triageFolds(r) {
+function researchOffer(r, researching) {
+  return [
+    r.research ? el("div", { class: "actions offer" },
+      button(r.research.label, `research:${r.ref}`, (b) => researchTicket(r, b), researching),
+      r.research.force ? el("span", { class: "muted", text: "This skips JEV's screen for instructions aimed at an agent, so read the ticket first." }) : null) : null,
+    r.research || saidIn.has(`research:${r.ref}`) ? saidLine(`research:${r.ref}`) : null,
+  ];
+}
+
+function triageFolds(r, researching) {
   const list = (items) => el("ol", { class: "questions" }, items.map((q) => el("li", { text: q })));
   const answerable = r.send && r.questions.length;
   return [
@@ -304,6 +429,7 @@ function triageFolds(r) {
     r.plan.length ? fold(`triage:p:${r.ref}`, "Show the plan", list(r.plan)) : null,
     r.report ? fold(`triage:r:${r.ref}`, "Show the report", el("pre", { class: "fold-text", text: r.report })) : null,
     answerable ? fold(`triage:q:${r.ref}`, "Answer the questions", sendForm(r)) : r.send ? sendForm(r) : null,
+    ...researchOffer(r, researching),
   ];
 }
 
@@ -613,6 +739,7 @@ async function chatAction(path, button, resultId) {
 const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 const feeds = {
   loop: { box: "loop-feed", run: "", after: 0, status: "" },
+  draft: { box: "draft-feed", run: "", after: 0, status: "" },
   session: { box: "session-feed", run: "", after: 0, status: "" },
 };
 let openLoop = "";
@@ -657,6 +784,7 @@ async function openFeed(which, runId) {
   const feed = feeds[which];
   Object.assign(feed, { run: runId, after: 0, status: "" });
   document.querySelector(`#${feed.box} .feed-lines`).textContent = "";
+  for (const said of document.querySelectorAll(`#${feed.box} .feed-said`)) said.hidden = true;
   await refreshFeed(which);
   document.getElementById(feed.box).scrollIntoView({ block: "nearest" });
 }
@@ -679,11 +807,15 @@ async function refreshFeed(which) {
       lines.textContent = "Nothing in the feed yet.";
     }
     feed.status = data.run.status;
-    box.querySelector(".feed-title").textContent = `${which === "loop" ? data.run.loop || "Feed" : "Session"} · ${clock(data.run.started)}`;
+    const title = which === "session" ? "Session" : data.run.kind === "draft" ? "Draft" : data.run.loop || "Feed";
+    box.querySelector(".feed-title").textContent = `${title} · ${clock(data.run.started)}`;
     const about = box.querySelector(".feed-about");
     if (about) about.replaceChildren(...runAbout(data.run).filter(Boolean));
     else box.querySelector(".feed-title").after(el("p", { class: "muted feed-about" }, runAbout(data.run).filter(Boolean)));
-    box.querySelector(".feed-stop").disabled = data.run.status !== "running";
+    const stop = box.querySelector(".feed-stop");
+    const ended = data.run.status !== "running";
+    if (ended && document.activeElement === stop) box.querySelector(".feed-close").focus();
+    stop.disabled = ended;
     if (which === "session") document.getElementById("session-go").disabled = data.run.status !== "running";
     if (stick) lines.scrollTop = lines.scrollHeight;
   } catch (e) {
@@ -700,21 +832,41 @@ async function stopFeedRun(which, btn, resultId) {
   btn.disabled = true;
   try {
     const r = await call(`/api/runs/${encodeURIComponent(feeds[which].run)}/stop`, {});
-    say(resultId, "ok", r.was === "gone" ? (r.ticket ? `${r.id} had already ended; the next pipeline poll marks it stopped and tells its ticket.` : `${r.id} had already ended, so it is marked stopped.`) : `Asked ${r.id} to stop. Its feed says when it has.`);
+    say(resultId, "ok", stopWords(feeds[which].run, r, "The feed says when it has."));
   } catch (e) {
     say(resultId, "fault", e.message);
   }
+  document.getElementById(resultId).focus();
   await refreshFeed(which);
 }
 
 function serveLine(serve) {
-  if (!serve.at) return el("p", {}, stateChip("fault"), " Serve has never run on this machine, so no loop fires on its own. ", el("code", { text: "arete install" }), " starts it and keeps it running.");
+  return [serveState(serve), !serve.at || !serve.alive
+    ? el("div", { class: "actions" }, button(serve.at ? "Restart serve" : "Install serve", "serve-install", installServe)) : null,
+  saidLine("serve")];
+}
+
+function serveState(serve) {
+  if (!serve.at) return el("p", {}, stateChip("fault"), " Serve has never run on this machine, so no loop fires on its own. Installing it starts it and keeps it running.");
   if (!serve.alive) return el("p", {}, stateChip("fault"), ` Serve last beat ${ago(serve.at)} (${clock(serve.at)}), so no loop fires on its own until it runs again.`);
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
   return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),
     ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running} running, ${serve.pending} waiting.` +
     (broken ? ` ${broken} broken.` : "") + (errors ? ` ${errors} sources fail to poll; Fleet lists them.` : ""));
+}
+
+async function installServe(btn) {
+  btn.disabled = true;
+  sayAt("serve", null, "Installing serve. It loads the background job and readies each repo's labels, so it can take a minute.");
+  try {
+    const r = await call("/api/serve/install", {});
+    sayAt("serve", "ok", r.restarting ? "Serve is restarting. This page stops answering for a few seconds and comes back once serve is up."
+      : `Installed serve${r.said ? `: ${r.said}` : ""}.`);
+  } catch (e) {
+    sayAt("serve", "fault", e.message);
+  }
+  refresh();
 }
 
 function approvalRow(a) {
@@ -737,6 +889,7 @@ async function decide(id, yes, btn) {
   } catch (e) {
     say("loops-result", "fault", e.message);
   }
+  document.getElementById("loops-result").focus();
   refresh();
 }
 
@@ -758,8 +911,9 @@ function loopRow(l) {
     cell([
       button("Open", `open:${l.name}`, () => openLoopDetail(l.name)), " ",
       button("Start", `start:${l.name}`, (b) => loopAction(l.name, "start", b), Boolean(l.error || l.running)), " ",
+      button("Try", `try:${l.name}`, (b) => loopAction(l.name, "try", b), Boolean(l.error || l.running)), " ",
       button(l.enabled ? "Turn off" : "Turn on", `switch:${l.name}`, (b) => loopAction(l.name, l.enabled ? "disable" : "enable", b), Boolean(l.error && !l.enabled)),
-    ], "c-buttons"));
+    ], "nb"));
 }
 
 function drawLoops(data, approvals) {
@@ -773,15 +927,49 @@ function drawLoops(data, approvals) {
     data.loops.length
       ? table("Spent counts the last 24 hours", [["Loop", "c-loop"], ["On", "c-on"], ["Kind"], ["Trigger"], ["Last run", "c-status"], ["Next", "c-time"], ["Spent", "num"], ["", "c-loop-buttons"]],
         data.loops.map(loopRow))
-      : quiet("No loop is installed. arete loop new drafts one from a sentence."));
+      : quiet("No loop is installed. Draft one from a sentence below."));
+  fillLoopNew(data.draft);
+}
+
+function fillLoopNew(d) {
+  const key = JSON.stringify(d);
+  if (key === loopNewKey) return;
+  loopNewKey = key;
+  options("loop-new-repo", "None", d.repos, document.getElementById("loop-new-repo").value);
+  fill("loop-new-models", d.models.map((m) => el("option", { value: m })));
+  document.getElementById("loop-new-model").placeholder = `default: ${d.default_model}`;
+}
+
+async function draftLoop(event) {
+  event.preventDefault();
+  const value = (id) => document.getElementById(`loop-new-${id}`).value.trim();
+  if (!value("sentence")) {
+    say("loop-new-result", "caution", "Say in a sentence what the loop should do first.");
+    return document.getElementById("loop-new-sentence").focus();
+  }
+  const btn = document.getElementById("loop-new-go");
+  btn.disabled = true;
+  try {
+    const r = await call("/api/loops/new", { sentence: value("sentence"), name: value("name"), repo: value("repo"), model: value("model") });
+    say("loop-new-result", "ok", `Started a draft at ${clock(r.started)}. Its feed is open below. The loop lands turned off, so try it before you turn it on.`);
+    for (const id of ["sentence", "name"]) document.getElementById(`loop-new-${id}`).value = "";
+    await openFeed("draft", r.id);
+    refresh();
+  } catch (e) {
+    say("loop-new-result", "fault", e.message);
+  } finally {
+    btn.disabled = false;
+  }
+  document.getElementById("loop-new-result").focus();
 }
 
 async function loopAction(name, action, btn) {
   btn.disabled = true;
   try {
     const r = await call(`/api/loops/${encodeURIComponent(name)}/${action}`, {});
-    if (action === "start") {
-      say("loops-result", "ok", `Started ${name}. Its feed is open below.`);
+    if (action === "start" || action === "try") {
+      say("loops-result", "ok", action === "start" ? `Started ${name} at ${clock(r.started)}. Its feed is open below.`
+        : `Started a try of ${name} at ${clock(r.started)}. Its feed, open below, shows what each emit would do, and none is sent.`);
       await openFeed("loop", r.id);
     } else {
       say("loops-result", "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`);
@@ -789,6 +977,7 @@ async function loopAction(name, action, btn) {
   } catch (e) {
     say("loops-result", "fault", e.message);
   }
+  document.getElementById("loops-result").focus();
   refresh();
 }
 
@@ -804,7 +993,7 @@ async function refreshLoopDetail() {
   try {
     drawLoopDetail(await call(`/api/loops/${encodeURIComponent(openLoop)}`));
   } catch (e) {
-    fill("loop-detail", heading(3, openLoop), fault(`The loop could not be read: ${e.message}`), closeLoopButton());
+    fill("loop-detail", heading(4, openLoop), fault(`The loop could not be read: ${e.message}`), closeLoopButton());
   }
   box.hidden = false;
 }
@@ -860,7 +1049,7 @@ function loopDigests(d) {
 function drawLoopDetail(d) {
   const memory = Object.keys(d.state || {}).length ? JSON.stringify(d.state, null, 2) : "";
   fill("loop-detail",
-    heading(3, d.name),
+    heading(4, d.name),
     d.error ? fault(`It does not load: ${d.error}`) : el("p", { text: d.description }),
     loopFacts(d),
     el("h3", { text: "Runs" }), loopRuns(d),
@@ -1043,7 +1232,7 @@ const LOADERS = {
   loops: async () => {
     const [loops, approvals] = await Promise.all([call("/api/loops"), call("/api/approvals")]);
     drawLoops(loops, approvals.approvals);
-    await Promise.all([refreshLoopDetail(), refreshFeed("loop")]);
+    await Promise.all([refreshLoopDetail(), refreshFeed("loop"), refreshFeed("draft")]);
   },
   launch: async () => {
     drawLaunch(await call("/api/sessions"));
@@ -1074,7 +1263,7 @@ const LOADERS = {
 };
 
 function nextDelay() {
-  if (view === "live" || view === "loops") return LIVE_MS;
+  if (view === "live" || view === "loops" || going[view]) return LIVE_MS;
   if (view === "launch") return feeds.session.run && feeds.session.status === "running" ? CHAT_BUSY_MS : SLOW_MS;
   if (view === "chat") return chatSeen.endsWith(":true") ? CHAT_BUSY_MS : SLOW_MS;
   return SLOW_MS;
@@ -1142,6 +1331,10 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.getElementById("chat").addEventListener("submit", sendChat);
   document.getElementById("launch").addEventListener("submit", launch);
+  document.getElementById("loop-new").addEventListener("submit", draftLoop);
+  document.getElementById("loop-new-sentence").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) document.getElementById("loop-new").requestSubmit();
+  });
   document.getElementById("launch-device").addEventListener("change", repoFollowsDevice);
   document.getElementById("launch-reset").addEventListener("click", async () => {
     document.getElementById("launch").reset();
@@ -1152,7 +1345,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("session-text").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) document.getElementById("session-send").requestSubmit();
   });
-  for (const [which, resultId] of [["loop", "loops-result"], ["session", "session-result"]]) {
+  for (const [which, resultId] of [["loop", "loop-feed-result"], ["draft", "draft-feed-result"], ["session", "session-result"]]) {
     const box = document.getElementById(feeds[which].box);
     box.querySelector(".feed-close").addEventListener("click", () => closeFeed(which));
     box.querySelector(".feed-stop").addEventListener("click", (event) => stopFeedRun(which, event.currentTarget, resultId));

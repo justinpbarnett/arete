@@ -79,7 +79,7 @@ def live() -> dict:
             "started": r["started"], "seconds": seconds_between(r["started"], None),
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
             "slot": slot_note(r, in_slots, waiting_for_slot),
-            "cost": round(r["cost_usd"] or 0, 2),
+            "cost": round(r["cost_usd"] or 0, 2), "stopping": bool(r["stop_asked"]),
         })
     return {"runs": rows, "slots": len(in_slots), "waiting": len(waiting_for_slot),
             "max_parallel": config.load().max_parallel}
@@ -94,7 +94,9 @@ def slot_note(r: dict, in_slots: set[str], waiting_for_slot: set[str]) -> str:
 
 
 def skipped() -> list[dict]:
-    return [{"ticket": name, "why": v["why"], "since": v.get("since", ""), "url": v.get("url", "")}
+    running = {(r["repo"], str(r["issue"])) for r in state.runs_marked_running(connect=state.reader) if r["issue"]}
+    return [{"ticket": name, "why": v["why"], "since": v.get("since", ""), "url": v.get("url", ""),
+             "can_run": bool(v.get("repo")), "running": (v.get("repo"), v.get("id")) in running}
             for name, v in sorted(pipeline.skipped_tickets().items())]
 
 
@@ -115,10 +117,14 @@ def recent(r: dict) -> dict:
     }
 
 
+def loops_running() -> set[str]:
+    return {r["loop"] for r in state.runs_marked_running(connect=state.reader) if r["kind"] == "loop"}
+
+
 def checks() -> dict:
     beat = util.read_json(paths.HEARTBEAT_FILE, {})
     return {
-        "heartbeat": beat.get("ts", ""),
+        "heartbeat": beat.get("ts", ""), "running": "heartbeat" in loops_running(),
         "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")}
                    for c in sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))],
         "loops": [{"name": k, **v} for k, v in sorted(util.read_json(paths.LOOP_MARKS_FILE, {}).items())],
@@ -138,7 +144,9 @@ def triage_board() -> dict:
     v = triage.view(connect=state.reader)
     srcs = {s.name: s for s in triage.sources(config.load())}
     meta = util.read_json(triage.META_FILE, {})
+    running = loops_running()
     return {
+        "refreshing": "triage" in running, "researching": "research" in running,
         "refreshed": meta.get("refreshed", ""), "posted": meta.get("posted", ""), "errors": meta.get("errors", []),
         "approved": meta.get("approved", []), "held": meta.get("held", {}),
         "summary": triage.summary(v),
@@ -149,15 +157,18 @@ def triage_board() -> dict:
 
 def triage_entry(r: dict, v: dict, standing: str, srcs: dict[str, triage.TriageSource]) -> dict:
     report = v["research"].get(r["ref"]) if standing == triage.RESEARCH_WORK else None
+    offer = triage.research_offer(r, report) if standing == triage.RESEARCH_WORK else None
     if report and report.get("answered_by"):
         report = v["research"].get(report["answered_by"])
     return {"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "", "url": r["url"] or "",
             "kind": r["kind"] or "", "size": r["size"] or "",
-            "verdict": triage.sent_note(r, False) if standing == triage.SENT else triage.verdict(r, v["research"]),
+            "verdict": triage.sent_note(r, False) if standing == triage.SENT
+            else triage.verdict(r, v["research"], commands=False),
             "prs": " ".join(triage.sent_prs(r)) if standing == triage.SENT else (report or {}).get("filed_url") or "",
             "questions": r.get("questions") or [], "assumptions": r["assumptions"] or [], "plan": r["plan"] or [],
             "summary": report["summary"] if report else "", "report": report["report"] if report else "",
-            "send": send_form(r, srcs.get(r.get("source", ""))) if standing in triage.SENDABLE else None}
+            "send": send_form(r, srcs.get(r.get("source", ""))) if standing in triage.SENDABLE else None,
+            "research": offer}
 
 
 def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:

@@ -228,7 +228,7 @@ def parent_hold(r: dict, ticket: triage.TicketText, kin: list[tuple[str, dict]])
     if not children or not ticket.thin():
         return ""
     return (f"it has no description of its own and its children {', '.join(children)} are research tickets, so their "
-            f"reports cover it; `arete research {r['ref']} --run --force` researches it anyway")
+            "reports cover it")
 
 
 def answered_by(cfg: config.Config, r: dict, ticket: triage.TicketText, done: list[tuple[str, dict, dict]],
@@ -304,20 +304,18 @@ def research(cfg: config.Config, r: dict, force: bool = False) -> tuple[str, str
         if fresh and judged and done:
             link, p = answered_by(cfg, r, ticket, done, {o["ref"]: o["title"] for o in rows})
             if link:
-                why = (f"the report for {link} already answers it (JEV p {p:.2f}); `arete research {ref} --run --force` "
-                       f"researches it anyway")
+                why = f"the report for {link} already answers it (JEV p {p:.2f})"
                 state.research_set(ref, **(base | {"answered_by": link}), status=ANSWERED, error=why, basis=basis)
                 return ANSWERED, why
         if not judged:
-            why = f"JEV is off, so nothing screens the ticket; `arete research {ref} --run --force`"
+            why = "JEV is off, so nothing screens the ticket"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
         screened = jev.injection(f"{r['title']}\n\n{text}", cfg, trace=("", f"research {ref} injection jev"))
         if screened is None:
             return LATER, f"JEV could not screen {ref}"
         if screened.yes >= cfg.jev.injection:
-            why = (f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f}); check the ticket, then "
-                   f"`arete research {ref} --run --force`")
+            why = f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f})"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
     state.research_set(ref, **base, status=RUNNING, error="")
@@ -360,13 +358,13 @@ def research(cfg: config.Config, r: dict, force: bool = False) -> tuple[str, str
     return DONE if ok else FAILED, f"{why} (${res.cost_usd:.2f})"
 
 
-def next_due(dry_run: bool = False) -> int:
+def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
     paths.ensure_dirs()
     cfg = config.load()
     with util.lock("research") as got:
         if not got:
-            print(f"{util.iso()} research already running")
-            return 0
+            print(f"{util.iso()} research already running" + ("; ask again when it ends" if asked else ""))
+            return 1 if asked else 0
         if dry_run:
             todo = due()
             print(f"would research {todo[0]['ref'] if todo else 'nothing'}"
@@ -374,8 +372,10 @@ def next_due(dry_run: bool = False) -> int:
             return 0
         tidy()
         if not network_up_or_skip("research", dry_run):
-            return 0
+            return 1 if asked else 0
         unfiled = file_unfiled(cfg)
+        if asked:
+            return research_asked(cfg, asked)
         todo = due()
         if not todo:
             mark_loop("research", not unfiled, unfiled[0] if unfiled else "nothing due")
@@ -387,6 +387,22 @@ def next_due(dry_run: bool = False) -> int:
                 break
         mark_loop("research", outcome in (DONE, *NO_RUN), why)
         return 1 if outcome in (FAILED, LATER) else 0
+
+
+def research_asked(cfg: config.Config, asked: list[dict]) -> int:
+    rows = {r["ref"].lower(): r for r in tickets()}
+    outcomes = []
+    for event in asked:
+        ref = str(event.get("ref") or "")
+        if not (r := rows.get(ref.lower())):
+            outcome, why = FAILED, "it is no longer a research ticket on the triage board"
+        else:
+            ref = r["ref"]
+            outcome, why = research(cfg, r, force=event.get("force") is True)
+        print(f"{util.iso()} {ref}: {outcome}: {why}", flush=True)
+        outcomes.append(outcome)
+    mark_loop("research", FAILED not in outcomes and LATER not in outcomes, why)
+    return 1 if FAILED in outcomes or LATER in outcomes else 0
 
 
 def run_now(ref: str, force: bool = False) -> int:

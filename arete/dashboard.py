@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,8 +26,12 @@ from . import (
     hooks,
     loops,
     paths,
+    pipeline,
+    research,
+    scaffold,
     sessions,
     settings,
+    state,
     triage,
     util,
 )
@@ -54,6 +59,9 @@ APPROVAL_PATH = "/api/approvals/"
 SESSION_PATH = "/api/sessions/"
 DEVICE_PATH = "/api/devices/"
 TRIAGE_PATH = "/api/triage/"
+SKIPPED_PATH = "/api/skipped/"
+PROPOSAL_PATH = "/api/proposals/"
+INSTALL_SECONDS = 120
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
@@ -139,12 +147,20 @@ class Refusal(Exception):
 STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
-                     triage.TrackerFailed: 502}
+                     triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409}
 
 
 def refusal_status(e: Exception) -> int | None:
     return e.status if isinstance(e, Refusal | hooks.HookRefused) else next(
         (status for kind, status in STATUS_OF_REFUSAL.items() if isinstance(e, kind)), None)
+
+
+def as_sentence(text: str) -> str:
+    text = text.strip()
+    first_word = text.split(" ", 1)[0]
+    if first_word.isalpha() and first_word.islower():
+        text = text[0].upper() + text[1:]
+    return text if text.endswith((".", "?", "!")) else f"{text}."
 
 
 def last_part(path: str, prefix: str) -> tuple[str, str]:
@@ -179,9 +195,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.api(method, path, {k: v[-1] for k, v in parse_qs(parts.query).items()}))
         except Exception as e:
             if status := refusal_status(e):
-                return self.send_json(status, {"error": str(e)})
+                return self.send_json(status, {"error": as_sentence(str(e))})
             self.log_error("%s", f"{type(e).__name__}: {e}")
-            self.send_json(500, {"error": util.first_line(f"{type(e).__name__}: {e}", 300)})
+            self.send_json(500, {"error": as_sentence(util.first_line(f"{type(e).__name__}: {e}", 300))})
 
     def admit(self, method: str, path: str) -> None:
         node: Node = self.server.node
@@ -210,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
                 run_id = unquote(path[len(LOG_PATH):])
                 return {"id": run_id, "lines": board.run_log(run_id)}
             if path == "/api/loops":
-                return {"loops": control.loop_views(), "serve": control.serve_beat()}
+                return {"loops": control.loop_views(), "serve": control.serve_beat(), "draft": draft_choices()}
             if path.startswith(LOOP_PATH):
                 return control.loop_detail(unquote(path[len(LOOP_PATH):]))
             if path.startswith(FEED_PATH):
@@ -234,6 +250,8 @@ class Handler(BaseHTTPRequestHandler):
                 return chat.file_draft()
             if path == "/api/chat/drop":
                 return chat.drop_draft()
+            if path == "/api/loops/new":
+                return self.draft_loop()
             if path.startswith(LOOP_PATH):
                 return self.loop_action(*last_part(path, LOOP_PATH))
             if path.startswith(RUN_PATH):
@@ -255,10 +273,26 @@ class Handler(BaseHTTPRequestHandler):
                 name, action = last_part(path, DEVICE_PATH)
                 if action == "probe":
                     return devices.probe(name)
+            if path == "/api/triage/refresh":
+                return {"run": engine.launch("triage")["id"]}
             if path.startswith(TRIAGE_PATH):
                 ref, action = last_part(path, TRIAGE_PATH)
                 if action == "send":
                     return self.send_ticket(ref)
+                if action == "research":
+                    return research_ticket(ref, self.body().get("force") is True)
+            if path == "/api/checks/run":
+                return {"run": engine.launch("heartbeat")["id"]}
+            if path.startswith(SKIPPED_PATH):
+                name, action = last_part(path, SKIPPED_PATH)
+                if action == "run":
+                    return pipeline.run_skipped(name)
+            if path.startswith(PROPOSAL_PATH):
+                proposal_id, action = last_part(path, PROPOSAL_PATH)
+                if action == "done":
+                    return forget_proposal(whole_number(proposal_id))
+            if path == "/api/serve/install":
+                return install_serve()
         raise Refusal(404, f"Nothing at {method} {path}.")
 
     def loop_action(self, name: str, action: str):
@@ -266,7 +300,14 @@ class Handler(BaseHTTPRequestHandler):
             return control.switch(name, action == "enable")
         if action == "start":
             return engine.launch(name)
-        raise Refusal(404, f"Loops take enable, disable or start, not {action}.")
+        if action == "try":
+            return scaffold.start_try(name)
+        raise Refusal(404, f"Loops take enable, disable, start or try, not {action}.")
+
+    def draft_loop(self) -> dict:
+        b = self.body()
+        return scaffold.start_draft(str(b.get("sentence") or ""), name=str(b.get("name") or ""),
+                                    repo=str(b.get("repo") or ""), model=str(b.get("model") or ""))
 
     def launch_session(self) -> dict:
         b = self.body()
@@ -346,6 +387,35 @@ class Server(ThreadingHTTPServer):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
         self.node, self.logins = node, logins
         super().__init__((address, port), Handler)
+
+
+def draft_choices() -> dict:
+    cfg = config.load()
+    return {"repos": [r.name for r in cfg.repos], "models": sessions.known_models(cfg), "default_model": cfg.model("loop")}
+
+
+def research_ticket(ref: str, force: bool) -> dict:
+    r = next((r for r in research.tickets() if r["ref"].lower() == ref.strip().lower()), None)
+    if not r:
+        raise control.NotFound(f"{ref} is not a research ticket on the triage board")
+    return {"ref": r["ref"], "run": engine.launch("research", events=[{"ref": r["ref"], "force": force}])["id"]}
+
+
+def forget_proposal(proposal_id: int) -> dict:
+    if not state.forget_proposal(proposal_id):
+        raise control.NotFound(f"#{proposal_id} is not open; it is done already")
+    return {"id": proposal_id}
+
+
+def install_serve() -> dict:
+    if control.serve_beat().get("pid") == os.getpid():
+        control.detach(["install"], "install.log")
+        return {"restarting": True}
+    res = util.sh([sys.executable, "-m", "arete.cli", "install"], timeout=INSTALL_SECONDS)
+    said = "; ".join(line.strip() for line in (res.stdout + res.stderr).splitlines() if line.strip())
+    if res.returncode != 0:
+        raise Refusal(500, f"Serve did not install: {util.first_line(said or f'exit {res.returncode}', 400)}")
+    return {"restarting": False, "said": util.first_line(said, 400)}
 
 
 def start_poll() -> str:
