@@ -202,7 +202,8 @@ class Command(Source):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            out.append(event(row.get("type", "command"), sid, row.get("key") or row.get("title"),
+            key = row.get("key") or row.get("title") or hashlib.sha1(line.strip().encode()).hexdigest()[:16]
+            out.append(event(row.get("type", "command"), sid, key,
                              row.get("title", ""), repo=row.get("repo", loop.repo), url=row.get("url", ""),
                              trust=source.get("trust", "internal"), data=row.get("data") or {}))
         return out, None
