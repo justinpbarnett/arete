@@ -18,10 +18,10 @@ MAX_DESCRIPTION = 1024
 
 LINK = re.compile(r"\]\(([^)\s#]+)(?:#[^)\s]*)?(?:\s[^)]*)?\)")
 HOOK_PATHS = [
-    (re.compile(r"(?:\$HOME|\$\{HOME\}|~)(/[^\s\"';|&)]+)"), lambda m: paths.HOME / m.group(1).lstrip("/")),
-    (re.compile(r"(?<![\w$}~./-])(/(?:Users|opt|usr/local)/[^\s\"';|&)]+)"), lambda m: Path(m.group(1))),
+    (re.compile(r"(?:\$HOME|\$\{HOME\}|~)(/[^\s\"';|&):]+)"), lambda m: paths.HOME / m.group(1).lstrip("/")),
+    (re.compile(r"(?<![\w$}~./-])(/(?:Users|opt|usr/local)/[^\s\"';|&):]+)"), lambda m: Path(m.group(1))),
 ]
-PLUGIN_ROOT = re.compile(r"\$\{CLAUDE_PLUGIN_ROOT\}(/[^\s\"';|&)]+)")
+PLUGIN_ROOT = re.compile(r"\$\{CLAUDE_PLUGIN_ROOT\}(/[^\s\"';|&):]+)")
 
 
 @dataclass
