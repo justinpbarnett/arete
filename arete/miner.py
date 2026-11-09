@@ -230,11 +230,15 @@ def render_events(cfg: config.Config, hours: float) -> str:
     by = Counter()
     repeats = Counter()
     skills = Counter()
+    subagents = Counter()
     for e in evs:
         repo = cfg.repo_for_path(e.get("cwd", "")) if e.get("cwd") else None
         rn = repo.name if repo else "none"
         if e.get("kind") == "skill" and e.get("cls") == "invoked":
             skills[e.get("detail")] += 1
+            continue
+        if e.get("kind") == "agent" and e.get("cls") == "spawned":
+            subagents[(e.get("detail") or "").partition(": ")[0]] += 1
             continue
         by[f"{rn} {e.get('kind')}/{e.get('cls')}"] += 1
         if e.get("cls") not in ("interrupted", "denied"):
@@ -246,6 +250,8 @@ def render_events(cfg: config.Config, hours: float) -> str:
         lines += ["", "Repeated failures:"] + [f"- {n} x {k}" for k, n in rep]
     if skills:
         lines += ["", "Skills used: " + ", ".join(f"{k} ({n})" for k, n in skills.most_common(15))]
+    if subagents:
+        lines += ["", "Subagents used: " + ", ".join(f"{k} ({n})" for k, n in subagents.most_common(15))]
     return "\n".join(lines)
 
 
