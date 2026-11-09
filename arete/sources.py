@@ -27,6 +27,11 @@ def source_id(loop: Loop, index: int) -> str:
     return f"{loop.name}#{index}"
 
 
+def fingerprint(source: dict) -> str:
+    settings = json.dumps({k: v for k, v in source.items() if k != "every"}, sort_keys=True, default=str)
+    return hashlib.sha256(settings.encode()).hexdigest()
+
+
 def every(source: dict) -> float:
     return cron.seconds(source["every"]) if source.get("every") else DEFAULT_EVERY
 
@@ -65,13 +70,16 @@ def github_name(cfg: config.Config, name: str) -> str:
 def poll(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
     source = loop.sources[index]
     sid = source_id(loop, index)
-    first = state.cursor(sid) is None
-    found, value = SOURCES[source["type"]].fetch(loop, source, cfg, sid, (state.cursor(sid) or {}).get("value"))
+    owner = fingerprint(source)
+    known = state.cursor(sid)
+    first = known is None or state.source_owner(sid) not in (None, owner)
+    found, value = SOURCES[source["type"]].fetch(loop, source, cfg, sid, None if first else known["value"])
     seen = state.seen_keys(sid)
     fresh = [e for e in found if e["key"] not in seen]
     fresh = list({e["key"]: e for e in fresh}.values())
     state.mark_seen(sid, [e["key"] for e in fresh])
     state.set_cursor(sid, value, True, f"{len(found)} read, {len(fresh)} new{' (baseline)' if first else ''}")
+    state.set_source_owner(sid, owner)
     return [] if first else fresh
 
 

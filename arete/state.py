@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS cursors (
     ok INTEGER,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS source_owners (
+    source TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     loop TEXT NOT NULL,
@@ -502,6 +506,17 @@ def set_cursor(source: str, value: str | None, ok: bool, detail: str = "") -> No
     with db() as c:
         c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
                   (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500]))
+
+
+def source_owner(source: str) -> str | None:
+    with db() as c:
+        r = c.execute("SELECT fingerprint FROM source_owners WHERE source = ?", (source,)).fetchone()
+        return r[0] if r else None
+
+
+def set_source_owner(source: str, fingerprint: str) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO source_owners (source, fingerprint) VALUES (?,?)", (source, fingerprint))
 
 
 def cursors(connect=db) -> list[dict]:
