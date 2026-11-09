@@ -17,6 +17,7 @@ FIX_TYPES = {"bug", "fire", "incident", "problem"}
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "created", "updated", "creator", "reporter",
                "assignee", "parent", "attachment"]
 JIRA_STATE_LABELS = {f"agent-{s}" for s in config.STATES}
+JIRA_LABEL_ARETE_LEAVES = "agent-running"
 SEARCH_FIELDS = ["summary", "created", "labels"]
 MAX_AGENT_ISSUES = 1000
 MAX_COMMENTS = 10
@@ -354,7 +355,9 @@ def is_arete_edit(h: dict) -> bool:
         before, after = _tokens(it.get("fromString")), _tokens(it.get("toString"))
         added |= after - before
         removed |= before - after
-    return bool(added) and (added | removed) <= JIRA_STATE_LABELS
+    if not added:
+        return removed == {JIRA_LABEL_ARETE_LEAVES}
+    return (added | removed) <= JIRA_STATE_LABELS
 
 
 def _authored_by(item: dict, account_id: str) -> bool:
