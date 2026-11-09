@@ -128,6 +128,7 @@ def loop_detail(name: str, connect=state.db) -> dict:
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
             "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "digests": digests(loop), "metrics": loop_metrics(loop, connect),
+            "model": loop.model_for(cfg) if loop.agent and not loop.error else "",
             "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
 
 
