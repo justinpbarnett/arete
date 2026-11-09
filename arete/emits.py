@@ -46,7 +46,8 @@ def ticket_body(loop: Loop, run_id: str, f: dict, trust: str) -> str:
             *sorted((k, v) for k, v in (f.get("fields") or {}).items())]
     table = "\n".join(f"| {plain(k, 60)} | {plain(v, 300).replace('|', '/').replace(chr(10), ' ')} |"
                       for k, v in rows if v)
-    evidence = "\n".join(f"- `{plain(e, 300).replace('`', chr(39))}`" for e in (f.get("evidence") or [])[:10])
+    evidence = "\n".join(f"- `{' '.join(plain(e, 300).replace('`', chr(39)).splitlines())}`"
+                         for e in (f.get("evidence") or [])[:10])
     return gh.marked("\n\n".join(part for part in [
         f"Found by the `{loop.name}` loop, run `{run_id}`.",
         "| Field | Value |\n|---|---|\n" + table,
