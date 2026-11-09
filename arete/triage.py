@@ -341,7 +341,7 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
 
 
 def lines_of(items) -> list[str]:
-    cleaned = (re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", str(item)).strip() for item in items or [])
+    cleaned = (re.sub(r"^\s*(\d+[.)]|[-*])(\s+|$)", "", str(item)).strip() for item in items or [])
     return [item for item in cleaned if item]
 
 
