@@ -22,6 +22,7 @@ STOP_GRACE_SECONDS = 10
 EVIDENCE_BRANCH = "arete/evidence"
 MAX_SCREENSHOTS = 8
 MAX_SAW_CHARS = 1200
+VERDICTS = ("pass", "fail", "blocked")
 
 SCHEMA = {
     "type": "object",
@@ -138,9 +139,13 @@ class Verified:
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:
-        v = cls(found.get("verdict", "blocked"), found.get("summary", "").strip(),
+        said = found.get("verdict")
+        v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),
                 [c for c in found.get("checks", []) if isinstance(c, dict)], found.get("blocked_by", "").strip())
-        if v.verdict == "pass" and not v.checks:
+        if v.verdict not in VERDICTS:
+            v.verdict = "blocked"
+            v.blocked_by = v.blocked_by or f"the verifier's verdict {json.dumps(said)} is not pass, fail or blocked"
+        elif v.verdict == "pass" and not v.checks:
             v.verdict, v.blocked_by = "blocked", "the verifier said pass but listed no checks"
         elif v.verdict == "pass" and v.failed_checks:
             v.verdict = "fail"
