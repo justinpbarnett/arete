@@ -35,6 +35,7 @@ OLD_RESEARCH_HINT = re.compile(r"; (check the ticket, then )?`arete research \S+
 OUTSIDE_SPRINT = "it is outside the sprint, so the research loop leaves it to you"
 NEEDS_FORCE = ("held", "parent", "answered")
 MARKUP = re.compile(r"\[[^\]]*\]|\{[^}]*\}|https?://\S+")
+CODE_FENCE = re.compile(r"(?m)^ {0,3}(?:(`{3,})[^`\n]*\n(?:.*\n)*? {0,3}\1`*|(~{3,}).*\n(?:.*\n)*? {0,3}\2~*)[ \t]*$")
 UNSPACED_SCRIPTS = r"\U00003040-\U000030ff\U00003400-\U00004dbf\U00004e00-\U00009fff\U0000f900-\U0000faff"
 WORDS = re.compile(rf"[{UNSPACED_SCRIPTS}]{{2}}|[^\W\d_{UNSPACED_SCRIPTS}]{{2,}}")
 SENT_DAYS = 7
@@ -923,10 +924,18 @@ def issue_header(cfg: config.Config, changed: str) -> str:
 
 
 def quiet(text: str) -> str:
-    return quiet_block(" ".join(text.split()))
+    return quiet_prose(" ".join(text.split()))
 
 
 def quiet_block(text: str) -> str:
+    kept, at = [], 0
+    for code in CODE_FENCE.finditer(text):
+        kept += [quiet_prose(text[at:code.start()]), code.group()]
+        at = code.end()
+    return "".join(kept + [quiet_prose(text[at:])])
+
+
+def quiet_prose(text: str) -> str:
     text = re.sub(r"(@|#|GH-|github\.com/)(?=\w)", "\\1\u200b", text, flags=re.IGNORECASE)
     text = re.sub(r"(?m)^#{1,3} ", "#### ", text)
     return re.sub(r"</?details", lambda m: m.group(0).replace("<", "&lt;"), text, flags=re.IGNORECASE)
