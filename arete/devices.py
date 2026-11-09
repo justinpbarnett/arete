@@ -125,7 +125,7 @@ def probe(device: Device | str, timeout: float = 20) -> dict:
     if d.kind == "proxmox":
         res = util.sh([*ssh_argv(d), f"qm config {d.template} | grep -E '^(name|template|memory|cores):'"],
                       timeout=timeout)
-        info = {"ok": res.returncode == 0, "detail": util.first_line(res.stdout.replace("\n", ", ")
+        info = {"ok": res.returncode == 0, "detail": util.first_line(", ".join(res.stdout.splitlines())
                                                                       if res.returncode == 0 else res.stderr, 300)}
     else:
         res = util.sh(PROBE if not d.remote else [*ssh_argv(d), PROBE], timeout=timeout)
