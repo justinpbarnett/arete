@@ -135,7 +135,7 @@ def run(
         structured=structured,
         cost_usd=max(0.0, session.spent_usd - resume.spent_usd),
         turns=int(data.get("num_turns") or 0),
-        error=(data.get("result", "") if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
+        error=(failure_reason(data) if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",
         usage_limit=usage_limit(data, data.get("result", "") or "") if is_error else None,
         raw=data,
@@ -145,6 +145,13 @@ def run(
         model=next(iter(data.get("modelUsage") or {}), model),
         provider="anthropic",
     )
+
+
+def failure_reason(data: dict) -> str:
+    if data.get("result"):
+        return data["result"]
+    subtype = "" if data.get("subtype", "success") == "success" else data["subtype"]
+    return ": ".join(filter(None, [subtype, "; ".join(map(str, data.get("errors") or []))]))
 
 
 def run_with_graceful_timeout(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str],
