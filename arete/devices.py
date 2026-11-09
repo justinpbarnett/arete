@@ -8,7 +8,7 @@ import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
-from . import paths, util
+from . import paths, record, util
 
 DEVICES_FILE = paths.CONFIG_DIR / "devices.toml"
 CACHE_FILE = paths.STATE_DIR / "devices.json"
@@ -176,26 +176,33 @@ def clone_address(d: Device, vmid: int) -> str:
 
 
 @contextmanager
-def lease(device: Device | str, label: str, log=lambda text: None):
+def lease(device: Device | str, run_id: str, log=lambda text: None):
     d = resolve(device)
     if d.kind != "proxmox":
+        record.mark(run_id, "lease", device=d.name, device_kind=d.kind)
         yield d
         return
     vmid = int(pve(d, "pvesh get /cluster/nextid").strip())
-    name = re.sub(r"[^a-z0-9-]+", "-", f"arete-{label}".lower())[:60].strip("-")
+    name = re.sub(r"[^a-z0-9-]+", "-", f"arete-{run_id}".lower())[:60].strip("-")
     log(f"cloning template {d.template} to VM {vmid} on {d.name}")
-    pve(d, f"qm clone {d.template} {vmid} --name {name} --full 0")
+    with record.timed(run_id, "clone", device=d.name, vmid=vmid, template=d.template):
+        pve(d, f"qm clone {d.template} {vmid} --name {name} --full 0")
     try:
-        pve(d, f"qm start {vmid}")
-        address = clone_address(d, vmid)
+        with record.timed(run_id, "boot", device=d.name, vmid=vmid) as boot:
+            pve(d, f"qm start {vmid}")
+            boot["address"] = address = clone_address(d, vmid)
         log(f"VM {vmid} is up at {address}")
+        record.mark(run_id, "lease", device=d.name, device_kind=d.kind, vmid=vmid, address=address)
         yield replace(d, name=f"{d.name} clone", kind="ssh", host=f"{d.user}@{address}", port=None,
                       jump=",".join(filter(None, [d.jump, f"{d.host}:{d.port}" if d.port else d.host])))
     finally:
         if d.keep:
             log(f"keeping VM {vmid}")
+            record.mark(run_id, "release", device=d.name, vmid=vmid, kept=True)
         else:
-            res = util.sh([*ssh_argv(d), f"qm stop {vmid} --skiplock 1; qm destroy {vmid} --purge 1"], timeout=300)
+            with record.timed(run_id, "release", device=d.name, vmid=vmid) as release:
+                res = util.sh([*ssh_argv(d), f"qm stop {vmid} --skiplock 1; qm destroy {vmid} --purge 1"], timeout=300)
+                release["exit"] = res.returncode
             log(f"destroyed VM {vmid}" if res.returncode == 0 else
                 f"could not destroy VM {vmid} on {d.name}, so it is still there: "
                 f"{util.first_line(res.stderr or res.stdout or f'exit {res.returncode}', 300)}")

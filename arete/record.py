@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import contextlib
+import gzip
+import itertools
+import json
 import os
+import re
 import shutil
 import sqlite3
-from collections.abc import Callable
+import sys
+import threading
+import time
+import zlib
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Self
 
-from . import paths, state, util
+from . import agent, gh, paths, state, util
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -14,6 +25,22 @@ STOPPED = "stopped by request"
 ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva"}
 FAILS_WHEN_DEAD = ("miner", "eval")
 TICKET_KINDS = ("pipeline",)
+RECORD_SUFFIX = ".jsonl.gz"
+TIMELINE = f"steps{RECORD_SUFFIX}"
+CLOCK_SECONDS = 1
+HEADER_WAIT_SECONDS = 10
+CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL", re.IGNORECASE)
+PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL)
+SHORTEST_SECRET = 8
+REDACTED = "[redacted]"
+LARGEST_SECRET_FILE = 64 * 1024
+INI_SECTION = re.compile(r"\[{1,2}[\w .:/\"-]*\]{1,2}")
+NAMED_VALUE = re.compile(r"""["']?([\w.-]+)["']?\s*:[ \t]*("(?:[^"\\]|\\.)*"|'[^']*'"""
+                         r"""|[^\s,'"{}\[\]#][^\s,{}\[\]]*(?:[ \t]+[^\s#,{}\[\]][^\s,{}\[\]]*)*)""")
+NETRC_FILES = (".netrc", "_netrc")
+NETRC_SECRET_WORDS = ("login", "password", "account")
+PGPASS_FILE = ".pgpass"
+PGPASS_FIELDS = 5
 
 
 def new_id(prefix: str, tag: str = "") -> str:
@@ -84,7 +111,9 @@ def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | Non
             return None
         if end_line:
             state.insert_feed(c, run_id, "end", end_line)
-        return dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+        settled = dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+    mark(run_id, "result", at=fields.pop("finished"), **fields)
+    return settled
 
 
 @contextmanager
@@ -138,3 +167,386 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
                 then(done)
                 settled.append(done)
     return settled
+
+
+def secrets(*files: Path) -> tuple[str, ...]:
+    found = {v for k, v in os.environ.items() if CREDENTIAL_NAME.search(k)}
+    found |= {gh.auth_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True)}
+    for f in files:
+        found |= file_secrets(f)
+    found = {v for v in found if len(v) >= SHORTEST_SECRET}
+    as_json = {json.dumps(v, ensure_ascii=False)[1:-1] for v in found}
+    return tuple(sorted(found | as_json, key=len, reverse=True))
+
+
+def file_secrets(path: Path, every_value: bool = False) -> set[str]:
+    try:
+        if path.stat().st_size > LARGEST_SECRET_FILE:
+            return set()
+        text = path.read_text(errors="replace")
+    except OSError:
+        return set()
+    found = set(PRIVATE_KEY.findall(text))
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line and not line.startswith("#") and not INI_SECTION.fullmatch(line)]
+    if path.name in NETRC_FILES:
+        return found | netrc_secrets(lines)
+    if path.name == PGPASS_FILE:
+        return found | {fields[-1] for line in lines if len(fields := pgpass_fields(line)) == PGPASS_FIELDS}
+    for line in lines:
+        key, sep, raw = line.removeprefix("export ").partition("=")
+        if sep and (every_value or CREDENTIAL_NAME.search(key) or looks_secret(util.env_value(raw))):
+            found.add(util.env_value(raw))
+        pairs = [(name, unquoted(value)) for name, value in NAMED_VALUE.findall(line)]
+        found |= {value for name, value in pairs if CREDENTIAL_NAME.search(name) or looks_secret(value)}
+        if not sep and not pairs and looks_secret(word := re.split(r"[\s:]+", line)[-1].strip("'\",")):
+            found.add(word)
+    return found
+
+
+def netrc_secrets(lines: list[str]) -> set[str]:
+    words = " ".join(lines).split()
+    return {unquoted(value) for name, value in itertools.pairwise(words) if name in NETRC_SECRET_WORDS}
+
+
+def pgpass_fields(line: str) -> list[str]:
+    return [field.replace("\\:", ":").replace("\\\\", "\\") for field in re.split(r"(?<!\\):", line)]
+
+
+def unquoted(value: str) -> str:
+    value = value.strip().rstrip(",").strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        with contextlib.suppress(json.JSONDecodeError):
+            return str(json.loads(value))
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def looks_secret(value: str) -> bool:
+    return len(value) >= SHORTEST_SECRET and not value.isalpha()
+
+
+def scrub(text: str, hidden: Sequence[str]) -> str:
+    for value in hidden:
+        text = text.replace(value, REDACTED)
+    return PRIVATE_KEY.sub(REDACTED, text)
+
+
+def slug(step: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", step).strip("-.") or "agent"
+
+
+def fresh_record(folder: Path, name: str) -> tuple[Path, int]:
+    folder.mkdir(parents=True, exist_ok=True)
+    for n in itertools.count(1):
+        path = folder / f"{name if n == 1 else f'{name}-{n}'}{RECORD_SUFFIX}"
+        if path.name == TIMELINE:
+            continue
+        try:
+            return path, os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            continue
+    raise AssertionError("unreachable")
+
+
+def append(fd: int, text: str) -> None:
+    os.write(fd, gzip.compress(f"{text}\n".encode(errors="replace")))
+
+
+class Recorder:
+    def __init__(self, run_id: str, step: str, header: dict, hidden: Sequence[str]):
+        self.run_id, self.step, self.hidden = run_id, step, hidden
+        self.runner, self.model = header.get("runner", ""), header.get("model", "")
+        self.lock = threading.RLock()
+        self.at, self.started = util.iso(), time.monotonic()
+        self.clocked, self.ended = self.started, False
+        self.header = {"arete": "header", **header, "run_id": run_id, "step": step, "started": self.at}
+        self.held: list[str] | None = []
+        self.waiting = threading.Timer(HEADER_WAIT_SECONDS, self.release)
+        self.waiting.daemon = True
+        self.path: Path | None = None
+        self.fd: int | None = None
+        try:
+            self.path, self.fd = fresh_record(paths.record_dir(run_id), slug(step))
+        except OSError as e:
+            self.fail(e)
+        if self.model or self.fd is None:
+            self.release()
+        else:
+            self.waiting.start()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, kind, error, trace) -> None:
+        if error is not None:
+            why = STOPPED if self.stop_requested(error) else f"crashed: {failure(error)}"
+            self.end({"ok": False, "error": why, "seconds": self.elapsed()})
+        self.close()
+
+    def stop_requested(self, error: BaseException) -> bool:
+        if isinstance(error, KeyboardInterrupt):
+            return True
+        try:
+            return stop_asked(self.run_id)
+        except sqlite3.Error:
+            return False
+
+    def elapsed(self) -> float:
+        return round(time.monotonic() - self.started, 1)
+
+    def line(self, raw: str) -> None:
+        raw = raw.rstrip("\r\n")
+        if not raw.strip():
+            return
+        with self.lock:
+            clock = []
+            if time.monotonic() - self.clocked >= CLOCK_SECONDS:
+                self.clocked = time.monotonic()
+                clock.append(json.dumps({"arete": "clock", "seconds": self.elapsed()}))
+            text = "\n".join([*clock, scrub(raw, self.hidden)])
+            if self.held is None:
+                self.put(text)
+                return
+            self.held.append(text)
+            if model := named_model(raw):
+                self.model = self.header["model"] = model
+                self.release()
+
+    def release(self) -> None:
+        with self.lock:
+            if self.held is None:
+                return
+            held, self.held = self.held, None
+            self.waiting.cancel()
+            self.write(self.header)
+            for text in held:
+                self.put(text)
+
+    def finish(self, res: agent.Result, seconds: float) -> None:
+        self.end({"ok": res.ok, "error": res.error, "text": res.text, "structured": res.structured,
+                  "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
+                  "turns": res.turns, "model": res.model, "provider": res.provider, "session": res.session.id,
+                  "seconds": round(seconds, 1)})
+
+    def end(self, result: dict) -> None:
+        if self.ended:
+            return
+        self.ended = True
+        self.release()
+        self.write({"arete": "result", **result})
+        self.close()
+        mark(self.run_id, "agent", at=self.at, step=self.step, record=self.path.name if self.path else "",
+             runner=self.runner, model=result.get("model") or self.model, ok=result["ok"],
+             seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
+             **({"error": util.first_line(result["error"], 300)} if result["error"] else {}))
+
+    def write(self, entry: dict) -> None:
+        with self.lock:
+            self.put(scrub(json.dumps(entry, ensure_ascii=False, default=str), self.hidden))
+
+    def put(self, text: str) -> None:
+        if self.fd is None:
+            return
+        try:
+            append(self.fd, text)
+        except OSError as e:
+            self.fail(e)
+
+    def fail(self, e: OSError) -> None:
+        print(f"{util.iso()} stopped recording {self.run_id} {self.step}: {e}", file=sys.stderr, flush=True)
+        self.close()
+
+    def close(self) -> None:
+        with self.lock:
+            self.release()
+            fd, self.fd = self.fd, None
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
+def mark(run_id: str, kind: str, **fields) -> None:
+    if not run_id:
+        return
+    text = scrub(json.dumps({"kind": kind, "at": util.iso(), **fields}, ensure_ascii=False, default=str), secrets())
+    folder = paths.record_dir(run_id)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        fd = os.open(folder / TIMELINE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            append(fd, text)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"{util.iso()} could not mark {kind} for {run_id}: {e}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def timed(run_id: str, kind: str, **detail):
+    at, started = util.iso(), time.monotonic()
+    try:
+        yield detail
+    except BaseException as e:
+        detail["error"] = failure(e)
+        raise
+    finally:
+        mark(run_id, kind, at=at, **detail, seconds=round(time.monotonic() - started, 2))
+
+
+def failure(e: BaseException) -> str:
+    return ": ".join(filter(None, [type(e).__name__, util.first_line(str(e), 300)]))
+
+
+def record_files(run_id: str) -> list[Path]:
+    found = [f for f in paths.record_dir(run_id).glob(f"*{RECORD_SUFFIX}") if f.name != TIMELINE]
+    return sorted(found, key=lambda f: f.stat().st_mtime)
+
+
+def find_record(run_id: str, step: str) -> Path | None:
+    folder = paths.record_dir(run_id)
+    for name in (step, f"{step}{RECORD_SUFFIX}", f"{slug(step)}{RECORD_SUFFIX}"):
+        if name != TIMELINE and (folder / name).is_file():
+            return folder / name
+    return None
+
+
+def raw_lines(path: Path) -> Iterator[str]:
+    with gzip.open(path, "rb") as f:
+        try:
+            for line in f:
+                if not line.endswith(b"\n"):
+                    return
+                if line.strip():
+                    yield line.decode(errors="replace").rstrip("\n")
+        except (EOFError, gzip.BadGzipFile, zlib.error):
+            return
+
+
+def lines(path: Path) -> Iterator[dict]:
+    for line in raw_lines(path):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+def events(path: Path) -> Iterator[dict]:
+    seconds, read = 0.0, unread
+    for line in lines(path):
+        own = line.pop("arete", None)
+        if own == "clock":
+            seconds = line.get("seconds", seconds)
+        elif own in ("header", "result"):
+            if own == "header":
+                read = READERS.get(line.get("runner"), lambda header: unread)(line)
+            yield {"kind": own, "seconds": seconds, **line}
+        elif not own:
+            for event in read(line):
+                yield {**event, "seconds": seconds}
+
+
+def unread(event: dict) -> list[dict]:
+    return []
+
+
+def blocks(content) -> list[dict]:
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def block_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") for b in blocks(content) if b.get("type") == "text")
+
+
+def claude_reader(header: dict) -> Callable[[dict], list[dict]]:
+    tool_names: dict[str, str] = {}
+    counted: set[str] = set()
+    resumed = header.get("resume") if isinstance(header.get("resume"), dict) else {}
+    spent_before = float(resumed.get("spent_usd") or 0)
+
+    def read(e: dict) -> list[dict]:
+        message = e.get("message") if isinstance(e.get("message"), dict) else {}
+        out = []
+        if e.get("type") == "assistant":
+            for b in blocks(message.get("content")):
+                if b.get("type") == "text":
+                    out.append({"kind": "message", "role": "assistant", "text": b.get("text", "")})
+                elif b.get("type") == "thinking":
+                    out.append({"kind": "message", "role": "thinking", "text": b.get("thinking", "")})
+                elif b.get("type") == "tool_use":
+                    tool_names[b.get("id", "")] = b.get("name", "")
+                    out.append({"kind": "tool_call", "id": b.get("id", ""), "name": b.get("name", ""),
+                                "input": b.get("input")})
+            if isinstance(usage := message.get("usage"), dict) and message.get("id") not in counted:
+                counted.add(message.get("id"))
+                out.append({"kind": "usage", "model": message.get("model", ""), **agent.claude_tokens(usage),
+                            "cost_usd": None})
+        elif e.get("type") == "user":
+            if isinstance(message.get("content"), str):
+                out.append({"kind": "message", "role": "user", "text": message["content"]})
+            for b in blocks(message.get("content")):
+                if b.get("type") == "tool_result":
+                    out.append({"kind": "tool_result", "id": b.get("tool_use_id", ""),
+                                "name": tool_names.get(b.get("tool_use_id", ""), ""), "text": block_text(b.get("content")),
+                                "error": bool(b.get("is_error"))})
+                elif b.get("type") == "text":
+                    out.append({"kind": "message", "role": "user", "text": b.get("text", "")})
+        elif e.get("type") == "result":
+            session_cost = e.get("total_cost_usd")
+            out.append({"kind": "usage", "total": True, "model": next(iter(e.get("modelUsage") or {}), ""),
+                        **agent.claude_tokens(e.get("usage") or {}),
+                        "cost_usd": None if session_cost is None else max(0.0, float(session_cost) - spent_before)})
+        return out
+
+    return read
+
+
+def read_pi(e: dict) -> list[dict]:
+    message = e.get("message") if isinstance(e.get("message"), dict) else {}
+    if e.get("type") != "message_end":
+        return []
+    if message.get("role") == "toolResult":
+        return [{"kind": "tool_result", "id": message.get("toolCallId", ""), "name": message.get("toolName", ""),
+                 "text": block_text(message.get("content")), "error": bool(message.get("isError"))}]
+    if message.get("role") == "user":
+        return [{"kind": "message", "role": "user", "text": block_text(message.get("content"))}]
+    if message.get("role") != "assistant":
+        return []
+    out = []
+    for b in blocks(message.get("content")):
+        if b.get("type") == "text":
+            out.append({"kind": "message", "role": "assistant", "text": b.get("text", "")})
+        elif b.get("type") == "thinking":
+            out.append({"kind": "message", "role": "thinking", "text": b.get("thinking", "")})
+        elif b.get("type") == "toolCall":
+            out.append({"kind": "tool_call", "id": b.get("id", ""), "name": b.get("name", ""),
+                        "input": b.get("arguments")})
+    if isinstance(usage := message.get("usage"), dict):
+        totals, provider = agent.usage_totals([usage]), message.get("provider", "")
+        out.append({"kind": "usage", "model": f"{provider}/{message.get('model')}" if provider else message.get("model", ""),
+                    "tokens_in": totals["tokens_in"], "tokens_out": totals["tokens_out"], "cost_usd": totals["cost_usd"]})
+    return out
+
+
+READERS: dict[str, Callable[[dict], Callable[[dict], list[dict]]]] = {"claude": claude_reader,
+                                                                      "pi": lambda header: read_pi}
+
+
+def named_model(raw: str) -> str:
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(event, dict):
+        return ""
+    if event.get("type") == "system" and event.get("subtype") == "init":
+        return str(event.get("model") or "")
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    if message.get("role") != "assistant" or not message.get("model"):
+        return ""
+    return f"{message['provider']}/{message['model']}" if message.get("provider") else str(message["model"])

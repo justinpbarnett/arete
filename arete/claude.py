@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import background, devices, paths, util
-from .agent import NO_SESSION, Result, Session, UsageLimit, json_from_text
+from .agent import (
+    NO_SESSION,
+    Result,
+    Session,
+    UsageLimit,
+    claude_tokens,
+    json_from_text,
+)
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
 PATH_RULE_OF = {"Read": "Read", "Glob": "Read", "Grep": "Read", "LS": "Read", "Edit": "Edit", "MultiEdit": "Edit",
@@ -24,6 +34,7 @@ LIMIT_SLACK_SECONDS = 60
 LIMIT_RECHECK_SECONDS = 1800
 MILLISECOND_STAMPS = 1e12
 STOP_GRACE_SECONDS = 30
+DRAIN_SECONDS = 10
 
 
 def binary() -> str:
@@ -50,10 +61,12 @@ def run(
     remote: devices.Device | None = None,
     settings: dict | None = None,
     extra_env: dict[str, str] | None = None,
+    on_line: Callable[[str], None] = lambda line: None,
 ) -> Result:
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
-    cmd = ["claude" if remote else binary(), "-p", "--output-format", "json", "--permission-mode", permission_mode]
+    cmd = ["claude" if remote else binary(), "-p", "--output-format", "stream-json", "--verbose",
+           "--permission-mode", permission_mode]
     if model:
         cmd += ["--model", model]
     tool_names = tool_set(tools, allowed_tools or [])
@@ -93,7 +106,7 @@ def run(
         cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd,
                            {"ARETE_AGENT": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
     try:
-        proc = run_with_graceful_timeout(cmd, None if remote else str(cwd), prompt, env, timeout)
+        proc = run_streaming(cmd, None if remote else str(cwd), prompt, env, timeout, on_line)
     except subprocess.TimeoutExpired:
         session = Session(fresh_session, 0.0, "claude") if fresh_session else resume
         return Result(ok=False, session=session, error=f"timed out after {timeout}s")
@@ -101,22 +114,7 @@ def run(
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
 
     out = proc.stdout.strip()
-    data: dict = {}
-    if out:
-        for line in reversed(out.splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    data = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    continue
-        if not data:
-            try:
-                data = json.loads(out)
-            except json.JSONDecodeError:
-                pass
-    if not data:
+    if not (data := result_event(out)):
         error = util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500)
         return Result(ok=False, session=resume, error=error,
                       usage_limit=usage_limit({}, error) if proc.returncode else None)
@@ -127,7 +125,6 @@ def run(
     is_error = bool(data.get("is_error")) or data.get("subtype", "success") != "success"
     session = (Session(data["session_id"], float(data.get("total_cost_usd") or 0), "claude") if data.get("session_id")
                else resume)
-    usage = data.get("usage") or {}
     return Result(
         ok=not is_error and proc.returncode == 0,
         text=data.get("result", "") or "",
@@ -139,12 +136,21 @@ def run(
         connection_failed=data.get("api_error") == "connection_failed",
         usage_limit=usage_limit(data, data.get("result", "") or "") if is_error else None,
         raw=data,
-        tokens_in=sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
-                                                         "cache_read_input_tokens")),
-        tokens_out=int(usage.get("output_tokens") or 0),
+        **claude_tokens(data.get("usage") or {}),
         model=next(iter(data.get("modelUsage") or {}), model),
         provider="anthropic",
     )
+
+
+def result_event(out: str) -> dict:
+    for line in reversed(out.splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    return {}
 
 
 def failure_reason(data: dict) -> str:
@@ -154,22 +160,44 @@ def failure_reason(data: dict) -> str:
     return ": ".join(filter(None, [subtype, "; ".join(map(str, data.get("errors") or []))]))
 
 
-def run_with_graceful_timeout(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str],
-                              timeout: float) -> subprocess.CompletedProcess:
-    with subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, errors="replace", env=env) as child:
-        try:
-            out, err = child.communicate(prompt, timeout=timeout)
-        except BaseException:
-            stop(child)
-            raise
-    return subprocess.CompletedProcess(cmd, child.returncode, out, err)
+def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str], timeout: float,
+                  on_line: Callable[[str], None]) -> subprocess.CompletedProcess:
+    child = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors="replace", env=env)
+    out: list[str] = []
+    err: list[str] = []
+    helpers = [threading.Thread(target=feed, args=(child.stdin, prompt), daemon=True),
+               threading.Thread(target=collect, args=(child.stdout, out, on_line), daemon=True),
+               threading.Thread(target=collect, args=(child.stderr, err, lambda line: None), daemon=True)]
+    for helper in helpers:
+        helper.start()
+    try:
+        child.wait(timeout=timeout)
+    except BaseException:
+        stop(child)
+        raise
+    finally:
+        for helper in helpers:
+            helper.join(DRAIN_SECONDS)
+    return subprocess.CompletedProcess(cmd, child.returncode, "".join(out), "".join(err))
+
+
+def feed(stdin, prompt: str) -> None:
+    with contextlib.suppress(OSError, ValueError), stdin:
+        stdin.write(prompt)
+
+
+def collect(stream, lines: list[str], on_line: Callable[[str], None]) -> None:
+    with stream:
+        for line in stream:
+            lines.append(line)
+            on_line(line)
 
 
 def stop(child: subprocess.Popen) -> None:
     child.terminate()
     try:
-        child.communicate(timeout=STOP_GRACE_SECONDS)
+        child.wait(timeout=STOP_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         util.kill_tree(child.pid)
         child.wait()

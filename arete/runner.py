@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import ask, claude, config, devices, guard, jev, pi, record, state, util
+from . import ask, claude, config, devices, guard, jev, paths, pi, record, state, util
 from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, Result, Session
 
 RUNNERS = ("claude", "pi")
@@ -133,6 +133,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kw["remote"] = target
     which, name = route(model, runner or resume.runner)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
+    record_id = trace[0] or record.new_id("call")
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
@@ -146,7 +147,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             wait_out(held["scope"])
             say("the claude usage limit has lifted, going on")
         started = util.iso()
-        res = attempt(which, name, prompt, cwd, resume, cfg, trace, kw)
+        res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw)
         if not res.usage_limit:
             if which == "claude" and res.ok:
                 state.clear_holds([s for s in LIMIT_SCOPES if limit_applies(s, res.model)], set_before=started)
@@ -171,16 +172,45 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
 
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
-            trace: tuple[str, str], kw: dict) -> Result:
+            trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict) -> Result:
+    header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
+              "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
+              "allowed_tools": kw.get("allowed_tools"), "disallowed_tools": kw.get("disallowed_tools"),
+              "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
+              "timeout": kw.get("timeout"),
+              "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
+    hidden = record.secrets(*secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg))
     started = time.monotonic()
-    res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, **kw)
-    res.runner = which
-    res.model = res.model or name
-    res.provider = res.provider or provider_of(res.model)
-    res.cost_usd = priced(res, cfg)
+    with record.Recorder(record_id, trace[1], header, hidden) as rec:
+        res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, on_line=rec.line, **kw)
+        res.runner = which
+        res.model = res.model or name
+        res.provider = res.provider or provider_of(res.model)
+        res.cost_usd = priced(res, cfg)
+        rec.finish(res, time.monotonic() - started)
     if trace[0]:
         record.step(trace[0], trace[1], res, time.monotonic() - started)
     return res
+
+
+def origin(cwd: Path | str, cfg: config.Config, target: devices.Device) -> dict:
+    if target.remote:
+        return {"repo": "", "commit": ""}
+    found = util.sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir", "HEAD"], cwd=cwd, timeout=10)
+    common, _, commit = found.stdout.strip().partition("\n") if found.returncode == 0 else ("", "", "")
+    repo = cfg.repo_for_work_dir(cwd) or (cfg.repo_for_path(Path(common).parent) if common else None)
+    return {"repo": repo.name if repo else "", "commit": commit}
+
+
+def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.Config) -> list[Path]:
+    found = [paths.HOME / name for name in (".netrc", ".pgpass", ".npmrc", ".pypirc", ".aws/credentials")]
+    found += [cfg.jira.env_file] if cfg.jira.env_file else []
+    for folder in [] if target.remote else folders:
+        try:
+            found += [f for f in Path(folder).iterdir() if guard.secret_path(f.name) and f.is_file()]
+        except OSError:
+            continue
+    return found
 
 
 def local_claude(kw: dict, cwd: Path | str, cfg: config.Config, run_id: str) -> dict:

@@ -43,6 +43,19 @@ class Result:
 NO_SESSION = Session()
 
 
+def usage_totals(usages: list[dict]) -> dict:
+    return {"cost_usd": sum(float((u.get("cost") or {}).get("total") or 0) for u in usages),
+            "tokens_in": sum(int(u.get("input") or 0) + int(u.get("cacheRead") or 0) + int(u.get("cacheWrite") or 0)
+                             for u in usages),
+            "tokens_out": sum(int(u.get("output") or 0) for u in usages)}
+
+
+def claude_tokens(usage: dict) -> dict:
+    return {"tokens_in": sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                               "cache_read_input_tokens")),
+            "tokens_out": int(usage.get("output_tokens") or 0)}
+
+
 def fenced_json(text: str):
     decoder = json.JSONDecoder()
     answer = None

@@ -22,6 +22,12 @@ def has_arete_mark(body: str | None) -> bool:
     return ARETE_MARK in (body or "")
 
 
+@functools.cache
+def auth_token() -> str:
+    res = util.sh(["gh", "auth", "token"], timeout=10)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
     res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input)
     if res.returncode != 0:
