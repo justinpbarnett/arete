@@ -103,7 +103,7 @@ def _tool_summary(block: dict) -> str:
 def session_digest(path: Path, since_ts: float) -> dict | None:
     items, cwd, sid, entry = [], "", path.stem, None
     last_agent, tools_by_id, recent_tools = "", {}, []
-    n_human = 0
+    n_human, strikes, replies = 0, 0, 0
     for line in path.read_text(errors="replace").split("\n"):
         try:
             d = json.loads(line)
@@ -147,6 +147,7 @@ def session_digest(path: Path, since_ts: float) -> dict | None:
                 if USER_REJECT in txt:
                     reason = txt.split("the user said:", 1)[1] if "the user said:" in txt else ""
                     items.append(f"[{hhmm}] REJECTED by human: {tool}" + (f" reason: {_short(reason, 400)}" if reason else ""))
+                    strikes += 1
                 elif CLASSIFIER in txt:
                     items.append(f"[{hhmm}] DENIED by permission classifier: {tool}")
         for text in _text_blocks(content):
@@ -157,6 +158,7 @@ def session_digest(path: Path, since_ts: float) -> dict | None:
             if text.startswith("[Request interrupted"):
                 if in_window:
                     items.append(f"[{hhmm}] INTERRUPTED the agent during: {', '.join(recent_tools) or 'a reply'}")
+                    strikes += 1
                 continue
             if APPROVALS.match(text):
                 continue
@@ -167,13 +169,13 @@ def session_digest(path: Path, since_ts: float) -> dict | None:
                 ctx = f"  agent before: {_short(last_agent, 300)}" if last_agent else ""
                 tools = f"  agent tools: {', '.join(recent_tools)}" if recent_tools else ""
                 items.append(f"[{hhmm}] HUMAN: {_short(text, 600)}" + (f"\n{ctx}" if ctx else "") + (f"\n{tools}" if tools else ""))
+                replies += 1
             recent_tools = []
     if entry == HEADLESS_ENTRYPOINT or not items:
         return None
     if cwd and any(str(d) in cwd for d in (paths.STATE_DIR, paths.WORKTREES_DIR)):
         return None
-    signal = sum(1 for i in items if "REJECTED" in i or "INTERRUPTED" in i) * 3 + sum(1 for i in items if "HUMAN:" in i)
-    return {"session": sid[:8], "cwd": cwd, "items": items, "signal": signal}
+    return {"session": sid[:8], "cwd": cwd, "items": items, "signal": strikes * 3 + replies}
 
 
 def collect(hours: float) -> list[dict]:
