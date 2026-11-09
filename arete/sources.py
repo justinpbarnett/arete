@@ -238,9 +238,12 @@ class Log(Source):
                 start = 0
             if size < start:
                 start = 0
-            with open(name, "rb") as f:
-                f.seek(max(start, size - MAX_LOG_READ))
-                chunk = f.read(size - f.tell())
+            try:
+                with open(name, "rb") as f:
+                    f.seek(max(start, size - MAX_LOG_READ))
+                    chunk = f.read(size - f.tell())
+            except OSError:
+                continue
             last_newline = chunk.rfind(b"\n")
             if last_newline == -1:
                 offsets[name] = start
