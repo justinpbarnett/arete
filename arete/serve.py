@@ -107,7 +107,7 @@ class Server:
             self.watch_metric(loop, st)
             self.poll(loop)
         self.loaded = True
-        self.dispatch({x.name: x for x in every_loop})
+        self.dispatch({x.name: x for x in reversed(every_loop)})
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             state.prune()
             self.pruned = time.monotonic()
