@@ -394,9 +394,9 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
     return ""
 
 
-def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict]) -> tuple[str, list[dict]]:
+def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict],
+               branch: str) -> tuple[str, list[dict]]:
     base = gh.default_branch(repo.github)
-    branch = miner_branch()
     wt = make_worktree(repo, base, branch, "miner")
     try:
         text = "\n\n".join(
@@ -515,10 +515,11 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
         print(f"miner: dry run, {len(props)} proposals, cost ${res.cost_usd:.2f}")
         return 0
     opened = []
+    branch = miner_branch()
     for name, ps in by_repo.items():
         url, landed = "", []
         try:
-            url, landed = apply_repo(cfg, run_id, cfg.repo(name), ps)
+            url, landed = apply_repo(cfg, run_id, cfg.repo(name), ps, branch)
         except Exception as e:
             print(f"{name}: apply failed: {e}")
         for p in ps:
@@ -530,7 +531,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             opened.append(url)
             print(f"{name}: {url}")
             if name != cfg.global_repo:
-                eval_pr(cfg, cfg.repo(name), url, miner_branch())
+                eval_pr(cfg, cfg.repo(name), url, branch)
     record.settle(run_id, "pr" if opened else "noop", summary=f"{len(props)} proposals, {len(opened)} PRs",
                   pr_url=" ".join(opened))
     return 0
