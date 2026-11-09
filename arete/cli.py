@@ -440,9 +440,17 @@ def piped_events() -> list[dict]:
 
 
 def read_events(file: str) -> list[dict] | None:
+    from . import control
+
     if not file:
         return None
-    data = json.loads(paths.expand(file).read_text())
+    path = paths.expand(file)
+    try:
+        data = json.loads(path.read_text())
+    except OSError as e:
+        raise control.Refused(f"--events {paths.short_path(path)}: {e.strerror or e}") from None
+    except ValueError as e:
+        raise control.Refused(f"--events {paths.short_path(path)} is not JSON: {e}") from None
     return data if isinstance(data, list) else [data]
 
 
