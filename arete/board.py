@@ -272,10 +272,10 @@ def run_rows(rows: list[dict]) -> list[dict]:
 
 def run_board(run_id: str) -> dict:
     if not re.fullmatch(r"\w[\w.-]*", run_id):
-        raise NotARunId(f"'{run_id}' is not a run id.")
+        raise NotARunId(f"'{run_id}' is not an id.")
     r = state.run_get(run_id, connect=state.reader)
     if not r:
-        raise control.NotFound(f"no run {run_id}")
+        raise control.NotFound(f"nothing has the id {run_id}")
     models: dict[tuple[str, str], dict] = {}
     for s in state.steps(run_id, connect=state.reader):
         key = (s["model"] or "no model", s["runner"] or "no runner")
