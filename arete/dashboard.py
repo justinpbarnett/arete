@@ -120,8 +120,9 @@ class Logins:
         if seen and time.monotonic() - seen[0] < WHOIS_SECONDS:
             return seen[1]
         login = (tailscale("whois", "--json", address).get("UserProfile") or {}).get("LoginName", "")
-        with self.guard:
-            self.seen[address] = (time.monotonic(), login)
+        if login:
+            with self.guard:
+                self.seen[address] = (time.monotonic(), login)
         return login
 
 
