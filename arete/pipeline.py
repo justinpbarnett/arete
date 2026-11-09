@@ -483,6 +483,12 @@ def machine_to_itself(run: AgentRun):
         yield
 
 
+def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
+    stdout_room = n - min(len(stderr), n // 2)
+    stderr_room = n - min(len(stdout), n // 2)
+    return util.tail(stdout, stdout_room) + util.tail(stderr, stderr_room)
+
+
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float) -> tuple[bool, str]:
     if not layer.checks:
@@ -496,7 +502,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
             if not passed:
-                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{util.tail(res.stdout + res.stderr, 6000)}\n```")
+                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
             else:
                 report.append(f"### {name} passed: `{cmd}`")
     for d, name in untracked_added_since(untracked_before):
