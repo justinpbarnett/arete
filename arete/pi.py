@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from . import devices, paths, util
@@ -102,6 +103,7 @@ def run(
     add_dirs: list[Path] | None = None,
     mcp_config: str = "",
     remote: devices.Device | None = None,
+    price: Callable[[Result], float] = lambda reply: reply.cost_usd,
 ) -> Result:
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
@@ -144,7 +146,8 @@ def run(
     if remote:
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir,))
     try:
-        proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd)
+        proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
+                                    lambda line: reply_cost(line, model, price))
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"pi not found: {e}", runner="pi", model=model)
     if cut_short_by:
@@ -192,8 +195,8 @@ def mcp_servers(mcp_config: str) -> dict:
         return {"unreadable": mcp_config}
 
 
-def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float,
-           max_budget_usd: float | None) -> tuple[subprocess.CompletedProcess, str]:
+def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budget_usd: float | None,
+           cost_of: Callable[[str], float]) -> tuple[subprocess.CompletedProcess, str]:
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, errors="replace", env=env)
     stderr: list[str] = []
@@ -207,7 +210,7 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float,
         for line in proc.stdout:
             lines.append(line)
             if max_budget_usd and '"message_end"' in line:
-                spent += reply_cost(line)
+                spent += cost_of(line)
                 if spent > max_budget_usd:
                     over_budget = f"stopped at its ${max_budget_usd:g} budget after ${spent:.2f}"
                     proc.kill()
@@ -223,12 +226,17 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float,
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")
 
 
-def reply_cost(line: str) -> float:
+def reply_cost(line: str, model: str, price: Callable[[Result], float]) -> float:
     try:
         message = json.loads(line).get("message") or {}
     except json.JSONDecodeError:
         return 0.0
-    return usage_totals([message.get("usage") or {}])["cost_usd"] if message.get("role") == "assistant" else 0.0
+    if message.get("role") != "assistant":
+        return 0.0
+    provider = message.get("provider", "")
+    return price(Result(ok=True, runner="pi", provider=provider,
+                        model=f"{provider}/{message.get('model')}" if provider else model,
+                        **usage_totals([message.get("usage") or {}])))
 
 
 def usage_totals(usages: list[dict]) -> dict:

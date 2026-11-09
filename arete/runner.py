@@ -137,6 +137,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kw.pop("max_budget_usd", None)
         if not target.remote:
             kw = local_claude(kw, cwd, cfg, trace[0])
+    else:
+        kw["price"] = lambda reply: priced(reply, cfg)
     while True:
         if wait_out_limits and (held := usage_hold(name, which)):
             say(hold_words(held))
