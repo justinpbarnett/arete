@@ -151,13 +151,13 @@ def linked(c: gh.Check) -> str:
 def watch(target: Target, log: Callable[[str], None]) -> Watched:
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
     checks: dict[str, gh.Check] = {}
-    read = False
     waiting_on: list[str] | None = None
     while True:
         try:
             checks = gh.commit_checks(target.github, target.sha)
-            read = True
+            just_read = True
         except READ_ERRORS as e:
+            just_read = False
             log(f"ci: reading the checks of {target.pr_name} failed, trying again: {util.first_line(str(e), 200)}")
         waited = time.monotonic() - target.pushed_at
         pending = sorted(c.name for c in checks.values() if c.state == "pending")
@@ -167,13 +167,13 @@ def watch(target: Target, log: Callable[[str], None]) -> Watched:
             waiting_on = pending
         if checks and not pending and waited >= SETTLE_SECONDS:
             return Watched(target, checks)
-        if read and not checks and waited >= FIRST_CHECK_SECONDS:
+        if just_read and not checks and waited >= FIRST_CHECK_SECONDS:
             log(f"ci: no checks on {target.pr_name} within {minutes(FIRST_CHECK_SECONDS)} of the push")
             return Watched(target, checks)
         if waited >= WAIT_SECONDS:
-            log(f"ci: {target.pr_name} still waiting on {', '.join(pending)} after {minutes(WAIT_SECONDS)}" if read
+            log(f"ci: {target.pr_name} still waiting on {', '.join(pending)} after {minutes(WAIT_SECONDS)}" if checks
                 else f"ci: could not read the checks of {target.pr_name} within {minutes(WAIT_SECONDS)}")
-            return Watched(target, checks, read)
+            return Watched(target, checks, bool(checks))
         time.sleep(POLL_SECONDS)
 
 
