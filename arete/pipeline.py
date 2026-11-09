@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -1775,6 +1776,28 @@ def layer_is_committed(root: Path) -> bool:
     return bool(git(["ls-files", ".agents/config.toml"], root, check=False).strip())
 
 
+def with_automerge_trust(text: str) -> str | None:
+    data = tomllib.loads(text)
+    if data.get("trust", {}).get("level") == "automerge":
+        return text
+    want = data | {"trust": data.get("trust", {}) | {"level": "automerge"}}
+    for new in automerge_trust_edits(text if not text or text.endswith("\n") else text + "\n"):
+        try:
+            if tomllib.loads(new) == want:
+                return new
+        except tomllib.TOMLDecodeError:
+            continue
+    return None
+
+
+def automerge_trust_edits(text: str) -> Iterator[str]:
+    for m in re.finditer(r"""\blevel[ \t]*=[ \t]*("[^"\n]*"|'[^'\n]*')""", text):
+        yield text[:m.start(1)] + '"automerge"' + text[m.end(1):]
+    for m in re.finditer(r"(?m)^[ \t]*\[[ \t]*trust[ \t]*\][^\n]*\n", text):
+        yield text[:m.end()] + 'level = "automerge"\n' + text[m.end():]
+    yield text + '\n[trust]\nlevel = "automerge"\n'
+
+
 def _maybe_propose_trust(repo: config.Repo) -> None:
     layer = config.load_layer(repo.layer_dir)
     if layer.trust_level != "pr" or streak(repo.name) < layer.automerge_after or not layer_is_committed(repo.path):
@@ -1794,7 +1817,10 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
         if not f.exists():
             return
         text = f.read_text()
-        new = re.sub(r'(?m)^(\s*level\s*=\s*)"pr"', r'\1"automerge"', text)
+        new = with_automerge_trust(text)
+        if new is None:
+            raise RuntimeError(f".agents/config.toml on {base} sets trust in a form arete cannot edit, "
+                               'so set trust.level = "automerge" there by hand')
         if new == text:
             return
         f.write_text(new)
