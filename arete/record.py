@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager
 
-from . import state, util
+from . import paths, state, util
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -121,7 +122,10 @@ def interrupt(row: dict) -> dict | None:
         util.end_session(row.get("pid"))
     status = dead_status(row)
     summary = STOPPED if status == "stopped" else INTERRUPTED
-    return settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
+    settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
+    if settled and row["kind"] == "draft":
+        shutil.rmtree(paths.draft_dir(row["id"]), ignore_errors=True)
+    return settled
 
 
 def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> list[dict]:

@@ -155,6 +155,12 @@ function clock(ts) {
   return d.toDateString() === new Date().toDateString() ? time : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${time}`;
 }
 
+function zonedClock(ts) {
+  if (!ts) return "";
+  const zone = new Date(ts).toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
+  return `${clock(ts)} ${zone}`;
+}
+
 function ago(ts) {
   if (!ts) return "never";
   const minutes = Math.max(0, Math.round((Date.now() - new Date(ts)) / 60000));
@@ -364,7 +370,7 @@ function researchTicket(r, btn) {
 
 function triageParts(t) {
   going.triage = t.refreshing || t.researching;
-  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${clock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent.`),
+  const parts = [quiet(`${t.refreshed ? `Triage last ran ${ago(t.refreshed)} (${zonedClock(t.refreshed)}).` : "Triage has not run yet."} It reads every open ticket, says what kind it is and what it needs, sends ready code tickets to the pipeline and research tickets to the research agent.`),
     el("div", { class: "actions" }, button(t.refreshing ? "Triage running" : "Refresh triage now", "triage-refresh", refreshTriage, t.refreshing)),
     saidLine("triage-refresh")];
   if (t.researching) parts.push(quiet("The research loop is running, so the research buttons wait until it ends."));

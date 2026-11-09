@@ -345,7 +345,7 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
         return FAILED, why
     summary = " ".join(str(answer.get("summary") or "").split())
     if not h:
-        report_file(ref).write_text(f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {util.iso()} for "
+        report_file(ref).write_text(f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} for "
                                     f"${res.cost_usd:.2f}.\n\n**Summary:** {summary}\n\n{report}\n")
         state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=res.cost_usd,
                            ticket=said, basis=basis, filed_path="", filed_url="")

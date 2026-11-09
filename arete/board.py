@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import re
 import statistics
 from collections import Counter, defaultdict
@@ -22,11 +23,12 @@ class NotARunId(ValueError):
 
 
 def snapshot(recent_runs: int = RECENT_RUNS) -> dict:
+    running = functools.cache(lambda: state.runs_marked_running(connect=state.reader))
     return {
         "now": util.iso(),
         "serve": panel(control.serve_beat),
-        "live": panel(live),
-        "skipped": panel(skipped),
+        "live": panel(lambda: live(running())),
+        "skipped": panel(lambda: skipped(running())),
         "waiting": panel(waiting),
         "recent": panel(lambda: [recent(r) for r in state.runs(limit=recent_runs, connect=state.reader)]),
         "checks": panel(checks),
@@ -67,8 +69,7 @@ def log_file(r: dict) -> Path:
     return paths.expand(r["log"]) if r.get("log") else paths.RUNS_DIR / r["id"] / "run.log"
 
 
-def live() -> dict:
-    running = state.runs_marked_running(connect=state.reader)
+def live(running: list[dict]) -> dict:
     in_slots = {r["id"] for r in pipeline.holding(running, "slot")}
     waiting_for_slot = {r["id"] for r in pipeline.holding(running, "slot-wait")}
     rows = []
@@ -93,11 +94,11 @@ def slot_note(r: dict, in_slots: set[str], waiting_for_slot: set[str]) -> str:
     return "waiting on CI without a run slot" if pipeline.freed_slot_for_ci(r["id"]) else "without a run slot"
 
 
-def skipped() -> list[dict]:
-    running = {(r["repo"], str(r["issue"])) for r in state.runs_marked_running(connect=state.reader) if r["issue"]}
+def skipped(running: list[dict]) -> list[dict]:
+    tickets_running = {(r["repo"], str(r["issue"])) for r in running if r["issue"]}
     return [{"ticket": name, "why": v["why"], "since": v.get("since", ""), "url": v.get("url", ""),
              "can_run": bool(v.get("repo"))}
-            for name, v in sorted(pipeline.skipped_tickets().items()) if (v.get("repo"), v.get("id")) not in running]
+            for name, v in sorted(pipeline.skipped_tickets().items()) if (v.get("repo"), v.get("id")) not in tickets_running]
 
 
 def waiting() -> dict:

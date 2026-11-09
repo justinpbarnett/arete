@@ -26,7 +26,6 @@ from . import (
 
 DRAFT_TRIES = 3
 REFERENCE = loops.ENGINE_DIR / "README.md"
-DRAFTS_DIR = paths.STATE_DIR / "drafts"
 DRAFTS_LOG = "drafts.log"
 SAMPLE_EVENTS = 3
 FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -176,21 +175,21 @@ def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
 def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) -> dict:
     taken = loop_names(cfg)
     check_request(request, cfg, taken)
-    prompt = draft_prompt(request, cfg, taken)
-    work = DRAFTS_DIR / run_id
+    work = paths.draft_dir(run_id)
     work.mkdir(parents=True, exist_ok=True)
+    kept = ""
     try:
-        folder, answer = valid_draft(run_id, request, cfg, taken, prompt, work, tell)
-    except BaseException:
-        shutil.rmtree(work, ignore_errors=True)
-        raise
-    dest = private_dir(cfg) / folder.name
-    if dest.exists():
-        raise control.Refused(f"a loop named {folder.name} appeared while this one drafted; its draft stays in "
-                              f"{paths.short_path(folder)}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(folder), dest)
-    shutil.rmtree(work, ignore_errors=True)
+        folder, answer = draft_until_valid(run_id, request, cfg, taken, work, tell)
+        dest = private_dir(cfg) / folder.name
+        if dest.exists():
+            kept = paths.short_path(folder)
+            raise control.Refused(f"a loop named {folder.name} appeared while this one drafted; its draft stays in "
+                                  f"{kept}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(folder), dest)
+    finally:
+        if not kept:
+            shutil.rmtree(work, ignore_errors=True)
     loop = loops.find(folder.name)
     loops.set_enabled(loop, False)
     loop_toml = (dest / "loop.toml").read_text()
@@ -200,8 +199,9 @@ def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) ->
     return {"name": loop.name, "dir": str(dest), "note": note, "run": run_id, "loop_toml": loop_toml}
 
 
-def valid_draft(run_id: str, request: DraftRequest, cfg: config.Config, taken: set[str], prompt: str, work: Path,
-                tell) -> tuple[Path, dict]:
+def draft_until_valid(run_id: str, request: DraftRequest, cfg: config.Config, taken: set[str], work: Path,
+                      tell) -> tuple[Path, dict]:
+    prompt = draft_prompt(request, cfg, taken)
     problem, folder, answer = "", Path(), {}
     for attempt in range(1, DRAFT_TRIES + 1):
         tell("draft", f"drafting, try {attempt} of {DRAFT_TRIES}")

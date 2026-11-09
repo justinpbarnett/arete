@@ -229,17 +229,18 @@ class Handler(BaseHTTPRequestHandler):
                 return {"loops": control.loop_views(connect=state.reader), "serve": control.serve_beat(),
                         "draft": draft_choices()}
             if path.startswith(LOOP_PATH):
-                return control.loop_detail(unquote(path[len(LOOP_PATH):]), state.reader)
+                return control.loop_detail(unquote(path[len(LOOP_PATH):]), connect=state.reader)
             if path.startswith(FEED_PATH):
                 return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
             if path == "/api/approvals":
-                return {"approvals": emits.waiting(state.reader)}
+                return {"approvals": emits.waiting(connect=state.reader)}
             if path == "/api/devices":
                 return {"devices": control.fleet()}
             if path == "/api/sessions":
                 return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
             if path == "/api/costs":
-                return control.costs(float(whole_number(query["days"]) or 1) if "days" in query else None, state.reader)
+                return control.costs(float(whole_number(query["days"]) or 1) if "days" in query else None,
+                                     connect=state.reader)
         if method == "POST":
             if path == "/api/settings":
                 return settings.save(self.body())

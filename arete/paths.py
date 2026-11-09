@@ -40,6 +40,10 @@ def scratch_dir(run_id: str) -> Path:
     return RUNS_DIR / run_id / "scratch"
 
 
+def draft_dir(run_id: str) -> Path:
+    return STATE_DIR / "drafts" / run_id
+
+
 def ensure_dirs() -> None:
     for d in (STATE_DIR, RUNS_DIR, WORKTREES_DIR, LOCKS_DIR, LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)

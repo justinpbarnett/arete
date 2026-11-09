@@ -44,11 +44,11 @@ def limit_applies(scope: str, model: str) -> bool:
     return scope == claude.EVERY_MODEL or scope in model.lower()
 
 
-def usage_hold(model: str, run_with: str = "") -> dict | None:
+def usage_hold(model: str, run_with: str = "", connect=state.db) -> dict | None:
     which, name = route(model, run_with)
     if which != "claude":
         return None
-    return next((h for h in reversed(state.holds()) if limit_applies(h["scope"], name)), None)
+    return next((h for h in reversed(state.holds(connect)) if limit_applies(h["scope"], name)), None)
 
 
 def hold_words(hold: dict) -> str:

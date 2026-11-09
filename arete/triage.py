@@ -854,11 +854,11 @@ def ticket(ref: str) -> str | None:
             lines.append(f"Run: {a['run']['status']} {' '.join(sent_prs(a))}".rstrip() if a["run"] else "Run: none yet")
         lines += ["Assumed:"] + [f"  - {x}" for x in a["assumptions"]] if a["assumptions"] else []
         return "\n".join(x for x in lines if x)
-    lines = [f"{r['ref']}: {r['title']}", r["url"], f"{r['source']}, updated {r['updated'] or 'unknown'}"]
+    lines = [f"{r['ref']}: {r['title']}", r["url"], f"{r['source']}, updated {stamp(r['updated']) or 'unknown'}"]
     kind = standing(r)
     if kind == NOT_TRIAGED:
         return "\n".join(lines + [f"Not triaged: {r['why']}"])
-    lines[-1] += f", triaged {r['ts']} for ${r['cost'] or 0:.3f}"
+    lines[-1] += f", triaged {stamp(r['ts'])} for ${r['cost'] or 0:.3f}"
     if kind == NEEDS_PERSON:
         return "\n".join(lines + ["Needs a person: nothing for arete to build or research.", f"Why: {r['why']}"])
     if kind == RESEARCH_WORK:

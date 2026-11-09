@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from collections import Counter, defaultdict
 from datetime import timedelta
 
@@ -35,8 +36,10 @@ class Refused(ValueError):
 def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
     paths.ensure_dirs()
     with open(paths.LOG_DIR / log_name, "a") as log:
-        return subprocess.Popen([sys.executable, "-m", "arete.cli", *args], stdin=subprocess.DEVNULL, stdout=log,
+        proc = subprocess.Popen([sys.executable, "-m", "arete.cli", *args], stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep)
+    threading.Thread(target=proc.wait, name=f"reap-{proc.pid}", daemon=True).start()
+    return proc
 
 
 def find_loop(name: str, cfg: config.Config | None = None) -> Loop:
@@ -125,7 +128,7 @@ def loop_detail(name: str, connect=state.db) -> dict:
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
             "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "digests": digests(loop), "metrics": loop_metrics(loop, connect),
-            "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg)}
+            "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
 
 
 def digests(loop: Loop) -> list[dict]:

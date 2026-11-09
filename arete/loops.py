@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, cron, devices, paths, runner, util
+from . import config, cron, devices, paths, runner, state, util
 
 ENGINE_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -130,8 +130,9 @@ class Loop:
     def meters_spend(self, cfg: config.Config) -> bool:
         return any(runner.metered(model, self.runner) for model in self.agent_models(cfg))
 
-    def usage_hold(self, cfg: config.Config) -> str:
-        held = next(filter(None, (runner.usage_hold(model, self.runner) for model in self.agent_models(cfg))), None)
+    def usage_hold(self, cfg: config.Config, connect=state.db) -> str:
+        held = next(filter(None, (runner.usage_hold(model, self.runner, connect) for model in self.agent_models(cfg))),
+                    None)
         return runner.hold_words(held) if held else ""
 
     def work_repo(self, cfg: config.Config) -> config.Repo:
