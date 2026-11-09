@@ -269,7 +269,7 @@ def report(findings: list[Finding], stats: list[str]) -> str:
     if not findings:
         lines.append("Nothing to fix.")
     for f in sorted(findings, key=lambda f: (order[f.severity], f.check, f.subject)):
-        lines.append(f"- {f.severity.upper()} [{f.check}] {f.subject}: {f.detail}")
+        lines.append(" ".join(f"- {f.severity.upper()} [{f.check}] {f.subject}: {f.detail}".split()))
     if stats:
         lines += ["", "## Arete runs, last 7 days", ""] + stats
     return "\n".join(lines) + "\n"
