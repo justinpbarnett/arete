@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from . import paths, util
+from .diffguard import NEVER_STAGED
 
 DEVICES_FILE = paths.CONFIG_DIR / "devices.toml"
 CACHE_FILE = paths.STATE_DIR / "devices.json"
@@ -19,6 +20,15 @@ PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi arete ollama; do command
 CLONE_BOOT_SECONDS = 180
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HOME_DIR = re.compile(r"~([a-z_][a-z0-9_.-]*)?")
+TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
+                'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
+                'test "$p" = https && test "$h" = github.com || return 0; '
+                'echo username=x-access-token; echo "password=$ARETE_GIT_TOKEN"; }; f')
+GIT_NO_HOOKS = "git -c core.hooksPath=/dev/null"
+GIT_WITH_TOKEN = ('ARETE_GIT_TOKEN="$arete_token" GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= '
+                  + shlex.join(["git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=",
+                                "-c", "credential.helper=" + TOKEN_HELPER]))
+CLONE_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -160,6 +170,52 @@ def pve(d: Device, command: str, timeout: float = 300) -> str:
     if res.returncode != 0:
         raise DeviceError(f"{d.name}: `{command}` failed: {util.first_line(res.stderr or res.stdout, 300)}")
     return res.stdout
+
+
+def run_script(device: Device | str, script: str, what: str, token: str = "", timeout: float = 300) -> str:
+    d = resolve(device)
+    if not d.remote:
+        raise DeviceError(f"{what} runs only on a remote device, not on {d.name}")
+    # The token goes over stdin because a command line shows in ps on both machines, into a shell variable
+    # that only GIT_WITH_TOKEN puts in an environment.
+    if token:
+        script = f"IFS= read -r arete_token && {script}"
+    res = util.sh([*ssh_argv(d), script], input=f"{token}\n" if token else "", timeout=timeout)
+    if res.returncode != 0:
+        raise DeviceError(f"{d.name}: {what} failed: {util.git_error(res.stderr or res.stdout) or f'exit {res.returncode}'}")
+    return res.stdout
+
+
+def github_url(github: str) -> str:
+    return f"https://github.com/{github}.git"
+
+
+def clone(device: Device | str, github: str, base: str, branch: str, folder: str, token: str) -> str:
+    q, where = shlex.quote, remote_dir(folder)
+    # The checkout can run filters from the device's git config, so it comes after the clone, without the token,
+    # and -f fills the work tree that --no-checkout left empty.
+    steps = [f"{GIT_WITH_TOKEN} clone -q --no-checkout --template= --branch {q(base)} {q(github_url(github))} {where}",
+             f"cd {where}", f"{GIT_NO_HOOKS} checkout -q -f -b {q(branch)}",
+             "{ git config user.email >/dev/null || { git config user.name arete && git config user.email arete@localhost; }; }",
+             "git rev-parse HEAD"]
+    return util.last_line(run_script(device, " && ".join(steps), f"cloning {github}", token, CLONE_SECONDS))
+
+
+def commit_all(device: Device | str, folder: str, message: str, deny: list[str]) -> tuple[str, list[str]]:
+    # The reset drops whatever the agent staged, so a denied path it added itself stays out too.
+    steps = [f"cd {remote_dir(folder)}", "git reset -q",
+             f"git add -A -- . {shlex.join([*NEVER_STAGED, *(f':(exclude){p}' for p in deny)])}",
+             f"{{ git diff --cached --quiet || {GIT_NO_HOOKS} commit -q -m {shlex.quote(message)}; }}",
+             f"git status --porcelain --untracked-files=all -- {shlex.join(deny)}",
+             "git rev-parse HEAD"]
+    *left_out, head = run_script(device, " && ".join(steps), "committing the session's work").splitlines() or [""]
+    return head.strip(), [line[3:] for line in left_out if line.strip()]
+
+
+def push(device: Device | str, folder: str, github: str, branch: str, token: str) -> None:
+    q = shlex.quote
+    run_script(device, f"cd {remote_dir(folder)} && {GIT_WITH_TOKEN} push -q --no-verify {q(github_url(github))} "
+                       f"{q(f'HEAD:refs/heads/{branch}')}", f"pushing {branch}", token)
 
 
 def clone_address(d: Device, vmid: int) -> str:

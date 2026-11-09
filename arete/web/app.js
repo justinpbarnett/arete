@@ -725,7 +725,6 @@ const feeds = {
 };
 let openLoop = "";
 let launchKey = "";
-let remoteDevices = [];
 let sessionSending = false;
 
 function button(text, focus, onClick, disabled = false) {
@@ -1073,7 +1072,6 @@ function fillChoices(c, reset = false) {
   if (key === launchKey && !reset) return;
   const keep = launchKey && !reset ? launchValues() : { device: "local", runner: "", repo: "", tools: c.default_tools };
   launchKey = key;
-  remoteDevices = c.remote_devices;
   options("launch-device", "", c.devices, keep.device);
   options("launch-runner", "By the model", c.runners, keep.runner);
   options("launch-repo", "None", c.repos, keep.repo);
@@ -1082,15 +1080,8 @@ function fillChoices(c, reset = false) {
   fill("launch-tools", el("legend", { text: "Tools" }), c.tools.map((t) => el("label", { class: "check" },
     el("input", { type: "checkbox", value: t, checked: keep.tools.includes(t) }), t)));
   document.getElementById("launch-about").textContent = "A session is an agent you talk to. It runs on the device and model you pick, " +
-    `takes each message you send, and closes after ${c.idle_hours} hours with no message. A session on a repo works in a worktree of its own, which stays when it ends.`;
-  repoFollowsDevice();
-}
-
-function repoFollowsDevice() {
-  const repo = document.getElementById("launch-repo");
-  const remote = remoteDevices.includes(document.getElementById("launch-device").value);
-  if (remote) repo.value = "";
-  repo.disabled = remote;
+    `takes each message you send, and closes after ${c.idle_hours} hours with no message. A session on a repo works in a worktree of its own on this machine, ` +
+    "which stays when it ends. On another device it works in a fresh clone, and arete pushes its branch to GitHub after each turn.";
 }
 
 function sessionRow(s) {
@@ -1327,7 +1318,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("loop-new-sentence").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) document.getElementById("loop-new").requestSubmit();
   });
-  document.getElementById("launch-device").addEventListener("change", repoFollowsDevice);
   document.getElementById("launch-reset").addEventListener("click", async () => {
     document.getElementById("launch").reset();
     document.getElementById("launch-result").hidden = true;

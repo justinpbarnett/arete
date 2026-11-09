@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import signal
 import time
 from dataclasses import asdict, dataclass, field
@@ -12,6 +13,8 @@ from . import (
     config,
     control,
     devices,
+    diffguard,
+    gh,
     jev,
     paths,
     record,
@@ -47,6 +50,11 @@ class Spec:
     branch: str = ""
     source: str = ""
     created: str = ""
+    github: str = ""
+    base: str = ""
+    deny: list[str] = field(default_factory=list)
+    pushed: str = ""
+    unpushed: bool = False
 
 
 class SessionStopped(Exception):
@@ -78,17 +86,36 @@ def device_named(name: str) -> devices.Device:
 def repo_named(name: str, device: devices.Device, cfg: config.Config) -> config.Repo | None:
     if not name.strip():
         return None
-    if device.remote:
-        raise control.Refused(f"a session on {device.name} starts in its folder {device.dir}; leave the repo empty")
     try:
-        return cfg.repo(name.strip())
+        repo = cfg.repo(name.strip())
     except config.UnknownRepo as e:
         raise control.Refused(e.args[0]) from e
+    if not device.remote:
+        return repo
+    config_file = paths.short_path(paths.CONFIG_FILE)
+    if not repo.github:
+        raise control.Refused(f"a session on {device.name} clones its repo from GitHub, and repo {repo.name} has no "
+                              f"github in {config_file}" + ("; its parts are separate repos, so start it on local"
+                                                            if repo.parts else ""))
+    if missing := cfg.github_app.missing():
+        raise control.Refused(f"a session on {device.name} clones {repo.github} with a token from a GitHub App; set "
+                              f"{', '.join(missing)} under [github_app] in {config_file}")
+    if not cfg.github_app.private_key.is_file():
+        raise control.Refused(f"[github_app] private_key {paths.short_path(cfg.github_app.private_key)} is not a file")
+    return repo
 
 
 def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> None:
-    if device.remote:
+    if device.remote and not repo:
         spec.cwd = device.dir
+        return
+    if device.remote:
+        layer = config.load_layer(repo.layer_dir)
+        spec.github = repo.github
+        spec.base = layer.base_branch or gh.default_branch(repo.github)
+        spec.deny = diffguard.denied_paths(layer)
+        spec.branch = f"session/{spec.id}"
+        spec.cwd = posixpath.join(device.dir, f"{repo.name}-{spec.id}")
         return
     if not repo:
         scratch = SESSIONS_DIR / spec.id / "work"
@@ -129,9 +156,11 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
                  device=spec.device, model=name, runner=which, trigger="manual",
                  log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"), summary=util.first_line(prompt, 200),
                  branch=spec.branch or None)
-    state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}; tools "
-                                     f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
-                                                                for reason, withheld in off.items()))
+    state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}"
+                                     + (f"; a clone of {spec.github} on {spec.branch} from {spec.base}"
+                                        if spec.github else "")
+                                     + f"; tools {', '.join(tools) or 'none'}"
+                                     + "".join(f"; {', '.join(withheld)} off: {reason}" for reason, withheld in off.items()))
     proc = control.detach(["session", "exec", spec.id], SESSION_LOG)
     record.note(spec.id, pid=proc.pid)
     return {"id": spec.id, "cwd": spec.cwd, "branch": spec.branch, "model": name, "runner": which,
@@ -228,21 +257,28 @@ def execute(session_id: str) -> str:
         status, summary = "done", ""
         try:
             with devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text)) as device:
+                head = clone_repo(spec, cfg, device) if spec.github else ""
                 resume, turn, prompt = NO_SESSION, 0, spec.prompt
                 idle_since = time.monotonic()
-                while True:
-                    if prompt:
-                        turn += 1
-                        resume = take_turn(spec, cfg, device, prompt, turn, resume)
-                        idle_since = time.monotonic()
-                    prompt = "\n\n".join(state.take_messages(session_id))
-                    if prompt:
-                        continue
-                    if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
-                        summary = f"closed after {cfg.session_idle_hours:g}h with no message"
-                        close(spec, status, summary)
-                        break
-                    time.sleep(INBOX_POLL_SECONDS)
+                try:
+                    while True:
+                        if prompt:
+                            turn += 1
+                            resume = take_turn(spec, cfg, device, prompt, turn, resume)
+                            if spec.github:
+                                head = push_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}", head)
+                            idle_since = time.monotonic()
+                        prompt = "\n\n".join(state.take_messages(session_id))
+                        if prompt:
+                            continue
+                        if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
+                            summary = f"closed after {cfg.session_idle_hours:g}h with no message"
+                            break
+                        time.sleep(INBOX_POLL_SECONDS)
+                finally:
+                    if spec.github:
+                        push_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}", head, last=True)
+                close(spec, status, summary)
         except SessionStopped:
             status, summary = "stopped", record.STOPPED if record.stop_asked(session_id) else "stopped by a signal"
         except Exception as e:
@@ -253,8 +289,48 @@ def execute(session_id: str) -> str:
         return status
 
 
+def clone_repo(spec: Spec, cfg: config.Config, device: devices.Device) -> str:
+    log_line(spec, "git", f"cloning {spec.github} into {spec.cwd} on {spec.branch} from {spec.base}")
+    head = devices.clone(device, spec.github, spec.base, spec.branch, spec.cwd,
+                         gh.installation_token(cfg.github_app, spec.github))
+    log_line(spec, "git", f"cloned {spec.github} at {head[:10]}")
+    return head
+
+
+def push_work(spec: Spec, cfg: config.Config, device: devices.Device, message: str, known: str,
+              last: bool = False) -> str:
+    spec.unpushed = True
+    try:
+        head, left_out = devices.commit_all(device, spec.cwd, message, spec.deny)
+        if left_out:
+            log_line(spec, "git", f"left {', '.join(left_out)} out of the commit, as only a person may change them")
+        if head != known:
+            devices.push(device, spec.cwd, spec.github, spec.branch, gh.installation_token(cfg.github_app, spec.github))
+            spec.pushed = head
+            log_line(spec, "git", f"pushed {head[:10]} to {spec.branch} on {spec.github}")
+        spec.unpushed = False
+        return head
+    except (gh.GhError, devices.DeviceError) as e:
+        log_line(spec, "error", f"the push of {spec.branch} failed: {e}"
+                                + ("" if last else "; arete tries again after the next turn"))
+        return known
+    finally:
+        save_spec(spec)
+
+
+def pushed_note(spec: Spec) -> str:
+    if spec.pushed and spec.unpushed:
+        return f"; {spec.branch} of {spec.github} has its work up to {spec.pushed[:10]}, but its last changes were not pushed"
+    if spec.pushed:
+        return f"; its work is on {spec.branch} of {spec.github} at {spec.pushed[:10]}"
+    return f"; its changes were not pushed to {spec.github}" if spec.unpushed else f"; it pushed nothing to {spec.github}"
+
+
 def close(spec: Spec, status: str, summary: str) -> None:
-    kept = f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else ""
+    if spec.github:
+        kept = pushed_note(spec)
+    else:
+        kept = f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else ""
     end_line = f"{status}: {summary}{kept} (${record.spent(spec.id):.2f})"
     if record.settle(spec.id, status, end_line=end_line, summary=f"{summary}{kept}"[:500]):
         write_log(spec, "end", end_line)
@@ -279,8 +355,6 @@ def known_models(cfg: config.Config) -> list[str]:
 
 def choices() -> dict:
     cfg = config.load()
-    fleet = devices.known()
-    return {"devices": [d.name for d in fleet], "remote_devices": [d.name for d in fleet if d.remote],
-            "repos": [r.name for r in cfg.repos], "models": known_models(cfg), "runners": list(runner.RUNNERS),
-            "tools": sorted(runner.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
-            "idle_hours": cfg.session_idle_hours}
+    return {"devices": [d.name for d in devices.known()], "repos": [r.name for r in cfg.repos],
+            "models": known_models(cfg), "runners": list(runner.RUNNERS), "tools": sorted(runner.KNOWN_TOOLS),
+            "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"), "idle_hours": cfg.session_idle_hours}

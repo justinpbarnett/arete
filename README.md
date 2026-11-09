@@ -70,7 +70,33 @@ arete session send ID "now try the cache"
 arete session attach ID | stop ID | list
 ```
 
-`--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Launch view starts one with the same choices.
+`--repo` gives it a config repo to work on.
+On `local` it works in a new worktree of the repo, which stays when the session ends.
+On any other device it works in a fresh clone of the repo's `github` at `<dir>/<repo>-<session id>`, on a new branch `session/<id>` from the layer's `git.base` or the GitHub default branch.
+After each turn, and once more when the session ends, arete commits the agent's changes on the device, as the device's git identity or as `arete`, and pushes the branch.
+The commit leaves out the paths the repo denies, as listed under `limits` below, and the session's feed names each file it left out.
+When a push fails, the session's end line says its last changes were not pushed.
+Each clone and each push uses a new installation token of the `[github_app]`, scoped to that one repo with `contents: write` and `pull_requests: write`, which lasts at most an hour.
+The token goes to the device over the ssh connection's stdin and into the environment of just the git that clones or pushes, whose credential helper gives it to `https://github.com` and no other host.
+That git runs with hooks off and over https only, and it pushes to the repo's GitHub URL rather than to the clone's `origin`, so no hook, remote or URL rewrite the agent sets in the clone can get the token.
+It is never in a command line, the repo, a prompt, the agent's environment, or arete's logs and records.
+The agent runs as the same user as arete's git on the device, though, so an agent that sets out to read the token, for example with a process it leaves running, still can.
+A remote session on a repo without `github`, or with `[github_app]` not set, is refused with the reason.
+Arete signs the app's JWT with `openssl`, so the machine arete runs on needs it.
+With no repo, a session on another device starts in its `dir`.
+
+The app goes in `~/.config/arete/config.toml` and must be installed on each repo a remote session clones:
+
+```toml
+[github_app]
+app_id = 123456
+installation_id = 7890123
+private_key = "~/.config/arete/github-app.pem"
+```
+
+`--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap.
+A session with no message for `session_idle_hours` closes.
+The dashboard's Launch view starts one with the same choices.
 
 `arete costs` shows model spend by model, runner and loop.
 
@@ -136,6 +162,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
 | `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the push screen's line for harm a revert will not undo and the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `screen_hold` (0.4, the chance at which a push screen question holds a push), `screen_reach` (0.6, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
+| `[github_app]` | `app_id`, `installation_id` and `private_key` (the path to the app's PEM key). Needed only by sessions with a repo on a device other than `local`. See [Runners, devices and sessions](#runners-devices-and-sessions). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost. |
 
 | Repo field | Default | Meaning |

@@ -86,6 +86,16 @@ class JevConfig:
 
 
 @dataclass
+class GithubApp:
+    app_id: str = ""
+    installation_id: str = ""
+    private_key: Path | None = None
+
+    def missing(self) -> list[str]:
+        return [name for name in ("app_id", "installation_id", "private_key") if not getattr(self, name)]
+
+
+@dataclass
 class Job:
     label: str
     log: Path | None = None
@@ -113,6 +123,7 @@ class Config:
     probes: list[Probe] = field(default_factory=list)
     jira: JiraConfig = field(default_factory=JiraConfig)
     jev: JevConfig = field(default_factory=JevConfig)
+    github_app: GithubApp = field(default_factory=GithubApp)
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
@@ -233,6 +244,12 @@ def load(path: Path | None = None) -> Config:
     if bad := sorted(set(cfg.jev.risk_weights) - set(JevConfig().risk_weights)):
         raise ValueError(f"[jev.risk_weights]: unknown weight {', '.join(bad)}; use "
                          f"{', '.join(JevConfig().risk_weights)}")
+    app = data.get("github_app", {})
+    cfg.github_app = GithubApp(
+        app_id=str(app.get("app_id", "")).strip(),
+        installation_id=str(app.get("installation_id", "")).strip(),
+        private_key=paths.expand(app["private_key"]) if app.get("private_key") else None,
+    )
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")
         if tracker not in ("github", "jira"):

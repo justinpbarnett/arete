@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import base64
 import functools
 import json
+import subprocess
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from . import util
+from . import config, paths, util
 
 ARETE_MARK = "<!-- arete -->"
+GITHUB_API = "https://api.github.com"
+APP_TOKEN_PERMISSIONS = {"contents": "write", "pull_requests": "write"}
 
 
 class GhError(RuntimeError):
@@ -242,6 +249,65 @@ def default_branch(repo: str) -> str:
         return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
     except (GhError, KeyError, TypeError):
         return "main"
+
+
+def base64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def app_jwt(app: config.GithubApp) -> str:
+    now = int(time.time())
+    signed = ".".join(base64url(json.dumps(part, separators=(",", ":")).encode()) for part in (
+        {"alg": "RS256", "typ": "JWT"}, {"iat": now - 60, "exp": now + 540, "iss": app.app_id}))
+    failed = f"openssl could not sign with [github_app] private_key {paths.short_path(app.private_key)}"
+    try:
+        res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(app.private_key)], input=signed.encode(),
+                             capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise GhError(f"{failed}: {e}") from None
+    if res.returncode != 0:
+        raise GhError(f"{failed}: {util.first_line(res.stderr.decode(errors='replace')) or f'exit {res.returncode}'}")
+    return f"{signed}.{base64url(res.stdout)}"
+
+
+def installation_token(app: config.GithubApp, repo: str) -> str:
+    where = f"for {repo} from [github_app] installation {app.installation_id}"
+    try:
+        reply = token_reply(app, repo, retry=True)
+    except urllib.error.HTTPError as e:
+        raise GhError(f"GitHub gave no token {where}: HTTP {e.code}: {http_message(e)}") from None
+    except OSError as e:
+        raise GhError(f"GitHub gave no token {where}: {getattr(e, 'reason', None) or e}") from None
+    if not (token := reply.get("token")):
+        raise GhError(f"GitHub gave no token {where}: its reply held none")
+    return token
+
+
+def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
+    body = {"repositories": [repo.rsplit("/", 1)[-1]], "permissions": APP_TOKEN_PERMISSIONS}
+    request = urllib.request.Request(
+        f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
+        method="POST", headers={"Authorization": f"Bearer {app_jwt(app)}", "Accept": "application/vnd.github+json",
+                                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as res:
+            reply = json.loads(res.read())
+    except urllib.error.HTTPError:
+        raise
+    except OSError:
+        if not (retry and util.wait_for_network()):
+            raise
+        return token_reply(app, repo, retry=False)
+    except ValueError:
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+def http_message(e: urllib.error.HTTPError) -> str:
+    try:
+        return str(json.loads(e.read()).get("message") or e.reason)
+    except (ValueError, OSError, AttributeError):
+        return str(e.reason)
 
 
 def repo_exists(repo: str) -> bool:

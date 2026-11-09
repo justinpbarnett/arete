@@ -819,7 +819,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", default="")
     p.add_argument("--runner", default="", help="claude or pi; by the model when left out")
     p.add_argument("--tools", default=None, help="comma separated; Read,Edit,Write,Glob,Grep,Bash by default")
-    p.add_argument("--repo", default="", help="a repo name from the config; work in a new worktree of it on a device of kind local")
+    p.add_argument("--repo", default="", help="a repo name from the config; local works in a new worktree of it, "
+                                              "another device in a fresh clone that arete pushes after each turn")
     p.add_argument("--budget", type=float, default=None, help="USD for the whole session")
     p.add_argument("--attach", action="store_true", help="start: follow it at once")
     p.set_defaults(fn=cmd_session_args)
