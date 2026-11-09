@@ -76,6 +76,14 @@ def filing(h: Home | None, path: str) -> dict[str, str]:
                           "a short kebab-case file name for it, without `.md`, like the names of the reports beside it.")}
 
 
+def kept_path(h: Home | None, prior: dict | None) -> str:
+    path = (prior or {}).get("filed_path") or ""
+    if not h or not path.startswith(f"{h.folder}/"):
+        return ""
+    url = (prior or {}).get("filed_url") or ""
+    return path if not url or f"/{h.repo.github.lower()}/" in url.lower() else ""
+
+
 def claim_path(h: Home, name: str, title: str) -> str:
     base = h.base
     util.git(["fetch", "-q", "origin", base], h.repo.path)
@@ -329,7 +337,7 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     repos = sorted(src.repos, key=lambda repo: repo.name not in named)
     dirs = list(dict.fromkeys(repo.path for repo in repos if repo.path.is_dir()))
     h = home_of(src, r)
-    filed_path = prior["filed_path"] if h and prior else ""
+    filed_path = kept_path(h, prior)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"{util.iso()} {ref}: researching", flush=True)
     res = runner.run(prompt("research", ref=ref, title=r["title"], ticket=text, related=related(src, r, done),
