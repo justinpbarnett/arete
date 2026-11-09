@@ -548,8 +548,9 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
         return aliases.setdefault(repo.name, f"private repo {len(aliases) + 1}") if hidden(repo) else repo.name
 
     main_label = arms["main"].label
-    lines = [(f"Prompt evals: each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and "
-              f"once with this branch's. Changed: {code_list(changed)}."), ""]
+    lead = (f"each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and once with this branch's"
+            if ran else "no eval suite ran")
+    lines = [f"Prompt evals: {lead}. Changed: {code_list(changed)}.", ""]
     if ran:
         lines += [f"| suite | `{main_label}` | this branch | tasks that changed |", "|---|---|---|---|"]
         for repo, result in ran:
@@ -560,10 +561,8 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
         lines.append(f"{util.paid_note(totals['main'].paid + totals['pr'].paid).capitalize()}."
                      + (f" Runs {code_list(ids)}." if ids else ""))
-    else:
-        lines.append("No eval suite ran.")
     if unmeasured:
         lines.append(f"Not measured, as no eval runs them: {code_list(unmeasured)}.")
     if skipped:
         lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why in skipped) + ".")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines).rstrip() + "\n"
