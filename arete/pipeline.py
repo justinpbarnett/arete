@@ -1711,11 +1711,11 @@ def sync_landings(cfg: config.Config) -> None:
 
 
 def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
-    saved = run.dir / f"uat-{branch}.md"
+    saved = run.dir / f"uat-{tracker.safe_filename(branch)}.md"
     if saved.exists():
         return saved.read_text()
     run.dir.mkdir(parents=True, exist_ok=True)
-    tries_file = run.dir / f"uat-{branch}.tries"
+    tries_file = run.dir / f"uat-{tracker.safe_filename(branch)}.tries"
     tries = int(tries_file.read_text() or 0) + 1 if tries_file.exists() else 1
     t = run.tracker.get(run.tid)
     urls = row["pr_url"].split()
