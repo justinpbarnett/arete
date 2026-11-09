@@ -104,7 +104,7 @@ def skipped(running: list[dict]) -> list[dict]:
 def waiting() -> dict:
     return {
         "tickets": [{"ticket": tracker.run_ticket_name(w), "comments": w["n"], "at_once": bool(w["at_once"]),
-                     "last": w["last"]} for w in state.feedback_waiting(connect=state.reader)],
+                     "submitted": w["submitted"], "last": w["last"]} for w in state.feedback_waiting(connect=state.reader)],
         "quiet_minutes": pipeline.FEEDBACK_QUIET_MINUTES,
     }
 

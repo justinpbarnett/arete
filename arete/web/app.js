@@ -228,7 +228,7 @@ function drawLive(snapshot) {
       ? [el("p", {}, `Review feedback runs ${waiting.quiet_minutes} min after the last comment, or at once when a review is submitted.`),
         table("Waiting", [["Ticket"], ["Comments", "num c-time"], ["When"]],
           waiting.tickets.map((w) => el("tr", {}, cell(w.ticket), cell(w.comments, "num"),
-            cell(`${w.at_once ? "review submitted" : "last comment"} ${clock(w.last)}`))))]
+            cell(w.at_once ? `review submitted ${clock(w.submitted)}` : `last comment ${clock(w.last)}`))))]
       : quiet("No review feedback is waiting.")),
     heading(5, "Recent runs"),
     panelParts(snapshot.recent, "Recent runs", (recent) => recent.length

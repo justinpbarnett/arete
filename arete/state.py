@@ -893,6 +893,7 @@ def close_feedback(pr_url: str, pr_state: str) -> None:
 def feedback_waiting(connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT repo, issue, COUNT(*) AS n, MAX(at_once) AS at_once, "
+                                           "MAX(CASE WHEN at_once THEN created END) AS submitted, "
                                            "MAX(created) AS last FROM feedback WHERE status = 'new' "
                                            "GROUP BY repo, issue ORDER BY last")]
 
