@@ -966,12 +966,16 @@ async function openLoopDetail(name) {
 }
 
 async function refreshLoopDetail() {
-  if (!openLoop) return;
+  const name = openLoop;
+  if (!name) return;
   const box = document.getElementById("loop-detail");
   try {
-    drawLoopDetail(await call(`/api/loops/${encodeURIComponent(openLoop)}`));
+    const detail = await call(`/api/loops/${encodeURIComponent(name)}`);
+    if (openLoop !== name) return;
+    drawLoopDetail(detail);
   } catch (e) {
-    fill("loop-detail", heading(4, openLoop), fault(`The loop could not be read: ${e.message}`), closeLoopButton());
+    if (openLoop !== name) return;
+    fill("loop-detail", heading(4, name), fault(`The loop could not be read: ${e.message}`), closeLoopButton());
   }
   box.hidden = false;
 }
