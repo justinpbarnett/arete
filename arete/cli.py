@@ -135,7 +135,7 @@ def print_recent(runs: list[dict]) -> None:
 
     if runs:
         print("recent runs:")
-        print_table([(r["id"], r["kind"], r["ticket"], r["status"], util.money(r["paid"]), r["pr_url"] or r["summary"])
+        print_table([(r["id"], r["kind"], r["ticket"], r["status"], util.paid_note(r["paid"]), r["pr_url"] or r["summary"])
                      for r in runs], 200)
 
 
@@ -184,7 +184,7 @@ def print_live(live: dict) -> None:
     print(f"runs live: {len(live['runs'])}, in {live['slots']} of {live['max_parallel']} run slots"
           + (f", {live['waiting']} waiting for one" if live["waiting"] else ""))
     if live["runs"]:
-        print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", util.money(r["paid"]),
+        print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", util.paid_note(r["paid"]),
                       r["slot"] or r["step"]) for r in live["runs"]], 200)
 
 
@@ -412,7 +412,7 @@ def loop_line(v: dict) -> str:
             else "never ran")
     due = f"next {when(v['next_due'])}" if v.get("next_due") else ""
     return (f"{v['name']:<22} {switch:<6} {v['kind']:<7} {v['trigger']:<22} {what:<26} {due:<17}"
-            f" {util.money(v['spent_24h'])}/24h" + (f"\n    {v['error']}" if v["error"] else ""))
+            f" {util.paid_note(v['spent_24h'])} in 24 h" + (f"\n    {v['error']}" if v["error"] else ""))
 
 
 def print_feed_line(line: dict) -> None:
@@ -553,7 +553,7 @@ def cmd_loop(args) -> int:
             if d["state"]:
                 print(f"  memory: {json.dumps(d['state'])[:300]}")
             for r in d["runs"][:8]:
-                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} {util.money(r['paid'])} "
+                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} {util.paid_note(r['paid']):<12} "
                       f"{util.first_line(r['summary'] or '', 90)}")
             for f in d["findings"][:8]:
                 print(f"  finding {f['title'][:90]} {f['url'] or ''}")
@@ -643,7 +643,7 @@ def cmd_session(args) -> int:
             return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
         for s in sessions.views():
             print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
-                  f"{s['device'] or '':<10} {util.money(s['paid'])}  {s['prompt'][:70]}")
+                  f"{s['device'] or '':<10} {util.paid_note(s['paid']):<12}  {s['prompt'][:70]}")
         if not state.runs(kind="session", limit=1):
             print("no sessions yet; `arete session start \"what to do\"`")
         return 0
