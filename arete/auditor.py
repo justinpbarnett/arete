@@ -93,6 +93,7 @@ def check_skills(cfg: config.Config) -> tuple[list[Finding], list[str]]:
 
 def _dead_links(text: str, base: Path) -> list[str]:
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)", "", text)
     dead = []
     for m in LINK.finditer(text):
         t = m.group(1)
