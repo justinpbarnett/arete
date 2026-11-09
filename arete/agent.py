@@ -43,18 +43,30 @@ class Result:
 NO_SESSION = Session()
 
 
+def fenced_json(text: str):
+    decoder = json.JSONDecoder()
+    answer = None
+    at = text.find("```")
+    while at != -1:
+        opening = text[at + 3 :].lstrip().removeprefix("json").lstrip()
+        at = text.find("```", at + 3)
+        if not opening.startswith(("{", "[")):
+            continue
+        try:
+            value, end = decoder.raw_decode(text, len(text) - len(opening))
+        except json.JSONDecodeError:
+            continue
+        rest = text[end:].lstrip()
+        if not rest or rest.startswith("```"):
+            answer = value
+            at = text.find("```", end)
+    return answer
+
+
 def json_from_text(text: str):
     text = text.strip()
-    if "```" in text:
-        for chunk in reversed(text.split("```")):
-            chunk = chunk.strip()
-            if chunk.startswith("json"):
-                chunk = chunk[4:].strip()
-            if chunk.startswith(("{", "[")):
-                try:
-                    return json.loads(chunk)
-                except json.JSONDecodeError:
-                    pass
+    if (fenced := fenced_json(text)) is not None:
+        return fenced
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end > start:
