@@ -18,6 +18,7 @@ JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "creat
                "assignee", "parent", "attachment"]
 JIRA_STATE_LABELS = {f"agent-{s}" for s in config.STATES}
 SEARCH_FIELDS = ["summary", "created", "labels"]
+MAX_AGENT_ISSUES = 1000
 MAX_COMMENTS = 10
 MAX_IMAGES = 6
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -120,7 +121,7 @@ class GitHubTracker:
     def todo(self) -> list[Ticket]:
         skip = {self.label_name(s) for s in config.STATES}
         out = []
-        for i in gh.issues(self.repo.github, LABEL):
+        for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
             names = {lb["name"] for lb in i.get("labels", [])}
             if names & skip or not self.by_owner(i):
                 continue
