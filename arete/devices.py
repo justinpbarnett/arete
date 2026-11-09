@@ -34,6 +34,7 @@ class Device:
     user: str = "root"
     keep: bool = False
     note: str = ""
+    via: Device | None = None
 
     @property
     def remote(self) -> bool:
@@ -98,7 +99,14 @@ def ssh_argv(d: Device) -> list[str]:
         argv += ["-i", str(paths.expand(d.identity))]
     if d.jump:
         argv += ["-J", d.jump]
+    if d.via:
+        argv += ["-o", f"ProxyCommand={proxy_command(d.via)}"]
     return [*argv, d.host]
+
+
+def proxy_command(hop: Device) -> str:
+    ssh, *reach_hop = ssh_argv(hop)
+    return f"{ssh} -W '[%h]:%p' {shlex.join(reach_hop).replace('%', '%%')}"
 
 
 def remote_dir(path) -> str:
@@ -190,8 +198,7 @@ def lease(device: Device | str, label: str, log=lambda text: None):
         pve(d, f"qm start {vmid}")
         address = clone_address(d, vmid)
         log(f"VM {vmid} is up at {address}")
-        yield replace(d, name=f"{d.name} clone", kind="ssh", host=f"{d.user}@{address}", port=None,
-                      jump=",".join(filter(None, [d.jump, f"{d.host}:{d.port}" if d.port else d.host])))
+        yield replace(d, name=f"{d.name} clone", kind="ssh", host=f"{d.user}@{address}", port=None, jump="", via=d)
     finally:
         if d.keep:
             log(f"keeping VM {vmid}")
