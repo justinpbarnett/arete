@@ -12,7 +12,7 @@ PUSH_RULES = ("lines", "deletes", "paths")
 PATCH_SHOWN = 12000
 RETRIED = ("screen", "proof")
 FENCE = re.compile(r"`{3,}")
-TAGS = re.compile(r"<[^>]{0,200}>")
+TAGS = re.compile(r"<[A-Za-z/!?][^>]{0,200}>")
 LINKS = re.compile(r"!?\[([^\]]{0,200})\]\([^)]{0,500}\)")
 FINDING_SCHEMA = {
     "type": "object",
