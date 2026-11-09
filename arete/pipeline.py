@@ -1122,7 +1122,7 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
         failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
         drafted = [c for c in with_prs if set_draft(run, c, True)]
         ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, with_prs)}"
-        publish_ci(run, pushed, ci.section(rounds, max_rounds, ending))
+        publish_ci(run, with_prs, ci.section(rounds, max_rounds, ending))
         if failed is e:
             raise
         raise failed from e
