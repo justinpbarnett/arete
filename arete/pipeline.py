@@ -1761,10 +1761,10 @@ def branch_holds_work(repo: str, branch: str, merge_sha: str, key: str) -> bool:
     return bool(merge_sha) and gh.branch_contains(repo, branch, merge_sha) or gh.merged_pr_names(repo, branch, key)
 
 
-def streak(repo_name: str) -> int:
+def streak(repo_name: str, since: str = "") -> int:
     n = 0
     for r in state.runs(kind="pipeline", repo=repo_name, limit=100):
-        if r["status"] == "merged":
+        if r["status"] == "merged" and (not since or (r["finished"] or "") > since):
             n += 1
         elif r["status"] in ("rejected", "failed"):
             break
@@ -1782,6 +1782,10 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
     branch = "arete/trust-automerge"
     if gh.open_pr_url(repo.github, branch):
         return
+    if gh.closed_pr_heads(repo.github, branch):
+        closed_at = gh.pr_view(branch, repo.github).get("closedAt") or ""
+        if streak(repo.name, since=closed_at) < layer.automerge_after:
+            return
     base = layer.base_branch or gh.default_branch(repo.github)
     labels = ["arete-trust"] if repo.tracker == "github" else []
     wt = make_worktree(repo, base, branch, "trust")
