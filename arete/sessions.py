@@ -240,6 +240,7 @@ def execute(session_id: str) -> str:
                         continue
                     if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
                         summary = f"closed after {cfg.session_idle_hours:g}h with no message"
+                        close(spec, status, summary)
                         break
                     time.sleep(INBOX_POLL_SECONDS)
         except SessionStopped:
@@ -248,11 +249,15 @@ def execute(session_id: str) -> str:
             status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        kept = f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else ""
-        end_line = f"{status}: {summary}{kept} (${record.spent(session_id):.2f})"
-        write_log(spec, "end", end_line)
-        record.settle(session_id, status, end_line=end_line, summary=f"{summary}{kept}"[:500])
+        close(spec, status, summary)
         return status
+
+
+def close(spec: Spec, status: str, summary: str) -> None:
+    kept = f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else ""
+    end_line = f"{status}: {summary}{kept} (${record.spent(spec.id):.2f})"
+    if record.settle(spec.id, status, end_line=end_line, summary=f"{summary}{kept}"[:500]):
+        write_log(spec, "end", end_line)
 
 
 def views(limit: int = 30, connect=state.db) -> list[dict]:
