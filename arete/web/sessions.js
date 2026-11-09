@@ -83,6 +83,7 @@ async function launch(event) {
       runner: values.runner, repo: values.repo, tools: values.tools, budget_usd: budget ? Number(budget) : null });
     lastSaid.set(`detail:session:${s.id}`, ["ok", `Launched: ${s.runner} ${s.model} on ${s.device}. Its feed shows below as it works.`]);
     prompt.value = "";
+    markSent("launch");
     document.getElementById("launch-result").hidden = true;
     toggleForm("launch-toggle", "launch", "launch-prompt", false);
     go(detailHash("session", s.id), "link");

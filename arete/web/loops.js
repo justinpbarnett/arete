@@ -86,6 +86,7 @@ async function draftLoop(event) {
     const r = await call("/api/loops/new", { sentence: value("sentence"), name: value("name"), repo: value("repo"), model: value("model") });
     lastSaid.set(`detail:run:${r.id}`, ["ok", `Started a draft at ${clock(r.started)}. Its feed shows below. The loop lands turned off, so try it before you turn it on.`]);
     for (const id of ["sentence", "name"]) document.getElementById(`loop-new-${id}`).value = "";
+    markSent("loop-new");
     document.getElementById("loop-new-result").hidden = true;
     toggleForm("loop-new-toggle", "loop-new", "loop-new-sentence", false);
     go(detailHash("run", r.id), "link");

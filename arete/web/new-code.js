@@ -1,13 +1,13 @@
 "use strict";
 
 const PAGE_CODE = document.querySelector('meta[name="arete-code"]').content;
-const HANDOFF = "arete.handoff.1";
-const NOTHING_CARRIED = { scroll: 0, paneScroll: 0, boxes: [], focus: "", focusId: "", console: false, forms: [], folds: [],
-  answers: [], messages: [], said: [], sendSaid: [] };
+const HANDOFF = "arete.handoff";
+const NOTHING_CARRIED = { scroll: 0, paneScroll: 0, boxes: [], consoleScroll: null, focus: "", console: false, forms: [], fields: [],
+  folds: [], answers: [], messages: [], said: [], sendSaid: [], results: [], queries: {} };
 const CARRIED = takeHandoff();
 let servedCode = PAGE_CODE;
-let changesInFlight = 0;
 let placeToPutBack = null;
+let consoleScrollToPutBack = null;
 
 function takeHandoff() {
   try {
@@ -23,6 +23,10 @@ function noteServedCode(response) {
   servedCode = response.headers.get("X-Arete-Code") || servedCode;
 }
 
+function newCodeServed() {
+  return servedCode !== PAGE_CODE;
+}
+
 function newCodeWaitsFor() {
   if (changesInFlight) return "your last action ends";
   if (document.querySelector("dialog[open]")) return "you close the dialog";
@@ -32,21 +36,25 @@ function newCodeWaitsFor() {
   return "";
 }
 
+function textFields(within = document) {
+  return [...within.querySelectorAll("textarea, input[type=text]")];
+}
+
 function unsentText() {
-  const typed = (field) => field.value.trim() && !field.closest("#settings-form, dialog");
-  const messages = [...document.querySelectorAll("textarea")];
-  // a send clears its message but keeps the form's other fields for the next one
-  const otherFieldsOnScreen = [...document.querySelectorAll("input[type=text]")].filter((field) => field.checkVisibility());
-  return [...messages, ...otherFieldsOnScreen].some(typed);
+  return textFields().some((field) => field.value.trim() && field.value !== field.dataset.sent && !field.closest("#settings-form, dialog"));
+}
+
+function markSent(formId) {
+  for (const field of textFields(document.getElementById(formId))) field.dataset.sent = field.value;
 }
 
 function newCodeNote() {
-  const waitsFor = servedCode === PAGE_CODE ? "" : newCodeWaitsFor();
+  const waitsFor = newCodeServed() ? newCodeWaitsFor() : "";
   return waitsFor ? `The new version loads once ${waitsFor}.` : "";
 }
 
-function reloadsForNewCode() {
-  if (servedCode === PAGE_CODE || newCodeWaitsFor()) return false;
+function reloadIfNewCode() {
+  if (!newCodeServed() || newCodeWaitsFor()) return false;
   try {
     sessionStorage.setItem(HANDOFF, JSON.stringify(placeNow()));
   } catch {
@@ -57,47 +65,80 @@ function reloadsForNewCode() {
 }
 
 function placeNow() {
-  const focused = document.activeElement;
   return {
     tab: TAB,
     scroll: scrollY,
     paneScroll: route.detail ? currentPane().scrollTop : 0,
-    boxes: scrolledIn(currentSection()),
-    focus: focused?.dataset?.focus || "",
-    focusId: focused?.id || "",
+    boxes: [...scrollersByPlace(currentSection())].map(([key, node]) => ({ key, ...boxScroll(node) })),
+    consoleScroll: boxScroll(document.getElementById("console-body")),
+    focus: focusSelector(document.activeElement),
     console: !document.getElementById("console").hidden,
-    forms: TOGGLE_FORMS.map(([, formId]) => formId).filter((formId) => !document.getElementById(formId).hidden),
+    forms: TOGGLE_FORMS.map(({ form }) => form).filter((form) => !document.getElementById(form).hidden),
+    fields: TOGGLE_FORMS.flatMap(({ form }) => textFields(document.getElementById(form)))
+      .filter((field) => field.value).map(({ id, value, dataset }) => ({ id, value, sent: dataset.sent })),
     folds: [...openQuestions],
     answers: [...drafts],
     messages: [...talkDrafts],
-    said: sentencesIn(lastSaid),
-    sendSaid: sentencesIn(sendSaid),
+    said: saidAsText(lastSaid),
+    sendSaid: saidAsText(sendSaid),
+    results: saidAsText(saidById).filter(([id]) => !document.getElementById(id).hidden),
+    queries: lastQuery,
   };
 }
 
-function sentencesIn(said) {
+function boxScroll(node) {
+  return { left: node.scrollLeft, top: node.scrollTop, atEnd: node.scrollTop + node.clientHeight >= node.scrollHeight - 4 };
+}
+
+function scrollBoxBack(node, { left, top, atEnd }) {
+  node.scrollTo(left, atEnd ? node.scrollHeight : top);
+}
+
+function focusSelector(node) {
+  if (node?.dataset?.focus) return `[data-focus="${CSS.escape(node.dataset.focus)}"]`;
+  if (node?.id) return `#${CSS.escape(node.id)}`;
+  if (node?.matches("nav.side a[data-view]")) return `nav.side a[data-view="${CSS.escape(node.dataset.view)}"]`;
+  return "";
+}
+
+function saidAsText(said) {
   return [...said].filter(([, [, sentence]]) => typeof sentence === "string");
 }
 
 function resumeCarried() {
   if (!CARRIED) return;
+  Object.assign(lastQuery, CARRIED.queries);
   for (const key of CARRIED.folds) openQuestions.add(key);
   for (const [key, text] of CARRIED.answers) drafts.set(key, text);
   for (const [id, text] of CARRIED.messages) talkDrafts.set(id, text);
   for (const [place, said] of CARRIED.said) lastSaid.set(place, said);
   for (const [ref, said] of CARRIED.sendSaid) sendSaid.set(ref, said);
-  for (const [toggleId, formId] of TOGGLE_FORMS) if (CARRIED.forms.includes(formId)) showForm(toggleId, formId, true);
+  for (const [id, [state, sentence]] of CARRIED.results) if (document.getElementById(id)) say(id, state, sentence);
+  for (const { toggle, form } of TOGGLE_FORMS) if (CARRIED.forms.includes(form)) showForm(toggle, form, true);
+  for (const { id, value, sent } of CARRIED.fields) putFieldBack(document.getElementById(id), value, sent);
+  consoleScrollToPutBack = CARRIED.consoleScroll;
   placeToPutBack = CARRIED;
+}
+
+function putFieldBack(field, value, sent) {
+  if (!field) return;
+  field.value = value;
+  if (sent !== undefined) field.dataset.sent = sent;
 }
 
 function putBackPlace() {
   if (!placeToPutBack) return;
-  const { scroll, paneScroll, boxes, focus, focusId } = placeToPutBack;
+  const { scroll, paneScroll, boxes, focus } = placeToPutBack;
   placeToPutBack = null;
-  const focused = focus ? [...document.querySelectorAll(`[data-focus="${CSS.escape(focus)}"]`)].find((node) => node.checkVisibility())
-    : focusId ? document.getElementById(focusId) : null;
-  focused?.focus({ preventScroll: true });
+  if (focus) firstShown(focus)?.focus({ preventScroll: true });
   scrollTo(0, scroll);
   if (route.detail) currentPane().scrollTop = paneScroll;
-  scrollBack(currentSection(), boxes);
+  const rebuilt = scrollersByPlace(currentSection());
+  for (const { key, ...scrolled } of boxes) if (rebuilt.has(key)) scrollBoxBack(rebuilt.get(key), scrolled);
+}
+
+function putBackConsoleScroll(body) {
+  if (!consoleScrollToPutBack) return;
+  scrollBoxBack(body, consoleScrollToPutBack);
+  consoleScrollToPutBack = null;
 }

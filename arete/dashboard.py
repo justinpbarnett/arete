@@ -92,7 +92,7 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
     return code, served
 
 
-WEB_CODE, WEB = web_snapshot()
+WEB_CODE, WEB_BY_PATH = web_snapshot()
 
 
 def tailscale(*args: str) -> dict:
@@ -217,8 +217,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
-            if method == "GET" and path in WEB:
-                return self.send(200, *WEB[path], "no-cache")
+            if method == "GET" and path in WEB_BY_PATH:
+                return self.send(200, *WEB_BY_PATH[path], "no-cache")
             if method == "POST" and path.startswith(hooks.HOOK_PATH):
                 got = hooks.receive(unquote(path[len(hooks.HOOK_PATH):]), self.headers, self.raw_body())
                 return self.send_json(202 if got["queued"] else 200, got)

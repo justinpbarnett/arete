@@ -144,7 +144,7 @@ function show(viewChanged, way) {
       document.getElementById(`${pane.id}-body`).replaceChildren(detail ? quiet("Loading") : "");
       document.getElementById(`${pane.id}-talk`).replaceChildren();
       pane.scrollTop = 0;
-      pendingDetailFocus = Boolean(detail) && way !== "start" && way !== "reload";
+      pendingDetailFocus = Boolean(detail) && way !== "start" && way !== "return";
     }
   }
   for (const a of section.querySelectorAll("a[data-row]")) {
@@ -209,9 +209,12 @@ function focusMark(node) {
   return node && node !== document.body ? { node, key: node.dataset?.focus ?? "" } : null;
 }
 
+function firstShown(selector) {
+  return [...document.querySelectorAll(selector)].find((node) => node.checkVisibility());
+}
+
 function refocus(mark, fallback = null) {
-  const again = mark?.node.isConnected ? mark.node
-    : mark?.key ? [...document.querySelectorAll(`[data-focus="${CSS.escape(mark.key)}"]`)].find((node) => node.checkVisibility()) : null;
+  const again = mark?.node.isConnected ? mark.node : mark?.key ? firstShown(`[data-focus="${CSS.escape(mark.key)}"]`) : null;
   (again ?? fallback)?.focus();
 }
 

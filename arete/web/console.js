@@ -85,6 +85,7 @@ function drawChat(data) {
   if (grew) {
     const body = document.getElementById("console-body");
     body.scrollTop = body.scrollHeight;
+    putBackConsoleScroll(body);
   }
 }
 

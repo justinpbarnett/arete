@@ -20,7 +20,7 @@ const PHONE = matchMedia("(pointer: coarse) and (max-width: 1040px)");
 const SVG = "http://www.w3.org/2000/svg";
 const URL_IN_TEXT = /(https:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
 const HELD = Symbol("held");
-const TOGGLE_FORMS = [["launch-toggle", "launch", "launch-prompt"], ["loop-new-toggle", "loop-new", "loop-new-sentence"]];
+const TOGGLE_FORMS = [{ toggle: "launch-toggle", form: "launch", focus: "launch-prompt" }, { toggle: "loop-new-toggle", form: "loop-new", focus: "loop-new-sentence" }];
 const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 
 let route = null;
@@ -30,6 +30,10 @@ let mouseAt = null;
 const openQuestions = new Set();
 const drafts = new Map();
 const lastSaid = new Map();
+const saidById = new Map();
+let changesInFlight = 0;
+
+class NoAnswer extends Error {}
 
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
@@ -90,6 +94,7 @@ function sayAt(place, state, sentence, { focus = true } = {}) {
 }
 
 function say(id, state, sentence) {
+  saidById.set(id, [state, sentence]);
   sayIn(document.getElementById(id), state, sentence);
 }
 
@@ -230,13 +235,16 @@ async function call(path, body) {
   const options = changes ? { method: "POST", headers: { "Content-Type": "application/json", "X-Arete": "1" }, body: JSON.stringify(body) }
     : { cache: "no-store" };
   if (changes) changesInFlight++;
-  const response = await fetch(path, options)
-    .catch(() => { throw new Error("The connection to arete failed."); })
-    .finally(() => { if (changes) changesInFlight--; });
-  noteServedCode(response);
-  const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
-  if (!response.ok) throw new Error(data.error || `The server answered ${response.status}.`);
-  return data;
+  try {
+    const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });
+    noteServedCode(response);
+    const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
+    if (!response.ok) throw new Error(data.error || `The server answered ${response.status}.`);
+    return data;
+  } finally {
+    // the caller says its result in the microtasks after this returns, so the change still counts until then
+    if (changes) setTimeout(() => changesInFlight--);
+  }
 }
 
 function unreadFault(what, failed) {

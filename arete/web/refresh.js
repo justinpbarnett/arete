@@ -2,6 +2,7 @@
 
 let timer = 0;
 let refreshCount = 0;
+let refreshDelay = SLOW_MS;
 const lastGood = new Map();
 
 function schedule(ms) {
@@ -21,11 +22,13 @@ async function refresh() {
   const label = VIEWS[at.view].label;
   try {
     const [draw, sidebar] = await Promise.all([LOADERS[at.view](at), call("/api/sidebar").catch(() => null)]);
-    if (mine !== refreshCount || reloadsForNewCode()) return;
+    if (mine !== refreshCount) return;
+    if (reloadIfNewCode()) return;
     if (sidebar) drawSidebar(sidebar);
     const drawn = draw();
     const held = drawn === HELD;
     const delay = held ? SLOW_MS : drawn || SLOW_MS;
+    refreshDelay = delay;
     if (held) tickLiveAgos(currentSection().querySelectorAll("time.ago"));
     else lastGood.set(at.view, new Date());
     const shown = held ? "held while you edit" : `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
@@ -34,11 +37,12 @@ async function refresh() {
     afterDraw();
     schedule(delay);
   } catch (e) {
-    if (mine !== refreshCount || reloadsForNewCode()) return;
+    if (mine !== refreshCount) return;
+    if (!(e instanceof NoAnswer) && reloadIfNewCode()) return;
     const shownAt = clock(lastGood.get(at.view));
     status("fault", `Arete did not answer: ${e.message}${shownAt ? ` What shows came at ${shownAt}.` : ""}`);
     document.querySelectorAll(".readout").forEach((r) => r.classList.add("stale"));
-    schedule(SLOW_MS);
+    schedule(refreshDelay);
   }
 }
 

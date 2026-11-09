@@ -7,12 +7,12 @@ function wireForms() {
     document.getElementById("settings-result").hidden = true;
     refresh();
   });
-  for (const [toggleId, formId, focusId] of TOGGLE_FORMS) {
+  for (const { toggle: toggleId, form, focus } of TOGGLE_FORMS) {
     const toggle = document.getElementById(toggleId);
     toggle.dataset.label = toggle.textContent;
     toggle.addEventListener("click", () => {
       trackAction(toggleId);
-      toggleForm(toggleId, formId, focusId);
+      toggleForm(toggleId, form, focus);
     });
   }
   document.getElementById("launch").addEventListener("submit", launch);
@@ -143,5 +143,5 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
   resumeCarried();
-  applyRoute(first, CARRIED ? "reload" : "start");
+  applyRoute(first, CARRIED ? "return" : "start");
 });

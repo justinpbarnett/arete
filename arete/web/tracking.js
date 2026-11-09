@@ -18,7 +18,7 @@ function report(row) {
 }
 
 function startStint(via) {
-  stint = { name: stintName(), via: via === "reload" ? "return" : via, at: performance.now() };
+  stint = { name: stintName(), via, at: performance.now() };
 }
 
 function endStint() {
