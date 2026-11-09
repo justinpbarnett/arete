@@ -315,7 +315,7 @@ def land(item: dict, wt: Path, src: Path, base: str) -> str:
         util.git(["reset", "-q", "--hard"], wt)
         util.git(["clean", "-qfd"], wt)
         try:
-            util.git(["rebase", "-q", f"origin/{base}"], wt)
+            util.git([*util.commit_identity(wt), "rebase", "-q", f"origin/{base}"], wt)
         except RuntimeError as e:
             util.git(["rebase", "--abort"], wt, check=False)
             raise RuntimeError(f"the change does not rebase onto origin/{base}: {e}") from e

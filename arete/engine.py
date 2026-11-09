@@ -680,8 +680,7 @@ def commit_message(run: LoopRun, ws: Workspace, text: str) -> str:
 
 
 def commit(wt: Path, message: str) -> None:
-    identity = [] if util.git(["config", "user.email"], wt, check=False).strip() else \
-        ["-c", "user.name=arete", "-c", "user.email=arete@localhost"]
+    identity = util.commit_identity(wt)
     diffguard.add(wt)
     util.git([*identity, "commit", "-q", "--no-verify", "-m", message], wt)
 

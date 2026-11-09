@@ -124,8 +124,19 @@ def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, in
         env: dict | None = None) -> str:
     res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env)
     if check and res.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args[:2])}: {git_error(res.stderr or res.stdout)}")
+        raise RuntimeError(f"git {git_command(args)}: {git_error(res.stderr or res.stdout)}")
     return res.stdout
+
+
+def git_command(args: list[str]) -> str:
+    while args[:1] == ["-c"]:
+        args = args[2:]
+    return " ".join(args[:2])
+
+
+def commit_identity(cwd: Path) -> list[str]:
+    return [] if git(["config", "user.email"], cwd, check=False).strip() else \
+        ["-c", "user.name=arete", "-c", "user.email=arete@localhost"]
 
 
 def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
