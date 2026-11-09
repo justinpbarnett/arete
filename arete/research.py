@@ -512,7 +512,7 @@ def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) ->
     return 1 if FAILED in outcomes or LATER in outcomes or unfiled else 0
 
 
-def run_now(ref: str, force: bool = False) -> int:
+def run_now(ref: str, force: bool = False, dry_run: bool = False) -> int:
     paths.ensure_dirs()
     cfg = config.load()
     r = ticket(ref)
@@ -523,6 +523,9 @@ def run_now(ref: str, force: bool = False) -> int:
         if not got:
             print("a research run is going; try again when it ends")
             return 1
+        if dry_run:
+            print(f"would research {r['ref']}")
+            return 0
         tidy()
         outcome, why = research(cfg, r, force=force, asked=True)
     print(f"{r['ref']}: {outcome}: {why}")

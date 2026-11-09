@@ -359,7 +359,7 @@ def cmd_research(args) -> int:
     if args.next or (args.dry_run and not args.ref):
         return research.next_due(dry_run=args.dry_run, asked=piped_events())
     if args.ref and args.run:
-        return research.run_now(args.ref, force=args.force)
+        return research.run_now(args.ref, force=args.force, dry_run=args.dry_run)
     if args.ref:
         shown = research.shown(args.ref)
         if shown is None:
@@ -889,7 +889,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--run", action="store_true", help="with REF: research it now")
     p.add_argument("--force", action="store_true", help="with --run: skip the JEV injection screen")
     p.add_argument("--next", action="store_true", help="research the next ticket due; what the research loop runs")
-    p.add_argument("--dry-run", action="store_true", help="say which ticket is due next; no model calls, no writes")
+    p.add_argument("--dry-run", action="store_true",
+                   help="say which ticket is due next, or with REF --run whether it would run; no model calls, no writes")
     p.set_defaults(fn=cmd_research)
 
     p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")
