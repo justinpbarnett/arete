@@ -17,6 +17,8 @@ SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAli
 PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi arete ollama; do command -v $t >/dev/null && echo has:$t; "
          "done; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/gpu:/'")
 CLONE_BOOT_SECONDS = 180
+END_WITH_SESSION = ("( (kill -0 $PPID && while kill -0 $PPID && kill -0 $$; do sleep 1; done && kill -0 $$ && kill -KILL -$$)"
+                    " </dev/null >/dev/null 2>&1 & ); exec \"$@\"")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HOME_DIR = re.compile(r"~([a-z_][a-z0-9_.-]*)?")
 
@@ -117,11 +119,14 @@ def remote_dir(path) -> str:
     return home + slash + (shlex.quote(rest) if rest else "")
 
 
-def wrap(device: Device | str, argv: list[str], cwd, env: dict | None = None, mkdirs: tuple = ()) -> list[str]:
+def wrap(device: Device | str, argv: list[str], cwd, env: dict | None = None, mkdirs: tuple = (),
+         end_with_session: bool = False) -> list[str]:
     d = resolve(device)
     if not d.remote:
         return argv
     exports = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in (env or {}).items() if ENV_NAME.match(k))
+    if end_with_session:
+        argv = ["sh", "-c", END_WITH_SESSION, "sh", *argv]
     steps = [f"mkdir -p {remote_dir(m)}" for m in mkdirs]
     steps += [f"cd {remote_dir(cwd or d.dir)}", f"exec {'env ' + exports + ' ' if exports else ''}{shlex.join(argv)}"]
     return [*ssh_argv(d), " && ".join(steps)]
