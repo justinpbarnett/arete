@@ -381,11 +381,13 @@ def make_workspace(repo: config.Repo, base: str, branch: str, key: str) -> tuple
     return ws, checkouts
 
 
-def make_worktree(repo: config.Repo, base: str, branch: str, key: str) -> Path:
+def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False) -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
     remove_workspace(c.wt, [c])
     fetch(c.src, base)
-    add_worktree(c, branch, c.origin_base)
+    if resume:
+        fetch(c.src, branch)
+    add_worktree(c, branch, f"origin/{branch}" if resume else c.origin_base)
     return c.wt
 
 

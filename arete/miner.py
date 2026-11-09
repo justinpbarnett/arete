@@ -397,7 +397,7 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
 def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict],
                branch: str) -> tuple[str, list[dict]]:
     base = gh.default_branch(repo.github)
-    wt = make_worktree(repo, base, branch, "miner")
+    wt = make_worktree(repo, base, branch, "miner", resume=bool(gh.open_pr_url(repo.github, branch)))
     try:
         text = "\n\n".join(
             f"### {i + 1}. `{p['file']}`\n\nChange: {p['change']}\n\nWhy: {p['why']}" for i, p in enumerate(props)
