@@ -144,10 +144,11 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             say(hold_words(held))
             wait_out(held["scope"])
             say("the claude usage limit has lifted, going on")
+        started = util.iso()
         res = attempt(which, name, prompt, cwd, resume, cfg, trace, kw)
         if not res.usage_limit:
             if which == "claude" and res.ok:
-                state.clear_holds([s for s in LIMIT_SCOPES if limit_applies(s, res.model)])
+                state.clear_holds([s for s in LIMIT_SCOPES if limit_applies(s, res.model)], set_before=started)
             return res
         limit = res.usage_limit
         state.hold(limit.scope, limit.until, f"claude {limit.kind or 'usage'} limit reached")

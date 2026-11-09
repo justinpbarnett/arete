@@ -677,9 +677,9 @@ def hold_until(scope: str) -> str:
     return r["until"] if r else ""
 
 
-def clear_holds(scopes: list[str]) -> None:
+def clear_holds(scopes: list[str], set_before: str) -> None:
     with db() as c:
-        c.executemany("DELETE FROM holds WHERE scope = ?", [(s,) for s in scopes])
+        c.executemany("DELETE FROM holds WHERE scope = ? AND ts < ?", [(s, set_before) for s in scopes])
 
 
 def runs_marked_running(connect=db) -> list[dict]:
