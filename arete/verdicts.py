@@ -120,8 +120,9 @@ def scored_line(x: dict) -> str:
 
 def render(data: dict) -> str:
     days = data["days"]
-    out = [f"JEV verdicts in the last {days:g} {'day' if days == 1 else 'days'} "
-           f"(since {data['since'][:16].replace('T', ' ')})", ""]
+    heading = (f"JEV verdicts in the last {days:g} {'day' if days == 1 else 'days'} "
+               f"(since {data['since'][:16].replace('T', ' ')})")
+    out = [heading, ""]
     if not data["kinds"]:
         return "\n".join(out + ["No verdicts yet."])
     for kind, k in data["kinds"].items():

@@ -529,8 +529,8 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
     if screened.yes >= cfg.jev.injection:
         labels = " and ".join(f"`{lb}`" for lb in labels_to_add(r))
         state.triage_put({**r, "ready": 0, "questions": [
-            f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f}). Check the ticket, then add {labels} "
-            "by hand to approve it."]})
+            (f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f}). Check the ticket, then add "
+             f"{labels} by hand to approve it.")]})
         return f"held for the injection screen (p {screened.yes:.2f})"
     to_pipeline(src, r, "triage")
     return ""
