@@ -209,7 +209,9 @@ def remote_root(folder: Path | str) -> str:
     text = str(folder).rstrip("/") or "/"
     if text.startswith("/"):
         return f"/{text}"
-    return text if text == "~" or text.startswith("~/") else f"~/{text}"
+    if text == "~" or text.startswith("~/"):
+        return text
+    return "." if devices.HOME_DIR.fullmatch(text.partition("/")[0]) else f"~/{text}"
 
 
 def scoped_to(roots: list[str], rules: list[str]) -> list[str]:
