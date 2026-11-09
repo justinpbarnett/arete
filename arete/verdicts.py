@@ -75,9 +75,10 @@ def report(days: float, cfg: config.Config) -> dict:
     reverted = [{"run_id": r["run_id"], "loop": r["loop"] or "", "about": r["about"] or "", "sha": full,
                  "approval": r["approval"], "reverted_by": by}
                 for sha, by in reverts.items() for full, r in landed.items() if full.startswith(sha)]
+    held_by_jev = {r["run_id"] for r in rows if r["outcome"] == "rejected" and r["held"]}
     cleared: dict[str, dict] = {}
     for r in rows:
-        if r["outcome"] != "rejected" or r["held"]:
+        if r["outcome"] != "rejected" or r["run_id"] in held_by_jev:
             continue
         x = cleared.setdefault(r["run_id"], {"run_id": r["run_id"], "loop": r["loop"] or "", "about": r["about"] or "",
                                              "approval": r["approval"], "sha": r["sha"] or "", "closest": None})
