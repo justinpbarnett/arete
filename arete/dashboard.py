@@ -403,7 +403,7 @@ def research_ticket(ref: str, force: bool) -> dict:
 
 def forget_proposal(proposal_id: int) -> dict:
     if not state.forget_proposal(proposal_id):
-        raise control.NotFound(f"#{proposal_id} is not open; it is done already")
+        raise control.NotFound(f"#{proposal_id} is not an open memory fact or harness fix")
     return {"id": proposal_id}
 
 
