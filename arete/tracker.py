@@ -433,13 +433,19 @@ def search_ticket(client: jira.Client, issue: dict, blocker: str = "") -> Ticket
                   created=f.get("created", ""), labels=list(f.get("labels") or []), blocker=blocker)
 
 
+def route_blocker(routes: set[str], labels: list[str]) -> str:
+    hits = routes & set(labels)
+    if not hits:
+        return f"it has no route label; add one of {', '.join(f'`{r}`' for r in sorted(routes))}"
+    if len(hits) > 1:
+        return f"it has more than one route label: {', '.join(sorted(hits))}"
+    return ""
+
+
 def jira_unrouted(project: str, routes: set[str], client: jira.Client) -> list[Ticket]:
     jql = candidates_jql(project)
     out = []
     for i in client.search(jql, SEARCH_FIELDS, limit=50):
-        hits = routes & set((i.get("fields") or {}).get("labels") or [])
-        if len(hits) != 1:
-            blocker = (f"it has no route label; add one of {', '.join(f'`{r}`' for r in sorted(routes))}" if not hits
-                       else f"it has more than one route label: {', '.join(sorted(hits))}")
+        if blocker := route_blocker(routes, (i.get("fields") or {}).get("labels") or []):
             out.append(search_ticket(client, i, blocker))
     return out

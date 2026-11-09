@@ -2023,6 +2023,9 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
     for t in tk.replied():
         if state.issue_running(repo.name, t.id):
             continue
+        if other_routes & set(t.labels):
+            skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
+            continue
         if blocker := tk.blocker(t.id):
             skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
             continue
