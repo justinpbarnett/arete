@@ -151,17 +151,19 @@ def session_digest(path: Path, since_ts: float) -> dict | None:
                     items.append(f"[{hhmm}] DENIED by permission classifier: {tool}")
         for text in _text_blocks(content):
             text = text.strip()
-            if not text or t < since_ts or text.startswith(SKIP_PREFIXES):
+            if not text or text.startswith(SKIP_PREFIXES):
                 continue
+            in_window = t >= since_ts
             if text.startswith("[Request interrupted"):
-                items.append(f"[{hhmm}] INTERRUPTED the agent during: {', '.join(recent_tools) or 'a reply'}")
+                if in_window:
+                    items.append(f"[{hhmm}] INTERRUPTED the agent during: {', '.join(recent_tools) or 'a reply'}")
                 continue
             if APPROVALS.match(text):
                 continue
             n_human += 1
-            if n_human == 1:
+            if in_window and n_human == 1:
                 items.append(f"[{hhmm}] HUMAN (task): {_short(text, 500)}")
-            else:
+            elif in_window:
                 ctx = f"  agent before: {_short(last_agent, 300)}" if last_agent else ""
                 tools = f"  agent tools: {', '.join(recent_tools)}" if recent_tools else ""
                 items.append(f"[{hhmm}] HUMAN: {_short(text, 600)}" + (f"\n{ctx}" if ctx else "") + (f"\n{tools}" if tools else ""))
