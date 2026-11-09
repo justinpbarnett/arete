@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -50,11 +51,11 @@ def run(
     extra_env: dict[str, str] | None = None,
 ) -> Result:
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
+    fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = ["claude" if remote else binary(), "-p", "--output-format", "json", "--permission-mode", permission_mode]
     if model:
         cmd += ["--model", model]
-    if tools is not None:
-        cmd += ["--tools", ",".join(tools)]
+    cmd += ["--tools", ",".join(tool_set(tools, allowed_tools or []))]
     if allowed_tools:
         roots = [remote_root(cwd)] if remote else local_roots([cwd, *add_dirs])
         cmd += ["--allowedTools", *scoped_to(roots, allowed_tools)]
@@ -63,6 +64,8 @@ def run(
         cmd += ["--json-schema", json.dumps(json_schema)]
     if resume.id:
         cmd += ["--resume", resume.id]
+    if fresh_session:
+        cmd += ["--session-id", fresh_session]
     if system:
         cmd += ["--append-system-prompt", system]
     if max_budget_usd:
@@ -89,7 +92,8 @@ def run(
             errors="replace", env=env, check=False,
         )
     except subprocess.TimeoutExpired:
-        return Result(ok=False, session=resume, error=f"timed out after {timeout}s")
+        session = Session(fresh_session, 0.0, "claude") if fresh_session else resume
+        return Result(ok=False, session=session, error=f"timed out after {timeout}s")
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
 
@@ -138,6 +142,16 @@ def run(
         model=next(iter(data.get("modelUsage") or {}), model),
         provider="anthropic",
     )
+
+
+def tool_set(tools: list[str] | None, rules: list[str]) -> list[str]:
+    names = [rule.split("(", 1)[0] for rule in (rules if tools is None else tools)]
+    built_in = [name for name in names if not name.startswith("mcp__")]
+    if "Bash" in built_in:
+        built_in.append("TaskStop")
+    if any(rule.startswith("mcp__") for rule in rules):
+        built_in.append("ToolSearch")
+    return list(dict.fromkeys(built_in))
 
 
 def usage_limit(data: dict, text: str) -> UsageLimit | None:
