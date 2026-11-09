@@ -78,7 +78,7 @@ def main(args) -> int:
     else:
         rows = [row("", jev.ask(sys.stdin.read(), {"q": q}, cfg, trace=("", "ask")), q)]
     if args.only:
-        rows = [r for r in rows if r.get("answer") == args.only]
+        rows = [r for r in rows if r.get("answer") == args.only or "error" in r]
     if args.json:
         print(json.dumps(rows if args.paths else rows[0], indent=2))
     else:

@@ -771,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--choice", nargs="+", metavar="LABEL[=ABOUT]", help="answer with one of these labels")
     p.add_argument("--score", nargs="+", metavar="LEVEL", help="rate on these levels, lowest first")
     p.add_argument("-r", "--recursive", action="store_true", help="look inside folders all the way down")
-    p.add_argument("--only", metavar="ANSWER", help="print only the rows with this answer")
+    p.add_argument("--only", metavar="ANSWER", help="print only the rows with this answer, and any errors")
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_ask)
 
