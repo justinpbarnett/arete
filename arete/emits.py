@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 from . import alerts, config, diffguard, gh, jev, paths, sources, state, util
-from .loops import FINDING_EVENT, Loop, as_list, check_env, find, worktree_kinds
+from .loops import FINDING_EVENT, Loop, as_list, blank, check_env, find, worktree_kinds
 
 DIGESTS_DIR = paths.STATE_DIR / "digests"
 SEVERITIES = ("low", "medium", "high", "critical")
@@ -192,6 +192,9 @@ class Push(Emit):
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         if loop.kind not in worktree_kinds():
             return [f"only {' and '.join(worktree_kinds())} loops emit a push"]
+        if not push_check(spec, loop):
+            return [f"a {loop.kind} loop's push emit needs check, the command that must pass on the rebased tree "
+                    "before the push lands"]
         approve = spec.get("approve", False)
         if isinstance(approve, dict) and (unknown := sorted(set(approve) - set(PUSH_RULES))):
             return [f"a push emit's approve table takes {', '.join(PUSH_RULES)}, not {', '.join(unknown)}"]
@@ -215,7 +218,7 @@ class Push(Emit):
         deleted = util.git_records(["diff", "--name-only", "--no-renames", "--diff-filter=D", start, branch], src)
         public = outcome.get("public", True)
         return {"repo": loop.repo, "workdir": str(src), "branch": branch, "base": outcome["base"],
-                "check": spec.get("check") or loop.spec.get("check", ""), "env": check_env(loop, run_id),
+                "check": push_check(spec, loop), "env": check_env(loop, run_id),
                 "timeout": loop.timeout_minutes * 60, "lines": diff.lines, "files": diff.files, "deleted": deleted,
                 "title": plain(f"{loop.name}: run {run_id}" if public else outcome.get("title", ""), 120),
                 "report": plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000),
@@ -292,6 +295,10 @@ class Push(Emit):
 
     def rejected(self, item: dict) -> None:
         util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+
+
+def push_check(spec: dict, loop: Loop) -> str:
+    return next((check for check in (spec.get("check"), loop.spec.get("check")) if not blank(check)), "")
 
 
 def proof_objection(proof: dict, patch: str, about: str, cfg: config.Config, run_id: str) -> dict[str, str]:
