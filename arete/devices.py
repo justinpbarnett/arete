@@ -135,7 +135,7 @@ def probe(device: Device | str, timeout: float = 20) -> dict:
                 "tools": [line[4:] for line in lines if line.startswith("has:")],
                 "gpus": [line[4:].strip() for line in lines if line.startswith("gpu:")],
                 "detail": "" if res.returncode == 0 else util.first_line(res.stderr or res.stdout, 300)}
-    info.update(name=d.name, kind=d.kind, seconds=round(time.monotonic() - started, 1), at=util.iso())
+    info.update(name=d.name, kind=d.kind, host=d.host, seconds=round(time.monotonic() - started, 1), at=util.iso())
     with util.lock("devices", wait=True):
         cache = util.read_json(CACHE_FILE, {})
         cache[d.name] = info
@@ -151,7 +151,8 @@ def home(device: Device | str) -> str:
     d = resolve(device)
     if not d.remote:
         return str(paths.HOME)
-    known = cached().get(d.name, {}).get("home")
+    entry = cached().get(d.name, {})
+    known = entry.get("home") if entry.get("host") == d.host else ""
     return known or probe(d).get("home") or "~"
 
 
