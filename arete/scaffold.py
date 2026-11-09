@@ -58,7 +58,7 @@ class DraftRequest:
 
 
 def private_dir(cfg: config.Config) -> Path:
-    return cfg.loop_dirs[0] if cfg.loop_dirs else paths.CONFIG_DIR / "loops"
+    return cfg.loop_dirs[0]
 
 
 def draft_prompt(request: DraftRequest, cfg: config.Config, taken: set[str]) -> str:
@@ -125,6 +125,9 @@ def loop_names(cfg: config.Config) -> set[str]:
 def check_request(request: DraftRequest, cfg: config.Config, taken: set[str]) -> None:
     if not request.sentence:
         raise control.Refused("say in one sentence what the loop should do")
+    if not cfg.loop_dirs:
+        raise control.Refused(f"[serve] loop_dirs in {paths.short_path(paths.CONFIG_FILE)} is empty, so a drafted "
+                              "loop would have no folder arete loads; add one to draft loops")
     if request.name and not loops.NAME.match(request.name):
         raise control.Refused(f"the name '{request.name}' must be lowercase letters, digits and dashes")
     if request.name in taken:
