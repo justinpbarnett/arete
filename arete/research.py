@@ -475,6 +475,8 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
         if not got:
             print(f"{util.iso()} research already running" + ("; ask again when it ends" if asked else ""))
             return 1 if asked else 0
+        if dry_run and asked:
+            return preview_asked(asked)
         if dry_run:
             todo = due()
             print(f"would research {todo[0]['ref'] if todo else 'nothing'}"
@@ -516,6 +518,19 @@ def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) ->
     ok = FAILED not in outcomes and LATER not in outcomes
     mark_loop("research", ok and not unfiled, unfiled[0] if ok and unfiled else why)
     return 1 if FAILED in outcomes or LATER in outcomes or unfiled else 0
+
+
+def preview_asked(asked: list[dict]) -> int:
+    rows = {r["ref"].lower(): r for r in tickets()}
+    missing = []
+    for event in asked:
+        ref = str(event.get("ref") or "")
+        if r := rows.get(ref.lower()):
+            print(f"would research {r['ref']}")
+        else:
+            missing.append(ref)
+            print(f"would not research {ref}: it is no longer a research ticket on the triage board")
+    return 1 if missing else 0
 
 
 def run_now(ref: str, force: bool = False, dry_run: bool = False) -> int:
