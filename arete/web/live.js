@@ -89,7 +89,7 @@ function approvalRow(a, place) {
     cell(kindTag(a.failed ? "Failed" : "Approval")),
     repoCell(a.repo),
     cell([el("div", { text: a.plain_summary || asked }),
-      a.failed ? el("div", {}, stateChip("fault"), ` ${capitalized(a.failed)}`) : null,
+      a.failed ? el("div", {}, stateChip("fault"), ` ${withPeriod(capitalized(a.failed))}`) : null,
       a.held ? el("div", { class: "muted", text: `Held: ${a.held}.` }) : null,
       reviewLine(a),
       details ? foldText(`approval:${a.id}`, "Show the details", details) : null,
@@ -109,7 +109,8 @@ function decide(a, yes, btn, place) {
   const starting = a.failed ? `Trying #${a.id} again.` : `Approving #${a.id}.`;
   return act(btn, place, `/api/approvals/${a.id}`, { approve: yes },
     (r) => (yes ? `Approved #${a.id}: ${r.result}.` : `Rejected #${a.id}. Nothing was sent.`),
-    { meanwhile: yes ? [starting, a.approving].filter(Boolean).join(" ") : null });
+    { meanwhile: yes ? [starting, a.approving].filter(Boolean).join(" ") : null,
+      sayingFault: (e) => e.answer?.kept && `#${a.id} was not sent, and it shows why.` });
 }
 
 function readyRow(r) {

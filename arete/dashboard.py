@@ -185,6 +185,13 @@ def refusal_status(e: Exception) -> int | None:
         (status for kind, status in STATUS_OF_REFUSAL.items() if isinstance(e, kind)), None)
 
 
+def refusal_answer(e: Exception) -> dict:
+    answer = {"error": as_sentence(str(e))}
+    if isinstance(e, control.KeptFailure):
+        answer["kept"] = True
+    return answer
+
+
 def as_sentence(text: str) -> str:
     text = text.strip()
     first_word = text.split(" ", 1)[0]
@@ -225,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.api(method, path, {k: v[-1] for k, v in parse_qs(parts.query).items()}))
         except Exception as e:
             if status := refusal_status(e):
-                return self.send_json(status, {"error": as_sentence(str(e))})
+                return self.send_json(status, refusal_answer(e))
             self.log_error("%s", f"{type(e).__name__}: {e}")
             self.send_json(500, {"error": as_sentence(util.first_line(f"{type(e).__name__}: {e}", 300))})
 

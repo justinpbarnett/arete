@@ -33,6 +33,10 @@ class Refused(ValueError):
     pass
 
 
+class KeptFailure(Refused):
+    pass
+
+
 def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
     paths.ensure_dirs()
     with open(paths.LOG_DIR / log_name, "a") as log:
@@ -169,6 +173,8 @@ def decide(approval_id: int, yes: bool) -> dict:
         return {"id": approval_id, "approved": yes, "result": delivery.decide(approval_id, yes)}
     except LookupError as e:
         raise NotFound(str(e)) from e
+    except delivery.KeptFailure as e:
+        raise KeptFailure(str(e)) from e
     except (ValueError, delivery.Failed) as e:
         raise Refused(str(e)) from e
 

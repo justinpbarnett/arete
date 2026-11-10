@@ -190,6 +190,13 @@ def tail(text: str, n: int = 4000) -> str:
     return text if len(text) <= n else "...\n" + text[-n:]
 
 
+def both_ends(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    half = (n - 5) // 2
+    return f"{text[:half]}\n...\n{text[-half:]}"
+
+
 def first_line(text: str, n: int = 160) -> str:
     for line in text.strip().splitlines():
         line = line.strip()

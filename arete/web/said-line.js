@@ -9,25 +9,25 @@ const CAN_HOVER = matchMedia("(any-hover: hover)");
 
 const heldGaps = new Map();
 
-async function answerPress(btn, place, answer) {
+async function answerPress(btn, place, answer, { sayingFault } = {}) {
   btn.disabled = true;
   const press = Press.start(place, btn);
   const pressedOn = route;
   try {
     await answer();
   } catch (e) {
-    sayAt(place, "fault", e.message);
+    sayAt(place, "fault", sayingFault?.(e) || e.message);
   }
   const answerLeftTheView = route !== pressedOn;
   if (!answerLeftTheView) await refresh();
   press?.settle();
 }
 
-function act(btn, place, path, body, saying, { meanwhile = null } = {}) {
+function act(btn, place, path, body, saying, { meanwhile = null, sayingFault } = {}) {
   return answerPress(btn, place, async () => {
     if (meanwhile) sayAt(place, null, meanwhile);
     sayAt(place, "ok", saying(await call(path, body)));
-  });
+  }, { sayingFault });
 }
 
 function sayAt(place, state, sentence, { focus = true } = {}) {

@@ -36,6 +36,13 @@ let changesInFlight = 0;
 
 class NoAnswer extends Error {}
 
+class ErrorAnswer extends Error {
+  constructor(message, answer) {
+    super(message);
+    this.answer = answer;
+  }
+}
+
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
@@ -58,6 +65,10 @@ function svg(tag, attrs = {}, text) {
 
 function capitalized(text) {
   return text.replace(/^./, (first) => first.toUpperCase());
+}
+
+function withPeriod(text) {
+  return /[.?!]$/.test(text) ? text : `${text}.`;
 }
 
 function pad(n) {
@@ -240,7 +251,7 @@ async function call(path, body) {
     const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });
     noteServedCode(response);
     const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
-    if (!response.ok) throw new Error(data.error || `The server answered ${response.status}.`);
+    if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data);
     return data;
   } finally {
     // the caller says its result in the microtasks after this returns, so the change still counts until then
@@ -250,7 +261,7 @@ async function call(path, body) {
 
 function unreadFault(what, failed) {
   const why = failed?.error || "no answer";
-  return fault(`${what} could not be read: ${why}${why.endsWith(".") ? "" : "."}`);
+  return fault(`${what} could not be read: ${withPeriod(why)}`);
 }
 
 function panelParts(panel, what, draw) {

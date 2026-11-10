@@ -456,7 +456,8 @@ def add_feed(run_id: str, kind: str, text: str) -> None:
 
 
 def insert_feed(c: sqlite3.Connection, run_id: str, kind: str, text: str) -> None:
-    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)", (run_id, util.iso(), kind, text[:4000]))
+    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)",
+              (run_id, util.iso(), kind, util.both_ends(text, 4000)))
 
 
 def feed(run_id: str, after: int = 0, connect=db) -> list[dict]:
