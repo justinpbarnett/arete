@@ -505,7 +505,7 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
 
 def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) -> int:
     rows = {r["ref"].lower(): r for r in tickets()}
-    outcomes = []
+    failures = []
     for event in asked:
         ref = str(event.get("ref") or "")
         if not (r := rows.get(ref.lower())):
@@ -514,10 +514,10 @@ def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) ->
             ref = r["ref"]
             outcome, why = research(cfg, r, force=event.get("force") is True, asked=True)
         print(f"{util.iso()} {ref}: {outcome}: {why}", flush=True)
-        outcomes.append(outcome)
-    ok = FAILED not in outcomes and LATER not in outcomes
-    mark_loop("research", ok and not unfiled, unfiled[0] if ok and unfiled else why)
-    return 1 if FAILED in outcomes or LATER in outcomes or unfiled else 0
+        if outcome in (FAILED, LATER):
+            failures.append(f"{ref}: {why}")
+    mark_loop("research", not failures and not unfiled, failures[0] if failures else unfiled[0] if unfiled else why)
+    return 1 if failures or unfiled else 0
 
 
 def preview_asked(asked: list[dict]) -> int:
