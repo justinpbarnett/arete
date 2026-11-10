@@ -37,6 +37,18 @@ def plain_summary(approval: dict, cfg: config.Config) -> str:
 
 
 def within_limits(said: str) -> str:
-    words = " ".join(SENTENCE_END.split(said)[:MOST_SENTENCES]).split()
-    kept = " ".join(words[:MOST_WORDS]) + (" …" if len(words) > MOST_WORDS else "")
-    return textwrap.shorten(kept, LONGEST_SUMMARY, placeholder=" …")
+    first, *rest = SENTENCE_END.split(" ".join(said.split()))[:MOST_SENTENCES]
+    kept = first
+    for sentence in rest:
+        if not fits_limits(f"{kept} {sentence}"):
+            break
+        kept = f"{kept} {sentence}"
+    return kept if fits_limits(kept) else cut_to_limits(kept)
+
+
+def fits_limits(text: str) -> bool:
+    return len(text.split()) <= MOST_WORDS and len(text) <= LONGEST_SUMMARY
+
+
+def cut_to_limits(text: str) -> str:
+    return textwrap.shorten(" ".join(text.split()[:MOST_WORDS]) + " …", LONGEST_SUMMARY, placeholder=" …")
