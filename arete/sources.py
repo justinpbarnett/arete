@@ -229,22 +229,24 @@ class Log(Source):
         return problems
 
     def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
-        offsets: dict[str, int] = json.loads(cursor) if cursor else {}
+        offsets: dict[str, list[int] | int] = json.loads(cursor) if cursor else {}
         pattern = re.compile(source.get("pattern") or LOG_PATTERN)
         files = sorted(glob.glob(str(paths.expand(source["path"]))))
         out: dict[str, dict] = {}
         for name in files:
             try:
-                size = os.path.getsize(name)
+                info = os.stat(name)
             except OSError:
                 continue
-            start = offsets.get(name)
+            size, inode = info.st_size, info.st_ino
+            mark = offsets.get(name)
+            start, known_inode = mark if isinstance(mark, list) else (mark, inode)
             if cursor is None or start is None:
-                offsets[name] = size
+                offsets[name] = [size, inode]
                 if cursor is None:
                     continue
                 start = 0
-            if size < start:
+            if size < start or known_inode != inode:
                 start = 0
             try:
                 with open(name, "rb") as f:
@@ -254,9 +256,9 @@ class Log(Source):
                 continue
             last_newline = chunk.rfind(b"\n")
             if last_newline == -1:
-                offsets[name] = start
+                offsets[name] = [start, inode]
                 continue
-            offsets[name] = size - len(chunk) + last_newline + 1
+            offsets[name] = [size - len(chunk) + last_newline + 1, inode]
             for raw in chunk[:last_newline].decode("utf-8", "replace").splitlines():
                 if not pattern.search(raw):
                     continue
