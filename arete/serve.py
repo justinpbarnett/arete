@@ -276,6 +276,7 @@ class Server:
         try:
             self.say(f"approval #{approval['id']}: {job.write(approval, self.cfg)}")
         except Exception as e:
+            state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
             self.say(f"approval #{approval['id']}: {job.not_written} yet, it tries again in "
                      f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
