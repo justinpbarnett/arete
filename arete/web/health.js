@@ -29,12 +29,12 @@ function probeWords(p) {
 function deviceRow(d) {
   const p = d.probe;
   const host = d.host || "this machine";
+  const tools = p?.ok && p.tools ? `Tools: ${p.tools.join(", ") || "none found"}` : "";
   return el("tr", {},
-    cell([el("span", { class: "nb", text: d.name }), d.note && d.note !== host ? el("div", { class: "muted", text: d.note }) : null]),
-    cell(d.kind), cell(host, "muted-cell"),
+    cell([el("span", { class: "nb", text: d.name }), el("div", { class: "muted wide-only wrap-cell", text: `${d.kind} on ${host}` }),
+      d.note && d.note !== host ? el("div", { class: "muted", text: d.note }) : null]),
     cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted" }, liveAgo(p.at))] : "not probed", "nb"),
-    cell(probeWords(p) || d.error || "", "muted-cell"),
-    cell([p?.ok && p.tools ? p.tools.join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
+    cell([probeWords(p) || d.error || "", tools ? el("div", { text: tools }) : null, p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null], "muted-cell"),
     cell(button("Probe", "probe", (b) => probe(d.name, b), { of: d.name }), "probe-cell"));
 }
 
@@ -94,7 +94,7 @@ function drawHealth(h) {
     heading(3, titles[2]),
     el("p", { text: "Loops and sessions run on these. A probe checks the device answers and lists its tools; devices.toml in the config folder adds one." }),
     saidLine("devices"),
-    panelParts(h.devices, "The devices", (devices) => table("", [["Device", "c-device"], ["Kind", "c-kind wide-only"], ["Host", "c-ref wide-only"], ["State", "c-status"], ["System", "wide-only"], ["Tools", "wide-only"], ["", "c-probe"]], devices.map(deviceRow), { stack: true })),
+    panelParts(h.devices, "The devices", (devices) => table("", [["Device", "c-device"], ["State", "c-status"], ["System", "wide-only"], ["", "c-probe"]], devices.map(deviceRow), { stack: true })),
     heading(4, titles[3]),
     panelParts(h.checks, "The heartbeat", (c) => [checksSummary(c),
       el("div", { class: "actions" }, button(c.running ? "Checks running" : "Run the checks now", "checks-run", runChecks, { disabled: c.running })),
