@@ -87,7 +87,7 @@ function approvalRow(a, place) {
     cell(kindTag(a.failed ? "Failed" : "Approval")),
     repoCell(a.repo),
     cell([el("div", { text: a.plain_summary || asked }),
-      a.failed ? el("div", {}, stateChip("fault"), ` ${a.failed.replace(/^./, (first) => first.toUpperCase())}`) : null,
+      a.failed ? el("div", {}, stateChip("fault"), ` ${capitalized(a.failed)}`) : null,
       a.held ? el("div", { class: "muted", text: `Held: ${a.held}.` }) : null,
       reviewLine(a),
       details ? foldText(`approval:${a.id}`, "Show the details", details) : null,
@@ -104,9 +104,9 @@ function reviewLine(a) {
 }
 
 function decide(id, yes, btn, place) {
-  if (yes) sayAt(place, null, `Approving #${id}. A push rebases and runs its check again before it lands, so it can take a minute.`, { from: btn });
   return act(btn, place, `/api/approvals/${id}`, { approve: yes },
-    (r) => (yes ? `Approved #${id}: ${r.result}.` : `Rejected #${id}. Nothing was sent.`));
+    (r) => (yes ? `Approved #${id}: ${r.result}.` : `Rejected #${id}. Nothing was sent.`),
+    { meanwhile: yes ? `Approving #${id}. A push rebases and runs its check again before it lands, so it can take a minute.` : null });
 }
 
 function readyRow(r) {
@@ -119,9 +119,9 @@ function readyRow(r) {
 }
 
 function sendReady(r, btn) {
-  sayAt("needs", null, `Sending ${r.ref}. It screens the ticket and writes to it, so it can take a few seconds.`, { from: btn });
   return act(btn, "needs", `/api/triage/${encodeURIComponent(r.ref)}/send`,
-    { questions: r.questions, answers: r.questions.map(() => ""), repo: r.repo }, (d) => d.said);
+    { questions: r.questions, answers: r.questions.map(() => ""), repo: r.repo }, (d) => d.said,
+    { meanwhile: `Sending ${r.ref}. It screens the ticket and writes to it, so it can take a few seconds.` });
 }
 
 function skippedRow(s) {

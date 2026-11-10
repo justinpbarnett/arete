@@ -54,6 +54,7 @@ main h3 { margin-top: 34px; }
 .actions.top { margin-top: 0; }
 p.said:not([hidden]) { margin-top: 0; }
 tr.said-row p.said { margin: 0; max-width: none; }
+p.said .state { vertical-align: top; }
 p.summary { margin: 0 0 14px; }
 .seg + p { margin-top: 14px; }
 .filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 0 0 6px; }

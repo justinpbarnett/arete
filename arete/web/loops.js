@@ -19,10 +19,10 @@ function serveLine(serve) {
 }
 
 function installServe(btn) {
-  sayAt("serve", null, "Installing serve. It loads the background job and readies each repo's labels, so it can take a minute.", { from: btn });
   return act(btn, "serve", "/api/serve/install", {}, (r) => (r.restarting
     ? "Serve is restarting. This page stops answering for a few seconds and comes back once serve is up."
-    : `Installed serve${r.said ? `: ${r.said}` : ""}.`));
+    : `Installed serve${r.said ? `: ${r.said}` : ""}.`),
+  { meanwhile: "Installing serve. It loads the background job and readies each repo's labels, so it can take a minute." });
 }
 
 function loopLastRun(l) {
@@ -100,6 +100,7 @@ async function draftLoop(event) {
 
 async function loopAction(name, action, btn, place) {
   btn.disabled = true;
+  keepSaidBeside(place, btn);
   try {
     const r = await call(`/api/loops/${encodeURIComponent(name)}/${action}`, {});
     if (action === "start" || action === "try") {
@@ -108,10 +109,10 @@ async function loopAction(name, action, btn, place) {
       go(detailHash("run", r.id), "link");
       return;
     }
-    if (r.enabled && !r.serve_up) sayAt(place, "caution", `${name} is on, but serve is down, so it fires once serve runs again.`, { from: btn });
-    else sayAt(place, "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`, { from: btn });
+    if (r.enabled && !r.serve_up) sayAt(place, "caution", `${name} is on, but serve is down, so it fires once serve runs again.`);
+    else sayAt(place, "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`);
   } catch (e) {
-    sayAt(place, "fault", e.message, { from: btn });
+    sayAt(place, "fault", e.message);
   }
   refresh();
 }

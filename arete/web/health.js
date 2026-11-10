@@ -41,11 +41,12 @@ function deviceRow(d) {
 async function probe(name, btn) {
   btn.disabled = true;
   btn.textContent = "Probing";
+  keepSaidBeside("devices", btn);
   try {
     const p = await call(`/api/devices/${encodeURIComponent(name)}/probe`, {});
-    sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`, { from: btn });
+    sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`);
   } catch (e) {
-    sayAt("devices", "fault", e.message, { from: btn });
+    sayAt("devices", "fault", e.message);
   }
   refresh();
 }
@@ -69,7 +70,7 @@ function healthSummary(h, failed) {
   const { faults, cautions } = countStates(failed.map((f) => f.state));
   const parts = [serveDown, faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",
     unread ? `${count(unread, "part", "parts")} could not be read` : ""].filter(Boolean);
-  return el("p", { class: "summary" }, stateChip(h.state), parts.length ? ` ${parts.join(", ")}.`.replace(/^ ./, (s) => s.toUpperCase()) : " Every alert, check, probe, device and loop answers.");
+  return el("p", { class: "summary" }, stateChip(h.state), parts.length ? ` ${capitalized(parts.join(", "))}.` : " Every alert, check, probe, device and loop answers.");
 }
 
 function tally(failing, what, after = "") {

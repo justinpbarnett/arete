@@ -32,6 +32,8 @@ const drafts = new Map();
 const lastSaid = new Map();
 const saidById = new Map();
 const saidBeside = new Map();
+const VACATED_SPOT_MS = 1000;
+let vacatedSpot = null;
 let changesInFlight = 0;
 
 class NoAnswer extends Error {}
@@ -54,6 +56,10 @@ function svg(tag, attrs = {}, text) {
   for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+function capitalized(text) {
+  return text.replace(/^./, (first) => first.toUpperCase());
 }
 
 function pad(n) {
@@ -86,10 +92,13 @@ function saidLine(place) {
     said ? sayParts(...said) : null);
 }
 
-function sayAt(place, state, sentence, { focus = true, from = null } = {}) {
+function shownSaidLine(place) {
+  return currentSection().querySelector(`[data-said="${CSS.escape(place)}"]`);
+}
+
+function sayAt(place, state, sentence, { focus = true } = {}) {
   lastSaid.set(place, [state, sentence]);
-  if (from) keepSaidBeside(place, from);
-  const line = currentSection().querySelector(`[data-said="${CSS.escape(place)}"]`);
+  const line = shownSaidLine(place);
   if (!line) return;
   sayIn(line, state, sentence);
   placeSaid(line, [line.closest("[id]")]);
@@ -98,34 +107,77 @@ function sayAt(place, state, sentence, { focus = true, from = null } = {}) {
 
 function keepSaidBeside(place, control) {
   const row = control.closest("tr");
-  let next = row?.nextElementSibling;
-  while (next?.matches(".said-row")) next = next.nextElementSibling;
-  if (row) saidBeside.set(place, { row: control.dataset.focus, next: next?.querySelector("[data-focus]")?.dataset.focus });
-  else saidBeside.delete(place);
+  if (!row) {
+    saidBeside.delete(place);
+    return;
+  }
+  const line = shownSaidLine(place);
+  saidBeside.set(place, {
+    pressed: control.dataset.focus,
+    later: rowKeysFrom(row, "nextElementSibling"),
+    earlier: rowKeysFrom(row, "previousElementSibling"),
+    above: Boolean(line && !line.hidden && line.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING),
+  });
+}
+
+function rowKeysFrom(row, step) {
+  const keys = [];
+  for (let other = row[step]; other; other = other[step]) {
+    if (!other.matches(".said-row")) keys.push(other.querySelector("[data-focus]")?.dataset.focus);
+  }
+  return keys.filter(Boolean);
 }
 
 function rowHolding(nodes, key) {
   return key ? elementsIn(nodes, `[data-focus="${CSS.escape(key)}"]`)[0]?.closest("tr") : null;
 }
 
+function firstRowHolding(nodes, keys) {
+  for (const key of keys) {
+    const row = rowHolding(nodes, key);
+    if (row) return row;
+  }
+  return null;
+}
+
 function placeSaid(line, nodes) {
+  delete line.dataset.standsFor;
   const beside = saidBeside.get(line.dataset.said);
-  if (!beside || line.hidden) return false;
-  const acted = rowHolding(nodes, beside.row);
-  const next = acted ? null : rowHolding(nodes, beside.next);
-  if (acted) delete line.dataset.standsFor;
-  else line.dataset.standsFor = beside.row;
-  if (!acted && !next) return false;
+  if (!beside || line.hidden) return;
+  const acted = rowHolding(nodes, beside.pressed);
+  if (!acted) guardVacatedSpot(beside);
+  const later = acted ? null : firstRowHolding(nodes, beside.later);
+  const neighbour = acted ?? later ?? firstRowHolding(nodes, beside.earlier);
+  if (!neighbour) return;
   const holder = line.closest("tr.said-row") ?? el("tr", { class: "said-row" }, el("td", {}, line));
-  holder.cells[0].colSpan = (acted ?? next).cells.length;
-  if (acted) acted.after(holder);
-  else next.before(holder);
-  return true;
+  holder.cells[0].colSpan = neighbour.cells.length;
+  if (later || (acted && beside.above)) neighbour.before(holder);
+  else neighbour.after(holder);
+  if (!acted) line.dataset.standsFor = beside.pressed;
+}
+
+function guardVacatedSpot(beside) {
+  if (beside.vacated) return;
+  beside.vacated = true;
+  const { left, top, right, bottom } = rowHolding([currentSection()], beside.pressed)?.getBoundingClientRect() ?? {};
+  if (bottom > top) vacatedSpot = { left, top, right, bottom, until: performance.now() + VACATED_SPOT_MS };
+}
+
+function forgetVacatedSpot() {
+  vacatedSpot = null;
+}
+
+function ignorePressOnVacatedSpot(e) {
+  const spot = vacatedSpot;
+  if (!spot || !e.detail || performance.now() > spot.until) return;
+  if (e.clientX < spot.left || e.clientX > spot.right || e.clientY < spot.top || e.clientY > spot.bottom) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
 }
 
 function saidBesideRows(nodes) {
-  const placed = elementsIn(nodes, "p[data-said]").filter((line) => placeSaid(line, nodes));
-  return nodes.filter((node) => !placed.includes(node));
+  for (const line of elementsIn(nodes, "p[data-said]")) placeSaid(line, nodes);
+  return nodes.filter((node) => !node.closest?.("tr.said-row"));
 }
 
 function say(id, state, sentence) {
@@ -352,12 +404,14 @@ function stopWords(what, r, after) {
   return r.ticket ? `${what} had already ended; the next pipeline poll marks it stopped and tells its ticket.` : `${what} had already ended, so it is marked stopped.`;
 }
 
-async function act(btn, place, path, body, saying) {
+async function act(btn, place, path, body, saying, { meanwhile = null } = {}) {
   btn.disabled = true;
+  keepSaidBeside(place, btn);
+  if (meanwhile) sayAt(place, null, meanwhile);
   try {
-    sayAt(place, "ok", saying(await call(path, body)), { from: btn });
+    sayAt(place, "ok", saying(await call(path, body)));
   } catch (e) {
-    sayAt(place, "fault", e.message, { from: btn });
+    sayAt(place, "fault", e.message);
   }
   refresh();
 }
