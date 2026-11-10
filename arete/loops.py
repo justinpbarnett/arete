@@ -365,9 +365,9 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     if not kind:
         problems.append(f"kind '{loop.kind}' is not one of {', '.join(KINDS)}")
     try:
-        remote, device_problem = devices.get(loop.device).remote, ""
+        device, device_problem = devices.get(loop.device), ""
     except devices.DeviceError as e:
-        remote, device_problem = False, str(e)
+        device, device_problem = devices.LOCAL, str(e)
     if loop.trigger.cron and loop.trigger.every:
         problems.append("[trigger] takes cron or every, not both")
     if loop.trigger.trust not in TRUST_ORDER:
@@ -375,7 +375,7 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     elif loop.trigger.metric and (why := loop.trigger.refusal(metric_event(loop, 0))):
         problems.append(f"[trigger] metric would never fire: the loop {why}")
     if kind:
-        problems += kind.problems(loop, remote)
+        problems += kind.problems(loop, device.remote)
     if loop.kind == "climb" and (goal := climb_goal(loop.spec)) not in CLIMB_GOALS:
         problems.append(f"[climb] goal '{goal}' is not one of {', '.join(CLIMB_GOALS)}")
     if loop.kind == "search" and "proof" in loop.spec:
@@ -384,7 +384,7 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     problems += [device_problem] if device_problem else []
     if loop.agent:
         problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
-                     for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, remote).items()]
+                     for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
     if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")

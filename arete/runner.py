@@ -81,14 +81,14 @@ def agent_problems(run_with: str, tools: list[str]) -> list[str]:
     return problems
 
 
-def withheld(model: str, run_with: str, tools: list[str], remote: bool) -> dict[str, list[str]]:
-    if route(model, run_with)[0] != "pi":
+def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:
+    if route(model, run_with)[0] != "pi" or device.sandbox:
         return {}
     reasons: dict[str, list[str]] = {}
     for tool in tools:
         if tool == "Bash":
             reasons.setdefault(PI_HOLDS_NO_BASH_RULES, []).append(tool)
-        elif tool in WRITING_TOOLS and not pi.can_confine(remote):
+        elif tool in WRITING_TOOLS and not pi.can_confine(device.remote):
             reasons.setdefault(pi.NO_CONFINEMENT_REASON, []).append(tool)
     return reasons
 

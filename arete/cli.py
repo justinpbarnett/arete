@@ -109,10 +109,10 @@ def show(panel: dict, what: str, draw) -> None:
         draw(panel["rows"])
 
 
-def print_table(rows: list[tuple[str, ...]], width: int) -> None:
+def print_table(rows: list[tuple[str, ...]], width: int, indent: str = "  ") -> None:
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]
     for row in rows:
-        print(("  " + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[-1])[:width])
+        print((indent + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[-1])[:width].rstrip())
 
 
 def print_checks(h: dict) -> None:
@@ -584,17 +584,23 @@ def cmd_devices(args) -> int:
             info = devices.probe(args.probe)
             print(json.dumps(info, indent=2))
             return 0 if info["ok"] else 1
-        for d in control.fleet():
-            p = d.get("probe") or {}
-            seen = (("ok" if p.get("ok") else "FAIL") + f" {when(p.get('at'))}") if p else "not probed"
-            extra = ", ".join(x for x in (p.get("system", ""), " ".join(p.get("tools") or []),
-                                          "; ".join(p.get("gpus") or []), p.get("detail", "")) if x)
-            print(f"{d['name']:<14} {d['kind']:<9} {d.get('host') or '':<22} {seen:<18} {extra}"[:220])
+        fleet = control.fleet()
+        print_table([(d["name"], d["kind"], d.get("host") or "", *probe_words(d.get("probe"))) for d in fleet], 220,
+                    indent="")
+        for d in fleet:
             if d.get("error"):
                 print(f"  {d['error']}")
         return 0
     except devices.DeviceError as e:
         return refused(e)
+
+
+def probe_words(probe: dict | None) -> tuple[str, str]:
+    if not probe:
+        return "not probed", ""
+    seen = ("ok" if probe.get("ok") else "FAIL") + f" {when(probe.get('at'))}"
+    return seen, ", ".join(x for x in (probe.get("system", ""), " ".join(probe.get("tools") or []),
+                                       "; ".join(probe.get("gpus") or []), probe.get("detail", "")) if x)
 
 
 def cmd_session(args) -> int:

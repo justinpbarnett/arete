@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager
 
-from . import paths, state, util
+from . import devices, paths, state, util
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -112,6 +112,8 @@ def dead(row: dict):
 def interrupt(row: dict) -> dict | None:
     if not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
+    if row.get("device"):
+        devices.release(row["device"], row["id"], lambda text: state.add_feed(row["id"], "device", text))
     status = dead_status(row)
     summary = STOPPED if status == "stopped" else INTERRUPTED
     settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)

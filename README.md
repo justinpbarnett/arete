@@ -76,6 +76,48 @@ note = "Hetzner box"
 
 `arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `arete` and `ollama` it has.
 
+A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
+Each run gets a VM of its own, works on it over ssh, and deletes it when the run ends.
+Arete reaches exe.dev as `ssh exe.dev` with your own ssh key, so it stores no exe.dev key.
+
+```toml
+[device.sandbox]
+kind = "exe"
+template = "arete-template"   # a VM to copy for each run; leave it out to start from exe.dev's own image
+egress = "integrations"       # integrations | all; leave it out for exe.dev's default
+note = "a fresh sandbox per run"
+```
+
+A sandbox is named `arete-` and its run id, and is tagged `arete`; a copy of a template also keeps the template's tags.
+`keep = true` leaves the sandbox up after the run and logs the `ssh exe.dev rm NAME` that deletes it; exe.dev bills it until then.
+When a run dies before it can delete its sandbox, `arete loop stop`, `arete session stop` or the next reap deletes it.
+A probe of an `exe` device makes a real sandbox, checks that it answers, and deletes it.
+
+Agents in a sandbox run on pi, which reads `~/.pi/agent/models.json` on the VM.
+Make the template a regular VM with `ssh exe.dev new --name=arete-template`, and give it a `models.json` whose providers go through exe.dev integrations:
+
+```json
+{
+  "providers": {
+    "openrouter": { "baseUrl": "https://openrouter.int.exe.xyz/api/v1", "apiKey": "integration" },
+    "exe-llm": { "baseUrl": "https://llm.int.exe.xyz/openai/v1", "api": "openai-responses", "apiKey": "integration",
+                 "models": [{ "id": "gpt-5.4-mini" }] }
+  }
+}
+```
+
+exe.dev adds the real key at the integration, so the VM holds none, and `egress = "integrations"` lets the sandbox reach the integrations alone.
+`exe-llm` is exe.dev's own LLM gateway, which every VM can reach; a loop or session asks for it as `exe-llm/gpt-5.4-mini`.
+OpenRouter needs an integration that holds your key, attached to the `arete` tag:
+
+```
+printf '%s' "$OPENROUTER_API_KEY" | ssh exe.dev integrations add openrouter --name=openrouter --key=- --attach tag:arete
+```
+
+A model is then `openrouter/` and an OpenRouter model id.
+In a sandbox, pi gets Bash, Edit and Write, and runs without the rules against git writes, because the VM holds nothing to push with and is deleted after the run.
+Keep it that way: never put git or GitHub credentials on a template.
+
 A session is an agent you start by hand and talk to, on any device, model and tool set:
 
 ```
@@ -465,7 +507,7 @@ A step on the `claude` CLI rides the subscription, so every paid sum leaves it o
 - Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`, never an `ANTHROPIC_API_KEY`, here or on a device.
 - A claude run takes no dollar cap and waits out a usage limit; budgets apply to pi alone.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
-- Agents never run git write commands. Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
+- Agents never run git write commands. Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely. The one exception is pi in an exe.dev sandbox, which holds no git credentials and is deleted after its run.
 - Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`. A `push` emit follows the same level: under `pr`, a person lands every push.
 - Alert issues carry check names and one short status line, never log contents.
 - PRs to public repos cite run ids, never transcript text.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -28,6 +29,13 @@ END_WITH_SESSION = ("( (kill -0 $PPID && while kill -0 $PPID && kill -0 $$; do s
                     " </dev/null >/dev/null 2>&1 & ); exec \"$@\"")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HOME_DIR = re.compile(r"~([a-z_][a-z0-9_.-]*)?")
+VM_NAME_CHARS = 60
+EXE_LOBBY = "exe.dev"
+EXE_VM_DOMAIN = ".exe.xyz"
+EXE_TAG = "arete"
+EXE_EGRESS = ("integrations", "all")
+EXE_BOOT_SECONDS = 120
+NOT_DELETED = "could not delete sandbox"
 
 
 @dataclass(frozen=True)
@@ -39,9 +47,11 @@ class Device:
     port: int | None = None
     identity: str = ""
     jump: str = ""
-    template: int | None = None
+    template: str = ""
     user: str = "root"
+    egress: str = ""
     keep: bool = False
+    sandbox: bool = False
     note: str = ""
     via: Device | None = None
     known_hosts: str = ""
@@ -77,14 +87,19 @@ def parse(data: dict) -> list[Device]:
         kind = d.get("kind", "ssh")
         if kind not in KINDS:
             raise DeviceError(f"device {name}: kind '{kind}' is not one of {', '.join(KINDS)}")
-        if kind != "local" and not d.get("host"):
+        if kind not in ("local", "exe") and not d.get("host"):
             raise DeviceError(f"device {name}: needs host, the ssh destination")
-        if kind == "proxmox" and not d.get("template"):
+        template = str(d.get("template") or "")
+        if kind == "proxmox" and not template.isdigit():
             raise DeviceError(f"device {name}: a proxmox device needs template, the VM id to clone")
-        found.append(Device(name, kind, str(d.get("host", "")), str(d.get("dir", "~")),
-                            int(d["port"]) if d.get("port") else None, str(d.get("identity", "")),
-                            str(d.get("jump", "")), int(d["template"]) if d.get("template") else None,
-                            str(d.get("user", "root")), bool(d.get("keep", False)), str(d.get("note", ""))))
+        egress = str(d.get("egress") or "")
+        if egress and egress not in EXE_EGRESS:
+            raise DeviceError(f"device {name}: egress '{egress}' is not one of {', '.join(EXE_EGRESS)}")
+        found.append(Device(name, kind, host=str(d.get("host") or (EXE_LOBBY if kind == "exe" else "")),
+                            dir=str(d.get("dir", "~")), port=int(d["port"]) if d.get("port") else None,
+                            identity=str(d.get("identity", "")), jump=str(d.get("jump", "")), template=template,
+                            user=str(d.get("user", "root")), egress=egress, keep=bool(d.get("keep", False)),
+                            sandbox=kind == "exe", note=str(d.get("note", ""))))
     return found
 
 
@@ -101,11 +116,18 @@ def resolve(device: Device | str) -> Device:
     return device if isinstance(device, Device) else get(device)
 
 
+def exe_vm(host: str) -> bool:
+    return host.rpartition("@")[2].endswith(EXE_VM_DOMAIN)
+
+
 def ssh_argv(d: Device) -> list[str]:
     argv = ["ssh", *SSH_OPTIONS]
     if d.known_hosts:
         argv += ["-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null", "-o", "KnownHostsCommand=none",
                  "-o", f"UserKnownHostsFile=\"{d.known_hosts.replace('%', '%%')}\""]
+    if exe_vm(d.host):
+        # Every exe.dev VM presents exe.dev's own host key, so the known_hosts line for exe.dev verifies them all.
+        argv += ["-o", f"HostKeyAlias={EXE_LOBBY}"]
     if d.port:
         argv += ["-p", str(d.port)]
     if d.identity:
@@ -149,20 +171,44 @@ def probe(device: Device | str, timeout: float = 20) -> dict:
                       timeout=timeout)
         info = {"ok": res.returncode == 0, "detail": util.first_line(", ".join(res.stdout.splitlines())
                                                                       if res.returncode == 0 else res.stderr, 300)}
+    elif d.kind == "exe":
+        info = probe_sandbox(d, timeout)
     else:
-        res = util.sh(PROBE if not d.remote else [*ssh_argv(d), PROBE], timeout=timeout)
-        lines = res.stdout.splitlines()
-        info = {"ok": res.returncode == 0 and bool(lines), "system": lines[0] if lines else "",
-                "home": lines[1] if len(lines) > 1 else "",
-                "tools": [line[4:] for line in lines if line.startswith("has:")],
-                "gpus": [line[4:].strip() for line in lines if line.startswith("gpu:")],
-                "detail": "" if res.returncode == 0 else util.first_line(res.stderr or res.stdout, 300)}
+        info = probe_shell(d, timeout)
     info.update(name=d.name, kind=d.kind, host=d.host, seconds=round(time.monotonic() - started, 1), at=util.iso())
     with util.lock("devices", wait=True):
         cache = util.read_json(CACHE_FILE, {})
         cache[d.name] = info
         util.write_json(CACHE_FILE, cache)
     return info
+
+
+def probe_shell(d: Device, timeout: float) -> dict:
+    res = util.sh(PROBE if not d.remote else [*ssh_argv(d), PROBE], timeout=timeout)
+    lines = res.stdout.splitlines()
+    return {"ok": res.returncode == 0 and bool(lines), "system": lines[0] if lines else "",
+            "home": lines[1] if len(lines) > 1 else "",
+            "tools": [line[4:] for line in lines if line.startswith("has:")],
+            "gpus": [line[4:].strip() for line in lines if line.startswith("gpu:")],
+            "detail": "" if res.returncode == 0 else util.first_line(res.stderr or res.stdout, 300)}
+
+
+def probe_sandbox(d: Device, timeout: float) -> dict:
+    said: list[str] = []
+    started = time.monotonic()
+    try:
+        with sandbox(replace(d, keep=False), f"probe-{d.name}-{util.now():%Y%m%d-%H%M%S}-{os.urandom(2).hex()}",
+                     said.append) as vm:
+            up = time.monotonic() - started
+            info = probe_shell(vm, timeout)
+    except DeviceError as e:
+        info, up = {"ok": False, "detail": str(e)}, 0.0
+    if leaked := [line for line in said if line.startswith(NOT_DELETED)]:
+        return {**info, "ok": False, "detail": util.first_line("; ".join([info["detail"], *leaked]).lstrip("; "), 300)}
+    if info["detail"]:
+        return info
+    made = f"a copy of {d.template}" if d.template else "a fresh sandbox"
+    return {**info, "detail": f"{made} answered in {up:.1f} s and was deleted"}
 
 
 def cached() -> dict:
@@ -183,6 +229,25 @@ def pve(d: Device, command: str, timeout: float = 300) -> str:
     if res.returncode != 0:
         raise DeviceError(f"{d.name}: `{command}` failed: {util.first_line(res.stderr or res.stdout, 300)}")
     return res.stdout
+
+
+def exe(d: Device, *command: str, timeout: float = 120) -> dict:
+    res = util.sh([*ssh_argv(d), shlex.join([*command, "--json"])], timeout=timeout)
+    lines = res.stdout.strip().splitlines()
+    try:
+        reply = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        reply = None
+    if res.returncode == 0 and isinstance(reply, dict) and not reply.get("error"):
+        return reply
+    why = (reply.get("error") if isinstance(reply, dict) else "") or \
+        util.first_line(res.stderr or res.stdout or f"exit {res.returncode}", 300)
+    raise DeviceError(f"{d.name}: `ssh {d.host} {command[0]}` failed: {why}")
+
+
+def vm_name(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", label.lower()).strip("-")
+    return "arete-" + slug[len("arete-") - VM_NAME_CHARS:].lstrip("-")
 
 
 @dataclass(frozen=True)
@@ -264,16 +329,36 @@ def trusted_clone(boot: BootingClone, address: str, known_hosts: Path) -> Device
         time.sleep(5)
 
 
+def answers_ssh(vm: Device) -> None:
+    deadline = time.monotonic() + EXE_BOOT_SECONDS
+    while True:
+        res = util.sh([*ssh_argv(vm), "true"], timeout=30)
+        if res.returncode == 0:
+            return
+        if time.monotonic() > deadline:
+            raise DeviceError(f"{vm.host} did not answer ssh in {EXE_BOOT_SECONDS}s: "
+                              f"{util.first_line(res.stderr or res.stdout or f'exit {res.returncode}', 300)}")
+        time.sleep(2)
+
+
 @contextmanager
 def lease(device: Device | str, label: str, log=lambda text: None):
     d = resolve(device)
-    if d.kind != "proxmox":
+    if d.kind == "proxmox":
+        with proxmox_clone(d, label, log) as clone:
+            yield clone
+    elif d.kind == "exe":
+        with sandbox(d, label, log) as vm:
+            yield vm
+    else:
         yield d
-        return
+
+
+@contextmanager
+def proxmox_clone(d: Device, label: str, log):
     vmid = int(pve(d, "pvesh get /cluster/nextid").strip())
-    name = re.sub(r"[^a-z0-9-]+", "-", f"arete-{label}".lower())[:60].strip("-")
     log(f"cloning template {d.template} to VM {vmid} on {d.name}")
-    pve(d, f"qm clone {d.template} {vmid} --name {name} --full 0")
+    pve(d, f"qm clone {d.template} {vmid} --name {vm_name(label)} --full 0")
     try:
         pve(d, f"qm start {vmid}")
         boot = BootingClone(d, vmid)
@@ -291,6 +376,53 @@ def lease(device: Device | str, label: str, log=lambda text: None):
             log(f"destroyed VM {vmid}" if res.returncode == 0 else
                 f"could not destroy VM {vmid} on {d.name}, so it is still there: "
                 f"{util.first_line(res.stderr or res.stdout or f'exit {res.returncode}', 300)}")
+
+
+@contextmanager
+def sandbox(d: Device, label: str, log):
+    name = vm_name(label)
+    egress = [f"--egress={d.egress}"] if d.egress else []
+    started = time.monotonic()
+    try:
+        if d.template:
+            log(f"copying {d.template} to sandbox {name} on exe.dev")
+            made = exe(d, "cp", d.template, name, "--sandbox", *egress)
+            exe(d, "tag", name, EXE_TAG)
+        else:
+            log(f"creating sandbox {name} on exe.dev")
+            made = exe(d, "new", f"--name={name}", "--sandbox", "--no-email", f"--tag={EXE_TAG}", *egress)
+        vm = replace(d, kind="ssh", host=made.get("ssh_dest") or f"{name}{EXE_VM_DOMAIN}", port=None)
+        answers_ssh(vm)
+        log(f"sandbox {name} is up at {vm.host} in {time.monotonic() - started:.1f} s")
+        yield vm
+    finally:
+        if d.keep:
+            log(f"keeping sandbox {name}, which is billed until `ssh {d.host} rm {name}` deletes it")
+        else:
+            drop_sandbox(d, name, log)
+
+
+def drop_sandbox(d: Device, name: str, log) -> None:
+    try:
+        gone = exe(d, "rm", name)
+    except DeviceError as e:
+        log(f"{NOT_DELETED} {name}, so it is still there and still billed: {e}")
+        return
+    if name in gone.get("deleted", []):
+        log(f"deleted sandbox {name}")
+    elif name not in gone.get("not_found", []):
+        log(f"{NOT_DELETED} {name}, so it is still there and still billed: "
+            f"{(gone.get('errors') or {}).get(name) or 'exe.dev gave no reason'}")
+
+
+def release(device: str, label: str, log=lambda text: None) -> None:
+    try:
+        d = get(device)
+    except DeviceError as e:
+        log(f"arete cannot check whether this run left a sandbox: {e}")
+        return
+    if d.kind == "exe" and not d.keep:
+        drop_sandbox(d, vm_name(label), log)
 
 
 def known() -> list[Device]:

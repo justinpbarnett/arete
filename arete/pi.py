@@ -110,6 +110,10 @@ def run(
                       session=resume, runner="pi", model=model)
     cwd = cwd if remote else Path(cwd).absolute()
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
+    sandboxed = bool(remote and remote.sandbox)
+    if sandboxed:
+        # A sandbox is deleted after its run and holds no git credentials, so the rules against git writes guard nothing.
+        disallowed_tools = [t for t in disallowed_tools or [] if "(" not in t]
     names = tool_names(tools, allowed_tools, disallowed_tools)
     sessions_dir = f"{devices.home(remote)}/.arete/pi-sessions" if remote else str(SESSIONS_DIR)
     cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
@@ -131,7 +135,7 @@ def run(
         cmd += ["--append-system-prompt", "You may also read and change files under: " + ", ".join(map(str, add_dirs))]
     if json_schema:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
-    if writing := sorted(WRITING & set(names)):
+    if (writing := sorted(WRITING & set(names))) and not sandboxed:
         if not can_confine(bool(remote)):
             return Result(ok=False, error=f"{NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
                           session=resume, runner="pi", model=model)

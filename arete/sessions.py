@@ -119,7 +119,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     target = device_named(device)
     work_repo = repo_named(repo, target, cfg)
     which, name = runner.route(model, run_with)
-    off = runner.withheld(model, run_with, tools, target.remote)
+    off = runner.withheld(model, run_with, tools, target)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
                 budget_usd, created=util.iso())
