@@ -111,15 +111,20 @@ function marksInUse() {
   return [document.activeElement, selection.isCollapsed ? null : selection.anchorNode].map(markHolding).filter(Boolean);
 }
 
+function middleOf(node) {
+  const { top, bottom } = node.getBoundingClientRect();
+  return (top + bottom) / 2;
+}
+
 function scrollingPane(node) {
   const pane = node.closest(".detail");
   return pane && getComputedStyle(pane).overflowY === "auto" ? pane : null;
 }
 
-function placeIn(box, marks) {
+function placeIn(box, marks, fresh) {
   const pane = scrollingPane(box);
   const section = box.closest("main > section");
-  if (!section) return { pane: null, x: scrollX, y: scrollY, anchors: [] };
+  if (!section) return { pane: null, x: scrollX, y: scrollY, anchors: [], vacated: null };
   const scope = pane ?? section;
   const panes = pane ? [] : [...section.querySelectorAll(".detail")].filter((p) => getComputedStyle(p).overflowY === "auto");
   const { top: shownTop, bottom: shownBottom } = pane ? pane.getBoundingClientRect() : { top: 0, bottom: innerHeight };
@@ -137,7 +142,12 @@ function placeIn(box, marks) {
   const inView = laidOut.filter(({ top, bottom }) => bottom > shownTop && top < shownBottom)
     .sort(hovering ? (a, b) => fromMouse(a) - fromMouse(b) : (a, b) => inUse.includes(b.node) - inUse.includes(a.node));
   const anchors = !y && !hovering ? [] : inView.length ? inView : laidOut.filter(({ bottom }) => bottom <= shownTop).slice(-1);
-  return { pane, x: scrollX, y, anchors: anchors.map(({ node, top }) => ({ node, id: box.contains(node) ? marks.idOf(node) : null, top })) };
+  const vacated = vacatedPress(box, fresh);
+  return {
+    pane, x: scrollX, y,
+    anchors: anchors.map(({ node, top }) => ({ node, id: box.contains(node) ? marks.idOf(node) : null, top })),
+    vacated: vacated && vacated.at > shownTop && vacated.at < shownBottom ? vacated : null,
+  };
 }
 
 function followAnchor(anchor, freshMarks, keptIds) {
@@ -146,17 +156,23 @@ function followAnchor(anchor, freshMarks, keptIds) {
   return { drift: node.getBoundingClientRect().top - anchor.top, stayed: !anchor.id || keptIds.has(anchor.id) };
 }
 
-function followStandIn(anchor, freshMarks) {
-  if (!anchor.id || freshMarks.nodeOf(anchor.id)) return null;
-  const standIn = freshMarks.nodes.find((node) => node.dataset.standsFor === placeKey(anchor.node));
-  return standIn?.checkVisibility() ? { drift: standIn.getBoundingClientRect().top - anchor.top } : null;
+function followAnchors(place, shownMarks, freshMarks) {
+  const keptIds = idsKeptInOrder(shownMarks.ids, freshMarks.ids);
+  const followed = place.anchors.map((anchor) => followAnchor(anchor, freshMarks, keptIds)).filter(Boolean);
+  return followed.find(({ stayed }) => stayed) ?? followed[0];
+}
+
+function intoVacated({ pane, vacated: { line, at } }) {
+  if (!line.checkVisibility()) return null;
+  const drift = middleOf(line) - at;
+  const scrolled = pane ? pane.scrollTop : scrollY;
+  if (scrolled + drift >= 0) return { drift };
+  openGapAbove(line, -(scrolled + drift));
+  return { drift: -scrolled };
 }
 
 function keepPlace(place, shownMarks, freshMarks) {
-  const keptIds = idsKeptInOrder(shownMarks.ids, freshMarks.ids);
-  const followed = place.anchors.map((anchor) => followAnchor(anchor, freshMarks, keptIds)).filter(Boolean);
-  const standIn = place.anchors.map((anchor) => followStandIn(anchor, freshMarks)).find(Boolean);
-  const anchor = standIn ?? followed.find(({ stayed }) => stayed) ?? followed[0];
+  const anchor = (place.vacated && intoVacated(place)) ?? followAnchors(place, shownMarks, freshMarks);
   if (place.pane) {
     const y = anchor ? place.pane.scrollTop + anchor.drift : place.y;
     if (place.pane.scrollTop !== y) place.pane.scrollTop = y;
@@ -247,7 +263,7 @@ function fill(id, ...nodes) {
   tickLiveAgos(elementsIn([...shown, ...fresh], "time.ago"));
   if (keepShownIfUnchanged(shown, fresh)) return;
   const shownMarks = new Marks(shown);
-  const place = placeIn(box, shownMarks);
+  const place = placeIn(box, shownMarks, fresh);
   const focusedId = shownMarks.idOf(document.activeElement);
   const caret = focusedId ? caretIn(document.activeElement) : null;
   const selected = selectionIn(box, shownMarks);
