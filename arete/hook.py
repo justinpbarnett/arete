@@ -17,7 +17,7 @@ BASH_CLASSES = [
     ("sqlite", r"sqlite3|OperationalError|database is locked"),
     ("network", r"ConnectionError|ETIMEDOUT|ConnectionRefused|ECONNREFUSED|Could not resolve host"),
     ("syntax", r"SyntaxError|IndentationError|parse error"),
-    ("test_failure", r"\bFAILED\b|\d+ failed|AssertionError|Tests?:\s+\d+ failed"),
+    ("test_failure", r"(?-i:\bFAILED\b)|\d+ failed|AssertionError|Tests?:\s+\d+ failed"),
     ("type_error", r"error TS\d+|TypeError"),
     ("timeout", r"timed out|timeout"),
 ]
