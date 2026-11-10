@@ -6,7 +6,9 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NoReturn
 
@@ -15,11 +17,13 @@ from . import (
     config,
     control,
     dashboard,
+    delivery,
     engine,
     explain,
     loops,
     paths,
     record,
+    reviewer,
     runner,
     sources,
     state,
@@ -29,12 +33,31 @@ from .loops import Loop
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
-SUMMARY_RETRY_SECONDS = 900
+APPROVAL_RETRY_SECONDS = 900
 POLL_THREADS = 8
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.engine"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
            "!=": operator.ne}
+
+
+@dataclass(frozen=True)
+class ApprovalJob:
+    note: str
+    doing: str
+    missing: str
+    wanted: Callable[[dict], bool]
+    model: Callable[[dict, config.Config], str]
+    work: Callable[[dict, config.Config], str]
+
+
+APPROVAL_JOBS = (
+    ApprovalJob("plain_summary", "a plain summary of an approval is still being written", "no plain summary",
+                wanted=lambda approval: True, model=lambda approval, cfg: cfg.model("explain"),
+                work=explain.note_plain_summary),
+    ApprovalJob("review", "a held push is still being reviewed", "no review", wanted=reviewer.wanted,
+                model=lambda approval, cfg: delivery.reviewer_of(approval), work=reviewer.review),
+)
 
 
 def next_due(loop: Loop, after: datetime) -> str:
@@ -92,8 +115,8 @@ class Server:
         self.ticks = 0
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
-        self.summary_pool = ThreadPoolExecutor(1, thread_name_prefix="summary")
-        self.summarizing: Future | None = None
+        self.job_pools = {job.note: ThreadPoolExecutor(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
+        self.jobs: dict[str, Future] = {}
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -114,7 +137,7 @@ class Server:
         self.forget_unpolled_errors(live)
         self.loaded = True
         self.dispatch({x.name: x for x in reversed(every_loop)})
-        self.summarize_next_approval()
+        self.start_approval_jobs()
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             state.prune()
             self.pruned = time.monotonic()
@@ -236,23 +259,28 @@ class Server:
                 self.waiting[item["id"]] = why
                 self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
 
-    def summarize_next_approval(self) -> None:
-        if self.summarizing and not self.summarizing.done():
-            return
-        if runner.usage_hold(self.cfg.model("explain")):
-            return
-        retry_from = util.iso(util.now() - timedelta(seconds=SUMMARY_RETRY_SECONDS))
-        due = (a for a in state.approvals() if not a["plain_summary"] and a["plain_summary_tried"] <= retry_from)
-        if approval := next(due, None):
-            state.set_plain_summary_tried(approval["id"], util.iso())
-            self.summarizing = self.summary_pool.submit(self.write_plain_summary, approval)
+    def start_approval_jobs(self) -> None:
+        retry_from = util.iso(util.now() - timedelta(seconds=APPROVAL_RETRY_SECONDS))
+        decidable = state.approvals()
+        for job in APPROVAL_JOBS:
+            if self.job_running(job):
+                continue
+            due = (a for a in decidable if job.wanted(a) and not a[job.note] and a[f"{job.note}_tried"] <= retry_from
+                   and not runner.usage_hold(job.model(a, self.cfg)))
+            if approval := next(due, None):
+                state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
+                self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)
 
-    def write_plain_summary(self, approval: dict) -> None:
+    def job_running(self, job: ApprovalJob) -> bool:
+        return job.note in self.jobs and not self.jobs[job.note].done()
+
+    def do_approval_job(self, job: ApprovalJob, approval: dict) -> None:
         try:
-            state.set_plain_summary(approval["id"], explain.plain_summary(approval, self.cfg))
+            if said := job.work(approval, self.cfg):
+                self.say(f"approval #{approval['id']}: {said}")
         except Exception as e:
-            self.say(f"approval #{approval['id']}: no plain summary, {util.first_line(str(e), 300)}; "
-                     f"it tries again in {SUMMARY_RETRY_SECONDS // 60} minutes")
+            self.say(f"approval #{approval['id']}: {job.missing} yet, it tries again in "
+                     f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
     def retry_once(self, item: dict, why: str) -> None:
         if self.restarted[item["id"]]:
@@ -275,8 +303,8 @@ class Server:
     def busy_with(self) -> str:
         if sum(not f.done() for f in self.polls.values()):
             return "a source poll is still running"
-        if self.summarizing and not self.summarizing.done():
-            return "a plain summary of an approval is still being written"
+        if running := [job.doing for job in APPROVAL_JOBS if self.job_running(job)]:
+            return running[0]
         if dashboard.POSTS_IN_FLIGHT.count:
             return "the dashboard is still answering a request"
         if chat.history()["busy"]:

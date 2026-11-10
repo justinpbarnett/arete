@@ -6,7 +6,7 @@ from . import config, diffguard, jev, outbound, paths, state, util
 from .emits import Emit, config_repo
 from .loops import Loop, as_list, blank, check_env, worktree_kinds
 
-PUSH_RULES = ("lines", "deletes", "paths")
+APPROVE_KEYS = ("lines", "deletes", "paths", "reviewer")
 PATCH_SHOWN = 12000
 
 
@@ -21,16 +21,19 @@ class Push(Emit):
             return [f"a {loop.kind} loop's push emit needs check, the command that must pass on the rebased tree "
                     "before the push lands"]
         approve = spec.get("approve", False)
-        if isinstance(approve, dict) and (unknown := sorted(set(approve) - set(PUSH_RULES))):
-            return [f"a push emit's approve table takes {', '.join(PUSH_RULES)}, not {', '.join(unknown)}"]
+        if isinstance(approve, dict) and (unknown := sorted(set(approve) - set(APPROVE_KEYS))):
+            return [f"a push emit's approve table takes {', '.join(APPROVE_KEYS)}, not {', '.join(unknown)}"]
         if not isinstance(approve, bool | dict):
-            return ["a push emit's approve is true, false, or a table of lines, deletes and paths"]
+            return ["a push emit's approve is true, false, or a table of lines, deletes, paths and reviewer"]
         rules = approve if isinstance(approve, dict) else {}
-        lines, globs = rules.get("lines", 0), rules.get("paths", [])
+        lines, globs, reviewer = rules.get("lines", 0), rules.get("paths", []), rules.get("reviewer", "opus")
         if isinstance(lines, bool) or not isinstance(lines, int):
             return [f"a push emit's approve lines is a whole number of lines, such as 80, not {lines!r}"]
         if not isinstance(globs, str | list) or not all(isinstance(g, str) for g in globs):
             return [f"a push emit's approve paths is a list of path patterns, such as [\"src/auth/*\"], not {globs!r}"]
+        if not isinstance(reviewer, str) or blank(reviewer):
+            return [f"a push emit's approve reviewer is the model that reviews a held push, such as \"opus\", "
+                    f"not {reviewer!r}"]
         return []
 
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
@@ -52,6 +55,9 @@ class Push(Emit):
                 "proof": outcome.get("proof")}
 
     def ruled(self, spec: dict, item: dict, cfg: config.Config) -> str:
+        return self.only_a_person(spec, item, cfg) or self.over_limits(spec, item, cfg)
+
+    def only_a_person(self, spec: dict, item: dict, cfg: config.Config) -> str:
         repo = config_repo(cfg, item["repo"])
         layer = config.load_layer(repo.layer_dir if repo else Path(item["workdir"]) / ".agents")
         if layer.trust_level != "automerge":
@@ -62,18 +68,29 @@ class Push(Emit):
         if approve is True:
             return "approve is on"
         rules = approve if isinstance(approve, dict) else {}
+        if touched := [f for f in item["files"] if util.matches_any(f, as_list(rules.get("paths")))]:
+            return f"touches {', '.join(touched[:5])}, which a person reads"
+        return ""
+
+    def over_limits(self, spec: dict, item: dict, cfg: config.Config) -> str:
+        approve = spec.get("approve", False)
+        rules = approve if isinstance(approve, dict) else {}
         if (limit := rules.get("lines")) and item["lines"] > int(limit):
             return f"{item['lines']} lines changed, over the {limit} line approval limit"
         if rules.get("deletes") and item["deleted"]:
             return f"deletes {', '.join(item['deleted'][:5])}"
-        if touched := [f for f in item["files"] if util.matches_any(f, as_list(rules.get("paths")))]:
-            return f"touches {', '.join(touched[:5])}"
-        if jev.ready(cfg, [repo]) and len(item.get("patch", "")) > PATCH_SHOWN:
+        if jev.ready(cfg, [config_repo(cfg, item["repo"])]) and len(item.get("patch", "")) > PATCH_SHOWN:
             return f"the diff runs past the {PATCH_SHOWN} characters JEV reads, so a person reads it whole"
         return ""
 
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
         return self.ruled(spec, item, cfg) or ". ".join(self.objections(item, cfg).values())
+
+    def reviewer(self, spec: dict, item: dict, cfg: config.Config) -> dict:
+        approve = spec.get("approve", False)
+        if not (isinstance(approve, dict) and (model := approve.get("reviewer"))):
+            return {}
+        return {"model": model, "may_land": not self.only_a_person(spec, item, cfg)}
 
     def objections(self, item: dict, cfg: config.Config) -> dict[str, str]:
         if not jev.ready(cfg, [config_repo(cfg, item["repo"])]):

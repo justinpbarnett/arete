@@ -89,7 +89,7 @@ labels = ["agent"]             # ticket: `agent` hands the ticket to the pipelin
 prefix = "[ci] "               # ticket: put before each title
 approve = false                # true holds it until you approve it on the dashboard or with `arete approve ID`
 # type = "pr":     draft = true, labels = [], title = ""; climb and search only
-# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"] }, check = ""; climb and search only; see Push below
+# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"], reviewer = "opus" }, check = ""; climb and search only; see Push below
 # type = "loop":   loop = "fix-it"; hands each finding to that loop as a finding event
 # type = "digest": appends to ~/.local/share/arete/digests/<loop>/<day>.md
 # type = "notify": a desktop notification
@@ -138,6 +138,14 @@ In a search loop, the JEV screen runs as soon as a try makes the check pass, and
 Before the first try of a search run fed by findings, JEV checks whether a commit that landed since the finding's run started, or a push of the same loop that waits for approval, already fixes the finding. At a chance of `[jev] fixed_skip` (0.7) or more, the run ends as done, already fixed by that change, and no agent runs. `arete jev report` shows what came of each verdict.
 
 The approval says which rule held it. Approving it lands it then, and rejecting it deletes the branch. A push that fails to land, because it no longer rebases or the check fails after the rebase, stays listed as a failed approval with its error, so you can try it again or reject it.
+
+`reviewer` in the `approve` table names a model, such as `"opus"`, that reviews each held push before a person does.
+Serve gives it the change rebased onto the current `origin/<base>`, the reason the push was held, the agent's case for it, and read-only tools with git's read commands.
+When it approves with high confidence, the push lands as if a person approved it, and the run's feed says that the reviewer approved it.
+Any other answer leaves the push waiting, with the review beside it on the dashboard and in `arete approve`.
+A push held by the trust level, by a path the repo denies, by `approve = true` or by `paths` always waits for a person, and its review only advises.
+A change that no longer rebases gets a review from git that says so, with no model call.
+A review that fails is tried again after 15 minutes, none starts while the model's usage limit holds, and a failed approval gets none.
 
 ## Safety
 

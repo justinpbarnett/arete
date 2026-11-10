@@ -88,12 +88,20 @@ function approvalRow(a, place) {
     repoCell(a.repo),
     cell([el("div", { text: a.plain_summary || asked }),
       a.failed ? el("div", {}, stateChip("fault"), ` Delivery failed: ${a.failed}`) : null,
+      a.held ? el("div", { class: "muted", text: `Held: ${a.held}.` }) : null,
+      reviewLine(a),
       details ? foldText(`approval:${a.id}`, "Show the details", details) : null,
       a.run_id && place === "needs" ? el("div", {}, itemLink("run", a.run_id, "Open the run that asked", `asked:${a.id}`)) : null]),
     cell(liveAgo(a.created), "nb"),
     cell(el("div", { class: "row-buttons" },
       button(a.failed ? "Try again" : "Approve", "approve", (b) => decide(a.id, true, b, place), { of: a.id }),
       button("Reject", "reject", (b) => decide(a.id, false, b, place), { of: a.id }))));
+}
+
+function reviewLine(a) {
+  const r = a.review || {};
+  if (r.decision) return el("div", {}, el("span", { class: "muted", text: `Review by ${r.by}: ` }), `${r.decision}, ${r.confidence} confidence. ${r.reason}`);
+  return a.reviewer && !a.failed ? el("div", { class: "muted", text: `Review by ${a.reviewer}: not read yet.` }) : null;
 }
 
 function decide(id, yes, btn, place) {

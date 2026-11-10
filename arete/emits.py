@@ -63,6 +63,9 @@ class Emit:
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
         return "approve is on" if spec.get("approve") else ""
 
+    def reviewer(self, spec: dict, item: dict, cfg: config.Config) -> dict:
+        return {}
+
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [findings] if findings or outcome.get("branch") else []
 

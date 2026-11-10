@@ -24,6 +24,7 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
             if trial:
                 log("held", f"would {what}")
             elif why := emit.held(spec, delivery["item"], cfg):
+                delivery |= {"held": why, "reviewer": emit.reviewer(spec, delivery["item"], cfg)}
                 waiting_id = state.add_approval(loop.name, run_id, delivery, what)
                 settle_judged(emit, run_id, "waiting", waiting_id)
                 log("emit", f"waiting for approval #{waiting_id} ({why}): {what}")
@@ -73,8 +74,13 @@ def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -
 def waiting(connect=state.db) -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "repo": repo_of(a),
              "what": a["summary"], "plain_summary": a["plain_summary"],
-             "failed": a["result"] if a["status"] == "failed" else "",
+             "failed": a["result"] if a["status"] == "failed" else "", "held": a["emit"].get("held", ""),
+             "reviewer": reviewer_of(a), "review": a["review"],
              "detail": emit_of(a).detail(a["emit"]["item"])} for a in state.approvals(connect)]
+
+
+def reviewer_of(approval: dict) -> str:
+    return (approval["emit"].get("reviewer") or {}).get("model", "")
 
 
 def emit_of(approval: dict) -> Emit:
@@ -85,7 +91,7 @@ def repo_of(approval: dict) -> str:
     return emit_of(approval).target_repo(approval["emit"]["item"]) or approval["run_repo"]
 
 
-def decide(approval_id: int, yes: bool) -> str:
+def decide(approval_id: int, yes: bool, by: str = "") -> str:
     row = state.approval(approval_id)
     if not row:
         raise LookupError(f"no approval #{approval_id}")
@@ -97,7 +103,7 @@ def decide(approval_id: int, yes: bool) -> str:
 
     def log(kind: str, text: str) -> None:
         if row["run_id"]:
-            state.add_feed(row["run_id"], kind, f"{verb} #{approval_id}, {text}")
+            state.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
 
     settle_judged(emit, row["run_id"], verb, approval_id, ("waiting", "failed", "approved"))
     if not yes:

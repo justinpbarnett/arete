@@ -4,7 +4,7 @@ import re
 import secrets
 import textwrap
 
-from . import config, delivery, paths, pipeline, runner, triage
+from . import config, delivery, paths, pipeline, runner, state, triage
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
 MOST_SENTENCES = 2
@@ -18,6 +18,11 @@ PATH_OR_COMMAND = re.compile(r"`|(?:^|\s)~?/\w|\w/[^\s/]+/")
 
 class NoSummary(RuntimeError):
     pass
+
+
+def note_plain_summary(approval: dict, cfg: config.Config) -> str:
+    state.set_approval_note(approval["id"], "plain_summary", plain_summary(approval, cfg))
+    return ""
 
 
 def plain_summary(approval: dict, cfg: config.Config) -> str:

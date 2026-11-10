@@ -10,6 +10,7 @@ from .agent import SUBSCRIPTION_RUNNER
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
+APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
 PAID_STEP = f"COALESCE(steps.runner, '') != '{SUBSCRIPTION_RUNNER}'"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 SCHEMA = """
@@ -135,7 +136,9 @@ CREATE TABLE IF NOT EXISTS approvals (
     created TEXT,
     decided TEXT,
     plain_summary TEXT DEFAULT '',
-    plain_summary_tried TEXT DEFAULT ''
+    plain_summary_tried TEXT DEFAULT '',
+    review TEXT DEFAULT '',
+    review_tried TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -322,7 +325,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                 for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")],
               ("triage", "closed", "ALTER TABLE triage ADD COLUMN closed TEXT DEFAULT ''"),
               *[("approvals", col, f"ALTER TABLE approvals ADD COLUMN {col} TEXT DEFAULT ''")
-                for col in ("plain_summary", "plain_summary_tried")],
+                for col in APPROVAL_NOTES],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               ("alerts", "repo", "ALTER TABLE alerts ADD COLUMN repo TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
@@ -647,28 +650,28 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str =
 
 def approvals(connect=db) -> list[dict]:
     with connect() as c:
-        return [{**dict(r), "emit": json.loads(r["emit"] or "{}")}
-                for r in c.execute("SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "
-                                   "LEFT JOIN runs r ON r.id = a.run_id "
-                                   f"WHERE a.status IN ({','.join('?' * len(DECIDABLE))}) "
-                                   "ORDER BY a.id DESC LIMIT 100", DECIDABLE)]
+        return [approval_of(r) for r in c.execute("SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "
+                                                 "LEFT JOIN runs r ON r.id = a.run_id "
+                                                 f"WHERE a.status IN ({','.join('?' * len(DECIDABLE))}) "
+                                                 "ORDER BY a.id DESC LIMIT 100", DECIDABLE)]
 
 
-def set_plain_summary(approval_id: int, text: str) -> None:
+def set_approval_note(approval_id: int, note: str, value: str) -> None:
+    if note not in APPROVAL_NOTES:
+        raise ValueError(f"an approval has no note {note}; it has {', '.join(APPROVAL_NOTES)}")
     with db() as c:
-        c.execute(f"UPDATE approvals SET plain_summary = ? WHERE id = ? AND status IN ({','.join('?' * len(DECIDABLE))})",
-                  (text, approval_id, *DECIDABLE))
-
-
-def set_plain_summary_tried(approval_id: int, at: str) -> None:
-    with db() as c:
-        c.execute("UPDATE approvals SET plain_summary_tried = ? WHERE id = ?", (at, approval_id))
+        c.execute(f"UPDATE approvals SET {note} = ? WHERE id = ? AND status IN ({','.join('?' * len(DECIDABLE))})",
+                  (value, approval_id, *DECIDABLE))
 
 
 def approval(approval_id: int) -> dict | None:
     with db() as c:
         r = c.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
-    return {**dict(r), "emit": json.loads(r["emit"] or "{}")} if r else None
+    return approval_of(r) if r else None
+
+
+def approval_of(row) -> dict:
+    return {**dict(row), "emit": json.loads(row["emit"] or "{}"), "review": json.loads(row["review"] or "{}")}
 
 
 def decide_approval(approval_id: int, status: str, result: str = "") -> bool:

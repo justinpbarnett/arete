@@ -653,6 +653,15 @@ def cmd_session(args) -> int:
         return refused(e)
 
 
+def approval_notes(a: dict) -> list[str]:
+    review = a["review"]
+    if review:
+        said = f"review by {review['by']}: {review['decision']}, {review['confidence']} confidence. {review['reason']}"
+    else:
+        said = f"review by {a['reviewer']}: not read yet" if a["reviewer"] and not a["failed"] else ""
+    return [note for note in (f"held: {a['held']}" if a["held"] else "", said) if note]
+
+
 def cmd_approve(args) -> int:
     from . import control, delivery
 
@@ -666,6 +675,9 @@ def cmd_approve(args) -> int:
                 if a["failed"]:
                     print(f"      delivery failed: {a['failed']}"[:240])
                     print(f"      `arete approve {a['id']}` tries again, `--reject` drops it")
+                for line in approval_notes(a):
+                    print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
+                                        subsequent_indent=" " * 8, break_on_hyphens=False))
             if not pending:
                 print("nothing waiting for approval")
             return 0
