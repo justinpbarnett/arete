@@ -141,7 +141,7 @@ def closed_pr_heads(repo: str, head: str) -> set[str]:
 
 
 def pr_body(url: str) -> str:
-    return (gh_json(["pr", "view", url, "--json", "body"]) or {}).get("body") or ""
+    return ((gh_json(["pr", "view", url, "--json", "body"]) or {}).get("body") or "").replace("\r\n", "\n")
 
 
 def pr_diff(url: str) -> str:
