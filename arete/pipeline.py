@@ -1395,6 +1395,10 @@ def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
 
 def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch: str, summary: str,
                            replies: list[dict]) -> tuple[str, str, str]:
+    if run.dry_run:
+        run.log("revise: no code changes; a dry run leaves the review unanswered")
+        remove_workspace(ws, checkouts)
+        return "dry-run", "no code changes for the review", ""
     run.log("revise: no code changes, answering the review")
     answer_feedback(run, replies, "No code change for this one; see the overall reply.")
     run.say(f"No code changes for your review.\n\n{summary.strip()[:3000]}")
