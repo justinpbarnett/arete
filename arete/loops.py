@@ -54,6 +54,8 @@ class Trigger:
     @property
     def summary(self) -> str:
         parts = [self.schedule] if self.schedule else []
+        if self.run_at_load:
+            parts.append("serve start")
         if self.events:
             parts.append(" ".join(self.events))
         if self.metric:
