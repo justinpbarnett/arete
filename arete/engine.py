@@ -353,6 +353,8 @@ def carry(run: LoopRun) -> str:
         status, summary = "skipped", f"budget: {e}"
     except Stopped:
         status, summary = "stopped", record.STOPPED if record.stop_asked(run.id) else "stopped by a signal"
+    except devices.DeviceError as e:
+        status, summary = "failed", util.first_line(str(e), 300)
     except Exception as e:
         run.log("error", traceback.format_exc().strip())
         status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
