@@ -61,7 +61,7 @@ class Push(Emit):
         return self.only_a_person(spec, item, cfg) or self.over_limits(spec, item, cfg)
 
     def only_a_person(self, spec: dict, item: dict, cfg: config.Config) -> str:
-        repo = config_repo(cfg, item["repo"])
+        repo = push_repo(cfg, item)
         layer = config.load_layer(repo.layer_dir if repo else Path(item["workdir"]) / ".agents")
         if layer.trust_level != "automerge":
             return f"the trust level of {item['repo']} is pr, so a person lands each push"
@@ -79,7 +79,7 @@ class Push(Emit):
             return f"{item['lines']} lines changed, over the {limit} line approval limit"
         if rules.get("deletes") and item["deleted"]:
             return f"deletes {', '.join(item['deleted'][:5])}"
-        if jev.ready(cfg, [config_repo(cfg, item["repo"])]) and len(item.get("patch", "")) > PATCH_SHOWN:
+        if jev.ready(cfg, [push_repo(cfg, item)]) and len(item.get("patch", "")) > PATCH_SHOWN:
             return f"the diff runs past the {PATCH_SHOWN} characters JEV reads"
         return ""
 
@@ -92,7 +92,7 @@ class Push(Emit):
         return {"model": model, "may_land": not self.only_a_person(spec, item, cfg)}
 
     def objections(self, item: dict, cfg: config.Config) -> dict[str, str]:
-        if not jev.ready(cfg, [config_repo(cfg, item["repo"])]):
+        if not jev.ready(cfg, [push_repo(cfg, item)]):
             return {}
         run_id, about = item.get("env", {}).get("ARETE_RUN_ID", ""), item.get("about") or item["title"]
         found = {}
@@ -139,6 +139,10 @@ class Push(Emit):
 def approve_rules(spec: dict) -> dict:
     approve = spec.get("approve", False)
     return approve if isinstance(approve, dict) else {}
+
+
+def push_repo(cfg: config.Config, item: dict) -> config.Repo | None:
+    return config_repo(cfg, item["repo"]) or cfg.repo_for_path(item["workdir"])
 
 
 def push_check(spec: dict, loop: Loop) -> str:
