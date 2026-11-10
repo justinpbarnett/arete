@@ -142,7 +142,7 @@ function placeIn(box, marks, fresh) {
   const inView = laidOut.filter(({ top, bottom }) => bottom > shownTop && top < shownBottom)
     .sort(hovering ? (a, b) => fromMouse(a) - fromMouse(b) : (a, b) => inUse.includes(b.node) - inUse.includes(a.node));
   const anchors = !y && !hovering ? [] : inView.length ? inView : laidOut.filter(({ bottom }) => bottom <= shownTop).slice(-1);
-  const vacated = vacatedPress(box, fresh);
+  const vacated = vacatedSpot(box, fresh);
   return {
     pane, x: scrollX, y,
     anchors: anchors.map(({ node, top }) => ({ node, id: box.contains(node) ? marks.idOf(node) : null, top })),
@@ -172,28 +172,19 @@ function scrollPaneOrPage(pane, y, x = scrollX) {
   } else if (scrollX !== x || scrollY !== y) scrollTo(x, y);
 }
 
-function anchorLineAt(line, y, pane) {
-  const drift = middleOf(line) - y;
-  const scrolled = scrolledIn(pane);
-  if (scrolled + drift >= 0) return { drift };
-  gapAt(line.dataset.said).widen(line, -(scrolled + drift));
-  return { drift: -scrolled };
-}
-
-function putLineAt(line, y) {
-  const pane = scrollingPane(line);
-  scrollPaneOrPage(pane, scrolledIn(pane) + anchorLineAt(line, y, pane).drift);
-}
-
-function keepNodeAt(node, y) {
-  const pane = scrollingPane(node);
-  scrollPaneOrPage(pane, scrolledIn(pane) + middleOf(node) - y);
+function scrollPaneOrPageBy(pane, by, x = scrollX) {
+  scrollPaneOrPage(pane, scrolledIn(pane) + by, x);
 }
 
 function keepPlace(place, shownMarks, freshMarks) {
   const { line, pressY } = place.vacated ?? {};
-  const anchor = (line?.checkVisibility() && anchorLineAt(line, pressY, place.pane)) || followAnchors(place, shownMarks, freshMarks);
-  scrollPaneOrPage(place.pane, anchor ? scrolledIn(place.pane) + anchor.drift : place.y, place.x);
+  if (line?.checkVisibility()) {
+    putLineAt(line, pressY, place.x);
+    return;
+  }
+  const anchor = followAnchors(place, shownMarks, freshMarks);
+  if (anchor) scrollPaneOrPageBy(place.pane, anchor.drift, place.x);
+  else scrollPaneOrPage(place.pane, place.y, place.x);
 }
 
 function textPoint(box, marks, node, offset) {
@@ -276,6 +267,7 @@ function fill(id, ...nodes) {
   const shown = [...box.childNodes];
   tickLiveAgos(elementsIn([...shown, ...fresh], "time.ago"));
   if (keepShownIfUnchanged(shown, fresh)) return;
+  const rowSlides = stopRowSlides(box);
   const shownMarks = new Marks(shown);
   const place = placeIn(box, shownMarks, fresh);
   const focusedId = shownMarks.idOf(document.activeElement);
@@ -294,4 +286,5 @@ function fill(id, ...nodes) {
   for (const [key, left, top] of scrolled) rebuilt.get(key)?.scrollTo(left, top);
   keepSelection(box, selected, freshMarks);
   keepPlace(place, shownMarks, freshMarks);
+  slideRowsFrom(box, rowSlides);
 }

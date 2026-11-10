@@ -21,21 +21,17 @@ const SVG = "http://www.w3.org/2000/svg";
 const URL_IN_TEXT = /(https:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
 const HELD = Symbol("held");
 const TOGGLE_FORMS = [{ toggle: "launch-toggle", form: "launch", focus: "launch-prompt" }, { toggle: "loop-new-toggle", form: "loop-new", focus: "loop-new-sentence" }];
-const GAP_HOLD_MS = 1000;
-const GAP_CLOSE_MS = 250;
-const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
 const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 
 let route = null;
 const lastQuery = {};
 let focusAfterDraw = "";
 let mouseAt = null;
+let pointerKnown = false;
 const openQuestions = new Set();
 const drafts = new Map();
 const lastSaid = new Map();
 const saidById = new Map();
-const saidBeside = new Map();
-const heldGaps = new Map();
 let changesInFlight = 0;
 
 class NoAnswer extends Error {}
@@ -96,188 +92,6 @@ function saidLine(place) {
 
 function shownSaidLine(place) {
   return currentSection().querySelector(`[data-said="${CSS.escape(place)}"]`);
-}
-
-function sayAt(place, state, sentence, { focus = true } = {}) {
-  lastSaid.set(place, [state, sentence]);
-  const press = saidBeside.get(place);
-  if (press) press.saidSince = true;
-  const line = shownSaidLine(place);
-  if (!line) return;
-  const box = line.closest("[id]");
-  const control = press?.controlIn(box);
-  const controlWas = control && middleOf(control);
-  const standingInAt = line.dataset.standsFor && line.checkVisibility() ? middleOf(line) : null;
-  sayIn(line, state, sentence);
-  placeSaid(line, [box]);
-  if (control) keepNodeAt(control, controlWas);
-  else if (standingInAt !== null && line.dataset.standsFor) putLineAt(line, standingInAt);
-  if (focus) line.focus();
-  if (control) press.controlMovedBy += middleOf(control) - controlWas;
-}
-
-class Press {
-  constructor(place, control) {
-    const row = control.closest("tr");
-    const line = shownSaidLine(place);
-    this.place = place;
-    this.key = control.dataset.focus;
-    this.later = rowKeysFrom(row, "nextElementSibling");
-    this.earlier = rowKeysFrom(row, "previousElementSibling");
-    this.lineAbove = Boolean(line && !line.hidden && line.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING);
-    this.time = performance.now();
-    this.controlMovedBy = 0;
-    this.saidSince = false;
-    this.waiting = true;
-  }
-
-  controlIn(box) {
-    return box.querySelector(`[data-focus="${CSS.escape(this.key)}"]`);
-  }
-
-  answered() {
-    this.waiting = false;
-    if (saidBeside.get(this.place) === this) gapAt(this.place).hold();
-  }
-}
-
-function keepSaidBeside(place, control) {
-  const press = control.closest("tr") ? new Press(place, control) : null;
-  if (press) saidBeside.set(place, press);
-  else saidBeside.delete(place);
-  if (press?.lineAbove) gapAt(place).hold();
-  else gapAt(place).close();
-  return press;
-}
-
-function rowKeysFrom(row, step) {
-  const keys = [];
-  for (let other = row[step]; other; other = other[step]) {
-    if (!other.matches(".said-row")) keys.push(other.querySelector("[data-focus]")?.dataset.focus);
-  }
-  return keys.filter(Boolean);
-}
-
-function rowHolding(nodes, key) {
-  return key ? elementsIn(nodes, `[data-focus="${CSS.escape(key)}"]`)[0]?.closest("tr") : null;
-}
-
-function firstRowHolding(nodes, keys) {
-  for (const key of keys) {
-    const row = rowHolding(nodes, key);
-    if (row) return row;
-  }
-  return null;
-}
-
-function placeSaid(line, nodes) {
-  delete line.dataset.standsFor;
-  showGap(line, 0);
-  const press = saidBeside.get(line.dataset.said);
-  if (!press) return;
-  const acted = rowHolding(nodes, press.key);
-  if (!acted && !press.saidSince) sayIn(line, null, "Waiting for the answer.");
-  if (line.hidden) return;
-  const later = acted ? null : firstRowHolding(nodes, press.later);
-  const neighbour = acted ?? later ?? firstRowHolding(nodes, press.earlier);
-  if (!neighbour) return;
-  const holder = line.closest("tr.said-row") ?? el("tr", { class: "said-row" }, el("td", {}, line));
-  holder.cells[0].colSpan = neighbour.cells.length;
-  if (later || (acted && press.lineAbove)) neighbour.before(holder);
-  else neighbour.after(holder);
-  showGap(line, gapAt(press.place).height);
-  if (!acted) line.dataset.standsFor = press.key;
-}
-
-function vacatedPress(box, fresh) {
-  const latestFirst = elementsIn(fresh, "p[data-stands-for]")
-    .map((line) => ({ line, press: saidBeside.get(line.dataset.said) }))
-    .sort((a, b) => b.press.time - a.press.time);
-  for (const { line, press } of latestFirst) {
-    const control = press.controlIn(box);
-    if (control?.checkVisibility()) return { line, pressY: middleOf(control) - press.controlMovedBy };
-  }
-  return null;
-}
-
-function showGap(line, height) {
-  if (height) line.style.marginTop = `${height}px`;
-  // Clearing marginTop alone leaves style="", and the next redraw's fresh line would then fail isEqualNode.
-  else line.removeAttribute("style");
-}
-
-class HeldGap {
-  constructor(place) {
-    this.place = place;
-    this.height = 0;
-    this.closing = null;
-    this.pointerMoves = null;
-    this.slide = null;
-  }
-
-  widen(line, by) {
-    this.height += by;
-    showGap(line, this.height);
-    this.hold();
-  }
-
-  hold() {
-    this.stopClosing();
-    if (this.height && !saidBeside.get(this.place)?.waiting) this.closing = setTimeout(() => this.closeOncePointerClears(), GAP_HOLD_MS);
-  }
-
-  stopClosing() {
-    clearTimeout(this.closing);
-    this.pointerMoves?.abort();
-    this.pointerMoves = null;
-    cancelAnimationFrame(this.slide);
-  }
-
-  closeOncePointerClears() {
-    if (!this.wouldSlideUnderPointer()) return this.close();
-    this.pointerMoves = new AbortController();
-    const closeIfClear = () => this.wouldSlideUnderPointer() || this.close();
-    document.addEventListener("pointermove", closeIfClear, { passive: true, signal: this.pointerMoves.signal });
-    document.documentElement.addEventListener("pointerleave", closeIfClear, { signal: this.pointerMoves.signal });
-  }
-
-  wouldSlideUnderPointer() {
-    const line = shownSaidLine(this.place);
-    if (!mouseAt || !line?.checkVisibility()) return false;
-    const sliding = scrollingPane(line) ?? line.closest("main");
-    const gapTop = line.getBoundingClientRect().top - this.height;
-    return mouseAt.y >= gapTop && sliding.contains(document.elementFromPoint(mouseAt.x, mouseAt.y));
-  }
-
-  close() {
-    this.stopClosing();
-    const from = this.height;
-    if (!from || REDUCED_MOTION.matches) return this.showHeight(0);
-    let start = null;
-    const step = (now) => {
-      start ??= now;
-      const done = Math.min((now - start) / GAP_CLOSE_MS, 1);
-      this.showHeight(from * (1 - done) ** 3);
-      if (done < 1) this.slide = requestAnimationFrame(step);
-    };
-    this.slide = requestAnimationFrame(step);
-  }
-
-  showHeight(height) {
-    this.height = height;
-    const line = shownSaidLine(this.place);
-    if (line?.closest("tr.said-row")) showGap(line, height);
-  }
-}
-
-function gapAt(place) {
-  if (!heldGaps.has(place)) heldGaps.set(place, new HeldGap(place));
-  return heldGaps.get(place);
-}
-
-function saidBesideRows(nodes) {
-  for (const line of elementsIn(nodes, "p[data-said]")) placeSaid(line, nodes);
-  return nodes.filter((node) => !node.closest?.("tr.said-row"));
 }
 
 function say(id, state, sentence) {
@@ -502,19 +316,6 @@ function secondsBetween(start, end) {
 function stopWords(what, r, after) {
   if (r.was !== "gone") return `Asked ${what} to stop. ${after}`;
   return r.ticket ? `${what} had already ended; the next pipeline poll marks it stopped and tells its ticket.` : `${what} had already ended, so it is marked stopped.`;
-}
-
-async function act(btn, place, path, body, saying, { meanwhile = null } = {}) {
-  btn.disabled = true;
-  const press = keepSaidBeside(place, btn);
-  if (meanwhile) sayAt(place, null, meanwhile);
-  try {
-    sayAt(place, "ok", saying(await call(path, body)));
-  } catch (e) {
-    sayAt(place, "fault", e.message);
-  }
-  press?.answered();
-  refresh();
 }
 
 function toggleForm(toggleId, formId, focusId, open = document.getElementById(formId).hidden) {

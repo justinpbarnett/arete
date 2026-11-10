@@ -38,18 +38,12 @@ function deviceRow(d) {
     cell(button("Probe", "probe", (b) => probe(d.name, b), { of: d.name }), "probe-cell"));
 }
 
-async function probe(name, btn) {
-  btn.disabled = true;
+function probe(name, btn) {
   btn.textContent = "Probing";
-  const press = keepSaidBeside("devices", btn);
-  try {
+  return answerPress(btn, "devices", async () => {
     const p = await call(`/api/devices/${encodeURIComponent(name)}/probe`, {});
     sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`);
-  } catch (e) {
-    sayAt("devices", "fault", e.message);
-  }
-  press?.answered();
-  refresh();
+  });
 }
 
 function failures(h) {
