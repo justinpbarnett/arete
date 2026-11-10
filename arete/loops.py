@@ -18,7 +18,7 @@ NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
 CLIMB_GOALS = {"max": True, "higher": True, "up": True, "min": False, "lower": False, "down": False}
 FINDING_EVENT = "finding"
-GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
+GITHUB_REMOTE = re.compile(r"github\.com(?::\d+)?[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 
 
 @dataclass
