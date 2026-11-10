@@ -8,7 +8,7 @@ import threading
 from collections import Counter, defaultdict
 from datetime import timedelta
 
-from . import config, devices, emits, hooks, loops, paths, record, sources, state, util
+from . import config, delivery, devices, emits, hooks, loops, paths, record, sources, state, util
 from .loops import Loop
 
 BEAT_FILE = paths.STATE_DIR / "serve.json"
@@ -166,10 +166,10 @@ def feed(run_id: str, after: int = 0) -> dict:
 
 def decide(approval_id: int, yes: bool) -> dict:
     try:
-        return {"id": approval_id, "approved": yes, "result": emits.decide(approval_id, yes)}
+        return {"id": approval_id, "approved": yes, "result": delivery.decide(approval_id, yes)}
     except LookupError as e:
         raise NotFound(str(e)) from e
-    except (ValueError, emits.Failed) as e:
+    except (ValueError, delivery.Failed) as e:
         raise Refused(str(e)) from e
 
 

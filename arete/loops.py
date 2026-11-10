@@ -357,7 +357,7 @@ def proof_problems(loop: Loop) -> list[str]:
 
 
 def validate(loop: Loop, cfg: config.Config) -> None:
-    from .emits import EMITS
+    from .delivery import EMITS
     from .sources import SOURCES, metric_event
 
     problems = []

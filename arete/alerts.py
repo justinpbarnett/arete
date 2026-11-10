@@ -1,23 +1,12 @@
 from __future__ import annotations
 
-import re
 import sys
 
-from . import gh, state, util
+from . import gh, outbound, state, util
 
 LABEL = "arete-alert"
 NOTIFY_SCRIPT = ("-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
                  "-e", "end run")
-SECRETISH = re.compile(r"((?:(?<![A-Za-z])|(?=sk-[a-z-]*[A-Z0-9_]))sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}"
-                       r"|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
-
-
-def redact(text: str) -> str:
-    return SECRETISH.sub("[redacted]", text)
-
-
-def sanitize(text: str, n: int = 200) -> str:
-    return util.first_line(redact(text), n)
 
 
 def notify(title: str, message: str) -> None:
@@ -29,7 +18,7 @@ def notify(title: str, message: str) -> None:
 
 
 def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = False) -> str:
-    status = sanitize(status)
+    status = outbound.sanitize(status)
     prev = state.alert_get(key)
     if dry_run:
         return f"would {'refresh' if prev else 'open'} alert {key}: {status}"

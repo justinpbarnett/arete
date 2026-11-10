@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
-from . import config, control, emits, gh, loops, paths, pipeline, sessions, state, tracker, triage, util
+from . import config, control, delivery, gh, loops, paths, pipeline, sessions, state, tracker, triage, util
 from .agent import SUBSCRIPTION_RUNNER
 
 RECENT_RUNS = 25
@@ -214,7 +214,7 @@ def live_board(draft: dict | None) -> dict:
 
 
 def needs_you(running: list[dict], board, draft: dict | None) -> dict:
-    return {"approvals": panel(lambda: emits.waiting(connect=state.reader)),
+    return {"approvals": panel(lambda: delivery.waiting(connect=state.reader)),
             "skipped": panel(lambda: skipped(running)), "proposals": panel(proposals),
             "ready": panel(lambda: ready_in_one_click(board())), "draft": draft}
 
@@ -290,7 +290,7 @@ def run_board(run_id: str) -> dict:
             "run": {**r, "ticket": ticket(r), "paid": state.paid_by_run([run_id], state.reader).get(run_id, 0)},
             "models": sorted(({**m, "cost_usd": round(m["cost_usd"], 4)} for m in models.values()),
                              key=lambda m: (-m["cost_usd"], m["model"])),
-            "approvals": [a for a in emits.waiting(connect=state.reader) if a["run_id"] == run_id],
+            "approvals": [a for a in delivery.waiting(connect=state.reader) if a["run_id"] == run_id],
             "lines_from": "feed" if r["kind"] in FEED_KINDS else "log",
             "session": {"prompt": spec.get("prompt", ""), "tools": spec.get("tools", []),
                         "cwd": paths.short_path(spec.get("cwd", "")), "repo": spec.get("repo", "")} if spec else None}

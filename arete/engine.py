@@ -16,16 +16,18 @@ from datetime import timedelta
 from pathlib import Path
 
 from . import (
-    alerts,
     config,
     control,
+    delivery,
     devices,
     diffguard,
     emits,
     gh,
     jev,
     loops,
+    outbound,
     paths,
+    push,
     record,
     runner,
     sources,
@@ -424,7 +426,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events),
                **({"value": value} if value is not None else {})}
     if loop.emits:
-        emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", took + (f", {util.count(len(fresh), 'new finding')}" if found else "")
 
 
@@ -487,8 +489,8 @@ def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
         a = reply.answers.get("twin")
         if a and a.value != "new" and a.value in options and a.sure(run.cfg.jev.confidence):
             twins[id(f)] = known[int(str(a.value)[1:])]
-            run.log("finding", f"JEV matches it to a known finding ({a.note()}): {emits.plain(f.get('title'), 200)}"
-                               f" is {emits.plain(twins[id(f)]['title'], 200)}")
+            run.log("finding", f"JEV matches it to a known finding ({a.note()}): {outbound.plain(f.get('title'), 200)}"
+                               f" is {outbound.plain(twins[id(f)]['title'], 200)}")
     return twins
 
 
@@ -507,8 +509,8 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
             is_new = not state.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
             is_new = state.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
-                                          emits.plain(f.get("title"), 200), "", run.id)
-        run.log("finding", f"{'new' if is_new else 'seen before'}: {emits.plain(f.get('title'), 200)}")
+                                          outbound.plain(f.get("title"), 200), "", run.id)
+        run.log("finding", f"{'new' if is_new else 'seen before'}: {outbound.plain(f.get('title'), 200)}")
         if is_new:
             fresh.append(f)
     return fresh
@@ -577,7 +579,7 @@ def classify(run: LoopRun, events: list[dict]) -> list[dict]:
 
 
 def known_finding(row: dict) -> str:
-    title = emits.plain(row["title"], 160)
+    title = outbound.plain(row["title"], 160)
     return f"- `{row['fingerprint_text']}`: {title}" if row.get("fingerprint_text") else f"- {title}"
 
 
@@ -632,7 +634,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
     outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events)}
     if fresh or any(e["type"] == "metric" for e in loop.emits):
-        emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", f"{summary} ({util.count(len(fresh), 'new finding')}, {len(found) - len(fresh)} seen before)"
 
 
@@ -827,7 +829,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                    "report": f"Climbed `{spec['measure']}` from {number_text(baseline)} to {number_text(best)}.\n\n"
                    + "\n".join(history)}
         drop_worktree(ws)
-        emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
         return "done", summary
     finally:
         close_workspace(ws, keep_branch=kept and not run.trial)
@@ -840,7 +842,7 @@ def problem(run: LoopRun) -> str:
                            for f in found)
     else:
         text = json.dumps(run.events, indent=1, default=str) if run.events else loops.prompt_text(run.loop)
-    return alerts.redact(text)[:PROBLEM_SHOWN]
+    return outbound.redact(text)[:PROBLEM_SHOWN]
 
 
 def proof_file(run: LoopRun) -> Path | None:
@@ -904,7 +906,7 @@ def landed_fixes(run: LoopRun, ws: Workspace, found: list[dict]) -> list[tuple[s
         sha, when, subject = (line.split(" ", 2) + ["", ""])[:3]
         if when.isdigit() and int(when) >= min(starts):
             patch = util.git(["show", "--format=", "--no-renames", sha], ws.wt, check=False)
-            landed.append((f"{sha[:10]} {util.first_line(subject, 120)}", alerts.redact(patch)[:emits.PATCH_SHOWN]))
+            landed.append((f"{sha[:10]} {util.first_line(subject, 120)}", outbound.redact(patch)[:push.PATCH_SHOWN]))
     return landed[:FIXES_ASKED]
 
 
@@ -921,7 +923,7 @@ def already_fixed(run: LoopRun, ws: Workspace) -> str:
     candidates = landed_fixes(run, ws, found) + waiting_fixes(run)
     if not candidates:
         return ""
-    matches = jev.fixed(problem(run), candidates, emits.plain(found[0].get("title"), 120), run.cfg,
+    matches = jev.fixed(problem(run), candidates, outbound.plain(found[0].get("title"), 120), run.cfg,
                         trace=(run.id, "fixed check jev"))
     if matches and matches[0].sure:
         return f"already fixed by {matches[0].ref} (JEV p {matches[0].p:.2f})"
@@ -993,7 +995,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             fix = f"try {i}: hit: {idea}"
             history.append(f"- {fix}")
             run.log("hit", f"try {i}: {idea}")
-            held = {} if run.trial else emits.objections(run.loop, run.id, search_outcome(run, ws, history, i, fix),
+            held = {} if run.trial else delivery.objections(run.loop, run.id, search_outcome(run, ws, history, i, fix),
                                                          run.cfg)
             for kind, why in held.items():
                 history.append(f"- try {i}: held by {HELD_BY[kind]}: {why}")
@@ -1005,7 +1007,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
                                 f"no hit in {util.count(tries, 'try', 'tries')}")
         outcome = search_outcome(run, ws, history, tries, fix)
         drop_worktree(ws)
-        emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
         return "done", outcome["summary"]
     finally:
         close_workspace(ws, keep_branch=bool(fix) and not run.trial)

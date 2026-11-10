@@ -4,7 +4,7 @@ import re
 import secrets
 import textwrap
 
-from . import config, emits, paths, pipeline, runner, triage
+from . import config, delivery, paths, pipeline, runner, triage
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
 MOST_SENTENCES = 2
@@ -22,9 +22,9 @@ class NoSummary(RuntimeError):
 
 def plain_summary(approval: dict, cfg: config.Config) -> str:
     item = approval["emit"]["item"]
-    text = pipeline.prompt("explain", loop=approval["loop"], repo=emits.repo_of(approval) or "none",
+    text = pipeline.prompt("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
                            mark=secrets.token_hex(8), action=approval["summary"],
-                           briefing=emits.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
+                           briefing=delivery.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
     res = runner.run(text, paths.STATE_DIR, model=cfg.model("explain"), tools=[], mcp_config=triage.NO_MCP_SERVERS,
                      json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS, wait_out_limits=False,
                      trace=("", f"plain summary #{approval['id']}"), cfg=cfg)
