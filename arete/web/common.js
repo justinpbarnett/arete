@@ -201,8 +201,9 @@ function withLinks(text) {
   return text.split(URL_IN_TEXT).map((part, i) => (i % 2 ? link(part, part) : document.createTextNode(part)));
 }
 
-function wholeWords(text) {
-  return text.split(" ").flatMap((word, i) => [i ? " " : null, el("span", { class: "nb", text: word })]).filter(Boolean);
+function breakOnlyAt(text, separator) {
+  if (!text) return "";
+  return text.split(separator).flatMap((part, i) => [i ? separator : null, el("span", { class: "nb", text: part })]).filter(Boolean);
 }
 
 function wrapAtSlashes(text) {
@@ -252,7 +253,7 @@ function rowLink(kind, id, text) {
 }
 
 function runName(r) {
-  return r.ticket ? wholeWords(r.ticket) : r.id;
+  return r.ticket ? breakOnlyAt(r.ticket, " ") : r.id;
 }
 
 function clampedSummary(text) {

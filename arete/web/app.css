@@ -192,7 +192,7 @@ th.c-run-buttons { width: 130px; }
 th.c-model { width: 190px; }
 th.c-probe { width: 134px; }
 th.c-loop { min-width: 160px; }
-@container (max-width: 879.98px) { td.last-run, td.run-status, th.c-paid-day { white-space: normal; } }
+@container (max-width: 879.98px) { td.last-run, td.run-status, td.loop-trigger, th.c-paid-day { white-space: normal; } }
 th.c-device { min-width: 200px; }
 @container (min-width: 720px) { th.c-work { min-width: 150px; } }
 @container (max-width: 560px) {

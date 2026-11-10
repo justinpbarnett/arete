@@ -150,7 +150,7 @@ function drawTriage(panel, r) {
           picked.rows.map((row) => linkedRow(detailHash("ticket", row.ref),
             cell(rowLink("ticket", row.ref, shortRef(row.ref)), "nb"),
             cell([row.title, row.summary ? el("div", { class: "muted", text: row.summary }) : null]),
-            cell(row.prs ? [...wholeWords(row.verdict), el("br"), ...pullLinks(row.prs)] : wholeWords(row.verdict)))))
+            cell(row.prs ? [...breakOnlyAt(row.verdict, " "), el("br"), ...pullLinks(row.prs)] : breakOnlyAt(row.verdict, " ")))))
         : quiet("None.")] : quiet("Triage has no groups yet."));
   if (r.detail) drawTicket(groups, r.detail.id, t.researching);
   return t.refreshing || t.researching ? LIVE_MS : SLOW_MS;

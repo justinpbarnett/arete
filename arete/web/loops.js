@@ -35,7 +35,7 @@ function loopLastRun(l) {
 
 function loopTrigger(l) {
   const next = l.next_due ? `next ${clock(l.next_due)}` : "";
-  return [el("span", { class: "nb", text: l.trigger }), el("div", { class: "muted", text: [l.kind, next].filter(Boolean).join(" · ") })];
+  return [...breakOnlyAt(l.trigger, ", "), el("div", { class: "muted", text: [l.kind, next].filter(Boolean).join(" · ") })];
 }
 
 function loopButtons(l, place) {
@@ -50,7 +50,7 @@ function loopRow(l) {
   return linkedRow(detailHash("loop", l.name),
     cell([rowLink("loop", l.name, l.name), el("div", { class: "muted", text: l.error || l.description })]),
     cell(l.error ? stateChip("fault") : l.enabled ? "on" : "off", "nb"),
-    cell(loopTrigger(l)),
+    cell(loopTrigger(l), "nb loop-trigger"),
     cell(loopLastRun(l), "last-run"),
     cell(paidMoney(l.spent_24h), "num"),
     cell(el("div", { class: "loop-buttons" }, loopButtons(l, "loops"))));
@@ -129,7 +129,7 @@ function budgetWords(d) {
 
 function loopFacts(d) {
   return el("dl", { class: "w" },
-    fact("On", d.enabled ? "on" : "off"), fact("Kind", d.kind), fact("Folder", pathCode(d.dir)), fact("Trigger", d.trigger),
+    fact("On", d.enabled ? "on" : "off"), fact("Kind", d.kind), fact("Folder", pathCode(d.dir)), fact("Trigger", breakOnlyAt(d.trigger, ", ")),
     fact("Webhook", d.webhook_path ? el("code", { text: `POST ${d.webhook_path}` }) : ""),
     fact("Repo", d.repo), fact("Model", modelOnRunner(d.model, d.runner)),
     fact("Device", d.device), fact("Queue", d.queue === d.name ? "its own" : d.queue), fact("Budget", budgetWords(d)),
