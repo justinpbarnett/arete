@@ -114,7 +114,7 @@ def run(
                       session=resume, runner="pi", model=model)
     cwd = cwd if remote else Path(cwd).absolute()
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
-    sandboxed = bool(remote and remote.sandbox)
+    sandboxed = bool(remote and remote.exe_sandbox)
     if sandboxed:
         # A sandbox is deleted after its run and holds no git credentials, so the rules against git writes guard nothing.
         disallowed_tools = [t for t in disallowed_tools or [] if not is_pattern_rule(t)]

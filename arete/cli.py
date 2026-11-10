@@ -400,7 +400,7 @@ def serve_line(beat: dict) -> str:
     if not beat:
         return "serve: never ran; `arete install` starts it"
     if not beat["alive"]:
-        return f"serve: DOWN, last beat {when(beat.get('at'))}"
+        return f"serve: DOWN, {'its process is gone, ' if beat['process_gone'] else ''}last beat {when(beat.get('at'))}"
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
             f"{beat['running']} running, {beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else ""))
 

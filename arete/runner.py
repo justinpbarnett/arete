@@ -84,11 +84,11 @@ def agent_problems(run_with: str, tools: list[str]) -> list[str]:
 
 
 def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
-    return SANDBOX_RUNS_PI if device.sandbox and route(model, run_with)[0] == "claude" else ""
+    return SANDBOX_RUNS_PI if device.exe_sandbox and route(model, run_with)[0] == "claude" else ""
 
 
 def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:
-    if route(model, run_with)[0] != "pi" or device.sandbox:
+    if route(model, run_with)[0] != "pi" or device.exe_sandbox:
         return {}
     reasons: dict[str, list[str]] = {}
     for tool in tools:

@@ -17,6 +17,7 @@ from . import (
     config,
     control,
     dashboard,
+    devices,
     engine,
     explain,
     hold_review,
@@ -126,6 +127,7 @@ class Server:
         live = [x for x in every_loop if x.enabled and not x.error]
         for row in record.reap(tickets=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
+            self.swept = 0.0
         states = state.loop_states()
         now = util.now()
         for loop in live:
@@ -202,9 +204,18 @@ class Server:
 
     def sweep_vms(self) -> None:
         try:
-            record.sweep_vms(self.say)
+            devices.sweep(self.sweep_log)
         except Exception as e:
             self.say(f"sweeping left-over VMs failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+
+    def sweep_log(self, run_id: str | None) -> Callable[[str], None]:
+        if not run_id:
+            return self.say
+
+        def log(text: str) -> None:
+            state.add_feed(run_id, "device", f"arete serve: {text}")
+            self.say(f"{run_id}: {text}")
+        return log
 
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)

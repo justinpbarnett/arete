@@ -3,11 +3,10 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from datetime import timedelta
 
-from . import devices, paths, state, util
+from . import paths, state, util
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -110,12 +109,11 @@ def dead(row: dict):
             yield free
 
 
-def interrupt(row: dict) -> dict | None:
+def interrupt(row: dict, notes: Sequence[str] = ()) -> dict | None:
     if not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
-    devices.release(row["id"], lambda text: state.add_feed(row["id"], "device", text))
     status = dead_status(row)
-    summary = STOPPED if status == "stopped" else INTERRUPTED
+    summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
     settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
     if settled and row["kind"] == "draft":
         shutil.rmtree(paths.draft_dir(row["id"]), ignore_errors=True)
@@ -132,17 +130,3 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
                 then(done)
                 settled.append(done)
     return settled
-
-
-def sweep_vms(say: Callable[[str], None]) -> None:
-    probes_made_before = util.iso(util.now() - timedelta(minutes=devices.PROBE_SANDBOX_MINUTES))
-    failing_before = util.iso(util.now() - timedelta(days=devices.SWEEP_GIVES_UP_DAYS))
-    for vm in state.vms_left_over(probes_made_before):
-        devices.sweep(vm, failing_before, feed_and_say(vm["run_id"], say) if vm["run_id"] else say)
-
-
-def feed_and_say(run_id: str, say: Callable[[str], None]) -> Callable[[str], None]:
-    def log(text: str) -> None:
-        state.add_feed(run_id, "device", f"arete serve: {text}")
-        say(f"{run_id}: {text}")
-    return log

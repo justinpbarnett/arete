@@ -361,7 +361,7 @@ def carry(run: LoopRun) -> str:
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         state.drop_claimed_items(run.id)
-    return settle(run, status, summary)
+    return settle(run, status, devices.with_left_up(summary, run.id))
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:

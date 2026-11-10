@@ -66,9 +66,10 @@ def stop_run(run_id: str) -> dict:
         if gone:
             if not (r := record.ask_stop(run_id)):
                 raise NotFound(f"no run {run_id}")
+            devices.release(run_id, lambda text: state.add_feed(run_id, "device", text))
             if r["kind"] in record.TICKET_KINDS:
                 return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
-            record.interrupt(r)
+            record.interrupt(r, devices.left_up(run_id))
             return {"id": run_id, "stopped": True, "was": "gone"}
     if not r["pid"]:
         raise Refused(f"{run_id} is still starting; stop it again in a moment")
@@ -87,7 +88,8 @@ def serve_beat() -> dict:
     data = util.read_json(BEAT_FILE, {})
     if data.get("at"):
         data["age_seconds"] = round((util.now() - util.parse_iso(data["at"])).total_seconds())
-        data["alive"] = util.pid_alive(data.get("pid")) and data["age_seconds"] < BEAT_STALE_SECONDS
+        data["process_gone"] = not util.pid_alive(data.get("pid"))
+        data["alive"] = not data["process_gone"] and data["age_seconds"] < BEAT_STALE_SECONDS
     return data
 
 

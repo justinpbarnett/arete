@@ -34,7 +34,7 @@ function deviceRow(d) {
     cell(d.kind), cell(host, "muted-cell"),
     cell(p ? [stateChip(p.ok ? "ok" : "fault"), el("br"), el("span", { class: "muted" }, liveAgo(p.at))] : "not probed", "nb"),
     cell(probeWords(p) || d.error || "", "muted-cell"),
-    cell([p ? (p.tools || []).join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
+    cell([p?.ok && p.tools ? p.tools.join(", ") || "none found" : "", p?.gpus?.length ? el("div", { text: p.gpus.join(", ") }) : null]),
     cell(button("Probe", "probe", (b) => probe(d.name, b), { of: d.name }), "probe-cell"));
 }
 
@@ -44,7 +44,7 @@ async function probe(name, btn) {
   keepSaidBeside("devices", btn);
   try {
     const p = await call(`/api/devices/${encodeURIComponent(name)}/probe`, {});
-    sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`);
+    sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `Probe of ${name}: ${p.detail || "no detail"}.`);
   } catch (e) {
     sayAt("devices", "fault", e.message);
   }
@@ -66,7 +66,7 @@ function failures(h) {
 
 function healthSummary(h, failed) {
   const unread = [h.checks, h.alerts, h.devices].filter((p) => !("rows" in p)).length;
-  const serveDown = !h.serve.at ? "serve has never run" : !h.serve.alive ? "serve is down" : "";
+  const serveDown = !h.serve.at ? "serve has never run" : !h.serve.alive ? (h.serve.process_gone ? "serve's process is gone" : "serve looks stuck") : "";
   const { faults, cautions } = countStates(failed.map((f) => f.state));
   const parts = [serveDown, faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",
     unread ? `${count(unread, "part", "parts")} could not be read` : ""].filter(Boolean);

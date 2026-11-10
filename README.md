@@ -79,6 +79,7 @@ note = "Hetzner box"
 A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
 Each run gets a VM of its own, works on it over ssh, and deletes it when the run ends.
 Arete reaches exe.dev as `ssh exe.dev` with your own ssh key, so it stores no exe.dev key.
+Every exe.dev VM shows exe.dev's own host key, so arete checks any `*.exe.xyz` host against your `known_hosts` line for `exe.dev`, and writes no line of its own.
 
 ```toml
 [device.sandbox]
@@ -91,32 +92,6 @@ note = "a fresh sandbox per run"
 A sandbox is named `arete-` and its run id, and is tagged `arete`; a copy of a template also keeps the template's tags.
 `keep = true` leaves the sandbox up after the run and logs the `ssh exe.dev rm NAME` that deletes it; exe.dev bills it until then.
 A probe of an `exe` device makes a real sandbox, checks that it answers, and deletes it.
-
-Arete writes each sandbox and proxmox clone to its state database before it asks for one, and strikes it off once the delete is confirmed.
-When a run dies before it can delete its VM, `arete loop stop`, `arete session stop` or the next reap deletes it.
-Every 5 minutes, `arete serve` deletes any VM still on that list whose run has ended, and any probe VM older than 10 minutes.
-That catches a delete that failed, a create that got no answer or was stopped, and a probe that was killed.
-A create that exe.dev refuses leaves nothing to delete, but ssh cannot tell a lobby it never reached from a connection that dropped after the VM was made, so a create with no answer stays on the list until a delete settles it.
-After 7 days of failed deletes, `arete serve` logs the command that deletes the VM and stops trying.
-A VM of a `keep = true` device leaves the list once it is up, so arete never deletes it.
-
-A device of kind `proxmox` clones a template VM on a Proxmox VE host for each run:
-
-```toml
-[device.pve]
-kind = "proxmox"
-host = "root@pve.lan"         # the Proxmox VE host, reached over ssh
-template = "9000"             # the VM id of the template to clone
-user = "root"                 # the login on the clone; root when left out
-note = "a linked clone per run"
-```
-
-Each run gets a linked clone of the template, named `arete-` and its run id.
-Arete starts the clone, asks the QEMU guest agent for its address, and reaches it over ssh with the Proxmox host as the jump host.
-So the template needs `qemu-guest-agent` running and your ssh key in the login's `authorized_keys`.
-Arete destroys the clone when the run ends, unless the device sets `keep = true`.
-Before it destroys a clone, arete checks that the VM id still holds a VM of that name.
-A probe of a `proxmox` device reads the template's config and makes no clone.
 
 Agents in a sandbox run on pi, which reads `~/.pi/agent/models.json` on the VM; a loop or session that would run claude there is refused.
 Make the template a regular VM with `ssh exe.dev new --name=arete-template`, and give it a `models.json` whose providers go through exe.dev integrations:
@@ -143,6 +118,35 @@ sed -nE 's/^(export )?OPENROUTER_API_KEY=//p' ~/.config/arete/pi.env | tr -d "\"
 A model is then `openrouter/` and an OpenRouter model id.
 In a sandbox, pi gets Bash, Edit and Write, and runs without the rules against git writes, because the VM holds nothing to push with and is deleted after the run.
 Keep it that way: never put git or GitHub credentials on a template.
+
+A device of kind `proxmox` clones a template VM on a Proxmox VE host for each run:
+
+```toml
+[device.pve]
+kind = "proxmox"
+host = "root@pve.lan"         # the Proxmox VE host, reached over ssh
+template = "9000"             # the VM id of the template to clone
+user = "root"                 # the login on the clone; root when left out
+note = "a linked clone per run"
+```
+
+Each run gets a linked clone of the template, named `arete-` and its run id.
+Arete starts the clone, asks the QEMU guest agent for its address, and reaches it over ssh with the Proxmox host as the jump host.
+So the template needs `qemu-guest-agent` running and your ssh key in the login's `authorized_keys`.
+Arete destroys the clone when the run ends, unless the device sets `keep = true`.
+Before it destroys a clone, arete checks that the VM id still holds a VM of that name.
+A probe of a `proxmox` device reads the template's config and makes no clone.
+
+Arete writes each sandbox and proxmox clone to its state database before it asks for one, and strikes it off once a delete confirms it is gone.
+`arete loop stop` and `arete session stop` delete the VM of a run that died before it could.
+Every 5 minutes, and right after it reaps a dead run, `arete serve` deletes any VM still on that list whose run has ended, and any probe VM older than 10 minutes.
+That catches a delete that failed, a create that got no answer or was stopped, and a probe that was killed.
+A create that ssh could not send, because it could not reach or log in to the host, leaves nothing to delete, and arete strikes it off at once.
+A create that the host refuses is struck off once a delete confirms that nothing is left.
+A connection can also drop after the VM is made, so a create with no answer stays on the list for 10 minutes even when a delete finds nothing, since the host may still finish it.
+A run whose VM could not be deleted says so in its summary, with the command that deletes it.
+After 7 days of failed deletes, `arete serve` logs that command and stops trying.
+A VM of a `keep = true` device leaves the list once it is up, so arete never deletes it.
 
 A session is an agent you start by hand and talk to, on any device, model and tool set:
 

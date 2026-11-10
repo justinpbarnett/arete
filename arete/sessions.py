@@ -253,7 +253,7 @@ def execute(session_id: str) -> str:
             status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        close(spec, status, summary)
+        close(spec, status, devices.with_left_up(summary, session_id))
         return status
 
 
