@@ -20,5 +20,8 @@ required-version = ">=0.10.2"
 module-name = "arete"
 module-root = ""
 
+[tool.ruff]
+line-length = 120
+
 [tool.ruff.lint]
 ignore = ["BLE001"]

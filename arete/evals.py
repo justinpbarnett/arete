@@ -493,7 +493,7 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
     root = paths.RUNS_DIR / record.new_id("eva", "prompts")
     arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
             "pr": Prompts(root / "pr", f"origin/{branch}")}
-    main, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
+    _, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
     fork = git(["merge-base", arms["main"].label, arms["pr"].label], arete.path).strip()
     before = export_prompts(arete, fork, root / "fork")
     changed = sorted(name for name in before.keys() | pr.keys() if before.get(name) != pr.get(name))
