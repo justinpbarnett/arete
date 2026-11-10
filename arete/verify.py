@@ -204,6 +204,6 @@ def push_evidence(src: Path, github: str, run_id: str, files: list[Path]) -> dic
         rows = "".join(f"{row}\n" for row in git(["ls-tree", old[0]], src).splitlines()
                        if not row.endswith(f"\t{run_id}"))
     root = git(["mktree"], src, input=rows + f"040000 tree {run_tree}\t{run_id}\n").strip()
-    commit = git(["commit-tree", root, *(["-p", old[0]] if old else []), "-m", f"evidence for run {run_id}"], src).strip()
+    commit = git([*util.commit_identity(src), "commit-tree", root, *(["-p", old[0]] if old else []), "-m", f"evidence for run {run_id}"], src).strip()
     git(["push", "-q", "origin", f"{commit}:refs/heads/{EVIDENCE_BRANCH}"], src, timeout=300)
     return {f.name: f"https://github.com/{github}/blob/{commit}/{run_id}/{f.name}?raw=true" for f in files}

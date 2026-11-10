@@ -418,7 +418,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
             print(f"{repo.name}: refused, {refusal}")
             return "", []
         fixes = util.count(len(landed), "mined fix", "mined fixes")
-        git(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
+        git([*util.commit_identity(wt), "commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
         if not remote_head(repo.path, branch):
             with util.repo_lock(repo.path):
                 git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)

@@ -1106,7 +1106,7 @@ def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
 def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
     for c in changed:
         try:
-            git(["commit", "-q", "-m", message], c.wt)
+            git([*util.commit_identity(c.wt), "commit", "-q", "-m", message], c.wt)
         except RuntimeError as e:
             raise RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
     moved = [c.github for c in checkouts if remote_head(c.src, branch) != c.lease]
@@ -1240,7 +1240,7 @@ def merge_moved_bases(run: Run, checkouts: list[Checkout], log_prefix: str = "")
         try:
             if git(["rev-list", "--count", f"HEAD..{c.origin_base}"], c.wt).strip() == "0":
                 continue
-            git(["merge", "-q", "--no-edit", c.origin_base], c.wt)
+            git([*util.commit_identity(c.wt), "merge", "-q", "--no-edit", c.origin_base], c.wt)
         except RuntimeError as e:
             git(["merge", "--abort"], c.wt, check=False)
             run.log(f"{log_prefix}could not merge `{c.origin_base}` into the branch in {c.github}, so this run works "
@@ -1588,7 +1588,7 @@ def commit_layer(layer_dir: Path, message: str) -> None:
         git(["init", "-q"], layer_dir)
     git(["add", "-A", "--", "."], layer_dir)
     if util.sh(["git", "diff", "--cached", "--quiet", "--", "."], cwd=layer_dir).returncode:
-        git(["commit", "-q", "-m", message, "--", "."], layer_dir)
+        git([*util.commit_identity(layer_dir), "commit", "-q", "-m", message, "--", "."], layer_dir)
 
 
 def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[dict]:
@@ -1881,7 +1881,7 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
         if new == text:
             return
         f.write_text(new)
-        git(["commit", "-q", "-am", "chore(agents): raise trust to automerge"], wt)
+        git([*util.commit_identity(wt), "commit", "-q", "-am", "chore(agents): raise trust to automerge"], wt)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt)
         for lb in labels:
             gh.ensure_label(repo.github, lb, "0e8a16", "Trust level change proposed by arete")

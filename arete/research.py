@@ -113,7 +113,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
         util.git(["add", "--", path], wt)
         if not util.git(["diff", "--cached", "--name-only"], wt).strip():
             return gh.open_pr_url(h.repo.github, branch) or f"https://github.com/{h.repo.github}/blob/{base}/{path}"
-        util.git(["commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
+        util.git([*util.commit_identity(wt), "commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
         util.git(["push", "-q", "--force", "-u", "origin", branch], wt)
         if url := gh.open_pr_url(h.repo.github, branch):
             gh.pr_edit_body(url, body)
