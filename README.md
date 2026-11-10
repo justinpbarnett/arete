@@ -132,7 +132,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `arete_repo` | Name of the `[[repo]]` that is this checkout. Its step prompts are harness files the miner may change. Default `arete`. |
 | `max_parallel` | Most pipeline runs at once on the machine. Default 1. |
 | `max_parallel_per_repo` | Most pipeline runs poll keeps going in one repo, runs in their CI wait included. Default 1. |
-| `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `chat` (the dashboard console). A role left out uses the claude CLI default, except `triage`, which uses haiku, and `research` and `chat`, which use opus. `arete status` lists each role's model. |
+| `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop` and `session`, which use sonnet, and `research` and `chat`, which use opus. `arete status` lists each role's model. |
 | `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly transcript digest. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
@@ -399,7 +399,7 @@ Close or Escape on an open item goes back to where you opened it, with focus on 
 Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, ticket or action.
 `g` and a letter goes to a view, `c` opens or closes the console, and `?` lists the keys.
 
-- Live: Running now, with each run's start, last step and time, and Stop; then Needs you: the pushes waiting for approval with Approve and Reject, a failed delivery with Try again, the ready tickets one press sends to the pipeline, the skipped tickets with Run anyway, the console's drafted issue, and the harness fixes and memory facts the miner leaves for you to make by hand, each with Mark done.
+- Live: Running now, with each run's start, last step and time, and Stop; then Needs you, where each row names its repo: the pushes waiting for approval with Approve and Reject, each led by a plain summary that the `explain` model writes about a minute after it arrives, a failed delivery with Try again, the ready tickets one press sends to the pipeline, the skipped tickets with Run anyway, the console's drafted issue, and the harness fixes and memory facts the miner leaves for you to make by hand, each with Mark done.
   None of these buttons asks you to confirm.
   Below them are the tickets waiting on review comments.
 - Runs: every run, the running ones first and then the newest, filtered by status, kind, repo and loop, with Show 25 more.

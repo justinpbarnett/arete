@@ -66,7 +66,7 @@ function drawRunDetail(pane, result, kind) {
       fact("Pull request", r.pr_url ? pullLinks(r.pr_url) : ""),
       fact("Summary", r.summary ? withLinks(r.summary) : "")),
     board.approvals.length ? [el("h3", { text: "Waiting for you" }),
-      table("", [["Kind", "c-kind"], ["What"], ["Since", "c-time"], ["", "c-decide"]], board.approvals.map((a) => approvalRow(a, place)), { stack: true })] : null,
+      table("", NEEDS_HEADS, board.approvals.map((a) => approvalRow(a, place)), { stack: true })] : null,
     s ? [el("h3", { text: "Session" }), el("dl", { class: "w" },
       fact("Folder", s.cwd ? el("code", { text: s.cwd }) : ""), fact("Repo", s.repo), fact("Tools", s.tools.join(", ") || "none")),
     s.prompt ? foldText(`prompt:${id}`, "Show the first message", s.prompt) : null] : null,

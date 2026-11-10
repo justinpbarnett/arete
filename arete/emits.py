@@ -93,6 +93,12 @@ class Emit:
     def detail(self, item: dict) -> str:
         return ""
 
+    def briefing(self, item: dict) -> str:
+        return self.detail(item)
+
+    def target_repo(self, item: dict) -> str:
+        return ""
+
     def rejected(self, item: dict) -> None:
         pass
 
@@ -131,6 +137,9 @@ class Ticket(Emit):
 
     def describe(self, item: dict) -> str:
         return f"file a ticket on {item['repo']} [{', '.join(item['labels'])}]: {item['title']}"
+
+    def target_repo(self, item: dict) -> str:
+        return item["repo"]
 
     def detail(self, item: dict) -> str:
         return item["body"]
@@ -260,13 +269,20 @@ class Push(Emit):
 
     def describe(self, item: dict) -> str:
         return (f"push {item['branch']} to {item['base']} of {item['repo']} after `{item['check']}` passes "
-                f"({item['lines']} lines in {util.count(len(item['files']), 'file')})")
+                f"({util.count(item['lines'], 'line')} in {util.count(len(item['files']), 'file')})")
 
     def detail(self, item: dict) -> str:
         proof = item.get("proof") or {}
         shown = f"Proof, {proof['name']}:\n{proof.get('text') or 'missing from the scratch folder'}" if proof else ""
         return "\n\n".join(filter(None, [item.get("about") or item["title"], f"Files: {', '.join(item['files'])}",
                                           item.get("story") or item["report"], item.get("patch", ""), shown]))
+
+    def briefing(self, item: dict) -> str:
+        problem = (item.get("proof") or {}).get("problem")
+        return "\n\n".join(filter(None, [f"The problem it fixes:\n{problem}" if problem else "", self.detail(item)]))
+
+    def target_repo(self, item: dict) -> str:
+        return item["repo"]
 
     def rejected(self, item: dict) -> None:
         util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
@@ -363,6 +379,9 @@ class ToLoop(Emit):
     def detail(self, item: dict) -> str:
         return plain(item["event"]["data"].get("summary"), 2000)
 
+    def target_repo(self, item: dict) -> str:
+        return item["event"].get("repo", "")
+
 
 class Digest(Emit):
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
@@ -382,7 +401,7 @@ class Digest(Emit):
         return paths.short_path(p)
 
     def describe(self, item: dict) -> str:
-        return f"add {item['text'].count(chr(10) + '- ')} lines to the digest {paths.short_path(item['file'])}"
+        return f"add {util.count(item['text'].count(chr(10) + '- '), 'line')} to the digest {paths.short_path(item['file'])}"
 
     def detail(self, item: dict) -> str:
         return item["text"]
@@ -480,9 +499,14 @@ def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -
 
 
 def waiting(connect=state.db) -> list[dict]:
-    return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "what": a["summary"],
+    return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "repo": repo_of(a),
+             "what": a["summary"], "plain_summary": a["plain_summary"],
              "failed": a["result"] if a["status"] == "failed" else "",
              "detail": EMITS[a["emit"]["type"]].detail(a["emit"]["item"])} for a in state.approvals(connect)]
+
+
+def repo_of(approval: dict) -> str:
+    return EMITS[approval["emit"]["type"]].target_repo(approval["emit"]["item"]) or approval["run_repo"]
 
 
 def decide(approval_id: int, yes: bool) -> str:

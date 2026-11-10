@@ -16,9 +16,11 @@ from . import (
     control,
     dashboard,
     engine,
+    explain,
     loops,
     paths,
     record,
+    runner,
     sources,
     state,
     util,
@@ -27,6 +29,7 @@ from .loops import Loop
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
+SUMMARY_RETRY_SECONDS = 900
 POLL_THREADS = 8
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.engine"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
@@ -89,6 +92,8 @@ class Server:
         self.ticks = 0
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
+        self.summarizing: Future | None = None
+        self.summary_tried: dict[int, float] = {}
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -109,6 +114,7 @@ class Server:
         self.forget_unpolled_errors(live)
         self.loaded = True
         self.dispatch({x.name: x for x in reversed(every_loop)})
+        self.summarize_next_approval()
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             state.prune()
             self.pruned = time.monotonic()
@@ -230,6 +236,25 @@ class Server:
                 self.waiting[item["id"]] = why
                 self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
 
+    def summarize_next_approval(self) -> None:
+        if self.summarizing and not self.summarizing.done():
+            return
+        if runner.usage_hold(self.cfg.model("explain")):
+            return
+        now = time.monotonic()
+        due = (a for a in state.approvals() if not a["plain_summary"]
+               and now - self.summary_tried.get(a["id"], -SUMMARY_RETRY_SECONDS) >= SUMMARY_RETRY_SECONDS)
+        if approval := next(due, None):
+            self.summary_tried[approval["id"]] = now
+            self.summarizing = self.pool.submit(self.write_plain_summary, approval)
+
+    def write_plain_summary(self, approval: dict) -> None:
+        try:
+            state.set_plain_summary(approval["id"], explain.plain_summary(approval, self.cfg))
+        except Exception as e:
+            self.say(f"approval #{approval['id']}: no plain summary, {util.first_line(str(e), 300)}; "
+                     f"it tries again in {SUMMARY_RETRY_SECONDS // 60} minutes")
+
     def retry_once(self, item: dict, why: str) -> None:
         if self.restarted[item["id"]]:
             state.drop_queue_item(item["id"])
@@ -251,6 +276,8 @@ class Server:
     def busy_with(self) -> str:
         if sum(not f.done() for f in self.polls.values()):
             return "a source poll is still running"
+        if self.summarizing and not self.summarizing.done():
+            return "a plain summary of an approval is still being written"
         if dashboard.POSTS_IN_FLIGHT.count:
             return "the dashboard is still answering a request"
         if chat.history()["busy"]:

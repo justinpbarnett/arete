@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     status TEXT,                   -- pending | approved | rejected | done | failed
     result TEXT,
     created TEXT,
-    decided TEXT
+    decided TEXT,
+    plain_summary TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +319,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
                 for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")],
               ("triage", "closed", "ALTER TABLE triage ADD COLUMN closed TEXT DEFAULT ''"),
+              ("approvals", "plain_summary", "ALTER TABLE approvals ADD COLUMN plain_summary TEXT DEFAULT ''"),
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
@@ -642,8 +644,15 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str =
 def approvals(connect=db) -> list[dict]:
     with connect() as c:
         return [{**dict(r), "emit": json.loads(r["emit"] or "{}")}
-                for r in c.execute(f"SELECT * FROM approvals WHERE status IN ({','.join('?' * len(DECIDABLE))}) "
-                                   "ORDER BY id DESC LIMIT 100", DECIDABLE)]
+                for r in c.execute("SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "
+                                   "LEFT JOIN runs r ON r.id = a.run_id "
+                                   f"WHERE a.status IN ({','.join('?' * len(DECIDABLE))}) "
+                                   "ORDER BY a.id DESC LIMIT 100", DECIDABLE)]
+
+
+def set_plain_summary(approval_id: int, text: str) -> None:
+    with db() as c:
+        c.execute("UPDATE approvals SET plain_summary = ? WHERE id = ?", (text, approval_id))
 
 
 def approval(approval_id: int) -> dict | None:

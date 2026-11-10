@@ -177,7 +177,7 @@ th.c-kind { width: 110px; }
 th.c-cost { width: 90px; }
 th.c-n { width: 90px; }
 th.c-rate { width: 130px; }
-th:is(.c-status, .c-time) { width: 1%; }
+th:is(.c-status, .c-time, .c-repo) { width: 1%; }
 th.c-duration { width: 120px; }
 .wide :is(th, td).num + :is(th, td):not(.num) { padding-left: 14px; }
 th.c-ref { width: 140px; }

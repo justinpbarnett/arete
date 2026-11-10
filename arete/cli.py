@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import textwrap
 from collections import Counter
 
 from . import __version__, config, paths
@@ -658,7 +660,9 @@ def cmd_approve(args) -> int:
         if args.id is None:
             pending = emits.waiting()
             for a in pending:
-                print(f"#{a['id']:<4} {a['loop']:<20} {when(a['created'])}  {a['what']}"[:240])
+                print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or '-':<12} {when(a['created'])}  "
+                                    f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
+                                    subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
                 if a["failed"]:
                     print(f"      delivery failed: {a['failed']}"[:240])
                     print(f"      `arete approve {a['id']}` tries again, `--reject` drops it")

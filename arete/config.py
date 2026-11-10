@@ -8,9 +8,9 @@ from typing import Literal
 from . import paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research")
+               "classify", "loop", "session", "research", "explain")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
-                   "research": "opus"}
+                   "research": "opus", "explain": "haiku"}
 
 
 class UnknownRepo(KeyError):

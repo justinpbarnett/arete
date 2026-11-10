@@ -41,8 +41,14 @@ function stopLiveRun(run, btn) {
     (r) => stopWords(run.ticket, r, "It leaves this list once it has."));
 }
 
+const NEEDS_HEADS = [["Kind", "c-kind"], ["Repo", "c-repo"], ["What"], ["Since", "c-time"], ["", "c-decide"]];
+
 function kindTag(text) {
   return el("span", { class: "tag", text });
+}
+
+function repoCell(repo) {
+  return cell(repo || el("span", { class: "muted", text: "none" }), "nb");
 }
 
 function needsParts(n) {
@@ -62,24 +68,27 @@ function needsParts(n) {
       p.hand.length ? quiet("By hand: Claude Code will not let an agent write under .claude/, so the miner leaves these harness fixes to you. Make each one, then mark it done.") : null,
       p.memory.length ? quiet("Memory: facts the miner noticed for an agent's memory. File each one by hand, then mark it done.") : null,
     ];
-    return [...p.hand.map((x) => proposalRow(x, "By hand", `${x.repo}/${x.file}`, `The fix to ${x.repo}/${x.file}`)),
-      ...p.memory.map((x) => proposalRow(x, "Memory", x.repo, `The ${x.repo} fact`))];
+    return [...p.hand.map((x) => proposalRow(x, "By hand", x.file, `The fix to ${x.repo}/${x.file}`)),
+      ...p.memory.map((x) => proposalRow(x, "Memory", "", `The ${x.repo} fact`))];
   });
   return [
     faults,
     rows.length
-      ? table("", [["Kind", "c-kind"], ["What"], ["Since", "c-time"], ["", "c-decide"]], rows, { stack: true })
+      ? table("", NEEDS_HEADS, rows, { stack: true })
       : faults.length ? null : el("p", {}, stateChip("ok"), " Nothing needs you."),
     notes,
   ];
 }
 
 function approvalRow(a, place) {
+  const asked = `${a.loop}: ${a.what}`;
+  const details = [a.plain_summary ? asked : "", a.detail].filter(Boolean).join("\n\n");
   return el("tr", {},
     cell(kindTag(a.failed ? "Failed" : "Approval")),
-    cell([el("div", {}, el("span", { class: "nb", text: a.loop }), `: ${a.what}`),
+    repoCell(a.repo),
+    cell([el("div", { text: a.plain_summary || asked }),
       a.failed ? el("div", {}, stateChip("fault"), ` Delivery failed: ${a.failed}`) : null,
-      a.detail ? foldText(`approval:${a.id}`, "Show the body", a.detail) : null,
+      details ? foldText(`approval:${a.id}`, "Show the details", details) : null,
       a.run_id && place === "needs" ? el("div", {}, itemLink("run", a.run_id, "Open the run that asked", `asked:${a.id}`)) : null]),
     cell(liveAgo(a.created), "nb"),
     cell(el("div", { class: "row-buttons" },
@@ -96,6 +105,7 @@ function decide(id, yes, btn, place) {
 function readyRow(r) {
   return el("tr", {},
     cell(kindTag("Ready")),
+    repoCell(r.repo),
     cell([el("div", {}, rowLink("ticket", r.ref, r.ref.replace(/^[^/#\s]+\//, "")), `: ${r.title}`), el("div", { class: "muted", text: r.verdict })]),
     cell(""),
     cell(el("div", { class: "row-buttons" }, button("Send", "send-ready", (b) => sendReady(r, b), { of: r.ref }))));
@@ -110,6 +120,7 @@ function sendReady(r, btn) {
 function skippedRow(s) {
   return el("tr", {},
     cell(kindTag("Skipped")),
+    repoCell(s.repo),
     cell([el("div", {}, link(s.url, s.ticket)), el("div", { class: "muted", text: s.why })]),
     cell(liveAgo(s.since), "nb"),
     cell(s.can_run ? el("div", { class: "row-buttons" }, button("Run anyway", "run-anyway", (b) => runSkipped(s.ticket, b), { of: s.ticket }))
@@ -124,6 +135,7 @@ function runSkipped(ticket, btn) {
 function draftRow(draft) {
   return el("tr", {},
     cell(kindTag("Draft")),
+    repoCell("arete"),
     cell([el("div", { text: draft.title }), el("div", { class: "muted", text: "The console drafted this issue on arete. Nothing reaches GitHub until you file it." }),
       foldText("draft:body", "Show the body", draft.body)]),
     cell(""),
@@ -147,10 +159,11 @@ function dropDraft(btn) {
   });
 }
 
-function proposalRow(x, kind, where, what) {
+function proposalRow(x, kind, file, what) {
   return el("tr", {},
     cell(kindTag(kind)),
-    cell([el("div", { class: "wrap-cell", text: where }), el("div", { class: "muted", text: x.change })]),
+    repoCell(x.repo),
+    cell([file ? el("div", { class: "wrap-cell", text: file }) : null, el("div", { class: file ? "muted" : "", text: x.change })]),
     cell(""),
     cell(el("div", { class: "row-buttons" }, button("Mark done", "done", (b) => markDone(x.id, what, b), { of: x.id }))));
 }
