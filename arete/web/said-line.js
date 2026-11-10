@@ -44,8 +44,18 @@ function sayAt(place, state, sentence, { focus = true } = {}) {
   placeSaid(line, [box]);
   if (control) keepNodeAt(control, controlWas);
   else if (standingInAt !== null && line.dataset.standsFor) putLineAt(line, standingInAt);
-  if (focus) line.focus();
+  if (focus) focusWhereItRests(line);
   if (control) press.noteControlMoved(middleOf(control) - controlWas);
+}
+
+function focusWhereItRests(line) {
+  const slide = line.closest("tr")?.getAnimations().find((animation) => animation.id === ROW_SLIDE);
+  if (!slide) return line.focus();
+  // Focus scrolls to where the line shows, so the slide jumps to its end for the focus and then carries on.
+  const slidFor = slide.currentTime;
+  slide.currentTime = slide.effect.getComputedTiming().endTime;
+  line.focus();
+  slide.currentTime = slidFor;
 }
 
 class Press {
