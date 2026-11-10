@@ -184,7 +184,7 @@ class NoLongerRebases(RuntimeError):
 
 def rebase_onto(wt: Path, base: str) -> None:
     try:
-        util.git([*util.commit_identity(wt), "rebase", "-q", f"origin/{base}"], wt)
+        util.git_as_owner(["rebase", "-q", f"origin/{base}"], wt)
     except RuntimeError as e:
         clashes = util.git_records(["diff", "--name-only", "--diff-filter=U"], wt, check=False)
         util.git(["rebase", "--abort"], wt, check=False)

@@ -218,7 +218,7 @@ def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
     git(["read-tree", sha], staging)
     git(["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", EVALS], staging)
     tree = git(["write-tree"], staging).strip()
-    return git(["-c", "user.name=arete", "-c", "user.email=arete@localhost", "commit-tree", tree, "-m",
+    return git([*util.ARETE_IDENTITY, "commit-tree", tree, "-m",
                 "eval base"], staging).strip()
 
 
@@ -245,7 +245,7 @@ def isolated_checkout(repo_path: Path, base: str, dest: Path) -> None:
 
 def commit_overlay(wt: Path) -> None:
     git(["add", "-A"], wt)
-    git(["-c", "user.name=arete", "-c", "user.email=arete@localhost", "commit", "-q", "--allow-empty",
+    git([*util.ARETE_IDENTITY, "commit", "-q", "--allow-empty",
          "--no-verify", "-m", "eval harness overlay"], wt)
 
 

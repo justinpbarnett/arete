@@ -262,7 +262,7 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
         (wt / rel).write_text(draft.toml)
         read_back(DirSource(wt), EVALS, name, draft)
         git(["add", "--", rel], wt)
-        git([*util.commit_identity(wt), "commit", "-q", "-m", f"chore(evals): add {name}\n\n{summary}\n\nArete-Run: {run.id}"], wt)
+        util.git_as_owner(["commit", "-q", "-m", f"chore(evals): add {name}\n\n{summary}\n\nArete-Run: {run.id}"], wt)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
         body = "\n\n".join([summary, f"## Task\n\n**{draft.title}**\n\n{draft.prompt}", f"## Steps\n\n{draft.verify}",
                             f"## On the merge commit\n\n{on_merge.markdown()}", f"## On the base\n\n{on_base.markdown()}",

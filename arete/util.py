@@ -134,9 +134,12 @@ def git_command(args: list[str]) -> str:
     return " ".join(args[:2])
 
 
-def commit_identity(cwd: Path) -> list[str]:
-    return [] if git(["config", "user.email"], cwd, check=False).strip() else \
-        ["-c", "user.name=arete", "-c", "user.email=arete@localhost"]
+ARETE_IDENTITY = ["-c", "user.name=arete", "-c", "user.email=arete@localhost"]
+
+
+def git_as_owner(args: list[str], cwd: Path, **kw) -> str:
+    owner_known = git(["config", "user.email"], cwd, check=False).strip()
+    return git([*([] if owner_known else ARETE_IDENTITY), *args], cwd, **kw)
 
 
 def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
