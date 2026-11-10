@@ -127,7 +127,9 @@ A push waits for approval in these cases:
 - Always, when it touches a path the repo denies: `.agents/config.toml`, `.github/workflows/`, `.env` files, `.claude/`, and the layer's `limits.deny`.
 - When `approve = true`.
 - When a rule in the `approve` table matches. `lines` holds a change over that many lines, `deletes` holds any file deletion, and `paths` holds a change to any file that matches one of its patterns.
-- With JEV on, when JEV reads the diff as more than a narrow fix: a chance of `[jev] screen_hold` (0.4) or more that it weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses; a chance of `irreversible_hold` (0.5) or more that it does harm a revert will not undo; or a reach past the fix it names of `screen_reach` (0.6) or more.
+- With JEV on, when JEV reads the diff as more than a narrow fix, at a chance at or over that question's line in `[jev.screen_lines]`:
+  it weakens a protection (`weakens`, 0.5), exposes credentials or personal data (`secrets`, 0.7), sends data somewhere new or builds a command from outside text (`outside`, 0.7), does harm a revert will not undo (`irreversible`, 0.5), adds a capability (`feature`, 0.6), removes a behavior instead of fixing it (`removes`, 0.5), or renames something other code or config uses (`renames`, 0.5).
+  A reach past the fix it names of `reach` (0.8 of 1) or more holds it too.
 - With JEV on and `[search] proof` set, when JEV doubts that the proof script tests the problem the finding describes: a chance of `[jev] proof_hold` (0.5) or more that it checks something else, or under it that it runs the code into the problem and checks for the wrong result. A missing proof, or one past 12000 characters, holds too, and the approval shows the proof.
 - With JEV on, when the diff runs past the 12000 characters JEV reads, or when the JEV call fails.
 
