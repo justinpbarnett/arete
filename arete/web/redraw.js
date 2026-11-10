@@ -166,6 +166,10 @@ function scrolledIn(pane) {
   return pane ? pane.scrollTop : scrollY;
 }
 
+function furthestScrollIn(pane) {
+  return pane ? pane.scrollHeight - pane.clientHeight : document.scrollingElement.scrollHeight - innerHeight;
+}
+
 function scrollPaneOrPage(pane, y, x = scrollX) {
   if (pane) {
     if (pane.scrollTop !== y) pane.scrollTop = y;

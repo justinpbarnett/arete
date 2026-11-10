@@ -52,7 +52,8 @@ class Press {
   static start(place, control) {
     const gap = gapAt(place);
     gap.press = control.closest("tr") ? new Press(place, control, gap) : null;
-    if (gap.press?.lineAbove) gap.hold();
+    const closingMovesThePress = gap.press?.lineAbove || gap.room > 0;
+    if (closingMovesThePress) gap.hold();
     else gap.close();
     const line = shownSaidLine(place);
     if (gap.press && line && !line.hidden) {
@@ -237,10 +238,11 @@ function vacatedSpot(box, fresh) {
 
 function putLineAt(line, y, x = scrollX) {
   const pane = scrollingPane(line);
-  const drift = middleOf(line) - y;
-  const shortOfTop = -(scrolledIn(pane) + drift);
-  if (shortOfTop > 0) gapAt(line.dataset.said).widen(line, shortOfTop);
-  scrollPaneOrPageBy(pane, Math.max(drift, -scrolledIn(pane)), x);
+  const neededScroll = scrolledIn(pane) + middleOf(line) - y;
+  const furthest = furthestScrollIn(pane);
+  if (neededScroll < 0) gapAt(line.dataset.said).widen(line, -neededScroll);
+  else if (neededScroll > furthest) gapAt(line.dataset.said).lengthen(pane, neededScroll - furthest);
+  scrollPaneOrPage(pane, Math.max(neededScroll, 0), x);
 }
 
 function keepNodeAt(node, y) {
@@ -252,6 +254,8 @@ class HeldGap {
     this.place = place;
     this.press = null;
     this.margin = 0;
+    this.room = 0;
+    this.roomPane = null;
     this.holdTimer = 0;
     this.pointerWatch = null;
     this.slideFrame = 0;
@@ -264,10 +268,17 @@ class HeldGap {
     this.hold();
   }
 
+  lengthen(pane, by) {
+    this.roomPane = pane;
+    this.room += by;
+    showRoomBelow(pane);
+    this.hold();
+  }
+
   hold() {
     this.stopClosing();
     const pressInFlight = this.press && !this.press.settled;
-    if (this.margin && !pressInFlight) this.holdTimer = setTimeout(() => this.closeOncePointerClears(), GAP_HOLD_MS);
+    if ((this.margin || this.room) && !pressInFlight) this.holdTimer = setTimeout(() => this.closeOncePointerClears(), GAP_HOLD_MS);
   }
 
   stopClosing() {
@@ -297,33 +308,45 @@ class HeldGap {
     if (mouseMayRestUnseen) return true;
     if (!mouseAt) return false;
     const sliding = scrollingPane(line) ?? line.closest(".page");
-    return mouseAt.y >= restingTop(line) && sliding.contains(document.elementFromPoint(mouseAt.x, mouseAt.y));
+    if (!sliding.contains(document.elementFromPoint(mouseAt.x, mouseAt.y))) return false;
+    const roomPullsAllBack = this.room > furthestScrollIn(this.roomPane) - scrolledIn(this.roomPane);
+    const marginPullsBelowUp = this.margin > 0 && mouseAt.y >= restingTop(line);
+    return roomPullsAllBack || marginPullsBelowUp;
   }
 
   close() {
     this.stopClosing();
-    const from = this.margin;
+    const { margin, room } = this;
     const line = shownSaidLine(this.place);
-    const rest = line?.checkVisibility() ? Math.min(from, marginAbove(line)) : 0;
-    if (from <= rest || REDUCED_MOTION.matches) {
-      this.showMargin(0);
+    const marginAtRest = line?.checkVisibility() ? Math.min(margin, marginAbove(line)) : 0;
+    if ((margin <= marginAtRest && !room) || REDUCED_MOTION.matches) {
+      this.show(0, 0);
       return;
     }
     let start = null;
     const step = (now) => {
       start ??= now;
-      const done = Math.min((now - start) / SLIDE_MS, 1);
-      this.showMargin(done < 1 ? rest + (from - rest) * (1 - done) ** 3 : 0);
-      if (done < 1) this.slideFrame = requestAnimationFrame(step);
+      const toGo = (1 - Math.min((now - start) / SLIDE_MS, 1)) ** 3;
+      this.show(toGo ? marginAtRest + (margin - marginAtRest) * toGo : 0, room * toGo);
+      if (toGo) this.slideFrame = requestAnimationFrame(step);
     };
     this.slideFrame = requestAnimationFrame(step);
   }
 
-  showMargin(margin) {
+  show(margin, room) {
     this.margin = margin;
+    this.room = room;
     const line = shownSaidLine(this.place);
     if (line && holdsAPlace(line)) showGap(line, margin);
+    showRoomBelow(this.roomPane);
   }
+}
+
+function showRoomBelow(pane) {
+  const room = [...heldGaps.values()].filter((gap) => gap.roomPane === pane).reduce((sum, gap) => sum + gap.room, 0);
+  const holder = pane ?? document.body;
+  if (room) holder.style.setProperty("--room-below", `${room}px`);
+  else holder.style.removeProperty("--room-below");
 }
 
 function gapAt(place) {
