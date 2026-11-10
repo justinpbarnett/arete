@@ -660,7 +660,7 @@ def cmd_approve(args) -> int:
         if args.id is None:
             pending = emits.waiting()
             for a in pending:
-                print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or '-':<12} {when(a['created'])}  "
+                print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
                                     f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
                                     subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
                 if a["failed"]:

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import re
+import secrets
 import textwrap
 
 from . import config, emits, paths, pipeline, runner, triage
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
+MOST_SENTENCES = 2
+MOST_WORDS = 40
 LONGEST_SUMMARY = 300
 BRIEFING_SHOWN = 20000
 TIMEOUT_SECONDS = 120
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+PATH_OR_COMMAND = re.compile(r"`|(?:^|\s)~?/\w|\w/[^\s/]+/")
 
 
 class NoSummary(RuntimeError):
@@ -15,14 +21,22 @@ class NoSummary(RuntimeError):
 
 
 def plain_summary(approval: dict, cfg: config.Config) -> str:
-    emit, item = emits.EMITS[approval["emit"]["type"]], approval["emit"]["item"]
+    item = approval["emit"]["item"]
     text = pipeline.prompt("explain", loop=approval["loop"], repo=emits.repo_of(approval) or "none",
-                           action=approval["summary"], briefing=emit.briefing(item)[:BRIEFING_SHOWN])
+                           mark=secrets.token_hex(8), action=approval["summary"],
+                           briefing=emits.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
     res = runner.run(text, paths.STATE_DIR, model=cfg.model("explain"), tools=[], mcp_config=triage.NO_MCP_SERVERS,
                      json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS, wait_out_limits=False,
                      trace=("", f"plain summary #{approval['id']}"), cfg=cfg)
-    said = res.structured.get("summary") if res.ok and isinstance(res.structured, dict) else ""
-    summary = textwrap.shorten(str(said or ""), LONGEST_SUMMARY, placeholder=" …")
-    if not summary:
+    said = str(res.structured.get("summary") or "").strip() if res.ok and isinstance(res.structured, dict) else ""
+    if not said:
         raise NoSummary(res.error or "the answer held no summary")
-    return summary
+    if PATH_OR_COMMAND.search(said):
+        raise NoSummary(f"the summary named a path or a command: {said}")
+    return within_limits(said)
+
+
+def within_limits(said: str) -> str:
+    words = " ".join(SENTENCE_END.split(said)[:MOST_SENTENCES]).split()
+    kept = " ".join(words[:MOST_WORDS]) + (" …" if len(words) > MOST_WORDS else "")
+    return textwrap.shorten(kept, LONGEST_SUMMARY, placeholder=" …")

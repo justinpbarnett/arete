@@ -92,8 +92,8 @@ class Server:
         self.ticks = 0
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
+        self.summary_pool = ThreadPoolExecutor(1, thread_name_prefix="summary")
         self.summarizing: Future | None = None
-        self.summary_tried: dict[int, float] = {}
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -241,12 +241,11 @@ class Server:
             return
         if runner.usage_hold(self.cfg.model("explain")):
             return
-        now = time.monotonic()
-        due = (a for a in state.approvals() if not a["plain_summary"]
-               and now - self.summary_tried.get(a["id"], -SUMMARY_RETRY_SECONDS) >= SUMMARY_RETRY_SECONDS)
+        retry_from = util.iso(util.now() - timedelta(seconds=SUMMARY_RETRY_SECONDS))
+        due = (a for a in state.approvals() if not a["plain_summary"] and a["plain_summary_tried"] <= retry_from)
         if approval := next(due, None):
-            self.summary_tried[approval["id"]] = now
-            self.summarizing = self.pool.submit(self.write_plain_summary, approval)
+            state.set_plain_summary_tried(approval["id"], util.iso())
+            self.summarizing = self.summary_pool.submit(self.write_plain_summary, approval)
 
     def write_plain_summary(self, approval: dict) -> None:
         try:

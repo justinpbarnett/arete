@@ -36,9 +36,9 @@ def history() -> dict:
 
 
 def view() -> dict:
-    h = history()
-    return {"messages": h["messages"], "busy": h["busy"], "draft": h["draft"],
-            "metered": runner.metered(config.load().model("chat"), h.get("runner", ""))}
+    h, cfg = history(), config.load()
+    return {"messages": h["messages"], "busy": h["busy"], "draft": h["draft"] and {**h["draft"], "repo": cfg.arete_repo},
+            "metered": runner.metered(cfg.model("chat"), h.get("runner", ""))}
 
 
 def message(sender: str, text: str, cost: float = 0.0) -> dict:

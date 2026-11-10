@@ -97,7 +97,7 @@ class Emit:
         return self.detail(item)
 
     def target_repo(self, item: dict) -> str:
-        return ""
+        return item.get("repo", "")
 
     def rejected(self, item: dict) -> None:
         pass
@@ -138,14 +138,14 @@ class Ticket(Emit):
     def describe(self, item: dict) -> str:
         return f"file a ticket on {item['repo']} [{', '.join(item['labels'])}]: {item['title']}"
 
-    def target_repo(self, item: dict) -> str:
-        return item["repo"]
-
     def detail(self, item: dict) -> str:
         return item["body"]
 
 
 class PullRequest(Emit):
+    def target_repo(self, item: dict) -> str:
+        return ""  # item["repo"] is the GitHub owner/name; the run that asked holds the config repo
+
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         if loop.kind not in worktree_kinds():
             return [f"only {' and '.join(worktree_kinds())} loops emit a pr"]
@@ -280,9 +280,6 @@ class Push(Emit):
     def briefing(self, item: dict) -> str:
         problem = (item.get("proof") or {}).get("problem")
         return "\n\n".join(filter(None, [f"The problem it fixes:\n{problem}" if problem else "", self.detail(item)]))
-
-    def target_repo(self, item: dict) -> str:
-        return item["repo"]
 
     def rejected(self, item: dict) -> None:
         util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
@@ -502,11 +499,15 @@ def waiting(connect=state.db) -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "repo": repo_of(a),
              "what": a["summary"], "plain_summary": a["plain_summary"],
              "failed": a["result"] if a["status"] == "failed" else "",
-             "detail": EMITS[a["emit"]["type"]].detail(a["emit"]["item"])} for a in state.approvals(connect)]
+             "detail": emit_of(a).detail(a["emit"]["item"])} for a in state.approvals(connect)]
+
+
+def emit_of(approval: dict) -> Emit:
+    return EMITS[approval["emit"]["type"]]
 
 
 def repo_of(approval: dict) -> str:
-    return EMITS[approval["emit"]["type"]].target_repo(approval["emit"]["item"]) or approval["run_repo"]
+    return emit_of(approval).target_repo(approval["emit"]["item"]) or approval["run_repo"]
 
 
 def decide(approval_id: int, yes: bool) -> str:

@@ -134,7 +134,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     result TEXT,
     created TEXT,
     decided TEXT,
-    plain_summary TEXT DEFAULT ''
+    plain_summary TEXT DEFAULT '',
+    plain_summary_tried TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -319,7 +320,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
                 for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")],
               ("triage", "closed", "ALTER TABLE triage ADD COLUMN closed TEXT DEFAULT ''"),
-              ("approvals", "plain_summary", "ALTER TABLE approvals ADD COLUMN plain_summary TEXT DEFAULT ''"),
+              *[("approvals", col, f"ALTER TABLE approvals ADD COLUMN {col} TEXT DEFAULT ''")
+                for col in ("plain_summary", "plain_summary_tried")],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
@@ -652,7 +654,13 @@ def approvals(connect=db) -> list[dict]:
 
 def set_plain_summary(approval_id: int, text: str) -> None:
     with db() as c:
-        c.execute("UPDATE approvals SET plain_summary = ? WHERE id = ?", (text, approval_id))
+        c.execute(f"UPDATE approvals SET plain_summary = ? WHERE id = ? AND status IN ({','.join('?' * len(DECIDABLE))})",
+                  (text, approval_id, *DECIDABLE))
+
+
+def set_plain_summary_tried(approval_id: int, at: str) -> None:
+    with db() as c:
+        c.execute("UPDATE approvals SET plain_summary_tried = ? WHERE id = ?", (at, approval_id))
 
 
 def approval(approval_id: int) -> dict | None:

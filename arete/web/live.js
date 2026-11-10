@@ -135,8 +135,8 @@ function runSkipped(ticket, btn) {
 function draftRow(draft) {
   return el("tr", {},
     cell(kindTag("Draft")),
-    repoCell("arete"),
-    cell([el("div", { text: draft.title }), el("div", { class: "muted", text: "The console drafted this issue on arete. Nothing reaches GitHub until you file it." }),
+    repoCell(draft.repo),
+    cell([el("div", { text: draft.title }), el("div", { class: "muted", text: `The console drafted this issue on ${draft.repo}. Nothing reaches GitHub until you file it.` }),
       foldText("draft:body", "Show the body", draft.body)]),
     cell(""),
     cell(el("div", { class: "row-buttons" },
