@@ -84,7 +84,7 @@ def waiting(connect=state.db) -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "repo": repo_of(a),
              "what": a["summary"], "plain_summary": a["plain_summary"],
              "failed": a["result"] if a["status"] == "failed" else "", "held": a["emit"].get("held", ""),
-             "review": review_shown(a),
+             "review": review_shown(a), "approving": emit_of(a).approving,
              "detail": emit_of(a).detail(a["emit"]["item"])} for a in state.approvals(connect)]
 
 

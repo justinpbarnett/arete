@@ -94,8 +94,8 @@ function approvalRow(a, place) {
       a.run_id && place === "needs" ? el("div", {}, itemLink("run", a.run_id, "Open the run that asked", `asked:${a.id}`)) : null]),
     cell(liveAgo(a.created), "nb"),
     cell(el("div", { class: "row-buttons" },
-      button(a.failed ? "Try again" : "Approve", "approve", (b) => decide(a.id, true, b, place), { of: a.id }),
-      button("Reject", "reject", (b) => decide(a.id, false, b, place), { of: a.id }))));
+      button(a.failed ? "Try again" : "Approve", "approve", (b) => decide(a, true, b, place), { of: a.id }),
+      button("Reject", "reject", (b) => decide(a, false, b, place), { of: a.id }))));
 }
 
 function reviewLine(a) {
@@ -103,10 +103,11 @@ function reviewLine(a) {
   return r.by ? el("div", {}, el("span", { class: "muted", text: `Review by ${r.by}: ` }), r.said) : null;
 }
 
-function decide(id, yes, btn, place) {
-  return act(btn, place, `/api/approvals/${id}`, { approve: yes },
-    (r) => (yes ? `Approved #${id}: ${r.result}.` : `Rejected #${id}. Nothing was sent.`),
-    { meanwhile: yes ? `Approving #${id}. A push rebases and runs its check again before it lands, so it can take a minute.` : null });
+function decide(a, yes, btn, place) {
+  const starting = a.failed ? `Trying #${a.id} again.` : `Approving #${a.id}.`;
+  return act(btn, place, `/api/approvals/${a.id}`, { approve: yes },
+    (r) => (yes ? `Approved #${a.id}: ${r.result}.` : `Rejected #${a.id}. Nothing was sent.`),
+    { meanwhile: yes ? [starting, a.approving].filter(Boolean).join(" ") : null });
 }
 
 function readyRow(r) {

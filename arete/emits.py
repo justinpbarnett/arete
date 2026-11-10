@@ -60,6 +60,7 @@ class LoopOff(RuntimeError):
 class Emit:
     kept_failures: tuple[type[Exception], ...] = (Exception,)
     judged = False
+    approving = ""
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         return []
@@ -96,6 +97,8 @@ class Emit:
 
 
 class Ticket(Emit):
+    approving = "It files the ticket on GitHub, so it can take a few seconds."
+
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         return sources.repo_problems(cfg, [spec.get("repo", "")], "ticket emit")
 
@@ -135,6 +138,8 @@ class Ticket(Emit):
 
 
 class PullRequest(Emit):
+    approving = "It pushes the branch and opens the pull request, so it can take a few seconds."
+
     def target_repo(self, item: dict) -> str:
         return ""  # item["repo"] is the GitHub owner/name; the run that asked holds the config repo
 
