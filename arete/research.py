@@ -177,6 +177,8 @@ def own_move(r: dict, m: tracker.Moved) -> None:
 
 
 def wanted(r: dict, report: dict) -> str:
+    if report["status"] == FAILED:
+        return FAILED
     if report["status"] != DONE:
         return ""
     if not report["filed_path"]:
@@ -194,9 +196,10 @@ def wanted(r: dict, report: dict) -> str:
 
 def settle_status(cfg: config.Config, r: dict) -> None:
     report = state.research_get(r["ref"])
-    if not report or report["status"] != DONE or report.get("moved") == config.DELIVERED or r.get("closed"):
+    if (not report or report["status"] not in (DONE, FAILED) or report.get("moved") == config.DELIVERED
+            or r.get("closed")):
         return
-    if not (jira_target(cfg, r, "pr") or jira_target(cfg, r, config.DELIVERED)):
+    if not any(jira_target(cfg, r, to) for to in ("pr", FAILED, config.DELIVERED)):
         return
     try:
         to = wanted(r, report)
