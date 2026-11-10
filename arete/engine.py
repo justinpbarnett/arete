@@ -205,7 +205,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     local = not device.remote
     if argv and argv[0] == "arete" and local:
         argv = [sys.executable, "-m", "arete.cli", *argv[1:]]
-    full = devices.wrap(device, argv, cwd, env, end_with_session=True)
+    full = devices.wrap(device, argv, cwd, env)
     deadline = time.monotonic() + timeout
     proc = subprocess.Popen(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, errors="replace", env={**os.environ, **env} if local else None,

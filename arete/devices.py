@@ -119,14 +119,12 @@ def remote_dir(path) -> str:
     return home + slash + (shlex.quote(rest) if rest else "")
 
 
-def wrap(device: Device | str, argv: list[str], cwd, env: dict | None = None, mkdirs: tuple = (),
-         end_with_session: bool = False) -> list[str]:
+def wrap(device: Device | str, argv: list[str], cwd, env: dict | None = None, mkdirs: tuple = ()) -> list[str]:
     d = resolve(device)
     if not d.remote:
         return argv
     exports = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in (env or {}).items() if ENV_NAME.match(k))
-    if end_with_session:
-        argv = ["sh", "-c", END_WITH_SESSION, "sh", *argv]
+    argv = ["sh", "-c", END_WITH_SESSION, "sh", *argv]
     steps = [f"mkdir -p {remote_dir(m)}" for m in mkdirs]
     steps += [f"cd {remote_dir(cwd or d.dir)}", f"exec {'env ' + exports + ' ' if exports else ''}{shlex.join(argv)}"]
     return [*ssh_argv(d), " && ".join(steps)]
