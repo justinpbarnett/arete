@@ -531,7 +531,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             if p in landed:
                 state.add_proposal(run_id, p, "applied", url)
             else:
-                state.add_proposal(run_id, p, "skipped" if url else "pending")
+                state.add_proposal(run_id, p, "skipped")
         if url:
             opened.append(url)
             print(f"{name}: {url}")
