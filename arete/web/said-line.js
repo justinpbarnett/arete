@@ -44,31 +44,59 @@ function sayAt(place, state, sentence, { focus = true } = {}) {
   placeSaid(line, [box]);
   if (control) keepNodeAt(control, controlWas);
   else if (standingInAt !== null && line.dataset.standsFor) putLineAt(line, standingInAt);
-  if (focus) focusWhereItRests(line);
+  if (focus && control) focusBesidePress(line, { waitsForTheAnswer: !state });
+  else if (focus) focusWhereItRests(line);
   if (control) press.noteControlMoved(middleOf(control) - controlWas);
 }
 
+function focusBesidePress(line, { waitsForTheAnswer }) {
+  // Focus would scroll a line outside the view to the view's middle, which would carry the pressed control away.
+  line.focus({ preventScroll: true });
+  // An answer's redraw follows at once and often puts the line on the press point, so scrolling to it now would scroll twice.
+  if (waitsForTheAnswer) showBesidePress(line);
+}
+
+function showBesidePress(line) {
+  // The line rests right beside the pressed row, so the least scroll that shows it keeps the press point on one of the two.
+  const { top, bottom } = whileRowRests(line, () => line.getBoundingClientRect());
+  const view = viewOf(line);
+  const hiddenAbove = view.top - top;
+  const hiddenBelow = bottom - view.bottom;
+  if (hiddenAbove > 0) scrollPaneOrPageBy(scrollingPane(line), -hiddenAbove);
+  else if (hiddenBelow > 0) scrollPaneOrPageBy(scrollingPane(line), Math.min(hiddenBelow, -hiddenAbove));
+}
+
 function focusWhereItRests(line) {
-  const slide = line.closest("tr")?.getAnimations().find((animation) => animation.id === ROW_SLIDE);
-  if (!slide) return line.focus();
-  // Focus scrolls to where the line shows, so the slide jumps to its end for the focus and then carries on.
+  whileRowRests(line, () => line.focus());
+}
+
+function whileRowRests(node, look) {
+  const slide = node.closest("tr")?.getAnimations().find((animation) => animation.id === ROW_SLIDE);
+  if (!slide) return look();
+  // The slide jumps to its end, where the row rests, and then carries on from the same frame.
   const slidFor = slide.currentTime;
   slide.currentTime = slide.effect.getComputedTiming().endTime;
-  line.focus();
+  const seen = look();
   slide.currentTime = slidFor;
+  return seen;
 }
 
 class Press {
   static start(place, control) {
     const gap = gapAt(place);
     gap.press = control.closest("tr") ? new Press(place, control, gap) : null;
-    const closingMovesThePress = gap.press?.lineAbove || gap.room > 0;
+    const closingMovesThePress = gap.press?.lineInViewAbove || gap.room > 0;
     if (closingMovesThePress) gap.hold();
     else gap.close();
     const line = shownSaidLine(place);
     if (gap.press && line && !line.hidden) {
       const box = line.closest("[id]");
-      slideRowsWhile(box, () => placeSaid(line, [box]));
+      const controlWas = middleOf(control);
+      slideRowsWhile(box, () => {
+        placeSaid(line, [box]);
+        // Besides the line's own move, the browser's scroll anchoring can shift the pressed row.
+        keepNodeAt(control, controlWas);
+      });
     }
     return gap.press;
   }
@@ -76,11 +104,13 @@ class Press {
   constructor(place, control, gap) {
     const row = control.closest("tr");
     const line = shownSaidLine(place);
+    this.place = place;
     this.gap = gap;
     this.key = control.dataset.focus;
     this.laterKeys = rowKeysFrom(row, "nextElementSibling");
     this.earlierKeys = rowKeysFrom(row, "previousElementSibling");
-    this.lineAbove = Boolean(line && !line.hidden && line.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const lineAbove = Boolean(line && !line.hidden && line.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING);
+    this.lineInViewAbove = lineAbove && !scrolledAboveTheView(line);
     this.time = performance.now();
     this.controlMovedBy = 0;
     this.lineShowsThisPress = false;
@@ -102,7 +132,7 @@ class Press {
     return {
       acted,
       neighbour: acted ?? later ?? firstRowHolding(nodes, this.earlierKeys),
-      lineGoesBefore: Boolean(later || (acted && this.lineAbove)),
+      lineGoesBefore: Boolean(later || (acted && this.lineInViewAbove)),
     };
   }
 
@@ -116,8 +146,27 @@ class Press {
 
   settle() {
     this.settled = true;
-    if (this.gap.press === this) this.gap.hold();
+    if (this.gap.press !== this) return;
+    this.gap.hold();
+    const line = shownSaidLine(this.place);
+    if (this.lineShowsThisPress && line && !line.hidden) showBesidePress(line);
   }
+}
+
+function viewOf(node) {
+  const pane = scrollingPane(node);
+  if (!pane) return { top: 0, bottom: innerHeight };
+  const { top, bottom } = pane.getBoundingClientRect();
+  const stuckAtTop = pane.querySelector(":scope > .detail-head");
+  const stuckAtBottom = pane.querySelector(':scope > [id$="-talk"]:not(:empty)');
+  return {
+    top: Math.max(top, stuckAtTop?.getBoundingClientRect().bottom ?? top, 0),
+    bottom: Math.min(bottom, stuckAtBottom?.getBoundingClientRect().top ?? bottom, innerHeight),
+  };
+}
+
+function scrolledAboveTheView(node) {
+  return node.getBoundingClientRect().bottom <= viewOf(node).top;
 }
 
 function pressAt(place) {
@@ -211,10 +260,15 @@ function stopRowSlides(box) {
 
 function stopRows(box, slideTimeFor) {
   const shownAt = new Map();
+  const view = viewOf(box);
   for (const row of box.querySelectorAll("tr")) {
     const slide = row.getAnimations().find((animation) => animation.id === ROW_SLIDE);
     const slideTime = slideTimeFor(slide);
-    if (rowKey(row) && slideTime > 0) shownAt.set(rowKey(row), { bottom: row.getBoundingClientRect().bottom, slideTime });
+    if (rowKey(row) && slideTime > 0) {
+      const { top, bottom } = row.getBoundingClientRect();
+      // A row slides only from where it showed: from outside the view it would streak across the rows in it.
+      if (bottom > view.top && top < view.bottom) shownAt.set(rowKey(row), { bottom, slideTime });
+    }
     slide?.cancel();
   }
   return shownAt;
