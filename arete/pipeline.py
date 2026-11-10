@@ -1418,7 +1418,14 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                       json_schema=REVIEW_SCHEMA, timeout=b.timeout)
     if not res.ok or not isinstance(res.structured, dict):
         return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
-    return res.structured
+    return {**res.structured, "problems": review_problems(res.structured.get("problems"))}
+
+
+def review_problems(listed) -> list[dict]:
+    if not isinstance(listed, list):
+        return []
+    return [{"file": p.get("file") or "", "problem": p.get("problem") or "", "severity": p.get("severity") or "unrated"}
+            for p in listed if isinstance(p, dict)]
 
 
 def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
