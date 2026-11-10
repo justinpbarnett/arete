@@ -61,7 +61,7 @@ def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
 
 def github_name(cfg: config.Config, name: str) -> str:
     if (path := paths.expand(name)).is_absolute():
-        return github_remote(path)
+        return next((r.github for r in cfg.repos if r.path.resolve() == path.resolve()), "") or github_remote(path)
     if "/" in name:
         return name
     return cfg.repo(name).github
