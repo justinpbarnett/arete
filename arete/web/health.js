@@ -41,13 +41,14 @@ function deviceRow(d) {
 async function probe(name, btn) {
   btn.disabled = true;
   btn.textContent = "Probing";
-  keepSaidBeside("devices", btn);
+  const press = keepSaidBeside("devices", btn);
   try {
     const p = await call(`/api/devices/${encodeURIComponent(name)}/probe`, {});
     sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`);
   } catch (e) {
     sayAt("devices", "fault", e.message);
   }
+  press?.answered();
   refresh();
 }
 

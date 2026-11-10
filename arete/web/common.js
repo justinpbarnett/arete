@@ -21,6 +21,9 @@ const SVG = "http://www.w3.org/2000/svg";
 const URL_IN_TEXT = /(https:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
 const HELD = Symbol("held");
 const TOGGLE_FORMS = [{ toggle: "launch-toggle", form: "launch", focus: "launch-prompt" }, { toggle: "loop-new-toggle", form: "loop-new", focus: "loop-new-sentence" }];
+const GAP_HOLD_MS = 1000;
+const GAP_CLOSE_MS = 250;
+const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
 const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 
 let route = null;
@@ -32,9 +35,7 @@ const drafts = new Map();
 const lastSaid = new Map();
 const saidById = new Map();
 const saidBeside = new Map();
-const GAP_HOLD_MS = 1000;
-const GAP_CLOSE_MS = 250;
-const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)");
+const heldGaps = new Map();
 let changesInFlight = 0;
 
 class NoAnswer extends Error {}
@@ -99,40 +100,54 @@ function shownSaidLine(place) {
 
 function sayAt(place, state, sentence, { focus = true } = {}) {
   lastSaid.set(place, [state, sentence]);
-  if (state !== null) holdGap(place);
+  const press = saidBeside.get(place);
+  if (press) press.saidSince = true;
   const line = shownSaidLine(place);
   if (!line) return;
-  const beside = saidBeside.get(place);
-  const pressed = beside && pressedIn(line.closest("[id]"), beside);
-  const pressedWas = pressed && middleOf(pressed);
+  const box = line.closest("[id]");
+  const control = press?.controlIn(box);
+  const controlWas = control && middleOf(control);
+  const standingInAt = line.dataset.standsFor && line.checkVisibility() ? middleOf(line) : null;
   sayIn(line, state, sentence);
-  placeSaid(line, [line.closest("[id]")]);
+  placeSaid(line, [box]);
+  if (control) keepNodeAt(control, controlWas);
+  else if (standingInAt !== null && line.dataset.standsFor) putLineAt(line, standingInAt);
   if (focus) line.focus();
-  if (pressed) beside.shifted += middleOf(pressed) - pressedWas;
+  if (control) press.controlMovedBy += middleOf(control) - controlWas;
+}
+
+class Press {
+  constructor(place, control) {
+    const row = control.closest("tr");
+    const line = shownSaidLine(place);
+    this.place = place;
+    this.key = control.dataset.focus;
+    this.later = rowKeysFrom(row, "nextElementSibling");
+    this.earlier = rowKeysFrom(row, "previousElementSibling");
+    this.lineAbove = Boolean(line && !line.hidden && line.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING);
+    this.time = performance.now();
+    this.controlMovedBy = 0;
+    this.saidSince = false;
+    this.waiting = true;
+  }
+
+  controlIn(box) {
+    return box.querySelector(`[data-focus="${CSS.escape(this.key)}"]`);
+  }
+
+  answered() {
+    this.waiting = false;
+    if (saidBeside.get(this.place) === this) gapAt(this.place).hold();
+  }
 }
 
 function keepSaidBeside(place, control) {
-  const kept = saidBeside.get(place);
-  clearTimeout(kept?.closing);
-  const row = control.closest("tr");
-  if (!row) {
-    saidBeside.delete(place);
-    return;
-  }
-  const line = shownSaidLine(place);
-  const above = Boolean(line && !line.hidden && line.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING);
-  saidBeside.set(place, {
-    pressed: control.dataset.focus,
-    later: rowKeysFrom(row, "nextElementSibling"),
-    earlier: rowKeysFrom(row, "previousElementSibling"),
-    above,
-    shifted: 0,
-    gap: above ? kept?.gap ?? 0 : 0,
-  });
-}
-
-function pressedIn(box, beside) {
-  return box.querySelector(`[data-focus="${CSS.escape(beside.pressed)}"]`);
+  const press = control.closest("tr") ? new Press(place, control) : null;
+  if (press) saidBeside.set(place, press);
+  else saidBeside.delete(place);
+  if (press?.lineAbove) gapAt(place).hold();
+  else gapAt(place).close();
+  return press;
 }
 
 function rowKeysFrom(row, step) {
@@ -158,56 +173,106 @@ function firstRowHolding(nodes, keys) {
 function placeSaid(line, nodes) {
   delete line.dataset.standsFor;
   showGap(line, 0);
-  const beside = saidBeside.get(line.dataset.said);
-  if (!beside || line.hidden) return;
-  const acted = rowHolding(nodes, beside.pressed);
-  const later = acted ? null : firstRowHolding(nodes, beside.later);
-  const neighbour = acted ?? later ?? firstRowHolding(nodes, beside.earlier);
+  const press = saidBeside.get(line.dataset.said);
+  if (!press) return;
+  const acted = rowHolding(nodes, press.key);
+  if (!acted && !press.saidSince) sayIn(line, null, "Waiting for the answer.");
+  if (line.hidden) return;
+  const later = acted ? null : firstRowHolding(nodes, press.later);
+  const neighbour = acted ?? later ?? firstRowHolding(nodes, press.earlier);
   if (!neighbour) return;
   const holder = line.closest("tr.said-row") ?? el("tr", { class: "said-row" }, el("td", {}, line));
   holder.cells[0].colSpan = neighbour.cells.length;
-  if (later || (acted && beside.above)) neighbour.before(holder);
+  if (later || (acted && press.lineAbove)) neighbour.before(holder);
   else neighbour.after(holder);
-  showGap(line, beside.gap);
-  if (!acted) line.dataset.standsFor = beside.pressed;
+  showGap(line, gapAt(press.place).height);
+  if (!acted) line.dataset.standsFor = press.key;
 }
 
 function vacatedPress(box, fresh) {
-  for (const line of elementsIn(fresh, "p[data-stands-for]")) {
-    const beside = saidBeside.get(line.dataset.said);
-    const pressed = pressedIn(box, beside);
-    if (pressed?.checkVisibility()) return { line, at: middleOf(pressed) - beside.shifted };
+  const latestFirst = elementsIn(fresh, "p[data-stands-for]")
+    .map((line) => ({ line, press: saidBeside.get(line.dataset.said) }))
+    .sort((a, b) => b.press.time - a.press.time);
+  for (const { line, press } of latestFirst) {
+    const control = press.controlIn(box);
+    if (control?.checkVisibility()) return { line, pressY: middleOf(control) - press.controlMovedBy };
   }
   return null;
 }
 
-function showGap(line, gap) {
-  if (gap) line.style.marginTop = `${gap}px`;
+function showGap(line, height) {
+  if (height) line.style.marginTop = `${height}px`;
+  // Clearing marginTop alone leaves style="", and the next redraw's fresh line would then fail isEqualNode.
   else line.removeAttribute("style");
 }
 
-function openGapAbove(line, gap) {
-  const beside = saidBeside.get(line.dataset.said);
-  beside.gap += gap;
-  showGap(line, beside.gap);
-  holdGap(line.dataset.said);
+class HeldGap {
+  constructor(place) {
+    this.place = place;
+    this.height = 0;
+    this.closing = null;
+    this.pointerMoves = null;
+    this.slide = null;
+  }
+
+  widen(line, by) {
+    this.height += by;
+    showGap(line, this.height);
+    this.hold();
+  }
+
+  hold() {
+    this.stopClosing();
+    if (this.height && !saidBeside.get(this.place)?.waiting) this.closing = setTimeout(() => this.closeOncePointerClears(), GAP_HOLD_MS);
+  }
+
+  stopClosing() {
+    clearTimeout(this.closing);
+    this.pointerMoves?.abort();
+    this.pointerMoves = null;
+    cancelAnimationFrame(this.slide);
+  }
+
+  closeOncePointerClears() {
+    if (!this.wouldSlideUnderPointer()) return this.close();
+    this.pointerMoves = new AbortController();
+    const closeIfClear = () => this.wouldSlideUnderPointer() || this.close();
+    document.addEventListener("pointermove", closeIfClear, { passive: true, signal: this.pointerMoves.signal });
+    document.documentElement.addEventListener("pointerleave", closeIfClear, { signal: this.pointerMoves.signal });
+  }
+
+  wouldSlideUnderPointer() {
+    const line = shownSaidLine(this.place);
+    if (!mouseAt || !line?.checkVisibility()) return false;
+    const sliding = scrollingPane(line) ?? line.closest("main");
+    const gapTop = line.getBoundingClientRect().top - this.height;
+    return mouseAt.y >= gapTop && sliding.contains(document.elementFromPoint(mouseAt.x, mouseAt.y));
+  }
+
+  close() {
+    this.stopClosing();
+    const from = this.height;
+    if (!from || REDUCED_MOTION.matches) return this.showHeight(0);
+    let start = null;
+    const step = (now) => {
+      start ??= now;
+      const done = Math.min((now - start) / GAP_CLOSE_MS, 1);
+      this.showHeight(from * (1 - done) ** 3);
+      if (done < 1) this.slide = requestAnimationFrame(step);
+    };
+    this.slide = requestAnimationFrame(step);
+  }
+
+  showHeight(height) {
+    this.height = height;
+    const line = shownSaidLine(this.place);
+    if (line?.closest("tr.said-row")) showGap(line, height);
+  }
 }
 
-function holdGap(place) {
-  const beside = saidBeside.get(place);
-  if (!beside?.gap) return;
-  clearTimeout(beside.closing);
-  beside.closing = setTimeout(() => closeGap(place), GAP_HOLD_MS);
-}
-
-function closeGap(place) {
-  const beside = saidBeside.get(place);
-  const gap = beside.gap;
-  beside.gap = 0;
-  const line = shownSaidLine(place);
-  if (!line?.closest("tr.said-row")) return;
-  showGap(line, 0);
-  if (!REDUCED_MOTION.matches) line.animate([{ marginTop: `${gap}px` }, { marginTop: "0px" }], { duration: GAP_CLOSE_MS, easing: "ease-out" });
+function gapAt(place) {
+  if (!heldGaps.has(place)) heldGaps.set(place, new HeldGap(place));
+  return heldGaps.get(place);
 }
 
 function saidBesideRows(nodes) {
@@ -441,13 +506,14 @@ function stopWords(what, r, after) {
 
 async function act(btn, place, path, body, saying, { meanwhile = null } = {}) {
   btn.disabled = true;
-  keepSaidBeside(place, btn);
+  const press = keepSaidBeside(place, btn);
   if (meanwhile) sayAt(place, null, meanwhile);
   try {
     sayAt(place, "ok", saying(await call(path, body)));
   } catch (e) {
     sayAt(place, "fault", e.message);
   }
+  press?.answered();
   refresh();
 }
 

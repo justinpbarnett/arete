@@ -100,7 +100,7 @@ async function draftLoop(event) {
 
 async function loopAction(name, action, btn, place) {
   btn.disabled = true;
-  keepSaidBeside(place, btn);
+  const press = keepSaidBeside(place, btn);
   try {
     const r = await call(`/api/loops/${encodeURIComponent(name)}/${action}`, {});
     if (action === "start" || action === "try") {
@@ -113,6 +113,8 @@ async function loopAction(name, action, btn, place) {
     else sayAt(place, "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`);
   } catch (e) {
     sayAt(place, "fault", e.message);
+  } finally {
+    press?.answered();
   }
   refresh();
 }

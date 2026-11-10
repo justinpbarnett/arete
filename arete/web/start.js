@@ -127,7 +127,8 @@ document.addEventListener("DOMContentLoaded", () => {
   wireDialogs();
   document.addEventListener("keydown", onKey);
   document.addEventListener("click", onClick);
-  document.addEventListener("pointermove", (e) => { mouseAt = e.pointerType === "mouse" ? { x: e.clientX, y: e.clientY } : null; }, { passive: true });
+  const noteMouseAt = (e) => { mouseAt = e.pointerType === "mouse" ? { x: e.clientX, y: e.clientY } : null; };
+  for (const event of ["pointermove", "pointerdown", "pointerover"]) document.addEventListener(event, noteMouseAt, { passive: true });
   document.documentElement.addEventListener("pointerleave", () => { mouseAt = null; });
   document.getElementById("skip").addEventListener("click", () => document.getElementById("main").focus());
   const asked = location.hash.replace(/^#/, "");

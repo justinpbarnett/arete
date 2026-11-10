@@ -128,7 +128,7 @@ function placeIn(box, marks, fresh) {
   const scope = pane ?? section;
   const panes = pane ? [] : [...section.querySelectorAll(".detail")].filter((p) => getComputedStyle(p).overflowY === "auto");
   const { top: shownTop, bottom: shownBottom } = pane ? pane.getBoundingClientRect() : { top: 0, bottom: innerHeight };
-  const y = pane ? pane.scrollTop : scrollY;
+  const y = scrolledIn(pane);
   const laidOut = [...scope.querySelectorAll(MARKS)]
     .filter((node) => !panes.some((p) => p.contains(node)) && node.checkVisibility())
     .map((node) => {
@@ -146,7 +146,7 @@ function placeIn(box, marks, fresh) {
   return {
     pane, x: scrollX, y,
     anchors: anchors.map(({ node, top }) => ({ node, id: box.contains(node) ? marks.idOf(node) : null, top })),
-    vacated: vacated && vacated.at > shownTop && vacated.at < shownBottom ? vacated : null,
+    vacated: vacated && vacated.pressY > shownTop && vacated.pressY < shownBottom ? vacated : null,
   };
 }
 
@@ -162,24 +162,38 @@ function followAnchors(place, shownMarks, freshMarks) {
   return followed.find(({ stayed }) => stayed) ?? followed[0];
 }
 
-function intoVacated({ pane, vacated: { line, at } }) {
-  if (!line.checkVisibility()) return null;
-  const drift = middleOf(line) - at;
-  const scrolled = pane ? pane.scrollTop : scrollY;
+function scrolledIn(pane) {
+  return pane ? pane.scrollTop : scrollY;
+}
+
+function scrollPaneOrPage(pane, y, x = scrollX) {
+  if (pane) {
+    if (pane.scrollTop !== y) pane.scrollTop = y;
+  } else if (scrollX !== x || scrollY !== y) scrollTo(x, y);
+}
+
+function anchorLineAt(line, y, pane) {
+  const drift = middleOf(line) - y;
+  const scrolled = scrolledIn(pane);
   if (scrolled + drift >= 0) return { drift };
-  openGapAbove(line, -(scrolled + drift));
+  gapAt(line.dataset.said).widen(line, -(scrolled + drift));
   return { drift: -scrolled };
 }
 
+function putLineAt(line, y) {
+  const pane = scrollingPane(line);
+  scrollPaneOrPage(pane, scrolledIn(pane) + anchorLineAt(line, y, pane).drift);
+}
+
+function keepNodeAt(node, y) {
+  const pane = scrollingPane(node);
+  scrollPaneOrPage(pane, scrolledIn(pane) + middleOf(node) - y);
+}
+
 function keepPlace(place, shownMarks, freshMarks) {
-  const anchor = (place.vacated && intoVacated(place)) ?? followAnchors(place, shownMarks, freshMarks);
-  if (place.pane) {
-    const y = anchor ? place.pane.scrollTop + anchor.drift : place.y;
-    if (place.pane.scrollTop !== y) place.pane.scrollTop = y;
-    return;
-  }
-  const y = anchor ? scrollY + anchor.drift : place.y;
-  if (scrollX !== place.x || scrollY !== y) scrollTo(place.x, y);
+  const { line, pressY } = place.vacated ?? {};
+  const anchor = (line?.checkVisibility() && anchorLineAt(line, pressY, place.pane)) || followAnchors(place, shownMarks, freshMarks);
+  scrollPaneOrPage(place.pane, anchor ? scrolledIn(place.pane) + anchor.drift : place.y, place.x);
 }
 
 function textPoint(box, marks, node, offset) {
