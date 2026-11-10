@@ -306,7 +306,7 @@ function paidMoney(n) {
 }
 
 function pathCode(path) {
-  return el("code", {}, path.split("/").map((part, i) => (i ? [el("wbr"), `/${part}`] : part)));
+  return el("code", { class: "path" }, wrapAtSlashes(path));
 }
 
 function modelOnRunner(model, runner) {

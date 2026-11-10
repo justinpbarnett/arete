@@ -206,6 +206,7 @@ td .state { margin-right: 2px; }
 td button { padding-top: 3px; padding-bottom: 2px; white-space: nowrap; }
 td.muted-cell { color: var(--muted); overflow-wrap: anywhere; }
 .id-part { display: inline-block; }
+code.path { display: inline-block; }
 .clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 td.wrap-cell, td .wrap-cell, td a[data-row] { overflow-wrap: anywhere; }
 td div.muted { font-size: 13px; margin-top: 2px; }
