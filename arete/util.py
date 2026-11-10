@@ -199,6 +199,10 @@ def first_line(text: str, n: int = 160) -> str:
     return ""
 
 
+def one_line(text: str, n: int = 300) -> str:
+    return " ".join(text.split())[:n]
+
+
 def last_line(text: str, n: int = 160) -> str:
     for line in reversed((text or "").strip().splitlines()):
         line = line.strip()

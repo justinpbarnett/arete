@@ -75,6 +75,7 @@ note = "Hetzner box"
 ```
 
 `arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `arete` and `ollama` it has.
+Arete's ssh never forwards your ssh agent, so an agent on a device cannot use your keys.
 
 A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
 Each run gets a VM of its own, works on it over ssh, and deletes it when the run ends.
@@ -91,6 +92,7 @@ note = "a fresh sandbox per run"
 
 A sandbox is named `arete-` and its run id, and is tagged `arete`; a copy of a template also keeps the template's tags.
 `keep = true` leaves the sandbox up after the run and logs the `ssh exe.dev rm NAME` that deletes it; exe.dev bills it until then.
+It keeps only a sandbox that came up and passed the checks below, and arete deletes one that it refuses or that never answers.
 A probe of an `exe` device makes a real sandbox, checks that it answers, and deletes it.
 
 Agents in a sandbox run on pi, which reads `~/.pi/agent/models.json` on the VM; a loop or session that would run claude there is refused.
@@ -117,10 +119,20 @@ sed -nE 's/^(export )?OPENROUTER_API_KEY=//p' ~/.config/arete/pi.env | tr -d "\"
 
 A model is then `openrouter/` and an OpenRouter model id.
 In a sandbox, pi gets Bash, Edit and Write, and runs without the rules against git writes, because the VM holds nothing to push with and is deleted after the run.
-A probe or a run refuses a sandbox that could push, and deletes it.
-That is a sandbox that holds `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, a gh login, a git `credential.helper`, `$GH_TOKEN`, `$GITHUB_TOKEN` or a private key in `~/.ssh`.
-It is also a sandbox that a `github` integration reaches through `auto:all`, the `arete` tag or a tag of the template, unless that integration is `--readonly`.
+A probe, a loop run or a session refuses a sandbox that could push, and deletes it, even on a `keep = true` device.
+The refusal names what arete found and never prints a value.
+Arete looks in the login's home and environment for:
+
+- `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc` or a gh login, also under `$XDG_CONFIG_HOME` or `$GH_CONFIG_DIR`
+- a git `credential.helper`, also one for a single URL, or a `url.insteadOf` that holds a credential
+- `$GH_TOKEN`, `$GITHUB_TOKEN` or their `_ENTERPRISE_` forms, in the environment or set in a shell startup file or `/etc/environment`
+- a private key anywhere under `~/.ssh`, or a `~/.ssh` that arete cannot read all of
+
+It also refuses a sandbox that a `github` integration reaches, unless that integration is `--readonly`.
+An integration reaches a sandbox through `auto:all`, a tag the sandbox carries (`arete`, and on a copy the template's tags), `vm:` and the sandbox's name, or the whole team.
+An attachment of a form arete does not know counts as reaching it.
 Arete cannot see a GitHub token inside another kind of integration, such as an `http-proxy` one, so keep those off what a sandbox reaches.
+The check reads the login's own home, so give root and any other user on the template no git credentials either.
 
 A device of kind `proxmox` clones a template VM on a Proxmox VE host for each run:
 

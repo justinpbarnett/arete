@@ -21,7 +21,7 @@ from . import paths, state, util
 DEVICES_FILE = paths.CONFIG_DIR / "devices.toml"
 CACHE_FILE = paths.STATE_DIR / "devices.json"
 KINDS = ("local", "ssh", "exe", "proxmox")
-SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=30"]
+SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=30", "-o", "ForwardAgent=no"]
 SSH_FAILED = 255
 SSH_FAILED_BEFORE_SENDING = re.compile(r"Could not resolve hostname|ssh: connect to host|kex_exchange_identification|"
                                        r"banner exchange|Host key verification failed|Permission denied \(")
@@ -42,11 +42,23 @@ EXE_VM_DOMAIN = ".exe.xyz"
 EXE_TAG = "arete"
 EXE_EGRESS = ("integrations", "all")
 EXE_BOOT_SECONDS = 120
-GIT_CREDENTIALS = ('{ for f in ~/.git-credentials "${XDG_CONFIG_HOME:-$HOME/.config}/git/credentials" ~/.netrc '
-                   '~/.config/gh/hosts.yml; do test -s "$f" && echo "$f"; done; '
-                   'git config --get-all credential.helper >/dev/null 2>&1 && echo "a git credential.helper"; '
-                   'for v in GH_TOKEN GITHUB_TOKEN; do test -n "$(printenv $v)" && echo "\\$$v"; done; '
-                   'grep -l "PRIVATE KEY" ~/.ssh/* 2>/dev/null; } | sed "s|^$HOME/|~/|"')
+FIND_GIT_CREDENTIALS = r"""
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+{
+  for f in ~/.git-credentials "$config/git/credentials" ~/.netrc "${GH_CONFIG_DIR:-$config/gh}/hosts.yml"; do
+    test -s "$f" && echo "$f"
+  done
+  git config --get-regexp '^credential\..*helper$' >/dev/null 2>&1 && echo "a git credential.helper"
+  git config --get-regexp '^url\..*\.insteadof$' 2>/dev/null | grep -qE 'https?://[^/ ]+@' &&
+    echo "a git url.insteadOf that holds a credential"
+  for v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
+    test -n "$(printenv $v)" && echo "\$$v"
+  done
+  grep -lE '(GH|GITHUB)(_ENTERPRISE)?_TOKEN=' ~/.profile ~/.bash_profile ~/.bash_login ~/.bashrc ~/.zshenv ~/.zprofile \
+    ~/.zshrc /etc/environment /etc/profile /etc/bash.bashrc /etc/profile.d/* 2>/dev/null | sed 's/^/a GitHub token in /'
+  test ! -e ~/.ssh || grep -rl "PRIVATE KEY" ~/.ssh 2>/dev/null || test $? = 1 || echo "~/.ssh (arete could not read all of it)"
+} | sed "s|$HOME/|~/|g"
+"""
 PROBE_SANDBOX_MINUTES = 10
 CREATE_MAY_FINISH_MINUTES = 10
 SWEEP_GIVES_UP_DAYS = 7
@@ -272,14 +284,25 @@ def pve(d: Device, command: str, timeout: float = 300) -> str:
     return res.stdout
 
 
-def exe(d: Device, *command: str, timeout: float = 120) -> dict | list:
+def exe(d: Device, *command: str, timeout: float = 120) -> dict:
+    return exe_reply(d, command, timeout, "an object", lambda reply: isinstance(reply, dict))
+
+
+def exe_list(d: Device, *command: str) -> list[dict]:
+    return exe_reply(d, command, 120, "a list of objects",
+                     lambda reply: isinstance(reply, list) and all(isinstance(row, dict) for row in reply))
+
+
+def exe_reply(d: Device, command: tuple[str, ...], timeout: float, shape: str, has_shape: Callable[[object], bool]):
     res = util.sh([*ssh_argv(d), shlex.join([*command, "--json"])], timeout=timeout)
     reply = json_reply(res.stdout)
-    if isinstance(reply, list) or isinstance(reply, dict) and not reply.get("error"):
-        return reply
     failed = f"{d.name}: `ssh {d.host} {command[0]}` failed: "
-    if isinstance(reply, dict):
-        raise DeviceError(failed + str(reply["error"]))
+    if isinstance(reply, dict) and reply.get("error"):
+        raise DeviceError(failed + util.one_line(str(reply["error"])))
+    if has_shape(reply):
+        return reply
+    if reply is not None:
+        raise DeviceError(f"{failed}its answer is not {shape}")
     never_sent = res.returncode == SSH_FAILED and SSH_FAILED_BEFORE_SENDING.search(res.stderr or "")
     raise (NeverSent if never_sent else NoAnswer)(failed + failure(res))
 
@@ -453,7 +476,7 @@ class Sandbox:
             return ""
         errors = reply.get("errors")
         why = errors.get(self.name) if isinstance(errors, dict) else errors
-        return f"could not delete {self}: {why or 'exe.dev gave no reason'}"
+        return f"could not delete {self}: {util.one_line(str(why or 'exe.dev gave no reason'))}"
 
 
 @contextmanager
@@ -478,9 +501,13 @@ def fresh_sandbox(d: Device, run_id: str, log):
     sandbox = Sandbox(d, vm_name(run_id))
     started = time.monotonic()
     vm = create_sandbox(sandbox, run_id, log)
-    with kept_or_deleted(sandbox, log):
+    try:
         boot_sandbox(sandbox, vm)
-        log(f"{sandbox} is up at {vm.host} in {time.monotonic() - started:.1f} s")
+    except BaseException:
+        delete_or_say_why(sandbox, log)
+        raise
+    log(f"{sandbox} is up at {vm.host} in {time.monotonic() - started:.1f} s")
+    with kept_or_deleted(sandbox, log):
         yield vm
 
 
@@ -528,36 +555,60 @@ def create_sandbox(sandbox: Sandbox, run_id: str | None, log) -> Device:
 
 
 def boot_sandbox(sandbox: Sandbox, vm: Device) -> None:
-    if sandbox.device.template:
-        tags = exe(sandbox.device, "tag", sandbox.name, EXE_TAG).get("tags") or [EXE_TAG]
-    else:
-        tags = [EXE_TAG]
-    refuse_github_integrations(sandbox, tags)
+    refuse_github_integrations(sandbox, sandbox_tags(sandbox))
     wait_for_ssh(vm)
     refuse_git_credentials(sandbox, vm)
 
 
+def sandbox_tags(sandbox: Sandbox) -> list[str]:
+    if not sandbox.device.template:
+        return [EXE_TAG]
+    tags = exe(sandbox.device, "tag", sandbox.name, EXE_TAG).get("tags")
+    if isinstance(tags, list) and EXE_TAG in tags:
+        return tags
+    raise DeviceError(f"exe.dev did not say which tags {sandbox} carries, so arete cannot tell which integrations "
+                      f"reach it")
+
+
 def refuse_github_integrations(sandbox: Sandbox, tags: list[str]) -> None:
-    reaches = {"auto:all", f"vm:{sandbox.name}", *(f"tag:{tag}" for tag in tags)}
-    for integration in exe(sandbox.device, "integrations", "ls"):
-        through = sorted(reaches & set(integration.get("attachments") or []))
-        if integration.get("type") == "github" and through and not read_only(integration):
-            name = integration["name"]
+    for integration in exe_list(sandbox.device, "integrations", "ls"):
+        if integration.get("type") != "github" or read_only(integration):
+            continue
+        if through := reached_through(integration, sandbox, tags):
+            name = integration.get("name") or "NAME"
             raise DeviceError(f"{sandbox} could push to GitHub through the integration {name}, attached to "
                               f"{', '.join(through)}; make it read-only with "
                               f"`ssh {sandbox.device.host} integrations edit {name} --readonly`, "
                               f"or attach it only to VMs you keep")
 
 
+def reached_through(integration: dict, sandbox: Sandbox, tags: list[str]) -> list[str]:
+    if is_true(integration.get("isTeam")):
+        return ["the team"]
+    return sorted(str(a) for a in integration.get("attachments") or [] if reaches(str(a), sandbox.name, tags))
+
+
+def reaches(attachment: str, vm_name: str, tags: list[str]) -> bool:
+    kind, _, target = attachment.partition(":")
+    if kind == "vm":
+        return target == vm_name
+    if kind == "tag":
+        return target in tags
+    return True
+
+
 def read_only(integration: dict) -> bool:
     # exe.dev does not document the field that marks a github integration read-only, so any key spelled readonly counts.
     settings = {**integration, **(integration.get("config") or {})}
-    return any(key.lower().replace("_", "") == "readonly" and str(value).lower() == "true"
-               for key, value in settings.items())
+    return any(key.lower().replace("_", "") == "readonly" and is_true(value) for key, value in settings.items())
+
+
+def is_true(value) -> bool:
+    return str(value).lower() == "true"
 
 
 def refuse_git_credentials(sandbox: Sandbox, vm: Device) -> None:
-    res = util.sh([*ssh_argv(vm), GIT_CREDENTIALS], timeout=30)
+    res = util.sh([*ssh_argv(vm), f"sh -c {shlex.quote(FIND_GIT_CREDENTIALS)}"], timeout=30)
     if res.returncode != 0:
         raise DeviceError(f"could not check {sandbox} for git credentials: {failure(res)}")
     if found := [line for line in res.stdout.splitlines() if line.strip()]:
