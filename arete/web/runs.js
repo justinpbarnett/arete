@@ -19,7 +19,7 @@ function drawRuns(data, q) {
       ? table("Running first, then newest first",
         [["Work", "c-work"], ["Kind", "c-kind wide-only"], ["Status", "c-status"], ["Started", "c-time"], ["Time", "num c-duration wide-only"], ...paid.head, ["Result", "c-result wide-only"]],
         data.runs.map((r) => linkedRow(detailHash("run", r.id),
-          cell(rowLink("run", r.id, runName(r))), cell(r.kind), cell(runStatus(r.status), "nb run-status"), cell(clock(r.started), "nb"),
+          cell(rowLink("run", r.id, runName(r))), cell(r.kind), cell(runStatus(r.status), "nb wrap-narrow"), cell(clock(r.started), "nb"),
           cell(duration(r.seconds), "num"), paid.cell(r),
           cell(r.pr_url ? pullLinks(r.pr_url) : clampedSummary(r.summary), "muted-cell"))))
       : quiet(filtered ? "No run matches these filters." : "No run has started yet."),

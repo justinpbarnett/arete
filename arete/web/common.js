@@ -201,14 +201,21 @@ function withLinks(text) {
   return text.split(URL_IN_TEXT).map((part, i) => (i % 2 ? link(part, part) : document.createTextNode(part)));
 }
 
-function breakOnlyAt(text, separator) {
-  if (!text) return "";
-  return text.split(separator).flatMap((part, i) => [i ? separator : null, el("span", { class: "nb", text: part })]).filter(Boolean);
+function joinSpans(parts, cls, gap) {
+  return parts.flatMap((part, i) => [i ? gap() : null, el("span", { class: cls }, part)]);
+}
+
+function wholeWords(text) {
+  return text ? joinSpans(text.split(" "), "nb", () => " ") : "";
 }
 
 function wrapAtSlashes(text) {
-  if (!text) return "";
-  return text.split(/(?<=\/)/).flatMap((part, i) => [i ? el("wbr") : null, el("span", { class: "id-part", text: part })]);
+  return text ? joinSpans(text.split(/(?<=\/)/), "part", () => el("wbr")) : "";
+}
+
+function wrapAfterCommas(text) {
+  const words = (part) => joinSpans(part.split(" "), "part", () => " ");
+  return text ? joinSpans(text.split(/(?<=,) /).map(words), "part", () => " ") : "";
 }
 
 function pullLinks(urls) {
@@ -253,7 +260,7 @@ function rowLink(kind, id, text) {
 }
 
 function runName(r) {
-  return r.ticket ? breakOnlyAt(r.ticket, " ") : r.id;
+  return r.ticket ? wholeWords(r.ticket) : r.id;
 }
 
 function clampedSummary(text) {
