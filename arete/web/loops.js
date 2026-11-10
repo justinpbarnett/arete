@@ -30,7 +30,12 @@ function installServe(btn) {
 function loopLastRun(l) {
   if (l.running) return ["running", el("br"), itemLink("run", l.running, "Open the run", `running:${l.name}`)];
   if (!l.last) return "never";
-  return [...runStatus(l.last.status), el("br"), el("a", { href: detailHash("run", l.last.id), "data-focus": `last:${l.name}`, class: "muted-link" }, liveAgo(l.last.started))];
+  return [...runStatus(l.last.status), el("br"), el("a", { href: detailHash("run", l.last.id), "data-focus": `last:${l.name}`, class: "muted-link nb" }, liveAgo(l.last.started))];
+}
+
+function loopTrigger(l) {
+  const next = l.next_due ? `next ${clock(l.next_due)}` : "";
+  return [el("span", { class: "nb", text: l.trigger }), el("div", { class: "muted", text: [l.kind, next].filter(Boolean).join(" · ") })];
 }
 
 function loopButtons(l, place) {
@@ -45,10 +50,8 @@ function loopRow(l) {
   return linkedRow(detailHash("loop", l.name),
     cell([rowLink("loop", l.name, l.name), el("div", { class: "muted", text: l.error || l.description })]),
     cell(l.error ? stateChip("fault") : l.enabled ? "on" : "off", "nb"),
-    cell(l.kind),
-    cell(l.trigger, "nb"),
-    cell(loopLastRun(l), "nb"),
-    cell(l.next_due ? clock(l.next_due) : "", "nb"),
+    cell(loopTrigger(l)),
+    cell(loopLastRun(l), "last-run"),
     cell(paidMoney(l.spent_24h), "num"),
     cell(el("div", { class: "loop-buttons" }, loopButtons(l, "loops"))));
 }
@@ -58,7 +61,7 @@ function drawLoops(data) {
     serveLine(data.serve),
     saidLine("loops"),
     data.loops.length
-      ? table("", [["Loop", "c-loop"], ["On", "c-on"], ["Kind", "wide-only"], ["Trigger", "wide-only"], ["Last run", "c-status"], ["Next", "c-time wide-only"], ["Paid 24 h", "num nb wide-only"], ["", "c-loop-buttons beside"]],
+      ? table("", [["Loop", "c-loop"], ["On", "c-on"], ["Trigger", "wide-only"], ["Last run", "c-status"], ["Paid 24 h", "num nb wide-only c-paid-day"], ["", "c-loop-buttons beside"]],
         data.loops.map(loopRow), { stack: true })
       : quiet("No loop is installed. New loop drafts one from a sentence."));
   fillLoopNew(data.draft);

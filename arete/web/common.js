@@ -392,7 +392,7 @@ function foldText(key, summary, text) {
 }
 
 function runStatus(status) {
-  return sayParts(RUN_STATE[status], status);
+  return sayParts(RUN_STATE[status], el("span", { class: "nb", text: status }));
 }
 
 function secondsBetween(start, end) {

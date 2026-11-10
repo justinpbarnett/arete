@@ -185,13 +185,14 @@ th.c-duration { width: 120px; }
 .wide :is(th, td).num + :is(th, td):not(.num) { padding-left: 14px; }
 th.c-ref { width: 140px; }
 th.c-verdict { width: 300px; }
-th.c-result { min-width: 220px; }
+th.c-result { min-width: 175px; }
 th.c-on { width: 70px; }
 th.c-decide { width: 210px; }
 th.c-run-buttons { width: 130px; }
 th.c-model { width: 190px; }
 th.c-probe { width: 134px; }
-th.c-loop { min-width: 220px; }
+th.c-loop { min-width: 160px; }
+@container (max-width: 879.98px) { td.last-run, th.c-paid-day { white-space: normal; } }
 th.c-device { min-width: 200px; }
 @container (min-width: 720px) { th.c-work { min-width: 150px; } }
 @container (max-width: 560px) {
