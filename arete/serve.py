@@ -221,14 +221,15 @@ class Server:
                 state.drop_queue_item(item["id"])
                 self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
                 continue
-            key = (item["queue"], item["grp"])
-            size = self.cfg.queues.get(item["queue"], 1)
+            queue = loop.queue_name
+            key = (queue, item["grp"])
+            size = self.cfg.queues.get(queue, 1)
             if item["grp"] and key in held_groups:
                 why = f"group {item['grp']} takes one at a time"
             elif loop.name in busy:
                 why = str(control.Busy(loop.name))
-            elif per_queue[item["queue"]] >= size:
-                why = f"queue {item['queue']} is full at {util.count(size, 'run')}"
+            elif per_queue[queue] >= size:
+                why = f"queue {queue} is full at {util.count(size, 'run')}"
             elif spent := engine.spent_limit(loop, self.cfg):
                 why = f"its {spent} is spent"
             elif held := loop.usage_hold(self.cfg):
@@ -247,7 +248,7 @@ class Server:
                 else:
                     self.waiting.pop(item["id"], None)
                     busy.add(loop.name)
-                    per_queue[item["queue"]] += 1
+                    per_queue[queue] += 1
                     why = ""
                     self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
             if item["grp"]:
