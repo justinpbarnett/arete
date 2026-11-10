@@ -299,9 +299,9 @@ function liveAgo(ts) {
 
 function duration(seconds) {
   if (seconds === null || seconds === undefined) return "";
-  if (seconds < 60) return `${seconds} s`;
+  if (seconds < 60) return `${seconds} s`;
   const minutes = Math.round(seconds / 60);
-  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${pad(minutes % 60)} min`;
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${pad(minutes % 60)} min`;
 }
 
 function money(n) {
