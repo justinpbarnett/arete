@@ -41,12 +41,17 @@ def secret(name: str, create: bool = True) -> str:
     return p.read_text().strip()
 
 
+def bearer_token(authorization: str) -> str:
+    scheme, _, credentials = authorization.strip().partition(" ")
+    return credentials.strip() if scheme.lower() == "bearer" else authorization.strip()
+
+
 def check(name: str, headers, body: bytes) -> None:
     key = secret(name, create=False)
     if not key:
         raise HookRefused(404, f"No webhook for {name}.")
     signature = headers.get("X-Hub-Signature-256", "")
-    token = headers.get("X-Arete-Token", "") or headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    token = headers.get("X-Arete-Token", "") or bearer_token(headers.get("Authorization", ""))
     if signature:
         expected = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature.encode(), expected.encode()):
