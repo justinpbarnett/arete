@@ -63,6 +63,7 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                         e.log_to(log)
                 else:
                     settle_judged(emit, run_id, "landed")
+                    emit.landed(batch, loop.name, done)
                     log("emit", f"{spec['type']}: {done}")
 
 
@@ -178,5 +179,6 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
         log("emit", "rejected, because trying again would fail the same way")
         raise Failed(why, e.cause) from e.cause
     state.decide_approval(approval_id, "done", done)
+    emit.landed(delivery.get("batch") or [], row["loop"], done)
     log("emit", f"{delivery['type']}: {done}")
     return done
