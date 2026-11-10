@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shlex
+import tempfile
 import time
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from . import paths, util
 
@@ -17,6 +20,9 @@ SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAli
 PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi arete ollama; do command -v $t >/dev/null && echo has:$t; "
          "done; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/gpu:/'")
 CLONE_BOOT_SECONDS = 180
+GUEST_HOST_KEYS = "sh -c 'cat /etc/ssh/ssh_host_*_key.pub'"
+HOST_KEY = re.compile(r"^(?:ssh|ecdsa|sk)-[\w@.-]+ [A-Za-z0-9+/]+={0,3}(?:\s|$)")
+GUEST_EXEC_REFUSED = re.compile(r"guest-exec\S* has been disabled", re.IGNORECASE)
 END_WITH_SESSION = ("( (kill -0 $PPID && while kill -0 $PPID && kill -0 $$; do sleep 1; done && kill -0 $$ && kill -KILL -$$)"
                     " </dev/null >/dev/null 2>&1 & ); exec \"$@\"")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -37,6 +43,7 @@ class Device:
     keep: bool = False
     note: str = ""
     via: Device | None = None
+    known_hosts: str = ""
 
     @property
     def remote(self) -> bool:
@@ -95,6 +102,9 @@ def resolve(device: Device | str) -> Device:
 
 def ssh_argv(d: Device) -> list[str]:
     argv = ["ssh", *SSH_OPTIONS]
+    if d.known_hosts:
+        argv += ["-o", "StrictHostKeyChecking=yes",
+                 "-o", f"UserKnownHostsFile=\"{d.known_hosts.replace('%', '%%')}\""]
     if d.port:
         argv += ["-p", str(d.port)]
     if d.identity:
@@ -174,17 +184,51 @@ def pve(d: Device, command: str, timeout: float = 300) -> str:
     return res.stdout
 
 
-def clone_address(d: Device, vmid: int) -> str:
-    deadline = time.monotonic() + CLONE_BOOT_SECONDS
+def clone_address(d: Device, vmid: int, deadline: float) -> str:
     while time.monotonic() < deadline:
         res = util.sh([*ssh_argv(d), f"qm guest cmd {vmid} network-get-interfaces"], timeout=30)
         if res.returncode == 0:
             for iface in json.loads(res.stdout or "[]"):
                 for a in iface.get("ip-addresses", []):
-                    if a.get("ip-address-type") == "ipv4" and not a["ip-address"].startswith("127."):
-                        return a["ip-address"]
+                    if a.get("ip-address-type") == "ipv4" and (address := reachable_ipv4(a.get("ip-address"))):
+                        return address
         time.sleep(5)
     raise DeviceError(f"{d.name}: clone {vmid} reported no address in {CLONE_BOOT_SECONDS}s")
+
+
+def reachable_ipv4(text) -> str:
+    try:
+        address = ipaddress.IPv4Address(text)
+    except ValueError:
+        return ""
+    return "" if address.is_loopback else str(address)
+
+
+def guest_host_keys(d: Device, vmid: int) -> list[str]:
+    res = util.sh([*ssh_argv(d), f"qm guest exec {vmid} -- {GUEST_HOST_KEYS}"], timeout=60)
+    if GUEST_EXEC_REFUSED.search(res.stderr + res.stdout):
+        raise DeviceError(f"{d.name}: the guest agent of clone {vmid} has guest-exec disabled, so arete cannot read "
+                          "the clone's ssh host keys to check them; allow guest-exec in the template's qemu-guest-agent")
+    if res.returncode != 0:
+        return []
+    out = str(json.loads(res.stdout or "{}").get("out-data", ""))
+    return [" ".join(line.split()[:2]) for line in out.splitlines() if HOST_KEY.match(line)]
+
+
+def trust_clone(d: Device, vmid: int, clone: Device, address: str, deadline: float) -> None:
+    while True:
+        keys = guest_host_keys(d, vmid)
+        Path(clone.known_hosts).write_text("".join(f"{address} {key}\n" for key in keys))
+        if not keys:
+            why = "its guest agent reported no ssh host key"
+        elif (res := util.sh([*ssh_argv(clone), "true"], timeout=30)).returncode == 0:
+            return
+        else:
+            why = util.last_line(res.stderr or res.stdout or f"exit {res.returncode}", 300)
+        if time.monotonic() >= deadline:
+            raise DeviceError(f"{d.name}: clone {vmid} did not answer ssh with a host key its guest agent reported "
+                              f"in {CLONE_BOOT_SECONDS}s; the last try said: {why}")
+        time.sleep(5)
 
 
 @contextmanager
@@ -199,9 +243,15 @@ def lease(device: Device | str, label: str, log=lambda text: None):
     pve(d, f"qm clone {d.template} {vmid} --name {name} --full 0")
     try:
         pve(d, f"qm start {vmid}")
-        address = clone_address(d, vmid)
+        deadline = time.monotonic() + CLONE_BOOT_SECONDS
+        address = clone_address(d, vmid, deadline)
         log(f"VM {vmid} is up at {address}")
-        yield replace(d, name=f"{d.name} clone", kind="ssh", host=f"{d.user}@{address}", port=None, jump="", via=d)
+        with tempfile.TemporaryDirectory(prefix="arete-clone-") as trust_dir:
+            clone = replace(d, name=f"{d.name} clone", kind="ssh", host=f"{d.user}@{address}", port=None, jump="",
+                            via=d, known_hosts=str(Path(trust_dir) / "known_hosts"))
+            trust_clone(d, vmid, clone, address, deadline)
+            log(f"VM {vmid} answers ssh with a host key its guest agent reported")
+            yield clone
     finally:
         if d.keep:
             log(f"keeping VM {vmid}")
