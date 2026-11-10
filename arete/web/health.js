@@ -53,7 +53,7 @@ async function probe(name, btn) {
 function failures(h) {
   const rows = [];
   const add = (state, what, name, detail) => rows.push({ state, row: el("tr", {}, cell(stateChip(state)), cell([el("span", { class: "muted", text: `${what} ` }), name]), cell(detail || "", "muted-cell")) });
-  for (const a of h.alerts.rows?.alerts ?? []) add("fault", "Alert", a.key, [`opened ${clock(a.opened)}, last seen `, liveAgo(a.last_seen), a.url ? [" · ", link(a.url, `#${a.issue}`)] : null]);
+  for (const a of h.alerts.rows?.alerts ?? []) add("fault", "Alert", a.key, [`opened ${clock(a.opened)}, last seen `, liveAgo(a.last_seen), a.url ? [" · ", link(a.url, `${a.repo}#${a.issue}`)] : null]);
   for (const c of h.checks.rows?.checks ?? []) if (c.state !== "ok") add(c.state, "Check", c.key, c.detail);
   for (const p of h.alerts.rows?.probes ?? []) if (!p.ok) add("fault", "Probe", p.name, p.detail);
   for (const l of h.checks.rows?.loops ?? []) if (!l.ok) add("fault", "Loop", l.name, l.detail);
