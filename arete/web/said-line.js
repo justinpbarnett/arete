@@ -243,9 +243,21 @@ function restingTop(line) {
 }
 
 function marginAbove(line) {
-  let above = line.previousElementSibling;
-  while (above && !above.checkVisibility()) above = above.previousElementSibling;
-  return above ? restingTop(line) - above.getBoundingClientRect().bottom : 0;
+  // The margin it collapses into can be a row's above it or a pane head's through the line's parent, so a margin taller than either measures it.
+  const pane = scrollingPane(line);
+  const scrolled = scrolledIn(pane);
+  const held = line.style.marginTop;
+  const topWith = (margin) => {
+    line.style.marginTop = margin;
+    return line.getBoundingClientRect().top + scrolledIn(pane);
+  };
+  const free = topWith("");
+  const collapsed = innerHeight - (topWith(`${innerHeight}px`) - free);
+  if (held) line.style.marginTop = held;
+  else line.removeAttribute("style");
+  // Scroll anchoring follows each trial margin.
+  scrollPaneOrPage(pane, scrolled);
+  return collapsed;
 }
 
 function slideRowsWhile(box, change) {
