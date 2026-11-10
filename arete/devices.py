@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import paths, state, util
 
@@ -42,6 +43,11 @@ EXE_VM_DOMAIN = ".exe.xyz"
 EXE_TAG = "arete"
 EXE_EGRESS = ("integrations", "all")
 EXE_BOOT_SECONDS = 120
+GIT_FORGES = {"github": "GitHub", "gitlab": "GitLab", "bitbucket": "Bitbucket", "forgejo": "Forgejo", "gitea": "Gitea"}
+GIT_HOSTS = ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "gitea.com", "sr.ht", "dev.azure.com",
+             "visualstudio.com", "gitee.com")
+READONLY_KINDS = ("github",)
+PLAIN_NAME = re.compile(r"[\w.-]+")
 FIND_GIT_CREDENTIALS = r"""
 config=${XDG_CONFIG_HOME:-$HOME/.config}
 {
@@ -555,7 +561,7 @@ def create_sandbox(sandbox: Sandbox, run_id: str | None, log) -> Device:
 
 
 def boot_sandbox(sandbox: Sandbox, vm: Device) -> None:
-    refuse_github_integrations(sandbox, sandbox_tags(sandbox))
+    refuse_pushing_integrations(sandbox, sandbox_tags(sandbox))
     wait_for_ssh(vm)
     refuse_git_credentials(sandbox, vm)
 
@@ -570,37 +576,93 @@ def sandbox_tags(sandbox: Sandbox) -> list[str]:
                       f"reach it")
 
 
-def refuse_github_integrations(sandbox: Sandbox, tags: list[str]) -> None:
+def refuse_pushing_integrations(sandbox: Sandbox, tags: list[str]) -> None:
     for integration in exe_list(sandbox.device, "integrations", "ls"):
-        if integration.get("type") != "github" or read_only(integration):
-            continue
-        if through := reached_through(integration, sandbox, tags):
+        if (push := how_it_pushes(integration)) and (through := reached_through(integration, sandbox, tags)):
             name = integration.get("name") or "NAME"
-            raise DeviceError(f"{sandbox} could push to GitHub through the integration {name}, attached to "
-                              f"{', '.join(through)}; make it read-only with "
-                              f"`ssh {sandbox.device.host} integrations edit {name} --readonly`, "
-                              f"or attach it only to VMs you keep")
+            fix = "attach it only to VMs you keep"
+            if kind_of(integration) in READONLY_KINDS:
+                fix = f"make it read-only with `ssh {sandbox.device.host} integrations edit {name} --readonly`, or {fix}"
+            raise DeviceError(f"{sandbox} could {push}: the integration {name} reaches it through "
+                              f"{', '.join(through)}; {fix}")
+
+
+def how_it_pushes(integration: dict) -> str | None:
+    kind = kind_of(integration)
+    if kind in READONLY_KINDS and read_only(integration):
+        return None
+    if forge := next((GIT_FORGES[s] for s in services_of(integration) if s in GIT_FORGES), None):
+        return f"push to {forge}"
+    if kind == "http-proxy":
+        return how_a_proxy_pushes(integration.get("target"))
+    if kind == "ssh-key":
+        return "push over ssh with a key exe.dev holds"
+    if kind == "exe-dev":
+        return "push through a GitHub integration it attaches to itself, using exe.dev as you"
+    return None
+
+
+def kind_of(integration: dict) -> str:
+    return normal_name(integration.get("type"))
+
+
+def services_of(integration: dict) -> set[str]:
+    return {kind_of(integration), normal_name(integration.get("catalogService")),
+            normal_name(integration_config(integration).get("service"))}
+
+
+def normal_name(value) -> str:
+    return re.sub(r"[\W_]+", "-", str(value or "").lower()).strip("-")
+
+
+def how_a_proxy_pushes(target) -> str | None:
+    if not target:
+        return None
+    host = proxied_host(target)
+    if not host:
+        return "push through a proxy target arete cannot read"
+    if any(host == h or host.endswith(f".{h}") for h in GIT_HOSTS):
+        return f"push to {host}"
+    return None
+
+
+def proxied_host(target) -> str | None:
+    if not isinstance(target, str):
+        return None
+    try:
+        host = urlsplit(target if "://" in target else f"//{target}").hostname
+    except ValueError:
+        return None
+    return host.rstrip(".") if host else None
 
 
 def reached_through(integration: dict, sandbox: Sandbox, tags: list[str]) -> list[str]:
-    if is_true(integration.get("isTeam")):
-        return ["the team"]
-    return sorted(str(a) for a in integration.get("attachments") or [] if reaches(str(a), sandbox.name, tags))
+    attachments = integration.get("attachments") or []
+    if not isinstance(attachments, list) or not all(isinstance(a, str) for a in attachments):
+        return ["attachments arete cannot read"]
+    if not attachments and is_true(integration.get("isTeam")):
+        return ["the team, which exe.dev lists no attachments for"]
+    return sorted(a for a in attachments if reaches(a, sandbox.name, tags))
 
 
 def reaches(attachment: str, vm_name: str, tags: list[str]) -> bool:
     kind, _, target = attachment.partition(":")
-    if kind == "vm":
+    if kind == "vm" and PLAIN_NAME.fullmatch(target):
         return target == vm_name
-    if kind == "tag":
+    if kind == "tag" and PLAIN_NAME.fullmatch(target):
         return target in tags
     return True
 
 
 def read_only(integration: dict) -> bool:
     # exe.dev does not document the field that marks a github integration read-only, so any key spelled readonly counts.
-    settings = {**integration, **(integration.get("config") or {})}
-    return any(key.lower().replace("_", "") == "readonly" and is_true(value) for key, value in settings.items())
+    settings = {**integration, **integration_config(integration)}
+    return any(normal_name(key).replace("-", "") == "readonly" and is_true(value) for key, value in settings.items())
+
+
+def integration_config(integration: dict) -> dict:
+    settings = integration.get("config")
+    return settings if isinstance(settings, dict) else {}
 
 
 def is_true(value) -> bool:

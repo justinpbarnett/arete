@@ -128,10 +128,24 @@ Arete looks in the login's home and environment for:
 - `$GH_TOKEN`, `$GITHUB_TOKEN` or their `_ENTERPRISE_` forms, in the environment or set in a shell startup file or `/etc/environment`
 - a private key anywhere under `~/.ssh`, or a `~/.ssh` that arete cannot read all of
 
-It also refuses a sandbox that a `github` integration reaches, unless that integration is `--readonly`.
-An integration reaches a sandbox through `auto:all`, a tag the sandbox carries (`arete`, and on a copy the template's tags), `vm:` and the sandbox's name, or the whole team.
-An attachment of a form arete does not know counts as reaching it.
-Arete cannot see a GitHub token inside another kind of integration, such as an `http-proxy` one, so keep those off what a sandbox reaches.
+It also refuses a sandbox that one of these integrations reaches:
+
+- a `github` integration, unless it is `--readonly`
+- a GitLab, Bitbucket, Forgejo, Gitea or GitHub integration from the catalog, which has no read-only form
+- an `http-proxy` integration whose target is on a public forge: github.com, gitlab.com, bitbucket.org, codeberg.org, gitea.com, sr.ht, dev.azure.com, visualstudio.com or gitee.com
+- an `http-proxy` integration whose target arete cannot read
+- an `ssh-key` integration, since arete cannot tell which hosts take its key
+- an `exe-dev` integration, which lets the sandbox use exe.dev as you and so attach a GitHub integration to itself
+
+An integration reaches a sandbox through `auto:all`, a tag the sandbox carries (`arete`, and on a copy the template's tags), or `vm:` and the sandbox's name.
+A team integration reaches it through its tags, and one that lists no attachments counts as reaching it.
+An attachment of a form arete does not know counts as reaching it, such as a wildcard, a list, or a time-boxed grant written after the name.
+Arete cannot tell whether other integrations can push, so keep these off what a sandbox reaches:
+
+- an `http-proxy` to another forge, such as a self-hosted one
+- an External Connection to a private network
+- a VM-to-VM proxy to a VM that holds credentials
+- cloud credentials through `wif` or a token-mint service
 The check reads the login's own home, so give root and any other user on the template no git credentials either.
 
 A device of kind `proxmox` clones a template VM on a Proxmox VE host for each run:
