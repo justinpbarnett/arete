@@ -5,16 +5,18 @@ Find the places where the agent made the person correct it, interrupt it, reject
 an instruction they had given before, and the failures that keep happening. For each pattern, decide
 the one harness change that would have prevented it next time, and where that change belongs:
 
-- `global`: true in every repo. Goes in repo `$global_repo` (public): a skill under `skills/<name>/SKILL.md`.
-  There is no global CLAUDE.md; a global rule belongs in the skill it is about, or in a new small skill.
+- `global`: true in every repo. Goes in repo `$global_repo` (public). A rule about how every agent works with the
+  person (how to report, when to act or ask, what never to do on their behalf) goes in `harness/claude/CLAUDE.md`,
+  the global CLAUDE.md every session loads; it waits for the person's approval before it is written. A rule about
+  one tool or task goes in the skill it is about, `skills/<name>/SKILL.md`, or in a new small skill.
 - `repo`: true in one repo. Goes in that repo's `CLAUDE.md`, `AGENTS.md`, `.claude/skills/**`,
   `.agents/expertise.md`, or a nested `CLAUDE.md` near the code it is about.
 - `repo` in `$arete_repo`, the pipeline itself: how arete's own unattended steps (plan, build, review, verify and
   the rest) do their job. When the same miss shows up in more than one repo, the fix belongs in the step prompt that
   runs it, not in each repo. You may change these, and no others: $arete_prompts. Keep every `$$name`
   placeholder in them as it is and add none: the pipeline fills them.
-- `memory`: a fact about the person, their preferences, or their life rather than about code or tools.
-  Record it with layer memory; another system handles those.
+- `memory`: a fact about the person or their life rather than about code, tools, or how agents work with them.
+  Record it with layer memory; another system handles those. A preference about how agents work is a `global` rule.
 
 Repos you may change (name, path, public):
 

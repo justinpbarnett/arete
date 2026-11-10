@@ -67,8 +67,10 @@ function needsParts(n) {
     notes = [
       p.hand.length ? quiet("By hand: Claude Code will not let an agent write under .claude/, so the miner leaves these harness fixes to you. Make each one, then mark it done.") : null,
       p.memory.length ? quiet("Memory: facts the miner noticed for an agent's memory. File each one by hand, then mark it done.") : null,
+      p.approve.length ? quiet("Rules: global rules the miner drafted for every agent on every machine. Approve writes one into the global CLAUDE.md and pushes it; reject teaches the miner not to propose it again.") : null,
     ];
-    return [...p.hand.map((x) => proposalRow(x, "By hand", x.file, `The fix to ${x.repo}/${x.file}`)),
+    return [...p.approve.map(ruleRow),
+      ...p.hand.map((x) => proposalRow(x, "By hand", x.file, `The fix to ${x.repo}/${x.file}`)),
       ...p.memory.map((x) => proposalRow(x, "Memory", "", `The ${x.repo} fact`))];
   });
   return [
@@ -174,6 +176,22 @@ function proposalRow(x, kind, file, what) {
     cell([file ? el("div", { class: "wrap-cell", text: file }) : null, el("div", { class: file ? "muted" : "", text: x.change })]),
     cell(""),
     cell(el("div", { class: "row-buttons" }, button("Mark done", "done", (b) => markDone(x.id, what, b), { of: x.id }))));
+}
+
+function ruleRow(x) {
+  const path = `/api/proposals/${x.id}`;
+  const writing = x.status === "filing";
+  return el("tr", {},
+    cell(kindTag("Rule")),
+    repoCell(x.repo),
+    cell([el("div", { class: "wrap-cell", text: x.file }), el("div", { class: "muted", text: x.change }),
+      writing ? el("div", { class: "muted", text: "Being written and pushed now. If it stays here, the writer stopped: try again." }) : null]),
+    cell(""),
+    cell(el("div", { class: "row-buttons" },
+      button(writing ? "Try again" : "Approve", "rule-approve", (b) => act(b, "needs", `${path}/approve`, {},
+        () => `The rule is being written into ${x.repo}/${x.file} and pushed. If that fails it comes back here, and loops.log says why.`), { of: x.id }),
+      writing ? null : button("Reject", "rule-reject", (b) => act(b, "needs", `${path}/reject`, {},
+        () => "The rule is rejected, so the miner will not propose it again."), { of: x.id }))));
 }
 
 function markDone(id, what, btn) {
