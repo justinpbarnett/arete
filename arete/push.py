@@ -20,8 +20,8 @@ class Push(Emit):
         if loop.kind not in worktree_kinds():
             return [f"only {' and '.join(worktree_kinds())} loops emit a push"]
         if not push_check(spec, loop):
-            return [f"a {loop.kind} loop's push emit needs check, the command that must pass on the rebased tree "
-                    "before the push lands"]
+            return [(f"a {loop.kind} loop's push emit needs check, the command that must pass on the rebased tree "
+                     "before the push lands")]
         approve = spec.get("approve", False)
         if isinstance(approve, dict) and (unknown := sorted(set(approve) - set(APPROVE_KEYS))):
             return [f"a push emit's approve table takes {', '.join(APPROVE_KEYS)}, not {', '.join(unknown)}"]
@@ -34,8 +34,8 @@ class Push(Emit):
         if not isinstance(globs, str | list) or not all(isinstance(g, str) for g in globs):
             return [f"a push emit's approve paths is a list of path patterns, such as [\"src/auth/*\"], not {globs!r}"]
         if "reviewer" in rules and (not isinstance(reviewer := rules["reviewer"], str) or blank(reviewer)):
-            return [f"a push emit's approve reviewer is the model that reviews a held push, such as \"opus\", "
-                    f"not {reviewer!r}"]
+            return [(f"a push emit's approve reviewer is the model that reviews a held push, such as \"opus\", "
+                     f"not {reviewer!r}")]
         return []
 
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
