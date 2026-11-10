@@ -25,6 +25,7 @@ from .heartbeat import mark_loop
 from .pipeline import (
     make_worktree,
     prompt,
+    remote_head,
     remove_worktree,
 )
 from .util import git
@@ -418,6 +419,9 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
             return "", []
         fixes = util.count(len(landed), "mined fix", "mined fixes")
         git(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
+        if not remote_head(repo.path, branch):
+            with util.repo_lock(repo.path):
+                git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
         body = ["Fixes mined from recent sessions where an agent needed correcting.", ""]
         for i, p in enumerate(landed, 1):
