@@ -151,6 +151,11 @@ def print_proposals(p: dict) -> None:
         print("harness fixes to make by hand, since Claude Code denies agent writes under .claude/ (then `arete forget ID`):")
     for h in p["hand"]:
         print(f"  {h['id']:<4} {h['repo']}/{h['file']}: {h['change']}"[:400])
+    if p["approve"]:
+        print("global rules waiting for approval (`arete file-rule ID` writes and pushes one, `arete reject-rule ID` drops it):")
+    for r in p["approve"]:
+        writing = " (being written now)" if r["status"] == "filing" else ""
+        print(f"  {r['id']:<4} {r['repo']}/{r['file']}{writing}: {r['change']}"[:400])
 
 
 def print_skipped(skipped: list[dict]) -> None:
@@ -196,6 +201,26 @@ def cmd_forget(args) -> int:
 
     if not state.forget_proposal(args.id):
         print(f"no open proposal #{args.id}")
+        return 1
+    return 0
+
+
+def cmd_file_rule(args) -> int:
+    from . import miner
+
+    try:
+        print(miner.file_rule(args.id))
+    except LookupError as e:
+        print(e)
+        return 1
+    return 0
+
+
+def cmd_reject_rule(args) -> int:
+    from . import state
+
+    if not state.move_proposal(args.id, ("approve",), "rejected"):
+        print(f"#{args.id} is not a rule waiting for approval")
         return 1
     return 0
 
@@ -889,6 +914,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("forget", help="mark a memory fact or hand edit from the miner as done")
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_forget)
+
+    p = sub.add_parser("file-rule", help="write an approved global rule from the miner into the global CLAUDE.md and push it")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_file_rule)
+
+    p = sub.add_parser("reject-rule", help="drop a global rule from the miner, so it is not proposed again")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_reject_rule)
 
     p = sub.add_parser("jira-check", help="read Jira with the configured token and count waiting tickets")
     p.set_defaults(fn=cmd_jira_check)

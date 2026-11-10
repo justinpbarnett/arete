@@ -185,9 +185,9 @@ def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:
 
 
 def proposals() -> dict:
-    return {status: [{k: p[k] for k in ("id", "repo", "file", "change")}
-                     for p in state.proposals(status=[status], limit=PROPOSALS_SHOWN, connect=state.reader)]
-            for status in ("memory", "hand")}
+    return {kind: [{k: p[k] for k in ("id", "repo", "file", "change", "status")}
+                   for p in state.proposals(status=statuses, limit=PROPOSALS_SHOWN, connect=state.reader)]
+            for kind, statuses in (("memory", ["memory"]), ("hand", ["hand"]), ("approve", ["approve", "filing"]))}
 
 
 def run_log(run_id: str) -> list[str]:
