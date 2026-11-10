@@ -100,8 +100,7 @@ function approvalRow(a, place) {
 
 function reviewLine(a) {
   const r = a.review || {};
-  if (r.decision) return el("div", {}, el("span", { class: "muted", text: `Review by ${r.by}: ` }), `${r.decision}, ${r.confidence} confidence. ${r.reason}`);
-  return a.reviewer && !a.failed ? el("div", { class: "muted", text: `Review by ${a.reviewer}: not read yet.` }) : null;
+  return r.by ? el("div", {}, el("span", { class: "muted", text: `Review by ${r.by}: ` }), r.said) : null;
 }
 
 function decide(id, yes, btn, place) {

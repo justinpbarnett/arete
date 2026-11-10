@@ -20,9 +20,9 @@ class NoSummary(RuntimeError):
     pass
 
 
-def note_plain_summary(approval: dict, cfg: config.Config) -> str:
+def write_plain_summary(approval: dict, cfg: config.Config) -> str:
     state.set_approval_note(approval["id"], "plain_summary", plain_summary(approval, cfg))
-    return ""
+    return "plain summary written"
 
 
 def plain_summary(approval: dict, cfg: config.Config) -> str:

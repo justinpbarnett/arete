@@ -325,7 +325,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                 for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")],
               ("triage", "closed", "ALTER TABLE triage ADD COLUMN closed TEXT DEFAULT ''"),
               *[("approvals", col, f"ALTER TABLE approvals ADD COLUMN {col} TEXT DEFAULT ''")
-                for col in APPROVAL_NOTES],
+                for col in ("plain_summary", "plain_summary_tried", "review", "review_tried")],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               ("alerts", "repo", "ALTER TABLE alerts ADD COLUMN repo TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
@@ -656,12 +656,14 @@ def approvals(connect=db) -> list[dict]:
                                                  "ORDER BY a.id DESC LIMIT 100", DECIDABLE)]
 
 
-def set_approval_note(approval_id: int, note: str, value: str) -> None:
+def set_approval_note(approval_id: int, note: str, value: str, while_in: tuple[str, ...] = DECIDABLE) -> bool:
     if note not in APPROVAL_NOTES:
         raise ValueError(f"an approval has no note {note}; it has {', '.join(APPROVAL_NOTES)}")
     with db() as c:
-        c.execute(f"UPDATE approvals SET {note} = ? WHERE id = ? AND status IN ({','.join('?' * len(DECIDABLE))})",
-                  (value, approval_id, *DECIDABLE))
+        before = c.total_changes
+        c.execute(f"UPDATE approvals SET {note} = ? WHERE id = ? AND status IN ({','.join('?' * len(while_in))})",
+                  (value, approval_id, *while_in))
+        return c.total_changes > before
 
 
 def approval(approval_id: int) -> dict | None:
@@ -674,8 +676,8 @@ def approval_of(row) -> dict:
     return {**dict(row), "emit": json.loads(row["emit"] or "{}"), "review": json.loads(row["review"] or "{}")}
 
 
-def decide_approval(approval_id: int, status: str, result: str = "") -> bool:
-    came_from = ("approved",) if status in ("done", "failed") else DECIDABLE
+def decide_approval(approval_id: int, status: str, result: str = "", came_from: tuple[str, ...] = DECIDABLE) -> bool:
+    came_from = ("approved",) if status in ("done", "failed") else came_from
     with db() as c:
         before = c.total_changes
         c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ? WHERE id = ? AND status IN "

@@ -237,8 +237,6 @@ def load(path: Path | None = None) -> Config:
     if bad := sorted(set(cfg.jev.screen_lines) - set(JevConfig().screen_lines)):
         raise ValueError(f"[jev.screen_lines]: unknown question {', '.join(bad)}; use "
                          f"{', '.join(JevConfig().screen_lines)}")
-    if gone := sorted({"screen_hold", "screen_reach"} & set(jv)):
-        raise ValueError(f"[jev]: {' and '.join(gone)} became one line per question in [jev.screen_lines]")
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")
         if tracker not in ("github", "jira"):

@@ -14,6 +14,10 @@ class Failed(RuntimeError):
     pass
 
 
+class AlreadyDecided(ValueError):
+    pass
+
+
 def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, trial: bool, log,
             cfg: config.Config) -> None:
     for spec in loop.emits:
@@ -75,12 +79,26 @@ def waiting(connect=state.db) -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "repo": repo_of(a),
              "what": a["summary"], "plain_summary": a["plain_summary"],
              "failed": a["result"] if a["status"] == "failed" else "", "held": a["emit"].get("held", ""),
-             "reviewer": reviewer_of(a), "review": a["review"],
+             "review": review_shown(a),
              "detail": emit_of(a).detail(a["emit"]["item"])} for a in state.approvals(connect)]
 
 
 def reviewer_of(approval: dict) -> str:
     return (approval["emit"].get("reviewer") or {}).get("model", "")
+
+
+def reviewer_may_land(approval: dict) -> bool:
+    return bool((approval["emit"].get("reviewer") or {}).get("may_land"))
+
+
+def review_shown(approval: dict) -> dict:
+    if review := approval["review"]:
+        kept = f" It waits for you, because {review['kept']}." if review.get("kept") else ""
+        return {"by": review["by"],
+                "said": f"{review['decision']}, {review['confidence']} confidence. {review['reason']}{kept}"}
+    if (model := reviewer_of(approval)) and approval["status"] == "pending":
+        return {"by": model, "said": "not read yet."}
+    return {}
 
 
 def emit_of(approval: dict) -> Emit:
@@ -91,15 +109,15 @@ def repo_of(approval: dict) -> str:
     return emit_of(approval).target_repo(approval["emit"]["item"]) or approval["run_repo"]
 
 
-def decide(approval_id: int, yes: bool, by: str = "") -> str:
+def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...] = state.DECIDABLE) -> str:
     row = state.approval(approval_id)
     if not row:
         raise LookupError(f"no approval #{approval_id}")
     delivery, verb = row["emit"], "approved" if yes else "rejected"
     emit = EMITS[delivery["type"]]
     cfg = config.load() if yes else None
-    if not state.decide_approval(approval_id, verb):
-        raise ValueError(f"approval #{approval_id} is already {state.approval(approval_id)['status']}")
+    if not state.decide_approval(approval_id, verb, came_from=came_from):
+        raise AlreadyDecided(f"approval #{approval_id} is already {state.approval(approval_id)['status']}")
 
     def log(kind: str, text: str) -> None:
         if row["run_id"]:

@@ -654,12 +654,11 @@ def cmd_session(args) -> int:
 
 
 def approval_notes(a: dict) -> list[str]:
+    failed = [f"delivery failed: {a['failed']}", f"`arete approve {a['id']}` tries again, `--reject` drops it"]
     review = a["review"]
-    if review:
-        said = f"review by {review['by']}: {review['decision']}, {review['confidence']} confidence. {review['reason']}"
-    else:
-        said = f"review by {a['reviewer']}: not read yet" if a["reviewer"] and not a["failed"] else ""
-    return [note for note in (f"held: {a['held']}" if a["held"] else "", said) if note]
+    return [*(failed if a["failed"] else []),
+            *(note for note in (f"held: {a['held']}" if a["held"] else "",
+                                f"review by {review['by']}: {review['said']}" if review else "") if note)]
 
 
 def cmd_approve(args) -> int:
@@ -672,9 +671,6 @@ def cmd_approve(args) -> int:
                 print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
                                     f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
                                     subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
-                if a["failed"]:
-                    print(f"      delivery failed: {a['failed']}"[:240])
-                    print(f"      `arete approve {a['id']}` tries again, `--reject` drops it")
                 for line in approval_notes(a):
                     print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
                                         subsequent_indent=" " * 8, break_on_hyphens=False))

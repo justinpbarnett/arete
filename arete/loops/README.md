@@ -133,7 +133,13 @@ A push waits for approval in these cases:
 - With JEV on and `[search] proof` set, when JEV doubts that the proof script tests the problem the finding describes: a chance of `[jev] proof_hold` (0.5) or more that it checks something else, or under it that it runs the code into the problem and checks for the wrong result. A missing proof, or one past 12000 characters, holds too, and the approval shows the proof.
 - With JEV on, when the diff runs past the 12000 characters JEV reads, or when the JEV call fails.
 
-In a search loop, the JEV screen runs as soon as a try makes the check pass, and a hold goes back to the agent before it reaches a person. The agent's next try gets JEV's reason and the diff so far, and adjusts the change so the check still passes and only the fix remains. Each adjusted change that passes the check replaces the held change as one commit and is screened again, and a try that fails the check goes back to the held change and its proof. The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for a person when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds. A proof check hold goes back to the agent the same way: the agent rewrites the proof, and may leave the code as it is. Only a JEV hold goes back to the agent. A rule in the list above, a diff past 12000 characters, and a failed JEV call go to a person at once, and a climb run's push is screened only when it is delivered.
+In a search loop, the JEV screen runs as soon as a try makes the check pass, and a hold goes back to the agent before it waits for approval.
+The agent's next try gets JEV's reason and the diff so far, and adjusts the change so the check still passes and only the fix remains.
+Each adjusted change that passes the check replaces the held change as one commit and is screened again, and a try that fails the check goes back to the held change and its proof.
+The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for approval when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds.
+A proof check hold goes back to the agent the same way: the agent rewrites the proof, and may leave the code as it is.
+Only a JEV hold goes back to the agent.
+A rule in the list above, a diff past 12000 characters, and a failed JEV call wait for approval at once, and a climb run's push is screened only when it is delivered.
 
 Before the first try of a search run fed by findings, JEV checks whether a commit that landed since the finding's run started, or a push of the same loop that waits for approval, already fixes the finding. At a chance of `[jev] fixed_skip` (0.7) or more, the run ends as done, already fixed by that change, and no agent runs. `arete jev report` shows what came of each verdict.
 
@@ -143,8 +149,10 @@ The approval says which rule held it. Approving it lands it then, and rejecting 
 Serve gives it the change rebased onto the current `origin/<base>`, the reason the push was held, the agent's case for it, and read-only tools with git's read commands.
 When it approves with high confidence, the push lands as if a person approved it, and the run's feed says that the reviewer approved it.
 Any other answer leaves the push waiting, with the review beside it on the dashboard and in `arete approve`.
-A push held by the trust level, by a path the repo denies, by `approve = true` or by `paths` always waits for a person, and its review only advises.
-A change that no longer rebases gets a review from git that says so, with no model call.
+A push held by the trust level, by a path the repo denies or by `paths` always waits for a person, and its review only advises.
+So does a push whose diff runs past the 60000 characters the reviewer reads.
+`approve = true` holds every push for a person, with no review.
+A change that newer commits on the base branch conflict with gets a reject from git that names the files, with no model call.
 A review that fails is tried again after 15 minutes, none starts while the model's usage limit holds, and a failed approval gets none.
 
 ## Safety

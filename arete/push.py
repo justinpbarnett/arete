@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import config, diffguard, jev, outbound, paths, state, util
@@ -25,13 +27,13 @@ class Push(Emit):
             return [f"a push emit's approve table takes {', '.join(APPROVE_KEYS)}, not {', '.join(unknown)}"]
         if not isinstance(approve, bool | dict):
             return ["a push emit's approve is true, false, or a table of lines, deletes, paths and reviewer"]
-        rules = approve if isinstance(approve, dict) else {}
-        lines, globs, reviewer = rules.get("lines", 0), rules.get("paths", []), rules.get("reviewer", "opus")
+        rules = approve_rules(spec)
+        lines, globs = rules.get("lines", 0), rules.get("paths", [])
         if isinstance(lines, bool) or not isinstance(lines, int):
             return [f"a push emit's approve lines is a whole number of lines, such as 80, not {lines!r}"]
         if not isinstance(globs, str | list) or not all(isinstance(g, str) for g in globs):
             return [f"a push emit's approve paths is a list of path patterns, such as [\"src/auth/*\"], not {globs!r}"]
-        if not isinstance(reviewer, str) or blank(reviewer):
+        if "reviewer" in rules and (not isinstance(reviewer := rules["reviewer"], str) or blank(reviewer)):
             return [f"a push emit's approve reviewer is the model that reviews a held push, such as \"opus\", "
                     f"not {reviewer!r}"]
         return []
@@ -51,7 +53,8 @@ class Push(Emit):
                 "title": outbound.plain(f"{loop.name}: run {run_id}" if public else outcome.get("title", ""), 120),
                 "report": outbound.plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000),
                 "about": outbound.plain(outcome.get("title", ""), 120), "story": outbound.plain(outcome.get("report", ""), 6000),
-                "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src), start, branch),
+                "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src),
+                                     f"git diff {start[:10]} {branch}"),
                 "proof": outcome.get("proof")}
 
     def ruled(self, spec: dict, item: dict, cfg: config.Config) -> str:
@@ -64,31 +67,27 @@ class Push(Emit):
             return f"the trust level of {item['repo']} is pr, so a person lands each push"
         if denied := [f for f in item["files"] if util.matches_any(f, diffguard.denied_paths(layer))]:
             return f"touches {', '.join(denied[:5])}, which only a person may change"
-        approve = spec.get("approve", False)
-        if approve is True:
+        if spec.get("approve") is True:
             return "approve is on"
-        rules = approve if isinstance(approve, dict) else {}
-        if touched := [f for f in item["files"] if util.matches_any(f, as_list(rules.get("paths")))]:
+        if touched := [f for f in item["files"] if util.matches_any(f, as_list(approve_rules(spec).get("paths")))]:
             return f"touches {', '.join(touched[:5])}, which a person reads"
         return ""
 
     def over_limits(self, spec: dict, item: dict, cfg: config.Config) -> str:
-        approve = spec.get("approve", False)
-        rules = approve if isinstance(approve, dict) else {}
+        rules = approve_rules(spec)
         if (limit := rules.get("lines")) and item["lines"] > int(limit):
             return f"{item['lines']} lines changed, over the {limit} line approval limit"
         if rules.get("deletes") and item["deleted"]:
             return f"deletes {', '.join(item['deleted'][:5])}"
         if jev.ready(cfg, [config_repo(cfg, item["repo"])]) and len(item.get("patch", "")) > PATCH_SHOWN:
-            return f"the diff runs past the {PATCH_SHOWN} characters JEV reads, so a person reads it whole"
+            return f"the diff runs past the {PATCH_SHOWN} characters JEV reads"
         return ""
 
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
         return self.ruled(spec, item, cfg) or ". ".join(self.objections(item, cfg).values())
 
     def reviewer(self, spec: dict, item: dict, cfg: config.Config) -> dict:
-        approve = spec.get("approve", False)
-        if not (isinstance(approve, dict) and (model := approve.get("reviewer"))):
+        if not (model := approve_rules(spec).get("reviewer")):
             return {}
         return {"model": model, "may_land": not self.only_a_person(spec, item, cfg)}
 
@@ -101,7 +100,7 @@ class Push(Emit):
             if held := jev.screen(item.get("patch", ""), about, cfg, trace=(run_id, "push screen jev")):
                 found["screen"] = f"JEV holds it: {'; '.join(held)}"
         except jev.Unjudged as e:
-            found["unjudged screen"] = f"JEV could not judge the diff, so a person decides: {e}"
+            found["unjudged screen"] = f"JEV could not judge the diff: {e}"
         if proof := item.get("proof"):
             found |= proof_objection(proof, item.get("patch", ""), about, cfg, run_id)
         return found
@@ -110,13 +109,8 @@ class Push(Emit):
         src, base = Path(item["workdir"]), item["base"]
         if "origin" not in util.git(["remote"], src, check=False).split():
             raise RuntimeError(f"{paths.short_path(src)} has no origin to push to")
-        wt = paths.WORKTREES_DIR / f"push-{run_id}"
-        util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
-        util.git(["worktree", "add", "-q", "--detach", str(wt), item["branch"]], src)
-        try:
+        with branch_worktree(src, item["branch"], f"push-{run_id}") as wt:
             sha = land(item, wt, src, base)
-        finally:
-            util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
         state.set_verdict_sha(run_id, sha)
         util.git(["branch", "-D", item["branch"]], src, check=False)
         return f"pushed {sha[:10]} to {base}; {fast_forward(src, base, sha)}"
@@ -139,6 +133,11 @@ class Push(Emit):
         util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
 
 
+def approve_rules(spec: dict) -> dict:
+    approve = spec.get("approve", False)
+    return approve if isinstance(approve, dict) else {}
+
+
 def push_check(spec: dict, loop: Loop) -> str:
     return next((check for check in (spec.get("check"), loop.spec.get("check")) if not blank(check)), "")
 
@@ -153,15 +152,43 @@ def proof_objection(proof: dict, patch: str, about: str, cfg: config.Config, run
         doubts = jev.proof(proof.get("problem") or about, name, text, patch, about, cfg,
                            trace=(run_id, "proof check jev"))
     except jev.Unjudged as e:
-        return {"unjudged proof": f"JEV could not judge {name}, so a person decides: {e}"}
+        return {"unjudged proof": f"JEV could not judge {name}: {e}"}
     return {"proof": f"JEV doubts that {name} proves the problem: {'; '.join(doubts)}"} if doubts else {}
 
 
-def shown_patch(patch: str, start: str, branch: str) -> str:
+def shown_patch(patch: str, whole: str, limit: int = PATCH_SHOWN) -> str:
     patch = outbound.redact(patch)
-    if len(patch) <= PATCH_SHOWN:
+    if len(patch) <= limit:
         return patch
-    return f"{patch[:PATCH_SHOWN]}\n\ncut at {PATCH_SHOWN} characters; git diff {start[:10]} {branch} shows the rest"
+    return f"{patch[:limit]}\n\ncut at {limit} characters; {whole} shows the rest"
+
+
+@contextmanager
+def branch_worktree(src: Path, branch: str, name: str) -> Iterator[Path]:
+    wt = paths.WORKTREES_DIR / name
+    util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
+    util.git(["worktree", "add", "-q", "--detach", str(wt), branch], src)
+    try:
+        yield wt
+    finally:
+        util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
+
+
+class NoLongerRebases(RuntimeError):
+    def __init__(self, base: str, clashes: list[str], error: RuntimeError):
+        self.clashes = clashes
+        where = f"newer commits there also change {', '.join(clashes[:5])}" if clashes \
+            else util.first_line(str(error), 300)
+        super().__init__(f"the change no longer rebases onto origin/{base}, because {where}")
+
+
+def rebase_onto(wt: Path, base: str) -> None:
+    try:
+        util.git([*util.commit_identity(wt), "rebase", "-q", f"origin/{base}"], wt)
+    except RuntimeError as e:
+        clashes = util.git_records(["diff", "--name-only", "--diff-filter=U"], wt, check=False)
+        util.git(["rebase", "--abort"], wt, check=False)
+        raise NoLongerRebases(base, clashes, e) from e
 
 
 def land(item: dict, wt: Path, src: Path, base: str) -> str:
@@ -169,11 +196,7 @@ def land(item: dict, wt: Path, src: Path, base: str) -> str:
         util.git(["fetch", "-q", "origin", base], src)
         util.git(["reset", "-q", "--hard"], wt)
         util.git(["clean", "-qfd"], wt)
-        try:
-            util.git([*util.commit_identity(wt), "rebase", "-q", f"origin/{base}"], wt)
-        except RuntimeError as e:
-            util.git(["rebase", "--abort"], wt, check=False)
-            raise RuntimeError(f"the change does not rebase onto origin/{base}: {e}") from e
+        rebase_onto(wt, base)
         gate = util.sh(item["check"], cwd=wt, timeout=item["timeout"], env=item["env"])
         if gate.returncode != 0:
             raise RuntimeError(f"`{item['check']}` exits {gate.returncode} after the rebase: "

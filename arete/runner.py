@@ -127,7 +127,7 @@ def priced(res: Result, cfg: config.Config) -> float:
 
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
-        wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, **kw) -> Result:
+        wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, **kw) -> Result:
     cfg = cfg or config.load()
     target = devices.resolve(device)
     if target.remote:
@@ -137,7 +137,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_claude(kw, cwd, cfg, trace[0])
+            kw = local_claude(kw, cwd, cfg, trace[0], ask_jev)
     else:
         kw["price"] = lambda reply: priced(reply, cfg)
     limited: list[Result] = []
@@ -184,11 +184,11 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     return res
 
 
-def local_claude(kw: dict, cwd: Path | str, cfg: config.Config, run_id: str) -> dict:
+def local_claude(kw: dict, cwd: Path | str, cfg: config.Config, run_id: str, ask_jev: bool) -> dict:
     kw = {**kw, "extra_env": {"ARETE_RUN_ID": run_id} if run_id else {}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings()
-    if runs_bash(kw) and jev.ready(cfg, [cfg.repo_for_work_dir(cwd)]):
+    if ask_jev and runs_bash(kw) and jev.ready(cfg, [cfg.repo_for_work_dir(cwd)]):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), ask.rule()]
         kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), ask.note()]))
     return kw

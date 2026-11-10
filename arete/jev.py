@@ -307,9 +307,10 @@ def screen(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = 
     lines = cfg.jev.screen_lines
     scores = {name: verdicts.scored(answers[name].yes, lines[name]) for name in SCREEN}
     scores["reach"] = verdicts.scored(float(answers["reach"].value), lines["reach"])
-    found = [f"{why} (p {scores[name]['p']:.2f})" for name, (_, why) in SCREEN.items() if verdicts.holds(scores[name])]
+    found = [f"{why} (p {scores[name]['p']:.2f}, line {lines[name]:g})" for name, (_, why) in SCREEN.items()
+             if verdicts.holds(scores[name])]
     if verdicts.holds(scores["reach"]):
-        found.append(f"reaches past the fix it names ({scores['reach']['p']:.2f} of 1)")
+        found.append(f"reaches past the fix it names ({scores['reach']['p']:.2f} of 1, line {lines['reach']:g})")
     verdicts.record(traced_run(trace), "push", subject, about, scores, "; ".join(found))
     return found
 

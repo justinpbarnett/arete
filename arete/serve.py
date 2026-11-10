@@ -17,13 +17,12 @@ from . import (
     config,
     control,
     dashboard,
-    delivery,
     engine,
     explain,
+    hold_review,
     loops,
     paths,
     record,
-    reviewer,
     runner,
     sources,
     state,
@@ -44,19 +43,17 @@ COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator
 @dataclass(frozen=True)
 class ApprovalJob:
     note: str
-    doing: str
-    missing: str
-    wanted: Callable[[dict], bool]
-    model: Callable[[dict, config.Config], str]
-    work: Callable[[dict, config.Config], str]
+    while_running: str
+    not_written: str
+    model_for: Callable[[dict, config.Config], str]
+    write: Callable[[dict, config.Config], str]
 
 
 APPROVAL_JOBS = (
     ApprovalJob("plain_summary", "a plain summary of an approval is still being written", "no plain summary",
-                wanted=lambda approval: True, model=lambda approval, cfg: cfg.model("explain"),
-                work=explain.note_plain_summary),
-    ApprovalJob("review", "a held push is still being reviewed", "no review", wanted=reviewer.wanted,
-                model=lambda approval, cfg: delivery.reviewer_of(approval), work=reviewer.review),
+                model_for=lambda approval, cfg: cfg.model("explain"), write=explain.write_plain_summary),
+    ApprovalJob("review", "a held push is still being reviewed", "no review",
+                model_for=hold_review.model_for, write=hold_review.review),
 )
 
 
@@ -265,8 +262,8 @@ class Server:
         for job in APPROVAL_JOBS:
             if self.job_running(job):
                 continue
-            due = (a for a in decidable if job.wanted(a) and not a[job.note] and a[f"{job.note}_tried"] <= retry_from
-                   and not runner.usage_hold(job.model(a, self.cfg)))
+            due = (a for a in decidable if (model := job.model_for(a, self.cfg)) and not a[job.note]
+                   and a[f"{job.note}_tried"] <= retry_from and not runner.usage_hold(model))
             if approval := next(due, None):
                 state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
                 self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)
@@ -276,10 +273,9 @@ class Server:
 
     def do_approval_job(self, job: ApprovalJob, approval: dict) -> None:
         try:
-            if said := job.work(approval, self.cfg):
-                self.say(f"approval #{approval['id']}: {said}")
+            self.say(f"approval #{approval['id']}: {job.write(approval, self.cfg)}")
         except Exception as e:
-            self.say(f"approval #{approval['id']}: {job.missing} yet, it tries again in "
+            self.say(f"approval #{approval['id']}: {job.not_written} yet, it tries again in "
                      f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
     def retry_once(self, item: dict, why: str) -> None:
@@ -303,7 +299,7 @@ class Server:
     def busy_with(self) -> str:
         if sum(not f.done() for f in self.polls.values()):
             return "a source poll is still running"
-        if running := [job.doing for job in APPROVAL_JOBS if self.job_running(job)]:
+        if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
             return running[0]
         if dashboard.POSTS_IN_FLIGHT.count:
             return "the dashboard is still answering a request"
