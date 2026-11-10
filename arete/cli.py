@@ -655,7 +655,7 @@ def cmd_session(args) -> int:
 
 
 def approval_notes(a: dict) -> list[str]:
-    failed = [f"delivery failed: {a['failed']}", f"`arete approve {a['id']}` tries again, `--reject` drops it"]
+    failed = [a["failed"], f"`arete approve {a['id']}` tries again, `--reject` drops it"]
     review = a["review"]
     return [*(failed if a["failed"] else []),
             *(note for note in (f"held: {a['held']}" if a["held"] else "",

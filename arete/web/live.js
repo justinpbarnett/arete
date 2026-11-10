@@ -87,7 +87,7 @@ function approvalRow(a, place) {
     cell(kindTag(a.failed ? "Failed" : "Approval")),
     repoCell(a.repo),
     cell([el("div", { text: a.plain_summary || asked }),
-      a.failed ? el("div", {}, stateChip("fault"), ` Delivery failed: ${a.failed}`) : null,
+      a.failed ? el("div", {}, stateChip("fault"), ` ${a.failed.replace(/^./, (first) => first.toUpperCase())}`) : null,
       a.held ? el("div", { class: "muted", text: `Held: ${a.held}.` }) : null,
       reviewLine(a),
       details ? foldText(`approval:${a.id}`, "Show the details", details) : null,
