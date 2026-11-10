@@ -169,8 +169,10 @@ def own_move(r: dict, m: tracker.Moved) -> None:
         row = triage.board_row(r["ref"])
         if not row or triage.moment(row["updated"]) != triage.moment(m.before):
             return
+        report = state.research_get(r["ref"])
         state.triage_put({**row, "updated": m.after})
-        state.research_keep(r["ref"], updated=m.after)
+        if report and report["updated"] == row["updated"]:
+            state.research_keep(r["ref"], updated=m.after)
     r["updated"] = m.after
 
 
