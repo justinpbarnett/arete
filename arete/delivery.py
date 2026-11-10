@@ -11,7 +11,12 @@ EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(
 
 
 class Failed(RuntimeError):
-    pass
+    def __init__(self, why: str, cause: Exception):
+        super().__init__(why)
+        self.cause = cause
+
+    def kept_by(self, emit: Emit) -> bool:
+        return isinstance(self.cause, emit.kept_failures)
 
 
 class AlreadyDecided(ValueError):
@@ -37,7 +42,7 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                     send(delivery, loop.name, run_id, cfg, log)
                     settle_judged(emit, run_id, "landed")
                 except Failed as e:
-                    if isinstance(e.__cause__, emit.kept_failures):
+                    if e.kept_by(emit):
                         failed_id = state.add_approval(loop.name, run_id, delivery, what, str(e))
                         settle_judged(emit, run_id, "failed", failed_id)
                         log("emit", f"kept as approval #{failed_id} to try again or reject")
@@ -70,7 +75,7 @@ def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -
     except (RuntimeError, OSError, ValueError, KeyError) as e:
         why = f"{kind} failed: {util.first_line(str(e), 300)}"
         log("error", why)
-        raise Failed(why) from e
+        raise Failed(why, e) from e
     log("emit", f"{kind}: {done}")
     return done
 
@@ -131,6 +136,13 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
     try:
         done = send(delivery, row["loop"], row["run_id"], cfg, log)
     except Exception as e:
+        if isinstance(e, Failed) and not e.kept_by(emit):
+            why = f"{e}. Trying again would fail the same way, so it is rejected"
+            state.decide_approval(approval_id, "rejected", why, came_from=("approved",))
+            settle_judged(emit, row["run_id"], "rejected", approval_id, ("approved",))
+            emit.rejected(delivery["item"])
+            log("emit", "rejected, because trying again would fail the same way")
+            raise Failed(why, e.cause) from e.cause
         state.decide_approval(approval_id, "failed", str(e))
         settle_judged(emit, row["run_id"], "failed", approval_id, ("approved",))
         raise

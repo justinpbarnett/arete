@@ -116,7 +116,8 @@ A climb or search agent that finds the goal cannot or should not be met changes 
 A `loop` emit hands each finding to another loop, which fires once per finding. That loop takes them with `[trigger] event = ["finding"]`, and the finding reaches its agent under `## Input`, fenced as data. A finding carries the weakest trust among the events that led to it, so a finding read out of untrusted text stays untrusted. A run with no events, or fed only by its own script, hands on internal findings. A loop that takes findings and has an acting tool such as Edit needs `[trigger] trust = "internal"` or above, so a finding read out of untrusted text never reaches an agent that edits.
 
 A finding handed to a loop that is off, or broken, waits for you as a failed delivery: turn the loop on and try it again, or reject it.
-A finding that the loop refuses, for its trust or its event type, is only logged in the run's feed, because trying it again cannot change the answer.
+A finding that the loop refuses, for its trust or its event type, is only logged in the run's feed, even while the loop is off, because trying it again cannot change the answer.
+A waiting finding that the loop refuses when you approve it or try it again is rejected, and the result says why.
 
 ## Push
 

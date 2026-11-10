@@ -13,7 +13,6 @@ PATCH_SHOWN = 12000
 
 
 class Push(Emit):
-    kept_failures = (Exception,)
     judged = True
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:

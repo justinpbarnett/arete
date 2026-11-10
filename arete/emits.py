@@ -58,7 +58,7 @@ class LoopOff(RuntimeError):
 
 
 class Emit:
-    kept_failures: tuple[type[Exception], ...] = ()
+    kept_failures: tuple[type[Exception], ...] = (Exception,)
     judged = False
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
@@ -96,8 +96,6 @@ class Emit:
 
 
 class Ticket(Emit):
-    kept_failures = (Exception,)
-
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         return sources.repo_problems(cfg, [spec.get("repo", "")], "ticket emit")
 
@@ -137,8 +135,6 @@ class Ticket(Emit):
 
 
 class PullRequest(Emit):
-    kept_failures = (Exception,)
-
     def target_repo(self, item: dict) -> str:
         return ""  # item["repo"] is the GitHub owner/name; the run that asked holds the config repo
 
@@ -201,12 +197,14 @@ class ToLoop(Emit):
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         target = find(item["loop"], cfg)
-        if not target.enabled:
-            raise LoopOff(f"the loop {target.name} is off{': ' + target.error if target.error else ''}")
+        if target.error:
+            raise LoopOff(f"the loop {target.name} is off: {target.error}")
         if why := target.trigger.refusal(item["event"]):
             raise ValueError(f"{target.name} {why}")
         if not target.takes_findings:
             raise ValueError(f"{target.name} takes findings only with [trigger] event = [\"{FINDING_EVENT}\"]")
+        if not target.enabled:
+            raise LoopOff(f"the loop {target.name} is off")
         queued = sources.fire(target, f"finding from {loop_name}", [item["event"]])
         return f"queued for {target.name} as #{queued[0]}"
 
@@ -221,8 +219,6 @@ class ToLoop(Emit):
 
 
 class Digest(Emit):
-    kept_failures = (Exception,)
-
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         lines = [f"## {util.now().astimezone().strftime('%H:%M')} {loop.name} ({run_id})", ""]
         lines += [f"- **{outbound.plain(f['title'], 160)}** ({f.get('severity') or 'unrated'}): {outbound.plain(f.get('summary'), 600)}"
@@ -247,6 +243,8 @@ class Digest(Emit):
 
 
 class Notify(Emit):
+    kept_failures = ()
+
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         titles = "; ".join(outbound.plain(f["title"], 80) for f in findings[:3]) or outbound.plain(outcome.get("summary"), 160)
         return {"title": f"arete: {loop.name}", "message": f"{len(findings)} found: {titles}" if findings else titles}
@@ -260,6 +258,8 @@ class Notify(Emit):
 
 
 class Metric(Emit):
+    kept_failures = ()
+
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         return [] if spec.get("name") else ["a metric emit needs name"]
 
