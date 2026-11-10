@@ -59,7 +59,7 @@ function drawRunDetail(pane, result, kind) {
     saidLine(place),
     el("dl", { class: "w" },
       fact("Status", runStatus(r.status)), fact("Kind", r.kind), fact("Repo", r.repo), fact("Loop", r.loop),
-      fact("Model", r.model ? `${r.model}${r.runner ? ` on ${r.runner}` : ""}` : ""), fact("Device", r.device),
+      fact("Model", modelOnRunner(r.model, r.runner)), fact("Device", r.device),
       fact("Started", r.started ? [zonedClock(r.started), " · ", liveAgo(r.started)] : ""),
       fact("Time", duration(secondsBetween(r.started, r.finished))),
       fact("Paid", paidWords(r, board.models)),

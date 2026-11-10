@@ -206,6 +206,7 @@ function wholeWords(text) {
 }
 
 function wrapAtSlashes(text) {
+  if (!text) return "";
   return text.split(/(?<=\/)/).flatMap((part, i) => [i ? el("wbr") : null, el("span", { class: "id-part", text: part })]);
 }
 
@@ -306,6 +307,10 @@ function paidMoney(n) {
 
 function pathCode(path) {
   return el("code", {}, path.split("/").map((part, i) => (i ? [el("wbr"), `/${part}`] : part)));
+}
+
+function modelOnRunner(model, runner) {
+  return model ? [wrapAtSlashes(model), runner ? ` on ${runner}` : null] : "";
 }
 
 function paidColumn(rows, { onPhone = false } = {}) {
