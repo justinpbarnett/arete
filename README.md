@@ -117,7 +117,10 @@ sed -nE 's/^(export )?OPENROUTER_API_KEY=//p' ~/.config/arete/pi.env | tr -d "\"
 
 A model is then `openrouter/` and an OpenRouter model id.
 In a sandbox, pi gets Bash, Edit and Write, and runs without the rules against git writes, because the VM holds nothing to push with and is deleted after the run.
-Keep it that way: never put git or GitHub credentials on a template.
+A probe or a run refuses a sandbox that could push, and deletes it.
+That is a sandbox that holds `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc`, a gh login, a git `credential.helper`, `$GH_TOKEN`, `$GITHUB_TOKEN` or a private key in `~/.ssh`.
+It is also a sandbox that a `github` integration reaches through `auto:all`, the `arete` tag or a tag of the template, unless that integration is `--readonly`.
+Arete cannot see a GitHub token inside another kind of integration, such as an `http-proxy` one, so keep those off what a sandbox reaches.
 
 A device of kind `proxmox` clones a template VM on a Proxmox VE host for each run:
 
@@ -537,7 +540,7 @@ A step on the `claude` CLI rides the subscription, so every paid sum leaves it o
 - Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`, never an `ANTHROPIC_API_KEY`, here or on a device.
 - A claude run takes no dollar cap and waits out a usage limit; budgets apply to pi alone.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
-- Agents never run git write commands, except pi in an exe.dev sandbox, which holds no git credentials and is deleted after its run.
+- Agents never run git write commands, except pi in an exe.dev sandbox, which arete refuses when it could push and deletes after its run.
   Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
 - Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`. A `push` emit follows the same level: under `pr`, a person lands every push.
 - Alert issues carry check names and one short status line, never log contents.

@@ -42,6 +42,11 @@ EXE_VM_DOMAIN = ".exe.xyz"
 EXE_TAG = "arete"
 EXE_EGRESS = ("integrations", "all")
 EXE_BOOT_SECONDS = 120
+GIT_CREDENTIALS = ('{ for f in ~/.git-credentials "${XDG_CONFIG_HOME:-$HOME/.config}/git/credentials" ~/.netrc '
+                   '~/.config/gh/hosts.yml; do test -s "$f" && echo "$f"; done; '
+                   'git config --get-all credential.helper >/dev/null 2>&1 && echo "a git credential.helper"; '
+                   'for v in GH_TOKEN GITHUB_TOKEN; do test -n "$(printenv $v)" && echo "\\$$v"; done; '
+                   'grep -l "PRIVATE KEY" ~/.ssh/* 2>/dev/null; } | sed "s|^$HOME/|~/|"')
 PROBE_SANDBOX_MINUTES = 10
 CREATE_MAY_FINISH_MINUTES = 10
 SWEEP_GIVES_UP_DAYS = 7
@@ -231,8 +236,7 @@ def probe_sandbox(d: Device, timeout: float) -> dict:
     finally:
         not_deleted = delete_or_say_why(sandbox, lambda text: None)
     if not_deleted:
-        return {**info, "ok": False, "detail": util.first_line("; ".join(filter(None, [info["detail"], not_deleted])),
-                                                                300)}
+        return {**info, "ok": False, "detail": "; ".join(filter(None, [info["detail"], not_deleted]))}
     if info["detail"]:
         return info
     sandbox_words = f"a copy of {d.template}" if d.template else "a fresh sandbox"
@@ -268,10 +272,10 @@ def pve(d: Device, command: str, timeout: float = 300) -> str:
     return res.stdout
 
 
-def exe(d: Device, *command: str, timeout: float = 120) -> dict:
+def exe(d: Device, *command: str, timeout: float = 120) -> dict | list:
     res = util.sh([*ssh_argv(d), shlex.join([*command, "--json"])], timeout=timeout)
     reply = json_reply(res.stdout)
-    if isinstance(reply, dict) and not reply.get("error"):
+    if isinstance(reply, list) or isinstance(reply, dict) and not reply.get("error"):
         return reply
     failed = f"{d.name}: `ssh {d.host} {command[0]}` failed: "
     if isinstance(reply, dict):
@@ -525,8 +529,41 @@ def create_sandbox(sandbox: Sandbox, run_id: str | None, log) -> Device:
 
 def boot_sandbox(sandbox: Sandbox, vm: Device) -> None:
     if sandbox.device.template:
-        exe(sandbox.device, "tag", sandbox.name, EXE_TAG)
+        tags = exe(sandbox.device, "tag", sandbox.name, EXE_TAG).get("tags") or [EXE_TAG]
+    else:
+        tags = [EXE_TAG]
+    refuse_github_integrations(sandbox, tags)
     wait_for_ssh(vm)
+    refuse_git_credentials(sandbox, vm)
+
+
+def refuse_github_integrations(sandbox: Sandbox, tags: list[str]) -> None:
+    reaches = {"auto:all", f"vm:{sandbox.name}", *(f"tag:{tag}" for tag in tags)}
+    for integration in exe(sandbox.device, "integrations", "ls"):
+        through = sorted(reaches & set(integration.get("attachments") or []))
+        if integration.get("type") == "github" and through and not read_only(integration):
+            name = integration["name"]
+            raise DeviceError(f"{sandbox} could push to GitHub through the integration {name}, attached to "
+                              f"{', '.join(through)}; make it read-only with "
+                              f"`ssh {sandbox.device.host} integrations edit {name} --readonly`, "
+                              f"or attach it only to VMs you keep")
+
+
+def read_only(integration: dict) -> bool:
+    # exe.dev does not document the field that marks a github integration read-only, so any key spelled readonly counts.
+    settings = {**integration, **(integration.get("config") or {})}
+    return any(key.lower().replace("_", "") == "readonly" and str(value).lower() == "true"
+               for key, value in settings.items())
+
+
+def refuse_git_credentials(sandbox: Sandbox, vm: Device) -> None:
+    res = util.sh([*ssh_argv(vm), GIT_CREDENTIALS], timeout=30)
+    if res.returncode != 0:
+        raise DeviceError(f"could not check {sandbox} for git credentials: {failure(res)}")
+    if found := [line for line in res.stdout.splitlines() if line.strip()]:
+        source = f"the template {sandbox.device.template}" if sandbox.device.template else "exe.dev's image"
+        raise DeviceError(f"{sandbox} holds git credentials ({', '.join(found)}), so an agent there could push; "
+                          f"take them off {source}")
 
 
 def delete_listed(vm: Clone | Sandbox, log) -> str:
