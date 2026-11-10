@@ -140,6 +140,9 @@ class Loop:
             if r.name == self.repo:
                 return r
         path = paths.expand(self.repo)
+        for r in cfg.repos:
+            if r.path.resolve() == path.resolve():
+                return r
         return config.Repo(name=self.repo, path=path, github=github_remote(path))
 
     def view(self) -> dict:
