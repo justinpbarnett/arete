@@ -304,6 +304,10 @@ function paidMoney(n) {
   return n > 0 ? money(n) : "";
 }
 
+function pathCode(path) {
+  return el("code", {}, path.split("/").map((part, i) => (i ? [el("wbr"), `/${part}`] : part)));
+}
+
 function paidColumn(rows, { onPhone = false } = {}) {
   const shown = rows.some((r) => r.paid > 0);
   return { head: shown ? [["Paid", onPhone ? "num c-cost" : "num c-cost wide-only"]] : [], cell: (r) => (shown ? cell(paidMoney(r.paid), "num") : null) };

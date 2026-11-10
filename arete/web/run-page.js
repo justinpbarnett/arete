@@ -68,7 +68,7 @@ function drawRunDetail(pane, result, kind) {
     board.approvals.length ? [el("h3", { text: "Waiting for you" }),
       table("", NEEDS_HEADS, board.approvals.map((a) => approvalRow(a, place)), { stack: true })] : null,
     s ? [el("h3", { text: "Session" }), el("dl", { class: "w" },
-      fact("Folder", s.cwd ? el("code", { text: s.cwd }) : ""), fact("Repo", s.repo), fact("Tools", s.tools.join(", ") || "none")),
+      fact("Folder", s.cwd ? pathCode(s.cwd) : ""), fact("Repo", s.repo), fact("Tools", s.tools.join(", ") || "none")),
     s.prompt ? foldText(`prompt:${id}`, "Show the first message", s.prompt) : null] : null,
     board.models.length ? [el("h3", { text: "Models" }), modelTable(board.models)] : null,
     el("h3", { text: feed ? "Feed" : "Log" }),

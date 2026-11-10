@@ -129,7 +129,7 @@ function budgetWords(d) {
 
 function loopFacts(d) {
   return el("dl", { class: "w" },
-    fact("On", d.enabled ? "on" : "off"), fact("Kind", d.kind), fact("Folder", el("code", { text: d.dir })), fact("Trigger", d.trigger),
+    fact("On", d.enabled ? "on" : "off"), fact("Kind", d.kind), fact("Folder", pathCode(d.dir)), fact("Trigger", d.trigger),
     fact("Webhook", d.webhook_path ? el("code", { text: `POST ${d.webhook_path}` }) : ""),
     fact("Repo", d.repo), fact("Model", d.model ? `${d.model}${d.runner ? ` on ${d.runner}` : ""}` : ""),
     fact("Device", d.device), fact("Queue", d.queue === d.name ? "its own" : d.queue), fact("Budget", budgetWords(d)),
