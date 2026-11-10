@@ -59,7 +59,7 @@ p.summary { margin: 0 0 14px; }
 .filters .fields { max-width: 640px; gap: 0 20px; }
 .filters .field { margin: 0; }
 .row-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
-td .row-buttons:has(> button + button) > button { flex: 1 0 auto; }
+td .row-buttons:has(> button + button) > button { flex: 1 1 0; min-width: max-content; }
 .tag { margin-right: 0; }
 a[aria-current="true"] { font-weight: 700; text-decoration-color: var(--ink); }
 a.muted-link { color: var(--muted); }
