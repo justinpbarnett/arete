@@ -94,13 +94,16 @@ def check_draft(draft: dict, wanted: str, cfg: config.Config, taken: set[str], w
         return Path(), f"the name '{name}' must be lowercase letters, digits and dashes"
     if name in taken:
         return Path(), f"a loop named {name} already exists; pick another name"
+    files = draft.get("files") or []
+    if not isinstance(files, list) or not all(isinstance(f, dict) for f in files):
+        return Path(), "files must be a list of {name, text} objects"
     folder = work / name
     shutil.rmtree(folder, ignore_errors=True)
     folder.mkdir(parents=True)
     (folder / "loop.toml").write_text(str(draft.get("loop_toml") or "").strip() + "\n")
     if str(draft.get("prompt_md") or "").strip():
         (folder / "prompt.md").write_text(str(draft["prompt_md"]).strip() + "\n")
-    for f in draft.get("files") or []:
+    for f in files:
         file_name = str(f.get("name") or "").strip()
         if not FILE_NAME.match(file_name) or file_name in OWN_FILES:
             return folder, f"the file name '{file_name}' must be a plain file name other than {' and '.join(OWN_FILES)}"
@@ -218,7 +221,7 @@ def draft_until_valid(run_id: str, request: DraftRequest, cfg: config.Config, ta
             if res.usage_limit:
                 break
             continue
-        answer = res.structured or {}
+        answer = res.structured if isinstance(res.structured, dict) else {}
         folder, problem = check_draft(answer, request.name, cfg, taken, work)
         if not problem:
             break
