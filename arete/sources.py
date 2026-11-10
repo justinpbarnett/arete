@@ -18,7 +18,7 @@ SIGNATURE_NOISE = [
     (re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?"), "<time>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE), "<uuid>"),
     (re.compile(r"\b0x[0-9a-f]+\b|\b[0-9a-f]{12,}\b", re.IGNORECASE), "<hex>"),
-    (re.compile(r"'[^']*'|\"[^\"]*\""), "<str>"),
+    (re.compile(r"(?<!\w)'[^']*'|\"[^\"]*\""), "<str>"),
     (re.compile(r"\d+"), "<n>"),
 ]
 
