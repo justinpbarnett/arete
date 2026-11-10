@@ -91,9 +91,10 @@ note = "a fresh sandbox per run"
 A sandbox is named `arete-` and its run id, and is tagged `arete`; a copy of a template also keeps the template's tags.
 `keep = true` leaves the sandbox up after the run and logs the `ssh exe.dev rm NAME` that deletes it; exe.dev bills it until then.
 When a run dies before it can delete its sandbox, `arete loop stop`, `arete session stop` or the next reap deletes it.
-A probe of an `exe` device makes a real sandbox, checks that it answers, and deletes it.
+A probe of an `exe` device makes a real sandbox, tagged `arete-probe` as well, checks that it answers, and deletes it.
+Every 5 minutes, `arete serve` deletes any sandbox that a finished run left behind, and any probe sandbox older than 10 minutes.
 
-Agents in a sandbox run on pi, which reads `~/.pi/agent/models.json` on the VM.
+Agents in a sandbox run on pi, which reads `~/.pi/agent/models.json` on the VM; a loop or session that would run claude there is refused.
 Make the template a regular VM with `ssh exe.dev new --name=arete-template`, and give it a `models.json` whose providers go through exe.dev integrations:
 
 ```json
@@ -507,7 +508,8 @@ A step on the `claude` CLI rides the subscription, so every paid sum leaves it o
 - Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`, never an `ANTHROPIC_API_KEY`, here or on a device.
 - A claude run takes no dollar cap and waits out a usage limit; budgets apply to pi alone.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
-- Agents never run git write commands. Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely. The one exception is pi in an exe.dev sandbox, which holds no git credentials and is deleted after its run.
+- Agents never run git write commands, except pi in an exe.dev sandbox, which holds no git credentials and is deleted after its run.
+  Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
 - Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`. A `push` emit follows the same level: under `pr`, a person lands every push.
 - Alert issues carry check names and one short status line, never log contents.
 - PRs to public repos cite run ids, never transcript text.

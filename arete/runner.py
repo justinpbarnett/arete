@@ -21,6 +21,8 @@ NO_GIT_WRITES = [
     "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
 ]
 PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
+SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider/model such as exe-llm/gpt-5.4-mini "
+                   "or openrouter/<model id>")
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
@@ -79,6 +81,10 @@ def agent_problems(run_with: str, tools: list[str]) -> list[str]:
     if unknown := sorted(set(tools) - KNOWN_TOOLS):
         problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
     return problems
+
+
+def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
+    return SANDBOX_RUNS_PI if device.sandbox and route(model, run_with)[0] == "claude" else ""
 
 
 def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:

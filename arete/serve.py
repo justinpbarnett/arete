@@ -33,6 +33,7 @@ from .loops import Loop
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
+SWEEP_SECONDS = 300
 POLL_THREADS = 8
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.engine"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
@@ -108,7 +109,7 @@ class Server:
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
-        self.pruned = 0.0
+        self.pruned = self.swept = 0.0
         self.ticks = 0
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
@@ -138,6 +139,9 @@ class Server:
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             state.prune()
             self.pruned = time.monotonic()
+        if time.monotonic() - self.swept > SWEEP_SECONDS:
+            record.sweep_sandboxes(self.say)
+            self.swept = time.monotonic()
         self.ticks += 1
         self.beat(every_loop, live)
 

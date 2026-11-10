@@ -382,6 +382,8 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems += proof_problems(loop)
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
+    if loop.agent and (refusal := runner.device_refusal(loop.model_for(cfg), loop.runner, device)):
+        problems.append(refusal)
     if loop.agent:
         problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
                      for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]

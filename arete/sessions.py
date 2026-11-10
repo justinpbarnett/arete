@@ -118,6 +118,8 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
         raise control.Refused("pick a model, or set [models] session in the config")
     target = device_named(device)
     work_repo = repo_named(repo, target, cfg)
+    if refusal := runner.device_refusal(model, run_with, target):
+        raise control.Refused(refusal)
     which, name = runner.route(model, run_with)
     off = runner.withheld(model, run_with, tools, target)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]

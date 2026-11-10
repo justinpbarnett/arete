@@ -766,6 +766,12 @@ def runs_marked_running(connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
+def settled_run_ids(devices: list[str], connect=db) -> list[str]:
+    with connect() as c:
+        return [r["id"] for r in c.execute(f"SELECT id FROM runs WHERE status != 'running' AND device IN "
+                                           f"({', '.join('?' * len(devices))})", devices)]
+
+
 def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "

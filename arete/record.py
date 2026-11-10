@@ -132,3 +132,27 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
                 then(done)
                 settled.append(done)
     return settled
+
+
+def sweep_sandboxes(say: Callable[[str], None]) -> None:
+    sandbox_devices = [d for d in devices.known() if d.sandbox]
+    for lobby in {d.host: d for d in sandbox_devices}.values():
+        try:
+            vms = devices.vms_on(lobby)
+        except devices.DeviceError as e:
+            say(f"cannot look for sandboxes that runs left behind: {e}")
+            continue
+        disposable = [d.name for d in sandbox_devices if d.host == lobby.host and not d.keep]
+        run_of = {devices.vm_name(run_id): run_id for run_id in state.settled_run_ids(disposable)}
+        for vm in vms:
+            if run_id := run_of.get(vm["vm_name"]):
+                devices.drop_sandbox(lobby, vm["vm_name"], feed_and_say(run_id, say))
+            elif devices.is_stale_probe(vm):
+                devices.drop_sandbox(lobby, vm["vm_name"], say)
+
+
+def feed_and_say(run_id: str, say: Callable[[str], None]) -> Callable[[str], None]:
+    def log(text: str) -> None:
+        state.add_feed(run_id, "device", f"arete serve: {text}")
+        say(f"{run_id}: {text}")
+    return log
