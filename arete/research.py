@@ -453,13 +453,14 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
         settle_status(cfg, r)
         return DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(res.paid_usd)})"
     titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
+    report_file(ref).write_text(f"{titled.rstrip()}\n")
     try:
         filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
     except RuntimeError as e:
-        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.paid_usd)
+        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.paid_usd,
+                           summary=summary, report=TITLE_LINE.sub("", titled, count=1))
         move(cfg, r, "failed")
         return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
-    report_file(ref).write_text(f"{titled.rstrip()}\n")
     state.research_set(ref, status=DONE, summary=summary, report=TITLE_LINE.sub("", titled, count=1), error="",
                        cost=res.paid_usd, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
     ok, why = file_in_home(cfg, h, r)
