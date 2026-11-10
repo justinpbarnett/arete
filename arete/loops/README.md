@@ -89,7 +89,7 @@ labels = ["agent"]             # ticket: `agent` hands the ticket to the pipelin
 prefix = "[ci] "               # ticket: put before each title
 approve = false                # true holds it until you approve it on the dashboard or with `arete approve ID`
 # type = "pr":     draft = true, labels = [], title = ""; climb and search only
-# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"], reviewer = "opus" }, check = ""; climb and search only; see Push below
+# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"], reviewer = "opus" }, check = "pytest -x"; climb and search only, and climb must set check; see Push below
 # type = "loop":   loop = "fix-it"; hands each finding to that loop as a finding event
 # type = "digest": appends to ~/.local/share/arete/digests/<loop>/<day>.md
 # type = "notify": a desktop notification
@@ -119,7 +119,11 @@ A `loop` emit hands each finding to another loop, which fires once per finding. 
 
 A `push` emit lands a climb or search run's change on the repo's default branch, with no PR. To land it, arete rebases the run's branch onto `origin/<base>`, runs the check again on the rebased tree, and pushes. When the push loses a race, arete fetches and tries once more. Then it fast forwards the repo's own checkout when that checkout is on the base branch, and deletes the run's branch.
 
-`check` is the command that must pass after the rebase. When it is left out, the `[search] check` runs. On a public repo, the commit message, the title and the report name the loop and the run id only, never what the agent wrote.
+`check` is the command that must pass after the rebase.
+A search loop's push may leave it out, and then the `[search] check` runs.
+A climb loop has no check of its own, so its push must set one, or the loop does not load.
+A push with no check never lands.
+On a public repo, the commit message, the title and the report name the loop and the run id only, never what the agent wrote.
 
 A push waits for approval in these cases:
 

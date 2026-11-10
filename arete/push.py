@@ -192,6 +192,9 @@ def rebase_onto(wt: Path, base: str) -> None:
 
 
 def land(item: dict, wt: Path, src: Path, base: str) -> str:
+    if blank(item.get("check")):
+        raise RuntimeError("it has no check to run after the rebase, so it does not land: reject it, "
+                           "and the loop's next run makes a push with one")
     for attempt in (1, 2):
         util.git(["fetch", "-q", "origin", base], src)
         util.git(["reset", "-q", "--hard"], wt)
