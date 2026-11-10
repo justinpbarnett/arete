@@ -1917,6 +1917,17 @@ class SkipLog:
         if not same:
             print(f"{util.iso()} {name}: not run, {blocker}")
 
+    def keep_repo(self, repo: str) -> None:
+        self.keep_earlier(lambda name, v: v.get("repo") == repo)
+
+    def keep_project(self, project: str) -> None:
+        self.keep_earlier(lambda name, v: not v.get("repo") and name.startswith(f"{project}-"))
+
+    def keep_earlier(self, belongs: Callable[[str, dict], bool]) -> None:
+        for name, v in self.before.items():
+            if belongs(name, v):
+                self.current.setdefault(name, v)
+
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
@@ -2146,12 +2157,16 @@ def poll(dry_run: bool = False) -> int:
                     slots -= 1
             except Exception as e:
                 failed(repo.name, e)
+                skips.keep_repo(repo.name)
         for project, client in reached_clients.items():
             try:
                 for t in tracker.jira_unrouted(project, routes.get(project, set()), client):
                     skips.note(t.ref, t, t.blocker)
             except Exception as e:
                 failed(f"jira {project}", e)
+                skips.keep_project(project)
+        for project in routes.keys() - reached_clients.keys():
+            skips.keep_project(project)
         if not dry_run:
             try:
                 sync_moves(cfg)
