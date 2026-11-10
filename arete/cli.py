@@ -129,7 +129,8 @@ def print_alerts(a: dict) -> None:
     if a["alerts"]:
         print("open alerts:")
     for x in a["alerts"]:
-        print(f"  {x['key']}  issue #{x['issue'] or '-'}  since {x['opened']}")
+        issue = f"{x['repo']}#{x['issue']}" if x["issue"] else "none"
+        print(f"  {x['key']}  issue {issue}  since {x['opened']}")
 
 
 def print_recent(runs: list[dict]) -> None:

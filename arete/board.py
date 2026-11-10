@@ -7,8 +7,9 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
-from . import config, control, delivery, gh, loops, paths, pipeline, sessions, state, tracker, triage, util
+from . import config, control, delivery, loops, paths, pipeline, sessions, state, tracker, triage, util
 from .agent import SUBSCRIPTION_RUNNER
+from .alerts import issue_link, opened_in
 
 RECENT_RUNS = 25
 TREND_DAYS = 30
@@ -140,7 +141,7 @@ def checks() -> dict:
 def alerts() -> dict:
     alert_repo = config.load().alert_repo
     return {
-        "alerts": [{**a, "url": gh.issue_url(alert_repo, a["issue"]) if a["issue"] and alert_repo else ""}
+        "alerts": [{**a, "repo": opened_in(a, alert_repo), "url": issue_link(a, alert_repo)}
                    for a in state.alerts(connect=state.reader)],
         "probes": state.probes(connect=state.reader),
     }

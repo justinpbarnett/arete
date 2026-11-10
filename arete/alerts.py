@@ -28,9 +28,12 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
         state.alert_set(key, (prev or {}).get("issue"))
         return f"notified {key}"
     try:
-        if prev and prev.get("issue") and prev.get("repo") in ("", repo) and gh.issue_state(repo, prev["issue"]) == "OPEN":
-            state.alert_set(key, prev["issue"], repo)
-            return f"alert {key} still open (#{prev['issue']})"
+        if prev and prev.get("issue"):
+            if (was_in := opened_in(prev, repo)) != repo:
+                close_issue(was_in, prev["issue"], f"Arete now files its alerts in {repo}, so this alert moves there.")
+            elif gh.issue_state(repo, prev["issue"]) == "OPEN":
+                state.alert_set(key, prev["issue"], repo)
+                return f"alert {key} still open (#{prev['issue']})"
         gh.ensure_label(repo, LABEL, "d93f0b", "Opened by arete heartbeat")
         body = (
             f"Check `{key}` is failing.\n\n"
@@ -45,7 +48,7 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
         if not prev:
             notify("arete", f"{title}: {status}")
         state.alert_set(key, (prev or {}).get("issue"))
-        return f"gh failed for {key} ({e}); notified locally"
+        return f"gh failed for {key} ({e}){'' if prev else '; notified locally'}"
 
 
 def clear_alert(repo: str, key: str, dry_run: bool = False) -> str | None:
@@ -54,11 +57,27 @@ def clear_alert(repo: str, key: str, dry_run: bool = False) -> str | None:
         return None
     if dry_run:
         return f"would close alert {key}"
-    if repo and prev.get("issue") and prev.get("repo") in ("", repo):
+    if (where := opened_in(prev, repo)) and prev.get("issue"):
         try:
-            gh.issue_close(repo, prev["issue"], f"Recovered at {util.iso()}.")
+            close_issue(where, prev["issue"], f"Recovered at {util.iso()}.")
         except gh.GhError as e:
-            if "Could not resolve to an issue" not in str(e):
-                return f"gh failed closing #{prev['issue']} for {key} ({e}); retrying next pass"
+            return f"gh failed closing {where}#{prev['issue']} for {key} ({e}); retrying next pass"
     state.alert_clear(key)
     return f"cleared {key}"
+
+
+def opened_in(alert: dict, alert_repo: str) -> str:
+    return alert.get("repo") or alert_repo
+
+
+def issue_link(alert: dict, alert_repo: str) -> str:
+    repo = opened_in(alert, alert_repo)
+    return gh.issue_url(repo, alert["issue"]) if repo and alert.get("issue") else ""
+
+
+def close_issue(repo: str, number: int, comment: str) -> None:
+    try:
+        gh.issue_close(repo, number, comment)
+    except gh.GhError as e:
+        if "Could not resolve to" not in str(e):
+            raise
