@@ -43,9 +43,9 @@ async function probe(name, btn) {
   btn.textContent = "Probing";
   try {
     const p = await call(`/api/devices/${encodeURIComponent(name)}/probe`, {});
-    sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`);
+    sayAt("devices", p.ok ? "ok" : "fault", p.ok ? `${name} answered in ${p.seconds} s${p.system ? `: ${p.system}` : ""}.` : `${name} did not answer: ${p.detail || "no detail"}.`, { from: btn });
   } catch (e) {
-    sayAt("devices", "fault", e.message);
+    sayAt("devices", "fault", e.message, { from: btn });
   }
   refresh();
 }

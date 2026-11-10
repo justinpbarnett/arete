@@ -146,10 +146,17 @@ function followAnchor(anchor, freshMarks, keptIds) {
   return { drift: node.getBoundingClientRect().top - anchor.top, stayed: !anchor.id || keptIds.has(anchor.id) };
 }
 
+function followStandIn(anchor, freshMarks) {
+  if (!anchor.id || freshMarks.nodeOf(anchor.id)) return null;
+  const standIn = freshMarks.nodes.find((node) => node.dataset.standsFor === placeKey(anchor.node));
+  return standIn?.checkVisibility() ? { drift: standIn.getBoundingClientRect().top - anchor.top } : null;
+}
+
 function keepPlace(place, shownMarks, freshMarks) {
   const keptIds = idsKeptInOrder(shownMarks.ids, freshMarks.ids);
   const followed = place.anchors.map((anchor) => followAnchor(anchor, freshMarks, keptIds)).filter(Boolean);
-  const anchor = followed.find(({ stayed }) => stayed) ?? followed[0];
+  const standIn = place.anchors.map((anchor) => followStandIn(anchor, freshMarks)).find(Boolean);
+  const anchor = standIn ?? followed.find(({ stayed }) => stayed) ?? followed[0];
   if (place.pane) {
     const y = anchor ? place.pane.scrollTop + anchor.drift : place.y;
     if (place.pane.scrollTop !== y) place.pane.scrollTop = y;
@@ -235,7 +242,7 @@ function scrollersByPlace(box) {
 
 function fill(id, ...nodes) {
   const box = document.getElementById(id);
-  const fresh = nodes.flat(Infinity).filter(Boolean).map(asNode);
+  const fresh = saidBesideRows(nodes.flat(Infinity).filter(Boolean).map(asNode));
   const shown = [...box.childNodes];
   tickLiveAgos(elementsIn([...shown, ...fresh], "time.ago"));
   if (keepShownIfUnchanged(shown, fresh)) return;

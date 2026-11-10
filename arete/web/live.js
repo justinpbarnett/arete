@@ -104,7 +104,7 @@ function reviewLine(a) {
 }
 
 function decide(id, yes, btn, place) {
-  if (yes) sayAt(place, null, `Approving #${id}. A push rebases and runs its check again before it lands, so it can take a minute.`);
+  if (yes) sayAt(place, null, `Approving #${id}. A push rebases and runs its check again before it lands, so it can take a minute.`, { from: btn });
   return act(btn, place, `/api/approvals/${id}`, { approve: yes },
     (r) => (yes ? `Approved #${id}: ${r.result}.` : `Rejected #${id}. Nothing was sent.`));
 }
@@ -119,7 +119,7 @@ function readyRow(r) {
 }
 
 function sendReady(r, btn) {
-  sayAt("needs", null, `Sending ${r.ref}. It screens the ticket and writes to it, so it can take a few seconds.`);
+  sayAt("needs", null, `Sending ${r.ref}. It screens the ticket and writes to it, so it can take a few seconds.`, { from: btn });
   return act(btn, "needs", `/api/triage/${encodeURIComponent(r.ref)}/send`,
     { questions: r.questions, answers: r.questions.map(() => ""), repo: r.repo }, (d) => d.said);
 }

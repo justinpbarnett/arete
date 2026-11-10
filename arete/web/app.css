@@ -53,6 +53,7 @@ main h3 { margin-top: 34px; }
 .detail-body h3 { margin-top: 30px; }
 .actions.top { margin-top: 0; }
 p.said:not([hidden]) { margin-top: 0; }
+tr.said-row p.said { margin: 0; max-width: none; }
 p.summary { margin: 0 0 14px; }
 .seg + p { margin-top: 14px; }
 .filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 0 0 6px; }
@@ -111,6 +112,7 @@ form.talk .actions { margin: 6px 0 10px; }
   .stack td[data-label] { display: flow-root; padding-left: 112px; min-height: 24px; }
   .stack td[data-label]::before { content: attr(data-label); float: left; width: 104px; margin: 2px 0 0 -112px; font-family: var(--mark); text-transform: uppercase; letter-spacing: .14em; font-size: 12px; line-height: 18px; color: var(--muted); }
   .stack td:not([data-label]) { padding-top: 8px; }
+  .stack tr.said-row > td { padding-top: 3px; }
   .stack .loop-buttons { display: grid; grid-template-columns: repeat(2, minmax(min-content, 1fr)); }
   .stack thead, .stack td.wide-only, .stack td[data-label]:empty { display: none; }
   tr:has(a[aria-current="true"]) { border-bottom-color: var(--ink); }

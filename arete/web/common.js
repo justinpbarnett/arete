@@ -31,6 +31,7 @@ const openQuestions = new Set();
 const drafts = new Map();
 const lastSaid = new Map();
 const saidById = new Map();
+const saidBeside = new Map();
 let changesInFlight = 0;
 
 class NoAnswer extends Error {}
@@ -85,12 +86,46 @@ function saidLine(place) {
     said ? sayParts(...said) : null);
 }
 
-function sayAt(place, state, sentence, { focus = true } = {}) {
+function sayAt(place, state, sentence, { focus = true, from = null } = {}) {
   lastSaid.set(place, [state, sentence]);
+  if (from) keepSaidBeside(place, from);
   const line = currentSection().querySelector(`[data-said="${CSS.escape(place)}"]`);
   if (!line) return;
   sayIn(line, state, sentence);
+  placeSaid(line, [line.closest("[id]")]);
   if (focus) line.focus();
+}
+
+function keepSaidBeside(place, control) {
+  const row = control.closest("tr");
+  let next = row?.nextElementSibling;
+  while (next?.matches(".said-row")) next = next.nextElementSibling;
+  if (row) saidBeside.set(place, { row: control.dataset.focus, next: next?.querySelector("[data-focus]")?.dataset.focus });
+  else saidBeside.delete(place);
+}
+
+function rowHolding(nodes, key) {
+  return key ? elementsIn(nodes, `[data-focus="${CSS.escape(key)}"]`)[0]?.closest("tr") : null;
+}
+
+function placeSaid(line, nodes) {
+  const beside = saidBeside.get(line.dataset.said);
+  if (!beside || line.hidden) return false;
+  const acted = rowHolding(nodes, beside.row);
+  const next = acted ? null : rowHolding(nodes, beside.next);
+  if (acted) delete line.dataset.standsFor;
+  else line.dataset.standsFor = beside.row;
+  if (!acted && !next) return false;
+  const holder = line.closest("tr.said-row") ?? el("tr", { class: "said-row" }, el("td", {}, line));
+  holder.cells[0].colSpan = (acted ?? next).cells.length;
+  if (acted) acted.after(holder);
+  else next.before(holder);
+  return true;
+}
+
+function saidBesideRows(nodes) {
+  const placed = elementsIn(nodes, "p[data-said]").filter((line) => placeSaid(line, nodes));
+  return nodes.filter((node) => !placed.includes(node));
 }
 
 function say(id, state, sentence) {
@@ -320,9 +355,9 @@ function stopWords(what, r, after) {
 async function act(btn, place, path, body, saying) {
   btn.disabled = true;
   try {
-    sayAt(place, "ok", saying(await call(path, body)));
+    sayAt(place, "ok", saying(await call(path, body)), { from: btn });
   } catch (e) {
-    sayAt(place, "fault", e.message);
+    sayAt(place, "fault", e.message, { from: btn });
   }
   refresh();
 }
