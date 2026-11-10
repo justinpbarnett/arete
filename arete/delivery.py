@@ -37,7 +37,7 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                     send(delivery, loop.name, run_id, cfg, log)
                     settle_judged(emit, run_id, "landed")
                 except Failed as e:
-                    if emit.kept_when_failed:
+                    if isinstance(e.__cause__, emit.kept_failures):
                         failed_id = state.add_approval(loop.name, run_id, delivery, what, str(e))
                         settle_judged(emit, run_id, "failed", failed_id)
                         log("emit", f"kept as approval #{failed_id} to try again or reject")

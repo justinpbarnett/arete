@@ -43,7 +43,8 @@ arete loop enable NAME
 Every run of every kind, pipeline, loop, session, chat and draft, is a row in one runs table with its trigger, model, runner, device, cost and tokens. Each model call is a step under its run. A run's live feed holds its steps, the tools the agent calls, and a command loop's output as it prints.
 
 An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it.
-A delivery that fails stays listed with its error, and approving it again tries the delivery again.
+A ticket, PR, push or digest that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
+Try again on the dashboard, or `arete approve ID`, delivers it again, so a finding whose ticket hits a GitHub outage is filed then instead of being lost.
 A `push` emit lands a climb or search change on the default branch with no PR.
 It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path.
 With `reviewer` in that table, a model such as opus reviews each held push first, and a push it approves with high confidence lands, unless the trust level, a path the repo denies or a listed path keeps it for a person.

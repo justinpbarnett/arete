@@ -53,8 +53,12 @@ def config_repo(cfg: config.Config, name: str) -> config.Repo | None:
         return next((r for r in cfg.repos if r.github == name), None)
 
 
+class LoopOff(RuntimeError):
+    pass
+
+
 class Emit:
-    kept_when_failed = False
+    kept_failures: tuple[type[Exception], ...] = ()
     judged = False
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
@@ -92,6 +96,8 @@ class Emit:
 
 
 class Ticket(Emit):
+    kept_failures = (Exception,)
+
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         return sources.repo_problems(cfg, [spec.get("repo", "")], "ticket emit")
 
@@ -131,6 +137,8 @@ class Ticket(Emit):
 
 
 class PullRequest(Emit):
+    kept_failures = (Exception,)
+
     def target_repo(self, item: dict) -> str:
         return ""  # item["repo"] is the GitHub owner/name; the run that asked holds the config repo
 
@@ -173,6 +181,8 @@ class PullRequest(Emit):
 
 
 class ToLoop(Emit):
+    kept_failures = (LoopOff,)
+
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         if not spec.get("loop"):
             return ["a loop emit needs loop, the name of the loop that takes each finding"]
@@ -192,7 +202,7 @@ class ToLoop(Emit):
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
         target = find(item["loop"], cfg)
         if not target.enabled:
-            raise RuntimeError(f"the loop {target.name} is off{': ' + target.error if target.error else ''}")
+            raise LoopOff(f"the loop {target.name} is off{': ' + target.error if target.error else ''}")
         if why := target.trigger.refusal(item["event"]):
             raise ValueError(f"{target.name} {why}")
         if not target.takes_findings:
@@ -211,6 +221,8 @@ class ToLoop(Emit):
 
 
 class Digest(Emit):
+    kept_failures = (Exception,)
+
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         lines = [f"## {util.now().astimezone().strftime('%H:%M')} {loop.name} ({run_id})", ""]
         lines += [f"- **{outbound.plain(f['title'], 160)}** ({f.get('severity') or 'unrated'}): {outbound.plain(f.get('summary'), 600)}"
