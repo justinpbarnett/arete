@@ -245,6 +245,8 @@ def execute(session_id: str) -> str:
                     time.sleep(INBOX_POLL_SECONDS)
         except SessionStopped:
             status, summary = "stopped", record.STOPPED if record.stop_asked(session_id) else "stopped by a signal"
+        except devices.DeviceError as e:
+            status, summary = "failed", util.first_line(str(e), 300)
         except Exception as e:
             status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
         finally:
