@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -753,6 +754,24 @@ def cmd_costs(args) -> int:
     return 0
 
 
+def cmd_steps(args) -> int:
+    from . import steps
+
+    where = ""
+    try:
+        cfg = config.load()
+        layer_dir = cfg.repo(args.repo).layer_dir if args.repo else None
+        where = f"{paths.short_path(layer_dir / 'config.toml')}: " if layer_dir else ""
+        layer = config.load_layer(layer_dir) if layer_dir else None
+        steps.check(cfg, layer)
+        sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.MODEL_ROLES]
+    except (ValueError, TypeError) as e:
+        print(f"{where}{e}", file=sys.stderr)
+        return 1
+    print_lines(json.dumps(dataclasses.asdict(s)) for s in sheet)
+    return 0
+
+
 def cmd_record(args) -> int:
     from . import record
 
@@ -929,6 +948,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop")
     p.add_argument("--days", type=float, default=None)
     p.set_defaults(fn=cmd_costs)
+
+    p = sub.add_parser("steps", help="the model, runner, effort, timeout and tries each step resolves to, one JSON line "
+                                     "per step")
+    p.add_argument("--repo", default="", help="read this repo's layer too")
+    p.add_argument("--kind", default="", choices=config.KINDS, help="resolve for this kind of ticket")
+    p.set_defaults(fn=cmd_steps)
 
     p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
                                       "events")

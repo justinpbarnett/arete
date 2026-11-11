@@ -39,6 +39,7 @@ ENDING_CHARS = 12000
 RESTATE_TIMEOUT = 600
 WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
 NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def binary() -> str:
@@ -90,11 +91,39 @@ def write_confinement(cwd: Path, add_dirs: list[Path]) -> list[str]:
     return ["sandbox-exec", *params, "-p", profile]
 
 
+def sessions_dir(remote: devices.Device | None) -> str:
+    return f"{devices.home(remote)}/.arete/pi-sessions" if remote else str(SESSIONS_DIR)
+
+
+def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
+            persist: bool = True, add_dirs: list[Path] | None = None,
+            remote: devices.Device | None = None) -> list[str]:
+    cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
+           "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp"]
+    cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
+    if model:
+        cmd += ["--model", model]
+    if effort:
+        cmd += ["--thinking", effort]
+    if persist or resume.id:
+        cmd += ["--session-dir", sessions_dir(remote)]
+        if resume.id:
+            cmd += ["--session", resume.id]
+    else:
+        cmd += ["--no-session"]
+    if system:
+        cmd += ["--append-system-prompt", system]
+    if add_dirs:
+        cmd += ["--append-system-prompt", "You may also read and change files under: " + ", ".join(map(str, add_dirs))]
+    return cmd
+
+
 def run(
     prompt: str,
     cwd: Path | str,
     *,
     model: str = "",
+    effort: str = "",
     tools: list[str] | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
@@ -121,24 +150,10 @@ def run(
         # A sandbox is deleted after its run and holds no git credentials, so the rules against git writes guard nothing.
         disallowed_tools = [t for t in disallowed_tools or [] if not is_pattern_rule(t)]
     names = tool_names(tools, allowed_tools, disallowed_tools)
-    sessions_dir = f"{devices.home(remote)}/.arete/pi-sessions" if remote else str(SESSIONS_DIR)
-    cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
-           "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp"]
-    cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
-    if model:
-        cmd += ["--model", model]
-    if persist or resume.id:
-        if not remote:
-            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        cmd += ["--session-dir", sessions_dir]
-        if resume.id:
-            cmd += ["--session", resume.id]
-    else:
-        cmd += ["--no-session"]
-    if system:
-        cmd += ["--append-system-prompt", system]
-    if add_dirs:
-        cmd += ["--append-system-prompt", "You may also read and change files under: " + ", ".join(map(str, add_dirs))]
+    if (persist or resume.id) and not remote:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = command(names, model=model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
+                  remote=remote)
     if json_schema:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
     if (writing := sorted(WRITING & set(names))) and not sandboxed:
@@ -154,7 +169,7 @@ def run(
         env["PI_CODING_AGENT_DIR"] = str(agent_dir())
     cmd = [*cmd, "--", prompt]
     if remote:
-        cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir,))
+        cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir(remote),))
     try:
         proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
                                     lambda line: reply_cost(line, model, price), on_line)

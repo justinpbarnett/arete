@@ -290,6 +290,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `max_parallel` | Most pipeline runs at once on the machine. Default 1. |
 | `max_parallel_per_repo` | Most pipeline runs poll keeps going in one repo, runs in their CI wait included. Default 1. |
 | `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop` and `session`, which use sonnet, and `research` and `chat`, which use opus. `arete status` lists each role's model. |
+| `[steps]`, `[kinds]`, `[tiers]`, `[factory]` | Each pipeline step's model, runner, effort, timeout and tries. See [Steps](#steps). |
 | `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly transcript digest. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
@@ -410,7 +411,7 @@ dir = "docs/research"
 | `setup.commands` | Run in each fresh worktree before the agent starts. |
 | `setup.copy` | Files copied from the main checkout into each worktree. |
 | `checks` | Every check must exit 0 before review. The agent may run them while it builds. |
-| `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), and the run timeout. Code enforces them after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. The PR shows it under "Left for a person", and a rerun on an open PR writes, rewrites or removes that section to match its plan. The verifier and the reviewer are told that a person makes it, so its absence never fails the run. The CI fix step counts a red check that only that change fixes as not caused by the PR. |
+| `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), and the timeout of each step and of the checks. `max_attempts` and `timeout_minutes` are the defaults for each step's `tries` and `timeout_minutes`, which [Steps](#steps) can set apart. Code enforces the diff size and the paths after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. The PR shows it under "Left for a person", and a rerun on an open PR writes, rewrites or removes that section to match its plan. The verifier and the reviewer are told that a person makes it, so its absence never fails the run. The CI fix step counts a red check that only that change fixes as not caused by the PR. |
 | `agent.allow_bash` | Bash patterns the agent may run, on top of read only git and file commands. |
 | `trust.level` | `pr`, or `automerge` once earned. |
 | `trust.automerge_after` | Merged PRs in a row before arete opens a PR proposing automerge. |
@@ -424,16 +425,61 @@ dir = "docs/research"
 | `verify.notes` | What the verifier must know: how to sign in, what not to touch, what is shared. |
 | `research.dir` | Folder, from the repo root, where arete files the reports of this repo's research tickets as pull requests. Leave it out and the reports stay in arete. See [Triage](#triage). |
 
-A template with an unknown field falls back to the default. A layer in `.agents/` that is not committed yet still works: runs read it from the main checkout and lessons land there, but arete never proposes automerge until it is committed. A layer outside the repo is read in place, lessons land in its `expertise.md`, and the miner leaves the repo's `.agents/` alone. Arete never proposes automerge for it: raise `trust.level` by hand.
+A template with an unknown field falls back to the default. A layer may also hold `[steps]`, `[kinds]` and `[tiers]`, which set its steps apart from the engine's; see [Steps](#steps). A layer in `.agents/` that is not committed yet still works: runs read it from the main checkout and lessons land there, but arete never proposes automerge until it is committed. A layer outside the repo is read in place, lessons land in its `expertise.md`, and the miner leaves the repo's `.agents/` alone. Arete never proposes automerge for it: raise `trust.level` by hand.
 
 After a run that had something to learn from (a failed check, a fix, a failed check in use, or PR feedback), the learn step rewrites `expertise.md` whole, in at most 80 lines. It checks each lesson against the code in the worktree and drops a lesson the code now contradicts, with the reason in the run's report. A rewrite over the cap is not applied. A layer outside the repo is made a git repo, and arete commits each rewrite there, so its log shows what was learned and from which run. A clean run learns nothing.
+
+## Steps
+
+Each pipeline step reads its own model, runner, effort, timeout and tries: plan, build (also revise, the fixes and the CI fixes), verify, review, learn and uat. `arete steps` prints what each step resolves to, one JSON line per step. `--repo NAME` reads that repo's layer too, and `--kind feat` or `--kind fix` resolves for that kind of ticket.
+
+```toml
+[tiers.default]
+S = { runner = "claude", model = "opus" }
+A = { runner = "claude", model = "sonnet" }
+C = { runner = "pi", provider = "openrouter", model = "qwen/qwen3-coder" }
+
+[factory]
+tier_map = "default"
+
+[steps.plan]
+tier = "S"
+effort = "high"
+timeout_minutes = 20
+tries = 2
+
+[steps.implement]
+tier = "A"
+timeout_minutes = 40
+
+[kinds.fix.steps.plan]
+effort = "medium"
+```
+
+A step is named by its `[models]` role. `implement` is a second name for `build`, and a table names the step one way, not both.
+
+| Key | Meaning |
+|-----|---------|
+| `tier` | A tier of the tier map in use, which sets `runner`, `provider` and `model`. |
+| `model` | The model. It wins over a tier at any level, and routes as in [Runners](#runners-devices-and-sessions). |
+| `runner` | `claude` or `pi`. It wins over the runner the model name picks, but not over a `claude:` or `pi:` prefix. |
+| `provider` | For pi, the provider put before a model name that does not start with it. |
+| `effort` | claude's `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) or pi's `--thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Left out, the runner's own default. |
+| `timeout_minutes` | The step's time limit. Default `limits.timeout_minutes`; learn 15, uat 10. The checks keep `limits.timeout_minutes`. |
+| `tries` | For build, the fix attempts after failed checks and the CI fix rounds; for verify, the rounds of verify in use; for uat, the tries at the test steps. Default `limits.max_attempts`; uat 3. The other steps run once. |
+
+Levels, where the last one to set a key wins: the defaults above, `[steps]` in `~/.config/arete/config.toml`, `[kinds.<kind>.steps]` there, `[steps]` in the repo's layer, then `[kinds.<kind>.steps]` there. A kind is `feat` or `fix`. A level that names a `model` also drops the `runner` and `provider` that lower levels set. A step with neither a model nor a tier takes its `[models]` role. The other roles, such as triage, chat and the miner, read `[models]` alone.
+
+`[tiers.<map>]` lists tiers by name. A layer's `[tiers.<map>]` adds to the engine's map of the same name, or replaces a tier it names again. `[factory] tier_map` names the map in use; it may be left out when there is one map.
+
+Config load refuses, in one line that names the table: an unknown step, kind or key, a tier the map does not have, a runner other than `claude` or `pi`, an effort the step's runner does not take, `tries` or `timeout_minutes` under 1, several tier maps with no `tier_map`, and a `tier_map` with no such map. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
 
 ## Verify in use
 
 Checks passing is not the bar. After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw. Reading the code and running the test suite do not count as checks. The builder does not add tests unless the repo's own rules ask for them.
 
 - Pass: the evidence goes in the PR body. Screenshots are pushed to the orphan branch `arete/evidence` and linked from the body.
-- Fail: the build session resumes with what failed, then the checks and the verifier run again, up to `limits.max_attempts`.
+- Fail: the build session resumes with what failed, then the checks and the verifier run again, up to the verify step's `tries` (default `limits.max_attempts`).
 - Blocked: the verifier could not check something (a service it may not reach, a sign in it cannot finish). The PR opens as a draft and says what it would take.
 
 Arete stops the server's whole process group after each verifier run, so no dev server outlives its step.
@@ -443,7 +489,7 @@ Arete stops the server's whole process group after each verifier run, so no dev 
 After the push, the run waits for the checks on the PR. It waits up to 30 minutes, or 3 minutes when no check reports at all. The run frees its `max_parallel` slot for the wait, so another ticket can start, and takes a slot back before a CI fix step. Arete compares each failed check with the same check on the head of the base branch.
 
 - Red on the base too: the PR section notes the base result and its date. This PR did not cause it, so nothing changes.
-- Passed on the base, skipped there, or no result there: a CI fix step reads the job log and the diff, and decides whether the PR caused the failure. When the base moved after the last push, arete first merges it into the branch, since CI tested the PR merged with that base. A merge that conflicts is undone, and the step works on the branch as it is, as it does when the fetch fails. A check that the PR did not cause gets a note with the reason. For a check that the PR did cause, the step fixes the code. Then the checks and the diff limit run again, arete pushes the fix, and the wait starts again. `limits.max_attempts` caps the rounds, and the diff limit counts the whole branch.
+- Passed on the base, skipped there, or no result there: a CI fix step reads the job log and the diff, and decides whether the PR caused the failure. When the base moved after the last push, arete first merges it into the branch, since CI tested the PR merged with that base. A merge that conflicts is undone, and the step works on the branch as it is, as it does when the fetch fails. A check that the PR did not cause gets a note with the reason. For a check that the PR did cause, the step fixes the code. Then the checks and the diff limit run again, arete pushes the fix, and the wait starts again. The build step's `tries` (default `limits.max_attempts`) caps the rounds, and the diff limit counts the whole branch.
 
 After each round, arete writes a `## CI` section into the PR body. It shows what passed, each red check with its base result and reason, and the earlier rounds. When the PR still causes a red check after the last round, or the fix step fails, arete turns the PR to a draft and fails the run. The section then ends with `Arete stopped:` and the reason. The PR stays open. Review comments on it start a revision, as on any arete PR. A later run that is approved and green marks it ready again. A run gets the status `pr` only when its PR caused no red check.
 

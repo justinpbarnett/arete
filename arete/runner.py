@@ -193,7 +193,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
               "allowed_tools": kw.get("allowed_tools"), "disallowed_tools": kw.get("disallowed_tools"),
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
-              "timeout": kw.get("timeout"),
+              "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
     hidden = record.secrets(*secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg))
     started = time.monotonic()

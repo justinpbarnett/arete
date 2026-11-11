@@ -11,6 +11,12 @@ MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "ap
                "classify", "loop", "session", "research", "explain")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
                    "research": "opus", "explain": "haiku"}
+STEP_ALIASES = {"implement": "build"}
+STEP_NAMES = (*MODEL_ROLES, *STEP_ALIASES)
+STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries")
+STEP_COUNTS = ("timeout_minutes", "tries")
+TIER_KEYS = ("runner", "provider", "model")
+KINDS = ("feat", "fix")
 
 
 class UnknownRepo(KeyError):
@@ -126,6 +132,10 @@ class Config:
     local_providers: list[str] = field(default_factory=lambda: ["ollama"])
     daily_budget_usd: float | None = None
     session_idle_hours: float = 2
+    tiers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    tier_map: str = ""
+    steps: dict[str, dict] = field(default_factory=dict)
+    kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -170,6 +180,55 @@ def moves_table(jira: dict, table: str, states: tuple[str, ...], hints: dict[str
     return moves
 
 
+def table_of(value, where: str) -> dict:
+    if not isinstance(value, dict):
+        raise TypeError(f"[{where}] must be a table, not {value!r}")
+    return value
+
+
+def step_table(table, where: str) -> dict:
+    table = table_of(table, where)
+    if bad := sorted(set(table) - set(STEP_KEYS)):
+        raise ValueError(f"[{where}]: unknown key {', '.join(bad)}; use {', '.join(STEP_KEYS)}")
+    for key in STEP_COUNTS:
+        if key in table and (type(table[key]) is not int or table[key] < 1):
+            raise ValueError(f"[{where}]: {key} must be a whole number of at least 1, not {table[key]!r}")
+    return {k: v if k in STEP_COUNTS else str(v) for k, v in table.items()}
+
+
+def step_tables(data, where: str) -> dict[str, dict]:
+    data = table_of(data, where)
+    if bad := sorted(set(data) - set(STEP_NAMES)):
+        raise ValueError(f"[{where}]: unknown step {', '.join(bad)}; use {', '.join(STEP_NAMES)}")
+    for alias, role in STEP_ALIASES.items():
+        if alias in data and role in data:
+            raise ValueError(f"[{where}.{alias}] and [{where}.{role}] are the same step; name the step once")
+    return {STEP_ALIASES.get(name, name): step_table(table, f"{where}.{name}") for name, table in data.items()}
+
+
+def kind_tables(data, where: str) -> dict[str, dict[str, dict]]:
+    data = table_of(data, where)
+    if bad := sorted(set(data) - set(KINDS)):
+        raise ValueError(f"[{where}]: unknown kind {', '.join(bad)}; use {', '.join(KINDS)}")
+    kinds = {}
+    for kind, table in data.items():
+        if bad := sorted(set(table_of(table, f"{where}.{kind}")) - {"steps"}):
+            raise ValueError(f"[{where}.{kind}]: unknown key {', '.join(bad)}; use steps")
+        kinds[kind] = step_tables(table.get("steps") or {}, f"{where}.{kind}.steps")
+    return kinds
+
+
+def tier_maps(data, where: str) -> dict[str, dict[str, dict[str, str]]]:
+    maps: dict[str, dict[str, dict[str, str]]] = {}
+    for name, tiers in table_of(data, where).items():
+        maps[name] = {}
+        for tier, entry in table_of(tiers, f"{where}.{name}").items():
+            if bad := sorted(set(table_of(entry, f"{where}.{name}.{tier}")) - set(TIER_KEYS)):
+                raise ValueError(f"[{where}.{name}] {tier}: unknown key {', '.join(bad)}; use {', '.join(TIER_KEYS)}")
+            maps[name][tier] = {k: str(v) for k, v in entry.items()}
+    return maps
+
+
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
     if not path.exists():
@@ -187,6 +246,10 @@ def load(path: Path | None = None) -> Config:
         dashboard_port=int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
     )
+    cfg.tiers = tier_maps(data.get("tiers") or {}, "tiers")
+    cfg.tier_map = str((data.get("factory") or {}).get("tier_map", ""))
+    cfg.steps = step_tables(data.get("steps") or {}, "steps")
+    cfg.kinds = kind_tables(data.get("kinds") or {}, "kinds")
     serve = data.get("serve", {})
     if "loop_dirs" in serve:
         cfg.loop_dirs = [paths.expand(d) for d in serve["loop_dirs"]]
@@ -281,6 +344,8 @@ def load(path: Path | None = None) -> Config:
                 timeout=int(p.get("timeout", 180)),
             )
         )
+    from . import steps
+    steps.check(cfg)
     return cfg
 
 
@@ -343,6 +408,9 @@ class RepoLayer:
     timeout_minutes: int = 45
     verify: Verify | None = None
     research_dir: str = ""
+    tiers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    steps: dict[str, dict] = field(default_factory=dict)
+    kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
 
     @property
     def builder_bash(self) -> list[str]:
@@ -361,7 +429,7 @@ class RepoLayer:
         return self.dir / "evals"
 
 
-LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research"}
+LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers"}
 
 
 def load_layer(layer_dir: Path) -> RepoLayer:
@@ -388,6 +456,9 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.subject = g.get("subject", layer.subject)
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(data.get("research", {}).get("dir", "")).strip().strip("/")
+    layer.tiers = tier_maps(data.get("tiers") or {}, "tiers")
+    layer.steps = step_tables(data.get("steps") or {}, "steps")
+    layer.kinds = kind_tables(data.get("kinds") or {}, "kinds")
     if "verify" in data:
         v = data["verify"]
         layer.verify = Verify(start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),

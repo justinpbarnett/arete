@@ -36,40 +36,40 @@ LIMIT_RECHECK_SECONDS = 1800
 MILLISECOND_STAMPS = 1e12
 STOP_GRACE_SECONDS = 30
 DRAIN_SECONDS = 10
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def binary() -> str:
     return shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
 
 
-def run(
-    prompt: str,
+def command(
     cwd: Path | str,
     *,
     model: str = "",
+    effort: str = "",
     tools: list[str] | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     permission_mode: str = "dontAsk",
     json_schema: dict | None = None,
     resume: Session = NO_SESSION,
+    fresh_session: str = "",
     system: str = "",
     max_budget_usd: float | None = None,
-    timeout: float = 1800,
     persist: bool = True,
     add_dirs: list[Path] | None = None,
     mcp_config: str = "",
     remote: devices.Device | None = None,
     settings: dict | None = None,
-    extra_env: dict[str, str] | None = None,
-    on_line: Callable[[str], None] = lambda line: None,
-) -> Result:
+) -> list[str]:
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
-    fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = ["claude" if remote else binary(), "-p", "--output-format", "stream-json", "--verbose",
            "--permission-mode", permission_mode]
     if model:
         cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
     tool_names = tool_set(tools, allowed_tools or [])
     cmd += ["--tools", ",".join(tool_names)]
     if allowed_tools:
@@ -97,7 +97,37 @@ def run(
     cmd += ["--strict-mcp-config", "--mcp-config", mcp_config or NO_MCP_SERVERS]
     if settings:
         cmd += ["--settings", json.dumps(settings)]
+    return cmd
 
+
+def run(
+    prompt: str,
+    cwd: Path | str,
+    *,
+    model: str = "",
+    effort: str = "",
+    tools: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+    permission_mode: str = "dontAsk",
+    json_schema: dict | None = None,
+    resume: Session = NO_SESSION,
+    system: str = "",
+    max_budget_usd: float | None = None,
+    timeout: float = 1800,
+    persist: bool = True,
+    add_dirs: list[Path] | None = None,
+    mcp_config: str = "",
+    remote: devices.Device | None = None,
+    settings: dict | None = None,
+    extra_env: dict[str, str] | None = None,
+    on_line: Callable[[str], None] = lambda line: None,
+) -> Result:
+    fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
+    cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
+                  disallowed_tools=disallowed_tools, permission_mode=permission_mode, json_schema=json_schema,
+                  resume=resume, fresh_session=fresh_session, system=system, max_budget_usd=max_budget_usd,
+                  persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, remote=remote, settings=settings)
     env = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
     env["ARETE_AGENT"] = "1"
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
