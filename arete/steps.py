@@ -5,7 +5,8 @@ from pathlib import Path
 
 from . import claude, config, pi, runner
 
-EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS}
+EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS,
+           runner.REPLAY: tuple(dict.fromkeys([*claude.EFFORTS, *pi.THINKING_LEVELS]))}
 BUILT_IN = {"learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3}}
 MODEL_SOURCE = ("runner", "provider")
 
@@ -78,6 +79,8 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     effort = found.get("effort", "")
     if effort and effort not in EFFORTS[which]:
         raise ValueError(f"{where}: effort '{effort}' is not a level {which} takes; use {', '.join(EFFORTS[which])}")
+    if cfg.replay.all:
+        which = runner.REPLAY
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"])
 

@@ -792,6 +792,18 @@ def cmd_record(args) -> int:
     return 0
 
 
+def cmd_replay(args) -> int:
+    from . import replay
+
+    try:
+        lines = replay.sample(paths.expand(args.folder))
+    except (OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    print_lines(lines)
+    return 0
+
+
 def print_lines(lines: Iterable[str]) -> None:
     try:
         for line in lines:
@@ -961,6 +973,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.set_defaults(fn=cmd_record)
+
+    p = sub.add_parser("replay", help="answer agent steps from files; `replay sample FOLDER` writes a fixture repo, its "
+                                      "bare origin, a layer and an answer per ticket step")
+    p.add_argument("action", choices=("sample",))
+    p.add_argument("folder")
+    p.set_defaults(fn=cmd_replay)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")
