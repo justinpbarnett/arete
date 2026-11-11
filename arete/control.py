@@ -8,7 +8,19 @@ import threading
 from collections import Counter, defaultdict
 from datetime import timedelta
 
-from . import config, devices, emits, hooks, loops, paths, record, sources, state, util
+from . import (
+    config,
+    delivery,
+    devices,
+    emits,
+    hooks,
+    loops,
+    paths,
+    record,
+    sources,
+    state,
+    util,
+)
 from .loops import Loop
 
 BEAT_FILE = paths.STATE_DIR / "serve.json"
@@ -30,6 +42,10 @@ class Busy(RuntimeError):
 
 
 class Refused(ValueError):
+    pass
+
+
+class KeptFailure(Refused):
     pass
 
 
@@ -66,9 +82,10 @@ def stop_run(run_id: str) -> dict:
         if gone:
             if not (r := record.ask_stop(run_id)):
                 raise NotFound(f"no run {run_id}")
+            devices.release(run_id, lambda text: state.add_feed(run_id, "device", text))
             if r["kind"] in record.TICKET_KINDS:
                 return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
-            record.interrupt(r)
+            record.interrupt(r, devices.left_up(run_id))
             return {"id": run_id, "stopped": True, "was": "gone"}
     if not r["pid"]:
         raise Refused(f"{run_id} is still starting; stop it again in a moment")
@@ -87,7 +104,8 @@ def serve_beat() -> dict:
     data = util.read_json(BEAT_FILE, {})
     if data.get("at"):
         data["age_seconds"] = round((util.now() - util.parse_iso(data["at"])).total_seconds())
-        data["alive"] = util.pid_alive(data.get("pid")) and data["age_seconds"] < BEAT_STALE_SECONDS
+        data["process_gone"] = not util.pid_alive(data.get("pid"))
+        data["alive"] = not data["process_gone"] and data["age_seconds"] < BEAT_STALE_SECONDS
     return data
 
 
@@ -102,7 +120,7 @@ def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]
     running = {r["loop"]: r["id"] for r in state.runs_marked_running(connect) if r["kind"] == "loop"}
     waiting = Counter(item["loop"] for item in state.pending(connect))
     spent: dict[str, float] = defaultdict(float)
-    for s in state.steps_since(day_ago(), connect):
+    for s in state.steps_since(day_ago(), connect, paid_only=True):
         spent[s.get("loop") or ""] += s["cost_usd"] or 0
     out = []
     for loop in every_loop:
@@ -121,13 +139,16 @@ def loop_detail(name: str, connect=state.db) -> dict:
     loop = find_loop(name, cfg)
     view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
     source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
+    runs = state.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
+    paid = state.paid_by_run([r["id"] for r in runs], connect)
     return {**view, "prompt": loops.prompt_text(loop), "state": state.loop_state(loop.name, connect)["data"],
-            "runs": state.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect),
+            "runs": [{**r, "paid": paid.get(r["id"], 0)} for r in runs],
             "findings": state.findings(loop.name, 40, connect),
             "waiting": [i for i in state.pending(connect) if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
             "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "digests": digests(loop), "metrics": loop_metrics(loop, connect),
+            "model": loop.model_for(cfg) if loop.agent and not loop.error else "",
             "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
 
 
@@ -163,10 +184,12 @@ def feed(run_id: str, after: int = 0) -> dict:
 
 def decide(approval_id: int, yes: bool) -> dict:
     try:
-        return {"id": approval_id, "approved": yes, "result": emits.decide(approval_id, yes)}
+        return {"id": approval_id, "approved": yes, "result": delivery.decide(approval_id, yes)}
     except LookupError as e:
         raise NotFound(str(e)) from e
-    except (ValueError, emits.Failed) as e:
+    except delivery.KeptFailure as e:
+        raise KeptFailure(str(e)) from e
+    except (ValueError, delivery.Failed) as e:
         raise Refused(str(e)) from e
 
 
@@ -183,13 +206,17 @@ def costs(days: float | None = None, connect=state.db) -> dict:
         since = util.iso(util.now() - timedelta(days=days))
     except (OverflowError, ValueError) as e:
         raise Refused(f"cannot look back {days:g} days: {e}") from e
+    return {"days": days, **paid_since(since, connect)}
+
+
+def paid_since(since: str, connect=state.db) -> dict:
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
-    for s in state.steps_since(since, connect):
+    for s in state.steps_since(since, connect, paid_only=True):
         cost = s["cost_usd"] or 0
         total += cost
-        keys = {"model": s["model"] or "?", "runner": s["runner"] or "?",
-                "loop": s.get("loop") or s.get("kind") or s.get("run_id") or "?",
+        keys = {"model": s["model"] or "no model", "runner": s["runner"] or "no runner",
+                "loop": s.get("loop") or s.get("kind") or s.get("run_id") or "no loop",
                 "day": util.parse_iso(s["ts"]).astimezone().strftime("%Y-%m-%d")}
         for group, key in keys.items():
             row = groups[group].setdefault(key, {"name": key, "cost_usd": 0.0, "steps": 0, "tokens_in": 0,
@@ -198,6 +225,6 @@ def costs(days: float | None = None, connect=state.db) -> dict:
             row["steps"] += 1
             row["tokens_in"] += s["tokens_in"] or 0
             row["tokens_out"] += s["tokens_out"] or 0
-    return {"days": days, "since": since, "total_usd": round(total, 4),
+    return {"since": since, "total_usd": round(total, 4),
             **{f"by_{group}": sorted(({**r, "cost_usd": round(r["cost_usd"], 4)} for r in rows.values()),
                                      key=lambda r: (-r["cost_usd"], r["name"])) for group, rows in groups.items()}}

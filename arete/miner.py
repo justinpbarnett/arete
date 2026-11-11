@@ -25,6 +25,7 @@ from .heartbeat import mark_loop
 from .pipeline import (
     make_worktree,
     prompt,
+    remote_head,
     remove_worktree,
 )
 from .util import git
@@ -36,7 +37,9 @@ LEARNABLE = ("In this digest of a person working with a coding agent, does the p
              "reject a tool call, repeat an instruction they gave before, or state a lasting preference or fact about "
              "themselves, or does the agent hit the same failure more than once?")
 MAX_MINER_DIFF = 200
-GLOBAL_GLOBS = ["skills/**", "CLAUDE.md", "AGENTS.md"]
+GLOBAL_RULES = "harness/claude/CLAUDE.md"
+GLOBAL_GLOBS = ["skills/**", GLOBAL_RULES]
+RULE_LOCK = "file-rule"
 NEVER = ["**/settings.json", "**/settings.local.json", ".github/**", ".agents/config.toml", "**/.env*"]
 ARETE_PROMPT_GLOB = f"{evals.ARETE_PROMPTS}/*.md"
 HAND_EDIT_WHY = "Claude Code denies agent writes under .claude/"
@@ -394,16 +397,76 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
     return ""
 
 
+def proposals_text(props: list[dict]) -> str:
+    return "\n\n".join(
+        f"### {i + 1}. `{p['file']}`\n\nChange: {p['change']}\n\nWhy: {p['why']}" for i, p in enumerate(props)
+    )
+
+
+def apply_in(cfg: config.Config, run_id: str, wt: Path, props: list[dict]) -> runner.Result:
+    return runner.run(prompt("apply", proposals=proposals_text(props)), wt, model=cfg.model("apply"),
+                      allowed_tools=runner.EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
+
+
+def awaits_approval(cfg: config.Config, p: dict) -> bool:
+    return p["repo"] == cfg.global_repo and p["file"] == GLOBAL_RULES
+
+
+def file_rule(proposal_id: int) -> str:
+    with util.lock(RULE_LOCK, wait=True):
+        p = state.proposal(proposal_id)
+        if not p or not state.move_proposal(proposal_id, ("approve", "filing"), "filing"):
+            raise LookupError(f"#{proposal_id} is not a rule waiting for approval")
+        cfg = config.load()
+        repo = cfg.repo(p["repo"])
+        try:
+            base = push_rule(cfg, repo, p)
+        except Exception:
+            state.move_proposal(proposal_id, ("filing",), "approve")
+            raise
+        state.move_proposal(proposal_id, ("filing",), "merged")
+        return catch_up(repo, base)
+
+
+def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
+    base = gh.default_branch(repo.github)
+    wt = make_worktree(repo, base, f"arete/rule-{p['id']}", f"rule-{p['id']}")
+    try:
+        res = apply_in(cfg, p["run_id"], wt, [p])
+        if not res.ok:
+            raise RuntimeError(f"the apply step failed: {util.first_line(res.error)}")
+        diff = diffguard.stage(wt)
+        if diff.files != [GLOBAL_RULES]:
+            raise RuntimeError(f"the apply step changed {', '.join(diff.files) or 'nothing'}, not only {GLOBAL_RULES}"
+                               f": {res.text.strip()[:300]}")
+        if refusal := diff.refusal(MAX_MINER_DIFF):
+            raise RuntimeError(refusal)
+        message = f"docs(harness): add an approved global rule\n\n{p['change']}\n\nArete-Run: {p['run_id']}"
+        util.git_as_owner(["commit", "-q", "-m", message], wt)
+        git(["push", "-q", "origin", f"HEAD:{base}"], wt, timeout=300)
+        return base
+    finally:
+        remove_worktree(repo, wt)
+
+
+def catch_up(repo: config.Repo, base: str) -> str:
+    try:
+        with util.repo_lock(repo.path):
+            git(["fetch", "-q", "origin", base], repo.path)
+            if git(["branch", "--show-current"], repo.path).strip() != base:
+                return f"pushed to {repo.name}/{base}; {repo.path} is on another branch, so pull it there by hand"
+            git(["merge", "-q", "--ff-only", f"origin/{base}"], repo.path)
+    except RuntimeError as e:
+        return f"pushed to {repo.name}/{base}; {repo.path} did not fast forward ({e}), so pull it by hand"
+    return f"pushed to {repo.name}/{base} and {repo.path} is up to date"
+
+
 def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict],
                branch: str) -> tuple[str, list[dict]]:
     base = gh.default_branch(repo.github)
     wt = make_worktree(repo, base, branch, "miner", resume=bool(gh.open_pr_url(repo.github, branch)))
     try:
-        text = "\n\n".join(
-            f"### {i + 1}. `{p['file']}`\n\nChange: {p['change']}\n\nWhy: {p['why']}" for i, p in enumerate(props)
-        )
-        res = runner.run(prompt("apply", proposals=text), wt, model=cfg.model("apply"),
-                         allowed_tools=runner.EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
+        res = apply_in(cfg, run_id, wt, props)
         if not res.ok:
             return "", []
         diff = diffguard.stage(wt)
@@ -417,7 +480,10 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
             print(f"{repo.name}: refused, {refusal}")
             return "", []
         fixes = util.count(len(landed), "mined fix", "mined fixes")
-        git(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
+        util.git_as_owner(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
+        if not remote_head(repo.path, branch):
+            with util.repo_lock(repo.path):
+                git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
         body = ["Fixes mined from recent sessions where an agent needed correcting.", ""]
         for i, p in enumerate(landed, 1):
@@ -478,7 +544,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     text = prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
-        pending=_fmt(state.proposals(status=["applied", "pending", "hand"])),
+        pending=_fmt(state.proposals(status=["applied", "pending", "hand", "approve", "filing"])),
         rejected=_fmt(state.proposals(status=["rejected"])),
         events=render_events(cfg, hours), digest=digest, audit=auditor.latest_findings(),
         feedback=render_feedback(pr_feedback),
@@ -500,19 +566,23 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     for p in props:
         ok, why = allowed(cfg, p)
         by_hand = ok and util.matches_any(p["file"], diffguard.CLAUDE_CODE_GUARDED)
-        mark = "->" if ok and not by_hand else "  "
-        note = f"  [skip: {why}]" if not ok else f"  [by hand: {HAND_EDIT_WHY}]" if by_hand else ""
+        held = ok and awaits_approval(cfg, p)
+        mark = "->" if ok and not by_hand and not held else "  "
+        note = (f"  [skip: {why}]" if not ok else f"  [by hand: {HAND_EDIT_WHY}]" if by_hand
+                else "  [waits for approval]" if held else "")
         print(f"{mark} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}{note}")
         if dry_run:
             continue
         if by_hand:
             state.add_proposal(run_id, p, "hand")
+        elif held:
+            state.add_proposal(run_id, p, "approve")
         elif ok and apply:
             by_repo[p["repo"]].append(p)
         else:
             state.add_proposal(run_id, p, "memory" if p["layer"] == "memory" else "pending" if ok else "skipped")
     if dry_run:
-        print(f"miner: dry run, {len(props)} proposals, cost ${res.cost_usd:.2f}")
+        print(f"miner: dry run, {len(props)} proposals, {util.paid_note(res.paid_usd)}")
         return 0
     opened, failures = [], []
     branch = miner_branch()
@@ -527,7 +597,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             if p in landed:
                 state.add_proposal(run_id, p, "applied", url)
             else:
-                state.add_proposal(run_id, p, "skipped" if url else "pending")
+                state.add_proposal(run_id, p, "skipped")
         if url:
             opened.append(url)
             print(f"{name}: {url}")

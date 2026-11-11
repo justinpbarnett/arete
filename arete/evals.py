@@ -86,8 +86,8 @@ class Arm:
         return f"{sum(r['passed'] for r in self.results)}/{len(self.results)}"
 
     @property
-    def cost(self) -> float:
-        return sum(r["cost"] for r in self.results)
+    def paid(self) -> float:
+        return sum(r["paid"] for r in self.results)
 
 
 class Source:
@@ -218,8 +218,16 @@ def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
     git(["read-tree", sha], staging)
     git(["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", EVALS], staging)
     tree = git(["write-tree"], staging).strip()
-    return git(["-c", "user.name=arete", "-c", "user.email=arete@localhost", "commit-tree", tree, "-m",
+    return git([*util.ARETE_IDENTITY, "commit-tree", tree, "-m",
                 "eval base"], staging).strip()
+
+
+def write_files_through_repo(repo_path: Path, snapshot: str, dest: Path) -> None:
+    env = {"GIT_DIR": git(["rev-parse", "--absolute-git-dir"], repo_path).strip(), "GIT_WORK_TREE": str(dest),
+           "GIT_INDEX_FILE": str(dest / ".git" / "index"),
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(dest / ".git" / "objects")}
+    git(["read-tree", snapshot], dest, env=env)
+    git(["checkout-index", "-a"], dest, timeout=600, env=env)
 
 
 def isolated_checkout(repo_path: Path, base: str, dest: Path) -> None:
@@ -231,12 +239,13 @@ def isolated_checkout(repo_path: Path, base: str, dest: Path) -> None:
     with tempfile.TemporaryDirectory(prefix=f"{dest.name}-base-", dir=dest.parent) as staging:
         snapshot = commit_without_evals(repo_path, sha, Path(staging))
         git(["fetch", "-q", "--no-tags", staging, snapshot], dest, timeout=600)
+    write_files_through_repo(repo_path, snapshot, dest)
     git(["checkout", "-q", "-B", "main", "FETCH_HEAD"], dest)
 
 
 def commit_overlay(wt: Path) -> None:
     git(["add", "-A"], wt)
-    git(["-c", "user.name=arete", "-c", "user.email=arete@localhost", "commit", "-q", "--allow-empty",
+    git([*util.ARETE_IDENTITY, "commit", "-q", "--allow-empty",
          "--no-verify", "-m", "eval harness overlay"], wt)
 
 
@@ -284,7 +293,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
     base = task.base or f"origin/{gh.default_branch(repo.github) if repo.github else 'main'}"
     wt = paths.WORKTREES_DIR / f"eval-{repo.name}-{task.name}"
     started = time.time()
-    result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "seconds": 0.0}
+    result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "paid": 0.0, "seconds": 0.0}
     try:
         if not task.check and not task.verify:
             raise RunFailed("the task has neither `check` nor `verify`")
@@ -364,7 +373,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         run.log(f"crashed: {result['why']}")
         return result
     finally:
-        result["cost"] = run.cost
+        result["cost"], result["paid"] = run.cost, run.paid
         result["seconds"] = round(time.time() - started, 1)
         shutil.rmtree(wt, ignore_errors=True)
 
@@ -414,9 +423,9 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
         arm = Arm(run_id, results)
         summary = f"{arm.score} passed on {label}"
         record.settle(run_id, "done", summary=summary)
-    print(f"{repo.name}: {summary}, ${record.spent(run_id):.2f}")
+    print(f"{repo.name}: {summary}, {util.paid_note(record.metered_spent(run_id))}")
     for r in results:
-        print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s ${r['cost']:.2f} {r['why']}"
+        print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s {util.paid_note(r['paid']):>12} {r['why']}"
               + ("  REGRESSED" if r["regressed"] else ""))
     (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, label, results))
     return arm
@@ -425,13 +434,13 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
 def results_md(repo: str, source: str, results: list[dict]) -> str:
     passed = sum(r["passed"] for r in results)
     lines = [f"Evals for {repo} on `{source}`: {passed}/{len(results)} passed.", "",
-             "| task | result | time | cost |", "|---|---|---|---|"]
+             "| task | result | time | paid |", "|---|---|---|---|"]
     for r in results:
         why = r["why"].replace("|", "\\|")
         res = "pass" if r["passed"] else f"fail ({why})"
         if r.get("regressed"):
             res += ", passed the three runs before"
-        lines.append(f"| {r['task']} | {res} | {r['seconds']:.0f}s | ${r['cost']:.2f} |")
+        lines.append(f"| {r['task']} | {res} | {r['seconds']:.0f}s | ${r['paid']:.2f} |")
     return "\n".join(lines) + "\n"
 
 
@@ -484,8 +493,10 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
     root = paths.RUNS_DIR / record.new_id("eva", "prompts")
     arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
             "pr": Prompts(root / "pr", f"origin/{branch}")}
-    main, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
-    changed = sorted(name for name in main.keys() | pr.keys() if main.get(name) != pr.get(name))
+    _, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
+    fork = git(["merge-base", arms["main"].label, arms["pr"].label], arete.path).strip()
+    before = export_prompts(arete, fork, root / "fork")
+    changed = sorted(name for name in before.keys() | pr.keys() if before.get(name) != pr.get(name))
     unmeasured = [name for name in changed if Path(name).stem not in BUILDER_PROMPTS]
     if not changed:
         return ""
@@ -537,8 +548,9 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
         return aliases.setdefault(repo.name, f"private repo {len(aliases) + 1}") if hidden(repo) else repo.name
 
     main_label = arms["main"].label
-    lines = [(f"Prompt evals: each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and "
-              f"once with this branch's. Changed: {code_list(changed)}."), ""]
+    lead = (f"each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and once with this branch's"
+            if ran else "no eval suite ran")
+    lines = [f"Prompt evals: {lead}. Changed: {code_list(changed)}.", ""]
     if ran:
         lines += [f"| suite | `{main_label}` | this branch | tasks that changed |", "|---|---|---|---|"]
         for repo, result in ran:
@@ -547,12 +559,10 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
         totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in arms}
         lines += [f"| all | {totals['main'].score} | {totals['pr'].score} | |", ""]
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
-        lines.append(f"Cost ${totals['main'].cost + totals['pr'].cost:.2f}."
+        lines.append(f"{util.paid_note(totals['main'].paid + totals['pr'].paid).capitalize()}."
                      + (f" Runs {code_list(ids)}." if ids else ""))
-    else:
-        lines.append("No eval suite ran.")
     if unmeasured:
         lines.append(f"Not measured, as no eval runs them: {code_list(unmeasured)}.")
     if skipped:
         lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why in skipped) + ".")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines).rstrip() + "\n"

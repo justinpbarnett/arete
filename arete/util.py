@@ -19,6 +19,7 @@ from typing import TextIO
 from . import paths
 
 PROBE_GRACE_SECONDS = 0.2
+TIMED_OUT = 124
 
 def now() -> datetime:
     return datetime.now(UTC)
@@ -56,7 +57,7 @@ def sh(
         )
     except subprocess.TimeoutExpired as e:
         res = subprocess.CompletedProcess(
-            cmd, 124, stdout=_s(e.stdout), stderr=_s(e.stderr) + f"\n[arete] timed out after {timeout}s"
+            cmd, TIMED_OUT, stdout=_s(e.stdout), stderr=_s(e.stderr) + f"\n[arete] timed out after {timeout}s"
         )
     except FileNotFoundError as e:
         res = subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(e))
@@ -120,11 +121,26 @@ def sh_with_network(cmd: list[str] | str, **kw) -> subprocess.CompletedProcess:
     return sh(cmd, **kw) if wait_for_network() else res
 
 
-def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None) -> str:
-    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input)
+def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None,
+        env: dict | None = None) -> str:
+    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env)
     if check and res.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args[:2])}: {git_error(res.stderr or res.stdout)}")
+        raise RuntimeError(f"git {git_command(args)}: {git_error(res.stderr or res.stdout)}")
     return res.stdout
+
+
+def git_command(args: list[str]) -> str:
+    while args[:1] == ["-c"]:
+        args = args[2:]
+    return " ".join(args[:2])
+
+
+ARETE_IDENTITY = ["-c", "user.name=arete", "-c", "user.email=arete@localhost"]
+
+
+def git_as_owner(args: list[str], cwd: Path, **kw) -> str:
+    owner_known = git(["config", "user.email"], cwd, check=False).strip()
+    return git([*([] if owner_known else ARETE_IDENTITY), *args], cwd, **kw)
 
 
 def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
@@ -158,6 +174,15 @@ def _s(b) -> str:
     return b.decode(errors="replace") if isinstance(b, bytes) else b
 
 
+def money(usd: float, places: int = 2) -> str:
+    least = 10 ** -places
+    return f"<${least:.{places}f}" if 0 < usd < least / 2 else f"${usd:.{places}f}"
+
+
+def paid_note(usd: float, places: int = 2) -> str:
+    return f"{money(usd, places)} paid" if usd else "nothing paid"
+
+
 def count(n: int, word: str, plural: str = "") -> str:
     return f"{n} {word if n == 1 else plural or word + 's'}"
 
@@ -166,12 +191,23 @@ def tail(text: str, n: int = 4000) -> str:
     return text if len(text) <= n else "...\n" + text[-n:]
 
 
+def both_ends(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    half = (n - 5) // 2
+    return f"{text[:half]}\n...\n{text[-half:]}"
+
+
 def first_line(text: str, n: int = 160) -> str:
     for line in text.strip().splitlines():
         line = line.strip()
         if line:
             return line[:n]
     return ""
+
+
+def one_line(text: str, n: int = 300) -> str:
+    return " ".join(text.split())[:n]
 
 
 def last_line(text: str, n: int = 160) -> str:

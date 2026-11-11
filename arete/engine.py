@@ -16,16 +16,18 @@ from datetime import timedelta
 from pathlib import Path
 
 from . import (
-    alerts,
     config,
     control,
+    delivery,
     devices,
     diffguard,
     emits,
     gh,
     jev,
     loops,
+    outbound,
     paths,
+    push,
     record,
     runner,
     sources,
@@ -90,6 +92,10 @@ class StoppedByAgent(Exception):
     pass
 
 
+class AgentFailed(Exception):
+    pass
+
+
 @dataclass
 class Workspace:
     src: Path
@@ -137,9 +143,6 @@ class LoopRun:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_file, "a") as f:
             f.write(f"{util.iso()} [{self.loop.name}] {text}\n")
-
-    def spent(self) -> float:
-        return record.spent(self.id)
 
     def room(self) -> float | None:
         tightest = tightest_limit(self.loop, self.cfg, record.metered_spent(self.id))
@@ -225,7 +228,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     note = f"\n[arete] stopped after {timeout:g}s\n"
     with open(output or os.devnull, "a") as out:
         out.write(note)
-    return 124, "".join(lines) + note
+    return util.TIMED_OUT, "".join(lines) + note
 
 
 def work_dir(run: LoopRun) -> Path | str:
@@ -350,17 +353,19 @@ def carry(run: LoopRun) -> str:
         status, summary = "skipped", f"budget: {e}"
     except Stopped:
         status, summary = "stopped", record.STOPPED if record.stop_asked(run.id) else "stopped by a signal"
+    except devices.DeviceError as e:
+        status, summary = "failed", util.one_line(str(e), 500)
     except Exception as e:
         run.log("error", traceback.format_exc().strip())
         status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         state.drop_claimed_items(run.id)
-    return settle(run, status, summary)
+    return settle(run, status, devices.with_left_up(summary, run.id))
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:
-    end_line = f"{status}: {summary} (${run.spent():.2f})"
+    end_line = f"{status}: {summary} ({util.paid_note(record.metered_spent(run.id))})"
     run.write_log(end_line)
     record.settle(run.id, status, end_line=end_line, summary=summary[:500])
     return status
@@ -423,7 +428,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events),
                **({"value": value} if value is not None else {})}
     if loop.emits:
-        emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", took + (f", {util.count(len(fresh), 'new finding')}" if found else "")
 
 
@@ -486,8 +491,8 @@ def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
         a = reply.answers.get("twin")
         if a and a.value != "new" and a.value in options and a.sure(run.cfg.jev.confidence):
             twins[id(f)] = known[int(str(a.value)[1:])]
-            run.log("finding", f"JEV matches it to a known finding ({a.note()}): {emits.plain(f.get('title'), 200)}"
-                               f" is {emits.plain(twins[id(f)]['title'], 200)}")
+            run.log("finding", f"JEV matches it to a known finding ({a.note()}): {outbound.plain(f.get('title'), 200)}"
+                               f" is {outbound.plain(twins[id(f)]['title'], 200)}")
     return twins
 
 
@@ -506,8 +511,8 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
             is_new = not state.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
             is_new = state.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
-                                          emits.plain(f.get("title"), 200), "", run.id)
-        run.log("finding", f"{'new' if is_new else 'seen before'}: {emits.plain(f.get('title'), 200)}")
+                                          outbound.plain(f.get("title"), 200), "", run.id)
+        run.log("finding", f"{'new' if is_new else 'seen before'}: {outbound.plain(f.get('title'), 200)}")
         if is_new:
             fresh.append(f)
     return fresh
@@ -576,7 +581,7 @@ def classify(run: LoopRun, events: list[dict]) -> list[dict]:
 
 
 def known_finding(row: dict) -> str:
-    title = emits.plain(row["title"], 160)
+    title = outbound.plain(row["title"], 160)
     return f"- `{row['fingerprint_text']}`: {title}" if row.get("fingerprint_text") else f"- {title}"
 
 
@@ -631,7 +636,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
     outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events)}
     if fresh or any(e["type"] == "metric" for e in loop.emits):
-        emits.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     return "done", f"{summary} ({util.count(len(fresh), 'new finding')}, {len(found) - len(fresh)} seen before)"
 
 
@@ -679,10 +684,8 @@ def commit_message(run: LoopRun, ws: Workspace, text: str) -> str:
 
 
 def commit(wt: Path, message: str) -> None:
-    identity = [] if util.git(["config", "user.email"], wt, check=False).strip() else \
-        ["-c", "user.name=arete", "-c", "user.email=arete@localhost"]
     diffguard.add(wt)
-    util.git([*identity, "commit", "-q", "--no-verify", "-m", message], wt)
+    util.git_as_owner(["commit", "-q", "--no-verify", "-m", message], wt)
 
 
 def drop_unstaged(wt: Path) -> None:
@@ -729,6 +732,14 @@ def stop_reason(idea: str) -> str:
     return idea[len(STOP_WORD):].strip() if idea.lower().startswith(STOP_WORD.lower()) else ""
 
 
+def empty_handed(stopped: str, unanswered_error: str, missed: str) -> tuple[str, str]:
+    if stopped:
+        return "done", f"the agent stopped the run: {stopped}"
+    if unanswered_error:
+        return "failed", f"agent failed on every try: {unanswered_error}"
+    return "done", missed
+
+
 def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str], files: list[str],
              keep_empty: bool = False) -> tuple[str, str]:
     res = run.agent(f"try {i}", attempt_prompt(run, goal, history, files), ws.wt, tools=run.loop.tools,
@@ -736,7 +747,7 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     idea = util.last_line(res.text or res.error or "", 200)
     if not res.ok:
         revert(ws.wt)
-        return "", f"the agent failed: {util.first_line(res.error, 200)}"
+        raise AgentFailed(util.first_line(res.error, 200) or "it gave no error text")
     if why := stop_reason(idea):
         revert(ws.wt)
         raise StoppedByAgent(why)
@@ -767,7 +778,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         return value, "" if value is not None else "did not print a number"
 
     ws = open_workspace(run)
-    kept, stopped = False, ""
+    kept, stopped, answered, agent_error = False, "", False, ""
     try:
         baseline, why = measure(ws.wt)
         if baseline is None:
@@ -779,6 +790,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
         for i in range(1, run.loop.tries + 1):
             try:
                 idea, why_not = try_once(run, ws, i, goal + f" Best so far: {number_text(best)}.", history, files)
+                answered = True
             except OverBudget as e:
                 if i == 1:
                     raise
@@ -789,6 +801,8 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                 run.log("stop", f"try {i}: the agent stopped the run: {e}")
                 stopped = str(e)
                 break
+            except AgentFailed as e:
+                idea, why_not, agent_error = "", f"the agent failed: {e}", str(e)
             if not idea:
                 history.append(f"- try {i}: {why_not}")
                 run.log("try", f"try {i}: {why_not}")
@@ -807,8 +821,8 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                 history.append(f"- try {i}: reverted, {result}: {idea}")
                 run.log("revert", f"try {i}: {result}: {idea}")
         if not kept:
-            return "done", (f"the agent stopped the run: {stopped}" if stopped
-                            else f"no try beat the baseline {number_text(baseline)}")
+            return empty_handed(stopped, "" if answered else agent_error,
+                                f"no try beat the baseline {number_text(baseline)}")
         climbed = f"{number_text(baseline)} -> {number_text(best)}"
         summary = f"{spec['measure']}: {climbed}"
         outcome = {**ws.outcome_fields(), "value": best, "facts": summary, "summary": summary,
@@ -816,7 +830,7 @@ def climb_loop(run: LoopRun) -> tuple[str, str]:
                    "report": f"Climbed `{spec['measure']}` from {number_text(baseline)} to {number_text(best)}.\n\n"
                    + "\n".join(history)}
         drop_worktree(ws)
-        emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
         return "done", summary
     finally:
         close_workspace(ws, keep_branch=kept and not run.trial)
@@ -829,7 +843,7 @@ def problem(run: LoopRun) -> str:
                            for f in found)
     else:
         text = json.dumps(run.events, indent=1, default=str) if run.events else loops.prompt_text(run.loop)
-    return alerts.redact(text)[:PROBLEM_SHOWN]
+    return outbound.redact(text)[:PROBLEM_SHOWN]
 
 
 def proof_file(run: LoopRun) -> Path | None:
@@ -893,7 +907,7 @@ def landed_fixes(run: LoopRun, ws: Workspace, found: list[dict]) -> list[tuple[s
         sha, when, subject = (line.split(" ", 2) + ["", ""])[:3]
         if when.isdigit() and int(when) >= min(starts):
             patch = util.git(["show", "--format=", "--no-renames", sha], ws.wt, check=False)
-            landed.append((f"{sha[:10]} {util.first_line(subject, 120)}", alerts.redact(patch)[:emits.PATCH_SHOWN]))
+            landed.append((f"{sha[:10]} {util.first_line(subject, 120)}", outbound.redact(patch)[:push.PATCH_SHOWN]))
     return landed[:FIXES_ASKED]
 
 
@@ -910,7 +924,7 @@ def already_fixed(run: LoopRun, ws: Workspace) -> str:
     candidates = landed_fixes(run, ws, found) + waiting_fixes(run)
     if not candidates:
         return ""
-    matches = jev.fixed(problem(run), candidates, emits.plain(found[0].get("title"), 120), run.cfg,
+    matches = jev.fixed(problem(run), candidates, outbound.plain(found[0].get("title"), 120), run.cfg,
                         trace=(run.id, "fixed check jev"))
     if matches and matches[0].sure:
         return f"already fixed by {matches[0].ref} (JEV p {matches[0].p:.2f})"
@@ -927,7 +941,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
     spec = run.loop.spec
     files = loops.as_list(spec.get("files"))
     ws = open_workspace(run)
-    fix, stopped, tries = "", "", 0
+    fix, stopped, tries, answered, agent_error = "", "", 0, False, ""
     held: dict[str, str] = {}
     held_proof: bytes | None = None
     try:
@@ -944,6 +958,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             try:
                 idea, why_not = try_once(run, ws, i, narrowing_goal(goal, ws, held, spec.get("proof", "")) if held
                                          else goal, history, files, keep_empty="proof" in held)
+                answered = True
             except OverBudget as e:
                 if i == 1:
                     raise
@@ -956,6 +971,8 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
                 run.log("stop", f"try {i}: the agent stopped the run: {e}")
                 stopped, tries = str(e), i
                 break
+            except AgentFailed as e:
+                idea, why_not, agent_error = "", f"the agent failed: {e}", str(e)
             tries = i
             if not idea:
                 if fix:
@@ -979,7 +996,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             fix = f"try {i}: hit: {idea}"
             history.append(f"- {fix}")
             run.log("hit", f"try {i}: {idea}")
-            held = {} if run.trial else emits.objections(run.loop, run.id, search_outcome(run, ws, history, i, fix),
+            held = {} if run.trial else delivery.objections(run.loop, run.id, search_outcome(run, ws, history, i, fix),
                                                          run.cfg)
             for kind, why in held.items():
                 history.append(f"- try {i}: held by {HELD_BY[kind]}: {why}")
@@ -987,11 +1004,11 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
             if not held:
                 break
         if not fix:
-            return "done", f"the agent stopped the run: {stopped}" if stopped else \
-                f"no hit in {util.count(tries, 'try', 'tries')}"
+            return empty_handed(stopped, "" if answered else agent_error,
+                                f"no hit in {util.count(tries, 'try', 'tries')}")
         outcome = search_outcome(run, ws, history, tries, fix)
         drop_worktree(ws)
-        emits.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+        delivery.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
         return "done", outcome["summary"]
     finally:
         close_workspace(ws, keep_branch=bool(fix) and not run.trial)

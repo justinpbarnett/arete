@@ -64,8 +64,13 @@ def field_values(spec: str, name: str, low: int, high: int) -> set[int]:
         a, b = (low, high) if start == "*" else (int(start), int(end) if end else int(start))
         if start != "*" and m.group(3) and not end:
             b = high
-        if not (low <= a <= high and low <= b <= high) or a > b or step < 1:
+        if not (low <= a <= high and low <= b <= high):
             raise BadSchedule(f"cron {name} '{part}' is outside {low}-{high}")
+        if a > b:
+            raise BadSchedule(f"cron {name} '{part}' runs backwards, {a} is after {b}: "
+                              f"for a range that wraps, use a list like {a}-{high},{low}-{b}")
+        if step < 1:
+            raise BadSchedule(f"cron {name} '{part}' needs a step of 1 or more")
         out.update(range(a, b + 1, step))
     return out
 

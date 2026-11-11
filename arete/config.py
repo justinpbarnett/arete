@@ -8,9 +8,9 @@ from typing import Literal
 from . import paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research")
+               "classify", "loop", "session", "research", "explain")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
-                   "research": "opus"}
+                   "research": "opus", "explain": "haiku"}
 
 
 class UnknownRepo(KeyError):
@@ -73,8 +73,9 @@ class JevConfig:
     irreversible_hold: float = 0.5
     secrets_hold: float = 0.55
     triage_skip: float = 0.2
-    screen_hold: float = 0.4
-    screen_reach: float = 0.6
+    screen_lines: dict[str, float] = field(default_factory=lambda: {
+        "weakens": 0.5, "secrets": 0.7, "outside": 0.7, "irreversible": 0.5, "feature": 0.6, "removes": 0.5,
+        "renames": 0.5, "reach": 0.8})
     proof_hold: float = 0.5
     fixed_skip: float = 0.7
     research_rerun: float = 0.4
@@ -219,8 +220,8 @@ def load(path: Path | None = None) -> Config:
         irreversible_hold=float(jv.get("irreversible_hold", JevConfig.irreversible_hold)),
         secrets_hold=float(jv.get("secrets_hold", JevConfig.secrets_hold)),
         triage_skip=float(jv.get("triage_skip", JevConfig.triage_skip)),
-        screen_hold=float(jv.get("screen_hold", JevConfig.screen_hold)),
-        screen_reach=float(jv.get("screen_reach", JevConfig.screen_reach)),
+        screen_lines={**JevConfig().screen_lines,
+                      **{str(k): float(v) for k, v in (jv.get("screen_lines") or {}).items()}},
         proof_hold=float(jv.get("proof_hold", JevConfig.proof_hold)),
         fixed_skip=float(jv.get("fixed_skip", JevConfig.fixed_skip)),
         research_rerun=float(jv.get("research_rerun", JevConfig.research_rerun)),
@@ -233,6 +234,9 @@ def load(path: Path | None = None) -> Config:
     if bad := sorted(set(cfg.jev.risk_weights) - set(JevConfig().risk_weights)):
         raise ValueError(f"[jev.risk_weights]: unknown weight {', '.join(bad)}; use "
                          f"{', '.join(JevConfig().risk_weights)}")
+    if bad := sorted(set(cfg.jev.screen_lines) - set(JevConfig().screen_lines)):
+        raise ValueError(f"[jev.screen_lines]: unknown question {', '.join(bad)}; use "
+                         f"{', '.join(JevConfig().screen_lines)}")
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")
         if tracker not in ("github", "jira"):

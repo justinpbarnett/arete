@@ -103,7 +103,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
     subject = tk.pr_title(fill_template(h.layer.subject, config.RepoLayer.subject, kind="docs(research)", id=t.id,
                                         title=r["title"]), t)
     body = (f"{tk.pr_link(t, whole=True)}\n\n**Summary:** {report['summary']}\n\n"
-            f"Arete researched [{r['ref']}]({r['url']}) for ${report['cost']:.2f} and files the report as `{path}`. "
+            f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
             "When the ticket changes, arete researches it again and pushes the new report here.")
     base = h.base
     wt = make_worktree(h.repo, base, branch, key)
@@ -113,7 +113,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
         util.git(["add", "--", path], wt)
         if not util.git(["diff", "--cached", "--name-only"], wt).strip():
             return gh.open_pr_url(h.repo.github, branch) or f"https://github.com/{h.repo.github}/blob/{base}/{path}"
-        util.git(["commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
+        util.git_as_owner(["commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
         util.git(["push", "-q", "--force", "-u", "origin", branch], wt)
         if url := gh.open_pr_url(h.repo.github, branch):
             gh.pr_edit_body(url, body)
@@ -169,12 +169,16 @@ def own_move(r: dict, m: tracker.Moved) -> None:
         row = triage.board_row(r["ref"])
         if not row or triage.moment(row["updated"]) != triage.moment(m.before):
             return
+        report = state.research_get(r["ref"])
         state.triage_put({**row, "updated": m.after})
-        state.research_keep(r["ref"], updated=m.after)
+        if report and report["updated"] == row["updated"]:
+            state.research_keep(r["ref"], updated=m.after)
     r["updated"] = m.after
 
 
 def wanted(r: dict, report: dict) -> str:
+    if report["status"] == FAILED:
+        return FAILED
     if report["status"] != DONE:
         return ""
     if not report["filed_path"]:
@@ -192,9 +196,10 @@ def wanted(r: dict, report: dict) -> str:
 
 def settle_status(cfg: config.Config, r: dict) -> None:
     report = state.research_get(r["ref"])
-    if not report or report["status"] != DONE or report.get("moved") == config.DELIVERED or r.get("closed"):
+    if (not report or report["status"] not in (DONE, FAILED) or report.get("moved") == config.DELIVERED
+            or r.get("closed")):
         return
-    if not (jira_target(cfg, r, "pr") or jira_target(cfg, r, config.DELIVERED)):
+    if not any(jira_target(cfg, r, to) for to in ("pr", FAILED, config.DELIVERED)):
         return
     try:
         to = wanted(r, report)
@@ -436,30 +441,31 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     report = str(answer.get("report") or "").strip()
     if not report:
         why = util.first_line(res.error or "the agent gave no report")
-        state.research_set(ref, status=FAILED, error=why, cost=res.cost_usd)
+        state.research_set(ref, status=FAILED, error=why, cost=res.paid_usd)
         move(cfg, r, "failed")
         return FAILED, why
     summary = " ".join(str(answer.get("summary") or "").split())
     if not h:
-        report_file(ref).write_text(f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} for "
-                                    f"${res.cost_usd:.2f}.\n\n**Summary:** {summary}\n\n{report}\n")
-        state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=res.cost_usd,
+        report_file(ref).write_text(f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} "
+                                    f"({util.paid_note(res.paid_usd)}).\n\n**Summary:** {summary}\n\n{report}\n")
+        state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=res.paid_usd,
                            ticket=said, basis=basis, filed_path="", filed_url="")
         settle_status(cfg, r)
-        return DONE, f"report written to {paths.short_path(report_file(ref))} (${res.cost_usd:.2f})"
+        return DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(res.paid_usd)})"
     titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
+    report_file(ref).write_text(f"{titled.rstrip()}\n")
     try:
         filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
     except RuntimeError as e:
-        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.cost_usd)
+        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.paid_usd,
+                           summary=summary, report=TITLE_LINE.sub("", titled, count=1))
         move(cfg, r, "failed")
         return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
-    report_file(ref).write_text(f"{titled.rstrip()}\n")
     state.research_set(ref, status=DONE, summary=summary, report=TITLE_LINE.sub("", titled, count=1), error="",
-                       cost=res.cost_usd, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
+                       cost=res.paid_usd, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
     ok, why = file_in_home(cfg, h, r)
     settle_status(cfg, r)
-    return DONE if ok else FAILED, f"{why} (${res.cost_usd:.2f})"
+    return DONE if ok else FAILED, f"{why} ({util.paid_note(res.paid_usd)})"
 
 
 def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
@@ -469,6 +475,8 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
         if not got:
             print(f"{util.iso()} research already running" + ("; ask again when it ends" if asked else ""))
             return 1 if asked else 0
+        if dry_run and asked:
+            return preview_asked(asked)
         if dry_run:
             todo = due()
             print(f"would research {todo[0]['ref'] if todo else 'nothing'}"
@@ -497,7 +505,7 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
 
 def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) -> int:
     rows = {r["ref"].lower(): r for r in tickets()}
-    outcomes = []
+    failures = []
     for event in asked:
         ref = str(event.get("ref") or "")
         if not (r := rows.get(ref.lower())):
@@ -506,13 +514,26 @@ def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) ->
             ref = r["ref"]
             outcome, why = research(cfg, r, force=event.get("force") is True, asked=True)
         print(f"{util.iso()} {ref}: {outcome}: {why}", flush=True)
-        outcomes.append(outcome)
-    ok = FAILED not in outcomes and LATER not in outcomes
-    mark_loop("research", ok and not unfiled, unfiled[0] if ok and unfiled else why)
-    return 1 if FAILED in outcomes or LATER in outcomes or unfiled else 0
+        if outcome in (FAILED, LATER):
+            failures.append(f"{ref}: {why}")
+    mark_loop("research", not failures and not unfiled, failures[0] if failures else unfiled[0] if unfiled else why)
+    return 1 if failures or unfiled else 0
 
 
-def run_now(ref: str, force: bool = False) -> int:
+def preview_asked(asked: list[dict]) -> int:
+    rows = {r["ref"].lower(): r for r in tickets()}
+    missing = []
+    for event in asked:
+        ref = str(event.get("ref") or "")
+        if r := rows.get(ref.lower()):
+            print(f"would research {r['ref']}")
+        else:
+            missing.append(ref)
+            print(f"would not research {ref}: it is no longer a research ticket on the triage board")
+    return 1 if missing else 0
+
+
+def run_now(ref: str, force: bool = False, dry_run: bool = False) -> int:
     paths.ensure_dirs()
     cfg = config.load()
     r = ticket(ref)
@@ -523,6 +544,9 @@ def run_now(ref: str, force: bool = False) -> int:
         if not got:
             print("a research run is going; try again when it ends")
             return 1
+        if dry_run:
+            print(f"would research {r['ref']}")
+            return 0
         tidy()
         outcome, why = research(cfg, r, force=force, asked=True)
     print(f"{r['ref']}: {outcome}: {why}")

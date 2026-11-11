@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import secrets
+from urllib.parse import parse_qs
 
 from . import loops, paths, sources, state, util
 
@@ -12,6 +13,7 @@ HOOKS_DIR = paths.CONFIG_DIR / "hooks"
 HOOK_PATH = "/hook/"
 MAX_HOOK_BODY = 1024 * 1024
 MAX_EVENT_BODY = 60_000
+FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 
 
 class HookRefused(Exception):
@@ -41,12 +43,17 @@ def secret(name: str, create: bool = True) -> str:
     return p.read_text().strip()
 
 
+def bearer_token(authorization: str) -> str:
+    scheme, _, credentials = authorization.strip().partition(" ")
+    return credentials.strip() if scheme.lower() == "bearer" else authorization.strip()
+
+
 def check(name: str, headers, body: bytes) -> None:
     key = secret(name, create=False)
     if not key:
         raise HookRefused(404, f"No webhook for {name}.")
     signature = headers.get("X-Hub-Signature-256", "")
-    token = headers.get("X-Arete-Token", "") or headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    token = headers.get("X-Arete-Token", "") or bearer_token(headers.get("Authorization", ""))
     if signature:
         expected = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature.encode(), expected.encode()):
@@ -58,8 +65,15 @@ def check(name: str, headers, body: bytes) -> None:
         raise HookRefused(403, "The token does not match the webhook secret.")
 
 
-def event_of(name: str, headers, body: bytes) -> dict:
+def body_text(headers, body: bytes) -> str:
     text = body.decode("utf-8", "replace")
+    if headers.get("Content-Type", "").partition(";")[0].strip().lower() != FORM_CONTENT_TYPE:
+        return text
+    return (parse_qs(text).get("payload") or [text])[0]
+
+
+def event_of(name: str, headers, body: bytes) -> dict:
+    text = body_text(headers, body)
     try:
         data = json.loads(text) if text.strip() else {}
     except json.JSONDecodeError:
@@ -75,7 +89,7 @@ def event_of(name: str, headers, body: bytes) -> dict:
             str(data.get("repo", "")))
     return sources.event("webhook" if not github_event else f"github.{github_event}", f"{name}#webhook", key, title,
                          repo=repo, url=str(data.get("url", ""))[:500], trust="untrusted",
-                         data=data if len(body) <= MAX_EVENT_BODY else {"truncated": text[:MAX_EVENT_BODY]})
+                         data=data if len(text) <= MAX_EVENT_BODY else {"truncated": text[:MAX_EVENT_BODY]})
 
 
 def receive(name: str, headers, body: bytes) -> dict:

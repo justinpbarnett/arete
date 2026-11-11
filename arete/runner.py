@@ -8,9 +8,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import ask, claude, config, devices, guard, jev, paths, pi, record, state, util
-from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, Result, Session
+from .agent import (
+    NO_SESSION,
+    READ_ONLY_TOOLS,
+    READ_TOOLS,
+    SUBSCRIPTION_RUNNER,
+    Result,
+    Session,
+)
 
 RUNNERS = ("claude", "pi")
+SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
+SECRET_SEARCH_DEPTH = 4
 BUDGET_FLOOR_USD = 0.005
 EDIT_TOOLS = [*READ_TOOLS, "Edit", "Write"]
 BUILD_TOOLS = [*EDIT_TOOLS, "TodoWrite"]
@@ -21,6 +30,8 @@ NO_GIT_WRITES = [
     "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
 ]
 PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
+SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider/model such as exe-llm/gpt-5.4-mini "
+                   "or openrouter/<model id>")
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
@@ -37,7 +48,7 @@ def route(model: str, runner: str = "") -> tuple[str, str]:
 
 
 def metered(model: str, run_with: str = "") -> bool:
-    return route(model, run_with)[0] != "claude"
+    return route(model, run_with)[0] != SUBSCRIPTION_RUNNER
 
 
 def limit_applies(scope: str, model: str) -> bool:
@@ -81,14 +92,18 @@ def agent_problems(run_with: str, tools: list[str]) -> list[str]:
     return problems
 
 
-def withheld(model: str, run_with: str, tools: list[str], remote: bool) -> dict[str, list[str]]:
-    if route(model, run_with)[0] != "pi":
+def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
+    return SANDBOX_RUNS_PI if device.exe_sandbox and route(model, run_with)[0] == "claude" else ""
+
+
+def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:
+    if route(model, run_with)[0] != "pi" or device.exe_sandbox:
         return {}
     reasons: dict[str, list[str]] = {}
     for tool in tools:
         if tool == "Bash":
             reasons.setdefault(PI_HOLDS_NO_BASH_RULES, []).append(tool)
-        elif tool in WRITING_TOOLS and not pi.can_confine(remote):
+        elif tool in WRITING_TOOLS and not pi.can_confine(device.remote):
             reasons.setdefault(pi.NO_CONFINEMENT_REASON, []).append(tool)
     return reasons
 
@@ -112,7 +127,8 @@ def claude_login() -> tuple[bool, str]:
 
 
 def cost_note(res: Result) -> str:
-    return f"({util.count(res.turns, 'turn')}, ${res.cost_usd:.2f})"
+    paid = "subscription" if res.runner == SUBSCRIPTION_RUNNER else util.paid_note(res.cost_usd)
+    return f"({util.count(res.turns, 'turn')}, {paid})"
 
 
 def priced(res: Result, cfg: config.Config) -> float:
@@ -126,7 +142,7 @@ def priced(res: Result, cfg: config.Config) -> float:
 
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
-        wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, **kw) -> Result:
+        wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, **kw) -> Result:
     cfg = cfg or config.load()
     target = devices.resolve(device)
     if target.remote:
@@ -137,7 +153,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_claude(kw, cwd, cfg, trace[0])
+            kw = local_claude(kw, cwd, cfg, trace[0], ask_jev)
     else:
         kw["price"] = lambda reply: priced(reply, cfg)
     limited: list[Result] = []
@@ -206,18 +222,20 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
     found = [paths.HOME / name for name in (".netrc", ".pgpass", ".npmrc", ".pypirc", ".aws/credentials")]
     found += [cfg.jira.env_file] if cfg.jira.env_file else []
     for folder in [] if target.remote else folders:
-        try:
-            found += [f for f in Path(folder).iterdir() if guard.secret_path(f.name) and f.is_file()]
-        except OSError:
-            continue
+        for here, subfolders, names in os.walk(folder):
+            subfolders[:] = [d for d in subfolders if d not in SECRET_SEARCH_SKIPS]
+            if Path(here).relative_to(folder).parts[SECRET_SEARCH_DEPTH:]:
+                subfolders.clear()
+                continue
+            found += [Path(here, n) for n in names if guard.secret_path(n)]
     return found
 
 
-def local_claude(kw: dict, cwd: Path | str, cfg: config.Config, run_id: str) -> dict:
+def local_claude(kw: dict, cwd: Path | str, cfg: config.Config, run_id: str, ask_jev: bool) -> dict:
     kw = {**kw, "extra_env": {"ARETE_RUN_ID": run_id} if run_id else {}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings()
-    if runs_bash(kw) and jev.ready(cfg, [cfg.repo_for_work_dir(cwd)]):
+    if ask_jev and runs_bash(kw) and jev.ready(cfg, [cfg.repo_for_work_dir(cwd)]):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), ask.rule()]
         kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), ask.note()]))
     return kw

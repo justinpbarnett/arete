@@ -1,0 +1,202 @@
+"use strict";
+
+const COARSE = matchMedia("(pointer: coarse)");
+let chatSeen = "";
+let chatLength = -1;
+let chatBusy = false;
+let chatTimer = 0;
+let chatCount = 0;
+let openChat = 0;
+let chatPickKey = "";
+let chatProjectsKey = "";
+const unsent = new Map();
+let consoleReturn = null;
+
+function setConsole(open, { focus = false, track = true } = {}) {
+  const panel = document.getElementById("console");
+  const opener = document.getElementById("console-open");
+  if (panel.hidden === !open) {
+    if (open && focus) focusConsole();
+    return;
+  }
+  panel.hidden = !open;
+  document.body.classList.toggle("console-open", open);
+  opener.setAttribute("aria-expanded", String(open));
+  try {
+    localStorage.setItem("arete.console", open ? "open" : "");
+  } catch {
+    // a browser that keeps no storage opens the console closed next time
+  }
+  if (open) {
+    if (track) trackAction("console-open");
+    consoleReturn = focusMark(document.activeElement);
+    if (focus) focusConsole();
+    pollChat();
+    return;
+  }
+  clearTimeout(chatTimer);
+  chatCount++;
+  if (panel.contains(document.activeElement) || document.activeElement === document.body) {
+    refocus(consoleReturn, opener);
+  }
+}
+
+function focusConsole() {
+  const target = COARSE.matches ? document.getElementById("console-title") : document.getElementById("chat-text");
+  target.focus();
+}
+
+async function pollChat() {
+  clearTimeout(chatTimer);
+  const mine = ++chatCount;
+  if (document.getElementById("console").hidden || document.hidden) return;
+  try {
+    const list = await call("/api/chats");
+    if (mine !== chatCount) return;
+    if (!list.chats.some((c) => c.id === openChat)) switchChat(list.chats[0]?.id || 0);
+    const id = openChat;
+    const shown = id ? await call(`/api/chats/${id}`) : null;
+    if (mine !== chatCount || id !== openChat) return;
+    drawChats(list);
+    drawChat(shown);
+    chatBusy = list.chats.some((c) => c.busy);
+  } catch (e) {
+    if (mine !== chatCount) return;
+    say("chat-result", "fault", `The chat could not be read: ${e.message}`);
+  }
+  chatTimer = setTimeout(pollChat, chatBusy ? CHAT_BUSY_MS : SLOW_MS);
+}
+
+function pollSoon() {
+  clearTimeout(chatTimer);
+  chatTimer = setTimeout(pollChat, 0);
+}
+
+function chatLabel(c) {
+  const note = c.busy ? "waiting on an answer" : c.drafted ? "a drafted issue waits" : "";
+  return [clock(c.created), c.project || "no project", c.title || "Nothing asked yet", note].filter(Boolean).join(" · ");
+}
+
+function drawChats(list) {
+  const projectsKey = JSON.stringify(list.projects);
+  if (projectsKey !== chatProjectsKey) {
+    chatProjectsKey = projectsKey;
+    options("chat-project", "No project", list.projects, document.getElementById("chat-project").value);
+  }
+  const key = `${openChat}:${JSON.stringify(list.chats.map(chatLabel))}`;
+  if (key === chatPickKey) return;
+  chatPickKey = key;
+  const pick = document.getElementById("chat-pick");
+  fill("chat-pick", list.chats.length ? list.chats.map((c) => el("option", { value: String(c.id), text: chatLabel(c) }))
+    : el("option", { value: "", text: "No chat yet" }));
+  pick.value = openChat ? String(openChat) : "";
+  pick.disabled = !list.chats.length;
+}
+
+function switchChat(id) {
+  const box = document.getElementById("chat-text");
+  unsent.set(openChat, box.value);
+  box.value = unsent.get(id) || "";
+  openChat = id;
+  chatSeen = "";
+  chatLength = -1;
+  chatPickKey = "";
+  for (const line of ["chat-result", "draft-result"]) document.getElementById(line).hidden = true;
+}
+
+function chatAbout(c) {
+  const where = c.project ? `on ${c.project}, ${c.folder ? `in ${c.folder}` : "which left the config"}` : `no project, in arete's folder ${c.folder}`;
+  return `Started ${clock(c.created)} · ${where}${c.metered ? ` · ${money(c.spent)} so far` : ""}`;
+}
+
+function drawChat(c) {
+  const about = document.getElementById("chat-about");
+  const working = document.getElementById("working");
+  document.getElementById("chat").hidden = !c;
+  about.hidden = !c;
+  working.hidden = !c?.busy;
+  document.getElementById("draft").hidden = !c?.draft;
+  if (!c?.draft) document.getElementById("draft-result").hidden = true;
+  if (!c) {
+    chatSeen = "";
+    return fill("messages", quiet("No chat yet. Pick a project, or none, under New chat on and press New chat."));
+  }
+  if (c.id !== openChat) return;
+  about.textContent = chatAbout(c);
+  document.getElementById("chat-send").disabled = c.busy;
+  if (c.draft) {
+    document.getElementById("draft-title").textContent = c.draft.title;
+    document.getElementById("draft-body").textContent = c.draft.body;
+  }
+  if (c.busy) {
+    const asked = [...c.messages].reverse().find((m) => m.sender === "you");
+    working.textContent = `Working on it · sent ${clock(asked?.ts)} · the answer shows here when it comes`;
+  }
+  const seen = `${c.id}:${JSON.stringify(c.messages)}:${c.busy}`;
+  if (seen === chatSeen) return;
+  const grew = c.messages.length !== chatLength;
+  chatSeen = seen;
+  chatLength = c.messages.length;
+  fill("messages", c.messages.length ? c.messages.map((m) => el("div", { class: `msg from-${m.sender}` },
+    el("div", { class: "who" }, withFigures([m.sender === "you" ? "You" : "Arete", clock(m.ts), c.metered && m.cost ? money(m.cost) : ""].filter(Boolean).join(" · "))),
+    el("p", {}, withLinks(m.text))))
+    : quiet(c.project ? `No messages yet. Ask about ${c.project}'s code, its checks, or how arete works on it.`
+      : "No messages yet. Ask what is running, why a run failed, or what to change."));
+  if (grew) {
+    const body = document.getElementById("console-body");
+    body.scrollTop = body.scrollHeight;
+    putBackConsoleScroll(body);
+  }
+}
+
+async function sendChat(event) {
+  event.preventDefault();
+  const id = openChat;
+  if (!id) return say("chat-result", "caution", "Start a chat first.");
+  const box = document.getElementById("chat-text");
+  const text = box.value.trim();
+  if (!text) return say("chat-result", "caution", "Write a message first.");
+  trackAction("chat-send");
+  document.getElementById("chat-result").hidden = true;
+  try {
+    await call(`/api/chats/${id}/send`, { text });
+    if (id === openChat) box.value = "";
+    else unsent.delete(id);
+  } catch (e) {
+    if (id === openChat) say("chat-result", "fault", e.message);
+  }
+  pollSoon();
+}
+
+async function newChat(event) {
+  event.preventDefault();
+  trackAction("chat-new");
+  const btn = document.getElementById("chat-new");
+  btn.disabled = true;
+  document.getElementById("chat-new-result").hidden = true;
+  try {
+    const c = await call("/api/chats/new", { project: document.getElementById("chat-project").value });
+    switchChat(c.id);
+    await pollChat();
+    document.getElementById("chat-text").focus();
+  } catch (e) {
+    say("chat-new-result", "fault", e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function draftAction(action, btn) {
+  trackAction(btn.id);
+  document.getElementById("draft-result").hidden = true;
+  btn.disabled = true;
+  try {
+    const answered = await call(`/api/chats/${openChat}/${action}`, {});
+    drawChat(answered);
+    if (action === "file") say("draft-result", "ok", answered.messages.at(-1)?.text || "Filed the issue.");
+  } catch (e) {
+    say("draft-result", "fault", e.message);
+  }
+  btn.disabled = false;
+  pollSoon();
+}

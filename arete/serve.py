@@ -6,7 +6,9 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import NoReturn
 
@@ -15,10 +17,14 @@ from . import (
     config,
     control,
     dashboard,
+    devices,
     engine,
+    explain,
+    hold_review,
     loops,
     paths,
     record,
+    runner,
     sources,
     state,
     util,
@@ -27,11 +33,30 @@ from .loops import Loop
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
+APPROVAL_RETRY_SECONDS = 900
+SWEEP_SECONDS = 300
 POLL_THREADS = 8
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.engine"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
            "!=": operator.ne}
+
+
+@dataclass(frozen=True)
+class ApprovalJob:
+    note: str
+    while_running: str
+    not_written: str
+    model_for: Callable[[dict, config.Config], str]
+    write: Callable[[dict, config.Config], str]
+
+
+APPROVAL_JOBS = (
+    ApprovalJob("plain_summary", "a plain summary of an approval is still being written", "no plain summary",
+                model_for=lambda approval, cfg: cfg.model("explain"), write=explain.write_plain_summary),
+    ApprovalJob("review", "a held push is still being reviewed", "no review",
+                model_for=hold_review.model_for, write=hold_review.review),
+)
 
 
 def next_due(loop: Loop, after: datetime) -> str:
@@ -43,7 +68,7 @@ def next_due(loop: Loop, after: datetime) -> str:
 
 def code_stamp() -> frozenset:
     stamp = set()
-    for p in paths.PACKAGE_DIR.rglob("*.py"):
+    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *dashboard.web_files()]:
         try:
             st = p.stat()
         except FileNotFoundError:
@@ -77,6 +102,7 @@ class Server:
         self.cfg = config.load()
         self.started = util.now()
         self.polls: dict[str, Future] = {}
+        self.sweep: Future | None = None
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
@@ -85,10 +111,12 @@ class Server:
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
-        self.pruned = 0.0
+        self.pruned = self.swept = 0.0
         self.ticks = 0
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
+        self.job_pools = {job.note: ThreadPoolExecutor(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
+        self.jobs: dict[str, Future] = {}
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -99,6 +127,7 @@ class Server:
         live = [x for x in every_loop if x.enabled and not x.error]
         for row in record.reap(tickets=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
+            self.swept = 0.0
         states = state.loop_states()
         now = util.now()
         for loop in live:
@@ -109,9 +138,13 @@ class Server:
         self.forget_unpolled_errors(live)
         self.loaded = True
         self.dispatch({x.name: x for x in reversed(every_loop)})
+        self.start_approval_jobs()
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             state.prune()
             self.pruned = time.monotonic()
+        if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
+            self.sweep = self.pool.submit(self.sweep_vms)
+            self.swept = time.monotonic()
         self.ticks += 1
         self.beat(every_loop, live)
 
@@ -166,6 +199,24 @@ class Server:
         for sid in set(self.errors) - polled:
             self.errors.pop(sid, None)
 
+    def sweeping(self) -> bool:
+        return bool(self.sweep) and not self.sweep.done()
+
+    def sweep_vms(self) -> None:
+        try:
+            devices.sweep(self.sweep_log)
+        except Exception as e:
+            self.say(f"sweeping left-over VMs failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+
+    def sweep_log(self, run_id: str | None) -> Callable[[str], None]:
+        if not run_id:
+            return self.say
+
+        def log(text: str) -> None:
+            state.add_feed(run_id, "device", f"arete serve: {text}")
+            self.say(f"{run_id}: {text}")
+        return log
+
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
         try:
@@ -195,14 +246,15 @@ class Server:
                 state.drop_queue_item(item["id"])
                 self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
                 continue
-            key = (item["queue"], item["grp"])
-            size = self.cfg.queues.get(item["queue"], 1)
+            queue = loop.queue_name
+            key = (queue, item["grp"])
+            size = self.cfg.queues.get(queue, 1)
             if item["grp"] and key in held_groups:
                 why = f"group {item['grp']} takes one at a time"
             elif loop.name in busy:
                 why = str(control.Busy(loop.name))
-            elif per_queue[item["queue"]] >= size:
-                why = f"queue {item['queue']} is full at {util.count(size, 'run')}"
+            elif per_queue[queue] >= size:
+                why = f"queue {queue} is full at {util.count(size, 'run')}"
             elif spent := engine.spent_limit(loop, self.cfg):
                 why = f"its {spent} is spent"
             elif held := loop.usage_hold(self.cfg):
@@ -221,7 +273,7 @@ class Server:
                 else:
                     self.waiting.pop(item["id"], None)
                     busy.add(loop.name)
-                    per_queue[item["queue"]] += 1
+                    per_queue[queue] += 1
                     why = ""
                     self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
             if item["grp"]:
@@ -229,6 +281,29 @@ class Server:
             if why and self.waiting.get(item["id"]) != why:
                 self.waiting[item["id"]] = why
                 self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
+
+    def start_approval_jobs(self) -> None:
+        retry_from = util.iso(util.now() - timedelta(seconds=APPROVAL_RETRY_SECONDS))
+        decidable = state.approvals()
+        for job in APPROVAL_JOBS:
+            if self.job_running(job):
+                continue
+            due = (a for a in decidable if (model := job.model_for(a, self.cfg)) and not a[job.note]
+                   and a[f"{job.note}_tried"] <= retry_from and not runner.usage_hold(model))
+            if approval := next(due, None):
+                state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
+                self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)
+
+    def job_running(self, job: ApprovalJob) -> bool:
+        return job.note in self.jobs and not self.jobs[job.note].done()
+
+    def do_approval_job(self, job: ApprovalJob, approval: dict) -> None:
+        try:
+            self.say(f"approval #{approval['id']}: {job.write(approval, self.cfg)}")
+        except Exception as e:
+            state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
+            self.say(f"approval #{approval['id']}: {job.not_written} yet, it tries again in "
+                     f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
     def retry_once(self, item: dict, why: str) -> None:
         if self.restarted[item["id"]]:
@@ -251,9 +326,13 @@ class Server:
     def busy_with(self) -> str:
         if sum(not f.done() for f in self.polls.values()):
             return "a source poll is still running"
+        if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
+            return running[0]
+        if self.sweeping():
+            return "a sweep of left-over VMs is still running"
         if dashboard.POSTS_IN_FLIGHT.count:
             return "the dashboard is still answering a request"
-        if chat.history()["busy"]:
+        if chat.any_busy():
             return "a chat message is still running"
         return ""
 
@@ -295,7 +374,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
     server = Server()
     server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
     if with_dashboard:
-        threading.Thread(target=dashboard.serve, name="dashboard", daemon=True).start()
+        threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
     while True:
         started = time.monotonic()
         try:

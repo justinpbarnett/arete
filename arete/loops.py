@@ -18,7 +18,7 @@ NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
 CLIMB_GOALS = {"max": True, "higher": True, "up": True, "min": False, "lower": False, "down": False}
 FINDING_EVENT = "finding"
-GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
+GITHUB_REMOTE = re.compile(r"github\.com(?::\d+)?[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 
 
 @dataclass
@@ -54,6 +54,8 @@ class Trigger:
     @property
     def summary(self) -> str:
         parts = [self.schedule] if self.schedule else []
+        if self.run_at_load:
+            parts.append("serve start")
         if self.events:
             parts.append(" ".join(self.events))
         if self.metric:
@@ -140,6 +142,9 @@ class Loop:
             if r.name == self.repo:
                 return r
         path = paths.expand(self.repo)
+        for r in cfg.repos:
+            if r.path.resolve() == path.resolve():
+                return r
         return config.Repo(name=self.repo, path=path, github=github_remote(path))
 
     def view(self) -> dict:
@@ -244,7 +249,7 @@ def load_all(cfg: config.Config | None = None) -> list[Loop]:
         try:
             loop = load(folder, origin, repo, cfg)
         except (LoopError, cron.BadSchedule, tomllib.TOMLDecodeError, ValueError, TypeError, KeyError,
-                AttributeError) as e:
+                AttributeError, OSError) as e:
             loop = broken(name, folder, origin, str(e) if isinstance(e, LoopError | cron.BadSchedule)
                           else f"{type(e).__name__}: {e}")
         if not loop.error and name in switched:
@@ -352,7 +357,7 @@ def proof_problems(loop: Loop) -> list[str]:
 
 
 def validate(loop: Loop, cfg: config.Config) -> None:
-    from .emits import EMITS
+    from .delivery import EMITS
     from .sources import SOURCES, metric_event
 
     problems = []
@@ -360,9 +365,9 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     if not kind:
         problems.append(f"kind '{loop.kind}' is not one of {', '.join(KINDS)}")
     try:
-        remote, device_problem = devices.get(loop.device).remote, ""
+        device, device_problem = devices.get(loop.device), ""
     except devices.DeviceError as e:
-        remote, device_problem = False, str(e)
+        device, device_problem = devices.LOCAL, str(e)
     if loop.trigger.cron and loop.trigger.every:
         problems.append("[trigger] takes cron or every, not both")
     if loop.trigger.trust not in TRUST_ORDER:
@@ -370,16 +375,18 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     elif loop.trigger.metric and (why := loop.trigger.refusal(metric_event(loop, 0))):
         problems.append(f"[trigger] metric would never fire: the loop {why}")
     if kind:
-        problems += kind.problems(loop, remote)
+        problems += kind.problems(loop, device.remote)
     if loop.kind == "climb" and (goal := climb_goal(loop.spec)) not in CLIMB_GOALS:
         problems.append(f"[climb] goal '{goal}' is not one of {', '.join(CLIMB_GOALS)}")
     if loop.kind == "search" and "proof" in loop.spec:
         problems += proof_problems(loop)
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
+    if loop.agent and (refusal := runner.device_refusal(loop.model_for(cfg), loop.runner, device)):
+        problems.append(refusal)
     if loop.agent:
         problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
-                     for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, remote).items()]
+                     for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
     if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")

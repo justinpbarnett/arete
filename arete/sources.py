@@ -18,7 +18,7 @@ SIGNATURE_NOISE = [
     (re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?"), "<time>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE), "<uuid>"),
     (re.compile(r"\b0x[0-9a-f]+\b|\b[0-9a-f]{12,}\b", re.IGNORECASE), "<hex>"),
-    (re.compile(r"'[^']*'|\"[^\"]*\""), "<str>"),
+    (re.compile(r"(?<!\w)'[^']*'|\"[^\"]*\""), "<str>"),
     (re.compile(r"\d+"), "<n>"),
 ]
 
@@ -61,7 +61,7 @@ def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
 
 def github_name(cfg: config.Config, name: str) -> str:
     if (path := paths.expand(name)).is_absolute():
-        return github_remote(path)
+        return next((r.github for r in cfg.repos if r.path.resolve() == path.resolve()), "") or github_remote(path)
     if "/" in name:
         return name
     return cfg.repo(name).github
@@ -212,7 +212,7 @@ class Command(Source):
                 continue
             key = row.get("key") or row.get("title") or hashlib.sha1(line.strip().encode()).hexdigest()[:16]
             out.append(event(row.get("type", "command"), sid, key,
-                             row.get("title", ""), repo=row.get("repo", loop.repo), url=row.get("url", ""),
+                             str(row.get("title") or ""), repo=row.get("repo", loop.repo), url=row.get("url", ""),
                              trust=source.get("trust", "internal"), data=row.get("data") or {}))
         return out, None
 
@@ -229,22 +229,24 @@ class Log(Source):
         return problems
 
     def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
-        offsets: dict[str, int] = json.loads(cursor) if cursor else {}
+        offsets: dict[str, list[int] | int] = json.loads(cursor) if cursor else {}
         pattern = re.compile(source.get("pattern") or LOG_PATTERN)
         files = sorted(glob.glob(str(paths.expand(source["path"]))))
         out: dict[str, dict] = {}
         for name in files:
             try:
-                size = os.path.getsize(name)
+                info = os.stat(name)
             except OSError:
                 continue
-            start = offsets.get(name)
+            size, inode = info.st_size, info.st_ino
+            mark = offsets.get(name)
+            start, known_inode = mark if isinstance(mark, list) else (mark, inode)
             if cursor is None or start is None:
-                offsets[name] = size
+                offsets[name] = [size, inode]
                 if cursor is None:
                     continue
                 start = 0
-            if size < start:
+            if size < start or known_inode != inode:
                 start = 0
             try:
                 with open(name, "rb") as f:
@@ -254,9 +256,9 @@ class Log(Source):
                 continue
             last_newline = chunk.rfind(b"\n")
             if last_newline == -1:
-                offsets[name] = start
+                offsets[name] = [start, inode]
                 continue
-            offsets[name] = size - len(chunk) + last_newline + 1
+            offsets[name] = [size - len(chunk) + last_newline + 1, inode]
             for raw in chunk[:last_newline].decode("utf-8", "replace").splitlines():
                 if not pattern.search(raw):
                     continue

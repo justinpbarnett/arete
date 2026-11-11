@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import textwrap
 from collections import Counter
 from collections.abc import Iterable
 
@@ -108,10 +110,10 @@ def show(panel: dict, what: str, draw) -> None:
         draw(panel["rows"])
 
 
-def print_table(rows: list[tuple[str, ...]], width: int) -> None:
+def print_table(rows: list[tuple[str, ...]], width: int, indent: str = "  ") -> None:
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]
     for row in rows:
-        print(("  " + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[-1])[:width])
+        print((indent + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[-1])[:width].rstrip())
 
 
 def print_checks(h: dict) -> None:
@@ -128,13 +130,16 @@ def print_alerts(a: dict) -> None:
     if a["alerts"]:
         print("open alerts:")
     for x in a["alerts"]:
-        print(f"  {x['key']}  issue #{x['issue'] or '-'}  since {x['opened']}")
+        issue = f"{x['repo']}#{x['issue']}" if x["issue"] else "none"
+        print(f"  {x['key']}  issue {issue}  since {x['opened']}")
 
 
 def print_recent(runs: list[dict]) -> None:
+    from . import util
+
     if runs:
         print("recent runs:")
-        print_table([(r["id"], r["kind"], r["ticket"], r["status"], f"${r['cost']:.2f}", r["pr_url"] or r["summary"])
+        print_table([(r["id"], r["kind"], r["ticket"], r["status"], util.paid_note(r["paid"]), r["pr_url"] or r["summary"])
                      for r in runs], 200)
 
 
@@ -147,6 +152,11 @@ def print_proposals(p: dict) -> None:
         print("harness fixes to make by hand, since Claude Code denies agent writes under .claude/ (then `arete forget ID`):")
     for h in p["hand"]:
         print(f"  {h['id']:<4} {h['repo']}/{h['file']}: {h['change']}"[:400])
+    if p["approve"]:
+        print("global rules waiting for approval (`arete file-rule ID` writes and pushes one, `arete reject-rule ID` drops it):")
+    for r in p["approve"]:
+        writing = " (being written now)" if r["status"] == "filing" else ""
+        print(f"  {r['id']:<4} {r['repo']}/{r['file']}{writing}: {r['change']}"[:400])
 
 
 def print_skipped(skipped: list[dict]) -> None:
@@ -178,10 +188,12 @@ def print_triage(t: dict) -> None:
 
 
 def print_live(live: dict) -> None:
+    from . import util
+
     print(f"runs live: {len(live['runs'])}, in {live['slots']} of {live['max_parallel']} run slots"
           + (f", {live['waiting']} waiting for one" if live["waiting"] else ""))
     if live["runs"]:
-        print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", f"${r['cost']:.2f}",
+        print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", util.paid_note(r["paid"]),
                       r["slot"] or r["step"]) for r in live["runs"]], 200)
 
 
@@ -190,6 +202,26 @@ def cmd_forget(args) -> int:
 
     if not state.forget_proposal(args.id):
         print(f"no open proposal #{args.id}")
+        return 1
+    return 0
+
+
+def cmd_file_rule(args) -> int:
+    from . import miner
+
+    try:
+        print(miner.file_rule(args.id))
+    except LookupError as e:
+        print(e)
+        return 1
+    return 0
+
+
+def cmd_reject_rule(args) -> int:
+    from . import state
+
+    if not state.move_proposal(args.id, ("approve",), "rejected"):
+        print(f"#{args.id} is not a rule waiting for approval")
         return 1
     return 0
 
@@ -325,8 +357,8 @@ def cmd_eval(args) -> int:
         print("usage: arete eval [REPO] or arete eval mine [REPO]", file=sys.stderr)
         return 2
     if not words:
-        if args.prompts:
-            print("arete eval --prompts DIR needs a REPO", file=sys.stderr)
+        if given := [flag for flag, value in (("--task", args.task), ("--ref", args.ref), ("--prompts", args.prompts)) if value]:
+            print(f"arete eval {' '.join(given)} needs a REPO", file=sys.stderr)
             return 2
         return evals.run_all(dry_run=args.dry_run)
     prompts_dir = paths.expand(args.prompts).resolve() if args.prompts else None
@@ -360,7 +392,7 @@ def cmd_research(args) -> int:
     if args.next or (args.dry_run and not args.ref):
         return research.next_due(dry_run=args.dry_run, asked=piped_events())
     if args.ref and args.run:
-        return research.run_now(args.ref, force=args.force)
+        return research.run_now(args.ref, force=args.force, dry_run=args.dry_run)
     if args.ref:
         shown = research.shown(args.ref)
         if shown is None:
@@ -394,12 +426,14 @@ def serve_line(beat: dict) -> str:
     if not beat:
         return "serve: never ran; `arete install` starts it"
     if not beat["alive"]:
-        return f"serve: DOWN, last beat {when(beat.get('at'))}"
+        return f"serve: DOWN, {'its process is gone, ' if beat['process_gone'] else ''}last beat {when(beat.get('at'))}"
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
             f"{beat['running']} running, {beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else ""))
 
 
 def loop_line(v: dict) -> str:
+    from . import util
+
     switch = "BROKEN" if v["error"] else ("on" if v["enabled"] else "off")
     last = v["last"] or {}
     what = (f"running {v['running']}" if v["running"] else
@@ -407,7 +441,7 @@ def loop_line(v: dict) -> str:
             else "never ran")
     due = f"next {when(v['next_due'])}" if v.get("next_due") else ""
     return (f"{v['name']:<22} {switch:<6} {v['kind']:<7} {v['trigger']:<22} {what:<26} {due:<17}"
-            f" ${v['spent_24h']:.2f}/24h" + (f"\n    {v['error']}" if v["error"] else ""))
+            f" {util.paid_note(v['spent_24h'])} in 24 h" + (f"\n    {v['error']}" if v["error"] else ""))
 
 
 def print_feed_line(line: dict) -> None:
@@ -441,9 +475,17 @@ def piped_events() -> list[dict]:
 
 
 def read_events(file: str) -> list[dict] | None:
+    from . import control
+
     if not file:
         return None
-    data = json.loads(paths.expand(file).read_text())
+    path = paths.expand(file)
+    try:
+        data = json.loads(path.read_text())
+    except OSError as e:
+        raise control.Refused(f"--events {paths.short_path(path)}: {e.strerror or e}") from None
+    except ValueError as e:
+        raise control.Refused(f"--events {paths.short_path(path)} is not JSON: {e}") from None
     return data if isinstance(data, list) else [data]
 
 
@@ -477,7 +519,7 @@ def cmd_loop(args) -> int:
         if args.action == "new":
             made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
                                   run_id=args.run_id)
-            print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, ${made['cost_usd']:.2f})\n")
+            print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
             print(made["loop_toml"])
             if made["note"]:
                 print(f"note: {made['note']}")
@@ -511,8 +553,8 @@ def cmd_loop(args) -> int:
         if args.action == "stop":
             target = args.name
             if not state.run_get(target):
-                running = [r for r in state.runs_marked_running()
-                           if r["kind"] == "loop" and r["loop"] == control.find_loop(target).name]
+                loop = control.find_loop(target)
+                running = [r for r in state.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
                 if not running:
                     raise control.Refused(f"{target} has no run going")
                 target = running[0]["id"]
@@ -540,7 +582,7 @@ def cmd_loop(args) -> int:
             if d["state"]:
                 print(f"  memory: {json.dumps(d['state'])[:300]}")
             for r in d["runs"][:8]:
-                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} ${r['cost_usd'] or 0:.2f} "
+                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} {util.paid_note(r['paid']):<12} "
                       f"{util.first_line(r['summary'] or '', 90)}")
             for f in d["findings"][:8]:
                 print(f"  finding {f['title'][:90]} {f['url'] or ''}")
@@ -568,12 +610,10 @@ def cmd_devices(args) -> int:
             info = devices.probe(args.probe)
             print(json.dumps(info, indent=2))
             return 0 if info["ok"] else 1
-        for d in control.fleet():
-            p = d.get("probe") or {}
-            seen = (("ok" if p.get("ok") else "FAIL") + f" {when(p.get('at'))}") if p else "not probed"
-            extra = ", ".join(x for x in (p.get("system", ""), " ".join(p.get("tools") or []),
-                                          "; ".join(p.get("gpus") or []), p.get("detail", "")) if x)
-            print(f"{d['name']:<14} {d['kind']:<9} {d.get('host') or '':<22} {seen:<18} {extra}"[:220])
+        fleet = control.fleet()
+        print_table([(d["name"], d["kind"], d.get("host") or "", *probe_words(d.get("probe"))) for d in fleet], 220,
+                    indent="")
+        for d in fleet:
             if d.get("error"):
                 print(f"  {d['error']}")
         return 0
@@ -581,15 +621,23 @@ def cmd_devices(args) -> int:
         return refused(e)
 
 
+def probe_words(probe: dict | None) -> tuple[str, str]:
+    if not probe:
+        return "not probed", ""
+    seen = ("ok" if probe.get("ok") else "FAIL") + f" {when(probe.get('at'))}"
+    return seen, ", ".join(x for x in (probe.get("system", ""), " ".join(probe.get("tools") or []),
+                                       "; ".join(probe.get("gpus") or []), probe.get("detail", "")) if x)
+
+
 def cmd_session(args) -> int:
     import select
     import threading
 
-    from . import control, sessions, state
+    from . import control, sessions, state, util
 
     try:
         if args.action == "start":
-            tools = [t for t in args.tools.split(",") if t] if args.tools is not None else None
+            tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
             s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
                                 tools=tools, repo=args.repo, budget_usd=args.budget)
             print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
@@ -599,6 +647,9 @@ def cmd_session(args) -> int:
                 return 0
             args.id = s["id"]
         if args.action in ("start", "attach"):
+            r = state.run_get(args.id)
+            if not r or r["kind"] != "session":
+                raise control.NotFound(f"no session {args.id}")
             stop = threading.Event()
             print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
 
@@ -627,7 +678,7 @@ def cmd_session(args) -> int:
             return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
         for s in sessions.views():
             print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
-                  f"{s['device'] or '':<10} ${s['cost_usd'] or 0:.2f}  {s['prompt'][:70]}")
+                  f"{s['device'] or '':<10} {util.paid_note(s['paid']):<12}  {s['prompt'][:70]}")
         if not state.runs(kind="session", limit=1):
             print("no sessions yet; `arete session start \"what to do\"`")
         return 0
@@ -635,17 +686,27 @@ def cmd_session(args) -> int:
         return refused(e)
 
 
+def approval_notes(a: dict) -> list[str]:
+    failed = [a["failed"], f"`arete approve {a['id']}` tries again, `--reject` drops it"]
+    review = a["review"]
+    return [*(failed if a["failed"] else []),
+            *(note for note in (f"held: {a['held']}" if a["held"] else "",
+                                f"review by {review['by']}: {review['said']}" if review else "") if note)]
+
+
 def cmd_approve(args) -> int:
-    from . import control, emits
+    from . import control, delivery
 
     try:
         if args.id is None:
-            pending = emits.waiting()
+            pending = delivery.waiting()
             for a in pending:
-                print(f"#{a['id']:<4} {a['loop']:<20} {when(a['created'])}  {a['what']}"[:240])
-                if a["failed"]:
-                    print(f"      delivery failed: {a['failed']}"[:240])
-                    print(f"      `arete approve {a['id']}` tries again, `--reject` drops it")
+                print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
+                                    f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
+                                    subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
+                for line in approval_notes(a):
+                    print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
+                                        subsequent_indent=" " * 8, break_on_hyphens=False))
             if not pending:
                 print("nothing waiting for approval")
             return 0
@@ -659,8 +720,8 @@ def cmd_webhook(args) -> int:
     from . import control, dashboard, hooks
 
     try:
-        loop = control.find_loop(args.name)
-    except control.NotFound as e:
+        loop = control.working_loop(args.name)
+    except (control.NotFound, control.Refused) as e:
         return refused(e)
     if not loop.trigger.webhook:
         print(f"{loop.name} has no webhook; set `webhook = true` under [trigger] in {paths.short_path(loop.file)}",
@@ -676,13 +737,13 @@ def cmd_webhook(args) -> int:
 
 
 def cmd_costs(args) -> int:
-    from . import control
+    from . import control, util
 
     try:
         c = control.costs(args.days)
     except control.Refused as e:
         return refused(e)
-    print(f"${c['total_usd']:.2f} in the last {c['days']:g} days")
+    print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; claude CLI steps ride the subscription and count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
         for row in c[f"by_{group}"][:12]:
@@ -865,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.set_defaults(fn=cmd_webhook)
 
-    p = sub.add_parser("costs", help="model spend by model, runner and loop")
+    p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop")
     p.add_argument("--days", type=float, default=None)
     p.set_defaults(fn=cmd_costs)
 
@@ -897,6 +958,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_forget)
 
+    p = sub.add_parser("file-rule", help="write an approved global rule from the miner into the global CLAUDE.md and push it")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_file_rule)
+
+    p = sub.add_parser("reject-rule", help="drop a global rule from the miner, so it is not proposed again")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_reject_rule)
+
     p = sub.add_parser("jira-check", help="read Jira with the configured token and count waiting tickets")
     p.set_defaults(fn=cmd_jira_check)
 
@@ -926,7 +995,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--run", action="store_true", help="with REF: research it now")
     p.add_argument("--force", action="store_true", help="with --run: skip the JEV injection screen")
     p.add_argument("--next", action="store_true", help="research the next ticket due; what the research loop runs")
-    p.add_argument("--dry-run", action="store_true", help="say which ticket is due next; no model calls, no writes")
+    p.add_argument("--dry-run", action="store_true",
+                   help="say which ticket is due next, or with REF --run whether it would run; no model calls, no writes")
     p.set_defaults(fn=cmd_research)
 
     p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")

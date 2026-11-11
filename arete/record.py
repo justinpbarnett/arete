@@ -74,16 +74,8 @@ def step(run_id: str, name: str, res, seconds: float) -> None:
                   (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
 
 
-def spent(run_id: str) -> float:
-    r = state.run_get(run_id)
-    return round(r["cost_usd"] or 0, 6) if r else 0.0
-
-
 def metered_spent(run_id: str) -> float:
-    with state.db() as c:
-        total = c.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM steps WHERE run_id = ? "
-                          "AND COALESCE(runner, '') != 'claude'", (run_id,)).fetchone()[0]
-    return round(float(total), 6)
+    return state.paid_by_run([run_id]).get(run_id, 0.0)
 
 
 def note(run_id: str, **fields) -> None:
@@ -146,11 +138,11 @@ def dead(row: dict):
             yield free
 
 
-def interrupt(row: dict) -> dict | None:
+def interrupt(row: dict, notes: Sequence[str] = ()) -> dict | None:
     if not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
     status = dead_status(row)
-    summary = STOPPED if status == "stopped" else INTERRUPTED
+    summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
     settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
     if settled and row["kind"] == "draft":
         shutil.rmtree(paths.draft_dir(row["id"]), ignore_errors=True)
@@ -228,9 +220,34 @@ def looks_secret(value: str) -> bool:
 
 
 def scrub(text: str, hidden: Sequence[str]) -> str:
+    plain = replaced(text, hidden)
+    if plain == text or parses(plain) or not parses(text):
+        return plain
+    return json.dumps(scrub_value(json.loads(text), hidden), ensure_ascii=False)
+
+
+def replaced(text: str, hidden: Sequence[str]) -> str:
     for value in hidden:
         text = text.replace(value, REDACTED)
     return PRIVATE_KEY.sub(REDACTED, text)
+
+
+def parses(text: str) -> bool:
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
+
+
+def scrub_value(value, hidden: Sequence[str]):
+    if isinstance(value, str):
+        return replaced(value, hidden)
+    if isinstance(value, list):
+        return [scrub_value(item, hidden) for item in value]
+    if isinstance(value, dict):
+        return {key: scrub_value(item, hidden) for key, item in value.items()}
+    return value
 
 
 def slug(step: str) -> str:

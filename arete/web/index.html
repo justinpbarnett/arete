@@ -3,180 +3,176 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Arete · Dashboard</title>
+<meta name="arete-code" content="">
+<title>Arete · Live</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/pattern.css">
 <link rel="stylesheet" href="/app.css">
-<script src="/app.js" defer></script>
+<script src="/common.js" defer></script>
+<script src="/said-line.js" defer></script>
+<script src="/new-code.js" defer></script>
+<script src="/redraw.js" defer></script>
+<script src="/routing.js" defer></script>
+<script src="/refresh.js" defer></script>
+<script src="/live.js" defer></script>
+<script src="/run-page.js" defer></script>
+<script src="/runs.js" defer></script>
+<script src="/sessions.js" defer></script>
+<script src="/loops.js" defer></script>
+<script src="/triage.js" defer></script>
+<script src="/outcomes.js" defer></script>
+<script src="/health.js" defer></script>
+<script src="/settings.js" defer></script>
+<script src="/usage.js" defer></script>
+<script src="/tracking.js" defer></script>
+<script src="/console.js" defer></script>
+<script src="/find.js" defer></script>
+<script src="/keys.js" defer></script>
+<script src="/loaders.js" defer></script>
+<script src="/start.js" defer></script>
 </head>
 <body>
-<div class="wrap">
+<button type="button" class="skip" id="skip">Skip to the content</button>
+<div class="wrap sidebar-page">
 
+<nav class="side" aria-label="Views">
+  <div class="group tools">
+    <button type="button" id="find-open" aria-haspopup="dialog">Find</button>
+    <button type="button" id="console-open" aria-expanded="false" aria-controls="console"><span>Console</span><span class="count" id="count-console"></span></button>
+  </div>
+  <p class="side-foot" id="serve-line"></p>
+  <p class="side-foot hints">Ctrl or Cmd K to find<br>? for the keys</p>
+</nav>
+
+<div class="page">
 <header>
   <div class="kicker">Arete · Dashboard</div>
-  <h1>Arete</h1>
-  <p class="sub">The pipeline that turns approved tickets into reviewed pull requests, the loops that watch and fix beside it, and the sessions you launch: what runs now, how it stands, what it costs, and a console to ask it why.</p>
+  <h1 id="title">Live</h1>
+  <p class="sub" id="sub"></p>
   <p class="status" id="status">Loading</p>
 </header>
 
-<nav class="actions views">
-  <div class="seg" role="group" aria-label="Views">
-    <button type="button" data-view="live">Live</button>
-    <button type="button" data-view="loops">Loops</button>
-    <button type="button" data-view="launch">Launch</button>
-    <button type="button" data-view="fleet">Fleet</button>
-    <button type="button" data-view="health">Health</button>
-    <button type="button" data-view="triage">Triage</button>
-    <button type="button" data-view="trends">Trends</button>
-    <button type="button" data-view="settings">Settings</button>
-    <button type="button" data-view="chat">Chat</button>
-  </div>
-</nav>
-
-<main>
+<main id="main" tabindex="-1">
 
 <section data-view="live">
-  <div id="live-now"></div>
-  <div id="log" hidden>
-    <h3 id="log-title">Log</h3>
-    <pre id="log-lines"></pre>
-    <div class="actions"><button type="button" id="log-close">Close the log</button></div>
+  <div id="live-body"></div>
+</section>
+
+<section data-view="runs" hidden>
+  <div class="split">
+    <div class="list" id="runs-list"></div>
+    <div class="detail" id="runs-detail" hidden></div>
   </div>
-  <div id="live-rest"></div>
+</section>
+
+<section data-view="sessions" hidden>
+  <div class="split">
+    <div class="list">
+      <div class="actions top">
+        <button type="button" id="launch-toggle" aria-expanded="false" aria-controls="launch">New session</button>
+      </div>
+      <form id="launch" novalidate hidden>
+        <h2><span class="n">01</span>New session</h2>
+        <p id="launch-about">A session is an agent you talk to. It runs on the device and model you pick and takes each message you send.</p>
+        <div class="field">
+          <label for="launch-prompt">First message</label>
+          <textarea id="launch-prompt" rows="4" spellcheck="true"></textarea>
+        </div>
+        <div class="fields">
+          <div class="field">
+            <label for="launch-device">Device</label>
+            <select id="launch-device"></select>
+          </div>
+          <div class="field">
+            <label for="launch-model">Model</label>
+            <input id="launch-model" type="text" list="launch-models" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="launch-runner">Runner</label>
+            <select id="launch-runner"></select>
+          </div>
+          <div class="field">
+            <label for="launch-repo">Repo</label>
+            <select id="launch-repo"></select>
+          </div>
+          <div class="field">
+            <label for="launch-budget">Budget in dollars</label>
+            <input id="launch-budget" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="no limit">
+          </div>
+        </div>
+        <fieldset id="launch-tools"><legend>Tools</legend></fieldset>
+        <datalist id="launch-models"></datalist>
+        <div class="actions">
+          <button type="submit" data-act id="launch-go">Launch</button>
+          <button type="button" id="launch-reset">Reset the form</button>
+        </div>
+        <p id="launch-result" aria-live="polite" tabindex="-1" hidden></p>
+      </form>
+      <div id="sessions-list"></div>
+    </div>
+    <div class="detail" id="sessions-detail" hidden></div>
+  </div>
 </section>
 
 <section data-view="loops" hidden>
-  <div id="loops"></div>
-  <p id="loops-result" aria-live="polite" tabindex="-1" hidden></p>
-  <div id="loop-feed" class="feed" hidden>
-    <h3 class="feed-title">Feed</h3>
-    <pre class="feed-lines"></pre>
-    <div class="actions">
-      <button type="button" class="feed-stop">Stop this run</button>
-      <button type="button" class="feed-close">Close the feed</button>
+  <div class="split">
+    <div class="list">
+      <div class="actions top">
+        <button type="button" id="loop-new-toggle" aria-expanded="false" aria-controls="loop-new">New loop</button>
+      </div>
+      <form id="loop-new" novalidate hidden>
+        <h2><span class="n">01</span>New loop</h2>
+        <p>Say in a sentence what the loop should do. A model drafts the loop folder, checks that it loads, and saves it turned off, so nothing fires until you try it and turn it on.</p>
+        <div class="field">
+          <label for="loop-new-sentence">What it should do</label>
+          <textarea id="loop-new-sentence" rows="3" spellcheck="true"></textarea>
+        </div>
+        <div class="fields">
+          <div class="field">
+            <label for="loop-new-name">Name</label>
+            <input id="loop-new-name" type="text" autocomplete="off" spellcheck="false" placeholder="the model picks one">
+          </div>
+          <div class="field">
+            <label for="loop-new-repo">Repo</label>
+            <select id="loop-new-repo"><option value="">None</option></select>
+          </div>
+          <div class="field">
+            <label for="loop-new-model">Model that drafts it</label>
+            <input id="loop-new-model" type="text" list="loop-new-models" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+        <datalist id="loop-new-models"></datalist>
+        <div class="actions">
+          <button type="submit" data-act id="loop-new-go">Draft it</button>
+          <span class="muted keys">Ctrl or Cmd with Enter drafts</span>
+        </div>
+        <p id="loop-new-result" aria-live="polite" tabindex="-1" hidden></p>
+      </form>
+      <div id="loops-list"></div>
     </div>
-    <p class="feed-said" id="loop-feed-result" aria-live="polite" tabindex="-1" hidden></p>
+    <div class="detail" id="loops-detail" hidden></div>
   </div>
-  <h2><span class="n">03</span>Draft a loop</h2>
-  <p>Say in a sentence what the loop should do. A model drafts the loop folder, checks that it loads, and saves it turned off, so nothing fires until you try it and turn it on.</p>
-  <form id="loop-new" novalidate>
-    <div class="field">
-      <label for="loop-new-sentence">What it should do</label>
-      <textarea id="loop-new-sentence" rows="3" spellcheck="true"></textarea>
-    </div>
-    <div class="fields">
-      <div class="field">
-        <label for="loop-new-name">Name</label>
-        <input id="loop-new-name" type="text" autocomplete="off" spellcheck="false" placeholder="the model picks one">
-      </div>
-      <div class="field">
-        <label for="loop-new-repo">Repo</label>
-        <select id="loop-new-repo"><option value="">None</option></select>
-      </div>
-      <div class="field">
-        <label for="loop-new-model">Model that drafts it</label>
-        <input id="loop-new-model" type="text" list="loop-new-models" autocomplete="off" spellcheck="false">
-      </div>
-    </div>
-    <datalist id="loop-new-models"></datalist>
-    <div class="actions">
-      <button type="submit" id="loop-new-go">Draft it</button>
-      <span class="muted keys">Ctrl or Cmd with Enter drafts</span>
-    </div>
-  </form>
-  <p id="loop-new-result" aria-live="polite" tabindex="-1" hidden></p>
-  <div id="draft-feed" class="feed" hidden>
-    <h3 class="feed-title">Draft</h3>
-    <pre class="feed-lines"></pre>
-    <div class="actions">
-      <button type="button" class="feed-stop">Stop this draft</button>
-      <button type="button" class="feed-close">Close the feed</button>
-    </div>
-    <p class="feed-said" id="draft-feed-result" aria-live="polite" tabindex="-1" hidden></p>
-  </div>
-  <div id="loop-detail" hidden></div>
-</section>
-
-<section data-view="launch" hidden>
-  <h2><span class="n">01</span>Launch a session</h2>
-  <p id="launch-about">A session is an agent you talk to. It runs on the device and model you pick and takes each message you send.</p>
-  <form id="launch" novalidate>
-    <div class="field">
-      <label for="launch-prompt">First message</label>
-      <textarea id="launch-prompt" rows="4" spellcheck="true"></textarea>
-    </div>
-    <div class="fields">
-      <div class="field">
-        <label for="launch-device">Device</label>
-        <select id="launch-device"></select>
-      </div>
-      <div class="field">
-        <label for="launch-model">Model</label>
-        <input id="launch-model" type="text" list="launch-models" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="launch-runner">Runner</label>
-        <select id="launch-runner"></select>
-      </div>
-      <div class="field">
-        <label for="launch-repo">Repo</label>
-        <select id="launch-repo"></select>
-      </div>
-      <div class="field">
-        <label for="launch-budget">Budget in dollars</label>
-        <input id="launch-budget" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="no limit">
-      </div>
-    </div>
-    <fieldset id="launch-tools"><legend>Tools</legend></fieldset>
-    <datalist id="launch-models"></datalist>
-    <div class="actions">
-      <button type="submit" data-act id="launch-go">Launch</button>
-      <button type="button" id="launch-reset">Reset the form</button>
-    </div>
-  </form>
-  <p id="launch-result" aria-live="polite" hidden></p>
-  <div id="session-feed" class="feed" hidden>
-    <h3 class="feed-title">Session</h3>
-    <p class="muted feed-about"></p>
-    <pre class="feed-lines"></pre>
-    <form id="session-send" novalidate>
-      <div class="field">
-        <label for="session-text">Message</label>
-        <textarea id="session-text" rows="3" spellcheck="true"></textarea>
-      </div>
-      <div class="actions">
-        <button type="submit" id="session-go">Send</button>
-        <button type="button" class="feed-stop">Stop the session</button>
-        <button type="button" class="feed-close">Close</button>
-      </div>
-    </form>
-    <p id="session-result" aria-live="polite" tabindex="-1" hidden></p>
-  </div>
-  <div id="sessions"></div>
-</section>
-
-<section data-view="fleet" hidden>
-  <div id="fleet"></div>
-  <p id="fleet-result" aria-live="polite" hidden></p>
-</section>
-
-<section data-view="health" hidden>
-  <div id="health"></div>
 </section>
 
 <section data-view="triage" hidden>
-  <p id="triage-result" aria-live="polite" tabindex="-1" hidden></p>
-  <div id="triage"></div>
+  <div class="split full">
+    <div class="list" id="triage-list"></div>
+    <div class="detail" id="triage-detail" hidden></div>
+  </div>
 </section>
 
-<section data-view="trends" hidden>
-  <div id="trends"></div>
+<section data-view="outcomes" hidden>
+  <div id="outcomes-body"></div>
+</section>
+
+<section data-view="health" hidden>
+  <div id="health-body"></div>
 </section>
 
 <section data-view="settings" hidden>
-  <h2><span class="n">01</span>Settings</h2>
-  <p>A save writes <code>config.toml</code> on the Mac. The pipeline reads it at its next poll, and a run already going keeps the models it started with.</p>
-  <form id="settings" novalidate>
+  <form id="settings-form" novalidate>
+    <h2><span class="n">01</span>Run limits</h2>
+    <p>A save writes <code>config.toml</code> on the Mac. The pipeline reads it at its next poll, and a run already going keeps the models it started with.</p>
     <div class="fields one-row">
       <div class="field">
         <label for="max-parallel">Runs at once</label>
@@ -187,48 +183,20 @@
         <input id="max-parallel-per-repo" name="max_parallel_per_repo" type="text" inputmode="numeric" autocomplete="off" spellcheck="false">
       </div>
     </div>
-    <h3>Models</h3>
+    <h2><span class="n">02</span>Models</h2>
     <p class="muted" id="model-hint"></p>
     <div class="fields" id="model-fields"></div>
     <datalist id="model-names"></datalist>
     <div class="actions">
-      <button type="submit" id="settings-save">Save</button>
+      <button type="submit" data-act id="settings-save">Save</button>
       <button type="button" id="settings-undo">Undo changes</button>
     </div>
+    <p id="settings-result" aria-live="polite" tabindex="-1" hidden></p>
   </form>
-  <p id="settings-result" aria-live="polite" hidden></p>
 </section>
 
-<section data-view="chat" hidden>
-  <h2><span class="n">01</span>Console</h2>
-  <p>Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here.</p>
-  <div id="messages" aria-live="polite"></div>
-  <p id="working" class="muted" hidden></p>
-  <div id="draft" class="draft" hidden>
-    <h3>Drafted issue</h3>
-    <p class="muted">Nothing reaches GitHub until you file it.</p>
-    <dl>
-      <dt>Title</dt><dd id="draft-title"></dd>
-      <dt>Body</dt><dd><pre id="draft-body"></pre></dd>
-    </dl>
-    <div class="actions">
-      <button type="button" id="draft-file">File this issue</button>
-      <button type="button" id="draft-drop">Drop</button>
-    </div>
-    <p id="draft-result" aria-live="polite" hidden></p>
-  </div>
-  <form id="chat" novalidate>
-    <div class="field">
-      <label for="chat-text">Message</label>
-      <textarea id="chat-text" rows="4" spellcheck="true"></textarea>
-    </div>
-    <div class="actions">
-      <button type="submit" data-act id="chat-send">Send</button>
-      <button type="button" id="chat-new">New chat</button>
-      <span class="muted keys">Ctrl or Cmd with Enter sends</span>
-    </div>
-  </form>
-  <p id="chat-result" aria-live="polite" hidden></p>
+<section data-view="usage" hidden>
+  <div id="usage-body"></div>
 </section>
 
 </main>
@@ -236,7 +204,79 @@
 <footer>
   <p>Arete · served from this machine to its owner on the tailnet</p>
 </footer>
-
 </div>
+</div>
+
+<aside id="console" class="console" aria-labelledby="console-title" hidden>
+  <div class="console-head">
+    <h2 id="console-title" tabindex="-1">Console</h2>
+    <button type="button" id="console-close">Close</button>
+  </div>
+  <div class="console-body" id="console-body">
+    <p class="muted">Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here or from Live. A chat on a project works in that repo's folder and knows its checks and what arete's agents learned there.</p>
+    <div class="field">
+      <label for="chat-pick">Chat</label>
+      <select id="chat-pick"></select>
+    </div>
+    <p id="chat-about" class="muted" hidden></p>
+    <div id="messages" aria-live="polite"></div>
+    <p id="working" class="muted" hidden></p>
+    <div id="draft" class="draft" hidden>
+      <h3>Drafted issue</h3>
+      <p class="muted">Nothing reaches GitHub until you file it.</p>
+      <dl>
+        <dt>Title</dt><dd id="draft-title"></dd>
+        <dt>Body</dt><dd><pre id="draft-body"></pre></dd>
+      </dl>
+      <div class="actions">
+        <button type="button" id="draft-file">File this issue</button>
+        <button type="button" id="draft-drop">Drop</button>
+      </div>
+      <p id="draft-result" aria-live="polite" tabindex="-1" hidden></p>
+    </div>
+  </div>
+  <form id="chat" novalidate>
+    <div class="field">
+      <label for="chat-text">Message</label>
+      <textarea id="chat-text" rows="3" spellcheck="true"></textarea>
+    </div>
+    <div class="actions">
+      <button type="submit" id="chat-send">Send</button>
+      <span class="muted keys">Ctrl or Cmd with Enter sends</span>
+    </div>
+    <p id="chat-result" aria-live="polite" tabindex="-1" hidden></p>
+  </form>
+  <form id="chat-new-form" novalidate>
+    <div class="field">
+      <label for="chat-project">New chat on</label>
+      <select id="chat-project"><option value="">No project</option></select>
+    </div>
+    <div class="actions">
+      <button type="submit" id="chat-new">New chat</button>
+    </div>
+    <p id="chat-new-result" aria-live="polite" tabindex="-1" hidden></p>
+  </form>
+</aside>
+
+<dialog id="palette" aria-labelledby="palette-label">
+  <div class="field">
+    <label for="palette-input" id="palette-label">Find a view, loop, run, session, ticket or action</label>
+    <input id="palette-input" type="text" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list" autocomplete="off" spellcheck="false">
+  </div>
+  <ul id="palette-list" role="listbox" aria-labelledby="palette-label"></ul>
+  <div class="actions"><button type="button" id="palette-close">Close</button><span class="muted keys">Up and Down move · Enter opens · Esc closes</span></div>
+</dialog>
+
+<dialog id="keys" aria-labelledby="keys-title">
+  <h2 id="keys-title">Keys</h2>
+  <dl class="w keys-list">
+    <dt><kbd>Ctrl</kbd> or <kbd>Cmd</kbd> <kbd>K</kbd></dt><dd>Find a view, loop, run, session, ticket or action</dd>
+    <dt><kbd>/</kbd></dt><dd>Find, outside a field</dd>
+    <dt id="keys-console"><kbd>C</kbd></dt><dd>Open or close the console</dd>
+    <dt><kbd>Esc</kbd></dt><dd>Close the open item, then the console</dd>
+    <dt><kbd>?</kbd></dt><dd>This list</dd>
+  </dl>
+  <div class="actions"><button type="button" id="keys-close">Close</button></div>
+</dialog>
 </body>
 </html>
