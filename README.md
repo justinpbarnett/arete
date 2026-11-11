@@ -55,7 +55,7 @@ A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete we
 
 ## Runners, devices and sessions
 
-A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, though every sum arete shows you counts only what you pay. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
+A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi, and a `replay:` prefix answers from files (see [Replay](#replay)). Claude and pi both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, though every sum arete shows you counts only what you pay. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
 
 `claude -p` stays open after its answer until each command the agent started in the background ends, so a server left running holds a step to its time limit and loses its answer.
 Each claude step that can run commands is told to stop with TaskStop each background command that does not end on its own before it answers, even when its task asks to keep one running.
@@ -300,6 +300,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
 | `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `[jev.screen_lines]` (the chance at which each push screen question holds a push: `weakens` 0.5, `secrets` 0.7, `outside` 0.7, `irreversible` 0.5, `feature` 0.6, `removes` 0.5, `renames` 0.5, and `reach` 0.8, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost. |
+| `[replay]` | `all` (default false, sends every agent call to the replay runner) and `dir` (the folder of answers; `ARETE_REPLAY_DIR` wins over it). See [Replay](#replay). |
 
 | Repo field | Default | Meaning |
 |------------|---------|---------|
@@ -462,7 +463,7 @@ A step is named by its `[models]` role. `implement` is a second name for `build`
 |-----|---------|
 | `tier` | A tier of the tier map in use, which sets `runner`, `provider` and `model`. |
 | `model` | The model. It wins over a tier at any level, and routes as in [Runners](#runners-devices-and-sessions). |
-| `runner` | `claude` or `pi`. It wins over the runner the model name picks, but not over a `claude:` or `pi:` prefix. |
+| `runner` | `claude`, `pi` or `replay`. It wins over the runner the model name picks, but not over a `claude:`, `pi:` or `replay:` prefix. |
 | `provider` | For pi, the provider put before a model name that does not start with it. |
 | `effort` | claude's `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) or pi's `--thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Left out, the runner's own default. |
 | `timeout_minutes` | The step's time limit. Default `limits.timeout_minutes`; learn 15, uat 10. The checks keep `limits.timeout_minutes`. |
@@ -472,7 +473,33 @@ Levels, where the last one to set a key wins: the defaults above, `[steps]` in `
 
 `[tiers.<map>]` lists tiers by name. A layer's `[tiers.<map>]` adds to the engine's map of the same name, or replaces a tier it names again. `[factory] tier_map` names the map in use; it may be left out when there is one map.
 
-Config load refuses, in one line that names the table: an unknown step, kind or key, a tier the map does not have, a runner other than `claude` or `pi`, an effort the step's runner does not take, `tries` or `timeout_minutes` under 1, several tier maps with no `tier_map`, and a `tier_map` with no such map. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
+Config load refuses, in one line that names the table: an unknown step, kind or key, a tier the map does not have, a runner other than `claude`, `pi` or `replay`, an effort the step's runner does not take, `tries` or `timeout_minutes` under 1, several tier maps with no `tier_map`, and a `tier_map` with no such map. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
+
+## Replay
+
+The `replay` runner answers each agent call from a file and calls no model, so a check of the pipeline's own flow runs in seconds and costs nothing. A step picks it like any runner: `runner = "replay"` in a step table or a tier, or a `replay:<name>` model. `[replay] all = true` in `~/.config/arete/config.toml` sends every agent call to it, whatever the step sheet says, and `arete steps` shows `replay` for every step.
+
+```toml
+[replay]
+all = true
+dir = "~/replay/answers"
+```
+
+`dir` is the folder of answers; `ARETE_REPLAY_DIR` wins over it. A relative folder is read from the folder arete runs in, not the step's working folder. A call traced as step `plan` reads `<dir>/plan.json`, named as its step row and record are. A second call of the same step in the same run reads `plan2.json`, a third `plan3.json`; a call with no run id always reads the first name. The file is one JSON object:
+
+| Key | Meaning |
+|-----|---------|
+| `text` | The answer's text. |
+| `structured` | The structured answer, for a step that passes a schema. |
+| `ok`, `error` | Default true and empty. `ok = false` with no error fails with one that names the file. |
+| `cost_usd`, `tokens_in`, `tokens_out`, `turns` | What the call reports. Default 0. |
+| `seconds` | How long the call sleeps before it answers. Default 0. |
+
+When `<dir>/<step>.patch` exists, arete applies it to the call's folder with `git apply` before it answers, even when the answer fails; this is how a replayed build changes files. No answer folder, a missing file, a file that is not one JSON object, a bad value and a patch that does not apply each fail the step with an error that names the folder setting or the file.
+
+A replayed call is recorded like any other: its step row, its record header and its timeline `agent` mark say `replay`, the raw record holds one `replay` line naming the answer and patch files, and it costs what the file says, which `[pricing]` never changes. Usage limit holds, the login check, the guard, JEV rules and devices do not apply to it. JEV calls are not agent calls and still go to JEV. `all = true` also sends chat, triage, loops and sessions to replay, so turn it on in a scratch `ARETE_CONFIG_DIR` and `ARETE_STATE_DIR`.
+
+`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review and learn, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has no `github` and no `pipeline`, so poll never picks it up.
 
 ## Verify in use
 

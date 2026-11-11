@@ -17,6 +17,7 @@ STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes",
 STEP_COUNTS = ("timeout_minutes", "tries")
 TIER_KEYS = ("runner", "provider", "model")
 KINDS = ("feat", "fix")
+REPLAY_KEYS = ("all", "dir")
 
 
 class UnknownRepo(KeyError):
@@ -93,6 +94,12 @@ class JevConfig:
 
 
 @dataclass
+class ReplayConfig:
+    all: bool = False
+    dir: Path | None = None
+
+
+@dataclass
 class Job:
     label: str
     log: Path | None = None
@@ -120,6 +127,7 @@ class Config:
     probes: list[Probe] = field(default_factory=list)
     jira: JiraConfig = field(default_factory=JiraConfig)
     jev: JevConfig = field(default_factory=JevConfig)
+    replay: ReplayConfig = field(default_factory=ReplayConfig)
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
@@ -227,6 +235,13 @@ def tier_maps(data, where: str) -> dict[str, dict[str, dict[str, str]]]:
                 raise ValueError(f"[{where}.{name}] {tier}: unknown key {', '.join(bad)}; use {', '.join(TIER_KEYS)}")
             maps[name][tier] = {k: str(v) for k, v in entry.items()}
     return maps
+
+
+def replay_table(data) -> ReplayConfig:
+    table = table_of(data, "replay")
+    if bad := sorted(set(table) - set(REPLAY_KEYS)):
+        raise ValueError(f"[replay]: unknown key {', '.join(bad)}; use {', '.join(REPLAY_KEYS)}")
+    return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
 
 
 def load(path: Path | None = None) -> Config:
@@ -344,6 +359,7 @@ def load(path: Path | None = None) -> Config:
                 timeout=int(p.get("timeout", 180)),
             )
         )
+    cfg.replay = replay_table(data.get("replay") or {})
     from . import steps
     steps.check(cfg)
     return cfg

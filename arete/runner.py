@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import ask, claude, config, devices, guard, jev, paths, pi, record, state, util
+from . import ask, claude, config, devices, guard, jev, paths, pi, record, replay, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -17,7 +17,8 @@ from .agent import (
     Session,
 )
 
-RUNNERS = ("claude", "pi")
+REPLAY = "replay"
+RUNNERS = ("claude", "pi", REPLAY)
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
 SECRET_SEARCH_DEPTH = 4
 BUDGET_FLOOR_USD = 0.005
@@ -132,6 +133,8 @@ def cost_note(res: Result) -> str:
 
 
 def priced(res: Result, cfg: config.Config) -> float:
+    if res.runner == REPLAY:
+        return res.cost_usd
     rate = cfg.pricing.get(res.model) or cfg.pricing.get(f"{res.runner}:{res.model}")
     if rate:
         return (res.tokens_in * rate[0] + res.tokens_out * rate[1]) / 1_000_000
@@ -144,17 +147,19 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
         wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, **kw) -> Result:
     cfg = cfg or config.load()
-    target = devices.resolve(device)
+    which, name = route(model, runner or resume.runner)
+    if cfg.replay.all:
+        which = REPLAY
+    target = devices.LOCAL if which == REPLAY else devices.resolve(device)
     if target.remote:
         kw["remote"] = target
-    which, name = route(model, runner or resume.runner)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
             kw = local_claude(kw, cwd, cfg, trace[0], ask_jev)
-    else:
+    elif which == "pi":
         kw["price"] = lambda reply: priced(reply, cfg)
     limited: list[Result] = []
     while True:
@@ -198,7 +203,11 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     hidden = record.secrets(*secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg))
     started = time.monotonic()
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
-        res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, on_line=rec.line, **kw)
+        if which == REPLAY:
+            res = replay.run(cwd, trace, cfg, rec.line)
+        else:
+            res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, on_line=rec.line,
+                                                             **kw)
         res.runner = which
         res.model = res.model or name
         res.provider = res.provider or provider_of(res.model)
