@@ -35,7 +35,7 @@ from . import (
     verdicts,
     verify,
 )
-from .agent import Result, Session
+from .agent import NO_SESSION, Result, Session
 from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
@@ -204,6 +204,7 @@ class AgentRun:
     layer: config.RepoLayer | None = None
     kind: str = ""
     overrides: dict = field(default_factory=dict)
+    sessions: dict[str, Session] = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -227,7 +228,11 @@ class AgentRun:
         return steps.resolve(self.cfg or config.load(), self.layer, role, self.kind, self.overrides)
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
-        kw = {**self.settings(role).call, **kw} if role else kw
+        s = self.settings(role) if role else None
+        if s:
+            reach = s.agent_kw(self.cfg or config.load(), kw.pop("allowed_tools", ()), kw.pop("mcp_config", ""))
+            kw = {**s.call, **reach,
+                  "resume": self.sessions.get(s.step, NO_SESSION) if s.session == "resume" else NO_SESSION, **kw}
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
@@ -242,6 +247,8 @@ class AgentRun:
                                      **{**kw, "resume": res.session})
                 else:
                     res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+        if s and res.session.id:
+            self.sessions[s.step] = res.session
         self.cost += res.cost_usd
         self.paid += res.paid_usd
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
@@ -598,17 +605,14 @@ class Build(TicketWork):
     tools: list[str]
     deny: list[str]
     expertise: str
-    session: Session = field(default_factory=Session)
     report: str = ""
     staged: Staged = field(default_factory=Staged)
     committed_lines: int = 0
     left_for_a_person: str = ""
 
     def resume(self, step: str, text: str, **kw) -> Result:
-        res = self.run.agent(step, text, self.ws, role="build", allowed_tools=self.tools,
-                             disallowed_tools=runner.NO_GIT_WRITES, resume=self.session, **kw)
-        self.session = res.session
-        return res
+        return self.run.agent(step, text, self.ws, role="build", allowed_tools=self.tools,
+                              disallowed_tools=runner.NO_GIT_WRITES, **kw)
 
     def check(self) -> bool:
         ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout)
@@ -849,8 +853,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     builder_bash = layer.builder_bash + reads
     commands = code_list(builder_bash)
     workspace = workspace_note(branch, checkouts)
-    read_tools = runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
-    build_tools = runner.BUILD_TOOLS + bash_rules(builder_bash)
+    read_rules = bash_rules(config.DEFAULT_ALLOW_BASH + reads)
+    build_rules = bash_rules(builder_bash)
     deny = diffguard.denied_paths(layer)
     limit = layer.max_diff_lines
     info = tk.label_name("needs-info")
@@ -868,7 +872,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                          body=t.body, comments=t.comments, attachments=attachments,
                                          feedback=feedback, expertise=expertise, checks=checks,
                                          commands=commands, max_lines=limit),
-                        ws, role="build", allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES,
+                        ws, role="build", allowed_tools=build_rules, disallowed_tools=runner.NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "revise step failed", res.text)
@@ -881,7 +885,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                         body=t.body, comments=t.comments, attachments=attachments,
                                         triage=triage_notes(approval), expertise=expertise, commands=commands,
                                         denied=code_list(deny), max_lines=limit, checks=checks),
-                        ws, role="plan", allowed_tools=read_tools, json_schema=PLAN_SCHEMA)
+                        ws, role="plan", allowed_tools=read_rules, json_schema=PLAN_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "planning step failed")
         plan = res.structured
@@ -906,7 +910,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
                                          expertise=expertise, checks=checks, commands=commands, max_lines=limit,
                                          estimate=estimate, verify=goal),
-                        ws, role="build", allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES)
+                        ws, role="build", allowed_tools=build_rules, disallowed_tools=runner.NO_GIT_WRITES)
         if not res.ok:
             return _fail(run, "build step failed", res.text)
         build_summary = res.text
@@ -920,8 +924,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         not_checked = NOT_CHECKED_LEFT_FOR_A_PERSON + left_for_a_person
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
     b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=layer.timeout_minutes * 60,
-              workspace=workspace, attachments=attachments, tools=build_tools, deny=deny, expertise=expertise,
-              session=res.session, left_for_a_person=left_for_a_person)
+              workspace=workspace, attachments=attachments, tools=build_rules, deny=deny, expertise=expertise,
+              left_for_a_person=left_for_a_person)
 
     attempts, tries = 1, run.settings("build").tries
     ok = b.check()
@@ -1446,7 +1450,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
                                    diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT)),
-                      b.ws, role="review", allowed_tools=runner.READ_TOOLS + bash_rules(b.read_bash),
+                      b.ws, role="review", allowed_tools=bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
@@ -1504,7 +1508,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
                                          surface=surface_note(v, url, evidence), notes=v.notes,
                                          commands=code_list(bash), checks=check_list(b.layer), **values),
                             b.ws, role="verify",
-                            allowed_tools=runner.READ_TOOLS + bash_rules(bash) + (["mcp__playwright"] if url else []),
+                            allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=verify.mcp_config(evidence) if url else "")
     except verify.ServerError as e:
@@ -1584,7 +1588,7 @@ def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise:
     res = run.agent("learn", prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
                                      story="\n\n".join(run.story), expertise=expertise,
                                      max_lines=EXPERTISE_MAX_LINES),
-                    wt, role="learn", allowed_tools=runner.READ_TOOLS, json_schema=LEARN_SCHEMA, persist=False)
+                    wt, role="learn", json_schema=LEARN_SCHEMA, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     rewrite = found.get("expertise", "").strip()
     lines = len(rewrite.splitlines())
@@ -1821,7 +1825,7 @@ def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
                        for url in urls)
     res = run.agent("uat", prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
                                   prs=prs, branch=branch),
-                    run.repo.path, role="uat", allowed_tools=runner.READ_TOOLS, json_schema=UAT_SCHEMA, persist=False)
+                    run.repo.path, role="uat", json_schema=UAT_SCHEMA, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     listed = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
     failure = util.first_line(res.error or "none came back")

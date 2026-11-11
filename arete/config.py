@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,8 +14,14 @@ MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop
                    "research": "opus", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
 STEP_NAMES = (*MODEL_ROLES, *STEP_ALIASES)
-STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries")
+STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
+             "session")
 STEP_COUNTS = ("timeout_minutes", "tries")
+STEP_LISTS = ("tools", "mcp", "instructions")
+INSTRUCTIONS = ("user", "repo")
+SESSIONS = ("resume", "fresh")
+MCP_KEYS = ("command", "args", "url")
+MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 TIER_KEYS = ("runner", "provider", "model")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
@@ -147,6 +154,7 @@ class Config:
     tier_map: str = ""
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
+    mcp: dict[str, dict] = field(default_factory=dict)
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -204,7 +212,37 @@ def step_table(table, where: str) -> dict:
     for key in STEP_COUNTS:
         if key in table and (type(table[key]) is not int or table[key] < 1):
             raise ValueError(f"[{where}]: {key} must be a whole number of at least 1, not {table[key]!r}")
-    return {k: v if k in STEP_COUNTS else str(v) for k, v in table.items()}
+    for key in STEP_LISTS:
+        if key in table and not (isinstance(table[key], list | tuple) and all(isinstance(v, str) for v in table[key])):
+            raise ValueError(f"[{where}]: {key} must be a list of names, not {table[key]!r}")
+    if bad := [v for v in table.get("instructions", ()) if v not in INSTRUCTIONS]:
+        raise ValueError(f"[{where}]: instructions {', '.join(map(repr, bad))} is not one of {', '.join(INSTRUCTIONS)}")
+    if "session" in table and table["session"] not in SESSIONS:
+        raise ValueError(f"[{where}]: session {table['session']!r} is not one of {', '.join(SESSIONS)}")
+    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else v if k in STEP_COUNTS else str(v) for k, v in table.items()}
+
+
+def mcp_tables(data) -> dict[str, dict]:
+    servers = {}
+    for name, entry in table_of(data, "mcp").items():
+        where = f"[mcp.{name}]"
+        if not MCP_NAME.fullmatch(name):
+            raise ValueError(f"{where}: a server name takes only letters, digits, _ and -")
+        if bad := sorted(set(table_of(entry, f"mcp.{name}")) - set(MCP_KEYS)):
+            raise ValueError(f"{where}: unknown key {', '.join(bad)}; use {', '.join(MCP_KEYS)}")
+        if ("command" in entry) == ("url" in entry):
+            raise ValueError(f"{where}: set exactly one of command and url")
+        for key in ("command", "url"):
+            if key in entry and not (isinstance(entry[key], str) and entry[key]):
+                raise ValueError(f"{where}: {key} must be a string, not {entry[key]!r}")
+        args = entry.get("args", [])
+        if "args" in entry and "url" in entry:
+            raise ValueError(f"{where}: args goes with command, not url")
+        if not (isinstance(args, list) and all(isinstance(a, str) for a in args)):
+            raise ValueError(f"{where}: args must be a list of strings, not {args!r}")
+        servers[name] = ({"command": entry["command"], "args": args} if "command" in entry
+                         else {"type": "http", "url": entry["url"]})
+    return servers
 
 
 def step_tables(data, where: str) -> dict[str, dict]:
@@ -363,6 +401,7 @@ def load(path: Path | None = None) -> Config:
             )
         )
     cfg.replay = replay_table(data.get("replay") or {})
+    cfg.mcp = mcp_tables(data.get("mcp") or {})
     from . import steps
     steps.check(cfg)
     return cfg

@@ -204,7 +204,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     started = time.monotonic()
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
         if which == REPLAY:
-            res = replay.run(cwd, trace, cfg, rec.line)
+            res = replay.run(cwd, trace, cfg, rec.line, resume)
         else:
             res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, on_line=rec.line,
                                                              **kw)

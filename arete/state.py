@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS steps (
     turns INTEGER DEFAULT 0,
     seconds REAL,
     error TEXT,
-    ts TEXT
+    ts TEXT,
+    first_context_tokens INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS steps_ts ON steps (ts);
 CREATE INDEX IF NOT EXISTS steps_run ON steps (run_id);
@@ -384,7 +385,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
                   ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
-                  ("stop_asked", "TEXT"), ("moved", "TEXT"))]]
+                  ("stop_asked", "TEXT"), ("moved", "TEXT"))],
+              ("steps", "first_context_tokens", "ALTER TABLE steps ADD COLUMN first_context_tokens INTEGER DEFAULT 0")]
 
 
 @contextmanager

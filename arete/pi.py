@@ -137,12 +137,16 @@ def run(
     add_dirs: list[Path] | None = None,
     mcp_config: str = "",
     remote: devices.Device | None = None,
+    instructions: list[str] | None = None,
     price: Callable[[Result], float] = lambda reply: reply.cost_usd,
     on_line: Callable[[str], None] = lambda line: None,
 ) -> Result:
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
                       session=resume, runner="pi", model=model)
+    if instructions:
+        return Result(ok=False, error="pi runs with --no-context-files and loads no instruction files, so run this "
+                                      "step on claude or set instructions = []", session=resume, runner="pi", model=model)
     cwd = cwd if remote else Path(cwd).absolute()
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
     sandboxed = bool(remote and remote.exe_sandbox)
@@ -272,7 +276,14 @@ def cut_short(proc: subprocess.CompletedProcess, resume: Session, model: str, re
                if e.get("type") == "message_end" and (e.get("message") or {}).get("role") == "assistant"]
     totals = usage_totals([m.get("usage") or {} for m in replies])
     return Result(ok=False, session=session_after(stream, resume, totals["cost_usd"]), error=reason,
-                  turns=len(replies), runner="pi", model=model, **totals)
+                  turns=len(replies), runner="pi", model=model, first_context_tokens=first_context_tokens(proc.stdout),
+                  **totals)
+
+
+def first_context_tokens(stream: str) -> int:
+    first = next((e["message"] for e in events(stream)
+                  if e.get("type") == "message_end" and (e.get("message") or {}).get("role") == "assistant"), None)
+    return usage_totals([first.get("usage") or {}])["tokens_in"] if first else 0
 
 
 def session_after(stream: list[dict], resume: Session, cost_usd: float) -> Session:
@@ -316,6 +327,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         connection_failed=failed and util.is_network_error(error),
         raw={"stopReason": last.get("stopReason"), "usage": usages[-1]},
         **totals,
+        first_context_tokens=first_context_tokens(proc.stdout),
         model=f"{last.get('provider')}/{last.get('model')}" if last.get("provider") else model,
         provider=last.get("provider", ""),
         runner="pi",
