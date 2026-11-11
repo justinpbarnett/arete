@@ -316,6 +316,10 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 
 An open issue labeled `agent` that the repo owner opened. Issues labeled `bug` or `fix` are fixes; the rest are features. Arete tracks progress with `agent:running`, `agent:pr`, `agent:failed` and `agent:needs-info`, and the PR closes the issue, unless it leaves a change for a person. Remove `agent:failed` or `agent:needs-info` to send it back to the queue. When the plan finds nothing left to build and the builder changes nothing, arete pushes nothing: with an open PR it keeps the PR in `agent:pr` and says so on the ticket, and with none it asks in `agent:needs-info` whether the ticket is done. A ticket in `agent:needs-info` also goes back when you reply to arete's question in a comment: poll removes the label, and the next run reads the question and your answer. `arete install` creates all of these labels in each GitHub pipeline repo, so `agent` is there to pick from any GitHub client, the phone app included.
 
+A body line that starts with `Waits on`, such as `Waits on #7.` or `Waits on #7 and #9`, holds the issue until every issue or PR of the same repo it names is closed or merged, and a number arete cannot read holds it too.
+Poll skips an issue that waits on such a number, with the reason in the serve log and the dashboard's queue; `arete run` skips it too, and `--force` or Run on the queue runs it anyway.
+A `#N` anywhere but a `Waits on` line holds nothing, and Jira tickets order work with their own links, not `Waits on` lines.
+
 ## Jira tickets
 
 ```toml
