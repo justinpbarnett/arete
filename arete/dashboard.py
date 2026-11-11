@@ -59,6 +59,7 @@ DEVICE_PATH = "/api/devices/"
 TRIAGE_PATH = "/api/triage/"
 SKIPPED_PATH = "/api/skipped/"
 PROPOSAL_PATH = "/api/proposals/"
+CHAT_PATH = "/api/chats/"
 INSTALL_SECONDS = 120
 USAGE_KINDS = ("visit", "action")
 USAGE_DEVICES = ("desktop", "phone")
@@ -174,7 +175,8 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, gh.GhError: 502,
+STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409,
+                     chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
                      triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409}
@@ -252,9 +254,9 @@ class Handler(BaseHTTPRequestHandler):
     def api(self, method: str, path: str, query: dict):
         if method == "GET":
             if path == "/api/sidebar":
-                return board.sidebar(chat.view())
+                return board.sidebar(chat.pulse())
             if path == "/api/live":
-                return board.live_board(chat.view()["draft"])
+                return board.live_board(chat.pulse()["draft"])
             if path == "/api/runs":
                 return board.runs_board(query, limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
             if path.startswith(RUN_PATH):
@@ -271,8 +273,10 @@ class Handler(BaseHTTPRequestHandler):
                 return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))))
             if path == "/api/settings":
                 return settings.current()
-            if path == "/api/chat":
-                return chat.view()
+            if path == "/api/chats":
+                return chat.listing()
+            if path.startswith(CHAT_PATH):
+                return chat.view(whole_number(unquote(path[len(CHAT_PATH):])))
             if path.startswith(LOG_PATH):
                 run_id = unquote(path[len(LOG_PATH):])
                 return {"id": run_id, "lines": board.run_log(run_id)}
@@ -291,14 +295,16 @@ class Handler(BaseHTTPRequestHandler):
                 return {}
             if path == "/api/settings":
                 return settings.save(self.body())
-            if path == "/api/chat":
-                return chat.send(self.chat_text())
-            if path == "/api/chat/new":
-                return chat.new()
-            if path == "/api/chat/file":
-                return chat.file_draft()
-            if path == "/api/chat/drop":
-                return chat.drop_draft()
+            if path == "/api/chats/new":
+                return chat.new(str(self.body().get("project") or ""))
+            if path.startswith(CHAT_PATH):
+                chat_id, action = last_part(path, CHAT_PATH)
+                if action == "send":
+                    return chat.send(whole_number(chat_id), self.chat_text())
+                if action == "file":
+                    return chat.file_draft(whole_number(chat_id))
+                if action == "drop":
+                    return chat.drop_draft(whole_number(chat_id))
             if path == "/api/loops/new":
                 return self.draft_loop()
             if path.startswith(LOOP_PATH):
@@ -538,7 +544,7 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     cfg = config.load()
     port = port or cfg.dashboard_port
     state.ensure_schema()
-    chat.settle_after_restart()
+    chat.recover()
     logins = Logins()
     waiting_for = ""
     while True:

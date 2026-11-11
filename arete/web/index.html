@@ -213,7 +213,12 @@
     <button type="button" id="console-close">Close</button>
   </div>
   <div class="console-body" id="console-body">
-    <p class="muted">Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here or from Live.</p>
+    <p class="muted">Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here or from Live. A chat on a project works in that repo's folder and knows its checks and what arete's agents learned there.</p>
+    <div class="field">
+      <label for="chat-pick">Chat</label>
+      <select id="chat-pick"></select>
+    </div>
+    <p id="chat-about" class="muted" hidden></p>
     <div id="messages" aria-live="polite"></div>
     <p id="working" class="muted" hidden></p>
     <div id="draft" class="draft" hidden>
@@ -237,10 +242,19 @@
     </div>
     <div class="actions">
       <button type="submit" id="chat-send">Send</button>
-      <button type="button" id="chat-new">New chat</button>
       <span class="muted keys">Ctrl or Cmd with Enter sends</span>
     </div>
     <p id="chat-result" aria-live="polite" tabindex="-1" hidden></p>
+  </form>
+  <form id="chat-new-form" novalidate>
+    <div class="field">
+      <label for="chat-project">New chat on</label>
+      <select id="chat-project"><option value="">No project</option></select>
+    </div>
+    <div class="actions">
+      <button type="submit" id="chat-new">New chat</button>
+    </div>
+    <p id="chat-new-result" aria-live="polite" tabindex="-1" hidden></p>
   </form>
 </aside>
 

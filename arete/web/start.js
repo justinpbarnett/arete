@@ -37,9 +37,13 @@ function wireConsole() {
   });
   document.getElementById("console-close").addEventListener("click", () => setConsole(false));
   document.getElementById("chat").addEventListener("submit", sendChat);
-  for (const [id, path, resultId] of [["chat-new", "/api/chat/new", "chat-result"],
-    ["draft-file", "/api/chat/file", "draft-result"], ["draft-drop", "/api/chat/drop", "draft-result"]]) {
-    document.getElementById(id).addEventListener("click", (event) => chatAction(path, event.currentTarget, resultId, id));
+  document.getElementById("chat-new-form").addEventListener("submit", newChat);
+  document.getElementById("chat-pick").addEventListener("change", (event) => {
+    switchChat(Number(event.currentTarget.value));
+    pollSoon();
+  });
+  for (const [id, action] of [["draft-file", "file"], ["draft-drop", "drop"]]) {
+    document.getElementById(id).addEventListener("click", (event) => draftAction(action, event.currentTarget));
   }
 }
 

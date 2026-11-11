@@ -151,20 +151,20 @@ function draftRow(draft) {
       foldText("draft:body", "Show the body", draft.body)]),
     cell(""),
     cell(el("div", { class: "row-buttons" },
-      button("File this issue", "file-draft", fileDraft),
-      button("Drop", "drop-draft", dropDraft),
+      button("File this issue", "file-draft", (btn) => fileDraft(draft.chat, btn)),
+      button("Drop", "drop-draft", (btn) => dropDraft(draft.chat, btn)),
       button("Open the console", "open-console", () => setConsole(true, { focus: true })))));
 }
 
-function fileDraft(btn) {
-  return act(btn, "needs", "/api/chat/file", {}, (view) => {
+function fileDraft(chat, btn) {
+  return act(btn, "needs", `/api/chats/${chat}/file`, {}, (view) => {
     drawChat(view);
     return view.messages.at(-1)?.text || "Filed the issue.";
   });
 }
 
-function dropDraft(btn) {
-  return act(btn, "needs", "/api/chat/drop", {}, (view) => {
+function dropDraft(chat, btn) {
+  return act(btn, "needs", `/api/chats/${chat}/drop`, {}, (view) => {
     drawChat(view);
     return "Dropped the drafted issue. Nothing reached GitHub.";
   });

@@ -551,12 +551,15 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
 
 The console is a side panel that opens from any view with its button or `c` and stays open from view to view; on a phone it fills the screen.
 It talks to a console agent on the `chat` model.
-The agent reads arete's code, config, state and logs, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues.
+Every chat is kept in `arete.db`, and the Chat picker in the panel lists them newest first.
+New chat starts one with no project, which works in arete's folder, or on one repo from the config, which works in that repo's folder and gets its layer's checks and expertise from arete's side.
+The agent reads arete's code, config, state and logs, and its project's code when it has one, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues.
 It never edits a file.
-Ask it for a change and it drafts an issue.
+Ask it for a change to arete and it drafts an issue.
 The draft shows in the panel and on Live, and nothing reaches GitHub until you press File this issue (Drop discards it).
 Each call to the model stops at $2, and a reply on a paid runner shows what it cost.
-Messages continue one session until New chat.
+Each chat continues its own session and waits on its own answer, so several chats can wait at once.
+On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
 
 Money counts only what you pay, on the dashboard and everywhere else arete shows a sum: the CLI, a run's end line in its feed, PR bodies, research reports and eval results.
 A step on the `claude` CLI rides the subscription, so every paid sum leaves it out, a run's page says "subscription" for its claude models, and a run that paid nothing ends its feed with "nothing paid".
