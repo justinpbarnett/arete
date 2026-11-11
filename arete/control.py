@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -14,6 +15,7 @@ from . import (
     devices,
     emits,
     hooks,
+    lines,
     loops,
     paths,
     record,
@@ -27,6 +29,9 @@ BEAT_FILE = paths.STATE_DIR / "serve.json"
 BEAT_STALE_SECONDS = 120
 DETACHED_LOG = "loops.log"
 COST_DAYS = 7
+COST_GROUPS = ("step", "kind", "model")
+STEP_FIELD_OF = {"step": "step", "kind": "task_kind", "model": "model"}
+TOKEN_FIELDS = ("tokens_in", "cache_read", "cache_write", "tokens_out")
 DIGEST_DAYS = 3
 DIGEST_CHARS = 20000
 METRIC_DAYS = 30
@@ -200,13 +205,51 @@ def fleet() -> list[dict]:
         return [{**devices.LOCAL.view(), "probe": None, "error": str(e)}]
 
 
-def costs(days: float | None = None, connect=state.db) -> dict:
+def cost_window(days: float | None) -> tuple[float, str]:
     days = COST_DAYS if days is None else days
     try:
-        since = util.iso(util.now() - timedelta(days=days))
+        return days, util.iso(util.now() - timedelta(days=days))
     except (OverflowError, ValueError) as e:
         raise Refused(f"cannot look back {days:g} days: {e}") from e
+
+
+def costs(days: float | None = None, connect=state.db) -> dict:
+    days, since = cost_window(days)
     return {"days": days, **paid_since(since, connect)}
+
+
+def step_costs(by: str, days: float | None = None, connect=state.db) -> dict:
+    if by not in COST_GROUPS:
+        raise Refused(f"cannot group costs by {by}; pick one of {', '.join(COST_GROUPS)}")
+    days, since = cost_window(days)
+    groups: dict[str, dict] = {}
+    for s in state.steps_since(since, connect):
+        name = s[STEP_FIELD_OF[by]] or f"no {by}"
+        row = groups.setdefault(name, {"by": by, "name": name, "runs": set(), "calls": 0, "cost_usd": 0.0,
+                                       **dict.fromkeys(TOKEN_FIELDS, 0), "minutes": 0.0, "api_minutes": 0.0})
+        row["runs"].add(s["run_id"])
+        row["calls"] += 1
+        row["cost_usd"] += s["cost_usd"] or 0
+        for f in TOKEN_FIELDS:
+            row[f] += s.get(f) or 0
+        row["minutes"] += (s["seconds"] or 0) / 60
+        row["api_minutes"] += (s.get("api_seconds") or 0) / 60
+    out = [{**r, "runs": len(r["runs"]), "cost_usd": round(r["cost_usd"], 4), "minutes": round(r["minutes"], 2),
+            "api_minutes": round(r["api_minutes"], 2)} for r in groups.values()]
+    waits = dict.fromkeys(lines.WAIT_CAUSES, 0.0)
+    for r in state.runs_since(since, connect):
+        try:
+            recorded = json.loads(r.get("wait_minutes") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(recorded, dict):
+            continue
+        for cause in waits:
+            if type(recorded.get(cause)) in (int, float):
+                waits[cause] += recorded[cause]
+    return {"days": days, "since": since, "by": by,
+            "groups": sorted(out, key=lambda r: (-r["cost_usd"], -r["calls"], r["name"])),
+            "wait_minutes": {cause: round(minutes, 2) for cause, minutes in waits.items()}}
 
 
 def paid_since(since: str, connect=state.db) -> dict:

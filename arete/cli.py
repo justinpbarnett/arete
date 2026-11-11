@@ -773,6 +773,8 @@ def cmd_webhook(args) -> int:
 def cmd_costs(args) -> int:
     from . import control, util
 
+    if args.by or args.json:
+        return print_step_costs(args.by or "step", args.days, args.json)
     try:
         c = control.costs(args.days)
     except control.Refused as e:
@@ -784,6 +786,28 @@ def cmd_costs(args) -> int:
             steps = "step " if row["steps"] == 1 else "steps"
             print(f"  {row['name']:<36} ${row['cost_usd']:>8.2f}  {row['steps']:>5} {steps}  "
                   f"{row['tokens_in']:>10,} in  {row['tokens_out']:>9,} out")
+    return 0
+
+
+def print_step_costs(by: str, days: float | None, as_json: bool) -> int:
+    from . import control
+
+    try:
+        c = control.step_costs(by, days)
+    except control.Refused as e:
+        return refused(e)
+    waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"]}
+    if as_json:
+        print_lines([*(json.dumps(g) for g in c["groups"]), json.dumps(waits)])
+        return 0
+    print(f"Every step by {by} in the last {c['days']:g} days. Cost is what each call reported; a claude CLI step's "
+          "is the API price, since it rides the subscription. `in` counts the input no cache served.")
+    rows = [(by, "runs", "calls", "cost", "in", "cache rd", "cache wr", "out", "min", "api min")]
+    rows += [(g["name"], str(g["runs"]), str(g["calls"]), f"${g['cost_usd']:.2f}",
+              f"{g['tokens_in'] - g['cache_read'] - g['cache_write']:,}", f"{g['cache_read']:,}", f"{g['cache_write']:,}",
+              f"{g['tokens_out']:,}", f"{g['minutes']:.1f}", f"{g['api_minutes']:.1f}") for g in c["groups"]]
+    print_table(rows, 200)
+    print("waits (minutes): " + "  ".join(f"{cause} {m:.1f}" for cause, m in c["wait_minutes"].items()))
     return 0
 
 
@@ -1008,8 +1032,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.set_defaults(fn=cmd_webhook)
 
-    p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop")
+    p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop; with --by, every step "
+                                     "by step, task kind or model, and the wait minutes by cause")
     p.add_argument("--days", type=float, default=None)
+    p.add_argument("--by", choices=("step", "kind", "model"))
+    p.add_argument("--json", action="store_true", help="one JSON line per group, then one with the wait minutes")
     p.set_defaults(fn=cmd_costs)
 
     p = sub.add_parser("steps", help="the model, runner, effort, timeout, tries, tools, mcp servers, instructions and "

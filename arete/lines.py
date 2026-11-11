@@ -16,6 +16,7 @@ HEARTBEAT_SECONDS = 30
 FOLLOW_POLL_SECONDS = 0.2
 END = "report"
 FIXED = ("ts", "run", "seq", "event")
+WAIT_CAUSES = ("limit", "ci", "slot", "person")
 
 _writing = threading.Lock()
 
@@ -95,6 +96,40 @@ def follow(run_id: str, start: int = 0) -> Iterator[dict]:
 def last_step(run_id: str) -> str:
     return next((str(line.get("step") or "") for line in reversed(read(run_id)) if line.get("event") == "step_start"),
                 "")
+
+
+def wait_start(run_id: str, cause: str, at: str) -> None:
+    write(run_id, "wait", cause=cause, phase="start", at=at)
+
+
+def wait_end(run_id: str, cause: str, since: str, until: str) -> None:
+    seconds = (util.parse_iso(until) - util.parse_iso(since)).total_seconds()
+    write(run_id, "wait", cause=cause, phase="end", at=until, since=since, minutes=round(max(0.0, seconds) / 60, 2))
+
+
+def waited(run_id: str, cause: str, since: str, until: str) -> None:
+    wait_start(run_id, cause, since)
+    wait_end(run_id, cause, since, until)
+
+
+@contextmanager
+def waiting(run_id: str, cause: str):
+    since = util.iso()
+    wait_start(run_id, cause, since)
+    try:
+        yield
+    finally:
+        wait_end(run_id, cause, since, util.iso())
+
+
+def wait_minutes(run_id: str) -> dict:
+    found = dict.fromkeys(WAIT_CAUSES, 0.0)
+    for line in read(run_id):
+        minutes = line.get("minutes")
+        if (line.get("event") == "wait" and line.get("phase") == "end" and line.get("cause") in found
+                and type(minutes) in (int, float)):
+            found[line["cause"]] += minutes
+    return {cause: round(minutes, 2) for cause, minutes in found.items()}
 
 
 @contextmanager

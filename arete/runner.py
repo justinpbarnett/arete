@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
 from . import ask, claude, config, devices, guard, jev, paths, pi, record, replay, state, util
@@ -150,7 +151,8 @@ def priced(res: Result, cfg: config.Config) -> float:
 
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
-        wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, **kw) -> Result:
+        wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, tier: str = "",
+        kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), **kw) -> Result:
     cfg = cfg or config.load()
     which, name = chosen(model, runner or resume.runner, cfg)
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
@@ -168,10 +170,11 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     while True:
         if wait_out_limits and (held := usage_hold(name, which)):
             say(hold_words(held))
-            wait_out(held["scope"])
+            with waits("limit"):
+                wait_out(held["scope"])
             say("the claude usage limit has lifted, going on")
         started = util.iso()
-        res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw)
+        res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind)
         if not res.usage_limit:
             if which == "claude" and res.ok:
                 state.clear_holds([s for s in LIMIT_SCOPES if limit_applies(s, res.model)], set_before=started)
@@ -182,7 +185,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             return res
         limited.append(res)
         say(hold_words({"why": f"claude {limit.kind or 'usage'} limit reached", "until": limit.until}))
-        wait_out(limit.scope)
+        with waits("limit"):
+            wait_out(limit.scope)
         say("the claude usage limit has lifted, going on")
         if res.session.id and res.turns > 1 and kw.get("persist", True):
             prompt, resume = CONTINUE_AFTER_LIMIT, res.session
@@ -192,11 +196,15 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
     res.cost_usd += sum(r.cost_usd for r in earlier)
     res.tokens_in += sum(r.tokens_in for r in earlier)
     res.tokens_out += sum(r.tokens_out for r in earlier)
+    res.cache_read += sum(r.cache_read for r in earlier)
+    res.cache_write += sum(r.cache_write for r in earlier)
+    res.api_seconds += sum(r.api_seconds for r in earlier)
     return res
 
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
-            trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict) -> Result:
+            trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
+            kind: str = "") -> Result:
     header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
               "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
               "allowed_tools": kw.get("allowed_tools"), "disallowed_tools": kw.get("disallowed_tools"),
@@ -217,7 +225,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         res.cost_usd = priced(res, cfg)
         rec.finish(res, time.monotonic() - started)
     if trace[0]:
-        record.step(trace[0], trace[1], res, time.monotonic() - started)
+        record.step(trace[0], trace[1], res, time.monotonic() - started, effort=kw.get("effort", ""), tier=tier,
+                    kind=kind)
     return res
 
 

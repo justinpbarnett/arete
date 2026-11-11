@@ -214,6 +214,8 @@ def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd
     result.cost_usd += again.cost_usd
     result.tokens_in += again.tokens_in
     result.tokens_out += again.tokens_out
+    result.cache_read += again.cache_read
+    result.cache_write += again.cache_write
     result.structured = json_from_text(again.text) if again.ok else None
 
 

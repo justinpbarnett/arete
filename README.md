@@ -189,6 +189,8 @@ arete session attach ID | stop ID | list
 
 `arete costs` shows what you paid for model calls, by model, runner and loop. A step on the claude CLI rides the subscription and counts nothing there.
 
+`arete costs --by step|kind|model` counts every step instead, at the cost each call reported (a claude CLI step's is the API price), grouped by step name, by the task's kind (`feat`, `fix`) or by model, over the last `--days N` (default 7). Each row shows the runs (distinct runs in the group), calls, cost, input tokens no cache served (`in`), cache reads and cache writes, output tokens, minutes and API minutes. The minutes are each call's whole time; the API minutes are the part the model's API calls took, as the runner reports it (claude does, pi does not), so the rest went to tools. The last line gives the wait minutes of the runs started in that window, by cause. `--json` prints one JSON line per group and a last line with `wait_minutes`; `--json` alone groups by step. The plain `arete costs` stays the paid view.
+
 ## JEV
 
 JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads text and answers a yes or no question, picks one of a few labels, or rates on a scale, each with a confidence, fast and for $0.042 per million input tokens. Arete asks it first where a classifier can settle the question, and leaves the question to the model only when JEV is unsure:
@@ -273,12 +275,13 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 |---|---|
 | `task` | `ticket`, `kind`, `repo`, `title`; when the run starts |
 | `answer` | `asked_in` (the run that asked), `question`; in the new run that the author's reply starts |
-| `step_start` | `step`, `runner`, `model`, `effort`; before each agent call |
+| `step_start` | `step`, `runner`, `model`, `effort`, `tier` (the step's tier, or empty), `kind` (the task's kind); before each agent call |
 | `heartbeat` | `step`, `seconds` so far; every 30 seconds while a step works (`lines.HEARTBEAT_SECONDS`) |
-| `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`; the cost counts an attempt the network dropped |
+| `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`, `try`, `cache_read`, `cache_write`, `api_seconds`; the cost counts an attempt the network dropped. `tokens_in` includes the cache reads and writes. `try` is how many calls of this step name the run has recorded, so the second call of `build` has try 2; a step the pipeline numbers itself (`fix1`, `fix2`) starts at 1 under each name. `api_seconds` is the time the model's API calls took (0 on pi, which reports none), so `seconds` minus `api_seconds` is the time spent in tools |
+| `wait` | `cause` (`limit`, `ci`, `slot` or `person`), `phase` (`start` or `end`), `at`; the end line adds `since` and `minutes`. `limit` is a claude usage limit hold, `ci` the watch on CI, `slot` the wait for a free run slot: after the CI watch, and before the run started, from the first poll that passed the ready ticket over (for `max_parallel` or `max_parallel_per_repo`). `person` runs from the asking run's `question` line to the start of the run the reply starts, or to the first pass-over if there was one. The `slot` and `person` lines are the run's first lines. A wait whose end line never came is not counted |
 | `question` | `question` (the comment), `summary`; when the run asks the ticket's author |
 | `error` | `step` (the last step started, or empty), `message`; for a failed or interrupted run, not for a stop by request |
-| `report` | `status` as the `runs` table holds it, `prs`, `minutes`, `cost_usd`; always the last line, and the poll writes it for a run whose process died |
+| `report` | `status` as the `runs` table holds it, `prs`, `minutes`, `cost_usd`, `wait_minutes` (minutes by cause, also kept on the run's row); always the last line, and the poll writes it for a run whose process died |
 
 Eval runs write the step events too, but no `task` or `report`.
 Each line is also printed to the run's stdout.
@@ -540,7 +543,7 @@ dir = "~/replay/answers"
 | `text` | The answer's text. |
 | `structured` | The structured answer, for a step that passes a schema. |
 | `ok`, `error` | Default true and empty. `ok = false` with no error fails with one that names the file. |
-| `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `first_context_tokens` | What the call reports. Default 0. |
+| `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `first_context_tokens`, `cache_read`, `cache_write`, `api_seconds` | What the call reports. Default 0. |
 | `session` | The session id the call reports when it resumes none. Default a new random id; a call that resumes a session reports that one. |
 | `seconds` | How long the call sleeps before it answers. Default 0. |
 

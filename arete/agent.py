@@ -36,6 +36,9 @@ class Result:
     raw: dict = field(default_factory=dict)
     tokens_in: int = 0
     tokens_out: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    api_seconds: float = 0.0
     first_context_tokens: int = 0
     model: str = ""
     provider: str = ""
@@ -53,13 +56,17 @@ def usage_totals(usages: list[dict]) -> dict:
     return {"cost_usd": sum(float((u.get("cost") or {}).get("total") or 0) for u in usages),
             "tokens_in": sum(int(u.get("input") or 0) + int(u.get("cacheRead") or 0) + int(u.get("cacheWrite") or 0)
                              for u in usages),
-            "tokens_out": sum(int(u.get("output") or 0) for u in usages)}
+            "tokens_out": sum(int(u.get("output") or 0) for u in usages),
+            "cache_read": sum(int(u.get("cacheRead") or 0) for u in usages),
+            "cache_write": sum(int(u.get("cacheWrite") or 0) for u in usages)}
 
 
 def claude_tokens(usage: dict) -> dict:
     return {"tokens_in": sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
                                                                "cache_read_input_tokens")),
-            "tokens_out": int(usage.get("output_tokens") or 0)}
+            "tokens_out": int(usage.get("output_tokens") or 0),
+            "cache_read": int(usage.get("cache_read_input_tokens") or 0),
+            "cache_write": int(usage.get("cache_creation_input_tokens") or 0)}
 
 
 def fenced_json(text: str):

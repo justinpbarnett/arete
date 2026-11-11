@@ -63,13 +63,16 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
                 raise
 
 
-def step(run_id: str, name: str, res, seconds: float) -> None:
+def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "") -> None:
     with state.db() as c:
         c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out, turns,"
-                  " seconds, error, ts, first_context_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  " seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                  " api_seconds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                  "(SELECT COUNT(*) + 1 FROM steps WHERE run_id = ? AND step = ?),?,?,?,?)",
                   (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
                    res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                   res.first_context_tokens))
+                   res.first_context_tokens, effort or "", tier or "", run_id, name, kind or "", res.cache_read,
+                   res.cache_write, round(res.api_seconds, 2)))
         c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
                   "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
                   (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
