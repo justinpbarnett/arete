@@ -435,7 +435,7 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
                             repos="\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none",
                             **filing(h, filed_path)),
                      dirs[0] if dirs else REPORTS_DIR, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
-                     mcp_config=triage.NO_MCP_SERVERS, json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
+                     json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
                      timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else {}
     report = str(answer.get("report") or "").strip()
