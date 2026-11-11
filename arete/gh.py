@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import itertools
 import json
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -241,8 +242,67 @@ def pr_set_draft(url: str, draft: bool) -> None:
     gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
-def pr_merge_auto(repo: str, number: int) -> None:
-    gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch"])
+MERGE_NOW = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
+MERGE_LATER = {"BLOCKED", "BEHIND"}
+MERGE_WAIT_SECONDS = 120
+MERGE_POLL_SECONDS = 5
+
+
+def merge_action(state: str, mergeable: str, auto_allowed: bool) -> str:
+    """merge, wait, auto or leave, from GitHub's mergeStateStatus and mergeable."""
+    state, mergeable = (state or "UNKNOWN").upper(), (mergeable or "UNKNOWN").upper()
+    if "UNKNOWN" in (state, mergeable):
+        return "wait"
+    if mergeable == "CONFLICTING":
+        return "leave"
+    if state in MERGE_NOW:
+        return "merge"
+    if state in MERGE_LATER and auto_allowed:
+        return "auto"
+    return "leave"
+
+
+def leave_reason(state: str, mergeable: str, auto_allowed: bool) -> str:
+    if mergeable == "CONFLICTING" or state == "DIRTY":
+        return "it conflicts with the base branch"
+    if state == "DRAFT":
+        return "it is a draft"
+    if state == "BLOCKED" and not auto_allowed:
+        return "GitHub blocks the merge until a required review or check passes, and the repo has auto merge off"
+    if state == "BEHIND" and not auto_allowed:
+        return "it is behind the base branch, and the repo has auto merge off"
+    return f"GitHub reports merge state {state}, mergeable {mergeable}"
+
+
+def pr_merge_state(repo: str, number: int) -> tuple[str, str]:
+    row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", "mergeStateStatus,mergeable"]) or {}
+    return (row.get("mergeStateStatus") or "UNKNOWN").upper(), (row.get("mergeable") or "UNKNOWN").upper()
+
+
+def repo_allows_auto_merge(repo: str) -> bool:
+    return bool((gh_json(["api", f"repos/{repo}"]) or {}).get("allow_auto_merge"))
+
+
+def pr_merge_auto(repo: str, number: int, wait: float = MERGE_WAIT_SECONDS,
+                  poll: float = MERGE_POLL_SECONDS) -> tuple[str, str]:
+    """Merge now, turn on auto merge, or leave the PR: ("merged", ""), ("auto", "") or ("left", reason)."""
+    auto_allowed = repo_allows_auto_merge(repo)
+    deadline = time.monotonic() + wait
+    while True:
+        state, mergeable = pr_merge_state(repo, number)
+        action = merge_action(state, mergeable, auto_allowed)
+        if action != "wait" or time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
+    if action == "merge":
+        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--delete-branch"])
+        return "merged", ""
+    if action == "auto":
+        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch"])
+        return "auto", ""
+    if action == "wait":
+        return "left", f"GitHub still reported the merge state as unknown after {wait:g} seconds"
+    return "left", leave_reason(state, mergeable, auto_allowed)
 
 
 def default_branch(repo: str) -> str:
