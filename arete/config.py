@@ -17,6 +17,7 @@ STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes",
 STEP_COUNTS = ("timeout_minutes", "tries")
 TIER_KEYS = ("runner", "provider", "model")
 KINDS = ("feat", "fix")
+TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 
 
@@ -39,7 +40,7 @@ class Repo:
     pipeline: bool = False
     mine: bool = True
     public: bool = False
-    tracker: Literal["github", "jira"] = "github"
+    tracker: Literal["github", "jira", "local"] = "github"
     jira_project: str = ""
     jira_label: str = ""
     layer: Path | None = None
@@ -53,6 +54,8 @@ class Repo:
 
 STATES = ("running", "pr", "failed", "needs-info")
 DELIVERED = "done"
+TASK_STATES = ("todo", *STATES, DELIVERED, "closed")
+TASK_FINISHED = (DELIVERED, "closed")
 RESEARCH_MOVES = ("running", "pr", "failed", DELIVERED)
 DASHBOARD_PORT = 8796
 
@@ -317,8 +320,8 @@ def load(path: Path | None = None) -> Config:
                          f"{', '.join(JevConfig().screen_lines)}")
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")
-        if tracker not in ("github", "jira"):
-            raise ValueError(f"repo {r['name']}: tracker must be github or jira, not '{tracker}'")
+        if tracker not in TRACKERS:
+            raise ValueError(f"repo {r['name']}: tracker must be github, jira or local, not '{tracker}'")
         github = r.get("github", "")
         parts = [Part(p["dir"].strip("/"), p["github"]) for p in r.get("part", [])]
         if parts and (github or tracker != "jira"):

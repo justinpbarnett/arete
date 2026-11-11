@@ -273,7 +273,7 @@ TriageSource = JiraSource | GitHubSource
 def sources(cfg: config.Config) -> list[TriageSource]:
     found: dict[tuple[str, str], TriageSource] = {}
     for r in cfg.repos:
-        if not (r.pipeline and r.parts):
+        if not (r.pipeline and r.parts) or r.tracker == "local":
             continue
         if r.tracker == "jira":
             project = r.jira_project or cfg.jira.project

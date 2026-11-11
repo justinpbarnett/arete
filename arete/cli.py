@@ -300,6 +300,39 @@ def cmd_run(args) -> int:
     return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force)
 
 
+def cmd_task(args) -> int:
+    from . import chat, state
+
+    if args.action == "add":
+        body = " ".join(args.body).strip()
+        if not body:
+            print('arete task add --repo NAME "what to do"', file=sys.stderr)
+            return 2
+        config.load().repo(args.repo)
+        print(state.task_add(args.repo, body, title=args.title.strip() or chat.title_of(body), kind=args.kind))
+        return 0
+    if args.action == "list":
+        print_lines(json.dumps(row, ensure_ascii=False) for row in state.tasks(args.repo, args.state))
+        return 0
+    tid = args.id.strip().lower()
+    if (row := state.task_get(tid)) is None:
+        print(f"no task {tid}", file=sys.stderr)
+        return 1
+    if args.action == "show":
+        print(json.dumps({**row, "comments": state.task_comments(tid)}, indent=2, ensure_ascii=False))
+    elif args.action == "reply":
+        text = " ".join(args.text).strip()
+        if not text:
+            print('arete task reply ID "your reply"', file=sys.stderr)
+            return 2
+        state.task_comment(tid, "owner", text)
+        print(f"{tid}: reply saved")
+    else:
+        state.task_set_state(tid, "closed")
+        print(f"{tid}: closed")
+    return 0
+
+
 def cmd_jira_check(args) -> int:
     from . import jira, pipeline, tracker
 
@@ -982,10 +1015,29 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")
-    p.add_argument("issue", help="an issue number (35) or a Jira key (ABC-1234)")
+    p.add_argument("issue", help="an issue number (35), a Jira key (ABC-1234) or a task id (t-1a2b)")
     p.add_argument("--dry-run", action="store_true", help="plan and build locally, no push, PR or tracker writes")
     p.add_argument("--force", action="store_true", help="run a ticket the approval rules would skip")
     p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("task", help="local tasks, which have no tracker issue: add, list, show, reply to and close them")
+    tsub = p.add_subparsers(dest="action", required=True)
+    t = tsub.add_parser("add", help="add a task to a repo and print its id")
+    t.add_argument("--repo", required=True, help="a repo name from the config")
+    t.add_argument("--title", default="", help="the body's first line by default")
+    t.add_argument("--kind", default="feat", choices=config.KINDS)
+    t.add_argument("body", nargs="+", help="what to do")
+    t = tsub.add_parser("list", help="one JSON line per task, oldest first")
+    t.add_argument("--repo", default="")
+    t.add_argument("--state", default="", choices=config.TASK_STATES)
+    t = tsub.add_parser("show", help="a task and its comments as JSON")
+    t.add_argument("id")
+    t = tsub.add_parser("reply", help="answer a task's question as its owner")
+    t.add_argument("id")
+    t.add_argument("text", nargs="+")
+    t = tsub.add_parser("close", help="close a task")
+    t.add_argument("id")
+    p.set_defaults(fn=cmd_task)
 
     p = sub.add_parser("poll", help="loop 3: run the pipeline on the oldest ready ticket in each pipeline repo")
     p.add_argument("--dry-run", action="store_true")

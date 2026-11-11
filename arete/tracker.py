@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from . import config, gh, jira
+from . import config, gh, jira, state
 
 LABEL = "agent"
 APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
@@ -24,8 +24,14 @@ MAX_COMMENTS = 10
 MAX_IMAGES = 6
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ARETE_TAG = "[arete]"
+TASK_ID = re.compile(r"t-[0-9a-f]{4,}", re.IGNORECASE)
 
-ERRORS = (gh.GhError, jira.JiraError)
+
+class TaskError(LookupError):
+    pass
+
+
+ERRORS = (gh.GhError, jira.JiraError, TaskError)
 
 
 @dataclass
@@ -69,9 +75,13 @@ class Ticket:
         self.title = self.title.strip()
 
 
+def is_task_id(tid) -> bool:
+    return bool(TASK_ID.fullmatch(str(tid or "").strip()))
+
+
 def ref_for(issue) -> str:
     s = str(issue or "")
-    return s if jira.KEY_RE.match(s) else f"#{s}"
+    return s if jira.KEY_RE.match(s) or is_task_id(s) else f"#{s}"
 
 
 def ticket_name(repo: str, ref: str) -> str:
@@ -98,9 +108,15 @@ _clients: dict[str, jira.Client] = {}
 
 
 def for_repo(cfg: config.Config, repo: config.Repo) -> Tracker:
+    if repo.tracker == "local":
+        return LocalTracker(repo)
     if repo.tracker == "jira":
         return JiraTracker(repo, cfg.jira)
     return GitHubTracker(repo)
+
+
+def for_ticket(cfg: config.Config, repo: config.Repo, tid: str | int) -> Tracker:
+    return LocalTracker(repo) if is_task_id(tid) else for_repo(cfg, repo)
 
 
 class GitHubTracker:
@@ -359,7 +375,98 @@ class JiraTracker:
         return f"Jira: [{t.ref}]({t.url})"
 
 
-Tracker = GitHubTracker | JiraTracker
+class LocalTracker:
+    name = "local"
+    pr_labels: tuple[str, ...] = ()
+
+    def __init__(self, repo: config.Repo):
+        self.repo = repo
+
+    @property
+    def queue_hint(self) -> str:
+        return "local tasks, with `arete task add`"
+
+    def label_name(self, state: str) -> str:
+        return state
+
+    def normalize(self, tid: str | int) -> str:
+        s = str(tid).strip().lower()
+        if not is_task_id(s):
+            raise ValueError(f"'{tid}' is not a task id like t-1a2b")
+        return s
+
+    def ref(self, tid: str) -> str:
+        return tid
+
+    def todo(self) -> list[Ticket]:
+        return [task_ticket(row) for row in state.tasks(self.repo.name, "todo")]
+
+    def by_owner(self, item: dict) -> bool:
+        return True
+
+    def blocker(self, tid: str) -> str:
+        if (row := state.task_get(tid)) is None:
+            return f"there is no task {tid}"
+        return task_wait_blocker(waits_on_tasks(row["body"]), task_state)
+
+    def replied(self) -> list[Ticket]:
+        return [task_ticket(row) for row in state.tasks_replied(self.repo.name)]
+
+    def save_images(self, t: Ticket, dest: Path) -> SavedImages:
+        return SavedImages()
+
+    def get(self, tid: str) -> Ticket:
+        if (row := state.task_get(tid)) is None:
+            raise TaskError(f"no task {tid}")
+        comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "")
+                    for c in state.task_comments(tid)]
+        blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
+                   else task_wait_blocker(waits_on_tasks(row["body"]), task_state))
+        return task_ticket(row, comments_text(comments), blocker)
+
+    def prepare(self) -> list[str]:
+        return []
+
+    def approve(self, tid: str) -> None:
+        if not state.task_set_state(tid, "todo"):
+            raise TaskError(f"no task {tid}")
+
+    def label(self, tid: str, add=(), remove=()) -> str:
+        if state.task_get(tid) is None:
+            return f"no task {tid}"
+        if add:
+            if add[0] not in config.TASK_STATES:
+                return f"'{add[0]}' is not a task state; use {', '.join(config.TASK_STATES)}"
+            state.task_set_state(tid, add[0])
+        elif remove:
+            state.task_set_state(tid, "todo", from_states=tuple(remove))
+        return ""
+
+    def comment(self, tid: str, body: str) -> str:
+        return "" if state.task_comment(tid, "arete", body) else f"no task {tid}"
+
+    def move(self, tid: str, state: str) -> str:
+        return ""
+
+    def pr_title(self, subject: str, t: Ticket) -> str:
+        return with_ref(subject, t.ref)
+
+    def pr_link(self, t: Ticket, whole: bool) -> str:
+        return ""
+
+
+Tracker = GitHubTracker | JiraTracker | LocalTracker
+
+
+def task_state(tid: str) -> str | None:
+    return (state.task_get(tid) or {}).get("state")
+
+
+def task_ticket(row: dict, comments: str = "", blocker: str = "") -> Ticket:
+    return Ticket(row["id"], row["id"], row["title"] or "", body=row["body"] or "(no description)",
+                  comments=comments, open=row["state"] not in config.TASK_FINISHED,
+                  kind=row["kind"] if row["kind"] in config.KINDS else "feat", created=row["created"] or "",
+                  updated=row["updated"] or "", blocker=blocker)
 
 
 def route_label(repo: config.Repo) -> str:
@@ -490,6 +597,7 @@ def route_blocker(routes: set[str], labels: list[str]) -> str:
 
 WAIT_LINE = re.compile(r"^[ \t]*waits[ \t]+on\b(.*)$", re.IGNORECASE | re.MULTILINE)
 WAIT_REF = re.compile(r"(?<![\w/])#(\d+)")
+WAIT_TASK = re.compile(r"(?<![\w-])t-[0-9a-f]{4,}(?![\w-])", re.IGNORECASE)
 
 
 def waits_on(body: str) -> list[int]:
@@ -497,9 +605,29 @@ def waits_on(body: str) -> list[int]:
     return list(dict.fromkeys(found))
 
 
+def waits_on_tasks(body: str) -> list[str]:
+    found = [tid.lower() for rest in WAIT_LINE.findall(body or "") for tid in WAIT_TASK.findall(rest)]
+    return list(dict.fromkeys(found))
+
+
+def joined(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 def _refs(numbers: list[int]) -> str:
-    refs = [f"#{n}" for n in numbers]
-    return refs[0] if len(refs) == 1 else f"{', '.join(refs[:-1])} and {refs[-1]}"
+    return joined([f"#{n}" for n in numbers])
+
+
+def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -> str:
+    seen = {tid: state_of(tid) for tid in waits}
+    held = [f"{tid} ({s})" for tid, s in seen.items() if s is not None and s not in config.TASK_FINISHED]
+    missing = [tid for tid, s in seen.items() if s is None]
+    parts = []
+    if held:
+        parts.append(f"it waits on {joined(held)}, not yet done or closed")
+    if missing:
+        parts.append(f"it waits on {joined(missing)}, which {'matches' if len(missing) == 1 else 'match'} no task")
+    return "; ".join(parts)
 
 
 def wait_blocker(waits: list[int], is_open: Callable[[int], bool | None]) -> str:
