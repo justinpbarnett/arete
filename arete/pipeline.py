@@ -1023,8 +1023,17 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                     run.log(f"automerge left off on {c.pr}: {hold}")
                     gh.pr_comment(c.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
                     continue
-                gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
-                run.log(f"automerge enabled on {c.pr}")
+                try:
+                    did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
+                except gh.GhError as e:
+                    did, why = "left", f"a GitHub call failed: {str(e).rstrip('.')}"
+                if did == "merged":
+                    run.log(f"automerged {c.pr}")
+                elif did == "auto":
+                    run.log(f"automerge enabled on {c.pr}")
+                else:
+                    run.log(f"automerge left {c.pr} for a person: {why}")
+                    gh.pr_comment(c.pr, f"Automerge could not merge this PR: {why}. A person merges it.")
             except gh.GhError as e:
                 run.log(f"automerge failed on {c.pr}: {e}")
     urls = record_prs(run, branch, with_prs)
