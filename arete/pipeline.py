@@ -10,7 +10,7 @@ import time
 import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -25,6 +25,7 @@ from . import (
     gh,
     jev,
     jira,
+    lines,
     paths,
     record,
     runner,
@@ -205,6 +206,7 @@ class AgentRun:
     kind: str = ""
     overrides: dict = field(default_factory=dict)
     sessions: dict[str, Session] = field(default_factory=dict)
+    writes_lines: bool = True
 
     @property
     def ref(self) -> str:
@@ -220,6 +222,10 @@ class AgentRun:
         with open(self.dir / "run.log", "a") as f:
             f.write(line + "\n")
 
+    def write_line(self, event: str, **fields) -> None:
+        if self.writes_lines:
+            lines.write(self.id, event, **fields)
+
     def save(self, name: str, data) -> None:
         p = self.dir / name
         p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
@@ -233,24 +239,33 @@ class AgentRun:
             reach = s.agent_kw(self.cfg or config.load(), kw.pop("allowed_tools", ()), kw.pop("mcp_config", ""))
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(s.step, NO_SESSION) if s.session == "resume" else NO_SESSION, **kw}
+        which, model = runner.chosen(kw.get("model", ""), kw.get("runner", "") or kw.get("resume", NO_SESSION).runner,
+                                     kw.get("cfg") or self.cfg or config.load())
+        effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost
+        self.write_line("step_start", step=step, runner=which, model=model, effort=effort)
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
-        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
-        if res.connection_failed:
-            self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
-            if util.wait_for_network():
-                self.cost += res.cost_usd
-                self.paid += res.paid_usd
-                self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
-                if res.session.id and res.turns > 1 and kw.get("persist", True):
-                    res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
-                                     **{**kw, "resume": res.session})
-                else:
-                    res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+        with lines.beating(self.id, step) if self.writes_lines else nullcontext():
+            res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+            if res.connection_failed:
+                self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
+                if util.wait_for_network():
+                    self.cost += res.cost_usd
+                    self.paid += res.paid_usd
+                    self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
+                    if res.session.id and res.turns > 1 and kw.get("persist", True):
+                        res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                                         **{**kw, "resume": res.session})
+                    else:
+                        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
         if s and res.session.id:
             self.sessions[s.step] = res.session
         self.cost += res.cost_usd
         self.paid += res.paid_usd
+        self.write_line("step_end", step=step, runner=res.runner or which, model=res.model or model, effort=effort,
+                        ok=res.ok, cost_usd=round(self.cost - spent, 6), tokens_in=res.tokens_in,
+                        tokens_out=res.tokens_out, turns=res.turns, seconds=round(time.monotonic() - started, 1),
+                        error=(res.error or "")[:500])
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
@@ -264,6 +279,7 @@ class Run(AgentRun):
     tid: str
     force: bool = False
     feedback: list[dict] = field(default_factory=list)
+    answering: dict = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -689,7 +705,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid)
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=pending_feedback(repo.name, tid))
+                      feedback=pending_feedback(repo.name, tid),
+                      answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {})
             run.dir.mkdir(parents=True, exist_ok=True)
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
@@ -720,8 +737,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     f"`{tk.label_name('failed')}` to retry.")
         if run.feedback and not dry_run:
             state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
+        if status == "failed":
+            lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
         run.log(f"done: {status} {pr_url or summary}")
         record.settle(run_id, status, summary=summary, pr_url=pr_url)
+        write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url})
         if status == "skipped":
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if status in ("pr", "noop", "needs-info", "dry-run") else 1
@@ -739,7 +759,19 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple
     return "failed", why, ""
 
 
+def write_report(row: dict) -> None:
+    lines.write(row["id"], "report", status=row.get("status") or "", prs=(row.get("pr_url") or "").split(),
+                minutes=run_minutes(row), cost_usd=round(float(row.get("cost_usd") or 0), 4))
+
+
+def run_minutes(row: dict) -> float:
+    if not (row.get("started") and row.get("finished")):
+        return 0
+    return round((util.parse_iso(row["finished"]) - util.parse_iso(row["started"])).total_seconds() / 60, 1)
+
+
 def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str) -> tuple[str, str, str]:
+    lines.write(run.id, "question", question=comment, summary=summary[:300])
     run.say(comment)
     run.enter("needs-info")
     remove_workspace(ws, checkouts)
@@ -798,6 +830,9 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         t = tk.get(run.tid)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
+    lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
+    if run.answering:
+        lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "")
     approval = state.triage_approval(t.ref if repo.tracker == "jira" else tracker.ticket_name(repo.name, t.ref))
     if run.feedback:
         closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
@@ -1361,14 +1396,14 @@ def publish_ci(run: AgentRun, pushed: list[Checkout], ci_section: str) -> None:
 
 
 def images_note(images: tracker.SavedImages) -> str:
-    lines = []
+    rows = []
     if images.paths:
-        lines += ["## Images on the issue", "", "Open each one with Read; they show what the issue describes.", ""]
-        lines += [f"- `{p}`" for p in images.paths]
+        rows += ["## Images on the issue", "", "Open each one with Read; they show what the issue describes.", ""]
+        rows += [f"- `{p}`" for p in images.paths]
     if images.left_out:
-        lines += ["", (f"Not downloaded, over the {tracker.MAX_IMAGES} image or "
-                       f"{tracker.MAX_IMAGE_BYTES // 2**20} MB cap: {', '.join(images.left_out)}")]
-    return "\n".join(lines).strip()
+        rows += ["", (f"Not downloaded, over the {tracker.MAX_IMAGES} image or "
+                      f"{tracker.MAX_IMAGE_BYTES // 2**20} MB cap: {', '.join(images.left_out)}")]
+    return "\n".join(rows).strip()
 
 
 def open_branch(run: Run) -> str:
@@ -1591,12 +1626,12 @@ def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise:
                     wt, role="learn", json_schema=LEARN_SCHEMA, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     rewrite = found.get("expertise", "").strip()
-    lines = len(rewrite.splitlines())
+    line_count = len(rewrite.splitlines())
     if not rewrite:
         run.log("learn: no expertise file came back, kept the old one")
         return
-    if lines > EXPERTISE_MAX_LINES:
-        run.log(f"learn: the rewrite has {lines} lines, over the {EXPERTISE_MAX_LINES} line cap; kept the old file")
+    if line_count > EXPERTISE_MAX_LINES:
+        run.log(f"learn: the rewrite has {line_count} lines, over the {EXPERTISE_MAX_LINES} line cap; kept the old file")
         return
     added = [a.strip() for a in found.get("added", []) if a.strip()]
     removed = [r for r in found.get("removed", []) if r.get("lesson", "").strip()]
@@ -1611,7 +1646,7 @@ def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise:
         return
     expertise_file.parent.mkdir(parents=True, exist_ok=True)
     expertise_file.write_text(rewrite + "\n")
-    run.log(f"learn: {len(added)} added, {len(removed)} removed, {lines} lines in {paths.short_path(expertise_file)}")
+    run.log(f"learn: {len(added)} added, {len(removed)} removed, {line_count} lines in {paths.short_path(expertise_file)}")
     if run.repo.layer:
         try:
             commit_layer(expertise_file.parent, f"{run.repo.name}: learn from {run.ref} ({run.id})\n\n{report}")
@@ -1794,7 +1829,7 @@ def sync_landings(cfg: config.Config) -> None:
             tk = tracker.for_repo(cfg, repo)
             err = tk.move_to(str(r["issue"]), target)
             if reached != branches[-1]:
-                run = Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=str(r["issue"]))
+                run = Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=str(r["issue"]), writes_lines=False)
                 moved = "" if err else f" and moved to {target}"
                 if say_err := run.say(f"This reached `{reached}`{moved}. To test it there:\n\n"
                                       + uat_steps(cfg, run, r, reached)):
@@ -1978,6 +2013,9 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])))
     run.dir.mkdir(parents=True, exist_ok=True)
+    if row["status"] != "stopped":
+        lines.write(row["id"], "error", step=lines.last_step(row["id"]), message=row.get("summary") or "")
+    write_report(row)
     if row["status"] == "stopped":
         run.log(record.STOPPED)
         run.give_up("was stopped by request")

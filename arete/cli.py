@@ -825,6 +825,24 @@ def cmd_record(args) -> int:
     return 0
 
 
+def cmd_lines(args) -> int:
+    from . import lines, state
+
+    if not lines.path(args.run_id).exists() and not state.run_get(args.run_id):
+        print(f"no run {args.run_id}", file=sys.stderr)
+        return 1
+    found = (lines.follow(args.run_id, args.start) if args.follow
+             else (line for line in lines.read(args.run_id) if lines.seq_of(line) > args.start))
+    try:
+        for line in found:
+            print(json.dumps(line, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
 def cmd_replay(args) -> int:
     from . import replay
 
@@ -1006,6 +1024,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.set_defaults(fn=cmd_record)
+
+    p = sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, questions, "
+                                     "errors and the report")
+    p.add_argument("run_id")
+    p.add_argument("-f", "--follow", action="store_true", help="keep printing new lines until the report line")
+    p.add_argument("--from", dest="start", type=int, default=0, metavar="SEQ",
+                   help="start after the line with this seq")
+    p.set_defaults(fn=cmd_lines)
 
     p = sub.add_parser("replay", help="answer agent steps from files; `replay sample FOLDER` writes a fixture repo, its "
                                       "bare origin, a layer and an answer per ticket step")
