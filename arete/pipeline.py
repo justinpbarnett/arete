@@ -22,6 +22,7 @@ from . import (
     config,
     control,
     diffguard,
+    factory,
     gh,
     jev,
     jira,
@@ -247,10 +248,13 @@ class AgentRun:
         effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost
         tier, kind = kw.setdefault("tier", s.tier if s else ""), kw.setdefault("kind", self.kind)
         kw.setdefault("waits", self.waiting)
-        self.write_line("step_start", step=step, runner=which, model=model, effort=effort, tier=tier, kind=kind)
+        seam = factory.inside(self.id)
+        lined = self.writes_lines and seam is None
+        if lined:
+            self.write_line("step_start", step=step, runner=which, model=model, effort=effort, tier=tier, kind=kind)
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
-        with lines.beating(self.id, step) if self.writes_lines else nullcontext():
+        with lines.beating(self.id, step) if lined else nullcontext():
             res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
             if res.connection_failed:
                 self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
@@ -267,12 +271,15 @@ class AgentRun:
             self.sessions[s.step] = res.session
         self.cost += res.cost_usd
         self.paid += res.paid_usd
-        self.write_line("step_end", step=step, runner=res.runner or which, model=res.model or model, effort=effort,
-                        ok=res.ok, cost_usd=round(self.cost - spent, 6), tokens_in=res.tokens_in,
-                        tokens_out=res.tokens_out, turns=res.turns, seconds=round(time.monotonic() - started, 1),
-                        error=(res.error or "")[:500], tier=tier, kind=kind,
-                        **{"try": state.step_tries(self.id, step)}, cache_read=res.cache_read,
-                        cache_write=res.cache_write, api_seconds=round(res.api_seconds, 2))
+        usage = {"runner": res.runner or which, "model": res.model or model, "effort": effort, "tier": tier,
+                 "kind": kind, "cost_usd": round(self.cost - spent, 6), "tokens_in": res.tokens_in,
+                 "tokens_out": res.tokens_out, "turns": res.turns, "cache_read": res.cache_read,
+                 "cache_write": res.cache_write, "api_seconds": round(res.api_seconds, 2)}
+        if seam is not None:
+            seam.add(error="" if res.ok else res.error or "", **usage)
+        else:
+            self.write_line("step_end", step=step, ok=res.ok, seconds=round(time.monotonic() - started, 1),
+                            error=(res.error or "")[:500], **{"try": state.step_tries(self.id, step)}, **usage)
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})

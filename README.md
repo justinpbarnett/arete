@@ -275,18 +275,32 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 |---|---|
 | `task` | `ticket`, `kind`, `repo`, `title`; when the run starts |
 | `answer` | `asked_in` (the run that asked), `question`; in the new run that the author's reply starts |
-| `step_start` | `step`, `runner`, `model`, `effort`, `tier` (the step's tier, or empty), `kind` (the task's kind); before each agent call |
+| `step_start` | `step`, `runner`, `model`, `effort`, `tier` (the step's tier, or empty), `kind` (the task's kind); before each agent call. A [seam](#the-seam) step writes `step` and `try` instead |
 | `heartbeat` | `step`, `seconds` so far; every 30 seconds while a step works (`lines.HEARTBEAT_SECONDS`) |
-| `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`, `try`, `cache_read`, `cache_write`, `api_seconds`; the cost counts an attempt the network dropped. `tokens_in` includes the cache reads and writes. `try` is how many calls of this step name the run has recorded, so the second call of `build` has try 2; a step the pipeline numbers itself (`fix1`, `fix2`) starts at 1 under each name. `api_seconds` is the time the model's API calls took (0 on pi, which reports none), so `seconds` minus `api_seconds` is the time spent in tools |
+| `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`, `try`, `cache_read`, `cache_write`, `api_seconds`; the cost counts an attempt the network dropped. `tokens_in` includes the cache reads and writes. `try` is how many calls of this step name the run has recorded, so the second call of `build` has try 2; a step the pipeline numbers itself (`fix1`, `fix2`) starts at 1 under each name. `api_seconds` is the time the model's API calls took (0 on pi, which reports none), so `seconds` minus `api_seconds` is the time spent in tools. A seam step's line has `step`, `try`, `result`, `ok` (true for `pass` alone), `next`, `feedback`, `data`, `session`, then its agent calls' `runner`, `model`, `effort`, `tier` and `kind` (the distinct values joined with `, `) and their summed `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `cache_read`, `cache_write` and `api_seconds`, then `seconds`, `error`, and `tree` and `fingerprint` for a step called with `tree`. An agent call inside a seam step writes no `step_start` or `step_end` of its own; its row in the `steps` table stays |
+| `route` | `continues` (the run this one continues), `after` (the last step it took from that run), `skipped` (how many steps it took), `only`; once, when a continuing or `only` flow starts running steps |
 | `wait` | `cause` (`limit`, `ci`, `slot` or `person`), `phase` (`start` or `end`), `at`; the end line adds `since` and `minutes`. `limit` is a claude usage limit hold, `ci` the watch on CI, `slot` the wait for a free run slot: after the CI watch, and before the run started, from the first poll that passed the ready ticket over (for `max_parallel` or `max_parallel_per_repo`). `person` runs from the asking run's `question` line to the start of the run the reply starts, or to the first pass-over if there was one. The `slot` and `person` lines are the run's first lines. A wait whose end line never came is not counted |
 | `question` | `question` (the comment), `summary`; when the run asks the ticket's author |
-| `error` | `step` (the last step started, or empty), `message`; for a failed or interrupted run, not for a stop by request |
-| `report` | `status` as the `runs` table holds it, `prs`, `minutes`, `cost_usd`, `wait_minutes` (minutes by cause, also kept on the run's row); always the last line, and the poll writes it for a run whose process died |
+| `error` | `step` (the last step started, or empty), `message`; for a failed or interrupted run, not for a stop by request, and right after the `step_end` of a seam step that raised or returned something it may not |
+| `report` | `status` as the `runs` table holds it, `prs`, `minutes`, `cost_usd`, `wait_minutes` (minutes by cause, also kept on the run's row); always the last line, and the poll writes it for a run whose process died. `flow.respond` writes `status`, the fields it is given and `steps`: for each step name in the run's `step_end` lines, its `tries`, `minutes` and `cost_usd` |
 
 Eval runs write the step events too, but no `task` or `report`.
 Each line is also printed to the run's stdout.
 `arete lines RUN_ID` prints the lines, `--from SEQ` starts after that `seq`, and `--follow` keeps printing new lines until the `report` line.
 The run log, the `<step>.json` files, the tables and the records stay as they were; the lines are an addition.
+
+## The seam
+
+`arete/factory.py` is one seam that a run's steps can go through. Nothing in the pipeline uses it yet, so every run behaves as before.
+
+- `factory.Outcome(result, next="", feedback="", data={}, session=NO_SESSION)` is what a step returns. `result` is `pass`, `fail`, `ask` or `stop`, and any other value raises. `next` names the step to run next, or is empty for the flow's own order. `data` is a JSON object. `outcome.passed` is true for `pass` alone.
+- `@factory.step("name")` registers `fn(flow, *args, **kw) -> Outcome` in `factory.STEPS`. A name registers once.
+- `factory.Flow(run_id, continues="", only="", ctx=None)` is the handle of one run, and `ctx` is whatever the steps need. `flow.step(name, *args, **kw)` writes `step_start`, calls the step and writes `step_end` (see Run lines). `try` counts the calls of the step from 1 and goes on from the runs this one continues.
+- A step that raises, returns anything but an `Outcome`, or returns `data` that JSON cannot write ends with `fail` and an `error` line, and the exception is raised again. An interrupt ends it with `stop` and no `error` line.
+- `tree=<folder>` stores the folder's fingerprint in `step_end`: `git write-tree` over the tracked and untracked files, ignored ones left out, staged on a copy of the index so the real one is untouched. The step function gets `tree` too.
+- `continues=<run id>` reads that run's lines and those of the runs it continued. Each `flow.step` call is matched in order against their `step_end` lines, and a call that meets a passing line of the same step returns the stored outcome without calling anything. A line with a fingerprint matches only while the folder's fingerprint equals the last one recorded for it, so a run whose folder is gone or changed goes on after the last step that did not touch it. The first call that does not match writes the `route` line and every later call runs.
+- `only=<step>` takes the steps before it from the stored outcomes, without comparing fingerprints, runs that step even if it passed, and returns a `stop` outcome for every later call. It raises `factory.Refused` naming the step when an earlier step has no stored passing outcome.
+- `flow.respond(status, **fields)` writes the `report` line.
 
 ## Layout
 
