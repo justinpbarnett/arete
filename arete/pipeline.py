@@ -197,6 +197,7 @@ class AgentRun:
     dir: Path
     dry_run: bool = False
     cost: float = 0.0
+    paid: float = 0.0
     add_dirs: list[Path] = field(default_factory=list)
     story: list[str] = field(default_factory=list)
 
@@ -226,6 +227,7 @@ class AgentRun:
             self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
             if util.wait_for_network():
                 self.cost += res.cost_usd
+                self.paid += res.paid_usd
                 self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                 if res.session.id and res.turns > 1 and kw.get("persist", True):
                     res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
@@ -233,6 +235,7 @@ class AgentRun:
                 else:
                     res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
         self.cost += res.cost_usd
+        self.paid += res.paid_usd
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
@@ -946,7 +949,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else f"<details><summary>Plan</summary>\n\n{plan_text[:6000]}\n\n</details>\n\n")
-        + f"Run `{run.id}`, {size}, ${record.spent(run.id):.2f}."
+        + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
     )
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
@@ -1103,7 +1106,7 @@ def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
 def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
     for c in changed:
         try:
-            git(["commit", "-q", "-m", message], c.wt)
+            util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         except RuntimeError as e:
             raise RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
     moved = [c.github for c in checkouts if remote_head(c.src, branch) != c.lease]
@@ -1237,7 +1240,7 @@ def merge_moved_bases(run: Run, checkouts: list[Checkout], log_prefix: str = "")
         try:
             if git(["rev-list", "--count", f"HEAD..{c.origin_base}"], c.wt).strip() == "0":
                 continue
-            git(["merge", "-q", "--no-edit", c.origin_base], c.wt)
+            util.git_as_owner(["merge", "-q", "--no-edit", c.origin_base], c.wt)
         except RuntimeError as e:
             git(["merge", "--abort"], c.wt, check=False)
             run.log(f"{log_prefix}could not merge `{c.origin_base}` into the branch in {c.github}, so this run works "
@@ -1392,6 +1395,10 @@ def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
 
 def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch: str, summary: str,
                            replies: list[dict]) -> tuple[str, str, str]:
+    if run.dry_run:
+        run.log("revise: no code changes; a dry run leaves the review unanswered")
+        remove_workspace(ws, checkouts)
+        return "dry-run", "no code changes for the review", ""
     run.log("revise: no code changes, answering the review")
     answer_feedback(run, replies, "No code change for this one; see the overall reply.")
     run.say(f"No code changes for your review.\n\n{summary.strip()[:3000]}")
@@ -1411,7 +1418,14 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                       json_schema=REVIEW_SCHEMA, timeout=b.timeout)
     if not res.ok or not isinstance(res.structured, dict):
         return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
-    return res.structured
+    return {**res.structured, "problems": review_problems(res.structured.get("problems"))}
+
+
+def review_problems(listed) -> list[dict]:
+    if not isinstance(listed, list):
+        return []
+    return [{"file": p.get("file") or "", "problem": p.get("problem") or "", "severity": p.get("severity") or "unrated"}
+            for p in listed if isinstance(p, dict)]
 
 
 def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
@@ -1574,7 +1588,7 @@ def commit_layer(layer_dir: Path, message: str) -> None:
         git(["init", "-q"], layer_dir)
     git(["add", "-A", "--", "."], layer_dir)
     if util.sh(["git", "diff", "--cached", "--quiet", "--", "."], cwd=layer_dir).returncode:
-        git(["commit", "-q", "-m", message, "--", "."], layer_dir)
+        util.git_as_owner(["commit", "-q", "-m", message, "--", "."], layer_dir)
 
 
 def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[dict]:
@@ -1867,7 +1881,7 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
         if new == text:
             return
         f.write_text(new)
-        git(["commit", "-q", "-am", "chore(agents): raise trust to automerge"], wt)
+        util.git_as_owner(["commit", "-q", "-am", "chore(agents): raise trust to automerge"], wt)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt)
         for lb in labels:
             gh.ensure_label(repo.github, lb, "0e8a16", "Trust level change proposed by arete")
@@ -1902,6 +1916,17 @@ class SkipLog:
                               "since": old.get("since") if same else util.iso()}
         if not same:
             print(f"{util.iso()} {name}: not run, {blocker}")
+
+    def keep_repo(self, repo: str) -> None:
+        self.keep_earlier(lambda name, v: v.get("repo") == repo)
+
+    def keep_project(self, project: str) -> None:
+        self.keep_earlier(lambda name, v: not v.get("repo") and name.startswith(f"{project}-"))
+
+    def keep_earlier(self, belongs: Callable[[str, dict], bool]) -> None:
+        for name, v in self.before.items():
+            if belongs(name, v):
+                self.current.setdefault(name, v)
 
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
@@ -2132,12 +2157,16 @@ def poll(dry_run: bool = False) -> int:
                     slots -= 1
             except Exception as e:
                 failed(repo.name, e)
+                skips.keep_repo(repo.name)
         for project, client in reached_clients.items():
             try:
                 for t in tracker.jira_unrouted(project, routes.get(project, set()), client):
                     skips.note(t.ref, t, t.blocker)
             except Exception as e:
                 failed(f"jira {project}", e)
+                skips.keep_project(project)
+        for project in routes.keys() - reached_clients.keys():
+            skips.keep_project(project)
         if not dry_run:
             try:
                 sync_moves(cfg)

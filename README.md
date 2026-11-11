@@ -8,7 +8,12 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 
 `arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted, and serve picks up its queues again when it starts.
 
-Serve restarts itself when its own code changes. On each tick it looks at the `.py` files of the arete package, and once a change has held still for one tick and serve has no source poll, dashboard request or chat message of its own in flight, it checks that the new code imports and then replaces itself with a fresh serve in the same process. Runs and sessions are processes of their own, so they keep going across the restart, and the fresh serve reaps each one when it ends. New code that does not import is named in the serve log, and serve keeps the code it started with. A self restart is not a start, so loops with `run_at_load` do not fire again. So a push to arete's own main, followed by a fast forward of the checkout serve runs from, reaches serve with no restart by hand.
+Serve restarts itself when its own code changes.
+On each tick it looks at the `.py` files of the arete package and the dashboard's web files, and once a change has held still for one tick and serve has no source poll, dashboard request or chat message of its own in flight, it checks that the new code imports and then replaces itself with a fresh serve in the same process.
+Runs and sessions are processes of their own, so they keep going across the restart, and the fresh serve reaps each one when it ends.
+New code that does not import is named in the serve log, and serve keeps the code it started with.
+A self restart is not a start, so loops with `run_at_load` do not fire again.
+So a push to arete's own main, followed by a fast forward of the checkout serve runs from, reaches serve with no restart by hand.
 
 ## Loops
 
@@ -37,11 +42,20 @@ arete loop enable NAME
 
 Every run of every kind, pipeline, loop, session, chat and draft, is a row in one runs table with its trigger, model, runner, device, cost and tokens. Each model call is a step under its run. A run's live feed holds its steps, the tools the agent calls, and a command loop's output as it prints.
 
-An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it. A delivery that fails stays listed with its error, and approving it again tries the delivery again. A `push` emit lands a climb or search change on the default branch with no PR. It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path. A push that fails to land stays as a failed approval. A `loop` emit hands each finding to another loop, so one loop can find and another can fix. [arete/loops/README.md](arete/loops/README.md) has the rules for both. A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
+An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it.
+A ticket, PR, push or digest that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
+Try again on the dashboard, or `arete approve ID`, delivers it again, so a finding whose ticket hits a GitHub outage is filed then instead of being lost.
+A `push` emit lands a climb or search change on the default branch with no PR.
+It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path.
+With `reviewer` in that table, a model such as opus reviews each held push first, and a push it approves with high confidence lands, unless the trust level, a path the repo denies or a listed path keeps it for a person.
+A push that fails to land stays as a failed approval.
+A `loop` emit hands each finding to another loop, so one loop can find and another can fix.
+[arete/loops/README.md](arete/loops/README.md) has the rules for both.
+A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
 
 ## Runners, devices and sessions
 
-A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, for display only. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
+A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi. Both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, though every sum arete shows you counts only what you pay. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
 
 `claude -p` stays open after its answer until each command the agent started in the background ends, so a server left running holds a step to its time limit and loses its answer.
 Each claude step that can run commands is told to stop with TaskStop each background command that does not end on its own before it answers, even when its task asks to keep one running.
@@ -70,9 +84,9 @@ arete session send ID "now try the cache"
 arete session attach ID | stop ID | list
 ```
 
-`--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Launch view starts one with the same choices.
+`--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Sessions view starts one with the same choices, under New session.
 
-`arete costs` shows model spend by model, runner and loop.
+`arete costs` shows what you paid for model calls, by model, runner and loop. A step on the claude CLI rides the subscription and counts nothing there.
 
 ## JEV
 
@@ -80,8 +94,17 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
 
 - Loops: a loop fed by outside text drops each event JEV reads as instructions to an agent before the agent sees it, and a ticket emit drawn from outside text waits for approval on the same check. A `[classify]` step asks JEV first and sends only the events it is unsure of to the model. A finding JEV matches to a known one, even worded another way, counts as that finding, not a new one.
 - Risk: the automerge of a pipeline PR waits for a person when JEV rates the diff risky (how much depends on what it changes, how near it comes to credentials, money or data, and how far it strays from its description), or reads it as a change a revert will not undo.
-- Push screen: a `push` emit under `automerge` that no static rule holds lands only when JEV reads its diff as a narrow fix. It waits for a person when JEV gives a chance of `screen_hold` or more that the diff weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses; a chance of `irreversible_hold` or more that it does harm a revert will not undo; or rates how far it reaches past the fix it names at `screen_reach` or more. A diff longer than the 12000 characters JEV reads waits too. In a search loop, a JEV hold goes back to the agent with JEV's reason, and the agent narrows the change and tries again; only the last held change reaches a person. JEV judges a given diff once, so the push at the end of the run gets the verdict the loop saw.
-- Proof check: a search loop with `[search] proof = "repro.py"` names the script in its scratch folder that proves the bug. When a try makes the check pass, JEV reads the finding, that script and the diff, and asks whether the script checks something other than the problem the finding describes, and whether it runs the code into that problem and checks for the wrong result. A chance of `proof_hold` or more on the first, or under `proof_hold` on the second, holds the push. In the run, that hold goes back to the agent like a push screen hold, and the agent rewrites the proof; at delivery it waits for a person, and the approval shows the proof. A missing proof, or one past the 12000 characters JEV reads, holds it too.
+- Push screen: a `push` emit under `automerge` that no static rule holds lands only when JEV reads its diff as a narrow fix.
+  It waits for approval when JEV's chance for one screen question reaches that question's line in `[jev.screen_lines]`: the diff weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, does harm a revert will not undo, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses, or it reaches past the fix it names.
+  The approval names each question that held it, with JEV's chance and the question's line.
+  A diff longer than the 12000 characters JEV reads waits too.
+  In a search loop, a JEV hold goes back to the agent with JEV's reason, and the agent narrows the change and tries again; only the last held change waits for approval.
+  JEV judges a given diff once, so the push at the end of the run gets the verdict the loop saw.
+- Proof check: a search loop with `[search] proof = "repro.py"` names the script in its scratch folder that proves the bug.
+  When a try makes the check pass, JEV reads the finding, that script and the diff, and asks whether the script checks something other than the problem the finding describes, and whether it runs the code into that problem and checks for the wrong result.
+  A chance of `proof_hold` or more on the first, or under `proof_hold` on the second, holds the push.
+  In the run, that hold goes back to the agent like a push screen hold, and the agent rewrites the proof; at delivery it waits for approval, and the approval shows the proof.
+  A missing proof, or one past the 12000 characters JEV reads, holds it too.
 - Already fixed: before the first try of a search run fed by findings, JEV reads the finding against each commit that landed on the base branch since the run that found it started, up to 40, and against each push of the same loop that waits for approval. When JEV gives a chance of `fixed_skip` or more that one of them already fixes it, the run ends as done, already fixed by that change, with no agent call. Otherwise the run goes on and its log names the closest change.
 - Verdicts: each push screen, proof, already fixed, research change, research answered and PR feedback verdict is stored with each question's chance, its line, and what came of it: landed, approved, rejected, replaced by a narrower try, waiting, failed, skipped, or went on. `arete jev report [--days N] [--json]` shows the holds per question and what came of them, the close holds and near misses within 0.1 of a line, the pushes JEV cleared that a person rejected, and the landed pushes a later commit reverted, so a line can move on evidence.
 - Triage: JEV asks whether a ticket asks for a change to a repo and what kind of ticket it is. A ticket it gives a chance of a code change at or under `triage_skip` settles with no model call, as research when JEV is sure it is research and as work for a person otherwise; one under even odds settles the same way when JEV is sure of research or person. Before arete sends a ticket to the pipeline or the research agent, JEV screens its text for instructions to an agent, and a ticket it flags waits for you.
@@ -92,7 +115,12 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
 - Guard: each local claude agent that can read files, write files or run commands runs `arete guard` as a PreToolUse hook. With no JEV call, it keeps the agent out of secret files (`.env`, keys, `~/.ssh`, cloud credentials), whether the agent reads or writes one or names one in a command. With JEV it also stops a command that would do harm git cannot undo (throw away uncommitted work, delete outside the working folder, force push, publish, drop data, send a message) and a command that would show or send a credential. A plain push or a new pull request goes through. When anything goes wrong, it lets the call through. `[jev] guard = false` turns it off.
 - `arete ask QUESTION [PATHS] [--choice A B] [--score LOW HIGH] [-r] [--only ANSWER] [--json]` asks JEV about piped text, or about each file, sixteen at a time. Agents that can run commands get it, with a short note on when it pays: sort files before reading them, sort a test failure before digging in, check a diff against its task. An agent may ask only about files inside its working folder, and never about secret files.
 
-JEV uses the OpenRouter key the pi runner uses: `OPENROUTER_API_KEY` in `~/.config/arete/pi.env`, or in arete's environment. With no key, with JEV off, or when a call fails, each step does what it did before JEV, with one exception: when the push screen's or the proof check's call fails, the push waits for a person, because a push lands with no review. When the already fixed check fails, the run goes on. Each call is a step of its run on the `jev` runner, priced at what OpenRouter charged; a guard check is a step only when it stops something. JEV sends the text it judges to OpenRouter and TypeSafe: events, tickets, diffs, transcripts, commands and files. Set `jev = false` on a repo whose code or tickets must not leave the machine.
+JEV uses the OpenRouter key the pi runner uses: `OPENROUTER_API_KEY` in `~/.config/arete/pi.env`, or in arete's environment.
+With no key, with JEV off, or when a call fails, each step does what it did before JEV, with one exception: when the push screen's or the proof check's call fails, the push waits for approval, because a push lands with no PR to review.
+When the already fixed check fails, the run goes on.
+Each call is a step of its run on the `jev` runner, priced at what OpenRouter charged; a guard check is a step only when it stops something.
+JEV sends the text it judges to OpenRouter and TypeSafe: events, tickets, diffs, transcripts, commands and files.
+Set `jev = false` on a repo whose code or tickets must not leave the machine.
 
 ## Runs, sleep and the network
 
@@ -127,7 +155,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `arete_repo` | Name of the `[[repo]]` that is this checkout. Its step prompts are harness files the miner may change. Default `arete`. |
 | `max_parallel` | Most pipeline runs at once on the machine. Default 1. |
 | `max_parallel_per_repo` | Most pipeline runs poll keeps going in one repo, runs in their CI wait included. Default 1. |
-| `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `chat` (the dashboard console). A role left out uses the claude CLI default, except `triage`, which uses haiku, and `research` and `chat`, which use opus. `arete status` lists each role's model. |
+| `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop` and `session`, which use sonnet, and `research` and `chat`, which use opus. `arete status` lists each role's model. |
 | `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly transcript digest. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
@@ -135,7 +163,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
-| `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the push screen's line for harm a revert will not undo and the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `screen_hold` (0.4, the chance at which a push screen question holds a push), `screen_reach` (0.6, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
+| `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `[jev.screen_lines]` (the chance at which each push screen question holds a push: `weakens` 0.5, `secrets` 0.7, `outside` 0.7, `irreversible` 0.5, `feature` 0.6, `removes` 0.5, `renames` 0.5, and `reach` 0.8, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost. |
 
 | Repo field | Default | Meaning |
@@ -347,7 +375,7 @@ The grader is the pipeline's verifier, started on the layer's `[verify]`. It get
 
 Arete's own step prompts, `arete/prompts/*.md`, are harness too. When the miner sees the same problem in how arete's steps do their job across repos, it proposes a change to the plan, build, fix, verify, review or other step prompts in the `arete_repo`. The grader, the eval writer, the miner and apply prompts stay human edited. Apply refuses a change that adds or drops a `$placeholder`, or adds or deletes a prompt file.
 
-Arete then runs each eval suite twice on the same day, once with main's prompts and once with the PR's, and comments on the PR with the pass rate of each, the tasks that changed, cost and run ids, and the changed prompts the evals do not exercise. Private repos show as "private repo N", never by name. These runs do not count toward the nightly baseline. The pipeline reads its prompts from this checkout, so pull it after you merge one of these PRs.
+Arete then runs each eval suite twice on the same day, once with main's prompts and once with the PR's, and comments on the PR with the pass rate of each, the tasks that changed, what was paid and run ids, and the changed prompts the evals do not exercise. Private repos show as "private repo N", never by name. These runs do not count toward the nightly baseline. The pipeline reads its prompts from this checkout, so pull it after you merge one of these PRs.
 
 ## Triage
 
@@ -380,35 +408,60 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 
 ## Dashboard
 
-`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone. It listens only on the machine's tailnet addresses. A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
+`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+It listens only on the machine's tailnet addresses.
+A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 
-- Live: the runs going now, with their start time, the last log line and the cost so far, and Stop for each; the labeled tickets the pipeline skips, with Run anyway to start one past what holds it; the harness fixes and memory facts the miner leaves for you to make by hand, each with Mark done; the tickets waiting on review comments; and the last 25 runs of every kind.
-  A run's log opens below the table.
-- Loops: what waits for your approval, with Approve and Reject, and a failed delivery with its error and Try again; then every loop with its switch, kind, trigger, last run, next fire and spend in the last 24 hours, and a broken loop with what is wrong.
-  Open shows a loop's facts, runs, findings, sources, memory, digests and metrics.
+A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find and Console.
+It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
+Below 1040 px the sidebar wraps into a block above the page.
+Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME` and `#ticket/REF`, so reload, Back and Forward put you where you were.
+An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find or the key list open, text selected or an action still going.
+Then the status line says what the new version waits for.
+Close or Escape on an open item goes back to where you opened it, with focus on its row.
+Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, ticket or action.
+`g` and a letter goes to a view, `c` opens or closes the console, and `?` lists the keys.
+
+- Live: Running now, with each run's start, last step and time, and Stop; then Needs you, where each row names its repo: the pushes waiting for approval with Approve and Reject, each led by a plain summary that the `explain` model writes about a minute after it arrives, then the reason it was held and the reviewer's verdict, a failed delivery with Try again, the ready tickets one press sends to the pipeline, the skipped tickets with Run anyway, the console's drafted issue, and the harness fixes and memory facts the miner leaves for you to make by hand, each with Mark done.
+  None of these buttons asks you to confirm.
+  Below them are the tickets waiting on review comments.
+- Runs: every run, the running ones first and then the newest, filtered by status, kind, repo and loop, with Show 25 more.
+  A run's page has its facts, its log, Stop, its pull request and a message box.
+- Sessions: the sessions, newest first.
+  New session starts one on a device, model, runner, tool set, repo and budget, and a session's page follows its feed and takes your messages.
+- Loops: every loop with its switch, kind, trigger, last run, next fire and what it paid in the last 24 hours, and a broken loop with what is wrong.
+  A loop's page shows its facts, runs, findings, sources, memory, digests and metrics.
   Start runs it now and follows its live feed, where Stop ends the run.
   Try runs it the way `arete loop try NAME` does, so its feed shows what each emit would do and sends none.
-  Below the loops, a sentence drafts a new loop the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
-  The serve line has Install serve or Restart serve when serve is not running.
-- Launch: start a session on a device, model, runner, tool set, repo and budget, then talk to it and follow its feed.
-- Fleet: serve's beat, with Install serve or Restart serve when serve is not running, and each device with its last probe and tools; Probe checks one again.
-- Health: the heartbeat checks, the probes, the loops that report on their own, and the open alerts.
-  Run the checks now starts the heartbeat.
-- Triage: the triage board, with each ticket's questions, assumptions and plan folded under it, each research report in full, and each sent ticket's pipeline status and PR.
+  New loop drafts a loop from a sentence the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
+  The approvals a loop waits for show on Live.
+- Triage: the triage board, one group at a time, behind buttons that show each group's count.
+  A ticket's page shows its questions, assumptions, plan, research report and pull requests.
   Answer a ticket's questions there and send it to the pipeline, which starts a poll.
   Refresh triage now starts a refresh.
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.
-- Trends: 30 days of cost and outcomes by day, runs by repo, eval pass rate by repo, and where the money went, by model, by runner and by loop.
-- Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`. A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use. An empty model removes its line, so the role goes back to its default.
-- Chat: console agents on the `chat` model.
-  Every chat is kept in `arete.db` and listed newest first, and Open shows any of them.
-  New chat starts one with no project, which works in arete's folder as the console, or on one repo from the config, which works in that repo's folder and gets its layer's checks and expertise file in its prompt.
-  A chat reads arete's code, config, state and logs, and its project's code when it has one, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues.
-  It never edits a file.
-  Ask it for a change to arete and it drafts an issue on arete, which shows under that chat; nothing reaches GitHub until you press File this issue, and Drop discards it.
-  Each call to the model stops at $2, and each reply shows what it cost.
-  Each chat continues its own session and waits on its own answer, so several chats can wait at once.
-  On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
+- Outcomes: for the last 30 days, the pipeline runs that shipped and failed each day, the decisions that went without you against the ones you made, what you paid by day, model, runner and loop, the runs by repo, and the eval pass rate by repo.
+- Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, and the loops that report on their own.
+- Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`.
+  A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use.
+  An empty model removes its line, so the role goes back to its default.
+- Usage: the views you open, how you get to them, and the buttons and keys you press, on desktop and phone, over 7, 30 or 90 days.
+  The page sends view, way and button names with counts and times only, never an id, typed text or page content, and the dashboard drops rows older than 90 days.
+
+The console is a side panel that opens from any view with its button or `c` and stays open from view to view; on a phone it fills the screen.
+It talks to a console agent on the `chat` model.
+Every chat is kept in `arete.db`, and the Chat picker in the panel lists them newest first.
+New chat starts one with no project, which works in arete's folder, or on one repo from the config, which works in that repo's folder and gets its layer's checks and expertise from arete's side.
+The agent reads arete's code, config, state and logs, and its project's code when it has one, runs `arete status`, `arete events`, `git log` and `git show`, and reads arete's GitHub issues.
+It never edits a file.
+Ask it for a change to arete and it drafts an issue.
+The draft shows in the panel and on Live, and nothing reaches GitHub until you press File this issue (Drop discards it).
+Each call to the model stops at $2, and a reply on a paid runner shows what it cost.
+Each chat continues its own session and waits on its own answer, so several chats can wait at once.
+On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
+
+Money counts only what you pay, on the dashboard and everywhere else arete shows a sum: the CLI, a run's end line in its feed, PR bodies, research reports and eval results.
+A step on the `claude` CLI rides the subscription, so every paid sum leaves it out, a run's page says "subscription" for its claude models, and a run that paid nothing ends its feed with "nothing paid".
 
 ## Rules
 

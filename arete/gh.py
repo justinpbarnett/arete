@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -25,7 +26,8 @@ def has_arete_mark(body: str | None) -> bool:
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
     res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input)
     if res.returncode != 0:
-        raise GhError(f"gh {' '.join(args[:3])}: {util.first_line(res.stderr or res.stdout, 300)}")
+        command = " ".join(itertools.takewhile(lambda arg: not arg.startswith("-"), args))
+        raise GhError(f"gh {command}: {util.first_line(res.stderr or res.stdout, 300)}")
     return res.stdout
 
 
@@ -141,7 +143,7 @@ def closed_pr_heads(repo: str, head: str) -> set[str]:
 
 
 def pr_body(url: str) -> str:
-    return (gh_json(["pr", "view", url, "--json", "body"]) or {}).get("body") or ""
+    return ((gh_json(["pr", "view", url, "--json", "body"]) or {}).get("body") or "").replace("\r\n", "\n")
 
 
 def pr_diff(url: str) -> str:
@@ -157,12 +159,12 @@ def pr_comment(url: str, body: str) -> None:
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
-    gh(["api", "-X", "POST", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies",
+    gh(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
         "--input", "-"], input=json.dumps({"body": marked(body)}))
 
 
 def api_list(path: str) -> list[dict]:
-    pages = gh_json(["api", "--paginate", "--slurp", f"{path}?per_page=100"]) or []
+    pages = gh_json(["api", f"{path}?per_page=100", "--paginate", "--slurp"]) or []
     return [item for page in pages for item in page]
 
 
@@ -293,7 +295,7 @@ def check_from_status(row: dict) -> Check:
 
 
 def commit_checks(repo: str, ref: str) -> dict[str, Check]:
-    pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repo}/commits/{ref}/check-runs?per_page=100"]) or []
+    pages = gh_json(["api", f"repos/{repo}/commits/{ref}/check-runs?per_page=100", "--paginate", "--slurp"]) or []
     runs = sorted((check_from_run(r) for page in pages for r in page.get("check_runs", [])), key=lambda c: c.check_run_id)
     statuses = (gh_json(["api", f"repos/{repo}/commits/{ref}/status?per_page=100"]) or {}).get("statuses", [])
     newest: dict[str, Check] = {c.name: c for c in runs}

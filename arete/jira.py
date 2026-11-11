@@ -31,7 +31,11 @@ def credentials(env_file: Path | None) -> tuple[str, str, str]:
     if missing:
         where = f" or in {env_file}" if env_file else "; or name an env file in [jira] env_file"
         raise JiraError(f"missing {', '.join(missing)}: set them in the environment{where}")
-    return vals[0].rstrip("/"), vals[1], vals[2]
+    base = vals[0].rstrip("/")
+    parts = urllib.parse.urlsplit(base)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise JiraError(f"JIRA_BASE_URL {base!r} is not a full URL; write it like https://your-site.atlassian.net")
+    return base, vals[1], vals[2]
 
 
 def parse_time(s: str) -> datetime:

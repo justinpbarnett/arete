@@ -245,6 +245,8 @@ def execute(session_id: str) -> str:
                     time.sleep(INBOX_POLL_SECONDS)
         except SessionStopped:
             status, summary = "stopped", record.STOPPED if record.stop_asked(session_id) else "stopped by a signal"
+        except devices.DeviceError as e:
+            status, summary = "failed", util.first_line(str(e), 300)
         except Exception as e:
             status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
         finally:
@@ -255,19 +257,23 @@ def execute(session_id: str) -> str:
 
 def close(spec: Spec, status: str, summary: str) -> None:
     kept = f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else ""
-    end_line = f"{status}: {summary}{kept} (${record.spent(spec.id):.2f})"
+    paid = record.metered_spent(spec.id)
+    end_line = f"{status}: {summary}{kept} ({util.paid_note(paid)})"
     if record.settle(spec.id, status, end_line=end_line, summary=f"{summary}{kept}"[:500]):
         write_log(spec, "end", end_line)
 
 
 def views(limit: int = 30, connect=state.db) -> list[dict]:
     out = []
-    for r in state.runs(kind="session", limit=limit, connect=connect):
+    rows = state.runs(kind="session", limit=limit, connect=connect)
+    paid = state.paid_by_run([r["id"] for r in rows], connect)
+    for r in rows:
         spec = util.read_json(spec_file(r["id"]), {})
         out.append({k: r.get(k) for k in ("id", "status", "started", "finished", "model", "runner", "device",
                                           "cost_usd", "summary", "branch")}
-                   | {"prompt": util.first_line(spec.get("prompt", ""), 200), "tools": spec.get("tools", []),
-                      "cwd": paths.short_path(spec.get("cwd", "")), "repo": spec.get("repo", "")})
+                   | {"paid": paid.get(r["id"], 0), "prompt": util.first_line(spec.get("prompt", ""), 200),
+                      "tools": spec.get("tools", []), "cwd": paths.short_path(spec.get("cwd", "")),
+                      "repo": spec.get("repo", "")})
     return out
 
 

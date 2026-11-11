@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -11,6 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -20,7 +23,6 @@ from . import (
     config,
     control,
     devices,
-    emits,
     engine,
     gh,
     hooks,
@@ -37,12 +39,8 @@ from . import (
 )
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
-STATIC = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-    "/app.css": ("app.css", "text/css; charset=utf-8"),
-    "/pattern.css": ("pattern.css", "text/css; charset=utf-8"),
-}
+WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
+CODE_MARK = b'<meta name="arete-code" content="">'
 TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
                   "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
 TAILSCALE_AS_CLI = {"TAILSCALE_BE_CLI": "1"}
@@ -63,8 +61,39 @@ SKIPPED_PATH = "/api/skipped/"
 PROPOSAL_PATH = "/api/proposals/"
 CHAT_PATH = "/api/chats/"
 INSTALL_SECONDS = 120
+USAGE_KINDS = ("visit", "action")
+USAGE_DEVICES = ("desktop", "phone")
+USAGE_NEEDS = {"visit": ("view", "via"), "action": ("view", "name")}
+USAGE_NAME = re.compile(r"[a-z]{1,20}(?:-[a-z]{1,20}){0,3}")
+USAGE_TAB = re.compile(r"[0-9a-f]{16}")
+USAGE_MOST_MS = 24 * 60 * 60 * 1000
 PAGE_POLICY = ("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self'; "
                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+
+
+def web_files() -> list[Path]:
+    return sorted(f for f in WEB_DIR.iterdir() if f.suffix in WEB_TYPES)
+
+
+def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
+    bodies = {f: f.read_bytes() for f in web_files()}
+    digest = hashlib.sha256()
+    for f, body in bodies.items():
+        digest.update(f"{f.name}\0{len(body)}\0".encode())
+        digest.update(body)
+    code = digest.hexdigest()[:12]
+    served = {}
+    for f, body in bodies.items():
+        if f.name == "index.html":
+            if CODE_MARK not in body:
+                raise RuntimeError(f"index.html lost {CODE_MARK.decode()}, so an open page could not tell when its code is old.")
+            served["/"] = (body.replace(CODE_MARK, f'<meta name="arete-code" content="{code}">'.encode()), WEB_TYPES[f.suffix])
+        else:
+            served[f"/{f.name}"] = (body, WEB_TYPES[f.suffix])
+    return code, served
+
+
+WEB_CODE, WEB_BY_PATH = web_snapshot()
 
 
 def tailscale(*args: str) -> dict:
@@ -121,8 +150,9 @@ class Logins:
         if seen and time.monotonic() - seen[0] < WHOIS_SECONDS:
             return seen[1]
         login = (tailscale("whois", "--json", address).get("UserProfile") or {}).get("LoginName", "")
-        with self.guard:
-            self.seen[address] = (time.monotonic(), login)
+        if login:
+            with self.guard:
+                self.seen[address] = (time.monotonic(), login)
         return login
 
 
@@ -145,8 +175,8 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409, chat.NoChat: 404,
-                     chat.BadProject: 400, gh.GhError: 502,
+STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409,
+                     chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
                      triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409}
@@ -155,6 +185,13 @@ STATUS_OF_REFUSAL = {board.NotARunId: 400, settings.Refused: 400, chat.Busy: 409
 def refusal_status(e: Exception) -> int | None:
     return e.status if isinstance(e, Refusal | hooks.HookRefused) else next(
         (status for kind, status in STATUS_OF_REFUSAL.items() if isinstance(e, kind)), None)
+
+
+def refusal_answer(e: Exception) -> dict:
+    answer = {"error": as_sentence(str(e))}
+    if isinstance(e, control.KeptFailure):
+        answer["kept"] = True
+    return answer
 
 
 def as_sentence(text: str) -> str:
@@ -189,15 +226,15 @@ class Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
-            if method == "GET" and path in STATIC:
-                return self.send_static(*STATIC[path])
+            if method == "GET" and path in WEB_BY_PATH:
+                return self.send(200, *WEB_BY_PATH[path], "no-cache")
             if method == "POST" and path.startswith(hooks.HOOK_PATH):
                 got = hooks.receive(unquote(path[len(hooks.HOOK_PATH):]), self.headers, self.raw_body())
                 return self.send_json(202 if got["queued"] else 200, got)
             self.send_json(200, self.api(method, path, {k: v[-1] for k, v in parse_qs(parts.query).items()}))
         except Exception as e:
             if status := refusal_status(e):
-                return self.send_json(status, {"error": as_sentence(str(e))})
+                return self.send_json(status, refusal_answer(e))
             self.log_error("%s", f"{type(e).__name__}: {e}")
             self.send_json(500, {"error": as_sentence(util.first_line(f"{type(e).__name__}: {e}", 300))})
 
@@ -216,10 +253,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, method: str, path: str, query: dict):
         if method == "GET":
-            if path == "/api/state":
-                return board.snapshot()
-            if path == "/api/trends":
-                return board.trends()
+            if path == "/api/sidebar":
+                return board.sidebar(chat.pulse())
+            if path == "/api/live":
+                return board.live_board(chat.pulse()["draft"])
+            if path == "/api/runs":
+                return board.runs_board(query, limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
+            if path.startswith(RUN_PATH):
+                return board.run_board(unquote(path[len(RUN_PATH):]))
+            if path == "/api/health":
+                return board.health_board()
+            if path == "/api/triage":
+                return board.panel(board.triage_board)
+            if path == "/api/outcomes":
+                return board.panel(board.outcomes)
+            if path == "/api/find":
+                return board.find()
+            if path == "/api/usage":
+                return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))))
             if path == "/api/settings":
                 return settings.current()
             if path == "/api/chats":
@@ -236,16 +287,12 @@ class Handler(BaseHTTPRequestHandler):
                 return control.loop_detail(unquote(path[len(LOOP_PATH):]), connect=state.reader)
             if path.startswith(FEED_PATH):
                 return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
-            if path == "/api/approvals":
-                return {"approvals": emits.waiting(connect=state.reader)}
-            if path == "/api/devices":
-                return {"devices": control.fleet()}
             if path == "/api/sessions":
                 return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
-            if path == "/api/costs":
-                return control.costs(float(whole_number(query["days"]) or 1) if "days" in query else None,
-                                     connect=state.reader)
         if method == "POST":
+            if path == "/api/usage":
+                state.add_usage(self.usage_row(), board.KEEP_USAGE_DAYS)
+                return {}
             if path == "/api/settings":
                 return settings.save(self.body())
             if path == "/api/chats/new":
@@ -299,8 +346,12 @@ class Handler(BaseHTTPRequestHandler):
                 proposal_id, action = last_part(path, PROPOSAL_PATH)
                 if action == "done":
                     return forget_proposal(whole_number(proposal_id))
+                if action == "approve":
+                    return approve_rule(whole_number(proposal_id))
+                if action == "reject":
+                    return reject_rule(whole_number(proposal_id))
             if path == "/api/serve/install":
-                return install_serve()
+                return install_serve(self.server.inside_serve)
         raise Refusal(404, f"Nothing at {method} {path}.")
 
     def loop_action(self, name: str, action: str):
@@ -337,6 +388,25 @@ class Handler(BaseHTTPRequestHandler):
         said = triage.send(config.load(), ref, questions, answers, str(b.get("repo") or ""))
         return {"ref": ref, "said": f"{said} {start_poll()}"}
 
+    def usage_row(self) -> dict:
+        b = self.body()
+        kind = b.get("kind")
+        if kind not in USAGE_KINDS:
+            raise Refusal(400, f"The kind is one of {', '.join(USAGE_KINDS)}.")
+        if b.get("device") not in USAGE_DEVICES:
+            raise Refusal(400, f"The device is one of {', '.join(USAGE_DEVICES)}.")
+        if not isinstance(b.get("tab"), str) or not USAGE_TAB.fullmatch(b["tab"]):
+            raise Refusal(400, "The tab is the page's mark of 16 hex digits.")
+        names = {k: b.get(k) or "" for k in ("view", "name", "via")}
+        if any(not isinstance(v, str) or (v or k in USAGE_NEEDS[kind]) and not USAGE_NAME.fullmatch(v)
+               for k, v in names.items()):
+            raise Refusal(400, f"The {' and '.join(USAGE_NEEDS[kind])} of each {kind} are lowercase words joined by "
+                               "hyphens, so usage keeps names and never ids or text.")
+        ms = b.get("ms", 0)
+        if isinstance(ms, bool) or not isinstance(ms, int) or not 0 <= ms <= USAGE_MOST_MS:
+            raise Refusal(400, "The time is a whole number of milliseconds, at most a day.")
+        return {"at": util.iso(), "kind": kind, "device": b["device"], "tab": b["tab"], "ms": ms, **names}
+
     def chat_text(self) -> str:
         text = str(self.body().get("text", "")).strip()
         if not text:
@@ -361,9 +431,6 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(400, "The request body is not a JSON object.")
         return data
 
-    def send_static(self, name: str, kind: str) -> None:
-        self.send(200, (WEB_DIR / name).read_bytes(), kind, "no-cache")
-
     def send_json(self, status: int, data) -> None:
         self.send(status, json.dumps(data, default=str).encode(), "application/json", "no-store")
 
@@ -372,11 +439,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", cache)
+        self.send_header("X-Arete-Code", WEB_CODE)
         self.send_header("Content-Security-Policy", PAGE_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def log_request(self, code="-", size="-") -> None:
         if self.command == "GET" and isinstance(code, int) and 200 <= code < 300:
@@ -391,9 +462,9 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: str, port: int, node: Node, logins: Logins):
+    def __init__(self, address: str, port: int, node: Node, logins: Logins, inside_serve: bool):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
-        self.node, self.logins = node, logins
+        self.node, self.logins, self.inside_serve = node, logins, inside_serve
         super().__init__((address, port), Handler)
 
 
@@ -415,11 +486,23 @@ def forget_proposal(proposal_id: int) -> dict:
     return {"id": proposal_id}
 
 
-def install_serve() -> dict:
-    beat = control.serve_beat()
-    if beat.get("alive"):
+def approve_rule(proposal_id: int) -> dict:
+    if (state.proposal(proposal_id, connect=state.reader) or {}).get("status") not in ("approve", "filing"):
+        raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
+    control.detach(["file-rule", str(proposal_id)])
+    return {"id": proposal_id}
+
+
+def reject_rule(proposal_id: int) -> dict:
+    if not state.move_proposal(proposal_id, ("approve",), "rejected"):
+        raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
+    return {"id": proposal_id}
+
+
+def install_serve(inside_serve: bool) -> dict:
+    if control.serve_beat().get("alive"):
         raise Refusal(409, "Serve is already up, so it needs no install")
-    if beat.get("pid") == os.getpid():
+    if inside_serve:
         control.detach(["install"], "install.log")
         return {"restarting": True}
     res = util.sh([sys.executable, "-m", "arete.cli", "install"], timeout=INSTALL_SECONDS)
@@ -441,11 +524,11 @@ def start_poll() -> str:
     return "Started a poll to build it."
 
 
-def open_servers(node: Node, port: int, logins: Logins) -> list[Server]:
+def open_servers(node: Node, port: int, logins: Logins, inside_serve: bool) -> list[Server]:
     servers: list[Server] = []
     try:
         for address in node.addresses:
-            servers.append(Server(address, port, node, logins))
+            servers.append(Server(address, port, node, logins, inside_serve))
     except OSError:
         for s in servers:
             s.server_close()
@@ -457,9 +540,10 @@ def say(text: str) -> None:
     print(f"{util.iso()} {text}", flush=True)
 
 
-def serve(port: int | None = None) -> NoReturn:
+def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     cfg = config.load()
     port = port or cfg.dashboard_port
+    state.ensure_schema()
     chat.recover()
     logins = Logins()
     waiting_for = ""
@@ -468,7 +552,7 @@ def serve(port: int | None = None) -> NoReturn:
         try:
             if node is None:
                 raise OSError("tailscale is not running or reports no address")
-            servers = open_servers(node, port, logins)
+            servers = open_servers(node, port, logins, inside_serve)
         except OSError as e:
             if str(e) != waiting_for:
                 say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")

@@ -58,6 +58,10 @@ class Candidate:
     def name(self) -> str:
         return tracker.run_ticket_name(self.run)
 
+    @property
+    def job(self) -> str:
+        return f"{slug(self.name)}-pr-{gh.pr_number(self.pr_url)}"
+
 
 @dataclass
 class Outcome:
@@ -258,7 +262,7 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
         (wt / rel).write_text(draft.toml)
         read_back(DirSource(wt), EVALS, name, draft)
         git(["add", "--", rel], wt)
-        git(["commit", "-q", "-m", f"chore(evals): add {name}\n\n{summary}\n\nArete-Run: {run.id}"], wt)
+        util.git_as_owner(["commit", "-q", "-m", f"chore(evals): add {name}\n\n{summary}\n\nArete-Run: {run.id}"], wt)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
         body = "\n\n".join([summary, f"## Task\n\n**{draft.title}**\n\n{draft.prompt}", f"## Steps\n\n{draft.verify}",
                             f"## On the merge commit\n\n{on_merge.markdown()}", f"## On the base\n\n{on_base.markdown()}",
@@ -293,7 +297,7 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
         tally = {}
         with record.failed_on_crash(run_id):
             for c in picked:
-                job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / slug(c.name), task=slug(c.name))
+                job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / c.job, task=c.job)
                 try:
                     o = mine_one(cfg, job, c)
                 except Exception as e:
@@ -304,5 +308,5 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
                 tally[o.status] = tally.get(o.status, 0) + 1
             summary = f"mined {util.count(len(picked), 'merged PR')}: " + ", ".join(f"{n} {s}" for s, n in tally.items())
             record.settle(run_id, "done", summary=summary)
-        print(f"{summary}, ${record.spent(run_id):.2f}")
+        print(f"{summary}, {util.paid_note(record.metered_spent(run_id))}")
         return 1 if "crashed" in tally else 0

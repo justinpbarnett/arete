@@ -61,9 +61,20 @@ def chat_row(chat_id: int) -> dict:
 
 def view(chat_id: int) -> dict:
     row = chat_row(chat_id)
-    return {**summary(row), "folder": folder(row["project"]),
-            "draft": {"title": row["draft_title"], "body": row["draft_body"]} if row["draft_title"] else None,
-            "messages": state.chat_messages(chat_id)}
+    cfg = config.load()
+    return {**summary(row), "folder": folder(row["project"]), "draft": draft_of(row, cfg),
+            "metered": runner.metered(cfg.model("chat"), row["runner"]), "messages": state.chat_messages(chat_id)}
+
+
+def draft_of(row: dict, cfg: config.Config) -> dict | None:
+    if not row["draft_title"]:
+        return None
+    return {"chat": row["id"], "title": row["draft_title"], "body": row["draft_body"], "repo": cfg.arete_repo}
+
+
+def pulse() -> dict:
+    row = state.chat_newest_draft()
+    return {"busy": any_busy(), "draft": draft_of(row, config.load()) if row else None}
 
 
 def folder(project: str) -> str:

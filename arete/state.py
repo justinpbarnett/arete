@@ -6,9 +6,13 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 from . import paths, util
+from .agent import SUBSCRIPTION_RUNNER
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
+APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
+PAID_STEP = f"COALESCE(steps.runner, '') != '{SUBSCRIPTION_RUNNER}'"
+USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -130,7 +134,11 @@ CREATE TABLE IF NOT EXISTS approvals (
     status TEXT,                   -- pending | approved | rejected | done | failed
     result TEXT,
     created TEXT,
-    decided TEXT
+    decided TEXT,
+    plain_summary TEXT DEFAULT '',
+    plain_summary_tried TEXT DEFAULT '',
+    review TEXT DEFAULT '',
+    review_tried TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,7 +164,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     key TEXT PRIMARY KEY,
     issue INTEGER,
     opened TEXT,
-    last_seen TEXT
+    last_seen TEXT,
+    repo TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS proposals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -311,6 +320,18 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     ts TEXT
 );
 CREATE INDEX IF NOT EXISTS chat_messages_chat ON chat_messages (chat_id, id);
+CREATE TABLE IF NOT EXISTS usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    tab TEXT,                      -- one browser tab's random id
+    device TEXT,                   -- desktop | phone
+    kind TEXT,                     -- visit | action
+    view TEXT,
+    name TEXT,                     -- the action's name; empty on a visit
+    via TEXT,                      -- how a visit began: start | sidebar | key | palette | link | back | close | step | return
+    ms INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS usage_at ON usage (at);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
@@ -326,7 +347,10 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
                 for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")],
               ("triage", "closed", "ALTER TABLE triage ADD COLUMN closed TEXT DEFAULT ''"),
+              *[("approvals", col, f"ALTER TABLE approvals ADD COLUMN {col} TEXT DEFAULT ''")
+                for col in ("plain_summary", "plain_summary_tried", "review", "review_tried")],
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
+              ("alerts", "repo", "ALTER TABLE alerts ADD COLUMN repo TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
@@ -350,6 +374,11 @@ def db():
         conn.close()
 
 
+def ensure_schema() -> None:
+    with db():
+        pass
+
+
 @contextmanager
 def reader():
     conn = sqlite3.connect(f"{paths.DB_FILE.absolute().as_uri()}?mode=ro", uri=True, timeout=30)
@@ -365,23 +394,37 @@ FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status I
 
 
 def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=db, loop: str | None = None,
-         firings: bool = False) -> list[dict]:
+         firings: bool = False, statuses: tuple[str, ...] = (), running_first: bool = False) -> list[dict]:
     q, args = "SELECT * FROM runs WHERE 1=1", []
     if not firings:
         q += f" AND NOT {FIRINGS}"
-    if kind:
-        q += " AND kind = ?"
-        args.append(kind)
-    if loop:
-        q += " AND loop = ?"
-        args.append(loop)
-    if repo:
-        q += " AND repo = ?"
-        args.append(repo)
-    q += " ORDER BY started DESC, rowid DESC LIMIT ?"
+    for column, value in (("kind", kind), ("loop", loop), ("repo", repo)):
+        if value:
+            q += f" AND {column} = ?"
+            args.append(value)
+    if statuses:
+        q += f" AND status IN ({','.join('?' * len(statuses))})"
+        args.extend(statuses)
+    q += " ORDER BY " + ("status = 'running' DESC, " if running_first else "") + "started DESC, rowid DESC LIMIT ?"
     args.append(limit)
     with connect() as c:
         return [dict(r) for r in c.execute(q, args)]
+
+
+def run_facets(connect=db) -> dict[str, list[str]]:
+    with connect() as c:
+        return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "
+                                                 f"AND COALESCE({column}, '') != '' ORDER BY 1")]
+                for column in ("kind", "repo", "loop")}
+
+
+def paid_by_run(run_ids: list[str], connect=db) -> dict[str, float]:
+    if not run_ids:
+        return {}
+    with connect() as c:
+        rows = c.execute(f"SELECT run_id, SUM(cost_usd) FROM steps WHERE run_id IN ({','.join('?' * len(run_ids))}) "
+                         f"AND {PAID_STEP} GROUP BY run_id", run_ids)
+        return {r[0]: round(float(r[1] or 0), 6) for r in rows}
 
 
 def runs_since(since: str, connect=db) -> list[dict]:
@@ -422,10 +465,12 @@ def steps(run_id: str, connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
 
 
-def steps_since(since: str, connect=db) -> list[dict]:
+def steps_since(since: str, connect=db, paid_only: bool = False) -> list[dict]:
+    paid = f" AND {PAID_STEP}" if paid_only else ""
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT s.*, r.loop, r.kind, r.repo FROM steps s LEFT JOIN runs r "
-                                           "ON r.id = s.run_id WHERE s.ts >= ? ORDER BY s.ts", (since,))]
+        return [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind, r.repo FROM steps LEFT JOIN runs r "
+                                           f"ON r.id = steps.run_id WHERE steps.ts >= ?{paid} ORDER BY steps.ts",
+                                           (since,))]
 
 
 def add_feed(run_id: str, kind: str, text: str) -> None:
@@ -434,7 +479,8 @@ def add_feed(run_id: str, kind: str, text: str) -> None:
 
 
 def insert_feed(c: sqlite3.Connection, run_id: str, kind: str, text: str) -> None:
-    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)", (run_id, util.iso(), kind, text[:4000]))
+    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)",
+              (run_id, util.iso(), kind, util.both_ends(text, 4000)))
 
 
 def feed(run_id: str, after: int = 0, connect=db) -> list[dict]:
@@ -628,19 +674,34 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str =
 
 def approvals(connect=db) -> list[dict]:
     with connect() as c:
-        return [{**dict(r), "emit": json.loads(r["emit"] or "{}")}
-                for r in c.execute(f"SELECT * FROM approvals WHERE status IN ({','.join('?' * len(DECIDABLE))}) "
-                                   "ORDER BY id DESC LIMIT 100", DECIDABLE)]
+        return [approval_of(r) for r in c.execute("SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "
+                                                 "LEFT JOIN runs r ON r.id = a.run_id "
+                                                 f"WHERE a.status IN ({','.join('?' * len(DECIDABLE))}) "
+                                                 "ORDER BY a.id DESC LIMIT 100", DECIDABLE)]
+
+
+def set_approval_note(approval_id: int, note: str, value: str, while_in: tuple[str, ...] = DECIDABLE) -> bool:
+    if note not in APPROVAL_NOTES:
+        raise ValueError(f"an approval has no note {note}; it has {', '.join(APPROVAL_NOTES)}")
+    with db() as c:
+        before = c.total_changes
+        c.execute(f"UPDATE approvals SET {note} = ? WHERE id = ? AND status IN ({','.join('?' * len(while_in))})",
+                  (value, approval_id, *while_in))
+        return c.total_changes > before
 
 
 def approval(approval_id: int) -> dict | None:
     with db() as c:
         r = c.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
-    return {**dict(r), "emit": json.loads(r["emit"] or "{}")} if r else None
+    return approval_of(r) if r else None
 
 
-def decide_approval(approval_id: int, status: str, result: str = "") -> bool:
-    came_from = ("approved",) if status in ("done", "failed") else DECIDABLE
+def approval_of(row) -> dict:
+    return {**dict(row), "emit": json.loads(row["emit"] or "{}"), "review": json.loads(row["review"] or "{}")}
+
+
+def decide_approval(approval_id: int, status: str, result: str = "", came_from: tuple[str, ...] = DECIDABLE) -> bool:
+    came_from = ("approved",) if status in ("done", "failed") else came_from
     with db() as c:
         before = c.total_changes
         c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ? WHERE id = ? AND status IN "
@@ -744,6 +805,12 @@ def chat_drop_draft(chat_id: int, title: str, body: str) -> None:
                   (chat_id, title, body))
 
 
+def chat_newest_draft() -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM chats WHERE draft_title != '' ORDER BY updated DESC, id DESC LIMIT 1").fetchone()
+        return dict(r) if r else None
+
+
 def busy_chats() -> list[int]:
     with db() as c:
         return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
@@ -758,8 +825,8 @@ def chat_import(chat: dict, messages: list[tuple]) -> int:
 
 
 def loop_spent_since(since: str, loop: str | None = None) -> float:
-    q = ("SELECT COALESCE(SUM(s.cost_usd), 0) FROM steps s JOIN runs r ON r.id = s.run_id "
-         "WHERE s.ts >= ? AND r.kind = 'loop' AND COALESCE(s.runner, '') != 'claude'")
+    q = ("SELECT COALESCE(SUM(steps.cost_usd), 0) FROM steps JOIN runs r ON r.id = steps.run_id "
+         f"WHERE steps.ts >= ? AND r.kind = 'loop' AND {PAID_STEP}")
     args: list = [since]
     if loop:
         q += " AND r.loop = ?"
@@ -843,12 +910,12 @@ def alert_get(key: str) -> dict | None:
         return dict(r) if r else None
 
 
-def alert_set(key: str, issue: int | None) -> None:
+def alert_set(key: str, issue: int | None, repo: str = "") -> None:
     prev = alert_get(key)
     with db() as c:
         c.execute(
-            "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen) VALUES (?,?,?,?)",
-            (key, issue, (prev or {}).get("opened") or util.iso(), util.iso()),
+            "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen, repo) VALUES (?,?,?,?,?)",
+            (key, issue, (prev or {}).get("opened") or util.iso(), util.iso(), repo or (prev or {}).get("repo") or ""),
         )
 
 
@@ -899,10 +966,20 @@ def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> 
         return [dict(r) for r in c.execute(q, args)]
 
 
-def forget_proposal(proposal_id: int) -> bool:
+def proposal(proposal_id: int, connect=db) -> dict | None:
+    with connect() as c:
+        row = c.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def move_proposal(proposal_id: int, before: tuple[str, ...], after: str) -> bool:
     with db() as c:
-        return c.execute("UPDATE proposals SET status = 'filed' WHERE id = ? AND status IN ('memory', 'hand')",
-                         (proposal_id,)).rowcount > 0
+        return c.execute(f"UPDATE proposals SET status = ? WHERE id = ? AND status IN ({','.join('?' * len(before))})",
+                         (after, proposal_id, *before)).rowcount > 0
+
+
+def forget_proposal(proposal_id: int) -> bool:
+    return move_proposal(proposal_id, ("memory", "hand"), "filed")
 
 
 def set_proposal_status_by_pr(pr_url: str, status: str) -> None:
@@ -1120,3 +1197,14 @@ def research_prune(refs: list[str]) -> None:
 def triage_prune(sources: list[str]) -> None:
     with db() as c:
         c.execute(f"DELETE FROM triage WHERE source NOT IN ({','.join('?' * len(sources))})", sources)
+
+
+def add_usage(row: dict, keep_days: float) -> None:
+    with db() as c:
+        c.execute(insert_sql("usage", USAGE_COLUMNS), tuple(row.get(k) for k in USAGE_COLUMNS))
+        c.execute("DELETE FROM usage WHERE at < ?", (util.iso(util.now() - timedelta(days=keep_days)),))
+
+
+def usage_since(since: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM usage WHERE at >= ? ORDER BY at", (since,))]

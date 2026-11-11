@@ -89,7 +89,7 @@ labels = ["agent"]             # ticket: `agent` hands the ticket to the pipelin
 prefix = "[ci] "               # ticket: put before each title
 approve = false                # true holds it until you approve it on the dashboard or with `arete approve ID`
 # type = "pr":     draft = true, labels = [], title = ""; climb and search only
-# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"] }, check = ""; climb and search only; see Push below
+# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"], reviewer = "opus" }, check = "pytest -x"; climb and search only, and climb must set check; see Push below
 # type = "loop":   loop = "fix-it"; hands each finding to that loop as a finding event
 # type = "digest": appends to ~/.local/share/arete/digests/<loop>/<day>.md
 # type = "notify": a desktop notification
@@ -115,11 +115,19 @@ A climb or search agent that finds the goal cannot or should not be met changes 
 
 A `loop` emit hands each finding to another loop, which fires once per finding. That loop takes them with `[trigger] event = ["finding"]`, and the finding reaches its agent under `## Input`, fenced as data. A finding carries the weakest trust among the events that led to it, so a finding read out of untrusted text stays untrusted. A run with no events, or fed only by its own script, hands on internal findings. A loop that takes findings and has an acting tool such as Edit needs `[trigger] trust = "internal"` or above, so a finding read out of untrusted text never reaches an agent that edits.
 
+A finding handed to a loop that is off, or broken, waits for you as a failed delivery: turn the loop on and try it again, or reject it.
+A finding that the loop refuses, for its trust or its event type, is only logged in the run's feed, even while the loop is off, because trying it again cannot change the answer.
+A waiting finding that the loop refuses when you approve it or try it again is rejected, and the result says why.
+
 ## Push
 
 A `push` emit lands a climb or search run's change on the repo's default branch, with no PR. To land it, arete rebases the run's branch onto `origin/<base>`, runs the check again on the rebased tree, and pushes. When the push loses a race, arete fetches and tries once more. Then it fast forwards the repo's own checkout when that checkout is on the base branch, and deletes the run's branch.
 
-`check` is the command that must pass after the rebase. When it is left out, the `[search] check` runs. On a public repo, the commit message, the title and the report name the loop and the run id only, never what the agent wrote.
+`check` is the command that must pass after the rebase.
+A search loop's push may leave it out, and then the `[search] check` runs.
+A climb loop has no check of its own, so its push must set one, or the loop does not load.
+A push with no check never lands.
+On a public repo, the commit message, the title and the report name the loop and the run id only, never what the agent wrote.
 
 A push waits for approval in these cases:
 
@@ -127,15 +135,33 @@ A push waits for approval in these cases:
 - Always, when it touches a path the repo denies: `.agents/config.toml`, `.github/workflows/`, `.env` files, `.claude/`, and the layer's `limits.deny`.
 - When `approve = true`.
 - When a rule in the `approve` table matches. `lines` holds a change over that many lines, `deletes` holds any file deletion, and `paths` holds a change to any file that matches one of its patterns.
-- With JEV on, when JEV reads the diff as more than a narrow fix: a chance of `[jev] screen_hold` (0.4) or more that it weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses; a chance of `irreversible_hold` (0.5) or more that it does harm a revert will not undo; or a reach past the fix it names of `screen_reach` (0.6) or more.
+- With JEV on, when JEV reads the diff as more than a narrow fix, at a chance at or over that question's line in `[jev.screen_lines]`:
+  it weakens a protection (`weakens`, 0.5), exposes credentials or personal data (`secrets`, 0.7), sends data somewhere new or builds a command from outside text (`outside`, 0.7), does harm a revert will not undo (`irreversible`, 0.5), adds a capability (`feature`, 0.6), removes a behavior instead of fixing it (`removes`, 0.5), or renames something other code or config uses (`renames`, 0.5).
+  A reach past the fix it names of `reach` (0.8 of 1) or more holds it too.
 - With JEV on and `[search] proof` set, when JEV doubts that the proof script tests the problem the finding describes: a chance of `[jev] proof_hold` (0.5) or more that it checks something else, or under it that it runs the code into the problem and checks for the wrong result. A missing proof, or one past 12000 characters, holds too, and the approval shows the proof.
 - With JEV on, when the diff runs past the 12000 characters JEV reads, or when the JEV call fails.
 
-In a search loop, the JEV screen runs as soon as a try makes the check pass, and a hold goes back to the agent before it reaches a person. The agent's next try gets JEV's reason and the diff so far, and adjusts the change so the check still passes and only the fix remains. Each adjusted change that passes the check replaces the held change as one commit and is screened again, and a try that fails the check goes back to the held change and its proof. The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for a person when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds. A proof check hold goes back to the agent the same way: the agent rewrites the proof, and may leave the code as it is. Only a JEV hold goes back to the agent. A rule in the list above, a diff past 12000 characters, and a failed JEV call go to a person at once, and a climb run's push is screened only when it is delivered.
+In a search loop, the JEV screen runs as soon as a try makes the check pass, and a hold goes back to the agent before it waits for approval.
+The agent's next try gets JEV's reason and the diff so far, and adjusts the change so the check still passes and only the fix remains.
+Each adjusted change that passes the check replaces the held change as one commit and is screened again, and a try that fails the check goes back to the held change and its proof.
+The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for approval when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds.
+A proof check hold goes back to the agent the same way: the agent rewrites the proof, and may leave the code as it is.
+Only a JEV hold goes back to the agent.
+A rule in the list above, a diff past 12000 characters, and a failed JEV call wait for approval at once, and a climb run's push is screened only when it is delivered.
 
 Before the first try of a search run fed by findings, JEV checks whether a commit that landed since the finding's run started, or a push of the same loop that waits for approval, already fixes the finding. At a chance of `[jev] fixed_skip` (0.7) or more, the run ends as done, already fixed by that change, and no agent runs. `arete jev report` shows what came of each verdict.
 
 The approval says which rule held it. Approving it lands it then, and rejecting it deletes the branch. A push that fails to land, because it no longer rebases or the check fails after the rebase, stays listed as a failed approval with its error, so you can try it again or reject it.
+
+`reviewer` in the `approve` table names a model, such as `"opus"`, that reviews each held push before a person does.
+Serve gives it the change rebased onto the current `origin/<base>`, the reason the push was held, the agent's case for it, and read-only tools with git's read commands.
+When it approves with high confidence, the push lands as if a person approved it, and the run's feed says that the reviewer approved it.
+Any other answer leaves the push waiting, with the review beside it on the dashboard and in `arete approve`.
+A push held by the trust level, by a path the repo denies or by `paths` always waits for a person, and its review only advises.
+So does a push whose diff runs past the 60000 characters the reviewer reads.
+`approve = true` holds every push for a person, with no review.
+A change that newer commits on the base branch conflict with gets a reject from git that names the files, with no model call.
+A review that fails is tried again after 15 minutes, none starts while the model's usage limit holds, and a failed approval gets none.
 
 ## Safety
 

@@ -18,7 +18,7 @@ NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
 CLIMB_GOALS = {"max": True, "higher": True, "up": True, "min": False, "lower": False, "down": False}
 FINDING_EVENT = "finding"
-GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
+GITHUB_REMOTE = re.compile(r"github\.com(?::\d+)?[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 
 
 @dataclass
@@ -54,6 +54,8 @@ class Trigger:
     @property
     def summary(self) -> str:
         parts = [self.schedule] if self.schedule else []
+        if self.run_at_load:
+            parts.append("serve start")
         if self.events:
             parts.append(" ".join(self.events))
         if self.metric:
@@ -140,6 +142,9 @@ class Loop:
             if r.name == self.repo:
                 return r
         path = paths.expand(self.repo)
+        for r in cfg.repos:
+            if r.path.resolve() == path.resolve():
+                return r
         return config.Repo(name=self.repo, path=path, github=github_remote(path))
 
     def view(self) -> dict:
@@ -244,7 +249,7 @@ def load_all(cfg: config.Config | None = None) -> list[Loop]:
         try:
             loop = load(folder, origin, repo, cfg)
         except (LoopError, cron.BadSchedule, tomllib.TOMLDecodeError, ValueError, TypeError, KeyError,
-                AttributeError) as e:
+                AttributeError, OSError) as e:
             loop = broken(name, folder, origin, str(e) if isinstance(e, LoopError | cron.BadSchedule)
                           else f"{type(e).__name__}: {e}")
         if not loop.error and name in switched:
@@ -352,7 +357,7 @@ def proof_problems(loop: Loop) -> list[str]:
 
 
 def validate(loop: Loop, cfg: config.Config) -> None:
-    from .emits import EMITS
+    from .delivery import EMITS
     from .sources import SOURCES, metric_event
 
     problems = []
