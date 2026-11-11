@@ -26,6 +26,7 @@ PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_
 PATH_RULE_OF = {"Read": "Read", "Glob": "Read", "Grep": "Read", "LS": "Read", "Edit": "Edit", "MultiEdit": "Edit",
                 "Write": "Edit", "NotebookEdit": "Edit"}
 GIT_WRITES_TO_ANY_PATH = "Bash(git * --output*)"
+NO_MCP_SERVERS = json.dumps({"mcpServers": {}})
 USAGE_LIMIT_TEXT = re.compile(r"(?:hit|reached) your [^.\n]{0,60}limit|usage limit reached", re.IGNORECASE)
 LEGACY_LIMIT_RESET = re.compile(r"usage limit reached\|(\d{10,13})", re.IGNORECASE)
 LIMIT_SCOPES = {"seven_day_opus": "opus", "seven_day_sonnet": "sonnet"}
@@ -93,8 +94,7 @@ def run(
         cmd += ["--no-session-persistence"]
     if add_dirs:
         cmd += ["--add-dir", *map(str, add_dirs)]
-    if mcp_config:
-        cmd += ["--strict-mcp-config", "--mcp-config", mcp_config]
+    cmd += ["--strict-mcp-config", "--mcp-config", mcp_config or NO_MCP_SERVERS]
     if settings:
         cmd += ["--settings", json.dumps(settings)]
 

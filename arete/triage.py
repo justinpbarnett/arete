@@ -24,7 +24,6 @@ MAX_PLAN_STEPS = 6
 MAX_ISSUE_CHARS = 60000
 META_FILE = paths.STATE_DIR / "triage.json"
 TICKET_RECORDS_DIR = paths.STATE_DIR / "triage"
-NO_MCP_SERVERS = json.dumps({"mcpServers": {}})
 SEARCH_FIELDS = ["summary", "updated", "labels", "parent"]
 SPRINT_JQL = "sprint in openSprints() OR (sprint in closedSprints() AND sprint not in futureSprints())"
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent", "updated"]
@@ -339,7 +338,7 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     res = runner.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage"), tools=runner.READ_TOOLS,
-                     allowed_tools=runner.READ_TOOLS, mcp_config=NO_MCP_SERVERS, json_schema=SCHEMA,
+                     allowed_tools=runner.READ_TOOLS, json_schema=SCHEMA,
                      max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
                      trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None

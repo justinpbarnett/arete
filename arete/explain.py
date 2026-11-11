@@ -4,7 +4,7 @@ import re
 import secrets
 import textwrap
 
-from . import config, delivery, paths, pipeline, runner, state, triage
+from . import config, delivery, paths, pipeline, runner, state
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
 MOST_SENTENCES = 2
@@ -30,7 +30,7 @@ def plain_summary(approval: dict, cfg: config.Config) -> str:
     text = pipeline.prompt("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
                            mark=secrets.token_hex(8), action=approval["summary"],
                            briefing=delivery.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
-    res = runner.run(text, paths.STATE_DIR, model=cfg.model("explain"), tools=[], mcp_config=triage.NO_MCP_SERVERS,
+    res = runner.run(text, paths.STATE_DIR, model=cfg.model("explain"), tools=[],
                      json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS, wait_out_limits=False,
                      trace=("", f"plain summary #{approval['id']}"), cfg=cfg)
     said = str(res.structured.get("summary") or "").strip() if res.ok and isinstance(res.structured, dict) else ""

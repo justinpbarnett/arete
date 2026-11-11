@@ -5,7 +5,7 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, delivery, outbound, pipeline, push, runner, state, triage, util
+from . import config, delivery, outbound, pipeline, push, runner, state, util
 
 DECISIONS = ("approve", "reject")
 CONFIDENCES = ("high", "medium", "low")
@@ -109,7 +109,7 @@ def read_change(approval: dict, wt: Path, base: str, diff: str, model: str, cfg:
                            log=log.strip() or "none")
     res = runner.run(text, wt, model=model, allowed_tools=runner.READ_TOOLS + pipeline.bash_rules(GIT_READS),
                      disallowed_tools=pipeline.bash_rules(GIT_READS_OUTSIDE_THE_WORKTREE), ask_jev=False,
-                     mcp_config=triage.NO_MCP_SERVERS, json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS,
+                     json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS,
                      wait_out_limits=False, trace=(approval["run_id"], f"review #{approval['id']}"), cfg=cfg)
     said = res.structured if res.ok and isinstance(res.structured, dict) else {}
     reason = outbound.plain(str(said.get("reason") or ""), LONGEST_REASON).strip()

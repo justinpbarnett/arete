@@ -602,6 +602,7 @@ A step on the `claude` CLI rides the subscription, so every paid sum leaves it o
 - Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`, never an `ANTHROPIC_API_KEY`, here or on a device.
 - A claude run takes no dollar cap and waits out a usage limit; budgets apply to pi alone.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
+- An agent on the `claude` CLI loads only the MCP servers its call names. The verifier names its browser and every other call names none, so the connectors and plugin servers of the account never load.
 - Agents never run git write commands, except pi in an exe.dev sandbox, which arete refuses when it could push and deletes after its run.
   Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
 - Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`. A `push` emit follows the same level: under `pr`, a person lands every push.
