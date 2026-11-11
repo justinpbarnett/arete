@@ -661,7 +661,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     if not repo.parts:
         print(f"{repo_name} has no github remote configured")
         return 1
-    tk = tracker.for_repo(cfg, repo)
+    tk = tracker.for_ticket(cfg, repo, tid)
     try:
         tid = tk.normalize(tid)
     except ValueError as e:
@@ -1753,7 +1753,7 @@ def sync_moves(cfg: config.Config) -> None:
             repo = cfg.repo(r["repo"])
         except KeyError:
             continue
-        tk = tracker.for_repo(cfg, repo)
+        tk = tracker.for_ticket(cfg, repo, str(r["issue"]))
         if not isinstance(tk, tracker.JiraTracker):
             continue
         try:
@@ -1779,7 +1779,7 @@ def sync_landings(cfg: config.Config) -> None:
             repo = cfg.repo(r["repo"])
         except KeyError:
             continue
-        if repo.tracker != "jira":
+        if repo.tracker != "jira" or tracker.is_task_id(r["issue"]):
             continue
         try:
             reached = furthest_branch(branches, r["pr_url"].split(), str(r["issue"]))
@@ -1971,8 +1971,8 @@ def settle_abandoned_runs(cfg: config.Config) -> None:
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     repo = cfg.repo(row["repo"])
-    run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_repo(cfg, repo), tid=str(row["issue"]),
-              feedback=pending_feedback(repo.name, str(row["issue"])))
+    run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
+              tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])))
     run.dir.mkdir(parents=True, exist_ok=True)
     if row["status"] == "stopped":
         run.log(record.STOPPED)

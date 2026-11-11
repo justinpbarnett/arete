@@ -199,7 +199,7 @@ def mine_one(cfg: config.Config, run: EvalRun, c: Candidate) -> Outcome:
     fetch_origin(c.repo)
     back = commits_landed(c.repo.path, merge, c.run["branch"] or "")
     base = git(["rev-parse", f"{merge}~{back}"], c.repo.path).strip()
-    ticket = tracker.for_repo(cfg, c.repo).get(str(c.run["issue"]))
+    ticket = tracker.for_ticket(cfg, c.repo, str(c.run["issue"])).get(str(c.run["issue"]))
     wt = paths.WORKTREES_DIR / f"mine-{c.repo.name}-{run.task}"
     try:
         isolated_checkout(c.repo.path, merge, wt)

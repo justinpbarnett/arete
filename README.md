@@ -307,7 +307,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `pipeline` | `false` | Poll this repo's tickets and run the build pipeline. |
 | `mine` | `true` | The miner may open harness PRs here. |
 | `public` | `false` | PR bodies cite run ids, never transcript text. |
-| `tracker` | `"github"` | `github` for issues in the repo, `jira` for tickets in Jira. PRs are on GitHub either way. |
+| `tracker` | `"github"` | `github` for issues in the repo, `jira` for tickets in Jira, `local` for [local tasks](#local-tasks) only; such a repo may have no `github`. PRs are on GitHub either way. |
 | `jira_project` | `[jira] project` | Jira project for this repo. |
 | `jira_label` | `repo-<github repo name>` | Route label that sends a Jira ticket to this repo. |
 | `jev` | `true` | JEV may read this repo's events, tickets, diffs, transcripts and files. `false` keeps them off OpenRouter and TypeSafe. See [JEV](#jev). |
@@ -366,6 +366,24 @@ Progress shows as `agent-running`, `agent-pr`, `agent-failed` and `agent-needs-i
 `[jira] skip_types` lists issue types arete leaves alone, such as `["Trail"]`: triage never reads them, so they never reach the board, auto approval or the research loop. A ticket of a skipped type that you label `agent` yourself still runs.
 
 Image attachments go to the agents as files they can open, up to 6 images and 5 MB each. The rest are named in the prompt, not downloaded. A failed download fails the run without labels, so the next poll tries again.
+
+## Local tasks
+
+A local task has no tracker issue: it lives in arete's state database. The `tasks` table holds its id, repo, title, body, kind (`feat` or `fix`), state, parent and times, and `task_comments` holds its comments, each by `owner` or `arete`. An id is `t-` and four hex digits, such as `t-1a2b`, longer when four clash. A task is `todo`, `running`, `pr`, `failed`, `needs-info`, `done` or `closed`. The pipeline's state labels are these states: where an issue gets `agent:needs-info`, a task moves to `needs-info`, and where the label comes off, the task goes back to `todo`.
+
+```sh
+arete task add --repo scratch --title "Paint the door" "Paint the front door blue."
+arete task list --repo scratch --state todo
+arete task show t-1a2b
+arete task reply t-1a2b "A dark navy blue."
+arete task close t-1a2b
+```
+
+`add` prints the new id. `--kind fix` makes a fix, and the title defaults to the body's first line. `list` prints one JSON line per task, oldest first, and both its filters are optional. `show` prints the task and its comments as JSON. `reply` stores your answer to arete's question, and `close` closes the task. Every task counts as yours. A task in `needs-info` whose newest comment is yours counts as replied, as an issue you answered does.
+
+A body line such as `Waits on t-1a2b.` holds the task until `t-1a2b` is `done` or `closed`. A named task in any other state holds it, `failed` and `needs-info` included, so a task that failed holds the tasks that wait on it. A name that matches no task holds it too, and the reason says so.
+
+A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for a ticket, as in `arete run web t-1a2b`. An issue number or a Jira key gets the repo's own tracker. `tracker = "local"` makes local tasks a repo's only tracker. Such a repo may have no `github`: it loads, shows in `arete status` and on the dashboard, and gets no triage, but `arete run` still refuses it with `has no github remote configured`. A PR for a task closes nothing and ends with the id, like `Paint the door (t-1a2b)`. Poll picks local tasks only in a `tracker = "local"` repo that has a `github` name and `pipeline = true`; a later change widens that.
 
 ## Per repo layer
 
