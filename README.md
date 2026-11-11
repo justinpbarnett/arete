@@ -261,6 +261,30 @@ On a remote device arete cannot read the work folder, so only the local secrets 
 claude reports a resumed session's running cost, so the header keeps what the session had cost before the call, and the closing `usage` total subtracts it to give the call's own cost, as the result line does.
 `--raw` prints the recorded lines as they were written.
 
+## Run lines
+
+Each pipeline run also tells its story as JSON lines in `runs/<run_id>/run.jsonl` under the state folder, one object per line, so one file can be followed while the run works or read after it died.
+Every line has `ts` (UTC, like `2026-11-11T12:00:00Z`), `run` (the run id), `seq` (1, 2, 3 and so on within the run) and `event`.
+Lines are only appended, never rewritten, and each is flushed as it is written.
+A writer holds a file lock while it appends, so several processes can write to one run and the lines stay whole and `seq` stays unique; `seq` goes on from the file, so it carries on after a restart.
+A last line cut short by a dying process is ended as a garbage line by the next writer, and readers skip any line that does not parse.
+
+| event | fields |
+|---|---|
+| `task` | `ticket`, `kind`, `repo`, `title`; when the run starts |
+| `answer` | `asked_in` (the run that asked), `question`; in the new run that the author's reply starts |
+| `step_start` | `step`, `runner`, `model`, `effort`; before each agent call |
+| `heartbeat` | `step`, `seconds` so far; every 30 seconds while a step works (`lines.HEARTBEAT_SECONDS`) |
+| `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`; the cost counts an attempt the network dropped |
+| `question` | `question` (the comment), `summary`; when the run asks the ticket's author |
+| `error` | `step` (the last step started, or empty), `message`; for a failed or interrupted run, not for a stop by request |
+| `report` | `status` as the `runs` table holds it, `prs`, `minutes`, `cost_usd`; always the last line, and the poll writes it for a run whose process died |
+
+Eval runs write the step events too, but no `task` or `report`.
+Each line is also printed to the run's stdout.
+`arete lines RUN_ID` prints the lines, `--from SEQ` starts after that `seq`, and `--follow` keeps printing new lines until the `report` line.
+The run log, the `<step>.json` files, the tables and the records stay as they were; the lines are an addition.
+
 ## Layout
 
 - Code: this repo, a uv project (Python pinned in `.python-version`, everything locked in `uv.lock`). Installed with `uv tool install --editable . --python 3.13`
@@ -270,6 +294,7 @@ claude reports a resumed session's running cost, so the header keeps what the se
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
 - State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
+- Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
 - Logs: `~/Library/Logs/arete/`
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names

@@ -48,6 +48,11 @@ def route(model: str, runner: str = "") -> tuple[str, str]:
     return ("pi" if "/" in model else "claude"), model
 
 
+def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
+    which, name = route(model, run_with)
+    return (REPLAY if cfg.replay.all else which), name
+
+
 def metered(model: str, run_with: str = "") -> bool:
     return route(model, run_with)[0] != SUBSCRIPTION_RUNNER
 
@@ -147,9 +152,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
         wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, **kw) -> Result:
     cfg = cfg or config.load()
-    which, name = route(model, runner or resume.runner)
-    if cfg.replay.all:
-        which = REPLAY
+    which, name = chosen(model, runner or resume.runner, cfg)
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
     if target.remote:
         kw["remote"] = target
