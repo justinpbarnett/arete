@@ -994,8 +994,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--days", type=float, default=None)
     p.set_defaults(fn=cmd_costs)
 
-    p = sub.add_parser("steps", help="the model, runner, effort, timeout and tries each step resolves to, one JSON line "
-                                     "per step")
+    p = sub.add_parser("steps", help="the model, runner, effort, timeout, tries, tools, mcp servers, instructions and "
+                                     "session each step resolves to, one JSON line per step")
     p.add_argument("--repo", default="", help="read this repo's layer too")
     p.add_argument("--kind", default="", choices=config.KINDS, help="resolve for this kind of ticket")
     p.set_defaults(fn=cmd_steps)

@@ -66,9 +66,10 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
 def step(run_id: str, name: str, res, seconds: float) -> None:
     with state.db() as c:
         c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out, turns,"
-                  " seconds, error, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  " seconds, error, ts, first_context_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                   res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso()))
+                   res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
+                   res.first_context_tokens))
         c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
                   "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
                   (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
@@ -344,7 +345,7 @@ class Recorder:
     def finish(self, res: agent.Result, seconds: float) -> None:
         self.end({"ok": res.ok, "error": res.error, "text": res.text, "structured": res.structured,
                   "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
-                  "turns": res.turns, "model": res.model, "provider": res.provider, "session": res.session.id,
+                  "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model, "provider": res.provider, "session": res.session.id,
                   "seconds": round(seconds, 1)})
 
     def end(self, result: dict) -> None:

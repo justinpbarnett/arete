@@ -36,6 +36,7 @@ class Result:
     raw: dict = field(default_factory=dict)
     tokens_in: int = 0
     tokens_out: int = 0
+    first_context_tokens: int = 0
     model: str = ""
     provider: str = ""
     runner: str = ""

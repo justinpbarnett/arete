@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 from . import config, paths, record, state, util
-from .agent import Result
+from .agent import NO_SESSION, Result, Session
 
 ENV = "ARETE_REPLAY_DIR"
+RUNNER = "replay"
 SAMPLE_FILE = "notes.txt"
 SAMPLE_TEXT = "A small file for replay checks.\n"
 SAMPLE_WORD = "kumquat"
@@ -48,7 +50,8 @@ def failed(error: str) -> Result:
     return Result(ok=False, error=error)
 
 
-def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Callable[[str], None]) -> Result:
+def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Callable[[str], None],
+        resume: Session = NO_SESSION) -> Result:
     if not (where := folder(cfg)):
         return failed(f"replay: no answer folder; set [replay] dir in {paths.short_path(paths.CONFIG_FILE)} or {ENV}")
     name = answer_name(*trace)
@@ -69,7 +72,10 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
         res = Result(ok=bool(answer.get("ok", True)), text=str(answer.get("text") or ""),
                      structured=answer.get("structured"), error=str(answer.get("error") or ""),
                      cost_usd=float(answer.get("cost_usd") or 0), tokens_in=int(answer.get("tokens_in") or 0),
-                     tokens_out=int(answer.get("tokens_out") or 0), turns=int(answer.get("turns") or 0))
+                     tokens_out=int(answer.get("tokens_out") or 0), turns=int(answer.get("turns") or 0),
+                     first_context_tokens=int(answer.get("first_context_tokens") or 0),
+                     session=resume if resume.id else Session(str(answer.get("session") or uuid.uuid4().hex), 0.0,
+                                                              RUNNER))
         seconds = max(0.0, float(answer.get("seconds") or 0))
     except (TypeError, ValueError) as e:
         return failed(f"replay: {answer_file} has a bad value: {e}")

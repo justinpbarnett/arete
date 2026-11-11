@@ -40,7 +40,7 @@ arete loop enable NAME
 
 `loop new` has a model draft the folder into `~/.config/arete/loops/`, validates it, and tries again on a problem. The draft starts off. `arete loop list`, `status NAME`, `start NAME`, `stop RUN` and `feed RUN -f` cover the rest, and so does the dashboard's Loops view.
 
-Every run of every kind, pipeline, loop, session, chat and draft, is a row in one runs table with its trigger, model, runner, device, cost and tokens. Each model call is a step under its run. A run's live feed holds its steps, the tools the agent calls, and a command loop's output as it prints.
+Every run of every kind, pipeline, loop, session, chat and draft, is a row in one runs table with its trigger, model, runner, device, cost and tokens. Each model call is a step under its run; a step row also keeps `first_context_tokens`, the input tokens of the call's first model turn with cache reads and writes, so the cost of what a step loads before it does any work shows, and 0 when the runner does not report it. A run's live feed holds its steps, the tools the agent calls, and a command loop's output as it prints.
 
 An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it.
 A ticket, PR, push or digest that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
@@ -238,7 +238,7 @@ The first line is a header with the runner, model, device, repo, commit, folder,
 When a call leaves the model to the runner's default, arete holds the header until the runner names the model it runs (claude's `init` event or pi's first reply), for at most 10 seconds, so the header names the model the default turned out to be.
 Then come the runner's own lines unchanged: claude's `stream-json` events or pi's `--mode json` events.
 A clock line with the seconds since the start goes in before a runner line whenever a second or more has passed since the last one.
-The last line is the result: ok, error, text, structured answer, cost, tokens, turns, model, session and seconds.
+The last line is the result: ok, error, text, structured answer, cost, tokens, first turn's input tokens, turns, model, session and seconds.
 A call that crashes ends with a result whose error starts with `crashed:`, and a call stopped on request (a stop from the CLI or the dashboard, or ctrl-c) ends with the error `stopped by request`.
 Neither has a cost or a turn count, in its result or in its timeline mark, because the runner never reported one.
 
@@ -290,7 +290,8 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `max_parallel` | Most pipeline runs at once on the machine. Default 1. |
 | `max_parallel_per_repo` | Most pipeline runs poll keeps going in one repo, runs in their CI wait included. Default 1. |
 | `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop` and `session`, which use sonnet, and `research` and `chat`, which use opus. `arete status` lists each role's model. |
-| `[steps]`, `[kinds]`, `[tiers]`, `[factory]` | Each pipeline step's model, runner, effort, timeout and tries. See [Steps](#steps). |
+| `[steps]`, `[kinds]`, `[tiers]`, `[factory]` | Each pipeline step's model, runner, effort, timeout, tries, tools, MCP servers, instructions and session. See [Steps](#steps). |
+| `[mcp.<name>]` | An MCP server a step can name in its `mcp` list: `command` with optional `args`, or `url` for an HTTP server. Servers are defined here only, not in a layer. |
 | `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly transcript digest. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
@@ -450,7 +451,7 @@ After a run that had something to learn from (a failed check, a fix, a failed ch
 
 ## Steps
 
-Each pipeline step reads its own model, runner, effort, timeout and tries: plan, build (also revise, the fixes and the CI fixes), verify, review, learn and uat. `arete steps` prints what each step resolves to, one JSON line per step. `--repo NAME` reads that repo's layer too, and `--kind feat` or `--kind fix` resolves for that kind of ticket.
+Each pipeline step reads its own model, runner, effort, timeout, tries, tools, MCP servers, instructions and session: plan, build (also revise, the fixes and the CI fixes), verify, review, learn and uat. `arete steps` prints what each step resolves to, one JSON line per step. `--repo NAME` reads that repo's layer too, and `--kind feat` or `--kind fix` resolves for that kind of ticket.
 
 ```toml
 [tiers.default]
@@ -486,12 +487,16 @@ A step is named by its `[models]` role. `implement` is a second name for `build`
 | `effort` | claude's `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) or pi's `--thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Left out, the runner's own default. |
 | `timeout_minutes` | The step's time limit. Default `limits.timeout_minutes`; learn 15, uat 10. The checks keep `limits.timeout_minutes`. |
 | `tries` | For build, the fix attempts after failed checks and the CI fix rounds; for verify, the rounds of verify in use; for uat, the tries at the test steps. Default `limits.max_attempts`; uat 3. The other steps run once. |
+| `tools` | The built in tools the step may use, from `Read`, `Glob`, `Grep`, `LS`, `Edit`, `MultiEdit`, `Write` and `TodoWrite`. Default `Read`, `Glob`, `Grep`, `Edit`, `Write` and `TodoWrite` for build, `Read`, `Glob` and `Grep` for the rest. The layer's shell rules still apply on top. pi always grants `Read`, `Glob` and `Grep`, so a pi step lists them. |
+| `mcp` | Names of `[mcp.<name>]` servers from `~/.config/arete/config.toml`; a claude step loads those and no others. Default `[]`. verify also gets its own browser server when the layer serves an app, and that server wins over one of the same name. pi takes no servers. |
+| `instructions` | Which standing instruction files load: `user` (`~/.claude/CLAUDE.md`) and `repo` (the repo's `CLAUDE.md` and `CLAUDE.local.md`). Default both on claude, `[]` on pi. On claude, a value short of both becomes `--setting-sources`, which also leaves out that source's `settings.json`. pi runs with `--no-context-files` and takes only `[]`. |
+| `session` | `resume` or `fresh`. With `resume`, a later round of the step (for build, a fix, review fix, verify fix or CI fix) continues the session of its earlier rounds; with `fresh`, each round is a new session whose prompt carries the failing output. Default `resume` for build, `fresh` for the rest. learn and uat keep no session, so they take only `fresh`. |
 
-Levels, where the last one to set a key wins: the defaults above, `[steps]` in `~/.config/arete/config.toml`, `[kinds.<kind>.steps]` there, `[steps]` in the repo's layer, then `[kinds.<kind>.steps]` there. A kind is `feat` or `fix`. A level that names a `model` also drops the `runner` and `provider` that lower levels set. A step with neither a model nor a tier takes its `[models]` role. The other roles, such as triage, chat and the miner, read `[models]` alone.
+Levels, where the last one to set a key wins: the defaults above, `[steps]` in `~/.config/arete/config.toml`, `[kinds.<kind>.steps]` there, `[steps]` in the repo's layer, then `[kinds.<kind>.steps]` there. A kind is `feat` or `fix`. A level that names a `model` also drops the `runner` and `provider` that lower levels set. A step with neither a model nor a tier takes its `[models]` role. The other roles, such as triage, chat and the miner, read `[models]` alone; `arete steps` shows `tools`, `mcp`, `instructions` and `session` for them too, but only the pipeline steps use those four.
 
 `[tiers.<map>]` lists tiers by name. A layer's `[tiers.<map>]` adds to the engine's map of the same name, or replaces a tier it names again. `[factory] tier_map` names the map in use; it may be left out when there is one map.
 
-Config load refuses, in one line that names the table: an unknown step, kind or key, a tier the map does not have, a runner other than `claude`, `pi` or `replay`, an effort the step's runner does not take, `tries` or `timeout_minutes` under 1, several tier maps with no `tier_map`, and a `tier_map` with no such map. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
+Config load refuses, in one line that names the table: an unknown step, kind or key, a tier the map does not have, a runner other than `claude`, `pi` or `replay`, an effort the step's runner does not take, `tries` or `timeout_minutes` under 1, several tier maps with no `tier_map`, a `tier_map` with no such map, a tool outside the `tools` list above (`Bash` and `mcp__` names included), a pi step whose `tools` leave out a read tool, an `mcp` name with no `[mcp.<name>]`, any `mcp` or `instructions` on pi, an `instructions` value other than `user` and `repo`, a `session` other than `resume` and `fresh`, `resume` for learn or uat, and an `[mcp.<name>]` with an unknown key, with both or neither of `command` and `url`, or with `args` beside `url`. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
 
 ## Replay
 
@@ -510,7 +515,8 @@ dir = "~/replay/answers"
 | `text` | The answer's text. |
 | `structured` | The structured answer, for a step that passes a schema. |
 | `ok`, `error` | Default true and empty. `ok = false` with no error fails with one that names the file. |
-| `cost_usd`, `tokens_in`, `tokens_out`, `turns` | What the call reports. Default 0. |
+| `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `first_context_tokens` | What the call reports. Default 0. |
+| `session` | The session id the call reports when it resumes none. Default a new random id; a call that resumes a session reports that one. |
 | `seconds` | How long the call sleeps before it answers. Default 0. |
 
 When `<dir>/<step>.patch` exists, arete applies it to the call's folder with `git apply` before it answers, even when the answer fails; this is how a replayed build changes files. No answer folder, a missing file, a file that is not one JSON object, a bad value and a patch that does not apply each fail the step with an error that names the folder setting or the file.

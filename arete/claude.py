@@ -37,6 +37,7 @@ MILLISECOND_STAMPS = 1e12
 STOP_GRACE_SECONDS = 30
 DRAIN_SECONDS = 10
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+SETTING_SOURCES = {"user": ("user",), "repo": ("project", "local")}
 
 
 def binary() -> str:
@@ -62,6 +63,7 @@ def command(
     mcp_config: str = "",
     remote: devices.Device | None = None,
     settings: dict | None = None,
+    instructions: list[str] | None = None,
 ) -> list[str]:
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
     cmd = ["claude" if remote else binary(), "-p", "--output-format", "stream-json", "--verbose",
@@ -95,6 +97,9 @@ def command(
     if add_dirs:
         cmd += ["--add-dir", *map(str, add_dirs)]
     cmd += ["--strict-mcp-config", "--mcp-config", mcp_config or NO_MCP_SERVERS]
+    if instructions is not None and set(instructions) != set(SETTING_SOURCES):
+        cmd += ["--setting-sources", ",".join(s for kind, sources in SETTING_SOURCES.items() if kind in instructions
+                                              for s in sources)]
     if settings:
         cmd += ["--settings", json.dumps(settings)]
     return cmd
@@ -120,6 +125,7 @@ def run(
     mcp_config: str = "",
     remote: devices.Device | None = None,
     settings: dict | None = None,
+    instructions: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     on_line: Callable[[str], None] = lambda line: None,
 ) -> Result:
@@ -127,7 +133,8 @@ def run(
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
                   disallowed_tools=disallowed_tools, permission_mode=permission_mode, json_schema=json_schema,
                   resume=resume, fresh_session=fresh_session, system=system, max_budget_usd=max_budget_usd,
-                  persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, remote=remote, settings=settings)
+                  persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, remote=remote, settings=settings,
+                  instructions=instructions)
     env = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
     env["ARETE_AGENT"] = "1"
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
@@ -167,6 +174,7 @@ def run(
         usage_limit=usage_limit(data, data.get("result", "") or "") if is_error else None,
         raw=data,
         **claude_tokens(data.get("usage") or {}),
+        first_context_tokens=first_context_tokens(out),
         model=next(iter(data.get("modelUsage") or {}), model),
         provider="anthropic",
     )
@@ -181,6 +189,17 @@ def result_event(out: str) -> dict:
         if isinstance(event, dict) and event.get("type") == "result":
             return event
     return {}
+
+
+def first_context_tokens(stream: str) -> int:
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "assistant" and not event.get("parent_tool_use_id"):
+            return claude_tokens((event.get("message") or {}).get("usage") or {})["tokens_in"]
+    return 0
 
 
 def failure_reason(data: dict) -> str:
