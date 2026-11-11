@@ -29,6 +29,7 @@ from . import (
     record,
     runner,
     state,
+    steps,
     tracker,
     util,
     verdicts,
@@ -160,7 +161,6 @@ HUNK_LINES = 6
 PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
 PR_SEEN_SETTLE = timedelta(minutes=1)
 REJECTED_PR_LISTEN = timedelta(days=7)
-UAT_TRIES = 3
 
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
@@ -200,6 +200,10 @@ class AgentRun:
     paid: float = 0.0
     add_dirs: list[Path] = field(default_factory=list)
     story: list[str] = field(default_factory=list)
+    cfg: config.Config | None = None
+    layer: config.RepoLayer | None = None
+    kind: str = ""
+    overrides: dict = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -219,7 +223,11 @@ class AgentRun:
         p = self.dir / name
         p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
 
-    def agent(self, step: str, text: str, cwd: Path, **kw) -> Result:
+    def settings(self, role: str) -> steps.Settings:
+        return steps.resolve(self.cfg or config.load(), self.layer, role, self.kind, self.overrides)
+
+    def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
+        kw = {**self.settings(role).call, **kw} if role else kw
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
@@ -597,8 +605,8 @@ class Build(TicketWork):
     left_for_a_person: str = ""
 
     def resume(self, step: str, text: str, **kw) -> Result:
-        res = self.run.agent(step, text, self.ws, model=self.cfg.model("build"), allowed_tools=self.tools,
-                             disallowed_tools=runner.NO_GIT_WRITES, resume=self.session, timeout=self.timeout, **kw)
+        res = self.run.agent(step, text, self.ws, role="build", allowed_tools=self.tools,
+                             disallowed_tools=runner.NO_GIT_WRITES, resume=self.session, **kw)
         self.session = res.session
         return res
 
@@ -734,14 +742,23 @@ def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: s
     return "needs-info", summary[:300], ""
 
 
-def resolve_layer(run: Run, ws: Path) -> config.RepoLayer:
+def checked_layer(cfg: config.Config, layer_dir: Path) -> config.RepoLayer:
+    try:
+        layer = config.load_layer(layer_dir)
+        steps.check(cfg, layer)
+    except (ValueError, TypeError) as e:
+        raise RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
+    return layer
+
+
+def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
     repo = run.repo
     if repo.layer:
-        return config.load_layer(repo.layer)
+        return checked_layer(cfg, repo.layer)
     if (ws / ".agents" / "config.toml").exists():
-        return config.load_layer(ws / ".agents")
+        return checked_layer(cfg, ws / ".agents")
     run.log(f"layer: {paths.short_path(repo.path / '.agents')} is not committed; lessons stay in the main checkout")
-    return config.load_layer(repo.path / ".agents")
+    return checked_layer(cfg, repo.path / ".agents")
 
 
 def triage_notes(approval: dict | None) -> str:
@@ -797,7 +814,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         run.log(f"images: left out {', '.join(images.left_out)}")
     attachments = images_note(images)
 
-    main_layer = config.load_layer(repo.layer_dir)
+    main_layer = checked_layer(cfg, repo.layer_dir)
     branch = open_branch(run) or fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
                                                slug=slug(t.title))
     if not run.dry_run:
@@ -809,7 +826,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
     for c in merge_moved_bases(run, [c for c in checkouts if c.resumes]):
         c.merged_base = True
-    layer = resolve_layer(run, ws)
+    layer = resolve_layer(cfg, run, ws)
+    run.cfg, run.layer, run.kind = cfg, layer, t.kind
     for rel in layer.copy:
         src = repo.path / rel
         if src.exists():
@@ -831,7 +849,6 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     builder_bash = layer.builder_bash + reads
     commands = code_list(builder_bash)
     workspace = workspace_note(branch, checkouts)
-    step_timeout = layer.timeout_minutes * 60
     read_tools = runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH + reads)
     build_tools = runner.BUILD_TOOLS + bash_rules(builder_bash)
     deny = diffguard.denied_paths(layer)
@@ -851,8 +868,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                          body=t.body, comments=t.comments, attachments=attachments,
                                          feedback=feedback, expertise=expertise, checks=checks,
                                          commands=commands, max_lines=limit),
-                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES,
-                        json_schema=REVISE_SCHEMA, timeout=step_timeout)
+                        ws, role="build", allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES,
+                        json_schema=REVISE_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "revise step failed", res.text)
         build_summary = res.structured.get("summary", "")
@@ -864,8 +881,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                         body=t.body, comments=t.comments, attachments=attachments,
                                         triage=triage_notes(approval), expertise=expertise, commands=commands,
                                         denied=code_list(deny), max_lines=limit, checks=checks),
-                        ws, model=cfg.model("plan"), allowed_tools=read_tools, json_schema=PLAN_SCHEMA,
-                        timeout=step_timeout)
+                        ws, role="plan", allowed_tools=read_tools, json_schema=PLAN_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "planning step failed")
         plan = res.structured
@@ -890,8 +906,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
                                          expertise=expertise, checks=checks, commands=commands, max_lines=limit,
                                          estimate=estimate, verify=goal),
-                        ws, model=cfg.model("build"), allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES,
-                        timeout=step_timeout)
+                        ws, role="build", allowed_tools=build_tools, disallowed_tools=runner.NO_GIT_WRITES)
         if not res.ok:
             return _fail(run, "build step failed", res.text)
         build_summary = res.text
@@ -904,22 +919,22 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     if left_for_a_person:
         not_checked = NOT_CHECKED_LEFT_FOR_A_PERSON + left_for_a_person
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
-    b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=step_timeout,
+    b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=layer.timeout_minutes * 60,
               workspace=workspace, attachments=attachments, tools=build_tools, deny=deny, expertise=expertise,
               session=res.session, left_for_a_person=left_for_a_person)
 
-    attempts = 1
+    attempts, tries = 1, run.settings("build").tries
     ok = b.check()
-    while not ok and attempts < layer.max_attempts:
+    while not ok and attempts < tries:
         run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(b.report, 2500)}")
         attempts += 1
-        b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=layer.max_attempts, failures=b.report))
+        b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=tries, failures=b.report))
         ok = b.check()
     run.save("checks.md", b.report)
     record.note(run.id, attempts=attempts)
     if not ok:
         run.story.append("Checks still failing after the last attempt.")
-        _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=False)
+        _learn(run, ws, layer.expertise_file, t.title, expertise, apply=False)
         return _fail(run, f"checks still failing after {attempts} attempts")
 
     b.require_valid_diff("the build and its fixes", f" (the plan estimated {estimate})" if estimate else "")
@@ -935,7 +950,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         review = _review(b, plan_to_review, verified, "review2")
 
     draft_why = draft_reason(review.get("verdict") == "approve", verified)
-    _learn(cfg, run, ws, layer.expertise_file, t.title, expertise, apply=True)
+    _learn(run, ws, layer.expertise_file, t.title, expertise, apply=True)
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
     outcome = f"{size}, review {review.get('verdict')}, in use {verified.verdict}"
@@ -1144,7 +1159,7 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
 
 def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_prs: list[Checkout],
              draft_why: str) -> str:
-    run, max_rounds = b.run, b.layer.max_attempts
+    run, max_rounds = b.run, b.run.settings("build").tries
     stopped_before = [c for c in pushed if stopped_by_ci(run, c)]
     rounds: list[ci.Round] = []
     try:
@@ -1431,8 +1446,8 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
                                    diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT)),
-                      b.ws, model=b.cfg.model("review"), allowed_tools=runner.READ_TOOLS + bash_rules(b.read_bash),
-                      json_schema=REVIEW_SCHEMA, timeout=b.timeout)
+                      b.ws, role="review", allowed_tools=runner.READ_TOOLS + bash_rules(b.read_bash),
+                      json_schema=REVIEW_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
     return {**res.structured, "problems": review_problems(res.structured.get("problems"))}
@@ -1449,19 +1464,20 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     if not b.layer.verify:
         b.run.log("verify: the layer has no [verify] section, so nothing checks the change in use")
         return verify.not_configured(b.layer.dir, b.ws)
-    for attempt in range(1, b.layer.max_attempts + 1):
+    tries = b.run.settings("verify").tries
+    for attempt in range(1, tries + 1):
         verified = check_in_use(b, goal, summary)
         if verified.verdict != "fail":
             return verified
         b.run.story.append(f"The check in use failed on attempt {attempt}:\n{util.tail(verified.markdown(), 2500)}")
-        if attempt == b.layer.max_attempts:
+        if attempt == tries:
             break
-        b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=b.layer.max_attempts,
+        b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=tries,
                                                    failures=verified.markdown(), checks=check_list(b.layer)))
         b.recheck("fixing what the check in use found")
     b.run.story.append("Still failing in use after the last attempt.")
-    _learn(b.cfg, b.run, b.ws, b.layer.expertise_file, b.ticket.title, b.expertise, apply=False)
-    raise RunFailed(f"it still does not work in use after {util.count(b.layer.max_attempts, 'attempt')}",
+    _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, b.expertise, apply=False)
+    raise RunFailed(f"it still does not work in use after {util.count(tries, 'attempt')}",
                     verified.markdown())
 
 
@@ -1487,9 +1503,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
                                          commands=code_list(bash), checks=check_list(b.layer), **values),
-                            b.ws, model=b.cfg.model("verify"),
+                            b.ws, role="verify",
                             allowed_tools=runner.READ_TOOLS + bash_rules(bash) + (["mcp__playwright"] if url else []),
-                            disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA, timeout=b.timeout,
+                            disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=verify.mcp_config(evidence) if url else "")
     except verify.ServerError as e:
         run.log(f"{step}: the app did not start")
@@ -1561,15 +1577,14 @@ def check_list(layer: config.RepoLayer) -> str:
     return ", ".join(f"`{c}`" for c in layer.checks.values()) or "(none configured)"
 
 
-def _learn(cfg, run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:
+def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:
     if not run.story:
         run.log("learn: clean run, nothing to learn")
         return
     res = run.agent("learn", prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
                                      story="\n\n".join(run.story), expertise=expertise,
                                      max_lines=EXPERTISE_MAX_LINES),
-                    wt, model=cfg.model("learn"), allowed_tools=runner.READ_TOOLS, json_schema=LEARN_SCHEMA,
-                    timeout=900, persist=False)
+                    wt, role="learn", allowed_tools=runner.READ_TOOLS, json_schema=LEARN_SCHEMA, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     rewrite = found.get("expertise", "").strip()
     lines = len(rewrite.splitlines())
@@ -1795,24 +1810,28 @@ def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
     tries_file = run.dir / f"uat-{tracker.safe_filename(branch)}.tries"
     tries = int(tries_file.read_text() or 0) + 1 if tries_file.exists() else 1
     t = run.tracker.get(run.tid)
+    try:
+        run.cfg, run.layer, run.kind = cfg, config.load_layer(run.repo.layer_dir), t.kind
+        most = run.settings("uat").tries
+    except (ValueError, TypeError) as e:
+        raise RetryNextPoll(f"{paths.short_path(run.repo.layer_dir / 'config.toml')}: {e}") from e
     urls = row["pr_url"].split()
     share = MAX_DIFF_IN_PROMPT // len(urls)
     prs = "\n\n".join(f"### {url}\n\n{gh.pr_body(url).strip()}\n\n```diff\n{cut(gh.pr_diff(url), share)}\n```"
                        for url in urls)
     res = run.agent("uat", prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
                                   prs=prs, branch=branch),
-                    run.repo.path, model=cfg.model("uat"), allowed_tools=runner.READ_TOOLS, json_schema=UAT_SCHEMA,
-                    timeout=600, persist=False)
+                    run.repo.path, role="uat", allowed_tools=runner.READ_TOOLS, json_schema=UAT_SCHEMA, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
-    steps = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
+    listed = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
     failure = util.first_line(res.error or "none came back")
-    if steps:
+    if listed:
         before = found.get("before", "").strip()
         text = (f"**Before you start:** {before}\n\n" if before else "") + "\n".join(
-            f"{i}. {s}" for i, s in enumerate(steps, 1))
-    elif tries < UAT_TRIES:
+            f"{i}. {s}" for i, s in enumerate(listed, 1))
+    elif tries < most:
         tries_file.write_text(str(tries))
-        raise RetryNextPoll(f"no test steps came back, try {tries} of {UAT_TRIES}: {failure}")
+        raise RetryNextPoll(f"no test steps came back, try {tries} of {most}: {failure}")
     else:
         text = (f"I could not write the steps ({failure}); "
                 f"the PR shows what changed: {' '.join(urls)}")

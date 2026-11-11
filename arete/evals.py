@@ -273,6 +273,7 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: AgentRun) -> config.R
 def grade(cfg: config.Config, run: EvalRun, layer: config.RepoLayer, wt: Path, title: str, ask: str, steps: str,
           timeout: float, step: str = "grade") -> verify.Verified:
     ticket = tracker.Ticket(id=run.task, ref=run.task, title=title, body=ask)
+    run.cfg, run.layer, run.overrides = cfg, layer, {"timeout_minutes": max(1, round(timeout / 60))}
     work = TicketWork(cfg, run, ticket, wt, [Checkout("", run.repo.github, run.repo.path, wt, "")], layer, timeout,
                       workspace="You are in a checkout of its code.")
     return use_product(work, step, "grade", goal=steps)
