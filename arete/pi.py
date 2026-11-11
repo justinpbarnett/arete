@@ -45,13 +45,17 @@ def binary() -> str:
     return shutil.which("pi") or (str(installed[-1]) if installed else "pi")
 
 
+def is_pattern_rule(rule: str) -> bool:
+    return "(" in rule
+
+
 def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallowed_tools: list[str] | None) -> list[str]:
     granted = tools if tools is not None else [*(allowed_tools or []), *READ_TOOLS]
     allowed = set(allowed_tools or []) | set(READ_TOOLS)
     denied = {t.split("(", 1)[0] for t in disallowed_tools or []}
     names: list[str] = []
     for tool in granted:
-        if tool in denied or "(" in tool:
+        if tool in denied or is_pattern_rule(tool):
             continue
         if tool not in allowed and tool not in READ_ONLY_TOOLS:
             continue
@@ -110,6 +114,10 @@ def run(
                       session=resume, runner="pi", model=model)
     cwd = cwd if remote else Path(cwd).absolute()
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
+    sandboxed = bool(remote and remote.exe_sandbox)
+    if sandboxed:
+        # A sandbox is deleted after its run and holds no git credentials, so the rules against git writes guard nothing.
+        disallowed_tools = [t for t in disallowed_tools or [] if not is_pattern_rule(t)]
     names = tool_names(tools, allowed_tools, disallowed_tools)
     sessions_dir = f"{devices.home(remote)}/.arete/pi-sessions" if remote else str(SESSIONS_DIR)
     cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
@@ -131,7 +139,7 @@ def run(
         cmd += ["--append-system-prompt", "You may also read and change files under: " + ", ".join(map(str, add_dirs))]
     if json_schema:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
-    if writing := sorted(WRITING & set(names)):
+    if (writing := sorted(WRITING & set(names))) and not sandboxed:
         if not can_confine(bool(remote)):
             return Result(ok=False, error=f"{NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
                           session=resume, runner="pi", model=model)

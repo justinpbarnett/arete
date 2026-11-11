@@ -75,6 +75,107 @@ note = "Hetzner box"
 ```
 
 `arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `arete` and `ollama` it has.
+Arete's ssh never forwards your ssh agent, so an agent on a device cannot use your keys.
+
+A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
+Each run gets a VM of its own, works on it over ssh, and deletes it when the run ends.
+Arete reaches exe.dev as `ssh exe.dev` with your own ssh key, so it stores no exe.dev key.
+Every exe.dev VM shows exe.dev's own host key, so arete checks any `*.exe.xyz` host against your `known_hosts` line for `exe.dev`, and writes no line of its own.
+
+```toml
+[device.sandbox]
+kind = "exe"
+template = "arete-template"   # a VM to copy for each run; leave it out to start from exe.dev's own image
+egress = "integrations"       # integrations | all; leave it out for "all", or for the template's own policy on a copy
+note = "a fresh sandbox per run"
+```
+
+A sandbox is named `arete-` and its run id, and is tagged `arete`; a copy of a template also keeps the template's tags.
+`keep = true` leaves the sandbox up after the run and logs the `ssh exe.dev rm NAME` that deletes it; exe.dev bills it until then.
+It keeps only a sandbox that came up and passed the checks below, and arete deletes one that it refuses or that never answers.
+A probe of an `exe` device makes a real sandbox, checks that it answers, and deletes it.
+
+Agents in a sandbox run on pi, which reads `~/.pi/agent/models.json` on the VM; a loop or session that would run claude there is refused.
+Make the template a regular VM with `ssh exe.dev new --name=arete-template`, and give it a `models.json` whose providers go through exe.dev integrations:
+
+```json
+{
+  "providers": {
+    "openrouter": { "baseUrl": "https://openrouter.int.exe.xyz/api/v1", "apiKey": "integration" },
+    "exe-llm": { "baseUrl": "https://llm.int.exe.xyz/openai/v1", "api": "openai-responses", "apiKey": "integration",
+                 "models": [{ "id": "gpt-5.4-mini" }] }
+  }
+}
+```
+
+exe.dev adds the real key at the integration, so the VM holds none, and `egress = "integrations"` lets the sandbox reach the integrations alone.
+`exe-llm` is exe.dev's own LLM gateway, which every VM can reach; a loop or session asks for it as `exe-llm/gpt-5.4-mini`.
+OpenRouter needs an integration that holds your key, attached to the `arete` tag.
+This command reads the key from `~/.config/arete/pi.env` and hands it to exe.dev on stdin, so the key stays out of your shell history:
+
+```
+sed -nE 's/^(export )?OPENROUTER_API_KEY=//p' ~/.config/arete/pi.env | tail -n 1 | tr -d "\"'\n" | ssh exe.dev integrations add openrouter --name=openrouter --key=- --attach tag:arete
+```
+
+A model is then `openrouter/` and an OpenRouter model id.
+In a sandbox, pi gets Bash, Edit and Write, and runs without the rules against git writes, because the VM holds nothing to push with and is deleted after the run.
+A probe, a loop run or a session refuses a sandbox that could push, and deletes it, even on a `keep = true` device.
+The refusal names what arete found and never prints a value.
+Arete looks in the login's home and environment for:
+
+- `~/.git-credentials`, `~/.config/git/credentials`, `~/.netrc` or a gh login, also under `$XDG_CONFIG_HOME` or `$GH_CONFIG_DIR`
+- a git `credential.helper`, also one for a single URL, or a `url.insteadOf` that holds a credential
+- `$GH_TOKEN`, `$GITHUB_TOKEN` or their `_ENTERPRISE_` forms, in the environment or set in a shell startup file or `/etc/environment`
+- a private key anywhere under `~/.ssh`, or a `~/.ssh` that arete cannot read all of
+
+It also refuses a sandbox that one of these integrations reaches:
+
+- a `github` integration, unless it is `--readonly`
+- a GitLab, Bitbucket, Forgejo, Gitea or GitHub integration from the catalog, which has no read-only form
+- an `http-proxy` integration whose target is on a public forge: github.com, gitlab.com, bitbucket.org, codeberg.org, gitea.com, sr.ht, dev.azure.com, visualstudio.com or gitee.com
+- an `http-proxy` integration whose target arete cannot read
+- an `ssh-key` integration, since arete cannot tell which hosts take its key
+- an `exe-dev` integration, which lets the sandbox use exe.dev as you and so attach a GitHub integration to itself
+
+An integration reaches a sandbox through `auto:all`, a tag the sandbox carries (`arete`, and on a copy the template's tags), or `vm:` and the sandbox's name.
+A team integration reaches it through its tags, and one that lists no attachments counts as reaching it.
+An attachment of a form arete does not know counts as reaching it, such as a wildcard, a list, or a time-boxed grant written after the name.
+Arete cannot tell whether other integrations can push, so keep these off what a sandbox reaches:
+
+- an `http-proxy` to another forge, such as a self-hosted one
+- an External Connection to a private network
+- a VM-to-VM proxy to a VM that holds credentials
+- cloud credentials through `wif` or a token-mint service
+The check reads the login's own home, so give root and any other user on the template no git credentials either.
+
+A device of kind `proxmox` clones a template VM on a Proxmox VE host for each run:
+
+```toml
+[device.pve]
+kind = "proxmox"
+host = "root@pve.lan"         # the Proxmox VE host, reached over ssh
+template = "9000"             # the VM id of the template to clone
+user = "root"                 # the login on the clone; root when left out
+note = "a linked clone per run"
+```
+
+Each run gets a linked clone of the template, named `arete-` and its run id.
+Arete starts the clone, asks the QEMU guest agent for its address, and reaches it over ssh with the Proxmox host as the jump host.
+So the template needs `qemu-guest-agent` running and your ssh key in the login's `authorized_keys`.
+Arete destroys the clone when the run ends, unless the device sets `keep = true`.
+Before it destroys a clone, arete checks that the VM id still holds a VM of that name.
+A probe of a `proxmox` device reads the template's config and makes no clone.
+
+Arete writes each sandbox and proxmox clone to its state database before it asks for one, and strikes it off once a delete confirms it is gone.
+`arete loop stop` and `arete session stop` delete the VM of a run that died before it could.
+Every 5 minutes, and right after it reaps a dead run, `arete serve` deletes any VM still on that list whose run has ended, and any probe VM older than 10 minutes.
+That catches a delete that failed, a create that got no answer or was stopped, and a probe that was killed.
+A create that ssh could not send, because it could not reach or log in to the host, leaves nothing to delete, and arete strikes it off at once.
+A create that the host refuses is struck off once a delete confirms that nothing is left.
+A connection can also drop after the VM is made, so a create with no answer stays on the list for 10 minutes even when a delete finds nothing, since the host may still finish it.
+A run whose VM could not be deleted says so in its summary, with the command that deletes it.
+After 7 days of failed deletes, `arete serve` logs that command and stops trying.
+A VM of a `keep = true` device leaves the list once it is up, so arete never deletes it.
 
 A session is an agent you start by hand and talk to, on any device, model and tool set:
 
@@ -465,7 +566,8 @@ A step on the `claude` CLI rides the subscription, so every paid sum leaves it o
 - Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`, never an `ANTHROPIC_API_KEY`, here or on a device.
 - A claude run takes no dollar cap and waits out a usage limit; budgets apply to pi alone.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
-- Agents never run git write commands. Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
+- Agents never run git write commands, except pi in an exe.dev sandbox, which arete refuses when it could push and deletes after its run.
+  Diff size and deny paths are enforced by code after the agent finishes, not by asking nicely.
 - Trust starts at `pr`. Automerge only arrives through a human: a config PR they merge, or for a layer outside the repo, their own edit to `trust.level`. A `push` emit follows the same level: under `pr`, a person lands every push.
 - Alert issues carry check names and one short status line, never log contents.
 - PRs to public repos cite run ids, never transcript text.

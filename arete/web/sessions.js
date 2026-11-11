@@ -58,7 +58,7 @@ function drawSessions(data) {
         data.sessions.map((s) => linkedRow(detailHash("session", s.id),
           cell([rowLink("session", s.id, firstMessage(s.prompt)), s.repo ? el("div", { class: "muted", text: `${s.repo}${s.branch ? ` · ${s.branch}` : ""}` }) : null], "wrap-cell"),
           cell(runStatus(s.status), "nb"), cell(clock(s.started), "nb"),
-          cell([s.model || "", el("div", { class: "muted", text: [s.runner, s.device].filter(Boolean).join(" on ") })]),
+          cell([wrapAtSlashes(s.model), el("div", { class: "muted", text: [s.runner, s.device].filter(Boolean).join(" on ") })]),
           paid.cell(s))), { stack: true })
       : quiet("No session yet. New session starts one."));
   return data.sessions.some((s) => s.status === "running") ? LIVE_MS : SLOW_MS;

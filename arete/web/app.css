@@ -187,13 +187,17 @@ th.c-duration { width: 120px; }
 .wide :is(th, td).num + :is(th, td):not(.num) { padding-left: 14px; }
 th.c-ref { width: 140px; }
 th.c-verdict { width: 300px; }
-th.c-result { min-width: 220px; }
+th.c-result { min-width: 175px; }
 th.c-on { width: 70px; }
 th.c-decide { width: 210px; }
 th.c-run-buttons { width: 130px; }
 th.c-model { width: 190px; }
 th.c-probe { width: 134px; }
-th.c-loop { min-width: 220px; }
+th.c-loop { min-width: 160px; }
+@container (max-width: 879.98px) {
+  .nb.wrap-narrow { white-space: normal; }
+  th.c-result { min-width: 150px; }
+}
 th.c-device { min-width: 200px; }
 @container (min-width: 720px) { th.c-work { min-width: 150px; } }
 @container (max-width: 560px) {
@@ -206,7 +210,8 @@ th.c-device { min-width: 200px; }
 td .state { margin-right: 2px; }
 td button { padding-top: 3px; padding-bottom: 2px; white-space: nowrap; }
 td.muted-cell { color: var(--muted); overflow-wrap: anywhere; }
-.id-part { display: inline-block; }
+.part { display: inline-block; }
+code.path { display: inline-block; }
 .clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 td.wrap-cell, td .wrap-cell, td a[data-row] { overflow-wrap: anywhere; }
 td div.muted { font-size: 13px; margin-top: 2px; }

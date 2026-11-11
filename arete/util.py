@@ -19,6 +19,7 @@ from typing import TextIO
 from . import paths
 
 PROBE_GRACE_SECONDS = 0.2
+TIMED_OUT = 124
 
 def now() -> datetime:
     return datetime.now(UTC)
@@ -56,7 +57,7 @@ def sh(
         )
     except subprocess.TimeoutExpired as e:
         res = subprocess.CompletedProcess(
-            cmd, 124, stdout=_s(e.stdout), stderr=_s(e.stderr) + f"\n[arete] timed out after {timeout}s"
+            cmd, TIMED_OUT, stdout=_s(e.stdout), stderr=_s(e.stderr) + f"\n[arete] timed out after {timeout}s"
         )
     except FileNotFoundError as e:
         res = subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(e))
@@ -203,6 +204,10 @@ def first_line(text: str, n: int = 160) -> str:
         if line:
             return line[:n]
     return ""
+
+
+def one_line(text: str, n: int = 300) -> str:
+    return " ".join(text.split())[:n]
 
 
 def last_line(text: str, n: int = 160) -> str:

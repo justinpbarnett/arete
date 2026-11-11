@@ -4,7 +4,9 @@ let loopNewKey = "";
 
 function serveState(serve) {
   if (!serve.at) return el("p", {}, stateChip("fault"), " Serve has never run on this machine, so no loop fires on its own. Installing it starts it and keeps it running.");
-  if (!serve.alive) return el("p", {}, stateChip("fault"), " Serve last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so no loop fires on its own until it runs again.`);
+  if (!serve.alive) return el("p", {}, stateChip("fault"), serve.process_gone
+    ? [" Serve's process is gone; it last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so no loop fires on its own until it runs again.`]
+    : [" Serve's process is up, but it last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so it looks stuck and no loop fires on its own until it beats again.`]);
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
   return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),
@@ -28,7 +30,12 @@ function installServe(btn) {
 function loopLastRun(l) {
   if (l.running) return ["running", el("br"), itemLink("run", l.running, "Open the run", `running:${l.name}`)];
   if (!l.last) return "never";
-  return [...runStatus(l.last.status), el("br"), el("a", { href: detailHash("run", l.last.id), "data-focus": `last:${l.name}`, class: "muted-link" }, liveAgo(l.last.started))];
+  return [...runStatus(l.last.status), el("br"), el("a", { href: detailHash("run", l.last.id), "data-focus": `last:${l.name}`, class: "muted-link nb" }, liveAgo(l.last.started))];
+}
+
+function loopTrigger(l) {
+  const next = l.next_due ? `next ${clock(l.next_due)}` : "";
+  return [wrapAfterCommas(l.trigger), el("div", { class: "muted", text: [l.kind, next].filter(Boolean).join(" · ") })];
 }
 
 function loopButtons(l, place) {
@@ -43,10 +50,8 @@ function loopRow(l) {
   return linkedRow(detailHash("loop", l.name),
     cell([rowLink("loop", l.name, l.name), el("div", { class: "muted", text: l.error || l.description })]),
     cell(l.error ? stateChip("fault") : l.enabled ? "on" : "off", "nb"),
-    cell(l.kind),
-    cell(l.trigger, "nb"),
-    cell(loopLastRun(l), "nb"),
-    cell(l.next_due ? clock(l.next_due) : "", "nb"),
+    cell(loopTrigger(l)),
+    cell(loopLastRun(l), "wrap-narrow"),
     cell(paidMoney(l.spent_24h), "num"),
     cell(el("div", { class: "loop-buttons" }, loopButtons(l, "loops"))));
 }
@@ -56,7 +61,7 @@ function drawLoops(data) {
     serveLine(data.serve),
     saidLine("loops"),
     data.loops.length
-      ? table("", [["Loop", "c-loop"], ["On", "c-on"], ["Kind", "wide-only"], ["Trigger", "wide-only"], ["Last run", "c-status"], ["Next", "c-time wide-only"], ["Paid 24 h", "num nb wide-only"], ["", "c-loop-buttons beside"]],
+      ? table("", [["Loop", "c-loop"], ["On", "c-on"], ["Trigger", "wide-only"], ["Last run", "c-status"], ["Paid 24 h", "num nb wide-only wrap-narrow"], ["", "c-loop-buttons beside"]],
         data.loops.map(loopRow), { stack: true })
       : quiet("No loop is installed. New loop drafts one from a sentence."));
   fillLoopNew(data.draft);
@@ -119,9 +124,9 @@ function budgetWords(d) {
 
 function loopFacts(d) {
   return el("dl", { class: "w" },
-    fact("On", d.enabled ? "on" : "off"), fact("Kind", d.kind), fact("Folder", el("code", { text: d.dir })), fact("Trigger", d.trigger),
+    fact("On", d.enabled ? "on" : "off"), fact("Kind", d.kind), fact("Folder", pathCode(d.dir)), fact("Trigger", wrapAfterCommas(d.trigger)),
     fact("Webhook", d.webhook_path ? el("code", { text: `POST ${d.webhook_path}` }) : ""),
-    fact("Repo", d.repo), fact("Model", d.model ? `${d.model}${d.runner ? ` on ${d.runner}` : ""}` : ""),
+    fact("Repo", d.repo), fact("Model", modelOnRunner(d.model, d.runner)),
     fact("Device", d.device), fact("Queue", d.queue === d.name ? "its own" : d.queue), fact("Budget", budgetWords(d)),
     fact("Paid 24 h", paidMoney(d.spent_24h)),
     fact("Emits", d.emits.join(", ") || "nothing"),
