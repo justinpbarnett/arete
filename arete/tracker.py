@@ -110,6 +110,8 @@ class GitHubTracker:
     def __init__(self, repo: config.Repo):
         self.repo = repo
         self.owner = repo.github.split("/")[0]
+        self._bodies: dict[str, str] = {}
+        self._open: dict[int, bool | None] = {}
 
     @property
     def queue_hint(self) -> str:
@@ -130,7 +132,10 @@ class GitHubTracker:
     def todo(self) -> list[Ticket]:
         skip = {self.label_name(s) for s in config.STATES}
         out = []
+        self._bodies, self._open = {}, {}
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
+            self._bodies[str(i["number"])] = i.get("body") or ""
+            self._open[int(i["number"])] = True
             names = {lb["name"] for lb in i.get("labels", [])}
             if names & skip or not self.by_owner(i):
                 continue
@@ -143,7 +148,19 @@ class GitHubTracker:
         return bool(login) and login.lower() == self.owner.lower()
 
     def blocker(self, tid: str) -> str:
-        return ""
+        body = self._bodies.get(tid)
+        if body is None:
+            body = (gh.issue(self.repo.github, int(tid)) or {}).get("body") or ""
+        return wait_blocker(waits_on(body), self.is_open)
+
+    def is_open(self, number: int) -> bool | None:
+        if number not in self._open:
+            try:
+                state = (gh.issue(self.repo.github, number) or {}).get("state")
+            except gh.GhError:
+                state = None
+            self._open[number] = True if state == "OPEN" else False if state in ("CLOSED", "MERGED") else None
+        return self._open[number]
 
     def replied(self) -> list[Ticket]:
         out = []
@@ -151,6 +168,7 @@ class GitHubTracker:
             if LABEL not in {lb["name"] for lb in i.get("labels", [])} or not self.by_owner(i):
                 continue
             full = gh.issue(self.repo.github, int(i["number"]))
+            self._bodies[str(i["number"])] = full.get("body") or ""
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
                     if self.by_owner(c) and c.get("createdAt")]
             if answered(mine):
@@ -168,7 +186,8 @@ class GitHubTracker:
         comments = [(self.owner, c.get("createdAt", ""), c.get("body", "")) for c in i.get("comments", [])
                     if self.by_owner(c)]
         blocker = ("" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
-            "" if LABEL in labels else f"it has no `{LABEL}` label")
+            "" if LABEL in labels else f"it has no `{LABEL}` label") or wait_blocker(
+            waits_on(i.get("body") or ""), self.is_open)
         return Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
@@ -467,6 +486,32 @@ def route_blocker(routes: set[str], labels: list[str]) -> str:
     if len(hits) > 1:
         return f"it has more than one route label: {', '.join(sorted(hits))}"
     return ""
+
+
+WAIT_LINE = re.compile(r"^[ \t]*waits[ \t]+on\b(.*)$", re.IGNORECASE | re.MULTILINE)
+WAIT_REF = re.compile(r"(?<![\w/])#(\d+)")
+
+
+def waits_on(body: str) -> list[int]:
+    found = [int(n) for rest in WAIT_LINE.findall(body or "") for n in WAIT_REF.findall(rest)]
+    return list(dict.fromkeys(found))
+
+
+def _refs(numbers: list[int]) -> str:
+    refs = [f"#{n}" for n in numbers]
+    return refs[0] if len(refs) == 1 else f"{', '.join(refs[:-1])} and {refs[-1]}"
+
+
+def wait_blocker(waits: list[int], is_open: Callable[[int], bool | None]) -> str:
+    seen = {n: is_open(n) for n in waits}
+    still = [n for n, v in seen.items() if v is True]
+    unread = [n for n, v in seen.items() if v is None]
+    parts = []
+    if still:
+        parts.append(f"it waits on {_refs(still)}, which {'is' if len(still) == 1 else 'are'} still open")
+    if unread:
+        parts.append(f"it waits on {_refs(unread)}, which arete could not read")
+    return "; ".join(parts)
 
 
 def jira_unrouted(project: str, routes: set[str], client: jira.Client) -> list[Ticket]:
