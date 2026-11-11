@@ -58,7 +58,7 @@ repo = "arete"                 # a config repo name or a path to a git repo; cli
 model = "sonnet"               # an alias or claude-* runs on claude; provider/model (deepseek/deepseek-flash, ollama/gemma4) runs on pi
 runner = ""                    # claude | pi, to force one
 tools = ["Read", "Glob", "Grep"]       # Read Glob Grep LS, plus Edit MultiEdit Write Bash
-device = "local"               # a device from ~/.config/arete/devices.toml
+device = "local"               # a device from ~/.config/arete/devices.toml; an exe device gives each run a sandbox of its own
 timeout_minutes = 30
 budget_usd = 0.50              # pi only: stop one run when it spends this
 daily_budget_usd = 2.00        # pi only: refuse to start when the last 24 hours spent this
@@ -170,6 +170,7 @@ Its events reach the agent fenced as data, and a ticket it files is built from t
 With JEV on, an event JEV reads as instructions to an agent is dropped before the agent sees it, and a ticket drawn from outside text that reads that way waits for approval.
 To act on what it finds, it emits a ticket labeled `agent` and the pipeline does the work under its own gates.
 Agents never run git writes; climb and search commit in their own worktree, and a `pr` or `push` emit pushes.
+A loop run by pi gets Bash only on an `exe` device, whose sandbox holds no git credentials and is deleted after the run.
 
 ## prompt.md
 

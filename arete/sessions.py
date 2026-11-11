@@ -118,8 +118,10 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
         raise control.Refused("pick a model, or set [models] session in the config")
     target = device_named(device)
     work_repo = repo_named(repo, target, cfg)
+    if refusal := runner.device_refusal(model, run_with, target):
+        raise control.Refused(refusal)
     which, name = runner.route(model, run_with)
-    off = runner.withheld(model, run_with, tools, target.remote)
+    off = runner.withheld(model, run_with, tools, target)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
                 budget_usd, created=util.iso())
@@ -246,12 +248,12 @@ def execute(session_id: str) -> str:
         except SessionStopped:
             status, summary = "stopped", record.STOPPED if record.stop_asked(session_id) else "stopped by a signal"
         except devices.DeviceError as e:
-            status, summary = "failed", util.first_line(str(e), 300)
+            status, summary = "failed", util.one_line(str(e), 500)
         except Exception as e:
             status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        close(spec, status, summary)
+        close(spec, status, devices.with_left_up(summary, session_id))
         return status
 
 

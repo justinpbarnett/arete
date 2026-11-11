@@ -17,6 +17,7 @@ from . import (
     config,
     control,
     dashboard,
+    devices,
     engine,
     explain,
     hold_review,
@@ -33,6 +34,7 @@ from .loops import Loop
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
+SWEEP_SECONDS = 300
 POLL_THREADS = 8
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.engine"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
@@ -100,6 +102,7 @@ class Server:
         self.cfg = config.load()
         self.started = util.now()
         self.polls: dict[str, Future] = {}
+        self.sweep: Future | None = None
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
@@ -108,7 +111,7 @@ class Server:
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
-        self.pruned = 0.0
+        self.pruned = self.swept = 0.0
         self.ticks = 0
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
@@ -124,6 +127,7 @@ class Server:
         live = [x for x in every_loop if x.enabled and not x.error]
         for row in record.reap(tickets=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
+            self.swept = 0.0
         states = state.loop_states()
         now = util.now()
         for loop in live:
@@ -138,6 +142,9 @@ class Server:
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             state.prune()
             self.pruned = time.monotonic()
+        if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
+            self.sweep = self.pool.submit(self.sweep_vms)
+            self.swept = time.monotonic()
         self.ticks += 1
         self.beat(every_loop, live)
 
@@ -191,6 +198,24 @@ class Server:
         polled = {sources.source_id(loop, i) for loop in live for i in range(len(loop.sources))}
         for sid in set(self.errors) - polled:
             self.errors.pop(sid, None)
+
+    def sweeping(self) -> bool:
+        return bool(self.sweep) and not self.sweep.done()
+
+    def sweep_vms(self) -> None:
+        try:
+            devices.sweep(self.sweep_log)
+        except Exception as e:
+            self.say(f"sweeping left-over VMs failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+
+    def sweep_log(self, run_id: str | None) -> Callable[[str], None]:
+        if not run_id:
+            return self.say
+
+        def log(text: str) -> None:
+            state.add_feed(run_id, "device", f"arete serve: {text}")
+            self.say(f"{run_id}: {text}")
+        return log
 
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
@@ -303,6 +328,8 @@ class Server:
             return "a source poll is still running"
         if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
             return running[0]
+        if self.sweeping():
+            return "a sweep of left-over VMs is still running"
         if dashboard.POSTS_IN_FLIGHT.count:
             return "the dashboard is still answering a request"
         if chat.any_busy():

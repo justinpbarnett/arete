@@ -8,7 +8,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import ask, claude, config, devices, guard, jev, pi, record, state, util
-from .agent import NO_SESSION, READ_ONLY_TOOLS, READ_TOOLS, SUBSCRIPTION_RUNNER, Result, Session
+from .agent import (
+    NO_SESSION,
+    READ_ONLY_TOOLS,
+    READ_TOOLS,
+    SUBSCRIPTION_RUNNER,
+    Result,
+    Session,
+)
 
 RUNNERS = ("claude", "pi")
 BUDGET_FLOOR_USD = 0.005
@@ -21,6 +28,8 @@ NO_GIT_WRITES = [
     "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
 ]
 PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
+SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider/model such as exe-llm/gpt-5.4-mini "
+                   "or openrouter/<model id>")
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
@@ -81,14 +90,18 @@ def agent_problems(run_with: str, tools: list[str]) -> list[str]:
     return problems
 
 
-def withheld(model: str, run_with: str, tools: list[str], remote: bool) -> dict[str, list[str]]:
-    if route(model, run_with)[0] != "pi":
+def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
+    return SANDBOX_RUNS_PI if device.exe_sandbox and route(model, run_with)[0] == "claude" else ""
+
+
+def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:
+    if route(model, run_with)[0] != "pi" or device.exe_sandbox:
         return {}
     reasons: dict[str, list[str]] = {}
     for tool in tools:
         if tool == "Bash":
             reasons.setdefault(PI_HOLDS_NO_BASH_RULES, []).append(tool)
-        elif tool in WRITING_TOOLS and not pi.can_confine(remote):
+        elif tool in WRITING_TOOLS and not pi.can_confine(device.remote):
             reasons.setdefault(pi.NO_CONFINEMENT_REASON, []).append(tool)
     return reasons
 

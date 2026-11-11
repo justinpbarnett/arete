@@ -126,12 +126,21 @@ function withLinks(text) {
   return text.split(URL_IN_TEXT).map((part, i) => (i % 2 ? link(part, part) : document.createTextNode(part)));
 }
 
+function joinSpans(parts, cls, gap) {
+  return parts.flatMap((part, i) => [i ? gap() : null, el("span", { class: cls }, part)]);
+}
+
 function wholeWords(text) {
-  return text.split(" ").flatMap((word, i) => [i ? " " : null, el("span", { class: "nb", text: word })]).filter(Boolean);
+  return text ? joinSpans(text.split(" "), "nb", () => " ") : "";
 }
 
 function wrapAtSlashes(text) {
-  return text.split(/(?<=\/)/).flatMap((part, i) => [i ? el("wbr") : null, el("span", { class: "id-part", text: part })]);
+  return text ? joinSpans(text.split(/(?<=\/)/), "part", () => el("wbr")) : "";
+}
+
+function wrapAfterCommas(text) {
+  const words = (part) => joinSpans(part.split(" "), "part", () => " ");
+  return text ? joinSpans(text.split(/(?<=,) /).map(words), "part", () => " ") : "";
 }
 
 function pullLinks(urls) {
@@ -215,9 +224,9 @@ function liveAgo(ts) {
 
 function duration(seconds) {
   if (seconds === null || seconds === undefined) return "";
-  if (seconds < 60) return `${seconds} s`;
+  if (seconds < 60) return `${seconds} s`;
   const minutes = Math.round(seconds / 60);
-  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${pad(minutes % 60)} min`;
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${pad(minutes % 60)} min`;
 }
 
 function money(n) {
@@ -227,6 +236,14 @@ function money(n) {
 
 function paidMoney(n) {
   return n > 0 ? money(n) : "";
+}
+
+function pathCode(path) {
+  return el("code", { class: "path" }, wrapAtSlashes(path));
+}
+
+function modelOnRunner(model, runner) {
+  return model ? [wrapAtSlashes(model), runner ? ` on ${runner}` : null] : "";
 }
 
 function paidColumn(rows, { onPhone = false } = {}) {
@@ -317,7 +334,7 @@ function foldText(key, summary, text) {
 }
 
 function runStatus(status) {
-  return sayParts(RUN_STATE[status], status);
+  return sayParts(RUN_STATE[status], el("span", { class: "nb", text: status }));
 }
 
 function secondsBetween(start, end) {

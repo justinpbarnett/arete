@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 
 from . import paths, state, util
@@ -109,11 +109,11 @@ def dead(row: dict):
             yield free
 
 
-def interrupt(row: dict) -> dict | None:
+def interrupt(row: dict, notes: Sequence[str] = ()) -> dict | None:
     if not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
     status = dead_status(row)
-    summary = STOPPED if status == "stopped" else INTERRUPTED
+    summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
     settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
     if settled and row["kind"] == "draft":
         shutil.rmtree(paths.draft_dir(row["id"]), ignore_errors=True)

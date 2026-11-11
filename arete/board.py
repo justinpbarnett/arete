@@ -7,7 +7,19 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
-from . import config, control, delivery, loops, paths, pipeline, sessions, state, tracker, triage, util
+from . import (
+    config,
+    control,
+    delivery,
+    loops,
+    paths,
+    pipeline,
+    sessions,
+    state,
+    tracker,
+    triage,
+    util,
+)
 from .agent import SUBSCRIPTION_RUNNER
 from .alerts import issue_link, opened_in
 

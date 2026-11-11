@@ -228,7 +228,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     note = f"\n[arete] stopped after {timeout:g}s\n"
     with open(output or os.devnull, "a") as out:
         out.write(note)
-    return 124, "".join(lines) + note
+    return util.TIMED_OUT, "".join(lines) + note
 
 
 def work_dir(run: LoopRun) -> Path | str:
@@ -354,14 +354,14 @@ def carry(run: LoopRun) -> str:
     except Stopped:
         status, summary = "stopped", record.STOPPED if record.stop_asked(run.id) else "stopped by a signal"
     except devices.DeviceError as e:
-        status, summary = "failed", util.first_line(str(e), 300)
+        status, summary = "failed", util.one_line(str(e), 500)
     except Exception as e:
         run.log("error", traceback.format_exc().strip())
         status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         state.drop_claimed_items(run.id)
-    return settle(run, status, summary)
+    return settle(run, status, devices.with_left_up(summary, run.id))
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:
