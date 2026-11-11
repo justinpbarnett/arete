@@ -27,16 +27,21 @@ let route = null;
 const lastQuery = {};
 let focusAfterDraw = "";
 let mouseAt = null;
+let pointerKnown = false;
 const openQuestions = new Set();
 const drafts = new Map();
 const lastSaid = new Map();
 const saidById = new Map();
-const saidBeside = new Map();
-const VACATED_SPOT_MS = 1000;
-let vacatedSpot = null;
 let changesInFlight = 0;
 
 class NoAnswer extends Error {}
+
+class ErrorAnswer extends Error {
+  constructor(message, answer) {
+    super(message);
+    this.answer = answer;
+  }
+}
 
 function el(tag, props = {}, ...kids) {
   const node = document.createElement(tag);
@@ -60,6 +65,10 @@ function svg(tag, attrs = {}, text) {
 
 function capitalized(text) {
   return text.replace(/^./, (first) => first.toUpperCase());
+}
+
+function withPeriod(text) {
+  return /[.?!]$/.test(text) ? text : `${text}.`;
 }
 
 function pad(n) {
@@ -94,90 +103,6 @@ function saidLine(place) {
 
 function shownSaidLine(place) {
   return currentSection().querySelector(`[data-said="${CSS.escape(place)}"]`);
-}
-
-function sayAt(place, state, sentence, { focus = true } = {}) {
-  lastSaid.set(place, [state, sentence]);
-  const line = shownSaidLine(place);
-  if (!line) return;
-  sayIn(line, state, sentence);
-  placeSaid(line, [line.closest("[id]")]);
-  if (focus) line.focus();
-}
-
-function keepSaidBeside(place, control) {
-  const row = control.closest("tr");
-  if (!row) {
-    saidBeside.delete(place);
-    return;
-  }
-  const line = shownSaidLine(place);
-  saidBeside.set(place, {
-    pressed: control.dataset.focus,
-    later: rowKeysFrom(row, "nextElementSibling"),
-    earlier: rowKeysFrom(row, "previousElementSibling"),
-    above: Boolean(line && !line.hidden && line.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING),
-  });
-}
-
-function rowKeysFrom(row, step) {
-  const keys = [];
-  for (let other = row[step]; other; other = other[step]) {
-    if (!other.matches(".said-row")) keys.push(other.querySelector("[data-focus]")?.dataset.focus);
-  }
-  return keys.filter(Boolean);
-}
-
-function rowHolding(nodes, key) {
-  return key ? elementsIn(nodes, `[data-focus="${CSS.escape(key)}"]`)[0]?.closest("tr") : null;
-}
-
-function firstRowHolding(nodes, keys) {
-  for (const key of keys) {
-    const row = rowHolding(nodes, key);
-    if (row) return row;
-  }
-  return null;
-}
-
-function placeSaid(line, nodes) {
-  delete line.dataset.standsFor;
-  const beside = saidBeside.get(line.dataset.said);
-  if (!beside || line.hidden) return;
-  const acted = rowHolding(nodes, beside.pressed);
-  if (!acted) guardVacatedSpot(beside);
-  const later = acted ? null : firstRowHolding(nodes, beside.later);
-  const neighbour = acted ?? later ?? firstRowHolding(nodes, beside.earlier);
-  if (!neighbour) return;
-  const holder = line.closest("tr.said-row") ?? el("tr", { class: "said-row" }, el("td", {}, line));
-  holder.cells[0].colSpan = neighbour.cells.length;
-  if (later || (acted && beside.above)) neighbour.before(holder);
-  else neighbour.after(holder);
-  if (!acted) line.dataset.standsFor = beside.pressed;
-}
-
-function guardVacatedSpot(beside) {
-  if (beside.vacated) return;
-  beside.vacated = true;
-  const { left, top, right, bottom } = rowHolding([currentSection()], beside.pressed)?.getBoundingClientRect() ?? {};
-  if (bottom > top) vacatedSpot = { left, top, right, bottom, until: performance.now() + VACATED_SPOT_MS };
-}
-
-function forgetVacatedSpot() {
-  vacatedSpot = null;
-}
-
-function ignorePressOnVacatedSpot(e) {
-  const spot = vacatedSpot;
-  if (!spot || !e.detail || performance.now() > spot.until) return;
-  if (e.clientX < spot.left || e.clientX > spot.right || e.clientY < spot.top || e.clientY > spot.bottom) return;
-  e.preventDefault();
-  e.stopImmediatePropagation();
-}
-
-function saidBesideRows(nodes) {
-  for (const line of elementsIn(nodes, "p[data-said]")) placeSaid(line, nodes);
-  return nodes.filter((node) => !node.closest?.("tr.said-row"));
 }
 
 function say(id, state, sentence) {
@@ -343,7 +268,7 @@ async function call(path, body) {
     const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });
     noteServedCode(response);
     const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
-    if (!response.ok) throw new Error(data.error || `The server answered ${response.status}.`);
+    if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data);
     return data;
   } finally {
     // the caller says its result in the microtasks after this returns, so the change still counts until then
@@ -353,7 +278,7 @@ async function call(path, body) {
 
 function unreadFault(what, failed) {
   const why = failed?.error || "no answer";
-  return fault(`${what} could not be read: ${why}${why.endsWith(".") ? "" : "."}`);
+  return fault(`${what} could not be read: ${withPeriod(why)}`);
 }
 
 function panelParts(panel, what, draw) {
@@ -419,18 +344,6 @@ function secondsBetween(start, end) {
 function stopWords(what, r, after) {
   if (r.was !== "gone") return `Asked ${what} to stop. ${after}`;
   return r.ticket ? `${what} had already ended; the next pipeline poll marks it stopped and tells its ticket.` : `${what} had already ended, so it is marked stopped.`;
-}
-
-async function act(btn, place, path, body, saying, { meanwhile = null } = {}) {
-  btn.disabled = true;
-  keepSaidBeside(place, btn);
-  if (meanwhile) sayAt(place, null, meanwhile);
-  try {
-    sayAt(place, "ok", saying(await call(path, body)));
-  } catch (e) {
-    sayAt(place, "fault", e.message);
-  }
-  refresh();
 }
 
 function toggleForm(toggleId, formId, focusId, open = document.getElementById(formId).hidden) {

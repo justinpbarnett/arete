@@ -465,7 +465,8 @@ def add_feed(run_id: str, kind: str, text: str) -> None:
 
 
 def insert_feed(c: sqlite3.Connection, run_id: str, kind: str, text: str) -> None:
-    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)", (run_id, util.iso(), kind, text[:4000]))
+    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)",
+              (run_id, util.iso(), kind, util.both_ends(text, 4000)))
 
 
 def feed(run_id: str, after: int = 0, connect=db) -> list[dict]:
@@ -920,10 +921,20 @@ def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> 
         return [dict(r) for r in c.execute(q, args)]
 
 
-def forget_proposal(proposal_id: int) -> bool:
+def proposal(proposal_id: int, connect=db) -> dict | None:
+    with connect() as c:
+        row = c.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def move_proposal(proposal_id: int, before: tuple[str, ...], after: str) -> bool:
     with db() as c:
-        return c.execute("UPDATE proposals SET status = 'filed' WHERE id = ? AND status IN ('memory', 'hand')",
-                         (proposal_id,)).rowcount > 0
+        return c.execute(f"UPDATE proposals SET status = ? WHERE id = ? AND status IN ({','.join('?' * len(before))})",
+                         (after, proposal_id, *before)).rowcount > 0
+
+
+def forget_proposal(proposal_id: int) -> bool:
+    return move_proposal(proposal_id, ("memory", "hand"), "filed")
 
 
 def set_proposal_status_by_pr(pr_url: str, status: str) -> None:

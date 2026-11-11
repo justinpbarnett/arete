@@ -103,10 +103,8 @@ async function draftLoop(event) {
   }
 }
 
-async function loopAction(name, action, btn, place) {
-  btn.disabled = true;
-  keepSaidBeside(place, btn);
-  try {
+function loopAction(name, action, btn, place) {
+  return answerPress(btn, place, async () => {
     const r = await call(`/api/loops/${encodeURIComponent(name)}/${action}`, {});
     if (action === "start" || action === "try") {
       lastSaid.set(`detail:run:${r.id}`, ["ok", action === "start" ? `Started ${name} at ${clock(r.started)}.`
@@ -116,10 +114,7 @@ async function loopAction(name, action, btn, place) {
     }
     if (r.enabled && !r.serve_up) sayAt(place, "caution", `${name} is on, but serve is down, so it fires once serve runs again.`);
     else sayAt(place, "ok", `${name} is ${r.enabled ? "on. Serve fires it from its next tick" : "off. A run already going finishes"}.`);
-  } catch (e) {
-    sayAt(place, "fault", e.message);
-  }
-  refresh();
+  });
 }
 
 function budgetWords(d) {

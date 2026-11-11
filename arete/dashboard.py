@@ -185,6 +185,13 @@ def refusal_status(e: Exception) -> int | None:
         (status for kind, status in STATUS_OF_REFUSAL.items() if isinstance(e, kind)), None)
 
 
+def refusal_answer(e: Exception) -> dict:
+    answer = {"error": as_sentence(str(e))}
+    if isinstance(e, control.KeptFailure):
+        answer["kept"] = True
+    return answer
+
+
 def as_sentence(text: str) -> str:
     text = text.strip()
     first_word = text.split(" ", 1)[0]
@@ -225,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.api(method, path, {k: v[-1] for k, v in parse_qs(parts.query).items()}))
         except Exception as e:
             if status := refusal_status(e):
-                return self.send_json(status, {"error": as_sentence(str(e))})
+                return self.send_json(status, refusal_answer(e))
             self.log_error("%s", f"{type(e).__name__}: {e}")
             self.send_json(500, {"error": as_sentence(util.first_line(f"{type(e).__name__}: {e}", 300))})
 
@@ -333,6 +340,10 @@ class Handler(BaseHTTPRequestHandler):
                 proposal_id, action = last_part(path, PROPOSAL_PATH)
                 if action == "done":
                     return forget_proposal(whole_number(proposal_id))
+                if action == "approve":
+                    return approve_rule(whole_number(proposal_id))
+                if action == "reject":
+                    return reject_rule(whole_number(proposal_id))
             if path == "/api/serve/install":
                 return install_serve(self.server.inside_serve)
         raise Refusal(404, f"Nothing at {method} {path}.")
@@ -466,6 +477,19 @@ def research_ticket(ref: str, force: bool) -> dict:
 def forget_proposal(proposal_id: int) -> dict:
     if not state.forget_proposal(proposal_id):
         raise control.NotFound(f"#{proposal_id} is not an open memory fact or harness fix")
+    return {"id": proposal_id}
+
+
+def approve_rule(proposal_id: int) -> dict:
+    if (state.proposal(proposal_id, connect=state.reader) or {}).get("status") not in ("approve", "filing"):
+        raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
+    control.detach(["file-rule", str(proposal_id)])
+    return {"id": proposal_id}
+
+
+def reject_rule(proposal_id: int) -> dict:
+    if not state.move_proposal(proposal_id, ("approve",), "rejected"):
+        raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
     return {"id": proposal_id}
 
 

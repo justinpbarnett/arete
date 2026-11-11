@@ -55,6 +55,8 @@ main h3 { margin-top: 34px; }
 p.said:not([hidden]) { margin-top: 0; }
 tr.said-row p.said { margin: 0; max-width: none; }
 p.said .state { vertical-align: top; }
+body, .detail { --room-below: 0px; }
+body::after, .detail::after { content: ""; display: block; height: var(--room-below); }
 p.summary { margin: 0 0 14px; }
 .seg + p { margin-top: 14px; }
 .filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 0 0 6px; }

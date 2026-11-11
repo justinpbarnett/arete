@@ -1,22 +1,35 @@
 from __future__ import annotations
 
+import traceback
+
 from . import config, state, util
 from .emits import Digest, Emit, Metric, Notify, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
 
 RETRIED = ("screen", "proof")
+SAYS_WHY = (RuntimeError, OSError, ValueError)
 EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(), "loop": ToLoop(),
                           "digest": Digest(), "notify": Notify(), "metric": Metric()}
 
 
 class Failed(RuntimeError):
-    def __init__(self, why: str, cause: Exception):
+    def __init__(self, why: str, cause: Exception, trace: str = ""):
         super().__init__(why)
         self.cause = cause
+        self.trace = trace
 
     def kept_by(self, emit: Emit) -> bool:
         return isinstance(self.cause, emit.kept_failures)
+
+    def log_to(self, log) -> None:
+        log("error", str(self))
+        if self.trace:
+            log("error", self.trace)
+
+
+class KeptFailure(Failed):
+    pass
 
 
 class AlreadyDecided(ValueError):
@@ -39,13 +52,19 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                 log("emit", f"waiting for approval #{waiting_id} ({why}): {what}")
             else:
                 try:
-                    send(delivery, loop.name, run_id, cfg, log)
-                    settle_judged(emit, run_id, "landed")
+                    done = send(delivery, loop.name, run_id, cfg)
                 except Failed as e:
                     if e.kept_by(emit):
                         failed_id = state.add_approval(loop.name, run_id, delivery, what, str(e))
                         settle_judged(emit, run_id, "failed", failed_id)
+                        e.log_to(log)
                         log("emit", f"kept as approval #{failed_id} to try again or reject")
+                    else:
+                        e.log_to(log)
+                else:
+                    settle_judged(emit, run_id, "landed")
+                    emit.landed(batch, loop.name, done)
+                    log("emit", f"{spec['type']}: {done}")
 
 
 def settle_judged(emit: Emit, run_id: str, outcome: str, approval: int | None = None,
@@ -68,16 +87,24 @@ def objections(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> di
     return {}
 
 
-def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, log) -> str:
+def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, *, wrap_crashes: bool = False) -> str:
     kind = delivery["type"]
     try:
-        done = EMITS[kind].execute(delivery["item"], delivery.get("batch") or [], loop_name, run_id, cfg)
-    except (RuntimeError, OSError, ValueError, KeyError) as e:
-        why = f"{kind} failed: {util.first_line(str(e), 300)}"
-        log("error", why)
-        raise Failed(why, e) from e
-    log("emit", f"{kind}: {done}")
-    return done
+        return EMITS[kind].execute(delivery["item"], delivery.get("batch") or [], loop_name, run_id, cfg)
+    except (*SAYS_WHY, KeyError) as e:
+        raise Failed(why_failed(kind, e), e) from e
+    except Exception as e:
+        if not wrap_crashes:
+            raise
+        raise Failed(why_failed(kind, e), e, traceback.format_exc().strip()) from e
+
+
+def why_failed(kind: str, e: Exception) -> str:
+    said = util.first_line(str(e), 300)
+    if said and isinstance(e, SAYS_WHY):
+        return f"{kind} failed: {said}"
+    named = type(e).__name__
+    return f"{kind} failed: {named}: {said}" if said else f"{kind} failed: {named}"
 
 
 def waiting(connect=state.db) -> list[dict]:
@@ -133,18 +160,25 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
         emit.rejected(delivery["item"])
         log("emit", f"nothing sent: {row['summary']}")
         return "rejected"
+
+    def settle_as(status: str, why: str) -> None:
+        state.decide_approval(approval_id, status, why, came_from=("approved",))
+        settle_judged(emit, row["run_id"], status, approval_id, ("approved",))
+
     try:
-        done = send(delivery, row["loop"], row["run_id"], cfg, log)
-    except Exception as e:
-        if isinstance(e, Failed) and not e.kept_by(emit):
-            why = f"{e}. Trying again would fail the same way, so it is rejected"
-            state.decide_approval(approval_id, "rejected", why, came_from=("approved",))
-            settle_judged(emit, row["run_id"], "rejected", approval_id, ("approved",))
-            emit.rejected(delivery["item"])
-            log("emit", "rejected, because trying again would fail the same way")
-            raise Failed(why, e.cause) from e.cause
-        state.decide_approval(approval_id, "failed", str(e))
-        settle_judged(emit, row["run_id"], "failed", approval_id, ("approved",))
-        raise
+        done = send(delivery, row["loop"], row["run_id"], cfg, wrap_crashes=True)
+    except Failed as e:
+        if e.kept_by(emit):
+            settle_as("failed", str(e))
+            e.log_to(log)
+            raise KeptFailure(str(e), e.cause) from e.cause
+        why = f"{e}. Trying again would fail the same way, so it is rejected"
+        settle_as("rejected", why)
+        emit.rejected(delivery["item"])
+        e.log_to(log)
+        log("emit", "rejected, because trying again would fail the same way")
+        raise Failed(why, e.cause) from e.cause
     state.decide_approval(approval_id, "done", done)
+    emit.landed(delivery.get("batch") or [], row["loop"], done)
+    log("emit", f"{delivery['type']}: {done}")
     return done

@@ -95,6 +95,9 @@ class Emit:
     def rejected(self, item: dict) -> None:
         pass
 
+    def landed(self, batch: list[dict], loop_name: str, done: str) -> None:
+        pass
+
 
 class Ticket(Emit):
     approving = "It files the ticket on GitHub, so it can take a few seconds."
@@ -125,10 +128,11 @@ class Ticket(Emit):
         repo = sources.github_name(cfg, item["repo"])
         for label in item["labels"]:
             gh.ensure_label(repo, label, restyle=False)
-        url = gh.issue_url(repo, gh.issue_create(repo, item["title"], item["body"], item["labels"]))
+        return gh.issue_url(repo, gh.issue_create(repo, item["title"], item["body"], item["labels"]))
+
+    def landed(self, batch: list[dict], loop_name: str, url: str) -> None:
         for f in batch:
             state.set_finding_url(loop_name, f["fingerprint_key"], url)
-        return url
 
     def describe(self, item: dict) -> str:
         return f"file a ticket on {item['repo']} [{', '.join(item['labels'])}]: {item['title']}"

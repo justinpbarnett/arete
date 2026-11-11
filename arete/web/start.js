@@ -127,10 +127,15 @@ document.addEventListener("DOMContentLoaded", () => {
   wireDialogs();
   document.addEventListener("keydown", onKey);
   document.addEventListener("click", onClick);
-  document.addEventListener("click", ignorePressOnVacatedSpot, true);
-  for (const scrolling of ["wheel", "touchmove"]) document.addEventListener(scrolling, forgetVacatedSpot, { passive: true });
-  document.addEventListener("pointermove", (e) => { mouseAt = e.pointerType === "mouse" ? { x: e.clientX, y: e.clientY } : null; }, { passive: true });
-  document.documentElement.addEventListener("pointerleave", () => { mouseAt = null; });
+  const noteMouseAt = (e) => {
+    pointerKnown = true;
+    mouseAt = e.pointerType === "mouse" ? { x: e.clientX, y: e.clientY } : null;
+  };
+  for (const event of ["pointermove", "pointerdown", "pointerover"]) document.addEventListener(event, noteMouseAt, { passive: true });
+  document.documentElement.addEventListener("pointerleave", () => {
+    pointerKnown = true;
+    mouseAt = null;
+  });
   document.getElementById("skip").addEventListener("click", () => document.getElementById("main").focus());
   const asked = location.hash.replace(/^#/, "");
   const first = knownRoute(location.hash);
