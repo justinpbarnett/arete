@@ -98,7 +98,8 @@ def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> N
     spec.source = str(repo.path)
     spec.branch = f"session/{spec.id}"
     wt = paths.WORKTREES_DIR / f"session-{spec.id}"
-    util.git(["worktree", "add", "-q", "-b", spec.branch, str(wt), "HEAD"], repo.path)
+    with record.timed(spec.id, "worktree", repo=repo.name, branch=spec.branch, path=str(wt)):
+        util.git(["worktree", "add", "-q", "-b", spec.branch, str(wt), "HEAD"], repo.path)
     spec.cwd = str(wt)
 
 

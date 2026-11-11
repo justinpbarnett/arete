@@ -7,6 +7,7 @@ import shutil
 import sys
 import textwrap
 from collections import Counter
+from collections.abc import Iterable
 
 from . import __version__, config, paths
 
@@ -752,6 +753,35 @@ def cmd_costs(args) -> int:
     return 0
 
 
+def cmd_record(args) -> int:
+    from . import record
+
+    folder = paths.record_dir(args.run_id)
+    if not folder.is_dir():
+        print(f"no record for run {args.run_id}", file=sys.stderr)
+        return 1
+    if not args.step:
+        timeline = folder / record.TIMELINE
+        print_lines(record.raw_lines(timeline) if timeline.is_file() else [])
+        print_lines(f.name for f in record.record_files(args.run_id))
+        return 0
+    if not (path := record.find_record(args.run_id, args.step)):
+        names = ", ".join(f.name for f in record.record_files(args.run_id)) or "none"
+        print(f"no step {args.step} in run {args.run_id}; its records: {names}", file=sys.stderr)
+        return 1
+    print_lines(record.raw_lines(path) if args.raw else (json.dumps(e, ensure_ascii=False) for e in record.events(path)))
+    return 0
+
+
+def print_lines(lines: Iterable[str]) -> None:
+    try:
+        for line in lines:
+            print(line)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+
+
 def cmd_loop_args(args) -> int:
     words = list(args.words)
     if args.action == "new":
@@ -899,6 +929,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop")
     p.add_argument("--days", type=float, default=None)
     p.set_defaults(fn=cmd_costs)
+
+    p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
+                                      "events")
+    p.add_argument("run_id")
+    p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
+    p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
+    p.set_defaults(fn=cmd_record)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")

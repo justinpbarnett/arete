@@ -17,6 +17,7 @@ from .agent import (
     Result,
     Session,
     json_from_text,
+    usage_totals,
 )
 
 TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": ("ls",), "Edit": ("edit",),
@@ -25,7 +26,7 @@ WRITING = {"edit", "write", "bash"}
 SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 PI_HOME = paths.HOME / ".pi"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
-KEYS_FILE = paths.CONFIG_DIR / "pi.env"
+KEYS_FILE = paths.PI_KEYS_FILE
 SHARED_SETTINGS = ("models.json", "settings.json")
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
@@ -108,6 +109,7 @@ def run(
     mcp_config: str = "",
     remote: devices.Device | None = None,
     price: Callable[[Result], float] = lambda reply: reply.cost_usd,
+    on_line: Callable[[str], None] = lambda line: None,
 ) -> Result:
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
@@ -155,14 +157,14 @@ def run(
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir,))
     try:
         proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
-                                    lambda line: reply_cost(line, model, price))
+                                    lambda line: reply_cost(line, model, price), on_line)
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"pi not found: {e}", runner="pi", model=model)
     if cut_short_by:
         return cut_short(proc, resume, model, cut_short_by)
     result = parse(proc, resume, model, json_schema)
     if json_schema and result.ok and result.structured is None:
-        restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT))
+        restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT), on_line)
     return result
 
 
@@ -184,12 +186,12 @@ def ending(stdout: str) -> str:
 
 
 def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd: Path | str,
-            remote: devices.Device | None, timeout: float) -> None:
+            remote: devices.Device | None, timeout: float, on_line: Callable[[str], None]) -> None:
     if not ending_text:
         return
     prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
               f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}\n\n{NO_ANSWER}")
-    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote)
+    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote, on_line=on_line)
     result.cost_usd += again.cost_usd
     result.tokens_in += again.tokens_in
     result.tokens_out += again.tokens_out
@@ -204,7 +206,8 @@ def mcp_servers(mcp_config: str) -> dict:
 
 
 def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budget_usd: float | None,
-           cost_of: Callable[[str], float]) -> tuple[subprocess.CompletedProcess, str]:
+           cost_of: Callable[[str], float],
+           on_line: Callable[[str], None]) -> tuple[subprocess.CompletedProcess, str]:
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, errors="replace", env=env)
     stderr: list[str] = []
@@ -217,6 +220,7 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
     try:
         for line in proc.stdout:
             lines.append(line)
+            on_line(line)
             if max_budget_usd and '"message_end"' in line:
                 spent += cost_of(line)
                 if spent > max_budget_usd:
@@ -245,13 +249,6 @@ def reply_cost(line: str, model: str, price: Callable[[Result], float]) -> float
     return price(Result(ok=True, runner="pi", provider=provider,
                         model=f"{provider}/{message.get('model')}" if provider else model,
                         **usage_totals([message.get("usage") or {}])))
-
-
-def usage_totals(usages: list[dict]) -> dict:
-    return {"cost_usd": sum(float((u.get("cost") or {}).get("total") or 0) for u in usages),
-            "tokens_in": sum(int(u.get("input") or 0) + int(u.get("cacheRead") or 0) + int(u.get("cacheWrite") or 0)
-                             for u in usages),
-            "tokens_out": sum(int(u.get("output") or 0) for u in usages)}
 
 
 def cut_short(proc: subprocess.CompletedProcess, resume: Session, model: str, reason: str) -> Result:

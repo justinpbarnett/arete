@@ -229,6 +229,38 @@ Poll does not wait for a run. It starts each run as its own detached `arete run`
 
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
+## Records
+
+Every agent call writes its runner's raw output to `runs/<run_id>/record/<step>.jsonl.gz` under the state folder while it runs.
+A call outside any run gets a run id of its own that starts with `call-`.
+A second call with the same step name in one run gets `<step>-2.jsonl.gz`, then `-3`, and so on.
+The first line is a header with the runner, model, device, repo, commit, folder, prompt, system prompt, tools, JSON schema, budget, timeout and the session it resumes.
+When a call leaves the model to the runner's default, arete holds the header until the runner names the model it runs (claude's `init` event or pi's first reply), for at most 10 seconds, so the header names the model the default turned out to be.
+Then come the runner's own lines unchanged: claude's `stream-json` events or pi's `--mode json` events.
+A clock line with the seconds since the start goes in before a runner line whenever a second or more has passed since the last one.
+The last line is the result: ok, error, text, structured answer, cost, tokens, turns, model, session and seconds.
+A call that crashes ends with a result whose error starts with `crashed:`, and a call stopped on request (a stop from the CLI or the dashboard, or ctrl-c) ends with the error `stopped by request`.
+Neither has a cost or a turn count, in its result or in its timeline mark, because the runner never reported one.
+
+`steps.jsonl.gz` in the same folder is the run's timeline, one line per mark: `create` (a fresh sandbox), `lease`, `clone`, `boot`, `release`, `worktree`, `setup`, `check`, `diff` (with the staged patch), `agent` (one per call, naming its record file) and `result` (the run's final status).
+Each mark has its start time, and the marks that time something have their seconds.
+
+The files are gzip, not zstd, because arete runs on Python 3.13 with the standard library only, and zstd comes to the standard library in 3.14; the `.gz` suffix names the codec, so a switch later is a new suffix.
+`zcat`, `gzip -dc` and `zless` read them.
+Each line goes to disk as its own complete gzip member the moment it is written, so a timeout, a budget stop or a killed process leaves a file that these tools and `arete record` read in full up to its last line.
+
+Before a line is written, arete replaces every secret it knows with `[redacted]`: the values of environment variables whose names hold TOKEN, SECRET, PASSW, API_KEY, ACCESS_KEY, PRIVATE_KEY or CREDENTIAL, `gh auth token`, and every value in `pi.env`.
+It also reads the Jira env file, `~/.netrc`, `~/.pgpass`, `~/.npmrc`, `~/.pypirc`, `~/.aws/credentials`, and the secret files (such as `.env`) in the work folder and the folders the call may also use, down four levels and skipping `.git`, `node_modules` and virtual environments.
+From `NAME=value` lines and from `name: value` pairs (YAML, JSON, `.pypirc`) it takes each value under a name like the ones above, and each other value of 8 or more characters that is not only letters.
+From `.netrc` it takes the word after each `login`, `password` and `account`, but not the `machine` host, and from `.pgpass` the password field of each line.
+Values shorter than 8 characters are left alone, and any PEM private key block is redacted wherever it shows up.
+On a remote device arete cannot read the work folder, so only the local secrets and the PEM rule apply there.
+
+`arete record RUN_ID` prints the timeline and lists the record files.
+`arete record RUN_ID STEP` prints one call as normalized events, the same shape for both runners: `header`, `message`, `tool_call`, `tool_result`, `usage` and `result`, each with the seconds since the call started.
+claude reports a resumed session's running cost, so the header keeps what the session had cost before the call, and the closing `usage` total subtracts it to give the call's own cost, as the result line does.
+`--raw` prints the recorded lines as they were written.
+
 ## Layout
 
 - Code: this repo, a uv project (Python pinned in `.python-version`, everything locked in `uv.lock`). Installed with `uv tool install --editable . --python 3.13`
@@ -237,6 +269,7 @@ A laptop sleeps and drops its network. When poll, triage or the heartbeat start 
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
 - State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`)
+- Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
 - Logs: `~/Library/Logs/arete/`
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names

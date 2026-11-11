@@ -17,7 +17,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import paths, state, util
+from . import paths, record, state, util
 
 DEVICES_FILE = paths.CONFIG_DIR / "devices.toml"
 CACHE_FILE = paths.STATE_DIR / "devices.json"
@@ -237,8 +237,6 @@ def probe_shell(d: Device, timeout: float) -> dict:
 
 
 def probe_sandbox(d: Device, timeout: float) -> dict:
-    from . import record
-
     sandbox = Sandbox(d, vm_name(record.new_id(f"probe-{d.name}")))
     started = time.monotonic()
     try:
@@ -423,11 +421,14 @@ def lease(device: Device | str, run_id: str, log=lambda text: None):
     d = resolve(device)
     if d.kind == "proxmox":
         with proxmox_clone(d, run_id, log) as clone:
+            record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=clone.host)
             yield clone
     elif d.kind == "exe":
         with fresh_sandbox(d, run_id, log) as vm:
+            record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=vm.host)
             yield vm
     else:
+        record.mark(run_id, "lease", device=d.name, device_kind=d.kind)
         yield d
 
 
@@ -489,12 +490,14 @@ class Sandbox:
 def proxmox_clone(d: Device, run_id: str, log):
     clone = Clone(d, vm_name(run_id), int(pve(d, "pvesh get /cluster/nextid").strip()))
     log(f"cloning template {d.template} to {clone} on {d.name}")
-    with creating(clone, run_id, log):
+    with creating(clone, run_id, log), record.timed(run_id, "clone", device=d.name, vmid=clone.vmid,
+                                                    template=d.template):
         pve(d, f"qm clone {d.template} {clone.vmid} --name {clone.name} --full 0")
     with kept_or_deleted(clone, log):
-        pve(d, f"qm start {clone.vmid}")
-        boot = BootingClone(d, clone.vmid)
-        address = clone_address(boot)
+        with record.timed(run_id, "boot", device=d.name, vmid=clone.vmid) as booted:
+            pve(d, f"qm start {clone.vmid}")
+            boot = BootingClone(d, clone.vmid)
+            booted["address"] = address = clone_address(boot)
         log(f"{clone} is up at {address}")
         with tempfile.TemporaryDirectory(prefix="arete-clone-") as trust_dir:
             vm = trusted_clone(boot, address, Path(trust_dir) / "known_hosts")
@@ -506,9 +509,11 @@ def proxmox_clone(d: Device, run_id: str, log):
 def fresh_sandbox(d: Device, run_id: str, log):
     sandbox = Sandbox(d, vm_name(run_id))
     started = time.monotonic()
-    vm = create_sandbox(sandbox, run_id, log)
+    with record.timed(run_id, "create", device=sandbox.device.name, sandbox=sandbox.name):
+        vm = create_sandbox(sandbox, run_id, log)
     try:
-        boot_sandbox(sandbox, vm)
+        with record.timed(run_id, "boot", device=sandbox.device.name, sandbox=sandbox.name):
+            boot_sandbox(sandbox, vm)
     except BaseException:
         delete_or_say_why(sandbox, log)
         raise

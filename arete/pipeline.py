@@ -374,19 +374,21 @@ def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
             git(["worktree", "prune"], c.src, check=False)
 
 
-def make_workspace(repo: config.Repo, base: str, branch: str, key: str) -> tuple[Path, list[Checkout]]:
+def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str) -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
     checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
                  for p in repo.parts]
     remove_workspace(ws, checkouts)
     for c in checkouts:
-        fetch(c.src, c.base)
-        c.pr = gh.open_pr_url(c.github, branch)
-        c.lease = remote_head(c.src, branch)
-        c.resumes = bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
-        if c.resumes:
-            fetch(c.src, branch)
-        add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
+        with record.timed(run_id, "clone", repo=c.github, base=c.base, branch=branch, path=str(c.wt)) as clone:
+            fetch(c.src, c.base)
+            c.pr = gh.open_pr_url(c.github, branch)
+            c.lease = remote_head(c.src, branch)
+            c.resumes = bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
+            if c.resumes:
+                fetch(c.src, branch)
+            add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
+            clone["resumed"] = c.resumes
     return ws, checkouts
 
 
@@ -519,7 +521,9 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     report, ok = [], True
     with machine_to_itself(run):
         for name, cmd in layer.checks.items():
-            res = util.sh(cmd, cwd=cwd, timeout=timeout)
+            with record.timed(run.id, "check", name=name, command=cmd) as check:
+                res = util.sh(cmd, cwd=cwd, timeout=timeout)
+                check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
@@ -604,6 +608,8 @@ class Build(TicketWork):
 
     def restage(self) -> Staged:
         self.staged = stage(self.checkouts, self.deny)
+        record.mark(self.run.id, "diff", files=self.staged.files, lines=self.staged.lines, denied=self.staged.denied,
+                    patch=self.staged.patch)
         return self.staged
 
     def require_valid_diff(self, after: str, planned: str = "") -> None:
@@ -798,7 +804,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         tk.prepare()
     run.enter("running")
 
-    ws, checkouts = make_workspace(repo, main_layer.base_branch, branch, t.id)
+    ws, checkouts = make_workspace(run.id, repo, main_layer.base_branch, branch, t.id)
     for c in checkouts:
         run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
     for c in merge_moved_bases(run, [c for c in checkouts if c.resumes]):
@@ -811,7 +817,9 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)
     for cmd in layer.setup:
-        res = util.sh(cmd, cwd=ws, timeout=1200)
+        with record.timed(run.id, "setup", command=cmd) as setup:
+            res = util.sh(cmd, cwd=ws, timeout=1200)
+            setup["exit"] = res.returncode
         run.log(f"setup `{cmd}`: exit {res.returncode}")
         if res.returncode != 0:
             run.save("setup.log", res.stdout + res.stderr)

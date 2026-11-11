@@ -9,6 +9,7 @@ ON_MAC = sys.platform == "darwin"
 LOG_DIR = Path(os.environ.get("ARETE_LOG_DIR", HOME / "Library" / "Logs" / "arete" if ON_MAC else STATE_DIR / "logs"))
 
 CONFIG_FILE = CONFIG_DIR / "config.toml"
+PI_KEYS_FILE = CONFIG_DIR / "pi.env"
 EVENTS_FILE = STATE_DIR / "events.jsonl"
 DB_FILE = STATE_DIR / "arete.db"
 RUNS_DIR = STATE_DIR / "runs"
@@ -38,6 +39,10 @@ def short_path(p: str | Path) -> str:
 
 def scratch_dir(run_id: str) -> Path:
     return RUNS_DIR / run_id / "scratch"
+
+
+def record_dir(run_id: str) -> Path:
+    return RUNS_DIR / run_id / "record"
 
 
 def draft_dir(run_id: str) -> Path:
