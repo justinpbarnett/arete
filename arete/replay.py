@@ -73,6 +73,8 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
                      structured=answer.get("structured"), error=str(answer.get("error") or ""),
                      cost_usd=float(answer.get("cost_usd") or 0), tokens_in=int(answer.get("tokens_in") or 0),
                      tokens_out=int(answer.get("tokens_out") or 0), turns=int(answer.get("turns") or 0),
+                     cache_read=int(answer.get("cache_read") or 0), cache_write=int(answer.get("cache_write") or 0),
+                     api_seconds=float(answer.get("api_seconds") or 0),
                      first_context_tokens=int(answer.get("first_context_tokens") or 0),
                      session=resume if resume.id else Session(str(answer.get("session") or uuid.uuid4().hex), 0.0,
                                                               RUNNER))

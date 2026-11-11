@@ -10,7 +10,7 @@ import time
 import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -226,6 +226,9 @@ class AgentRun:
         if self.writes_lines:
             lines.write(self.id, event, **fields)
 
+    def waiting(self, cause: str):
+        return lines.waiting(self.id, cause) if self.writes_lines else nullcontext()
+
     def save(self, name: str, data) -> None:
         p = self.dir / name
         p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
@@ -242,7 +245,9 @@ class AgentRun:
         which, model = runner.chosen(kw.get("model", ""), kw.get("runner", "") or kw.get("resume", NO_SESSION).runner,
                                      kw.get("cfg") or self.cfg or config.load())
         effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost
-        self.write_line("step_start", step=step, runner=which, model=model, effort=effort)
+        tier, kind = kw.setdefault("tier", s.tier if s else ""), kw.setdefault("kind", self.kind)
+        kw.setdefault("waits", self.waiting)
+        self.write_line("step_start", step=step, runner=which, model=model, effort=effort, tier=tier, kind=kind)
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         with lines.beating(self.id, step) if self.writes_lines else nullcontext():
@@ -265,7 +270,9 @@ class AgentRun:
         self.write_line("step_end", step=step, runner=res.runner or which, model=res.model or model, effort=effort,
                         ok=res.ok, cost_usd=round(self.cost - spent, 6), tokens_in=res.tokens_in,
                         tokens_out=res.tokens_out, turns=res.turns, seconds=round(time.monotonic() - started, 1),
-                        error=(res.error or "")[:500])
+                        error=(res.error or "")[:500], tier=tier, kind=kind,
+                        **{"try": state.step_tries(self.id, step)}, cache_read=res.cache_read,
+                        cache_write=res.cache_write, api_seconds=round(res.api_seconds, 2))
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
@@ -708,6 +715,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       feedback=pending_feedback(repo.name, tid),
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {})
             run.dir.mkdir(parents=True, exist_ok=True)
+        opening_waits(run_id, run.answering, "" if dry_run else state.take_passed_over(repo.name, str(tid)))
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
         if run.feedback:
@@ -760,8 +768,21 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple
 
 
 def write_report(row: dict) -> None:
+    waits = lines.wait_minutes(row["id"])
+    record.note(row["id"], wait_minutes=json.dumps(waits))
     lines.write(row["id"], "report", status=row.get("status") or "", prs=(row.get("pr_url") or "").split(),
-                minutes=run_minutes(row), cost_usd=round(float(row.get("cost_usd") or 0), 4))
+                minutes=run_minutes(row), cost_usd=round(float(row.get("cost_usd") or 0), 4), wait_minutes=waits)
+
+
+def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
+    now = util.iso()
+    if answering:
+        asked = next((line.get("ts") for line in reversed(lines.read(answering["id"]))
+                      if line.get("event") == "question"), None) or answering.get("finished")
+        if asked:
+            lines.waited(run_id, "person", asked, passed_over or now)
+    if passed_over:
+        lines.waited(run_id, "slot", passed_over, now)
 
 
 def run_minutes(row: dict) -> float:
@@ -1256,14 +1277,15 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
     for n in range(1, max_rounds + 1):
         slot.free()
         run.log(FREED_SLOT_FOR_CI)
-        current = ci.Round(n, [ci.compare_with_base(ci.watch(ci_target(c), run.log), run.log) for c in watched])
+        with run.waiting("ci"):
+            current = ci.Round(n, [ci.compare_with_base(ci.watch(ci_target(c), run.log), run.log) for c in watched])
         judged = [r for r in current.reds if r.kind != "base"]
         for r in judged:
             if r.key in not_caused:
                 r.caused, r.reason = False, not_caused[r.key]
         fresh = [r for r in judged if r.key not in not_caused]
         if fresh:
-            slot.take(run.log)
+            slot.take(run.log, run.waiting)
         try:
             fix_summary = judge_ci(b, fresh, n, max_rounds, watched) if fresh else ""
         except RunFailed:
@@ -2073,11 +2095,12 @@ class RunSlot:
     def hold(self) -> None:
         self.held = util.hold_lock(state.run_lock("slot", self.repo, self.tid))
 
-    def take(self, log: Callable[[str], None]) -> None:
+    def take(self, log: Callable[[str], None],
+             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext()) -> None:
         if self.held:
             return
-        waiting: TextIO | None = None
-        try:
+        waiting = False
+        with ExitStack() as stack:
             while True:
                 with util.lock(SLOTS_LOCK, wait=True):
                     self.max_parallel = live_max_parallel(self.max_parallel)
@@ -2086,12 +2109,11 @@ class RunSlot:
                         log("ci: took a run slot back" + (" after waiting for one" if waiting else ""))
                         return
                     if not waiting:
-                        waiting = util.hold_lock(state.run_lock("slot-wait", self.repo, self.tid))
+                        waiting = True
+                        stack.enter_context(util.hold_lock(state.run_lock("slot-wait", self.repo, self.tid)))
+                        stack.enter_context(waits("slot"))
                         log(f"ci: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
                 time.sleep(SLOT_POLL_SECONDS)
-        finally:
-            if waiting:
-                waiting.close()
 
     def free(self) -> None:
         if self.held:
@@ -2220,9 +2242,14 @@ def poll(dry_run: bool = False) -> int:
                     reached_clients.setdefault(tk.project, tk.client)
                 pick = next_pick(repo, tk, skips, other_routes)
                 if not pick:
+                    if not dry_run:
+                        state.drop_passed_over(repo.name)
                     continue
                 tid, why = pick
                 name = tracker.ticket_name(repo.name, tk.ref(tid))
+                waiting = going[repo.name] >= cfg.max_parallel_per_repo or slots <= 0
+                if waiting and not dry_run:
+                    state.pass_over(repo.name, str(tid))
                 if going[repo.name] >= cfg.max_parallel_per_repo:
                     print(f"{util.iso()} {name}: waiting, {repo.name} already has {util.count(going[repo.name], 'run')} "
                           f"going (max_parallel_per_repo {cfg.max_parallel_per_repo})")

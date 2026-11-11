@@ -46,7 +46,14 @@ CREATE TABLE IF NOT EXISTS steps (
     seconds REAL,
     error TEXT,
     ts TEXT,
-    first_context_tokens INTEGER DEFAULT 0
+    first_context_tokens INTEGER DEFAULT 0,
+    effort TEXT DEFAULT '',
+    tier TEXT DEFAULT '',
+    try INTEGER DEFAULT 0,
+    kind TEXT DEFAULT '',
+    cache_read INTEGER DEFAULT 0,
+    cache_write INTEGER DEFAULT 0,
+    api_seconds REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS steps_ts ON steps (ts);
 CREATE INDEX IF NOT EXISTS steps_run ON steps (run_id);
@@ -362,6 +369,12 @@ CREATE TABLE IF NOT EXISTS task_comments (
     ts TEXT
 );
 CREATE INDEX IF NOT EXISTS task_comments_task ON task_comments (task);
+CREATE TABLE IF NOT EXISTS passed_over (
+    repo TEXT NOT NULL,
+    issue TEXT NOT NULL,
+    since TEXT NOT NULL,           -- when the poller first passed this ready ticket over for want of a slot
+    PRIMARY KEY (repo, issue)
+);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
@@ -385,8 +398,12 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
                   ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
-                  ("stop_asked", "TEXT"), ("moved", "TEXT"))],
-              ("steps", "first_context_tokens", "ALTER TABLE steps ADD COLUMN first_context_tokens INTEGER DEFAULT 0")]
+                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("wait_minutes", "TEXT"))],
+              ("steps", "first_context_tokens", "ALTER TABLE steps ADD COLUMN first_context_tokens INTEGER DEFAULT 0"),
+              *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
+                  ("effort", "TEXT DEFAULT ''"), ("tier", "TEXT DEFAULT ''"), ("try", "INTEGER DEFAULT 0"),
+                  ("kind", "TEXT DEFAULT ''"), ("cache_read", "INTEGER DEFAULT 0"), ("cache_write", "INTEGER DEFAULT 0"),
+                  ("api_seconds", "REAL DEFAULT 0"))]]
 
 
 @contextmanager
@@ -496,12 +513,18 @@ def steps(run_id: str, connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
 
 
+def step_tries(run_id: str, step: str) -> int:
+    with db() as c:
+        return c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
+
+
 def steps_since(since: str, connect=db, paid_only: bool = False) -> list[dict]:
     paid = f" AND {PAID_STEP}" if paid_only else ""
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind, r.repo FROM steps LEFT JOIN runs r "
-                                           f"ON r.id = steps.run_id WHERE steps.ts >= ?{paid} ORDER BY steps.ts",
-                                           (since,))]
+        rows = [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind AS run_kind, r.repo FROM steps "
+                                           f"LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ?{paid} "
+                                           "ORDER BY steps.ts", (since,))]
+    return [{**d, "task_kind": d.get("kind") or "", "kind": d["run_kind"]} for d in rows]
 
 
 def add_feed(run_id: str, kind: str, text: str) -> None:
@@ -885,6 +908,23 @@ def hold_until(scope: str) -> str:
 def clear_holds(scopes: list[str], set_before: str) -> None:
     with db() as c:
         c.executemany("DELETE FROM holds WHERE scope = ? AND ts < ?", [(s, set_before) for s in scopes])
+
+
+def pass_over(repo: str, issue: str) -> None:
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO passed_over (repo, issue, since) VALUES (?,?,?)", (repo, str(issue), util.iso()))
+
+
+def take_passed_over(repo: str, issue: str) -> str:
+    with db() as c:
+        r = c.execute("SELECT since FROM passed_over WHERE repo = ? AND issue = ?", (repo, str(issue))).fetchone()
+        c.execute("DELETE FROM passed_over WHERE repo = ? AND issue = ?", (repo, str(issue)))
+    return r["since"] if r else ""
+
+
+def drop_passed_over(repo: str) -> None:
+    with db() as c:
+        c.execute("DELETE FROM passed_over WHERE repo = ?", (repo,))
 
 
 def runs_marked_running(connect=db) -> list[dict]:

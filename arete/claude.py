@@ -149,7 +149,10 @@ def run(
         return Result(ok=False, session=session, error=f"timed out after {timeout}s")
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
+    return parse(proc, resume, model, json_schema)
 
+
+def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None) -> Result:
     out = proc.stdout.strip()
     if not (data := result_event(out)):
         error = util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500)
@@ -174,6 +177,7 @@ def run(
         usage_limit=usage_limit(data, data.get("result", "") or "") if is_error else None,
         raw=data,
         **claude_tokens(data.get("usage") or {}),
+        api_seconds=round(float(data.get("duration_api_ms") or 0) / 1000, 2),
         first_context_tokens=first_context_tokens(out),
         model=next(iter(data.get("modelUsage") or {}), model),
         provider="anthropic",
