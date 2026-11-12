@@ -14,7 +14,6 @@ every = "10m"
 
 [run]
 repo = "arete"
-model = "sonnet"
 tools = ["Read", "Glob", "Grep"]
 timeout_minutes = 15
 budget_usd = 0.75

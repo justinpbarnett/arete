@@ -128,7 +128,7 @@ def kept_out(roots: list[Path], hidden: list[Path | str]) -> dict[str, str]:
     denied |= {path: "deny" for p in hidden for path in both(p)}
     denied |= {str(paths.HOME / d): "deny" for d in sorted(guard.SECRET_DIRS)}
     denied |= {p: "deny" for d in (home(), paths.CONFIG_DIR, paths.HOME / ".config" / "arete",
-                                   paths.HOME / ".claude") for p in both(d)}
+                                   paths.HOME / ".claude", paths.HOME / ".pi") for p in both(d)}
     if gh := shutil.which("gh"):
         denied |= {p: "deny" for p in both(gh)}
     return denied
@@ -136,7 +136,7 @@ def kept_out(roots: list[Path], hidden: list[Path | str]) -> dict[str, str]:
 
 def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> dict[str, str]:
     granted = {}
-    blocked = [home().resolve(), (paths.HOME / ".claude").resolve()]
+    blocked = [home().resolve(), (paths.HOME / ".claude").resolve(), (paths.HOME / ".pi").resolve()]
     hidden_paths = {Path(p).resolve() for p in hidden}
     if gh := shutil.which("gh"):
         hidden_paths.add(Path(gh).resolve())
