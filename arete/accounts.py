@@ -25,6 +25,8 @@ class Auth:
     family: str = ""
     identity: str = ""
     generation: str = ""
+    credential: str = ""
+    provider: str = ""
 
 
 cache: dict[str, tuple[float, Auth]] = {}
@@ -131,7 +133,9 @@ def claude(status=None, account=None, token: str = "", source: str = "", lookup=
             values += [account_uuid]
         return Auth(mode, "claude", identity("claude", values), generation)
 
-    return cached(generation, discover)
+    found = cached(generation, discover)
+    return Auth(found.mode, found.family, found.identity, generation,
+                fingerprint("credential-v1", "claude", source, token or [status, account]), "anthropic")
 
 
 def codex(data=None, source: str = "", provider: str = "") -> Auth:
@@ -140,7 +144,9 @@ def codex(data=None, source: str = "", provider: str = "") -> Auth:
     selected = data.get("auth_mode")
     if (selected in ("apikey", "api_key") or provider == "openai" or
             (not selected and data.get("OPENAI_API_KEY"))):
-        return Auth("api_key", generation=generation)
+        return Auth("api_key", generation=generation,
+                    credential=fingerprint("credential-v1", "codex", source, data.get("OPENAI_API_KEY") or data),
+                    provider="openai")
     if selected and selected not in ("chatgpt", "subscription"):
         return Auth(generation=generation)
     tokens = mapping(data.get("tokens"))
@@ -155,31 +161,36 @@ def codex(data=None, source: str = "", provider: str = "") -> Auth:
         values += [mapping(claims.get("https://api.openai.com/auth")).get("chatgpt_account_id"),
                    claims.get("chatgpt_account_id")]
     mode = "subscription" if tokens or provider == "chatgpt" or data.get("auth_mode") in ("chatgpt", "subscription") else ""
-    return Auth(mode, "codex", "" if malformed else identity("codex", values), generation)
+    return Auth(mode, "codex", "" if malformed else identity("codex", values), generation,
+                fingerprint("credential-v1", "codex", source, data), "openai-codex")
 
 
 def pi(provider: str, credential=None, source: str = "", lookup=None) -> Auth:
     credential = mapping(credential)
     generation = fingerprint("pi", source, provider, credential)
+    local = fingerprint("credential-v1", "pi", source, provider, credential)
     if credential.get("type") != "oauth":
-        return Auth("api_key", generation=generation)
+        return Auth("api_key", generation=generation, credential=local, provider=provider)
     if provider not in PI_SUBSCRIPTIONS:
-        return Auth("api_key", generation=generation)
+        return Auth("api_key", generation=generation, credential=local, provider=provider)
     family = {"anthropic": "claude", "openai-codex": "codex"}.get(provider, "")
     if family == "claude":
         found = claude(account={"accountUuid": credential.get("accountUuid")},
                        token=credential.get("access", ""), source=source, lookup=lookup)
-        return Auth("subscription", family, found.identity, generation)
+        return Auth("subscription", family, found.identity, generation, local, provider)
     if family == "codex":
         token = credential.get("access")
         claims = jwt(token) if token else {}
         values = [credential.get("accountId"),
                   mapping(claims.get("https://api.openai.com/auth")).get("chatgpt_account_id"),
                   claims.get("chatgpt_account_id")]
-        return Auth("subscription", family, "" if token and not claims else identity(family, values), generation)
-    return Auth("subscription", generation=generation)
+        return Auth("subscription", family, "" if token and not claims else identity(family, values), generation,
+                    local, provider)
+    return Auth("subscription", generation=generation, credential=local, provider=provider)
 
 
 def scope(auth: Auth, limit: str, unknown: str = "") -> str:
-    account = auth.identity or unknown
+    if auth.mode == "api_key":
+        return "credit-v1:" + fingerprint(auth.provider, auth.credential or unknown) if auth.credential or unknown else ""
+    account = auth.identity or auth.credential or unknown
     return "subscription-v1:" + json.dumps([auth.family, account, limit], separators=(",", ":")) if account else ""

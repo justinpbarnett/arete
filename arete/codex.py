@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import accounts, claude, config, environment, guard, paths, util
-from .agent import NO_SESSION, Result, Session, UsageLimit, json_from_text
+from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
 from .pi import SCHEMA_RULE
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
@@ -310,7 +310,7 @@ def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
     auth = auth or authentication(kw.get("passing"), kw.get("extra_env"), kw.get("remote"))
     result = _run(*args, auth=auth, **kw)
     result.auth_mode = auth.mode
-    if auth.mode != "subscription":
+    if auth.mode not in ("subscription", "api_key"):
         result.usage_limit = None
     return result
 
@@ -436,7 +436,7 @@ def events(stdout: str) -> list[dict]:
 
 def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None,
           provider: str, before: dict[str, int] | None = None) -> Result:
-    thread, texts, failures, usage, turns = "", [], [], {}, 0
+    thread, texts, failures, diagnostics, usage, turns = "", [], [], [], {}, 0
     for event in events(proc.stdout):
         kind = event.get("type")
         if kind == "thread.started":
@@ -449,8 +449,10 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
             usage = {k: max(0, int(v or 0) - (before or {}).get(k, 0)) for k, v in (event.get("usage") or {}).items()}
         elif kind == "turn.failed":
             failures.append(str((event.get("error") or {}).get("message") or "the turn failed"))
+            diagnostics.append(event)
         elif kind == "error":
             failures.append(str(event.get("message") or "codex reported an error"))
+            diagnostics.append(event)
     text = texts[-1] if texts else ""
     ok = proc.returncode == 0 and not failures and bool(thread)
     error = "" if ok else util.tail("\n".join(failures) or proc.stderr.strip() or f"exit {proc.returncode}", 1500)
@@ -463,7 +465,8 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=turns,
         error=error,
         connection_failed=not ok and util.is_network_error(error),
-        usage_limit=None if ok else usage_limit("\n".join([*failures, proc.stderr])),
+        usage_limit=None if ok else (credit_limit([*diagnostics, proc.stderr]) if provider == KEY_PROVIDER else
+                                    usage_limit("\n".join([*failures, proc.stderr]))),
         raw={"usage": usage, "thread_id": thread},
         tokens_in=usage.get("input_tokens", 0),
         tokens_out=usage.get("output_tokens", 0),
