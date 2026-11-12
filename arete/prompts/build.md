@@ -21,6 +21,7 @@ $expertise
 ## Rules
 
 - Make the change the plan describes. Add or change tests only where the repo's own docs ask for them.
+- Write self-documenting code: no docstrings, and a comment only for what the code cannot show, such as a line that looks wrong and is right. Follow the repo's own docs where they ask for more.
 - Run the checks yourself before you finish: $checks
 - Shell commands you may run: $commands. Others are refused. If the plan needs one, stop without
   editing and say exactly what a human must run.
