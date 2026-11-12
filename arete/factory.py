@@ -226,9 +226,12 @@ class Flow:
         line = self.earlier[self.skipped] if self.skipped < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
-        if self.only and line.get("tree") and not os.path.isdir(line["tree"]) and (why := self.restore(line)):
-            raise Refused(f"only {self.only}: run {self.continues} removed its work folder {line['tree']} when it "
-                          f"ended, and {why}")
+        if self.only and line.get("tree") and not os.path.isdir(line["tree"]):
+            why = self.restore(line)
+            if why or not os.path.isdir(line["tree"]):
+                why = why or "its work folder is still missing after restoring from origin"
+                raise Refused(f"only {self.only}: run {self.continues} removed its work folder {line['tree']} when it "
+                              f"ended, and {why}")
         if not self.only and line.get("tree"):
             now = self.print_of(kw.get("tree") or line["tree"])
             if not now or now != self.last_prints.get(str(line["tree"])):

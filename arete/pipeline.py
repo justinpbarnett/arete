@@ -395,6 +395,7 @@ class Checkout:
     lease: str = ""
     resumes: bool = False
     merged_base: bool = False
+    revision: str = ""
 
     @property
     def prefix(self) -> str:

@@ -116,10 +116,9 @@ def last_step(run_id: str) -> str:
 
 
 def ended_in_error(run_id: str, reply: str = "") -> bool:
-    found = read(run_id)
-    at = max((i for i, line in enumerate(found)
-              if reply and line.get("event") == "step_start" and line.get("step") == reply), default=len(found))
-    return any(part and part[-1].get("event") == "error" for part in (found, found[:at]))
+    last = next((line for line in reversed(read(run_id)) if line.get("event") in ("error", "step_start")
+                 and not (reply and line.get("event") == "step_start" and line.get("step") == reply)), {})
+    return last.get("event") == "error"
 
 
 def wait_start(run_id: str, cause: str, at: str) -> None:

@@ -60,10 +60,20 @@ def remade(line: dict) -> tuple[str, list[pipeline.Checkout], str]:
         return branch, [], "only the folder of a prepare step can be made again"
     made = [pipeline.Checkout(**{**c, "src": Path(c["src"]), "wt": Path(c["wt"])}) for c in listed]
     try:
-        missing = [c for c in made if not pipeline.remote_head(c.src, branch)]
+        for c in made:
+            c.lease = pipeline.remote_head(c.src, branch)
+            if c.lease:
+                continue
+            if not c.revision:
+                return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
+                                      "and no starting revision was recorded")
+            local = util.git(["rev-parse", "--verify", f"refs/heads/{branch}"], c.src, check=False).strip()
+            if c.resumes or c.pr or local != c.revision:
+                return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
+                                      "and it was not left unchanged")
     except RuntimeError as e:
         return branch, made, f"arete could not look for its branch {branch} on origin: {e}"
-    return branch, made, f"its branch {branch} is not on origin" if missing else ""
+    return branch, made, ""
 
 
 def restore(job: Job, line: dict) -> str:
@@ -74,8 +84,10 @@ def restore(job: Job, line: dict) -> str:
     try:
         pipeline.remove_workspace(ws, made)
         for c in made:
-            pipeline.fetch(c.src, branch)
-            pipeline.add_worktree(c, branch, f"origin/{branch}")
+            if c.lease:
+                pipeline.fetch(c.src, branch)
+            pipeline.add_worktree(c, branch, f"origin/{branch}" if c.lease else c.revision)
+            job.restored[str(c.wt)] = util.git(["rev-parse", "HEAD"], c.wt).strip() if c.lease else ""
     except RuntimeError as e:
         return f"arete could not make it again from origin/{branch}: {e}"
     job.run.log(f"made {ws} again from origin/{branch}")
@@ -133,6 +145,7 @@ class Job:
     ci_result: str = ""
     check_commands: list[str] = field(default_factory=list)
     check_rules: list[str] = field(default_factory=list)
+    restored: dict[str, str] = field(default_factory=dict)
 
     @property
     def with_prs(self) -> list[pipeline.Checkout]:
@@ -239,6 +252,9 @@ class Job:
         self.expertise, self.approval = data["expertise"], data.get("approval")
         self.checkouts = [pipeline.Checkout(**{**c, "src": Path(c["src"]), "wt": Path(c["wt"])})
                           for c in data["checkouts"]]
+        for c in self.checkouts:
+            if str(c.wt) in self.restored:
+                c.lease = self.restored[str(c.wt)]
         self.layer = pipeline.checked_layer(self.cfg, Path(data["layer"]))
         self.check_commands, self.check_rules = pipeline.check_script(run.dir, self.layer, self.ws)
         run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
@@ -320,6 +336,8 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
     for c in pipeline.merge_moved_bases(run, [c for c in checkouts if c.resumes]):
         c.merged_base = True
+    for c in checkouts:
+        c.revision = util.git(["rev-parse", "HEAD"], c.wt).strip()
     layer = pipeline.resolve_layer(cfg, run, job.ws)
     if why := pipeline.furnish(cfg, run, layer, job.ws):
         return end_as("fail", "failed", why=why)

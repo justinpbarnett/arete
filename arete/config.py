@@ -532,7 +532,10 @@ LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify"
 
 
 def section(data: dict, name: str) -> dict:
-    return table_of(data.get(name, {}), name)
+    try:
+        return table_of(data.get(name) or {}, name)
+    except TypeError:
+        raise ValueError(f"[{name}] is not a table") from None
 
 
 def load_layer(layer_dir: Path) -> RepoLayer:
