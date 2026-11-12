@@ -89,7 +89,7 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
     return res
 
 
-def sample(where: Path) -> list[str]:
+def sample(where: Path, adw: bool = False) -> list[str]:
     where = Path(os.path.abspath(where))
     if where.exists() and any(where.iterdir()):
         raise FileExistsError(f"{where} is not empty")
@@ -110,11 +110,12 @@ def sample(where: Path) -> list[str]:
     for step, answer in SAMPLE_ANSWERS.items():
         (answers / f"{step}.json").write_text(json.dumps({**answer, **SAMPLE_USAGE}, indent=2) + "\n")
     (layer / "config.toml").write_text(f"[checks]\nword = {json.dumps(SAMPLE_CHECK)}\n\n[git]\nbase = \"main\"\n\n"
-                                       f"[verify]\nnotes = {json.dumps(SAMPLE_NOTES)}\n")
+                                       f"[verify]\nnotes = {json.dumps(SAMPLE_NOTES)}\n"
+                                       + ("\n[factory]\npath = \"adw\"\n" if adw else ""))
     return [f"# wrote {repo}, {origin}, {layer} and {answers}",
             f"# add these lines to {paths.short_path(paths.CONFIG_FILE)}, best in a scratch {SCRATCH_CONFIG}:",
             "",
             "[replay]", "all = true", f"dir = {json.dumps(str(answers))}",
             "",
             "[[repo]]", f"name = {json.dumps(SAMPLE_REPO)}", f"path = {json.dumps(str(repo))}",
-            f"layer = {json.dumps(str(layer))}", "jev = false"]
+            f"layer = {json.dumps(str(layer))}", "tracker = \"local\"", "jev = false"]

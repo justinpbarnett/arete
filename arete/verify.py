@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 from . import config, paths, util
@@ -150,6 +150,10 @@ class Verified:
         elif v.verdict == "pass" and v.failed_checks:
             v.verdict = "fail"
         return v
+
+    @classmethod
+    def stored(cls, data: dict) -> Verified:
+        return cls(**{f.name: data[f.name] for f in fields(cls) if f.name in data})
 
     @property
     def failed_checks(self) -> list[dict]:

@@ -134,7 +134,7 @@ function drawOutcomes() {
   fill("outcomes-body",
     jumps(titles),
     heading(1, titles[0]),
-    el("p", {}, `${shipped} pipeline runs shipped a pull request and ${failed} failed in ${t.days.length} days.` +
+    el("p", {}, `${shipped} pipeline runs shipped a change and ${failed} failed in ${t.days.length} days.` +
       (other ? ` ${other} more ended another way, such as needing information.` : "")),
     outcomeChart(t.days, width),
     heading(2, titles[1]),

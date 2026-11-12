@@ -26,6 +26,7 @@ TIER_KEYS = ("runner", "provider", "model")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
+FACTORY_PATHS = ("classic", "adw")
 
 
 class UnknownRepo(KeyError):
@@ -469,6 +470,7 @@ class RepoLayer:
     tiers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
+    factory_path: str = FACTORY_PATHS[0]
 
     @property
     def builder_bash(self) -> list[str]:
@@ -487,7 +489,8 @@ class RepoLayer:
         return self.dir / "evals"
 
 
-LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers"}
+LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
+                  "factory"}
 
 
 def load_layer(layer_dir: Path) -> RepoLayer:
@@ -517,6 +520,9 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.tiers = tier_maps(data.get("tiers") or {}, "tiers")
     layer.steps = step_tables(data.get("steps") or {}, "steps")
     layer.kinds = kind_tables(data.get("kinds") or {}, "kinds")
+    layer.factory_path = str((data.get("factory") or {}).get("path", layer.factory_path)).strip()
+    if layer.factory_path not in FACTORY_PATHS:
+        raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     if "verify" in data:
         v = data["verify"]
         layer.verify = Verify(start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),

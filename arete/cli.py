@@ -871,7 +871,7 @@ def cmd_replay(args) -> int:
     from . import replay
 
     try:
-        lines = replay.sample(paths.expand(args.folder))
+        lines = replay.sample(paths.expand(args.folder), adw=args.adw)
     except (OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -1064,6 +1064,7 @@ def main(argv: list[str] | None = None) -> int:
                                       "bare origin, a layer and an answer per ticket step")
     p.add_argument("action", choices=("sample",))
     p.add_argument("folder")
+    p.add_argument("--adw", action="store_true", help="turn on [factory] path = \"adw\" in the sample layer")
     p.set_defaults(fn=cmd_replay)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")

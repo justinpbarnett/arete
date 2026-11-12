@@ -692,8 +692,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    if not repo.parts:
-        print(f"{repo_name} has no github remote configured")
+    from . import flows
+    try:
+        path, broken = flows.wanted(repo), ""
+    except (ValueError, TypeError) as e:
+        path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
+    adw = path == flows.ADW and not repo.parts
+    if adw and not flows.has_origin(repo) or not adw and not repo.parts:
+        print(f"{repo_name} has no github remote configured" + (" and no git remote origin, which [factory] path = "
+                                                               "\"adw\" needs" if adw else broken))
         return 1
     tk = tracker.for_ticket(cfg, repo, tid)
     try:
@@ -725,13 +732,17 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         opening_waits(run_id, run.answering, "" if dry_run else state.take_passed_over(repo.name, str(tid)))
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
+        if path == flows.ADW and repo.parts:
+            run.log("factory: [factory] path is adw, but the adw flow runs only on a repo with no GitHub name for now, "
+                    "so this run takes the classic path")
+        flow = flows.start(cfg, run, earlier[0] if restarting else {}) if adw else None
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if not dry_run:
                 state.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
         try:
-            status, summary, pr_url = _run(cfg, run, slot)
+            status, summary, pr_url = flows.feature(flow) if flow else _run(cfg, run, slot)
         except Stopped:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
@@ -756,10 +767,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
         run.log(f"done: {status} {pr_url or summary}")
         record.settle(run_id, status, summary=summary, pr_url=pr_url)
-        write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url})
+        write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow)
         if status == "skipped":
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
-        return 0 if status in ("pr", "noop", "needs-info", "dry-run") else 1
+        return 0 if status in ("pr", "noop", "needs-info", "dry-run", "done") else 1
 
 
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple[str, str, str]:
@@ -774,11 +785,15 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple
     return "failed", why, ""
 
 
-def write_report(row: dict) -> None:
+def write_report(row: dict, flow: factory.Flow | None = None) -> None:
     waits = lines.wait_minutes(row["id"])
     record.note(row["id"], wait_minutes=json.dumps(waits))
-    lines.write(row["id"], "report", status=row.get("status") or "", prs=(row.get("pr_url") or "").split(),
-                minutes=run_minutes(row), cost_usd=round(float(row.get("cost_usd") or 0), 4), wait_minutes=waits)
+    report = {"prs": (row.get("pr_url") or "").split(), "minutes": run_minutes(row),
+              "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": waits}
+    if flow:
+        flow.respond(row.get("status") or "", **report)
+    else:
+        lines.write(row["id"], "report", status=row.get("status") or "", **report)
 
 
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
