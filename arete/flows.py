@@ -234,7 +234,8 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                                                                  kind=t.kind, id=t.id, slug=pipeline.slug(t.title))
     if not run.dry_run:
         tk.prepare()
-    run.enter("running")
+    if not run.alone:
+        run.enter("running")
     if repo.parts and not run.dry_run:
         checkouts = pipeline.make_workspace(run.id, repo, main_layer.base_branch, branch, run.tid)[1]
     else:
