@@ -291,7 +291,7 @@ The run log, the `<step>.json` files, the tables and the records stay as they we
 
 ## The seam
 
-`arete/factory.py` is one seam that a run's steps can go through. Nothing in the pipeline uses it yet, so every run behaves as before.
+`arete/factory.py` is one seam that a run's steps can go through. The feature flow in `arete/flows.py` runs on it when a repo's layer sets `[factory] path = "adw"`; every other run takes the classic pipeline and behaves as before.
 
 - `factory.Outcome(result, next="", feedback="", data={}, session=NO_SESSION)` is what a step returns. `result` is `pass`, `fail`, `ask` or `stop`, and any other value raises. `next` names the step to run next, or is empty for the flow's own order. `data` is a JSON object. `outcome.passed` is true for `pass` alone.
 - `@factory.step("name")` registers `fn(flow, *args, **kw) -> Outcome` in `factory.STEPS`. A name registers once.
@@ -301,6 +301,26 @@ The run log, the `<step>.json` files, the tables and the records stay as they we
 - `continues=<run id>` reads that run's lines and those of the runs it continued. Each `flow.step` call is matched in order against their `step_end` lines, and a call that meets a passing line of the same step returns the stored outcome without calling anything. A line with a fingerprint matches only while the folder's fingerprint equals the last one recorded for it, so a run whose folder is gone or changed goes on after the last step that did not touch it. The first call that does not match writes the `route` line and every later call runs.
 - `only=<step>` takes the steps before it from the stored outcomes, without comparing fingerprints, runs that step even if it passed, and returns a `stop` outcome for every later call. It raises `factory.Refused` naming the step when an earlier step has no stored passing outcome.
 - `flow.respond(status, **fields)` writes the `report` line.
+
+### The adw flow
+
+`[factory] path` in a layer is `classic` (the default) or `adw`; any other value fails the layer's load. For now the adw flow runs only on a repo with no `github` name. Such a repo needs a git remote `origin`, or `arete run` refuses it as before. A repo that has a `github` name and sets `adw` logs `factory: [factory] path is adw, but ...` and takes the classic path.
+
+The flow runs these seam steps, each with the pipeline's own helpers and the agent call names of the classic run (`plan`, `build`, `fix2`, `review_fix`, `verify`, `verify2`, `review`, `review2`, `learn`):
+
+| step | does |
+|---|---|
+| `prepare` | Reads the ticket, holds a closed or blocked one, saves its images, picks the branch, makes the worktree from `origin`, loads the layer, copies files and runs the setup commands. |
+| `plan` | Plans; asks the author when the plan is ambiguous or over `max_diff_lines`. |
+| `implement` | The build, then a fix round after each failed check (`fix2` and up) and the review fix. |
+| `checks` | Runs the layer's checks. A fail goes back to `implement` until the build step's `tries` run out; then learn runs without applying and the run fails. |
+| `verify` | Checks the change in use, with its own rounds as in a classic run. |
+| `review` | Reviews. `request_changes` goes back to `implement` once, then `checks`, `verify` and `review` again. |
+| `learn` | Rewrites `expertise.md` as a classic run does. |
+| `publish` | Commits the staged change with `git.subject` and the ticket ref, pushes the branch to `origin`, notes the branch on the run and moves the task to `done`. A dry run saves `diff.patch` instead. |
+| `respond` | Ends the run as the classic run would: the failure comment, the question (and its `question` line), the nothing to build comment, or a `done` comment with the summary, the check in use and the review. |
+
+Each step's `data` holds what a later step needs, so a run that restarts after an interrupted adw run continues it: it takes every passing step whose worktree is unchanged from the stored outcomes and runs the rest. The run's `report` line comes from `flow.respond`. The status `done` counts as success, and its summary names the pushed branch.
 
 ## Layout
 
@@ -426,7 +446,7 @@ arete task close t-1a2b
 
 A body line such as `Waits on t-1a2b.` holds the task until `t-1a2b` is `done` or `closed`. A named task in any other state holds it, `failed` and `needs-info` included, so a task that failed holds the tasks that wait on it. A name that matches no task holds it too, and the reason says so.
 
-A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for a ticket, as in `arete run web t-1a2b`. An issue number or a Jira key gets the repo's own tracker. `tracker = "local"` makes local tasks a repo's only tracker. Such a repo may have no `github`: it loads, shows in `arete status` and on the dashboard, and gets no triage, but `arete run` still refuses it with `has no github remote configured`. A PR for a task closes nothing and ends with the id, like `Paint the door (t-1a2b)`. Poll picks local tasks only in a `tracker = "local"` repo that has a `github` name and `pipeline = true`; a later change widens that.
+A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for a ticket, as in `arete run web t-1a2b`. An issue number or a Jira key gets the repo's own tracker. `tracker = "local"` makes local tasks a repo's only tracker. Such a repo may have no `github`: it loads, shows in `arete status` and on the dashboard, and gets no triage, but `arete run` refuses it with `has no github remote configured` unless its layer sets `[factory] path = "adw"` and the repo has a git remote `origin`. Then the run pushes a branch to `origin` and moves the task to `done`; see [The adw flow](#the-adw-flow). A PR for a task closes nothing and ends with the id, like `Paint the door (t-1a2b)`. Poll picks local tasks only in a `tracker = "local"` repo that has a `github` name and `pipeline = true`; a later change widens that.
 
 ## Per repo layer
 
@@ -466,6 +486,9 @@ notes = "Sign up only with addresses at example.test."
 
 [research]
 dir = "docs/research"
+
+[factory]
+path = "classic"
 ```
 
 | Key | Meaning |
@@ -486,6 +509,7 @@ dir = "docs/research"
 | `verify.allow_bash` | Bash patterns the verifier may run, on top of `curl` and `echo`. |
 | `verify.notes` | What the verifier must know: how to sign in, what not to touch, what is shared. |
 | `research.dir` | Folder, from the repo root, where arete files the reports of this repo's research tickets as pull requests. Leave it out and the reports stay in arete. See [Triage](#triage). |
+| `factory.path` | `classic` (default) or `adw`, which runs a ticket through the [adw flow](#the-adw-flow) on a repo with no `github` name. |
 
 A template with an unknown field falls back to the default. A layer may also hold `[steps]`, `[kinds]` and `[tiers]`, which set its steps apart from the engine's; see [Steps](#steps). A layer in `.agents/` that is not committed yet still works: runs read it from the main checkout and lessons land there, but arete never proposes automerge until it is committed. A layer outside the repo is read in place, lessons land in its `expertise.md`, and the miner leaves the repo's `.agents/` alone. Arete never proposes automerge for it: raise `trust.level` by hand.
 
@@ -565,7 +589,7 @@ When `<dir>/<step>.patch` exists, arete applies it to the call's folder with `gi
 
 A replayed call is recorded like any other: its step row, its record header and its timeline `agent` mark say `replay`, the raw record holds one `replay` line naming the answer and patch files, and it costs what the file says, which `[pricing]` never changes. Usage limit holds, the login check, the guard, JEV rules and devices do not apply to it. JEV calls are not agent calls and still go to JEV. `all = true` also sends chat, triage, loops and sessions to replay, so turn it on in a scratch `ARETE_CONFIG_DIR` and `ARETE_STATE_DIR`.
 
-`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review and learn, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has no `github` and no `pipeline`, so poll never picks it up.
+`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review and learn, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has `tracker = "local"`, no `github` and no `pipeline`, so poll never picks it up. `--adw` adds `[factory] path = "adw"` to the layer, so `arete run replay-sample t-...` on a task from `arete task add --repo replay-sample` runs the [adw flow](#the-adw-flow) and pushes the branch to `origin.git`. The answers serve both paths.
 
 ## Verify in use
 
@@ -717,7 +741,7 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
   Answer a ticket's questions there and send it to the pipeline, which starts a poll.
   Refresh triage now starts a refresh.
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.
-- Outcomes: for the last 30 days, the pipeline runs that shipped and failed each day, the decisions that went without you against the ones you made, what you paid by day, model, runner and loop, the runs by repo, and the eval pass rate by repo.
+- Outcomes: for the last 30 days, the pipeline runs that shipped (a pull request, or a branch the adw flow pushed) and failed each day, the decisions that went without you against the ones you made, what you paid by day, model, runner and loop, the runs by repo, and the eval pass rate by repo.
 - Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, and the loops that report on their own.
 - Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`.
   A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use.
