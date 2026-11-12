@@ -65,6 +65,7 @@ CHECKED_IN_USE_HEADING = "## Checked in use"
 SLOTS_LOCK = "run-slots"
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
+SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
@@ -752,7 +753,7 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     except (ValueError, TypeError):
         adw = False
     if not adw:
-        return [sys.executable, "-m", "arete.cli", "run", repo_name, str(tid), *flags]
+        return [sys.executable, "-m", "arete.cli", "run", repo_name, str(tid), "--local", *flags]
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
     return script_command(cfg, name, repo_name, str(tid), *flags)
 
@@ -897,7 +898,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow, run)
         if status == "skipped":
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
-        return 0 if (status in ("pr", "noop", "needs-info", "dry-run", "done") if passed is None else passed) else 1
+        return 0 if (status in SUCCEEDED if passed is None else passed) else 1
 
 
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple[str, str, str]:

@@ -78,6 +78,11 @@ def cmd_init(args) -> int:
 def cmd_status(args) -> int:
     from . import board, control
 
+    if args.json:
+        return status_lines(args.run_id)
+    if args.run_id:
+        print("arete status --json RUN_ID prints one run's steps", file=sys.stderr)
+        return 2
     cfg = config.load()
     views = control.loop_views(cfg)
     snap = board.snapshot(recent_runs=args.limit)
@@ -102,6 +107,38 @@ def cmd_status(args) -> int:
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
     show(snap["live"], "the live runs", print_live)
     return 0
+
+
+def status_lines(run_id: str) -> int:
+    from . import client
+
+    def live() -> int:
+        try:
+            panel = client.call("GET", "/api/live")["live"]
+        except client.Down:
+            from . import board, state
+
+            panel = board.panel(lambda: board.live(state.runs_marked_running(connect=state.reader)))
+        if "error" in panel:
+            client.emit({"error": panel["error"]})
+            return 1
+        for row in panel["rows"]["runs"]:
+            client.emit(row)
+        return 0
+
+    def steps() -> int:
+        try:
+            read = list(client.events(run_id))
+        except client.Down:
+            if (found := local_lines(run_id, 0, False)) is None:
+                client.emit({"error": f"no run {run_id}"})
+                return 1
+            read = list(found)
+        for line in client.steps_of(run_id, read):
+            client.emit(line)
+        return 0
+
+    return client.steered(steps if run_id else live)
 
 
 def show(panel: dict, what: str, draw) -> None:
@@ -295,14 +332,67 @@ def cmd_uninstall(args) -> int:
 
 
 def cmd_run(args) -> int:
-    from . import pipeline
+    from . import client, pipeline
 
+    if not (args.local or args.dry_run):
+        try:
+            started = client.call("POST", "/api/tasks", {"repo": args.repo, "ticket": args.issue, "force": args.force})
+        except client.Down:
+            started = None
+        except client.Failed as e:
+            return client.failed(e)
+        if started is not None:
+            return client.steered(lambda: run_followed(started))
     return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force)
 
 
-def cmd_task(args) -> int:
-    from . import chat, state
+def run_followed(started: dict) -> int:
+    from . import client, lines, pipeline
 
+    client.emit(started)
+    if not (run_id := started.get("run")):
+        return 1
+    try:
+        for line in client.followed(run_id):
+            client.emit(line)
+            if line.get("event") == lines.END:
+                return 0 if line.get("status") in pipeline.SUCCEEDED else 1
+    except KeyboardInterrupt:
+        print(f"detached; run {run_id} keeps going; `arete stop {run_id}` stops it", file=sys.stderr)
+        return 130
+    return 1
+
+
+def task_shown(task_id: str, repo: str) -> int:
+    from urllib.parse import quote
+
+    from . import client
+
+    try:
+        client.emit(client.call("GET", f"/api/tasks/{quote(task_id, safe='')}"
+                                + (f"?repo={quote(repo, safe='')}" if repo else "")))
+        return 0
+    except client.Down:
+        from . import control, gh, jira, tasks
+
+        try:
+            client.emit(tasks.view(task_id, repo))
+        except (control.NotFound, control.Refused, gh.GhError, jira.JiraError) as e:
+            client.emit({"error": str(e)})
+            return 1
+    return 0
+
+
+def cmd_task(args) -> int:
+    from . import chat, client, state
+
+    if args.action == "start":
+        return client.say("POST", "/api/tasks", {"repo": args.repo, "prompt": " ".join(args.prompt),
+                                                 "title": args.title, "kind": args.kind})
+    if args.action == "run":
+        return client.say("POST", "/api/tasks", {"repo": args.repo, "ticket": args.ticket})
+    if args.action == "show":
+        return client.steered(lambda: task_shown(args.id, args.repo))
     if args.action == "add":
         body = " ".join(args.body).strip()
         if not body:
@@ -315,12 +405,10 @@ def cmd_task(args) -> int:
         print_lines(json.dumps(row, ensure_ascii=False) for row in state.tasks(args.repo, args.state))
         return 0
     tid = args.id.strip().lower()
-    if (row := state.task_get(tid)) is None:
+    if state.task_get(tid) is None:
         print(f"no task {tid}", file=sys.stderr)
         return 1
-    if args.action == "show":
-        print(json.dumps({**row, "comments": state.task_comments(tid)}, indent=2, ensure_ascii=False))
-    elif args.action == "reply":
+    if args.action == "reply":
         text = " ".join(args.text).strip()
         if not text:
             print('arete task reply ID "your reply"', file=sys.stderr)
@@ -774,7 +862,7 @@ def cmd_costs(args) -> int:
     from . import control, util
 
     if args.by or args.json:
-        return print_step_costs(args.by or "step", args.days, args.json)
+        return print_step_costs(args.by or ["step"], args.days, args.json)
     try:
         c = control.costs(args.days)
     except control.Refused as e:
@@ -789,24 +877,27 @@ def cmd_costs(args) -> int:
     return 0
 
 
-def print_step_costs(by: str, days: float | None, as_json: bool) -> int:
+def print_step_costs(groupings: list[str], days: float | None, as_json: bool) -> int:
     from . import control
 
     try:
-        c = control.step_costs(by, days)
+        found = [(by, control.step_costs(by, days)) for by in groupings]
     except control.Refused as e:
         return refused(e)
+    c = found[-1][1]
     waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"]}
     if as_json:
-        print_lines([*(json.dumps(g) for g in c["groups"]), json.dumps(waits)])
+        print_lines([*(json.dumps(g) for _, each in found for g in each["groups"]), json.dumps(waits)])
         return 0
-    print(f"Every step by {by} in the last {c['days']:g} days. Cost is what each call reported; a claude CLI step's "
-          "is the API price, since it rides the subscription. `in` counts the input no cache served.")
-    rows = [(by, "runs", "calls", "cost", "in", "cache rd", "cache wr", "out", "min", "api min")]
-    rows += [(g["name"], str(g["runs"]), str(g["calls"]), f"${g['cost_usd']:.2f}",
-              f"{g['tokens_in'] - g['cache_read'] - g['cache_write']:,}", f"{g['cache_read']:,}", f"{g['cache_write']:,}",
-              f"{g['tokens_out']:,}", f"{g['minutes']:.1f}", f"{g['api_minutes']:.1f}") for g in c["groups"]]
-    print_table(rows, 200)
+    for by, each in found:
+        print(f"Every step by {by} in the last {each['days']:g} days. Cost is what each call reported; a claude CLI "
+              "step's is the API price, since it rides the subscription. `in` counts the input no cache served.")
+        rows = [(by, "runs", "calls", "cost", "in", "cache rd", "cache wr", "out", "min", "api min")]
+        rows += [(g["name"], str(g["runs"]), str(g["calls"]), f"${g['cost_usd']:.2f}",
+                  f"{g['tokens_in'] - g['cache_read'] - g['cache_write']:,}", f"{g['cache_read']:,}",
+                  f"{g['cache_write']:,}", f"{g['tokens_out']:,}", f"{g['minutes']:.1f}", f"{g['api_minutes']:.1f}")
+                 for g in each["groups"]]
+        print_table(rows, 200)
     print("waits (minutes): " + "  ".join(f"{cause} {m:.1f}" for cause, m in c["wait_minutes"].items()))
     return 0
 
@@ -849,22 +940,70 @@ def cmd_record(args) -> int:
     return 0
 
 
-def cmd_lines(args) -> int:
+def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
     from . import lines, state
 
-    if not lines.path(args.run_id).exists() and not state.run_get(args.run_id):
-        print(f"no run {args.run_id}", file=sys.stderr)
-        return 1
-    found = (lines.follow(args.run_id, args.start) if args.follow
-             else (line for line in lines.read(args.run_id) if lines.seq_of(line) > args.start))
-    try:
+    if not lines.path(run_id).exists() and not state.run_get(run_id):
+        return None
+    return (lines.follow(run_id, start) if follow
+            else (line for line in lines.read(run_id) if lines.seq_of(line) > start))
+
+
+def cmd_lines(args) -> int:
+    from . import client
+
+    def printed() -> int:
+        try:
+            found = (client.followed if args.follow else client.events)(args.run_id, args.start)
+        except client.Down:
+            if (found := local_lines(args.run_id, args.start, args.follow)) is None:
+                client.emit({"error": f"no run {args.run_id}"})
+                return 1
         for line in found:
-            print(json.dumps(line, ensure_ascii=False), flush=True)
-    except BrokenPipeError:
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-    except KeyboardInterrupt:
-        return 130
-    return 0
+            if not args.step or line.get("step") == args.step:
+                client.emit(line)
+        return 0
+
+    return client.steered(printed)
+
+
+def cmd_wait(args) -> int:
+    from . import client
+
+    return client.steered(lambda: client.wait(args.run_id))
+
+
+def cmd_answer(args) -> int:
+    from . import client
+
+    return client.say("POST", client.run_path(args.run_id, "answer"), {"text": " ".join(args.text)})
+
+
+def cmd_resume(args) -> int:
+    from . import client
+
+    return client.say("POST", client.run_path(args.run_id, "resume"), {"step": args.step} if args.step else {})
+
+
+def cmd_step(args) -> int:
+    from urllib.parse import quote
+
+    from . import client
+
+    sets = {}
+    for setting in args.sets:
+        key, eq, value = setting.partition("=")
+        if not eq or not key.strip():
+            client.emit({"error": f"write each setting as key=value, not '{setting}'"})
+            return 1
+        sets[key.strip()] = value
+    return client.say("POST", client.run_path(args.run_id, f"steps/{quote(args.step, safe='')}"), {"set": sets})
+
+
+def cmd_stop(args) -> int:
+    from . import client
+
+    return client.say("POST", client.run_path(args.run_id, "stop"))
 
 
 def cmd_replay(args) -> int:
@@ -934,8 +1073,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
 
-    p = sub.add_parser("status", help="settings, heartbeat, alerts, recent runs")
+    p = sub.add_parser("status", help="settings, heartbeat, alerts, recent runs; with --json, the live runs or one "
+                                      "run's steps as JSON lines")
+    p.add_argument("run_id", nargs="?", default="", help="with --json: this run's steps, then its report")
     p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("events", help="summarize hook events")
@@ -1035,7 +1177,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop; with --by, every step "
                                      "by step, task kind or model, and the wait minutes by cause")
     p.add_argument("--days", type=float, default=None)
-    p.add_argument("--by", choices=("step", "kind", "model"))
+    p.add_argument("--by", nargs="+", choices=("step", "kind", "model"), help="one grouping or several, in order")
     p.add_argument("--json", action="store_true", help="one JSON line per group, then one with the wait minutes")
     p.set_defaults(fn=cmd_costs)
 
@@ -1058,7 +1200,34 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-f", "--follow", action="store_true", help="keep printing new lines until the report line")
     p.add_argument("--from", dest="start", type=int, default=0, metavar="SEQ",
                    help="start after the line with this seq")
+    p.add_argument("--step", default="", help="print only this step's lines")
     p.set_defaults(fn=cmd_lines)
+
+    p = sub.add_parser("wait", help="follow a run through the server, printing its step_end, question, error and "
+                                    "report lines, until the report or a question")
+    p.add_argument("run_id")
+    p.set_defaults(fn=cmd_wait)
+
+    p = sub.add_parser("answer", help="answer the question of a run that ended needs-info, through the server, which "
+                                      "starts the next run")
+    p.add_argument("run_id")
+    p.add_argument("text", nargs="+")
+    p.set_defaults(fn=cmd_answer)
+
+    p = sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the server")
+    p.add_argument("run_id")
+    p.add_argument("--step", default="", help="run this step and every step after it again")
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("step", help="run one step of a run that ended alone, through the server")
+    p.add_argument("run_id")
+    p.add_argument("step")
+    p.add_argument("sets", nargs="*", metavar="KEY=VALUE", help="override one of the step's settings")
+    p.set_defaults(fn=cmd_step)
+
+    p = sub.add_parser("stop", help="stop a running run, through the server")
+    p.add_argument("run_id")
+    p.set_defaults(fn=cmd_stop)
 
     p = sub.add_parser("replay", help="answer agent steps from files; `replay sample FOLDER` writes a fixture repo, its "
                                       "bare origin, a layer and an answer per ticket step")
@@ -1072,9 +1241,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("issue", help="an issue number (35), a Jira key (ABC-1234) or a task id (t-1a2b)")
     p.add_argument("--dry-run", action="store_true", help="plan and build locally, no push, PR or tracker writes")
     p.add_argument("--force", action="store_true", help="run a ticket the approval rules would skip")
+    p.add_argument("--local", action="store_true", help="run in this process even when the server is up; the server "
+                                                        "and the poller start runs this way")
     p.set_defaults(fn=cmd_run)
 
-    p = sub.add_parser("task", help="local tasks, which have no tracker issue: add, list, show, reply to and close them")
+    p = sub.add_parser("task", help="local tasks, which have no tracker issue: add, list, show, reply to and close them; "
+                                    "start one from a prompt or a ticket through the server")
     tsub = p.add_subparsers(dest="action", required=True)
     t = tsub.add_parser("add", help="add a task to a repo and print its id")
     t.add_argument("--repo", required=True, help="a repo name from the config")
@@ -1084,13 +1256,22 @@ def main(argv: list[str] | None = None) -> int:
     t = tsub.add_parser("list", help="one JSON line per task, oldest first")
     t.add_argument("--repo", default="")
     t.add_argument("--state", default="", choices=config.TASK_STATES)
-    t = tsub.add_parser("show", help="a task and its comments as JSON")
+    t = tsub.add_parser("show", help="a task or a tracker item with its runs and children, as one JSON line")
     t.add_argument("id")
+    t.add_argument("--repo", default="", help="the repo of a tracker item no run names yet")
     t = tsub.add_parser("reply", help="answer a task's question as its owner")
     t.add_argument("id")
     t.add_argument("text", nargs="+")
     t = tsub.add_parser("close", help="close a task")
     t.add_argument("id")
+    t = tsub.add_parser("start", help="add a task from a prompt and start it through the server; one JSON line")
+    t.add_argument("--repo", required=True, help="a repo name from the config")
+    t.add_argument("--kind", default="feat", choices=config.KINDS)
+    t.add_argument("--title", default="", help="the prompt's first line by default")
+    t.add_argument("prompt", nargs="+", help="what to do")
+    t = tsub.add_parser("run", help="start a tracker item or a task through the server, past its waits; one JSON line")
+    t.add_argument("repo")
+    t.add_argument("ticket", help="an issue number, a Jira key or a task id")
     p.set_defaults(fn=cmd_task)
 
     p = sub.add_parser("poll", help="loop 3: run the pipeline on the oldest ready ticket in each pipeline repo")

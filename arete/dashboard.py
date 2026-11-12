@@ -339,7 +339,8 @@ class Handler(BaseHTTPRequestHandler):
                                       self.body().get("approve") is True)
             if path == "/api/tasks":
                 b = self.body()
-                return tasks.start(*(str(b.get(k) or "") for k in ("repo", "prompt", "title", "kind", "ticket")))
+                return tasks.start(*(str(b.get(k) or "") for k in ("repo", "prompt", "title", "kind", "ticket")),
+                                   force=b.get("force") is not False)
             if path == "/api/sessions":
                 return self.launch_session()
             if path.startswith(SESSION_PATH):
@@ -631,6 +632,8 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
         for s in servers:
             threading.Thread(target=s.serve_forever, daemon=True).start()
         say(f"dashboard listening on port {port} at {', '.join(node.addresses)}")
+        util.write_json(paths.SERVER_FILE, {"pid": os.getpid(), "addresses": list(node.addresses), "port": port,
+                                            **paths.state_and_config(), "at": util.iso()})
         while this_node(cfg.dashboard_owner) == node:
             time.sleep(WATCH_SECONDS)
         say("the tailnet address or owner changed; listening again")

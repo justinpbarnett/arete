@@ -16,6 +16,7 @@ RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+SERVER_FILE = STATE_DIR / "server.json"
 LOOP_MARKS_FILE = STATE_DIR / "loops.json"
 LOCKS_DIR = STATE_DIR / "locks"
 
@@ -28,6 +29,10 @@ CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 
 def expand(p: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(p))))
+
+
+def state_and_config() -> dict:
+    return {"state": str(STATE_DIR.resolve()), "config": str(CONFIG_FILE.resolve())}
 
 
 def short_path(p: str | Path) -> str:
