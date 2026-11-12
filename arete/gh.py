@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from . import util
 
 ARETE_MARK = "<!-- arete -->"
+NO_ISSUE = "Could not resolve to an issue"
 
 
 class GhError(RuntimeError):
@@ -107,7 +108,7 @@ def issue_state(repo: str, number: int) -> str:
     try:
         return (gh_json(["issue", "view", str(number), "--repo", repo, "--json", "state"]) or {}).get("state", "")
     except GhError as e:
-        if "Could not resolve to an issue" in str(e):
+        if NO_ISSUE in str(e):
             return ""
         raise
 

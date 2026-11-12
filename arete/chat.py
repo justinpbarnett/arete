@@ -100,11 +100,11 @@ def new(project: str) -> dict:
     return view(state.chat_add(project))
 
 
-def title_of(text: str) -> str:
+def title_of(text: str, limit: int = TITLE_CHARS) -> str:
     line = util.first_line(text, len(text))
-    if len(line) <= TITLE_CHARS:
+    if len(line) <= limit:
         return line
-    return (line[:TITLE_CHARS + 1].rpartition(" ")[0] or line[:TITLE_CHARS]).rstrip() + "…"
+    return (line[:limit + 1].rpartition(" ")[0] or line[:limit]).rstrip() + "…"
 
 
 def send(chat_id: int, text: str) -> dict:

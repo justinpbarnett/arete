@@ -5,7 +5,7 @@ import json
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -71,7 +71,7 @@ def read(run_id: str) -> list[dict]:
         return []
 
 
-def follow(run_id: str, start: int = 0) -> Iterator[dict]:
+def follow(run_id: str, start: int = 0, ended: Callable[[], bool] = lambda: False) -> Iterator[dict]:
     target, offset, rest = path(run_id), 0, b""
     while True:
         try:
@@ -90,6 +90,8 @@ def follow(run_id: str, start: int = 0) -> Iterator[dict]:
             if line.get("event") == END:
                 return
         if not chunk:
+            if ended():
+                return
             time.sleep(FOLLOW_POLL_SECONDS)
 
 

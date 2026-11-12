@@ -21,7 +21,9 @@ KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
 
 
 class JiraError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
 
 
 def credentials(env_file: Path | None) -> tuple[str, str, str]:
@@ -95,7 +97,7 @@ class Client:
                     time.sleep(wait)
                     continue
                 later = f" (retry after {wait:.0f} s)" if wait > MAX_RETRY_WAIT else ""
-                raise JiraError(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}{later}".rstrip()) from None
+                raise JiraError(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}{later}".rstrip(), e.code) from None
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 if attempt < RETRIES:
                     if not util.online():

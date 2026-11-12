@@ -995,6 +995,13 @@ def last_pipeline_starts() -> dict[str, str]:
                                               "GROUP BY repo")}
 
 
+def running_run(repo: str, issue: int | str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "
+                      "ORDER BY started DESC, rowid DESC LIMIT 1", (repo, issue)).fetchone()
+        return dict(r) if r else None
+
+
 def issue_running(repo: str, issue: int | str) -> bool:
     with db() as c:
         return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status = 'running' LIMIT 1",
@@ -1352,6 +1359,11 @@ def tasks(repo: str = "", in_state: str = "", connect=db) -> list[dict]:
             args.append(value)
     with connect() as c:
         return [dict(r) for r in c.execute(q + " ORDER BY created, rowid", args)]
+
+
+def task_children(parent: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE parent = ? ORDER BY created, rowid", (parent,))]
 
 
 def task_set_state(tid: str, new: str, from_states: tuple[str, ...] = ()) -> bool:

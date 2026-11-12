@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +27,8 @@ from . import (
     engine,
     gh,
     hooks,
+    jira,
+    lines,
     loops,
     paths,
     pipeline,
@@ -34,6 +37,7 @@ from . import (
     sessions,
     settings,
     state,
+    tasks,
     triage,
     util,
 )
@@ -60,6 +64,11 @@ TRIAGE_PATH = "/api/triage/"
 SKIPPED_PATH = "/api/skipped/"
 PROPOSAL_PATH = "/api/proposals/"
 CHAT_PATH = "/api/chats/"
+TASK_PATH = "/api/tasks/"
+EVENTS_PATH = re.compile(r"/api/runs/([^/]+)/events")
+EVENTS_TYPE = "application/x-ndjson"
+RUN_ID = re.compile(r"\w[\w.-]*")
+END_GRACE_SECONDS = 5
 INSTALL_SECONDS = 120
 USAGE_KINDS = ("visit", "action")
 USAGE_DEVICES = ("desktop", "phone")
@@ -176,7 +185,7 @@ class Refusal(Exception):
 
 
 STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409,
-                     chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502,
+                     chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
                      triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409}
@@ -231,7 +240,10 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and path.startswith(hooks.HOOK_PATH):
                 got = hooks.receive(unquote(path[len(hooks.HOOK_PATH):]), self.headers, self.raw_body())
                 return self.send_json(202 if got["queued"] else 200, got)
-            self.send_json(200, self.api(method, path, {k: v[-1] for k, v in parse_qs(parts.query).items()}))
+            query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
+            if method == "GET" and (events := EVENTS_PATH.fullmatch(path)):
+                return self.send_events(unquote(events[1]), query)
+            self.send_json(200, self.api(method, path, query))
         except Exception as e:
             if status := refusal_status(e):
                 return self.send_json(status, refusal_answer(e))
@@ -261,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
                 return board.runs_board(query, limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
             if path.startswith(RUN_PATH):
                 return board.run_board(unquote(path[len(RUN_PATH):]))
+            if path.startswith(TASK_PATH):
+                return tasks.view(unquote(path[len(TASK_PATH):]), query.get("repo", ""))
             if path == "/api/health":
                 return board.health_board()
             if path == "/api/triage":
@@ -316,6 +330,9 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith(APPROVAL_PATH):
                 return control.decide(whole_number(unquote(path[len(APPROVAL_PATH):])),
                                       self.body().get("approve") is True)
+            if path == "/api/tasks":
+                b = self.body()
+                return tasks.start(*(str(b.get(k) or "") for k in ("repo", "prompt", "title", "kind", "ticket")))
             if path == "/api/sessions":
                 return self.launch_session()
             if path.startswith(SESSION_PATH):
@@ -434,15 +451,38 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, status: int, data) -> None:
         self.send(status, json.dumps(data, default=str).encode(), "application/json", "no-store")
 
-    def send(self, status: int, payload: bytes, kind: str, cache: str) -> None:
+    def send_events(self, run_id: str, query: dict) -> None:
+        if not RUN_ID.fullmatch(run_id):
+            raise board.NotARunId(f"'{run_id}' is not a run id.")
+        if not lines.path(run_id).exists() and not state.run_get(run_id, connect=state.reader):
+            raise control.NotFound(f"nothing has the id {run_id}")
+        start = whole_number(query.get("from", "0"))
+        if query.get("follow") != "1":
+            found = (line for line in lines.read(run_id) if lines.seq_of(line) > start)
+            return self.send(200, b"".join(map(event_line, found)), EVENTS_TYPE, "no-store")
+        self.head(200, EVENTS_TYPE, "no-store")
+        self.close_connection = True
+        try:
+            self.end_headers()
+            for line in lines.follow(run_id, start, run_ended(run_id)):
+                self.wfile.write(event_line(line))
+                self.wfile.flush()
+        except OSError:
+            pass
+
+    def head(self, status: int, kind: str, cache: str, length: int | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", kind)
-        self.send_header("Content-Length", str(len(payload)))
+        if length is not None:
+            self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", cache)
         self.send_header("X-Arete-Code", WEB_CODE)
         self.send_header("Content-Security-Policy", PAGE_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+
+    def send(self, status: int, payload: bytes, kind: str, cache: str) -> None:
+        self.head(status, kind, cache, len(payload))
         try:
             self.end_headers()
             self.wfile.write(payload)
@@ -466,6 +506,24 @@ class Server(ThreadingHTTPServer):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
         self.node, self.logins, self.inside_serve = node, logins, inside_serve
         super().__init__((address, port), Handler)
+
+
+def event_line(line: dict) -> bytes:
+    return json.dumps(line, ensure_ascii=False, default=str).encode() + b"\n"
+
+
+def run_ended(run_id: str) -> Callable[[], bool]:
+    quiet_since = None
+
+    def ended() -> bool:
+        nonlocal quiet_since
+        if (state.run_get(run_id, connect=state.reader) or {}).get("status") == "running":
+            quiet_since = None
+            return False
+        quiet_since = quiet_since or time.monotonic()
+        return time.monotonic() - quiet_since >= END_GRACE_SECONDS
+
+    return ended
 
 
 def draft_choices() -> dict:

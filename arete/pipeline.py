@@ -769,20 +769,32 @@ def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Scri
     return ""
 
 
+def run_refusal(repo: config.Repo, script: bool = False) -> tuple[bool, str]:
+    from . import flows
+    try:
+        path, broken = flows.wanted(repo), ""
+    except (ValueError, TypeError, OSError) as e:
+        path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
+    adw = path == flows.ADW or script
+    if repo.parts or adw and flows.has_origin(repo):
+        return adw, ""
+    return adw, f"{repo.name} has no github remote configured" + (
+        " and no git remote origin, which [factory] path = \"adw\" needs" if adw else broken)
+
+
+def runnable(repo: config.Repo) -> bool:
+    return bool(repo.parts) or not run_refusal(repo)[1]
+
+
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
               script: Script | None = None) -> int:
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
     from . import flows
-    try:
-        path, broken = flows.wanted(repo), ""
-    except (ValueError, TypeError) as e:
-        path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
-    adw = path == flows.ADW or script is not None
-    if not repo.parts and not (adw and flows.has_origin(repo)):
-        print(f"{repo_name} has no github remote configured" + (" and no git remote origin, which [factory] path = "
-                                                               "\"adw\" needs" if adw else broken))
+    adw, refusal = run_refusal(repo, script is not None)
+    if refusal:
+        print(refusal)
         return 1
     tk = tracker.for_ticket(cfg, repo, tid)
     try:
@@ -2255,6 +2267,13 @@ def no_free_slot(max_parallel: int) -> str:
     return f"no run slot is free (max_parallel {max_parallel})"
 
 
+def held_back(cfg: config.Config, repo_name: str, going: Counter, slots: int) -> str:
+    if going[repo_name] >= cfg.max_parallel_per_repo:
+        return (f"{repo_name} already has {util.count(going[repo_name], 'run')} going "
+                f"(max_parallel_per_repo {cfg.max_parallel_per_repo})")
+    return no_free_slot(cfg.max_parallel) if slots <= 0 else ""
+
+
 def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen:
     return control.launch(run_command(repo_name, tid, force), RUNS_LOG)
 
@@ -2286,15 +2305,22 @@ def run_skipped(name: str) -> dict:
     return {"ticket": name, "repo": entry["repo"], "id": entry["id"]}
 
 
+def sources(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
+    if isinstance(tk, tracker.LocalTracker):
+        return [tk]
+    return [*([tk] if repo.parts or isinstance(tk, tracker.JiraTracker) else []), tracker.LocalTracker(repo)]
+
+
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
                 other_routes: set[str] = frozenset()) -> tracker.Ticket | None:
-    for t in tk.todo():
-        if other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
-            continue
-        if blocker := tk.blocker(t.id):
-            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
-            continue
-        return t
+    for source in sources(repo, tk):
+        for t in source.todo():
+            if other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
+                continue
+            if blocker := source.blocker(t.id):
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
+                continue
+            return t
     return None
 
 
@@ -2315,16 +2341,17 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
     for tid in state.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=FEEDBACK_QUIET_MINUTES))):
         if not state.issue_running(repo.name, tid):
             return tid, "revising the PR for your review comments"
-    for t in tk.replied():
-        if state.issue_running(repo.name, t.id):
-            continue
-        if other_routes & set(t.labels):
-            skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
-            continue
-        if blocker := tk.blocker(t.id):
-            skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
-            continue
-        return t.id, f"{t.title} (you replied to the question)"
+    for source in sources(repo, tk):
+        for t in source.replied():
+            if state.issue_running(repo.name, t.id):
+                continue
+            if other_routes & set(t.labels):
+                skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
+                continue
+            if blocker := source.blocker(t.id):
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
+                continue
+            return t.id, f"{t.title} (you replied to the question)"
     return (fresh.id, fresh.title) if fresh else None
 
 
@@ -2335,7 +2362,7 @@ def poll(dry_run: bool = False) -> int:
         if not got:
             print(f"{util.iso()} poll already running")
             return 0
-        if not network_up_or_skip("poll", dry_run):
+        if any(r.parts or r.tracker != "local" for r in cfg.repos) and not network_up_or_skip("poll", dry_run):
             return 0
         errors: list[str] = []
 
@@ -2355,7 +2382,7 @@ def poll(dry_run: bool = False) -> int:
         going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)
         starts = state.last_pipeline_starts()
-        pipeline_repos = [r for r in cfg.repos if r.pipeline and r.parts]
+        pipeline_repos = [r for r in cfg.repos if r.pipeline and runnable(r)]
         restarting = {r.name for r in pipeline_repos if state.interrupted_tickets(r.name)}
         skips = SkipLog({} if dry_run else util.read_json(SKIPPED_FILE, {}))
         routes = jira_routes_by_project(cfg)
@@ -2373,15 +2400,11 @@ def poll(dry_run: bool = False) -> int:
                         state.drop_passed_over(repo.name)
                     continue
                 tid, why = pick
-                name = tracker.ticket_name(repo.name, tk.ref(tid))
-                waiting = going[repo.name] >= cfg.max_parallel_per_repo or slots <= 0
-                if waiting and not dry_run:
-                    state.pass_over(repo.name, str(tid))
-                if going[repo.name] >= cfg.max_parallel_per_repo:
-                    print(f"{util.iso()} {name}: waiting, {repo.name} already has {util.count(going[repo.name], 'run')} "
-                          f"going (max_parallel_per_repo {cfg.max_parallel_per_repo})")
-                elif slots <= 0:
-                    print(f"{util.iso()} {name}: waiting, {no_free_slot(cfg.max_parallel)}")
+                name = tracker.ticket_name(repo.name, tracker.for_ticket(cfg, repo, tid).ref(tid))
+                if waiting := held_back(cfg, repo.name, going, slots):
+                    if not dry_run:
+                        state.pass_over(repo.name, str(tid))
+                    print(f"{util.iso()} {name}: waiting, {waiting}")
                 else:
                     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
                     if not dry_run:

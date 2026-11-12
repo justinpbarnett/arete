@@ -287,6 +287,7 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 Eval runs write the step events too, but no `task` or `report`.
 Each line is also printed to the run's stdout.
 `arete lines RUN_ID` prints the lines, `--from SEQ` starts after that `seq`, and `--follow` keeps printing new lines until the `report` line.
+The dashboard serves the same lines at `GET /api/runs/RUN_ID/events`; see [API](#api).
 The run log, the `<step>.json` files, the tables and the records stay as they were; the lines are an addition.
 
 ## The seam
@@ -479,7 +480,9 @@ arete task close t-1a2b
 
 A body line such as `Waits on t-1a2b.` holds the task until `t-1a2b` is `done` or `closed`. A named task in any other state holds it, `failed` and `needs-info` included, so a task that failed holds the tasks that wait on it. A name that matches no task holds it too, and the reason says so.
 
-A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for a ticket, as in `arete run web t-1a2b`. An issue number or a Jira key gets the repo's own tracker. `tracker = "local"` makes local tasks a repo's only tracker. Such a repo may have no `github`: it loads, shows in `arete status` and on the dashboard, and gets no triage, but `arete run` refuses it with `has no github remote configured` unless its layer sets `[factory] path = "adw"` and the repo has a git remote `origin`. Then the run pushes a branch to `origin` and moves the task to `done`; see [The adw flow](#the-adw-flow). A PR for a task closes nothing and ends with the id, like `Paint the door (t-1a2b)`. Poll picks local tasks only in a `tracker = "local"` repo that has a `github` name and `pipeline = true`; a later change widens that.
+A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for a ticket, as in `arete run web t-1a2b`. An issue number or a Jira key gets the repo's own tracker. `tracker = "local"` makes local tasks a repo's only tracker. Such a repo may have no `github`: it loads, shows in `arete status` and on the dashboard, and gets no triage, but `arete run` refuses it with `has no github remote configured` unless its layer sets `[factory] path = "adw"` and the repo has a git remote `origin`. Then the run pushes a branch to `origin` and moves the task to `done`; see [The adw flow](#the-adw-flow). A PR for a task closes nothing and ends with the id, like `Paint the door (t-1a2b)`.
+
+Poll picks local tasks in every `pipeline = true` repo that `arete run` would take, after the tracker's tickets, oldest first, replied tasks included, and a task whose wait still holds is skipped. A config whose repos all use `tracker = "local"` and have no `github` makes no network call when it polls. `POST /api/tasks` on the dashboard adds a task and starts it, or starts one that exists; see [API](#api).
 
 ## Per repo layer
 
@@ -622,7 +625,7 @@ When `<dir>/<step>.patch` exists, arete applies it to the call's folder with `gi
 
 A replayed call is recorded like any other: its step row, its record header and its timeline `agent` mark say `replay`, the raw record holds one `replay` line naming the answer and patch files, and it costs what the file says, which `[pricing]` never changes. Usage limit holds, the login check, the guard, JEV rules and devices do not apply to it. JEV calls are not agent calls and still go to JEV. `all = true` also sends chat, triage, loops and sessions to replay, so turn it on in a scratch `ARETE_CONFIG_DIR` and `ARETE_STATE_DIR`.
 
-`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review and learn, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has `tracker = "local"`, no `github` and no `pipeline`, so poll never picks it up. `--adw` adds `[factory] path = "adw"` to the layer, so `arete run replay-sample t-...` on a task from `arete task add --repo replay-sample` runs the [adw flow](#the-adw-flow) and pushes the branch to `origin.git`. The answers serve both paths. A `github` name added to the sample's `[[repo]]` makes the adw flow go on to the PR, CI and publish steps, which call GitHub.
+`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review and learn, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has `tracker = "local"`, no `github` and no `pipeline`, so poll never picks it up; add `pipeline = true` with `--adw` and `arete poll` starts its `todo` tasks. `--adw` adds `[factory] path = "adw"` to the layer, so `arete run replay-sample t-...` on a task from `arete task add --repo replay-sample` runs the [adw flow](#the-adw-flow) and pushes the branch to `origin.git`. The answers serve both paths. A `github` name added to the sample's `[[repo]]` makes the adw flow go on to the PR, CI and publish steps, which call GitHub.
 
 ## Verify in use
 
@@ -796,6 +799,26 @@ On the first start of this version, the old `chat.json` moves into one chat and 
 
 Money counts only what you pay, on the dashboard and everywhere else arete shows a sum: the CLI, a run's end line in its feed, PR bodies, research reports and eval results.
 A step on the `claude` CLI rides the subscription, so every paid sum leaves it out, a run's page says "subscription" for its claude models, and a run that paid nothing ends its feed with "nothing paid".
+
+### API
+
+These routes pass the same caller check as the page, and the POST needs the `X-Arete` header. A bad request gets 400, an unknown task or run 404, and a tracker that fails 502.
+
+`POST /api/tasks` takes one of two JSON bodies:
+
+- `{"repo": "web", "prompt": "...", "title": "...", "kind": "feat"}` adds a local task and starts it. `title` defaults to the prompt's first line that is not a `Waits on` line, cut to 80 characters, and `kind` is `feat` or `fix`, `feat` by default.
+- `{"repo": "web", "ticket": "123"}` starts a tracker issue, a Jira key or a `t-` task that exists, past its waits, as `arete run` does.
+
+It answers `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the run's id, or `queued` with an empty `run` when no slot is free (`max_parallel` or `max_parallel_per_repo`) or the prompt's `Waits on` line still holds; `why` says which. A queued task in a `pipeline = true` repo starts at a later poll. A ticket whose run is going on answers that run's id with `already running` and never starts twice.
+
+`GET /api/tasks/ID` returns the task: a local task's row with its `comments`, or a tracker item's `id`, `ref`, `title`, `url` and `state`, with `?repo=NAME` when no run names it yet. Both add `runs` (`id`, `status`, `started`, `finished`, `prs`, `cost_usd`), newest first, and `children`, the local tasks whose parent it is.
+
+`GET /api/runs/RUN_ID/events` returns the run's [lines](#run-lines) as `application/x-ndjson`. `?from=SEQ` starts after that `seq`, and `?follow=1` keeps the response open and sends each new line until the `report` line, or until the run has stopped and no line comes.
+
+```sh
+curl -H 'X-Arete: 1' -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' http://HOST:PORT/api/tasks
+curl 'http://HOST:PORT/api/runs/RUN_ID/events?follow=1'
+```
 
 ## Rules
 

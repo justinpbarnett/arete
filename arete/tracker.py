@@ -458,6 +458,10 @@ class LocalTracker:
 Tracker = GitHubTracker | JiraTracker | LocalTracker
 
 
+def item_state(tk: Tracker, t: Ticket) -> str:
+    return next((s for s in config.STATES if tk.label_name(s) in t.labels), "open" if t.open else "closed")
+
+
 def task_state(tid: str) -> str | None:
     return (state.task_get(tid) or {}).get("state")
 
