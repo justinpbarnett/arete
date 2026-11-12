@@ -24,6 +24,7 @@ from . import (
     ci,
     config,
     control,
+    devices,
     diffguard,
     environment,
     factory,
@@ -33,6 +34,7 @@ from . import (
     lines,
     outbound,
     paths,
+    pi,
     record,
     runner,
     state,
@@ -278,7 +280,12 @@ class AgentRun:
         kw.setdefault("repo", self.repo)
         seam = factory.inside(self.id)
         lined = self.writes_lines and seam is None
-        if lined:
+        if lined and which == "pi" and not devices.resolve(kw.get("device", "local")).remote:
+            kw["on_launch"] = lambda selected: self.write_line(
+                "step_start", step=step, runner=which, model=selected.model, effort=effort, tier=tier, kind=kind,
+                provider=selected.provider, auth_mode=selected.auth.mode,
+                env=pi.launch_env_names(selected))
+        elif lined:
             self.write_line("step_start", step=step, runner=which, model=model, effort=effort, tier=tier, kind=kind,
                             env=runner.env_names(kw.get("model", ""), run_with, cfg, self.repo, self.id))
         self.log(f"{step}: starting")
@@ -302,6 +309,7 @@ class AgentRun:
         self.paid += res.paid_usd
         usage = {"runner": res.runner or which, "model": res.model or model, "effort": effort, "tier": tier,
                  "auth_mode": ", ".join(res.modes),
+                 "provider": res.provider,
                  "kind": kind, "cost_usd": round(self.cost - spent, 6), "tokens_in": res.tokens_in,
                  "tokens_out": res.tokens_out, "turns": res.turns, "cache_read": res.cache_read,
                  "cache_write": res.cache_write, "api_seconds": round(res.api_seconds, 2)}

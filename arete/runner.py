@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import sys
@@ -83,10 +84,10 @@ def run_env(run_id: str) -> dict[str, str]:
 
 
 def env_names(model: str, run_with: str, cfg: config.Config, repo: config.Repo | None, run_id: str) -> list[str]:
-    which, name = stands_for(model, run_with)
+    which, _ = stands_for(model, run_with)
     passing = environment.passed(cfg, repo)
     if which == "pi":
-        return sorted(pi.agent_env(name, passing, cfg.environment.providers))
+        return sorted(environment.build(passing))
     if which == "codex":
         return sorted(codex.agent_env(passing, run_env(run_id)))
     return sorted(claude.agent_env(passing, run_env(run_id)))
@@ -111,7 +112,8 @@ def authentication(model: str, run_with: str = "", *, cfg: config.Config | None 
     passing = environment.passed(cfg, repo)
     remote = target if target.remote else None
     if which == "pi":
-        return pi.authentication(name, passing, cfg.environment.providers, remote)
+        return (accounts.Auth("api_key") if remote else
+                pi_route(name, cfg, repo, target).auth)
     return (codex if which == "codex" else claude).authentication(passing, remote=remote)
 
 
@@ -125,17 +127,38 @@ def limit_applies(scope: str, model: str) -> bool:
     return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in model.lower()
 
 
+def auth_hold(auth: accounts.Auth, model: str, connect=state.db, unknown: str = "") -> dict | None:
+    if auth.mode != "subscription" or not (auth.identity or unknown):
+        return None
+    scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model) if limit_applies(s, model)]
+    return next((h for h in reversed(state.holds(connect)) if h["scope"] in scopes), None)
+
+
+def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
+    return LIMIT_SCOPES.get(auth.family, (provider_of(model),))
+
+
+def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=state.db,
+             mode: str = "") -> pi.Route | None:
+    if devices.resolve(device).remote:
+        return None
+    return pi.select(model, environment.passed(cfg, repo), cfg.environment.providers,
+                     held=lambda auth, name: auth_hold(auth, name, connect), mode=mode,
+                     local_providers=cfg.local_providers)
+
+
 def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None,
                repo: config.Repo | None = None, device: devices.Device | str = "local",
                auth: accounts.Auth | None = None, unknown: str = "") -> dict | None:
     which, name = route(model, run_with)
     if which == REPLAY or (cfg and cfg.replay.all):
         return None
+    if auth is None and which == "pi":
+        selected = pi_route(name, cfg or config.load(), repo, device, connect)
+        auth = selected.auth if selected else accounts.Auth("api_key")
+        name = selected.model if selected else name
     auth = auth or authentication(model, run_with, cfg=cfg, repo=repo, device=device)
-    if auth.mode != "subscription" or not (auth.identity or unknown):
-        return None
-    scopes = [accounts.scope(auth, s, unknown) for s in LIMIT_SCOPES.get(auth.family, ()) if limit_applies(s, name)]
-    return next((h for h in reversed(state.holds(connect)) if h["scope"] in scopes), None)
+    return auth_hold(auth, name, connect, unknown)
 
 
 def hold_words(hold: dict) -> str:
@@ -219,6 +242,8 @@ def cost_note(res: Result) -> str:
 def priced(res: Result, cfg: config.Config) -> float:
     if res.runner == REPLAY:
         return res.cost_usd
+    if res.runner == "pi" and res.auth_mode == "subscription":
+        return res.cost_usd
     rate = cfg.pricing.get(res.model) or cfg.pricing.get(f"{res.runner}:{res.model}")
     if rate:
         return (res.tokens_in * rate[0] + res.tokens_out * rate[1]) / 1_000_000
@@ -231,7 +256,9 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
         wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, tier: str = "",
         kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(),
-        repo: config.Repo | None = None, **kw) -> Result:
+        repo: config.Repo | None = None, selected: pi.Route | None = None,
+        remaining_budget: Callable[[], float | None] | None = None,
+        on_launch: Callable[[pi.Route], None] = lambda selected: None, **kw) -> Result:
     cfg = cfg or config.load()
     which, name = chosen(model, runner or (resume.runner if not model else ""), cfg)
     if resume.runner != which:
@@ -258,21 +285,44 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             kw["providers"] = cfg.environment.providers
     limited: list[Result] = []
     invocation = secrets.token_hex(16)
+    pinned = selected is not None
     while True:
-        auth = authentication(name, which, cfg=cfg, repo=repo, device=target) if which != REPLAY else accounts.Auth()
+        if which == "pi" and not target.remote:
+            selected = selected or pi_route(name, cfg, repo, target)
+            auth = selected.auth
+            name = selected.model
+            kw["selected"] = selected
+        else:
+            auth = authentication(name, which, cfg=cfg, repo=repo, device=target) if which != REPLAY else accounts.Auth()
         unknown = "local-" + accounts.fingerprint(invocation, auth.generation)
         if wait_out_limits and (held := usage_hold(name, which, cfg=cfg, auth=auth, unknown=unknown)):
             say(hold_words(held))
             with waits("limit"):
-                wait_out(held["scope"], lambda auth=auth: authentication(name, which, cfg=cfg, repo=repo,
-                                                                       device=target) != auth)
+                wait_out(held["scope"], lambda auth=auth, name=name, pinned=pinned: not (which == "pi" and pinned) and
+                         authentication(name, which, cfg=cfg, repo=repo, device=target) != auth)
             say(f"the {which} usage limit has lifted, going on")
+            if not pinned:
+                selected = None
             continue
+        if auth.mode == "subscription":
+            if which == "pi":
+                kw["max_budget_usd"] = None
+        elif remaining_budget:
+            remaining = remaining_budget()
+            if which == "pi":
+                kw["max_budget_usd"] = remaining
+            elif remaining is not None and remaining <= BUDGET_FLOOR_USD:
+                kw["budget_error"] = "API-key budget is spent"
+        if (auth.mode != "subscription" and kw.get("max_budget_usd") is not None
+                and kw["max_budget_usd"] <= BUDGET_FLOOR_USD):
+            kw["budget_error"] = "API-key budget is spent"
         started = util.iso()
+        if selected:
+            on_launch(selected)
         res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind, auth)
         if not res.usage_limit:
             if auth.mode == "subscription" and res.ok:
-                state.clear_holds([accounts.scope(auth, s, unknown) for s in LIMIT_SCOPES.get(auth.family, ())
+                state.clear_holds([accounts.scope(auth, s, unknown) for s in limit_scopes(auth, name)
                                    if limit_applies(s, res.model)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
@@ -282,9 +332,12 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         if not wait_out_limits:
             return with_spent(res, limited)
         limited.append(res)
+        if which == "pi":
+            pinned = True
         say(hold_words({"why": why, "until": limit.until}))
         with waits("limit"):
-            wait_out(scope, lambda auth=auth: authentication(name, which, cfg=cfg, repo=repo, device=target) != auth)
+            wait_out(scope, lambda auth=auth, name=name: which != "pi" and
+                     authentication(name, which, cfg=cfg, repo=repo, device=target) != auth)
         say(f"the {which} usage limit has lifted, going on")
         if res.session.id and res.turns > 1 and kw.get("persist", True):
             prompt, resume = CONTINUE_AFTER_LIMIT, res.session
@@ -318,15 +371,36 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
     found = secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg)
-    hidden = record.secrets(*found)
+    selected = kw.get("selected")
+    hidden = list(record.secrets(*found))
+    if selected:
+        hidden.extend(selected.hidden)
+        hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
+                           key=len, reverse=True)
+        header["env"] = pi.launch_env_names(selected)
+        header["provider"] = selected.provider
+    def refresh_hidden():
+        if selected and auth.mode == "subscription":
+            hidden.extend(v for v in [*pi.credential_values(accounts.read(selected.owner)),
+                                     *tuple(selected.refreshed_secrets)] if len(v) >= 8
+                          and v not in hidden)
+            hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
+                               key=len, reverse=True)
+    def safe_line(line):
+        refresh_hidden()
+        rec.line(line)
     started = time.monotonic()
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
-        if which == REPLAY:
+        budget_error = kw.pop("budget_error", "")
+        if budget_error:
+            res = Result(ok=False, error=budget_error, session=resume, runner=which, model=name)
+        elif which == REPLAY:
             res = replay.run(cwd, trace, cfg, rec.line, resume)
         elif which == "codex":
             res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line, hidden=found, auth=auth, **kw)
         else:
-            res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, on_line=rec.line,
+            res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume,
+                                                             on_line=safe_line if selected else rec.line,
                                                              auth=auth, **kw)
         res.runner = which
         res.model = res.model or name
@@ -334,7 +408,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         if which != REPLAY:
             res.auth_mode = auth.mode
             if (auth.mode != "subscription" or
-                    (res.usage_limit and res.usage_limit.scope not in LIMIT_SCOPES.get(auth.family, ()))):
+                    (res.usage_limit and res.usage_limit.scope not in limit_scopes(auth, name))):
                 res.usage_limit = None
         if res.calls:
             for call in res.calls:
@@ -343,6 +417,13 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
         else:
             res.cost_usd = priced(res, cfg)
+        if selected:
+            refresh_hidden()
+            res.error = record.scrub(res.error, hidden)
+            res.text = record.scrub(res.text, hidden)
+            res.structured = record.scrub_value(res.structured, hidden)
+            for call in res.calls:
+                call.error = record.scrub(call.error, hidden)
         rec.finish(res, time.monotonic() - started)
     if trace[0]:
         for call in res.calls or [res]:

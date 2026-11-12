@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import accounts, claude, config, devices, environment, paths, util
@@ -19,6 +23,7 @@ from .agent import (
     READ_TOOLS,
     Result,
     Session,
+    UsageLimit,
     json_from_text,
     usage_totals,
 )
@@ -29,10 +34,11 @@ WRITING = {"edit", "write", "bash"}
 SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 PI_HOME = paths.HOME / ".pi"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
+LOGIN_DIR = paths.STATE_DIR / "pi-login"
+KEY_DIR = paths.STATE_DIR / "pi-key"
 KEYS_FILE = paths.PI_KEYS_FILE
 GUARD_FILE = paths.PACKAGE_DIR / "pi_guard.mjs"
 GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls"})
-SHARED_SETTINGS = ("models.json", "settings.json")
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
 RESTATE = ("An agent finished a task but did not write its answer as the JSON it was asked for. Below is how its run "
@@ -46,6 +52,201 @@ WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
 NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azure": "AZURE_OPENAI_API_KEY",
+             "google": "GEMINI_API_KEY", "google-vertex": "GOOGLE_CLOUD_API_KEY", "huggingface": "HF_TOKEN",
+             "vercel-ai-gateway": "AI_GATEWAY_API_KEY", "moonshotai": "MOONSHOT_API_KEY",
+             "moonshotai-cn": "MOONSHOT_API_KEY", "kimi-coding": "KIMI_API_KEY", "opencode-go": "OPENCODE_API_KEY",
+             **{p: p.upper().replace("-", "_") + "_API_KEY" for p in
+                ("nvidia", "deepseek", "groq", "cerebras", "xai", "typesafe", "radius", "openrouter", "zai",
+                 "mistral", "minimax", "minimax-cn", "fireworks", "together", "baseten", "opencode", "meta",
+                 "ant-ling", "qwen-token-plan", "qwen-token-plan-cn", "zai-coding-cn", "xiaomi",
+                 "xiaomi-token-plan-cn", "xiaomi-token-plan-ams", "xiaomi-token-plan-sgp")},
+             "cloudflare-workers-ai": "CLOUDFLARE_API_KEY", "cloudflare-ai-gateway": "CLOUDFLARE_API_KEY"}
+KEY_NAMES.update({"qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
+                  "qwen-token-plan-individual-cn": "QWEN_TOKEN_PLAN_CN_API_KEY", "github-copilot": "COPILOT_GITHUB_TOKEN"})
+REFERENCES = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
+SAFE_HEADERS = {"accept": r"application/json|text/event-stream", "content-type": r"application/json(?:; ?charset=utf-8)?",
+                "anthropic-version": r"\d{4}-\d{2}-\d{2}",
+                "anthropic-beta": r"[a-z][a-z0-9-]*-\d{4}-\d{2}-\d{2}(?:, ?[a-z][a-z0-9-]*-\d{4}-\d{2}-\d{2})*"}
+
+
+@dataclass(frozen=True)
+class Route:
+    provider: str
+    model: str
+    auth: accounts.Auth = field(repr=False)
+    error: str = ""
+    login_available: bool = False
+    login_held: bool = False
+    owner: Path = field(default_factory=lambda: PI_HOME / "agent" / "auth.json", repr=False)
+    key: str = field(default="", repr=False)
+    key_name: str = ""
+    models: dict = field(default_factory=dict, repr=False, compare=False)
+    settings: dict = field(default_factory=dict, repr=False, compare=False)
+    env: dict = field(default_factory=dict, repr=False, compare=False)
+    hidden: tuple[str, ...] = field(default=(), repr=False, compare=False)
+    view: Path | None = field(default=None, repr=False, compare=False)
+    refreshed: set[str] = field(default_factory=set, repr=False, compare=False)
+    refreshed_secrets: set[str] = field(default_factory=set, repr=False, compare=False)
+
+
+def credential_values(value) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in credential_values(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in credential_values(v)]
+    return []
+
+
+def credential_config(value) -> list[str]:
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in
+                (credential_values(v) if k in ("apiKey", "headers", "env") else credential_config(v))]
+    return [s for v in value for s in credential_config(v)] if isinstance(value, list) else []
+
+
+def sanitized(value):
+    if isinstance(value, list):
+        return [sanitized(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out = {k: sanitized(v) for k, v in value.items() if k not in ("apiKey", "authHeader", "env", "headers")}
+    headers = value.get("headers")
+    if isinstance(headers, dict):
+        safe = {k: v for k, v in headers.items() if k.lower() in SAFE_HEADERS and isinstance(v, str)
+                and re.fullmatch(SAFE_HEADERS[k.lower()], v)}
+        if safe:
+            out["headers"] = safe
+    return out
+
+
+def model_configuration() -> dict:
+    try:
+        text = (PI_HOME / "agent" / "models.json").read_text(encoding="utf-8-sig")
+        strings = r'"(?:\\.|[^"\\])*"'
+        text = re.sub(strings + r'|//[^\n]*', lambda m: m[0] if m[0].startswith('"') else "", text)
+        text = re.sub(strings + r'|,(\s*[}\]])', lambda m: m[1] or m[0], text)
+        return accounts.mapping(json.loads(text))
+    except (OSError, ValueError):
+        return {}
+
+
+def select(model: str, passing=None, providers=None, *, held=lambda auth, model: None, mode: str = "",
+           source=None, local_providers=(), owner_auth: Path | None = None) -> Route:
+    if passing is None or providers is None:
+        cfg = config.load()
+        passing = environment.passed(cfg) if passing is None else passing
+        providers = cfg.environment.providers if providers is None else providers
+        local_providers = cfg.local_providers
+    settings = accounts.read(PI_HOME / "agent" / "settings.json")
+    models = model_configuration()
+    provider, sep, name = model.partition("/")
+    if not model:
+        provider, name = settings.get("defaultProvider", ""), settings.get("defaultModel", "")
+    elif not sep:
+        provider, name = settings.get("defaultProvider", ""), model
+    provider = provider if isinstance(provider, str) else ""
+    name = name if isinstance(name, str) else ""
+    resolved = f"{provider}/{name or '*'}" if provider else model
+    owner = Path(owner_auth).absolute() if owner_auth is not None else PI_HOME / "agent" / "auth.json"
+    store = accounts.read(owner)
+    credential = accounts.mapping(store.get(provider))
+    login = (credential.get("type") == "oauth" and isinstance(credential.get("access"), str)
+             and bool(credential.get("access")) and isinstance(credential.get("refresh"), str)
+             and bool(credential.get("refresh")) and isinstance(credential.get("expires"), (int, float))
+             and not isinstance(credential["expires"], bool) and math.isfinite(credential["expires"]))
+    auth = accounts.pi(provider, credential, str(owner)) if login else accounts.Auth("api_key")
+    keys = util.read_env_file(KEYS_FILE)
+    available = {**(os.environ if source is None else source), **keys}
+    configured = accounts.mapping(accounts.mapping(models.get("providers")).get(provider))
+    supported = (provider in KEY_NAMES or bool(configured.get("api")) or
+                 any(accounts.mapping(m).get("api") for m in configured.get("models", []) if isinstance(m, dict)))
+    names = [KEY_NAMES[provider]] if provider in KEY_NAMES else []
+    if supported and provider != "openai-codex":
+        names += list(providers.get(provider, ()))
+        raw = configured.get("apiKey", "")
+        if isinstance(raw, str) and not raw.startswith("!"):
+            names += [a or b for a, b in REFERENCES.findall(raw)]
+    else:
+        names = []
+    exact = [n for n in names if isinstance(n, str) and re.fullmatch(r"[A-Za-z_]\w*", n)]
+    key_name = next((n for n in exact if keys.get(n)), "") or next((n for n in exact if available.get(n)), "")
+    key = available.get(key_name, "")
+    local = provider == "ollama" or (provider in local_providers and bool(configured))
+    local |= bool(configured and re.match(r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::|/|$)",
+                                         str(configured.get("baseUrl", ""))))
+    local = local and provider != "openai-codex"
+    login_held = bool(login and held(auth, resolved))
+    chosen_login = login and mode != "api_key" and (mode == "subscription" or not login_held or not key)
+    error = ""
+    if not provider:
+        error = "pi needs provider/model or defaultProvider in ~/.pi/agent/settings.json before choosing credentials"
+    elif (mode == "subscription" and not login) or (not chosen_login and not (key or local)):
+        error = (f"pi {provider}: no usable login or supported key; checked {owner}, {KEYS_FILE} and Arete environment")
+    chosen_auth = auth if chosen_login else accounts.Auth("subscription" if mode == "subscription" else "api_key")
+    raw_credentials = credential_config(models)
+    refs = {n for v in raw_credentials for pair in REFERENCES.findall(v) for n in pair if n}
+    aliases = {n for values in providers.values() for n in values}
+    never = {n for n in available if re.search(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL", n, re.IGNORECASE)
+             or n in refs or n in KEY_NAMES.values() or environment.passes(n, aliases)}
+    env = environment.build(passing, {"ARETE_AGENT": "1"}, never=(*PARENT_SESSION_VARS, *never), source=available)
+    for n in ("PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", "ARETE_PI_REFRESH_FD", "ARETE_PI_REFRESH_ACK_FD",
+              "ARETE_PI_REFRESH_PROVIDER",
+              "NODE_OPTIONS", "NODE_PATH"):
+        env.pop(n, None)
+    if not chosen_login and key:
+        env[key_name] = key
+        env["ARETE_PI_SELECTED_KEY"] = key
+    clean_models = sanitized(models)
+    if isinstance(clean_models.get("providers"), dict):
+        clean_models["providers"] = {p: v for p, v in clean_models["providers"].items() if v}
+    if not chosen_login and provider and (key or local):
+        view = clean_models.setdefault("providers", {}).setdefault(provider, {})
+        view["apiKey"] = "$ARETE_PI_SELECTED_KEY" if key else "arete-local"
+    clean_settings = sanitized(settings)
+    for n in ("extensions", "packages", "skills", "promptTemplates", "themes", "mcpServers"):
+        clean_settings.pop(n, None)
+    hidden = [*credential_values(store), *raw_credentials, *keys.values(),
+              *(available[n] for n in never if available.get(n)), key]
+    return Route(provider, resolved, chosen_auth, error, login_available=login, login_held=login_held,
+                 owner=owner, key=key, key_name=key_name, models=clean_models, settings=clean_settings, env=env,
+                 hidden=tuple(v for v in hidden if len(v) >= 8))
+
+
+def private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("pi route directory must be a private directory")
+
+
+def prepare(route: Route) -> Path:
+    root = LOGIN_DIR if route.auth.mode == "subscription" else KEY_DIR
+    private_dir(root)
+    auth = root / "auth.json"
+    if auth.is_symlink() or (auth.exists() and (not auth.is_file() or auth.stat().st_nlink != 1)):
+        raise ValueError("pi route auth store must not be an unexpected link")
+    folder = Path(tempfile.mkdtemp(prefix="call-", dir=root))
+    if route.auth.mode == "subscription":
+        (folder / "auth.json").symlink_to(route.owner)
+    else:
+        with (folder / "auth.json").open("x") as out:
+            out.write("{}")
+        (folder / "auth.json").chmod(0o600)
+    for name, value in (("models.json", route.models), ("settings.json", route.settings)):
+        with (folder / name).open("x") as out:
+            json.dump(value, out)
+    return folder
+
+
+def cleanup(folder: Path) -> None:
+    for name in ("auth.json", "models.json", "settings.json", "models-store.json"):
+        (folder / name).unlink(missing_ok=True)
+    try:
+        folder.rmdir()
+    except OSError:
+        pass
 
 
 def binary() -> str:
@@ -75,44 +276,25 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
     return names
 
 
-def agent_dir() -> Path:
-    AGENT_DIR.mkdir(parents=True, exist_ok=True)
-    for name in SHARED_SETTINGS:
-        link, source = AGENT_DIR / name, PI_HOME / "agent" / name
-        if source.exists() and not link.is_symlink():
-            link.unlink(missing_ok=True)
-            try:
-                link.symlink_to(source)
-            except FileExistsError:
-                pass
-    return AGENT_DIR
-
-
 def default_provider() -> str:
     settings = util.read_json(PI_HOME / "agent" / "settings.json", {})
     provider = settings.get("defaultProvider") if isinstance(settings, dict) else ""
     return provider if isinstance(provider, str) else ""
 
 
-def provider_names(provider: str, providers: dict[str, tuple[str, ...]]) -> list[str]:
-    return [re.sub(r"\W", "_", provider).upper() + "_*", *providers.get(provider, ())]
-
-
 def agent_env(model: str, passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
-              source=None) -> dict[str, str]:
-    if passing is None or providers is None:
-        cfg = config.load()
-        passing = environment.passed(cfg) if passing is None else passing
-        providers = cfg.environment.providers if providers is None else providers
-    keys = util.read_env_file(KEYS_FILE)
-    provider = model.split("/", 1)[0] if "/" in model else default_provider()
-    names = [*passing, *(provider_names(provider, providers) if provider else keys)]
-    return environment.build(names, {"ARETE_AGENT": "1", "PI_CODING_AGENT_DIR": str(AGENT_DIR)},
-                             never=PARENT_SESSION_VARS, source={**(os.environ if source is None else source), **keys})
+              source=None, selected: Route | None = None) -> dict[str, str]:
+    return dict((selected or select(model, passing, providers, source=source)).env)
+
+
+def launch_env_names(route: Route) -> list[str]:
+    controls = ({"ARETE_PI_REFRESH_FD", "ARETE_PI_REFRESH_ACK_FD", "ARETE_PI_REFRESH_PROVIDER"}
+                if route.auth.mode == "subscription" else set())
+    return sorted({*route.env, "PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", *controls})
 
 
 def guard_env(auth_paths: list[Path] | None = None) -> dict[str, str]:
-    roots = [PI_HOME, AGENT_DIR, paths.CONFIG_DIR,
+    roots = [PI_HOME, AGENT_DIR, LOGIN_DIR, KEY_DIR, paths.CONFIG_DIR,
              *(paths.HOME / p for p in (".claude", ".codex", ".gemini", ".ssh", ".aws", ".docker", ".kube",
                                        ".gnupg", ".password-store", ".config/gh", ".config/gcloud",
                                        ".config/opencode", ".local/share/opencode")),
@@ -140,12 +322,16 @@ def can_confine(remote: bool) -> bool:
     return not remote and sys.platform == "darwin" and bool(shutil.which("sandbox-exec"))
 
 
-def write_confinement(cwd: Path, add_dirs: list[Path]) -> list[str]:
-    roots = [cwd, *add_dirs, AGENT_DIR, SESSIONS_DIR]
+def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None) -> list[str]:
+    roots = [cwd, *add_dirs, AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
     allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
     profile = f'(version 1)(allow default)(deny file-write* (subpath "/"))(allow file-write* {allow})'
+    if auth_path is not None:
+        profile += '(allow file-write* (literal (param "AUTH")) (literal (param "LOCK")))'
     params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={Path(root).resolve()}")]
+    if auth_path is not None:
+        params += ["-D", f"AUTH={auth_path.resolve()}", "-D", f"LOCK={auth_path.resolve()}.lock"]
     return ["sandbox-exec", *params, "-p", profile]
 
 
@@ -179,29 +365,149 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
 
 
 def authentication(model: str, passing=None, providers=None, remote=None) -> accounts.Auth:
-    if remote:
-        return accounts.Auth("api_key")
-    env = agent_env(model, passing, providers)
-    provider = model.split("/", 1)[0] if "/" in model else default_provider()
-    folder = Path(env["PI_CODING_AGENT_DIR"])
-    credential = accounts.read(folder / "auth.json").get(provider)
-    return accounts.pi(provider, credential, str(folder))
+    return accounts.Auth("api_key") if remote else select(model, passing, providers).auth
 
 
-def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
-    auth = auth or authentication(kw.get("model", ""), kw.get("passing"), kw.get("providers"), kw.get("remote"))
+def usage_limit(auth: accounts.Auth, provider: str, text: str) -> UsageLimit | None:
+    if not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|you.ve (?:hit|reached).{0,30}limit|"
+                     r"weekly limit|five.hour limit", text, re.IGNORECASE) and not claude.USAGE_LIMIT_TEXT.search(text):
+        return None
+    from . import codex
+
+    reset = (re.search(r'''(?:resetsAt|reset_at|resetAt|reset|resets_at)["'\s:=]+(\d{10,16})(?!\d)''',
+                       text, re.IGNORECASE) or claude.LEGACY_LIMIT_RESET.search(text))
+    until = None
+    try:
+        if reset:
+            stamp = float(reset[1])
+            until = datetime.fromtimestamp(stamp / 1000 if stamp >= 1e12 else stamp, UTC)
+        else:
+            iso = re.search(r'''(?:resets?[_ ]?at|reset|try again at)["'\s:=]+'''
+                            r'(\d{4}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2}))', text, re.IGNORECASE)
+            until = (util.parse_iso(iso[1]) if iso else
+                     codex.reset_time(re.sub(r"\bresets?\s+(at\s+|in\s+)?", lambda m: "try again " +
+                                            (m[1] or "at "), text, flags=re.IGNORECASE)))
+    except (ValueError, OverflowError, OSError):
+        pass
+    now = util.now()
+    if until is None or until > now + timedelta(days=366):
+        until = now + timedelta(seconds=claude.LIMIT_RECHECK_SECONDS)
+    else:
+        until = max(now, until) + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)
+    scope = claude.EVERY_MODEL if auth.family == "claude" else codex.LIMIT_SCOPE if auth.family == "codex" else provider
+    if auth.family == "claude":
+        kind = next((name for name in claude.LIMIT_SCOPES if name in text), "")
+        scope = claude.LIMIT_SCOPES.get(kind, scope)
+    return UsageLimit(util.iso(until), scope, "subscription")
+
+
+def login_unchanged(route: Route) -> bool:
+    credential = accounts.mapping(accounts.read(route.owner).get(route.provider))
+    if credential.get("type") != "oauth":
+        return False
+    latest = accounts.pi(route.provider, credential, str(route.owner))
+    return (latest.generation in {route.auth.generation, *route.refreshed} or
+            bool(route.auth.identity and latest.identity == route.auth.identity))
+
+
+def observed_refresh(route: Route, event: dict) -> None:
+    if event.get("provider") != route.provider:
+        return
+    before, after = accounts.mapping(event.get("before")), accounts.mapping(event.get("after"))
+    route.refreshed_secrets.update(v for v in credential_values([before, after]) if len(v) >= 8)
+    if before.get("type") != "oauth" or after.get("type") != "oauth":
+        return
+    previous = accounts.fingerprint("pi", str(route.owner), route.provider, before)
+    if previous not in {route.auth.generation, *route.refreshed}:
+        return
+    latest = accounts.pi(route.provider, after, str(route.owner))
+    markers = ("accountId", "accountUuid", "account_id", "account_uuid", "userId", "user_id")
+    if route.auth.identity:
+        if latest.identity != route.auth.identity:
+            return
+    elif any(before.get(name) != after.get(name) for name in markers):
+        return
+    route.refreshed.add(latest.generation)
+
+
+@contextmanager
+def refresh_channel(route: Route | None, env: dict):
+    if route is None or route.auth.mode != "subscription":
+        yield ()
+        return
+    reader, writer = os.pipe()
+    ack_reader, ack_writer = os.pipe()
+
+    def receive():
+        try:
+            with os.fdopen(reader, "rb") as source:
+                for raw in source:
+                    try:
+                        observed_refresh(route, accounts.mapping(json.loads(raw)))
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        os.write(ack_writer, b"1")
+                    except OSError:
+                        break
+        finally:
+            os.close(ack_writer)
+
+    thread = threading.Thread(target=receive, daemon=True)
+    thread.start()
+    env["ARETE_PI_REFRESH_FD"] = str(writer)
+    env["ARETE_PI_REFRESH_ACK_FD"] = str(ack_reader)
+    env["ARETE_PI_REFRESH_PROVIDER"] = route.provider
+    try:
+        yield (writer, ack_reader)
+    finally:
+        os.close(writer)
+        os.close(ack_reader)
+        thread.join()
+
+
+def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None, **kw) -> Result:
+    if kw.get("remote"):
+        selected = None
+    else:
+        selected = selected or select(kw.get("model", ""), kw.get("passing"), kw.get("providers"))
+        auth = selected.auth
+        kw["model"] = selected.model
+    auth = auth or accounts.Auth("api_key")
+    if auth.mode == "subscription":
+        kw["max_budget_usd"] = None
     started = time.monotonic()
-    result = _run(*args, auth=auth, **kw)
+    if selected and selected.error:
+        result = Result(ok=False, error=selected.error, runner="pi", model=selected.model,
+                        session=kw.get("resume", NO_SESSION))
+    elif selected and auth.mode == "subscription" and not login_unchanged(selected):
+        result = Result(ok=False, error=f"pi {selected.provider}: selected login changed or is no longer available",
+                        runner="pi", model=selected.model, session=kw.get("resume", NO_SESSION))
+    else:
+        folder = None
+        try:
+            if selected and selected.view is None:
+                folder = prepare(selected)
+                selected = replace(selected, view=folder)
+            result = _run(*args, auth=auth, selected=selected, **kw)
+        except (OSError, ValueError) as e:
+            result = Result(ok=False, error=f"pi setup failed: {e}", runner="pi", model=kw.get("model", ""),
+                            session=kw.get("resume", NO_SESSION))
+        finally:
+            if folder is not None:
+                cleanup(folder)
     result.call_seconds = time.monotonic() - started
     if result.calls:
         result.calls[0].call_seconds = result.call_seconds - sum(call.call_seconds for call in result.calls[1:])
     result.auth_mode = auth.mode
+    result.provider = selected.provider if selected else result.provider
     if not result.ok and auth.mode == "subscription":
-        if auth.family == "claude":
-            result.usage_limit = claude.usage_limit({}, result.error)
-        elif auth.family == "codex":
-            from . import codex
-            result.usage_limit = codex.usage_limit(result.error)
+        result.usage_limit = usage_limit(auth, result.provider, result.error)
+    resume = kw.get("resume", NO_SESSION)
+    if selected and result.session.id:
+        charged = sum(0 if c.auth_mode == "subscription" else kw.get("price", lambda r: r.cost_usd)(c)
+                      for c in result.calls or [result])
+        result.session = replace(result.session, spent_usd=resume.spent_usd + charged)
     return result
 
 
@@ -230,6 +536,7 @@ def _run(
     passing: list[str] | None = None,
     providers: dict[str, tuple[str, ...]] | None = None,
     auth: accounts.Auth | None = None,
+    selected: Route | None = None,
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -250,35 +557,46 @@ def _run(
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     cmd = command(names, model=model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
                   remote=remote)
+    if selected and selected.provider:
+        cmd += ["--provider", selected.provider]
     if json_schema:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
+    confined = False
     if (writing := sorted(WRITING & set(names))) and not sandboxed:
         if not can_confine(bool(remote)):
             return Result(ok=False, error=f"{NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
                           session=resume, runner="pi", model=model)
-        cmd = write_confinement(cwd, add_dirs) + cmd
+        cmd = write_confinement(cwd, add_dirs, selected.owner if selected and auth.mode == "subscription" else None) + cmd
+        confined = True
+    if selected and auth.mode == "subscription" and not confined and can_confine(False):
+        cmd = write_confinement(cwd, add_dirs, selected.owner) + cmd
 
     cmd = [*cmd, "--", prompt]
     if remote:
         env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, "ARETE_AGENT": "1"}
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir(remote),))
     else:
-        agent_dir()
-        env = {**agent_env(model, passing, providers), **guard_env()}
+        folder = selected.view
+        env = {**selected.env, "PI_CODING_AGENT_DIR": str(folder), **guard_env([selected.owner, folder / "auth.json"])}
     try:
-        proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
-                                    lambda line: reply_cost(line, model, price, auth.mode), on_line)
+        with refresh_channel(selected, env) as descriptors:
+            proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
+                                       lambda line: reply_cost(line, model, price, auth.mode), on_line,
+                                       **({"pass_fds": descriptors} if descriptors else {}))
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"pi not found: {e}", runner="pi", model=model)
     if cut_short_by:
         return cut_short(proc, resume, model, cut_short_by)
     result = parse(proc, resume, model, json_schema)
     result.auth_mode = auth.mode
+    if selected and result.session.id:
+        result.session = replace(result.session, spent_usd=resume.spent_usd +
+                                 (0 if auth.mode == "subscription" else price(result)))
     if json_schema and result.ok and result.structured is None:
         restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT), on_line,
                 passing, providers, price,
                 max(0, max_budget_usd - (0 if auth.mode == "subscription" else price(result)))
-                if max_budget_usd is not None else None)
+                if max_budget_usd is not None else None, selected=selected)
     return result
 
 
@@ -303,16 +621,17 @@ def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd
             remote: devices.Device | None, timeout: float, on_line: Callable[[str], None],
             passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
             price: Callable[[Result], float] = lambda reply: reply.cost_usd,
-            max_budget_usd: float | None = None) -> None:
+            max_budget_usd: float | None = None, selected: Route | None = None) -> None:
     if not ending_text:
         return
-    auth = authentication(model, passing, providers, remote)
+    auth = selected.auth if selected else authentication(model, passing, providers, remote)
     if auth.mode != "subscription" and max_budget_usd is not None and max_budget_usd <= 0:
         return
     prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
               f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}\n\n{NO_ANSWER}")
     again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote, on_line=on_line,
-                passing=passing, providers=providers, auth=auth, price=price, max_budget_usd=max_budget_usd)
+                passing=passing, providers=providers, auth=auth, selected=selected, price=price,
+                max_budget_usd=max_budget_usd)
     result.calls = [replace(result, calls=[]), again]
     result.aggregate_paid_usd = result.paid_usd + again.paid_usd
     result.auth_modes = tuple(dict.fromkeys([*result.modes, *again.modes]))
@@ -333,9 +652,9 @@ def mcp_servers(mcp_config: str) -> dict:
 
 def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budget_usd: float | None,
            cost_of: Callable[[str], float],
-           on_line: Callable[[str], None]) -> tuple[subprocess.CompletedProcess, str]:
+           on_line: Callable[[str], None], *, pass_fds: tuple[int, ...] = ()) -> tuple[subprocess.CompletedProcess, str]:
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, errors="replace", env=env)
+                            text=True, errors="replace", env=env, pass_fds=pass_fds)
     stderr: list[str] = []
     reader = threading.Thread(target=lambda: stderr.append(proc.stderr.read()), daemon=True)
     reader.start()

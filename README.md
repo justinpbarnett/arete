@@ -73,7 +73,7 @@ The step's session keeps codex's thread id with runner `codex`, and a later roun
 Public PR reports and tracker comments pass through outbound redaction before publication; raw local evidence stays intact.
 A ChatGPT login is a subscription, as claude is: the step shows `subscription`, counts nothing in paid sums, and still records its reported cost and tokens.
 An API key login is metered, priced at the model's `[pricing]` price, since codex reports no cost.
-When codex reports a usage limit, codex steps wait under a hold of their own, so a codex limit never holds a claude step and a claude limit never holds a codex step.
+Subscription holds follow the account and provider family: matching Codex and pi openai-codex accounts share holds, as matching Claude and pi anthropic accounts do. Different accounts stay independent.
 The heartbeat checks `codex login status` beside `claude auth status` once any step, role or configured loop resolves to codex, and raises `codex:auth` when you are logged out.
 Codex runs on the local device only; a loop or session that would run it on another device is refused in one line.
 
@@ -99,7 +99,11 @@ Its sandbox and the `arete codex-guard` PreToolUse hook keep the promises claude
 
 A timed out codex call keeps any thread id already emitted, so a later fix can resume it. Network access is off inside the agent sandbox, so a verify command cannot `curl` the served app; a configured Playwright MCP server runs outside that sandbox.
 
-Arete runs pi with a pi folder of its own, `~/.local/share/arete/pi-agent/`. It links `models.json` and `settings.json` from `~/.pi/agent/` and holds no logins. Keys for pi's providers go in `~/.config/arete/pi.env` as `NAME=value` lines, such as `OPENROUTER_API_KEY=...`. A loop then spends on a key you give arete, such as one with a weekly limit, and never on your own pi logins. A provider with no key there falls back to a key set in arete's own environment, and fails the step when there is none; the launchd serve sets no keys. A device other than `local` runs its own pi with its own logins.
+Subscription logins precede API keys. Before each local pi call, Arete resolves the provider and chooses an available login without an account hold, then a supported key from `~/.config/arete/pi.env` or Arete's environment; `pi.env` wins. A held login without a key waits. A provider missing both fails before launch and names the locations checked; unauthenticated local providers still work. A failed login call does not immediately retry on a key; a later call may select one. Codex keeps using its ChatGPT login when available and stays isolated from ambient API keys.
+
+Pi login calls share the owner's account, usage limits and refresh state through an auth symlink to `~/.pi/agent/auth.json`. Arete never copies or rewrites that file. Separate `pi-login` and `pi-key` directories under Arete state hold private configuration views for each invocation; key views contain no logins, and login environments exclude API keys and credential overrides. Noncredential model settings survive. Subscription calls have zero charged cost and no dollar cap, retaining reported cost, tokens and cache counts. Key calls retain pricing and budget enforcement, checked against their selected route before launch. A device other than `local` keeps using its own pi configuration and credentials.
+
+Installed Pi 1.5.2's `FileAuthStorageBackend` writes through the auth path in place with `writeFileSync`. Its `proper-lockfile` protocol resolves symlinks and atomically creates the canonical auth file's `.lock` directory, updates its timestamp and removes it on release. The login symlink therefore shares both refresh tokens and locking with owner Pi. Arete's macOS confinement allows those writes to the canonical file and lock only, without granting the owner directory; its trusted tool guard still denies credential reads, writes, aliases and searches. Explicit `--extension` loads under `--no-extensions`, and extension startup errors stop normal print mode before model execution.
 
 `~/.config/arete/devices.toml` lists the machines loops and sessions run on, besides `local`:
 
@@ -244,11 +248,7 @@ It also gets `ARETE_AGENT=1` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
 The agent's shell, its hooks and the MCP servers it starts get the same environment.
 `CLAUDE_CODE_OAUTH_TOKEN` therefore reaches the agent's shell too; a login made with `claude auth login` stays in the CLI's own store instead.
 
-A pi agent adds the keys of the provider its model names: the part before `/`, such as `openrouter` in `openrouter/qwen3-coder`, or pi's `defaultProvider` in `~/.pi/agent/settings.json` for a model with no `/`.
-It gets each variable whose name starts with the provider's name in capitals and `_`, such as `OPENROUTER_*` (a `-` or other sign in the name becomes `_`), plus the names `[environment.providers]` lists for that provider.
-It reads them from `~/.config/arete/pi.env` first, and from the server's environment when `pi.env` lacks one.
-When arete cannot tell the provider, the agent gets every name in `pi.env`.
-It also gets `ARETE_AGENT=1` and `PI_CODING_AGENT_DIR`.
+A pi key call gets its selected supported provider key, including configured `[environment.providers]` aliases and model credential environment references, from `~/.config/arete/pi.env` before the server's environment. Login calls exclude those credentials even under `pass = ["*"]`. Credential commands and header overrides cannot replace the selected route. An unqualified model needs a configured `defaultProvider`; Arete pins that provider before launch. Each call also gets `ARETE_AGENT=1` and its private `PI_CODING_AGENT_DIR`.
 
 A codex agent adds `CODEX_HOME`, and never gets `CODEX_API_KEY`, `OPENAI_API_KEY` or the parent session's names above, even under `pass = ["*"]`.
 It also gets `ARETE_AGENT=1`.
@@ -344,10 +344,11 @@ Neither has a cost or a turn count, in its result or in its timeline mark, becau
 
 `steps.jsonl.gz` in the same folder is the run's timeline, one line per mark: `create` (a fresh sandbox), `lease`, `clone`, `boot`, `release`, `worktree`, `setup`, `check`, `diff` (with the staged patch), `agent` (one per call, naming its record file) and `result` (the run's final status).
 Each mark has its start time, and the marks that time something have their seconds.
-Classic `step_end` lines and saved step results include `auth_mode`, joining distinct modes with `, ` when a step retries across modes. Saved results also retain the `auth_modes` list and aggregate `paid_usd`. Seam `step_end` lines join distinct modes like their other call labels; a joined value describes several calls, not one authentication mode. Individual results keep their own mode. A pi schema restatement resolves authentication again before launching; its usage gets a separate step row, and the combined record result lists each call's mode, paid amount and usage in `calls`, alongside aggregate `auth_modes` and `paid_usd`.
+Classic `step_end` lines and saved step results include `auth_mode`, joining distinct modes with `, ` when a step retries across modes. Saved results also retain the `auth_modes` list and aggregate `paid_usd`. Seam `step_end` lines join distinct modes like their other call labels; a joined value describes several calls, not one authentication mode. Individual results keep their own mode. A pi schema restatement keeps the original route, provider and configuration; its usage gets a separate step row, and the combined record result lists each call's mode, paid amount and usage in `calls`, alongside aggregate `auth_modes` and `paid_usd`.
+The trusted Pi guard reports completed SDK credential refreshes through a private pipe, so restatement and pinned retries can follow token rotation even when the provider exposes no stable account identity. Refresh continuity stays within the invocation and outside records; unrelated login replacements are refused.
 
 Subscription limit holds are qualified by subscription family, nonsecret account identity and limit scope. Matching Claude and pi anthropic account UUIDs share the `claude` family; matching Codex and pi openai-codex ChatGPT account IDs share `codex`. Claude's all-model, opus and sonnet limits remain distinct; Codex's limit covers its family. Different accounts never share a hold. An unknown identity can wait only within its own invocation. Old unqualified holds expire without becoming pi holds.
-Discovery reads login metadata separately from launching an agent. Opaque Claude OAuth credentials can use a read-only profile lookup with a short timeout, a response-size bound and no redirects. Only nonsecret identity snapshots and one-way fingerprints are cached; credentials and profile bodies never enter records. A changed credential, account or login directory invalidates discovery, including on bounded wakeups while waiting. Only a successful subscription call clears older applicable holds for its captured account and scope; API-key success cannot clear them. Reset slack, session continuation and original-prompt retries still apply. This foundation does not start using the owner's pi login or change replay execution.
+Discovery reads login metadata separately from launching an agent. Opaque Claude OAuth credentials can use a read-only profile lookup with a short timeout, a response-size bound and no redirects. Only nonsecret identity snapshots and one-way fingerprints are cached; credentials and profile bodies never enter records. A changed credential, account or login directory invalidates discovery, including on bounded wakeups while waiting. Only a successful subscription call clears older applicable holds for its captured account and scope; API-key success cannot clear them. Reset slack, session continuation and original-prompt retries still apply.
 
 The files are gzip, not zstd, because arete runs on Python 3.13 with the standard library only, and zstd comes to the standard library in 3.14; the `.gz` suffix names the codec, so a switch later is a new suffix.
 `zcat`, `gzip -dc` and `zless` read them.
@@ -1002,7 +1003,7 @@ The `justfile` at the top of this checkout wraps these commands in `adw` recipes
 
 ## Rules
 
-- Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`, never an `ANTHROPIC_API_KEY`, here or on a device.
+- Agents run through `claude -p`, `codex` or `pi`; subscription logins precede API keys. Claude execution never uses `--bare` or an `ANTHROPIC_API_KEY`, here or on a device.
 - A claude run takes no dollar cap and waits out a subscription usage limit; budgets count API-key spend. Codex has no per-call dollar cap.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
 - An agent on the `claude` CLI loads only the MCP servers its call names. The verifier names its browser and every other call names none, so the connectors and plugin servers of the account never load.
