@@ -372,6 +372,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
     found = secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg)
     selected = kw.get("selected")
+    if selected:
+        found.extend(selected.sensitive_files)
     hidden = list(record.secrets(*found))
     if selected:
         hidden.extend(selected.hidden)
@@ -380,15 +382,20 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         header["env"] = pi.launch_env_names(selected)
         header["provider"] = selected.provider
     def refresh_hidden():
-        if selected and auth.mode == "subscription":
+        if selected and selected.using_login:
             hidden.extend(v for v in [*pi.credential_values(accounts.read(selected.owner)),
                                      *tuple(selected.refreshed_secrets)] if len(v) >= 8
                           and v not in hidden)
+        if selected:
+            hidden.extend(v for path in selected.sensitive_files for v in record.file_secrets(path, every_value=True)
+                          if len(v) >= 8 and v not in hidden)
+        if selected:
             hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
                                key=len, reverse=True)
     def safe_line(line):
         refresh_hidden()
         rec.line(line)
+    refresh_hidden()
     started = time.monotonic()
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
         budget_error = kw.pop("budget_error", "")

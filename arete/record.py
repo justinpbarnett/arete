@@ -198,8 +198,12 @@ def file_secrets(path: Path, every_value: bool = False) -> set[str]:
             found.add(util.env_value(raw))
         pairs = [(name, unquoted(value)) for name, value in NAMED_VALUE.findall(line)]
         found |= {value for name, value in pairs if CREDENTIAL_NAME.search(name) or looks_secret(value)}
-        if not sep and not pairs and looks_secret(word := re.split(r"[\s:]+", line)[-1].strip("'\",")):
-            found.add(word)
+        if not sep and not pairs:
+            if every_value:
+                found.add(line.strip("'\","))
+            word = re.split(r"[\s:]+", line)[-1].strip("'\",")
+            if every_value or looks_secret(word):
+                found.add(word)
     return found
 
 

@@ -101,7 +101,7 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
     if cfg.replay.all:
         return []
     configured = accounts.mapping(pi.model_configuration().get("providers"))
-    names = set(configured) | set(accounts.read(pi.PI_HOME / "agent" / "auth.json")) | set(cfg.environment.providers)
+    names = set(configured) | set(accounts.read(pi.owner_dir() / "auth.json")) | set(cfg.environment.providers)
     names |= {p for p in pi.KEY_NAMES if os.environ.get(pi.KEY_NAMES[p])}
     keys = util.read_env_file(pi.KEYS_FILE)
     names |= {p for p, n in pi.KEY_NAMES.items() if keys.get(n)}
@@ -131,9 +131,12 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
         selected = runner.pi_route(model, cfg, repo, device)
         provider = selected.provider or "unspecified"
         hold = runner.auth_hold(selected.auth, selected.model)
+        source = f"SDK-managed {selected.managed.kind}" if selected.managed else "key"
         detail = ("missing login and key" if selected.error else "held login; waiting" if hold else
-                  "login-backed" if selected.auth.mode == "subscription" else
-                  "login held; using key" if selected.login_held and selected.key else "key-only" if selected.key else
+                  f"login-backed ({'subscription' if selected.auth.mode == 'subscription' else 'metered'})"
+                  if selected.using_login else
+                  f"login held; using {source}" if selected.login_held and selected.key_available else
+                  source if selected.managed else "key-only" if selected.key_available else
                   "unauthenticated local")
         key = f"pi:{provider}:auth" + (f":{repo.name}" if repo else "")
         out[key] = Check(key, not selected.error, f"{provider}: {detail}")

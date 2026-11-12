@@ -53,6 +53,7 @@ NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with t
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azure": "AZURE_OPENAI_API_KEY",
+             "amazon-bedrock": "AWS_BEARER_TOKEN_BEDROCK",
              "google": "GEMINI_API_KEY", "google-vertex": "GOOGLE_CLOUD_API_KEY", "huggingface": "HF_TOKEN",
              "vercel-ai-gateway": "AI_GATEWAY_API_KEY", "moonshotai": "MOONSHOT_API_KEY",
              "moonshotai-cn": "MOONSHOT_API_KEY", "kimi-coding": "KIMI_API_KEY", "opencode-go": "OPENCODE_API_KEY",
@@ -64,10 +65,43 @@ KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azur
              "cloudflare-workers-ai": "CLOUDFLARE_API_KEY", "cloudflare-ai-gateway": "CLOUDFLARE_API_KEY"}
 KEY_NAMES.update({"qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
                   "qwen-token-plan-individual-cn": "QWEN_TOKEN_PLAN_CN_API_KEY", "github-copilot": "COPILOT_GITHUB_TOKEN"})
+TRANSPORT_NAMES = {"amazon-bedrock": ("AWS_REGION", "AWS_DEFAULT_REGION", "AWS_EC2_METADATA_DISABLED",
+                                     "AWS_EC2_METADATA_V1_DISABLED", "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+                                     "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+                                     "AWS_ENDPOINT_URL_STS", "AWS_ENDPOINT_URL", "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
+                                     "AWS_USE_FIPS_ENDPOINT", "AWS_USE_DUALSTACK_ENDPOINT", "AWS_AUTH_SCHEME_PREFERENCE",
+                                     "AWS_MAX_ATTEMPTS", "AWS_RETRY_MODE", "AWS_DEFAULTS_MODE", "AWS_BEDROCK_FORCE_HTTP1"),
+                   "azure": ("AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME", "AZURE_OPENAI_API_VERSION",
+                             "AZURE_OPENAI_DEPLOYMENT_NAME_MAP"),
+                   "google-vertex": ("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"),
+                   "cloudflare-workers-ai": ("CLOUDFLARE_ACCOUNT_ID",)}
+MANAGED_NAMES = ("AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+                 "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+                 "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                 "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                 "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "AWS_SDK_LOAD_CONFIG",
+                 "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG", "ANTHROPIC_AUTH_TOKEN",
+                 "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE",
+                 "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID",
+                 "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID")
+CREDENTIAL_FILES = ("AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                    "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
+                    "ANTHROPIC_IDENTITY_TOKEN_FILE")
 REFERENCES = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
 SAFE_HEADERS = {"accept": r"application/json|text/event-stream", "content-type": r"application/json(?:; ?charset=utf-8)?",
                 "anthropic-version": r"\d{4}-\d{2}-\d{2}",
                 "anthropic-beta": r"[a-z][a-z0-9-]*-\d{4}-\d{2}-\d{2}(?:, ?[a-z][a-z0-9-]*-\d{4}-\d{2}-\d{2})*"}
+
+
+def owner_dir() -> Path:
+    return paths.expand(os.environ.get("PI_CODING_AGENT_DIR") or PI_HOME / "agent").absolute()
+
+
+@dataclass(frozen=True)
+class ManagedCredential:
+    kind: str
+    env: dict[str, str] = field(repr=False)
+    files: tuple[Path, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -78,7 +112,7 @@ class Route:
     error: str = ""
     login_available: bool = False
     login_held: bool = False
-    owner: Path = field(default_factory=lambda: PI_HOME / "agent" / "auth.json", repr=False)
+    owner: Path = field(default_factory=lambda: owner_dir() / "auth.json", repr=False)
     key: str = field(default="", repr=False)
     key_name: str = ""
     models: dict = field(default_factory=dict, repr=False, compare=False)
@@ -88,6 +122,65 @@ class Route:
     view: Path | None = field(default=None, repr=False, compare=False)
     refreshed: set[str] = field(default_factory=set, repr=False, compare=False)
     refreshed_secrets: set[str] = field(default_factory=set, repr=False, compare=False)
+    managed: ManagedCredential | None = field(default=None, repr=False)
+    using_login: bool = False
+    sensitive_files: tuple[Path, ...] = field(default=(), repr=False)
+
+    @property
+    def key_available(self) -> bool:
+        return bool(self.key or self.managed)
+
+
+def managed_credential(provider: str, available: dict) -> ManagedCredential | None:
+    if provider == "anthropic":
+        if available.get("ANTHROPIC_AUTH_TOKEN"):
+            return ManagedCredential("header", {"ANTHROPIC_AUTH_TOKEN": available["ANTHROPIC_AUTH_TOKEN"]})
+        required = ("ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE")
+        if all(available.get(name) for name in required):
+            path = paths.expand(available["ANTHROPIC_IDENTITY_TOKEN_FILE"]).absolute()
+            if path.is_file():
+                env = {name: available[name] for name in
+                       (*required, "ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID") if available.get(name)}
+                env["ANTHROPIC_IDENTITY_TOKEN_FILE"] = str(path)
+                return ManagedCredential("federation", env, (path,))
+    if provider == "cloudflare-ai-gateway":
+        names = ("CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID")
+        if all(available.get(name) for name in names):
+            return ManagedCredential("gateway_header", {name: available[name] for name in names})
+    if provider == "amazon-bedrock":
+        if available.get("AWS_PROFILE"):
+            kind, names = "profile", ["AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "AWS_SDK_LOAD_CONFIG"]
+        elif available.get("AWS_ACCESS_KEY_ID") and available.get("AWS_SECRET_ACCESS_KEY"):
+            kind, names = "iam", ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+        elif available.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") or available.get("AWS_CONTAINER_CREDENTIALS_FULL_URI"):
+            kind = "container"
+            names = ["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" if available.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+                     else "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                     "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" if available.get("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
+                     else "AWS_CONTAINER_AUTHORIZATION_TOKEN"]
+        elif available.get("AWS_WEB_IDENTITY_TOKEN_FILE") and available.get("AWS_ROLE_ARN"):
+            kind, names = "web_identity", ["AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME"]
+        else:
+            return None
+        env = {name: available[name] for name in [*names, *TRANSPORT_NAMES[provider]] if available.get(name)}
+        defaults = [paths.HOME / ".aws" / name for name in ("credentials", "config")] if kind == "profile" else []
+        files = list(defaults)
+        for name in ("AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE",
+                     "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"):
+            if env.get(name):
+                path = paths.expand(env[name]).absolute()
+                env[name] = str(path)
+                files.append(path)
+        return ManagedCredential(kind, env, tuple(files))
+    if provider == "google-vertex":
+        project = available.get("GOOGLE_CLOUD_PROJECT") or available.get("GCLOUD_PROJECT")
+        location = available.get("GOOGLE_CLOUD_LOCATION")
+        path = paths.expand(available.get("GOOGLE_APPLICATION_CREDENTIALS") or
+                            paths.HOME / ".config" / "gcloud" / "application_default_credentials.json").absolute()
+        if project and location and path.is_file():
+            return ManagedCredential("adc", {"GOOGLE_CLOUD_PROJECT": project, "GOOGLE_CLOUD_LOCATION": location,
+                                             "GOOGLE_APPLICATION_CREDENTIALS": str(path)}, (path,))
+    return None
 
 
 def credential_values(value) -> list[str]:
@@ -107,6 +200,26 @@ def credential_config(value) -> list[str]:
     return [s for v in value for s in credential_config(v)] if isinstance(value, list) else []
 
 
+def configured_key(value, available: dict) -> str:
+    if not isinstance(value, str) or value.startswith("!"):
+        return ""
+    missing = False
+
+    def part(match):
+        nonlocal missing
+        if match[0] in ("$$", "$!"):
+            return match[0][1:]
+        name = match[1] if match[1] is not None else match[2]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            return match[0]
+        if not available.get(name):
+            missing = True
+        return available.get(name, "")
+
+    resolved = re.sub(r"\$\$|\$!|\$\{([^}]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", part, value)
+    return "" if missing else resolved
+
+
 def sanitized(value):
     if isinstance(value, list):
         return [sanitized(v) for v in value]
@@ -122,9 +235,9 @@ def sanitized(value):
     return out
 
 
-def model_configuration() -> dict:
+def model_configuration(folder: Path | None = None) -> dict:
     try:
-        text = (PI_HOME / "agent" / "models.json").read_text(encoding="utf-8-sig")
+        text = ((folder or owner_dir()) / "models.json").read_text(encoding="utf-8-sig")
         strings = r'"(?:\\.|[^"\\])*"'
         text = re.sub(strings + r'|//[^\n]*', lambda m: m[0] if m[0].startswith('"') else "", text)
         text = re.sub(strings + r'|,(\s*[}\]])', lambda m: m[1] or m[0], text)
@@ -140,8 +253,9 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
         passing = environment.passed(cfg) if passing is None else passing
         providers = cfg.environment.providers if providers is None else providers
         local_providers = cfg.local_providers
-    settings = accounts.read(PI_HOME / "agent" / "settings.json")
-    models = model_configuration()
+    owner = Path(owner_auth).absolute() if owner_auth is not None else owner_dir() / "auth.json"
+    settings = accounts.read(owner.parent / "settings.json")
+    models = model_configuration(owner.parent)
     provider, sep, name = model.partition("/")
     if not model:
         provider, name = settings.get("defaultProvider", ""), settings.get("defaultModel", "")
@@ -150,12 +264,11 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     provider = provider if isinstance(provider, str) else ""
     name = name if isinstance(name, str) else ""
     resolved = f"{provider}/{name or '*'}" if provider else model
-    owner = Path(owner_auth).absolute() if owner_auth is not None else PI_HOME / "agent" / "auth.json"
     store = accounts.read(owner)
     credential = accounts.mapping(store.get(provider))
     login = (credential.get("type") == "oauth" and isinstance(credential.get("access"), str)
              and bool(credential.get("access")) and isinstance(credential.get("refresh"), str)
-             and bool(credential.get("refresh")) and isinstance(credential.get("expires"), (int, float))
+             and isinstance(credential.get("expires"), (int, float))
              and not isinstance(credential["expires"], bool) and math.isfinite(credential["expires"]))
     auth = accounts.pi(provider, credential, str(owner)) if login else accounts.Auth("api_key")
     keys = util.read_env_file(KEYS_FILE)
@@ -164,55 +277,78 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     supported = (provider in KEY_NAMES or bool(configured.get("api")) or
                  any(accounts.mapping(m).get("api") for m in configured.get("models", []) if isinstance(m, dict)))
     names = [KEY_NAMES[provider]] if provider in KEY_NAMES else []
+    raw = configured.get("apiKey", "")
     if supported and provider != "openai-codex":
         names += list(providers.get(provider, ()))
-        raw = configured.get("apiKey", "")
-        if isinstance(raw, str) and not raw.startswith("!"):
-            names += [a or b for a, b in REFERENCES.findall(raw)]
+        if provider == "anthropic":
+            names.insert(0, "ANTHROPIC_OAUTH_TOKEN")
     else:
         names = []
-    exact = [n for n in names if isinstance(n, str) and re.fullmatch(r"[A-Za-z_]\w*", n)]
+    context = {*MANAGED_NAMES, *TRANSPORT_NAMES.get(provider, ())}
+    exact = [n for n in names if isinstance(n, str) and re.fullmatch(r"[A-Za-z_]\w*", n) and n not in context]
     key_name = next((n for n in exact if keys.get(n)), "") or next((n for n in exact if available.get(n)), "")
     key = available.get(key_name, "")
+    if supported and provider != "openai-codex" and raw and not keys.get(key_name):
+        key = configured_key(raw, available)
+        key_name = "ARETE_PI_SELECTED_KEY" if key else ""
+    prefer_header = (provider == "anthropic" and available.get("ANTHROPIC_AUTH_TOKEN") and
+                     (not keys.get(key_name) or keys.get("ANTHROPIC_AUTH_TOKEN")))
+    managed = managed_credential(provider, available) if not key or prefer_header or provider == "cloudflare-ai-gateway" else None
+    if provider == "cloudflare-ai-gateway":
+        key, key_name = "", ""
+    if provider == "cloudflare-workers-ai" and not available.get("CLOUDFLARE_ACCOUNT_ID"):
+        key, key_name = "", ""
+    has_key = bool(key or managed)
     local = provider == "ollama" or (provider in local_providers and bool(configured))
     local |= bool(configured and re.match(r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::|/|$)",
                                          str(configured.get("baseUrl", ""))))
     local = local and provider != "openai-codex"
     login_held = bool(login and held(auth, resolved))
-    chosen_login = login and mode != "api_key" and (mode == "subscription" or not login_held or not key)
+    chosen_login = login and mode != "api_key" and (mode in ("login", "subscription") or not login_held or not has_key)
     error = ""
     if not provider:
-        error = "pi needs provider/model or defaultProvider in ~/.pi/agent/settings.json before choosing credentials"
-    elif (mode == "subscription" and not login) or (not chosen_login and not (key or local)):
+        error = f"pi needs provider/model or defaultProvider in {owner.parent / 'settings.json'} before choosing credentials"
+    elif (mode in ("login", "subscription") and not login) or (not chosen_login and not (has_key or local)):
         error = (f"pi {provider}: no usable login or supported key; checked {owner}, {KEYS_FILE} and Arete environment")
-    chosen_auth = auth if chosen_login else accounts.Auth("subscription" if mode == "subscription" else "api_key")
+    chosen_auth = auth if chosen_login else accounts.Auth(
+        "subscription" if mode in ("login", "subscription") and provider in accounts.PI_SUBSCRIPTIONS else "api_key")
     raw_credentials = credential_config(models)
     refs = {n for v in raw_credentials for pair in REFERENCES.findall(v) for n in pair if n}
     aliases = {n for values in providers.values() for n in values}
+    transport = TRANSPORT_NAMES.get(provider, ())
     never = {n for n in available if re.search(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL", n, re.IGNORECASE)
-             or n in refs or n in KEY_NAMES.values() or environment.passes(n, aliases)}
-    env = environment.build(passing, {"ARETE_AGENT": "1"}, never=(*PARENT_SESSION_VARS, *never), source=available)
+             or n in refs or n in KEY_NAMES.values() or (n in MANAGED_NAMES and n not in transport)
+             or (environment.passes(n, aliases) and n not in transport)}
+    names = [*passing, re.sub(r"\W", "_", provider).upper() + "_*", *transport]
+    env = environment.build(names, {"ARETE_AGENT": "1"}, never=(*PARENT_SESSION_VARS, *never), source=available)
     for n in ("PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", "ARETE_PI_REFRESH_FD", "ARETE_PI_REFRESH_ACK_FD",
               "ARETE_PI_REFRESH_PROVIDER",
               "NODE_OPTIONS", "NODE_PATH"):
         env.pop(n, None)
-    if not chosen_login and key:
+    if not chosen_login and managed:
+        env.update(managed.env)
+    elif not chosen_login and key:
         env[key_name] = key
         env["ARETE_PI_SELECTED_KEY"] = key
     clean_models = sanitized(models)
     if isinstance(clean_models.get("providers"), dict):
         clean_models["providers"] = {p: v for p, v in clean_models["providers"].items() if v}
-    if not chosen_login and provider and (key or local):
+    if not chosen_login and provider and not managed and (key or local):
         view = clean_models.setdefault("providers", {}).setdefault(provider, {})
         view["apiKey"] = "$ARETE_PI_SELECTED_KEY" if key else "arete-local"
     clean_settings = sanitized(settings)
     for n in ("extensions", "packages", "skills", "promptTemplates", "themes", "mcpServers"):
         clean_settings.pop(n, None)
     hidden = [*credential_values(store), *raw_credentials, *keys.values(),
-              *(available[n] for n in never if available.get(n)), key]
+              *(available[n] for n in never if available.get(n)), key,
+              *(managed.env.values() if managed else ())]
+    files = {paths.expand(available[name]).absolute() for name in CREDENTIAL_FILES if available.get(name)}
+    if managed:
+        files.update(managed.files)
     return Route(provider, resolved, chosen_auth, error, login_available=login, login_held=login_held,
                  owner=owner, key=key, key_name=key_name, models=clean_models, settings=clean_settings, env=env,
-                 hidden=tuple(v for v in hidden if len(v) >= 8))
+                 hidden=tuple(v for v in hidden if len(v) >= 8), managed=managed if not chosen_login else None,
+                 using_login=chosen_login, sensitive_files=tuple(sorted(files)))
 
 
 def private_dir(path: Path) -> None:
@@ -222,13 +358,13 @@ def private_dir(path: Path) -> None:
 
 
 def prepare(route: Route) -> Path:
-    root = LOGIN_DIR if route.auth.mode == "subscription" else KEY_DIR
+    root = LOGIN_DIR if route.using_login else KEY_DIR
     private_dir(root)
     auth = root / "auth.json"
     if auth.is_symlink() or (auth.exists() and (not auth.is_file() or auth.stat().st_nlink != 1)):
         raise ValueError("pi route auth store must not be an unexpected link")
     folder = Path(tempfile.mkdtemp(prefix="call-", dir=root))
-    if route.auth.mode == "subscription":
+    if route.using_login:
         (folder / "auth.json").symlink_to(route.owner)
     else:
         with (folder / "auth.json").open("x") as out:
@@ -277,7 +413,7 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
 
 
 def default_provider() -> str:
-    settings = util.read_json(PI_HOME / "agent" / "settings.json", {})
+    settings = util.read_json(owner_dir() / "settings.json", {})
     provider = settings.get("defaultProvider") if isinstance(settings, dict) else ""
     return provider if isinstance(provider, str) else ""
 
@@ -289,23 +425,25 @@ def agent_env(model: str, passing: list[str] | None = None, providers: dict[str,
 
 def launch_env_names(route: Route) -> list[str]:
     controls = ({"ARETE_PI_REFRESH_FD", "ARETE_PI_REFRESH_ACK_FD", "ARETE_PI_REFRESH_PROVIDER"}
-                if route.auth.mode == "subscription" else set())
+                if route.using_login else set())
     return sorted({*route.env, "PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", *controls})
 
 
-def guard_env(auth_paths: list[Path] | None = None) -> dict[str, str]:
-    roots = [PI_HOME, AGENT_DIR, LOGIN_DIR, KEY_DIR, paths.CONFIG_DIR,
+def guard_env(auth_paths: list[Path] | None = None, secret_paths: tuple[Path, ...] = ()) -> dict[str, str]:
+    sources = {PI_HOME / "agent", owner_dir(), *(path.parent for path in auth_paths or [])}
+    roots = [PI_HOME, *sorted(sources), AGENT_DIR, LOGIN_DIR, KEY_DIR, paths.CONFIG_DIR,
              *(paths.HOME / p for p in (".claude", ".codex", ".gemini", ".ssh", ".aws", ".docker", ".kube",
                                        ".gnupg", ".password-store", ".config/gh", ".config/gcloud",
                                        ".config/opencode", ".local/share/opencode")),
              *(Path(os.environ[p]) for p in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR")
                if os.environ.get(p)),
              Path("/proc"), Path("/dev")]
-    auth = [PI_HOME / "agent" / "auth.json", AGENT_DIR / "auth.json", *(auth_paths or [])]
+    auth = [PI_HOME / "agent" / "auth.json", owner_dir() / "auth.json", AGENT_DIR / "auth.json",
+            *(auth_paths or [])]
     files = [KEYS_FILE, paths.CONFIG_FILE,
              *(paths.HOME / p for p in (".netrc", ".npmrc", ".pypirc", ".git-credentials")),
-             PI_HOME / "agent" / "models.json",
-             PI_HOME / "agent" / "settings.json", paths.HOME / ".claude" / ".credentials.json",
+             *(source / name for source in sorted(sources) for name in ("models.json", "settings.json")),
+             paths.HOME / ".claude" / ".credentials.json",
              paths.HOME / ".codex" / "auth.json", paths.HOME / ".gemini" / "oauth_creds.json",
              paths.HOME / ".aws" / "credentials", paths.HOME / ".config" / "gh" / "hosts.yml",
              paths.HOME / ".config" / "gcloud" / "application_default_credentials.json",
@@ -313,6 +451,7 @@ def guard_env(auth_paths: list[Path] | None = None) -> dict[str, str]:
              paths.HOME / ".local" / "share" / "opencode" / "auth.json"]
     for path in auth:
         files.extend((path, path.resolve(), Path(str(path) + ".lock"), Path(str(path.resolve()) + ".lock")))
+    files.extend(path for source in secret_paths for path in (source, source.resolve()))
     return {"ARETE_PI_GUARD_PATHS": json.dumps({"roots": list(map(str, roots)), "files": list(map(str, files)),
                                               "write_roots": [str(paths.PACKAGE_DIR)],
                                               "write_files": [str(GUARD_FILE)]})}
@@ -432,7 +571,7 @@ def observed_refresh(route: Route, event: dict) -> None:
 
 @contextmanager
 def refresh_channel(route: Route | None, env: dict):
-    if route is None or route.auth.mode != "subscription":
+    if route is None or not route.using_login:
         yield ()
         return
     reader, writer = os.pipe()
@@ -480,7 +619,7 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
     if selected and selected.error:
         result = Result(ok=False, error=selected.error, runner="pi", model=selected.model,
                         session=kw.get("resume", NO_SESSION))
-    elif selected and auth.mode == "subscription" and not login_unchanged(selected):
+    elif selected and selected.using_login and not login_unchanged(selected):
         result = Result(ok=False, error=f"pi {selected.provider}: selected login changed or is no longer available",
                         runner="pi", model=selected.model, session=kw.get("resume", NO_SESSION))
     else:
@@ -566,9 +705,9 @@ def _run(
         if not can_confine(bool(remote)):
             return Result(ok=False, error=f"{NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
                           session=resume, runner="pi", model=model)
-        cmd = write_confinement(cwd, add_dirs, selected.owner if selected and auth.mode == "subscription" else None) + cmd
+        cmd = write_confinement(cwd, add_dirs, selected.owner if selected and selected.using_login else None) + cmd
         confined = True
-    if selected and auth.mode == "subscription" and not confined and can_confine(False):
+    if selected and selected.using_login and not confined and can_confine(False):
         cmd = write_confinement(cwd, add_dirs, selected.owner) + cmd
 
     cmd = [*cmd, "--", prompt]
@@ -577,7 +716,8 @@ def _run(
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir(remote),))
     else:
         folder = selected.view
-        env = {**selected.env, "PI_CODING_AGENT_DIR": str(folder), **guard_env([selected.owner, folder / "auth.json"])}
+        env = {**selected.env, "PI_CODING_AGENT_DIR": str(folder),
+               **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files)}
     try:
         with refresh_channel(selected, env) as descriptors:
             proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
@@ -641,6 +781,10 @@ def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd
     result.cache_read += again.cache_read
     result.cache_write += again.cache_write
     result.structured = json_from_text(again.text) if again.ok else None
+    if again.usage_limit:
+        result.ok = False
+        result.error = again.error
+        result.usage_limit = again.usage_limit
 
 
 def mcp_servers(mcp_config: str) -> dict:
