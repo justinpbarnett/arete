@@ -38,7 +38,8 @@ def repo_named(cfg: config.Config, name: str) -> config.Repo:
         raise control.Refused(f"There is no repo '{name}'; the repos are {names}") from None
 
 
-def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", ticket: str = "") -> dict:
+def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", ticket: str = "",
+          force: bool = True) -> dict:
     prompt, ticket = prompt.strip(), ticket.strip()
     if not prompt and not ticket:
         raise control.Refused("Give a prompt to add a task and start it, or a ticket to start one that exists.")
@@ -51,7 +52,7 @@ def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", tic
     if kind not in ("", *config.KINDS):
         raise control.Refused(f"The kind is {' or '.join(config.KINDS)}, not '{kind}'.")
     if ticket:
-        return start_ticket(cfg, repo, ticket)
+        return start_ticket(cfg, repo, ticket, force)
     tid = state.task_add(repo.name, prompt, title.strip() or title_of(prompt), kind or "feat")
     if waits := tracker.LocalTracker(repo).blocker(tid):
         return answer(tid, repo.name, "", "queued", f"{waits}; " + ("the poller starts it once the wait ends"
@@ -59,7 +60,7 @@ def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", tic
     return begin(cfg, repo, tid, force=False, poller_picks=repo.pipeline)
 
 
-def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str) -> dict:
+def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool = True) -> dict:
     try:
         tid = tracker.for_ticket(cfg, repo, ticket).normalize(ticket)
     except ValueError as e:
@@ -69,7 +70,7 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str) -> dict:
             raise control.NotFound(f"no task {tid}")
         if row["repo"] != repo.name:
             raise control.Refused(f"{tid} is a task of {row['repo']}, not {repo.name}")
-    return begin(cfg, repo, tid, force=True, poller_picks=False)
+    return begin(cfg, repo, tid, force=force, poller_picks=False)
 
 
 def live_run(repo: str, tid: str) -> dict | None:

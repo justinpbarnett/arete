@@ -189,7 +189,7 @@ arete session attach ID | stop ID | list
 
 `arete costs` shows what you paid for model calls, by model, runner and loop. A step on the claude CLI rides the subscription and counts nothing there.
 
-`arete costs --by step|kind|model` counts every step instead, at the cost each call reported (a claude CLI step's is the API price), grouped by step name, by the task's kind (`feat`, `fix`) or by model, over the last `--days N` (default 7). Each row shows the runs (distinct runs in the group), calls, cost, input tokens no cache served (`in`), cache reads and cache writes, output tokens, minutes and API minutes. The minutes are each call's whole time; the API minutes are the part the model's API calls took, as the runner reports it (claude does, pi does not), so the rest went to tools. The last line gives the wait minutes of the runs started in that window, by cause. `--json` prints one JSON line per group and a last line with `wait_minutes`; `--json` alone groups by step. The plain `arete costs` stays the paid view.
+`arete costs --by step|kind|model` counts every step instead, at the cost each call reported (a claude CLI step's is the API price), grouped by step name, by the task's kind (`feat`, `fix`) or by model, or by several in turn with `--by step kind model`, over the last `--days N` (default 7). Each row shows the runs (distinct runs in the group), calls, cost, input tokens no cache served (`in`), cache reads and cache writes, output tokens, minutes and API minutes. The minutes are each call's whole time; the API minutes are the part the model's API calls took, as the runner reports it (claude does, pi does not), so the rest went to tools. The last line gives the wait minutes of the runs started in that window, by cause. `--json` prints one JSON line per group and a last line with `wait_minutes`; `--json` alone groups by step. The plain `arete costs` stays the paid view.
 
 ## JEV
 
@@ -286,7 +286,7 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 
 Eval runs write the step events too, but no `task` or `report`.
 Each line is also printed to the run's stdout.
-`arete lines RUN_ID` prints the lines, `--from SEQ` starts after that `seq`, and `--follow` keeps printing new lines until the `report` line.
+`arete lines RUN_ID` prints the lines, `--from SEQ` starts after that `seq`, `--follow` keeps printing new lines until the `report` line, and `--step STEP` prints only that step's lines. It reads them from the server when the server is up, and from the file when it is not.
 The dashboard serves the same lines at `GET /api/runs/RUN_ID/events`; see [API](#api).
 The run log, the `<step>.json` files, the tables and the records stay as they were; the lines are an addition.
 
@@ -361,11 +361,12 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 
 - Code: this repo, a uv project (Python pinned in `.python-version`, everything locked in `uv.lock`). Installed with `uv tool install --editable . --python 3.13`
 - Config: `~/.config/arete/config.toml` (`arete init` writes a starting one)
-- adw scripts: `adws/` here, or the folder `[factory] adws` names (see The adw scripts)
+- adw scripts: `adws/` here, or the folder `[factory] adws` names (see The adw scripts); `adws/README.md` is the guide for an agent that steers runs
+- `justfile`: the `adw` recipes that steer runs through the server (see From the CLI)
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`)
+- State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`, `dashboard.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -478,7 +479,7 @@ arete task reply t-1a2b "A dark navy blue."
 arete task close t-1a2b
 ```
 
-`add` prints the new id. `--kind fix` makes a fix, and the title defaults to the body's first line. `list` prints one JSON line per task, oldest first, and both its filters are optional. `show` prints the task and its comments as JSON. `reply` stores your answer to arete's question, and `close` closes the task. Every task counts as yours. A task in `needs-info` whose newest comment is yours counts as replied, as an issue you answered does.
+`add` prints the new id. `--kind fix` makes a fix, and the title defaults to the body's first line. `list` prints one JSON line per task, oldest first, and both its filters are optional. `show` prints one JSON line: the task and its comments, with its `runs` and `children` as `GET /api/tasks/ID` gives them, from the server when it is up. `task start --repo NAME "PROMPT"` adds a task and starts it, and `task run REPO TICKET` starts one that exists; both go through the server (see [From the CLI](#from-the-cli)). `reply` stores your answer to arete's question, and `close` closes the task. Every task counts as yours. A task in `needs-info` whose newest comment is yours counts as replied, as an issue you answered does.
 
 A body line such as `Waits on t-1a2b.` holds the task until `t-1a2b` is `done` or `closed`. A named task in any other state holds it, `failed` and `needs-info` included, so a task that failed holds the tasks that wait on it. A name that matches no task holds it too, and the reason says so.
 
@@ -627,7 +628,7 @@ When `<dir>/<step>.patch` exists, arete applies it to the call's folder with `gi
 
 A replayed call is recorded like any other: its step row, its record header and its timeline `agent` mark say `replay`, the raw record holds one `replay` line naming the answer and patch files, and it costs what the file says, which `[pricing]` never changes. Usage limit holds, the login check, the guard, JEV rules and devices do not apply to it. JEV calls are not agent calls and still go to JEV. `all = true` also sends chat, triage, loops and sessions to replay, so turn it on in a scratch `ARETE_CONFIG_DIR` and `ARETE_STATE_DIR`.
 
-`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review and learn, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has `tracker = "local"`, no `github` and no `pipeline`, so poll never picks it up; add `pipeline = true` with `--adw` and `arete poll` starts its `todo` tasks. `--adw` adds `[factory] path = "adw"` to the layer, so `arete run replay-sample t-...` on a task from `arete task add --repo replay-sample` runs the [adw flow](#the-adw-flow) and pushes the branch to `origin.git`. The answers serve both paths. A `github` name added to the sample's `[[repo]]` makes the adw flow go on to the PR, CI and publish steps, which call GitHub.
+`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review and learn, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has `tracker = "local"`, no `github` and no `pipeline`, so poll never picks it up; add `pipeline = true` with `--adw` and `arete poll` starts its `todo` tasks. `--adw` adds `[factory] path = "adw"` to the layer, so `arete run replay-sample t-...` on a task from `arete task add --repo replay-sample` runs the [adw flow](#the-adw-flow) and pushes the branch to `origin.git`. On scratch state `arete run` calls only a server started on that state (see [From the CLI](#from-the-cli)), so with none it runs in its own process, as before. The answers serve both paths. A `github` name added to the sample's `[[repo]]` makes the adw flow go on to the PR, CI and publish steps, which call GitHub.
 
 ## Verify in use
 
@@ -809,7 +810,7 @@ These routes pass the same caller check as the page, and the POST needs the `X-A
 `POST /api/tasks` takes one of two JSON bodies:
 
 - `{"repo": "web", "prompt": "...", "title": "...", "kind": "feat"}` adds a local task and starts it. `title` defaults to the prompt's first line that is not a `Waits on` line, cut to 80 characters, and `kind` is `feat` or `fix`, `feat` by default.
-- `{"repo": "web", "ticket": "123"}` starts a tracker issue, a Jira key or a `t-` task that exists, past its waits, as `arete run` does.
+- `{"repo": "web", "ticket": "123"}` starts a tracker issue, a Jira key or a `t-` task that exists, past its waits, as `arete run --force` does. With `"force": false`, its `Waits on` line holds it and the run ends `skipped`, as `arete run` without `--force` does.
 
 It answers `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the run's id, or `queued` with an empty `run` when no slot is free (`max_parallel` or `max_parallel_per_repo`) or the prompt's `Waits on` line still holds; `why` says which. In a repo the poller does not pick, `why` names the task and the `ticket` body that starts it. A queued task in a `pipeline = true` repo starts at a later poll. A ticket whose run is going on answers that run's id with `already running` and never starts twice.
 
@@ -832,6 +833,31 @@ curl 'http://HOST:PORT/api/runs/RUN_ID/events?follow=1'
 curl -H 'X-Arete: 1' -d '{"text": "Put the toggle in the header."}' http://HOST:PORT/api/runs/RUN_ID/answer
 curl -H 'X-Arete: 1' -d '{"step": "verify"}' http://HOST:PORT/api/runs/RUN_ID/resume
 ```
+
+### From the CLI
+
+Each of these commands makes one call to the server and prints JSON lines and nothing else:
+
+| command | route |
+|---|---|
+| `arete task start --repo NAME [--kind feat\|fix] [--title T] "PROMPT"` | `POST /api/tasks` with a prompt |
+| `arete task run REPO TICKET` | `POST /api/tasks` with a ticket |
+| `arete task show ID [--repo NAME]` | `GET /api/tasks/ID` |
+| `arete wait RUN_ID` | `GET /api/runs/RUN_ID/events?follow=1`, printing only the `step_end`, `question`, `error` and `report` lines; it stops printing after a `question` line and returns at the `report` line |
+| `arete lines RUN_ID [--step STEP] [--follow]` | `GET /api/runs/RUN_ID/events` |
+| `arete answer RUN_ID "TEXT"` | `POST /api/runs/RUN_ID/answer` |
+| `arete resume RUN_ID [--step STEP]` | `POST /api/runs/RUN_ID/resume` |
+| `arete step RUN_ID STEP [key=value ...]` | `POST /api/runs/RUN_ID/steps/STEP` |
+| `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
+| `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
+
+They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, process id, state folder and config file to `dashboard.json` in the state folder. The commands call that server while its process is alive and it works on the same state folder and config file as they do. `ARETE_SERVER=http://HOST:PORT` names a server and skips that check. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
+
+A failed command prints one line with `error` and no `event`, with `code` when the server answered with an HTTP status, and exits 1. A `step_end` line or a step row with an `error` field is a step's error, not the command's. When no server works on the state, the readers (`task show`, `lines` and `status --json`) read the local state instead, and the others print one `error` line and exit 1. When a stream of lines drops, as it does when serve restarts on new code, `wait`, `lines --follow` and `arete run` connect again and go on from the last line they read. They give up with an `error` line when the run ended with no `report` line, or when no line came for 2 minutes.
+
+`arete run REPO TICKET` asks the server to start the run, as `POST /api/tasks` with `"force"` set by `--force`, prints the answer, then prints the run's lines until its `report` line. It exits 0 when the report's status counts as success, as before. Ctrl-c detaches and leaves the run going. With `--local` or `--dry-run`, or when no server works on its state, it runs in its own process as before. The server and the poller start a classic run with `--local`.
+
+The `justfile` at the top of this checkout wraps these commands in `adw` recipes, one `uv run arete` call each; `just --list` lists them. [adws/README.md](adws/README.md) is the guide for an agent that steers runs with them.
 
 ## Rules
 
