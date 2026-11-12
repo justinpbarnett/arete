@@ -55,4 +55,5 @@ issue. Arete posts the split instead of building. Do not cut what the issue asks
 
 Set `ambiguous` to true only if a reasonable engineer could not proceed without an answer from the issue author,
 and put the single most important question in `question`. Missing detail you can decide sensibly is not ambiguity: decide it and say so in the plan.
+List in `assumptions` each such detail you decided yourself where the issue left it open, one short sentence each.
 Set `risk` to high if the change touches auth, payments, data migrations, or deletes data.

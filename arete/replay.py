@@ -24,7 +24,8 @@ SAMPLE_ANSWERS = {
     "plan": {"text": f"Add {SAMPLE_WORD} to {SAMPLE_FILE}.", "structured": {
         "plan": f"Add the word {SAMPLE_WORD} on a line of its own at the end of {SAMPLE_FILE}.",
         "ambiguous": False, "risk": "low", "estimated_lines": 1,
-        "verify": f"1. Run `grep {SAMPLE_WORD} {SAMPLE_FILE}` in the repo.\n2. It prints the line {SAMPLE_WORD}."}},
+        "verify": f"1. Run `grep {SAMPLE_WORD} {SAMPLE_FILE}` in the repo.\n2. It prints the line {SAMPLE_WORD}.",
+        "assumptions": [f"The word goes on a new last line of {SAMPLE_FILE}."]}},
     "build": {"text": f"Added {SAMPLE_WORD} to {SAMPLE_FILE}."},
     "verify": {"text": f"{SAMPLE_FILE} holds {SAMPLE_WORD}.", "structured": {
         "verdict": "pass", "summary": f"{SAMPLE_FILE} holds {SAMPLE_WORD}.",

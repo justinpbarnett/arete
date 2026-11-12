@@ -977,7 +977,15 @@ def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db, whole:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                                            + (f"AND {WHOLE_RUN} " if whole else "")
-                                           + "ORDER BY started DESC LIMIT ?", (repo, issue, limit))]
+                                           + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
+
+
+def later_run(repo: str, issue: int | str, run_id: str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "
+                      "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
+                      (repo, issue, run_id)).fetchone()
+        return dict(r) if r else None
 
 
 def interrupted_tickets(repo: str) -> list[str]:

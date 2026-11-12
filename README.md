@@ -274,15 +274,15 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 | event | fields |
 |---|---|
 | `task` | `ticket`, `kind`, `repo`, `title`, and `path` (the name of the script in `adws/` that ran it, such as `feature`) for a run from a [script](#the-adw-scripts); when the run starts |
-| `answer` | `asked_in` (the run that asked), `question`; in the new run that the author's reply starts |
+| `answer` | `asked_in` (the run that asked), `question`, `text` (the answer given through `POST /api/runs/RUN_ID/answer`, or empty); in the new run that the author's reply starts |
 | `step_start` | `step`, `runner`, `model`, `effort`, `tier` (the step's tier, or empty), `kind` (the task's kind); before each agent call. A [seam](#the-seam) step writes `step` and `try` instead, and a seam step that calls an agent (`plan`, `implement`, `revise`, `verify`, `review`, `learn`) adds the `runner`, `model`, `effort`, `tier` and `kind` its settings resolve to, `--set` overrides included |
 | `heartbeat` | `step`, `seconds` so far; every 30 seconds while a step works (`lines.HEARTBEAT_SECONDS`) |
 | `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`, `try`, `cache_read`, `cache_write`, `api_seconds`; the cost counts an attempt the network dropped. `tokens_in` includes the cache reads and writes. `try` is how many calls of this step name the run has recorded, so the second call of `build` has try 2; a step the pipeline numbers itself (`fix1`, `fix2`) starts at 1 under each name. `api_seconds` is the time the model's API calls took (0 on pi, which reports none), so `seconds` minus `api_seconds` is the time spent in tools. A seam step's line has `step`, `try`, `result`, `ok` (true for `pass` alone), `next`, `feedback`, `data`, `session`, then its agent calls' `runner`, `model`, `effort`, `tier` and `kind` (the distinct values joined with `, `) and their summed `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `cache_read`, `cache_write` and `api_seconds`, then `seconds`, `error`, and `tree` and `fingerprint` for a step called with `tree`. An agent call inside a seam step writes no `step_start` or `step_end` of its own; its row in the `steps` table stays |
-| `route` | `continues` (the run this one continues), `after` (the last step it took from that run), `skipped` (how many steps it took), `only`; once, when a continuing or `only` flow starts running steps |
+| `route` | `continues` (the run this one continues), `after` (the last step it took from that run), `skipped` (how many steps it took), `only`, `again` (the step `--from` names, or empty); once, when a continuing or `only` flow starts running steps |
 | `wait` | `cause` (`limit`, `ci`, `slot` or `person`), `phase` (`start` or `end`), `at`; the end line adds `since` and `minutes`. `limit` is a claude usage limit hold, `ci` the watch on CI, `slot` the wait for a free run slot: after the CI watch, and before the run started, from the first poll that passed the ready ticket over (for `max_parallel` or `max_parallel_per_repo`). `person` runs from the asking run's `question` line to the start of the run the reply starts, or to the first pass-over if there was one. The `slot` and `person` lines are the run's first lines. A wait whose end line never came is not counted |
 | `question` | `question` (the comment), `summary`; when the run asks the ticket's author |
 | `error` | `step` (the last step started, or empty), `message`; for a failed or interrupted run, not for a stop by request, and right after the `step_end` of a seam step that raised or returned something it may not |
-| `report` | `status` as the `runs` table holds it (`step` for a run of one step alone), `prs`, `minutes`, `cost_usd`, `wait_minutes` (minutes by cause, also kept on the run's row); always the last line, and the poll writes it for a run whose process died. `flow.respond` writes `status`, the fields it is given and `steps`: for each step name in the run's `step_end` lines, its `tries`, `minutes` and `cost_usd` |
+| `report` | `task` (the ticket's id), `status` as the `runs` table holds it (`step` for a run of one step alone), `prs`, `summary`, `requirements` (each check in use: `what`, `passed`, and `evidence`, the path of its screenshot or of the verify step's `.md` report), `assumptions` (what the plan decided where the ticket left it open), `left_for_a_person`, `review` (`verdict`, `summary`, and `problems`, each with `file`, `text` and `severity`), `question` (the summary of what the run asked), `steps` (for each step name in the run's `step_end` lines, its `tries`, `minutes` and `cost_usd`), `minutes`, `cost_usd`, `wait_minutes` (minutes by cause, also kept on the run's row). A classic run and a seam run write the same fields, and a field the run never reached is empty (`""`, `[]`, or a `review` with empty fields), never absent. `requirements` and `review` are the last check in use and review. Always the last line, and the poll writes it for a run whose process died. `flow.respond` writes `status`, the fields it is given and `steps` |
 
 Eval runs write the step events too, but no `task` or `report`.
 Each line is also printed to the run's stdout.
@@ -296,11 +296,12 @@ The run log, the `<step>.json` files, the tables and the records stay as they we
 
 - `factory.Outcome(result, next="", feedback="", data={}, session=NO_SESSION)` is what a step returns. `result` is `pass`, `fail`, `ask` or `stop`, and any other value raises. `next` names the step to run next, or is empty for the flow's own order. `data` is a JSON object. `outcome.passed` is true for `pass` alone.
 - `@factory.step("name")` registers `fn(flow, *args, **kw) -> Outcome` in `factory.STEPS`. A name registers once.
-- `factory.Flow(run_id, continues="", only="", ctx=None, labels=None)` is the handle of one run, and `ctx` is whatever the steps need. `flow.step(name, *args, **kw)` writes `step_start`, calls the step and writes `step_end` (see Run lines). `labels(name)` returns the fields that step's `step_start` adds. `try` counts the calls of the step from 1 and goes on from the runs this one continues.
+- `factory.Flow(run_id, continues="", only="", ctx=None, labels=None, again="")` is the handle of one run, and `ctx` is whatever the steps need. `flow.step(name, *args, **kw)` writes `step_start`, calls the step and writes `step_end` (see Run lines). `labels(name)` returns the fields that step's `step_start` adds. `try` counts the calls of the step from 1 and goes on from the runs this one continues.
 - A step that raises, returns anything but an `Outcome`, or returns `data` that JSON cannot write ends with `fail` and an `error` line, and the exception is raised again. An interrupt ends it with `stop` and no `error` line.
 - `tree=<folder>` stores the folder's fingerprint in `step_end`: `git write-tree` over the tracked and untracked files, ignored ones left out, staged on a copy of the index so the real one is untouched. The step function gets `tree` too.
 - `continues=<run id>` reads that run's lines and those of the runs it continued. Each `flow.step` call is matched in order against their `step_end` lines, and a call that meets a passing line of the same step returns the stored outcome without calling anything. A call also takes a failing line of the same step that the earlier run moved on from (no error, later lines follow) and gets its stored result, so a flow with a route back in its history follows the same route. A line with a fingerprint matches only while the folder's fingerprint equals the last one recorded for it, so a run whose folder is gone or changed goes on after the last step that did not touch it. The first call that does not match writes the `route` line and every later call runs.
 - `only=<step>` takes the steps before it from the stored outcomes, without comparing fingerprints, runs that step even if it passed, and raises `factory.OnlyDone` at every later call, which ends the run with the status `step`. It raises `factory.Refused` naming the step when an earlier step has no stored outcome it can take.
+- `again=<step>` with `continues` takes no stored outcome for that step, so it and every step after it run again.
 - `flow.respond(status, **fields)` writes the `report` line.
 
 ### The adw flow
@@ -339,7 +340,7 @@ The order of an adw run's steps lives in short scripts in `adws/` at the top of 
 | `adws/step.py` | Runs one step of an earlier run alone. |
 
 ```
-python adws/feature.py <repo> <ticket> [--force] [--dry-run] [--continue RUN] [--only STEP] [--set step.key=value ...]
+python adws/feature.py <repo> <ticket> [--force] [--dry-run] [--continue RUN] [--from STEP] [--only STEP] [--set step.key=value ...]
 python adws/revise.py  <repo> <ticket> [same options]
 python adws/step.py    <run id> <step> [key=value ...]
 ```
@@ -347,6 +348,7 @@ python adws/step.py    <run id> <step> [key=value ...]
 Run them with the Python that has arete installed (`uv run python adws/feature.py ...` from the checkout).
 
 - `--continue RUN` takes the passing steps of that earlier run of the same ticket (see `continues` in [The seam](#the-seam)). A run id of another repo or ticket is refused before any run starts.
+- `--from STEP` with `--continue` takes the stored outcomes up to that step, then runs it and every step after it again. It needs `--continue` and does not go with `--only`.
 - `--only STEP` runs that step alone and takes the steps before it from the stored outcomes; with no `--continue` there are none, so it refuses, naming the first step it could not take. The run ends with the status `step`, exits 0 only when the step passed, and leaves the ticket and the tracker as they were. Its `runs` row holds the step in `only_step`, so the ticket's history looks past it: the poller still restarts an interrupted run, a second interruption still fails the ticket, and a run after a question still answers it. A step run that dies or is stopped is settled `interrupted` or `stopped` with no comment, no ticket move and no restart.
 - `--set step.key=value` overrides one setting of one step for this run, with the keys and values of `[steps]` (see [Steps](#steps)); repeat it for more. The step names are the seam's (`plan`, `implement`, `revise`, `verify`, `review`, `learn`); `implement` and `revise` both set the build step. A value `[steps]` would not take is refused before any run starts.
 - `step.py <run id> <step> [key=value ...]` reads the script the earlier run used from the `path` on its `task` line and runs it with `--continue <run id> --only <step>`, each `key=value` as `--set <step>.key=value`. It refuses a run that did not come from a script, and settings for a step that calls no agent. The step runs in the earlier run's work folder, and a run that ended `done` or with a PR has removed it, so `step.py` refuses such a run and names the folder.
@@ -802,7 +804,7 @@ A step on the `claude` CLI rides the subscription, so every paid sum leaves it o
 
 ### API
 
-These routes pass the same caller check as the page, and the POST needs the `X-Arete` header. A bad request gets 400, an unknown task or run 404, and a tracker that fails 502.
+These routes pass the same caller check as the page, and the POST needs the `X-Arete` header. A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
 
 `POST /api/tasks` takes one of two JSON bodies:
 
@@ -811,13 +813,24 @@ These routes pass the same caller check as the page, and the POST needs the `X-A
 
 It answers `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the run's id, or `queued` with an empty `run` when no slot is free (`max_parallel` or `max_parallel_per_repo`) or the prompt's `Waits on` line still holds; `why` says which. In a repo the poller does not pick, `why` names the task and the `ticket` body that starts it. A queued task in a `pipeline = true` repo starts at a later poll. A ticket whose run is going on answers that run's id with `already running` and never starts twice.
 
-`GET /api/tasks/ID` returns the task: a local task's row with its `comments`, or a tracker item's `id`, `ref`, `title`, `url` and `state`, with `?repo=NAME` when no run names it yet. Both add `runs` (`id`, `status`, `started`, `finished`, `prs`, `cost_usd`), newest first, and `children`, the local tasks whose parent it is.
+`GET /api/tasks/ID` returns the task: a local task's row with its `comments`, or a tracker item's `id`, `ref`, `title`, `url` and `state`, with `?repo=NAME` when no run names it yet. Both add `runs` (`id`, `status`, `started`, `finished`, `prs`, `cost_usd`, and `report`, the run's [`report` line](#run-lines), or `{}` while it has none), newest first, and `children`, the local tasks whose parent it is.
 
 `GET /api/runs/RUN_ID/events` returns the run's [lines](#run-lines) as `application/x-ndjson`. `?from=SEQ` starts after that `seq`, and `?follow=1` keeps the response open and sends each new line until the `report` line, or until the run has stopped or its process has died and no line comes.
+
+These routes steer a ticket's run. The first three answer `{"task", "repo", "run", "state", "why"}` as `POST /api/tasks` does, with the run they started:
+
+- `POST /api/runs/RUN_ID/answer` with `{"text": "..."}` answers the question of a run that ended `needs-info`. It stores the answer on the ticket, as the owner's reply on a local task, a comment on a GitHub issue, which then loses its `needs-info` label, or a comment on a Jira ticket, and keeps it in the run's folder as `answer.md`. Then it starts the ticket's next run, whose `answer` line carries the `text`. A run of the ticket going on, or no free slot, refuses with 409 before the answer is stored. A label GitHub would not remove is named in `why`, and the run starts anyway.
+- `POST /api/runs/RUN_ID/resume` resumes a run that ended `interrupted`, `stopped` or `failed`, with the script in `adws/` it ran and `--continue`, so it goes on at the first step with no passing line: it passes `--from` the first step whose line did not pass, so a failing step and the steps after it run again instead of being taken from the old run. `{"step": "verify"}` runs that step and every step after it again instead. A run still marked running whose process is gone is settled first, as the poll would. A run of the classic path, a run of one step alone, and a step the run never started are refused.
+- `POST /api/runs/RUN_ID/steps/STEP` runs one step of a run that has ended alone, as `adws/step.py` does, and `{"set": {"model": "opus"}}` overrides that step's settings. It refuses a run that did not come from a script, settings for a step that calls no agent or that `[steps]` would not take, and a run whose work folder is gone.
+- `POST /api/runs/RUN_ID/stop` stops a running run as before, and the run ends with a `stopped` report.
+
+Each refuses a run in the wrong state and names the state. `answer` and `resume` also refuse a run that is not the ticket's latest and name the run that came after it; runs of one step alone do not count. `steps` has no such rule.
 
 ```sh
 curl -H 'X-Arete: 1' -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' http://HOST:PORT/api/tasks
 curl 'http://HOST:PORT/api/runs/RUN_ID/events?follow=1'
+curl -H 'X-Arete: 1' -d '{"text": "Put the toggle in the header."}' http://HOST:PORT/api/runs/RUN_ID/answer
+curl -H 'X-Arete: 1' -d '{"step": "verify"}' http://HOST:PORT/api/runs/RUN_ID/resume
 ```
 
 ## Rules

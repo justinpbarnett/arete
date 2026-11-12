@@ -173,11 +173,13 @@ def checked(name: str, value) -> Outcome:
 
 class Flow:
     def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None,
-                 labels: Callable[[str], dict] | None = None) -> None:
+                 labels: Callable[[str], dict] | None = None, again: str = "") -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
+        if again and again not in STEPS:
+            raise KeyError(f"from {again}: no step by that name")
         chained = chain(continues)
-        self.run_id, self.continues, self.only, self.ctx = run_id, continues, only, ctx
+        self.run_id, self.continues, self.only, self.ctx, self.again = run_id, continues, only, ctx, again
         self.labels = labels or (lambda name: {})
         self.earlier = history(chained)
         self.tries = tries_in([lines.read(run_id), *chained])
@@ -192,7 +194,7 @@ class Flow:
         if self.done:
             raise OnlyDone(f"only {self.only} runs in this flow")
         if self.matching:
-            if name != self.only and (found := self.stored(name, kw)):
+            if name not in (self.only, self.again) and (found := self.stored(name, kw)):
                 self.skipped += 1
                 return found
             if self.only and name != self.only:
@@ -230,7 +232,7 @@ class Flow:
     def route(self) -> None:
         after = str(self.earlier[self.skipped - 1].get("step") or "") if self.skipped else ""
         lines.write(self.run_id, "route", continues=self.continues, after=after, skipped=self.skipped,
-                    only=self.only)
+                    only=self.only, again=self.again)
         self.matching = False
 
     def run(self, name: str, args: tuple, kw: dict) -> Outcome:
@@ -272,16 +274,19 @@ class Flow:
     def respond(self, status: str, **fields) -> dict:
         if self.matching:
             self.route()
-        tally: dict[str, list] = {}
-        for line in lines.read(self.run_id):
-            if line.get("event") == "step_end":
-                counts = tally.setdefault(str(line.get("step") or ""), [0, 0.0, 0.0])
-                counts[0] += 1
-                counts[1] += amount(line, "seconds")
-                counts[2] += amount(line, "cost_usd")
-        steps = {name: {"tries": n, "minutes": round(seconds / 60, 2), "cost_usd": round(cost, 6)}
-                 for name, (n, seconds, cost) in tally.items()}
-        return lines.write(self.run_id, "report", **{**fields, "status": status, "steps": steps})
+        return lines.write(self.run_id, "report", **{**fields, "status": status, "steps": tally(self.run_id)})
+
+
+def tally(run_id: str) -> dict[str, dict]:
+    found: dict[str, list] = {}
+    for line in lines.read(run_id):
+        if line.get("event") == "step_end":
+            counts = found.setdefault(str(line.get("step") or ""), [0, 0.0, 0.0])
+            counts[0] += 1
+            counts[1] += amount(line, "seconds")
+            counts[2] += amount(line, "cost_usd")
+    return {name: {"tries": n, "minutes": round(seconds / 60, 2), "cost_usd": round(cost, 6)}
+            for name, (n, seconds, cost) in found.items()}
 
 
 def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
@@ -309,6 +314,8 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
                    help="take the passing steps of this earlier run of the ticket")
     p.add_argument("--only", default="", choices=sorted(STEPS),
                    help="run this step alone, the steps before it from the stored outcomes")
+    p.add_argument("--from", dest="again", default="", choices=sorted(STEPS),
+                   help="with --continue, run this step again and every step after it")
     p.add_argument("--set", dest="sets", action="append", default=[], metavar="STEP.KEY=VALUE",
                    help="override one setting of one step; repeat for more")
     args = p.parse_args(argv)
@@ -316,7 +323,7 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
         table = overrides(args.sets, flows.ROLE_OF)
     except (ValueError, TypeError) as e:
         p.error(str(e))
-    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table)
+    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again)
     try:
         code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
     except config.UnknownRepo as e:

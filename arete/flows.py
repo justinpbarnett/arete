@@ -32,12 +32,30 @@ def ran_on_seam(run_id: str) -> bool:
 
 
 def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.RunSlot | None = None,
-          continues: str = "", only: str = "") -> factory.Flow:
+          continues: str = "", only: str = "", again: str = "") -> factory.Flow:
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.tid}"
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     job = Job(cfg, run, ws, slot=slot)
-    return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels)
+    return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again)
+
+
+def facts(name: str, data: dict) -> dict:
+    if name in ("plan", "revise"):
+        return {"assumptions": pipeline.assumptions_of(data), "left_for_a_person": str(data.get("left_for_a_person") or "")}
+    if name == "verify" and isinstance(data.get("verified"), dict):
+        return {"requirements": Verified.stored(data["verified"]).requirements()}
+    if name == "review" and isinstance(data.get("review"), dict):
+        return {"review": pipeline.report_review(data["review"])}
+    return {}
+
+
+def seam_facts(run_id: str) -> dict:
+    found: dict = {}
+    for line in factory.history(factory.chain(run_id)):
+        if line.get("result") == "pass" or line.get("step") == "review":
+            found.update(facts(str(line.get("step") or ""), factory.outcome_of(line).data))
+    return found
 
 
 @dataclass
@@ -115,6 +133,8 @@ class Job:
 
     def take(self, name: str, outcome: Outcome, stored: bool) -> None:
         data, run = outcome.data, self.run
+        if outcome.passed or name == "review":
+            run.facts.update(facts(name, data))
         if "story" in data:
             run.story = list(data["story"])
         if name == "prepare" and outcome.passed:
@@ -178,7 +198,8 @@ def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
     lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=run.repo.name, title=t.title,
                 **({"path": run.path} if run.path else {}))
     if run.answering:
-        lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "")
+        lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
+                    text=pipeline.answer_text(run.answering["id"]))
 
 
 def end_as(result: str, kind: str, **fields) -> Outcome:
@@ -301,7 +322,8 @@ def plan(flow: factory.Flow) -> Outcome:
     return Outcome("pass", data={
         "plan": plan_text, "estimate": estimate,
         "goal": found.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for.",
-        "left_for_a_person": pipeline.left_section(run, (found.get("left_for_a_person") or "").strip())})
+        "left_for_a_person": pipeline.left_section(run, (found.get("left_for_a_person") or "").strip()),
+        "assumptions": pipeline.assumptions_of(found)})
 
 
 @factory.step("revise")
