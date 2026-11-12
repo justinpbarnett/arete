@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
-from . import config, paths, util
+from . import config, environment, paths, util
 from .util import git
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
@@ -66,14 +66,16 @@ def with_free_ports(v: config.Verify) -> config.Verify:
 
 
 @contextmanager
-def serving(v: config.Verify, cwd: Path, log: Path):
+def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
+            repo: config.Repo | None = None):
     if not v.start:
         yield ""
         return
     url = v.url.rstrip("/")
     with open(log, "w") as out:
         proc = subprocess.Popen(v.start, shell=True, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, **util.own_group_args())
+                                stdin=subprocess.DEVNULL, env=environment.commands(cfg or config.load(), repo),
+                                **util.own_group_args())
     try:
         wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
         yield url

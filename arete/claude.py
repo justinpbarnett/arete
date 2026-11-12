@@ -12,7 +12,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import background, devices, paths, util
+from . import background, config, devices, environment, paths, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -23,6 +23,8 @@ from .agent import (
 )
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
+LOGIN_VARS = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN")
+AGENT_SETS = {"ARETE_AGENT": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
 PATH_RULE_OF = {"Read": "Read", "Glob": "Read", "Grep": "Read", "LS": "Read", "Edit": "Edit", "MultiEdit": "Edit",
                 "Write": "Edit", "NotebookEdit": "Edit"}
 GIT_WRITES_TO_ANY_PATH = "Bash(git * --output*)"
@@ -42,6 +44,12 @@ SETTING_SOURCES = {"user": ("user",), "repo": ("project", "local")}
 
 def binary() -> str:
     return shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+
+
+def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None) -> dict[str, str]:
+    passing = environment.passed(config.load()) if passing is None else passing
+    return environment.build([*LOGIN_VARS, *passing], {**AGENT_SETS, **(extra or {})}, never=PARENT_SESSION_VARS,
+                             source=source)
 
 
 def command(
@@ -127,6 +135,7 @@ def run(
     settings: dict | None = None,
     instructions: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
+    passing: list[str] | None = None,
     on_line: Callable[[str], None] = lambda line: None,
 ) -> Result:
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
@@ -135,13 +144,11 @@ def run(
                   resume=resume, fresh_session=fresh_session, system=system, max_budget_usd=max_budget_usd,
                   persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, remote=remote, settings=settings,
                   instructions=instructions)
-    env = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
-    env["ARETE_AGENT"] = "1"
-    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
-    env.update(extra_env or {})
     if remote:
-        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd,
-                           {"ARETE_AGENT": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
+        env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, **AGENT_SETS, **(extra_env or {})}
+        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, dict(AGENT_SETS))
+    else:
+        env = agent_env(passing, extra_env)
     try:
         proc = run_streaming(cmd, None if remote else str(cwd), prompt, env, timeout, on_line)
     except subprocess.TimeoutExpired:

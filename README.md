@@ -191,6 +191,60 @@ arete session attach ID | stop ID | list
 
 `arete costs --by step|kind|model` counts every step instead, at the cost each call reported (a claude CLI step's is the API price), grouped by step name, by the task's kind (`feat`, `fix`) or by model, or by several in turn with `--by step kind model`, over the last `--days N` (default 7). Each row shows the runs (distinct runs in the group), calls, cost, input tokens no cache served (`in`), cache reads and cache writes, output tokens, minutes and API minutes. The minutes are each call's whole time; the API minutes are the part the model's API calls took, as the runner reports it (claude does, pi does not), so the rest went to tools. The last line gives the wait minutes of the runs started in that window, by cause. `--json` prints one JSON line per group and a last line with `wait_minutes`; `--json` alone groups by step. The plain `arete costs` stays the paid view.
 
+## An agent's environment
+
+A local agent, and each command that runs a repo's code, starts from a short list of named variables, never the server's whole environment.
+A key, token or proxy setting in the server's environment stays out unless you name it.
+Every such process gets these, when the server has them:
+
+- `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, every `LC_*`, `TZ`, `TMPDIR`, `TERM`
+- `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`
+- `ARETE_CONFIG_DIR`, `ARETE_STATE_DIR`, `ARETE_LOG_DIR`, `ARETE_WORKTREES_DIR`, so the guard hook and `arete ask` read the same config, state and worktrees as the server
+- each name in `[environment] pass`
+
+A claude agent adds its login, `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`, and never gets `ANTHROPIC_API_KEY`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT` or `CLAUDE_CODE_SSE_PORT`, even under `pass = ["*"]`.
+It also gets `ARETE_AGENT=1` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
+The agent's shell, its hooks and the MCP servers it starts get the same environment.
+`CLAUDE_CODE_OAUTH_TOKEN` therefore reaches the agent's shell too; a login made with `claude auth login` stays in the CLI's own store instead.
+
+A pi agent adds the keys of the provider its model names: the part before `/`, such as `openrouter` in `openrouter/qwen3-coder`, or pi's `defaultProvider` in `~/.pi/agent/settings.json` for a model with no `/`.
+It gets each variable whose name starts with the provider's name in capitals and `_`, such as `OPENROUTER_*` (a `-` or other sign in the name becomes `_`), plus the names `[environment.providers]` lists for that provider.
+It reads them from `~/.config/arete/pi.env` first, and from the server's environment when `pi.env` lacks one.
+When arete cannot tell the provider, the agent gets every name in `pi.env`.
+It also gets `ARETE_AGENT=1` and `PI_CODING_AGENT_DIR`.
+
+These commands start from the same list, plus the values arete sets for them, such as a loop check's `ARETE_RUN_ID` and `ARETE_SCRATCH`:
+
+- a layer's `[setup] commands`, `[checks]` and `[verify] start`
+- a loop's check and measure commands, and a `push` emit's gate check
+- an eval's setup commands and its held out check
+
+Arete's own commands keep the server's environment: git, gh and ssh, the sources and the heartbeat's probes, the installer, and `claude auth status`.
+A device other than `local` keeps today's environment, since the device is its own machine.
+
+`[environment] pass` names more variables to pass, in `~/.config/arete/config.toml` for every repo, or in a repo's layer for that repo's agents and commands:
+
+```toml
+[environment]
+pass = ["HTTPS_PROXY", "NODE_EXTRA_CA_CERTS"]
+
+[environment.providers]
+amazon-bedrock = ["AWS_*"]
+```
+
+A name may end in `*` to match a prefix, and `["*"]` passes everything but the parent session's names above.
+Here a pi agent on `amazon-bedrock/...` also gets every `AWS_*` variable, and no other agent does.
+Arete reads a layer's `pass` from the repo's layer folder, never from a worktree, so an agent cannot widen its own environment, and a layer arete cannot read passes nothing more.
+`[environment.providers]` goes in the engine config only.
+A proxy, a Bedrock or Vertex login, or a CA certificate file that claude needs goes in `pass` too.
+
+A setup or check command that used a variable from the server's environment may now miss it.
+On each start, `arete serve` logs the server variables that no longer reach agents and these commands, by name, never by value; add the ones a command needs to `pass`.
+Each step's `step_start` run line lists the names its agent gets (see [Run lines](#run-lines)).
+
+This keeps a key out of an agent's reach only as far as the environment goes.
+The agent runs as your user, so it can still read a file your user can; the guard's secret file rules are a second layer, and a device is the real wall.
+
 ## JEV
 
 JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads text and answers a yes or no question, picks one of a few labels, or rates on a scale, each with a confidence, fast and for $0.042 per million input tokens. Arete asks it first where a classifier can settle the question, and leaves the question to the model only when JEV is unsure:
@@ -219,6 +273,8 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
 - `arete ask QUESTION [PATHS] [--choice A B] [--score LOW HIGH] [-r] [--only ANSWER] [--json]` asks JEV about piped text, or about each file, sixteen at a time. Agents that can run commands get it, with a short note on when it pays: sort files before reading them, sort a test failure before digging in, check a diff against its task. An agent may ask only about files inside its working folder, and never about secret files.
 
 JEV uses the OpenRouter key the pi runner uses: `OPENROUTER_API_KEY` in `~/.config/arete/pi.env`, or in arete's environment.
+The guard runs inside the agent, which no longer gets the server's environment (see [An agent's environment](#an-agents-environment)), so a key set only in arete's environment leaves the guard with no judge: it keeps only its secret file rules.
+`arete serve` says so when it starts, and so does the run log of each claude step that can run commands; put the key in `pi.env` to give the guard its judge back.
 With no key, with JEV off, or when a call fails, each step does what it did before JEV, with one exception: when the push screen's or the proof check's call fails, the push waits for approval, because a push lands with no PR to review.
 When the already fixed check fails, the run goes on.
 Each call is a step of its run on the `jev` runner, priced at what OpenRouter charged; a guard check is a step only when it stops something.
@@ -275,7 +331,7 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 |---|---|
 | `task` | `ticket`, `kind`, `repo`, `title`, and `path` (the name of the script in `adws/` that ran it, such as `feature`) for a run from a [script](#the-adw-scripts); when the run starts |
 | `answer` | `asked_in` (the run that asked), `question`, `text` (the answer given through `POST /api/runs/RUN_ID/answer`, or empty); in the new run that the author's reply starts |
-| `step_start` | `step`, `runner`, `model`, `effort`, `tier` (the step's tier, or empty), `kind` (the task's kind); before each agent call. A [seam](#the-seam) step writes `step` and `try` instead, and a seam step that calls an agent (`plan`, `implement`, `revise`, `verify`, `review`, `learn`) adds the `runner`, `model`, `effort`, `tier` and `kind` its settings resolve to, `--set` overrides included |
+| `step_start` | `step`, `runner`, `model`, `effort`, `tier` (the step's tier, or empty), `kind` (the task's kind), `env` (the sorted names of the variables the agent starts with, never their values; see [An agent's environment](#an-agents-environment)); before each agent call. A [seam](#the-seam) step writes `step` and `try` instead, and a seam step that calls an agent (`plan`, `implement`, `revise`, `verify`, `review`, `learn`) adds the `runner`, `model`, `effort`, `tier`, `kind` and `env` its settings resolve to, `--set` overrides included |
 | `heartbeat` | `step`, `seconds` so far; every 30 seconds while a step works (`lines.HEARTBEAT_SECONDS`) |
 | `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`, `try`, `cache_read`, `cache_write`, `api_seconds`; the cost counts an attempt the network dropped. `tokens_in` includes the cache reads and writes. `try` is how many calls of this step name the run has recorded, so the second call of `build` has try 2; a step the pipeline numbers itself (`fix1`, `fix2`) starts at 1 under each name. `api_seconds` is the time the model's API calls took (0 on pi, which reports none), so `seconds` minus `api_seconds` is the time spent in tools. A seam step's line has `step`, `try`, `result`, `ok` (true for `pass` alone), `next`, `feedback`, `data`, `session`, then its agent calls' `runner`, `model`, `effort`, `tier` and `kind` (the distinct values joined with `, `) and their summed `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `cache_read`, `cache_write` and `api_seconds`, then `seconds`, `error`, and `tree` and `fingerprint` for a step called with `tree`. An agent call inside a seam step writes no `step_start` or `step_end` of its own; its row in the `steps` table stays |
 | `route` | `continues` (the run this one continues), `after` (the last step it took from that run), `skipped` (how many steps it took), `only`, `again` (the step `--from` names, or empty); once, when a continuing or `only` flow starts running steps |
@@ -401,6 +457,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `[jev.screen_lines]` (the chance at which each push screen question holds a push: `weakens` 0.5, `secrets` 0.7, `outside` 0.7, `irreversible` 0.5, `feature` 0.6, `removes` 0.5, `renames` 0.5, and `reach` 0.8, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost. |
 | `[replay]` | `all` (default false, sends every agent call to the replay runner) and `dir` (the folder of answers; `ARETE_REPLAY_DIR` wins over it). See [Replay](#replay). |
+| `[environment]` | `pass`, the names of more server variables that local agents and the commands that run a repo's code get, each an exact name, a prefix ending in `*`, or `"*"` for all. `[environment.providers]` maps a pi provider to more names its agents get, such as `amazon-bedrock = ["AWS_*"]`. See [An agent's environment](#an-agents-environment). |
 
 | Repo field | Default | Meaning |
 |------------|---------|---------|
@@ -549,6 +606,7 @@ path = "classic"
 | `verify.notes` | What the verifier must know: how to sign in, what not to touch, what is shared. |
 | `research.dir` | Folder, from the repo root, where arete files the reports of this repo's research tickets as pull requests. Leave it out and the reports stay in arete. See [Triage](#triage). |
 | `factory.path` | `classic` (default) or `adw`, which runs a ticket through the [adw flow](#the-adw-flow) on any repo. |
+| `environment.pass` | More server variables this repo's local agents and commands get, on top of the engine's `[environment] pass`. Read from the layer folder, never from a worktree. A layer takes no `[environment.providers]`. See [An agent's environment](#an-agents-environment). |
 
 A template with an unknown field falls back to the default. A layer may also hold `[steps]`, `[kinds]` and `[tiers]`, which set its steps apart from the engine's; see [Steps](#steps). A layer in `.agents/` that is not committed yet still works: runs read it from the main checkout and lessons land there, but arete never proposes automerge until it is committed. A layer outside the repo is read in place, lessons land in its `expertise.md`, and the miner leaves the repo's `.agents/` alone. Arete never proposes automerge for it: raise `trust.level` by hand.
 

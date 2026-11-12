@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+import os
+from collections.abc import Iterable, Mapping
+
+from . import config, util
+
+BASE = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TZ", "TMPDIR", "TERM", "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "ARETE_CONFIG_DIR", "ARETE_STATE_DIR", "ARETE_LOG_DIR",
+        "ARETE_WORKTREES_DIR")
+SHELL_BOOKKEEPING = ("_", "PWD", "OLDPWD", "SHLVL", "ARETE_SERVE_RESTARTED_FOR_NEW_CODE")
+
+
+def passes(name: str, patterns: Iterable[str]) -> bool:
+    return any(p == "*" or p == name or (p.endswith("*") and name.startswith(p[:-1])) for p in patterns)
+
+
+def build(names: Iterable[str], sets: Mapping[str, str] | None = None, *, never: Iterable[str] = (),
+          source: Mapping[str, str] | None = None) -> dict[str, str]:
+    patterns, never = [*BASE, *names], set(never)
+    kept = {k: v for k, v in (os.environ if source is None else source).items()
+            if k not in never and passes(k, patterns)}
+    return {**kept, **(sets or {})}
+
+
+def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:
+    names = list(cfg.environment.passes)
+    if repo is None:
+        return names
+    try:
+        return names + list(config.load_layer(repo.layer_dir).passes)
+    except (ValueError, TypeError, OSError):
+        return names
+
+
+def commands(cfg: config.Config, repo: config.Repo | None = None, sets: Mapping[str, str] | None = None) -> dict:
+    return build(passed(cfg, repo), sets)
+
+
+def sh(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None,
+       sets: Mapping[str, str] | None = None, **kw):
+    return util.sh(cmd, env=commands(cfg, repo, sets), inherit=False, **kw)
+
+
+def dropped(cfg: config.Config, source: Mapping[str, str] | None = None) -> list[str]:
+    patterns = [*BASE, *cfg.environment.passes]
+    return sorted(k for k in (os.environ if source is None else source)
+                  if k not in SHELL_BOOKKEEPING and not passes(k, patterns))

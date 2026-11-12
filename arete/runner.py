@@ -8,7 +8,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
-from . import ask, claude, config, devices, guard, jev, paths, pi, record, replay, state, util
+from . import ask, claude, config, devices, environment, guard, jev, paths, pi, record, replay, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -52,6 +52,32 @@ def route(model: str, runner: str = "") -> tuple[str, str]:
 def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
     which, name = route(model, run_with)
     return (REPLAY if cfg.replay.all else which), name
+
+
+def stands_for(model: str, run_with: str) -> tuple[str, str]:
+    which, name = route(model, "" if run_with == REPLAY else run_with)
+    return (which if which != REPLAY else "pi" if "/" in name else "claude"), name
+
+
+def run_env(run_id: str) -> dict[str, str]:
+    return {"ARETE_RUN_ID": run_id} if run_id else {}
+
+
+def env_names(model: str, run_with: str, cfg: config.Config, repo: config.Repo | None, run_id: str) -> list[str]:
+    which, name = stands_for(model, run_with)
+    passing = environment.passed(cfg, repo)
+    if which == "pi":
+        return sorted(pi.agent_env(name, passing, cfg.environment.providers))
+    return sorted(claude.agent_env(passing, run_env(run_id)))
+
+
+def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: config.Repo | None = None) -> str:
+    passing = environment.passed(cfg, repo) if passing is None else passing
+    if not (cfg.jev.guard and jev.ready(cfg, [repo])) or jev.key(claude.agent_env(passing)):
+        return ""
+    return (f"the guard has no judge: JEV's key is only in the server's environment, which an agent no longer gets, so "
+            f"the guard judges no command and keeps only its secret file rules; put {jev.KEY_NAME} in "
+            f"{paths.short_path(pi.KEYS_FILE)}")
 
 
 def metered(model: str, run_with: str = "") -> bool:
@@ -152,20 +178,26 @@ def priced(res: Result, cfg: config.Config) -> float:
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
         wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, tier: str = "",
-        kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), **kw) -> Result:
+        kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(),
+        repo: config.Repo | None = None, **kw) -> Result:
     cfg = cfg or config.load()
     which, name = chosen(model, runner or resume.runner, cfg)
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
     if target.remote:
         kw["remote"] = target
+    elif which in ("claude", "pi"):
+        repo = repo or cfg.repo_for_work_dir(cwd)
+        kw["passing"] = environment.passed(cfg, repo)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_claude(kw, cwd, cfg, trace[0], ask_jev)
+            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo)
     elif which == "pi":
         kw["price"] = lambda reply: priced(reply, cfg)
+        if not target.remote:
+            kw["providers"] = cfg.environment.providers
     limited: list[Result] = []
     while True:
         if wait_out_limits and (held := usage_hold(name, which)):
@@ -252,11 +284,14 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
     return found
 
 
-def local_claude(kw: dict, cwd: Path | str, cfg: config.Config, run_id: str, ask_jev: bool) -> dict:
-    kw = {**kw, "extra_env": {"ARETE_RUN_ID": run_id} if run_id else {}}
+def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: Callable[[str], None],
+                 repo: config.Repo | None) -> dict:
+    kw = {**kw, "extra_env": run_env(run_id)}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings()
-    if ask_jev and runs_bash(kw) and jev.ready(cfg, [cfg.repo_for_work_dir(cwd)]):
+        if runs_bash(kw) and (note := judge_note(cfg, kw["passing"], repo)):
+            say(note)
+    if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), ask.rule()]
         kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), ask.note()]))
     return kw

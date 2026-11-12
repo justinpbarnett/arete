@@ -19,6 +19,7 @@ from . import (
     dashboard,
     devices,
     engine,
+    environment,
     explain,
     hold_review,
     loops,
@@ -370,9 +371,24 @@ class Server:
         })
 
 
+def start_notes(cfg: config.Config) -> list[str]:
+    notes = []
+    if dropped := environment.dropped(cfg):
+        notes.append(f"these server variables no longer reach agents or the commands that run a repo's code: "
+                     f"{', '.join(dropped)}; add a name to [environment] pass in "
+                     f"{paths.short_path(paths.CONFIG_FILE)} or a repo's layer to pass it (a trailing * matches a "
+                     f"prefix, [\"*\"] passes all); a claude agent still gets its login and a pi agent its provider's "
+                     f"keys")
+    if judge := runner.judge_note(cfg):
+        notes.append(judge)
+    return notes
+
+
 def run(with_dashboard: bool = True) -> NoReturn:
     server = Server()
     server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
+    for note in start_notes(server.cfg):
+        server.say(note)
     if with_dashboard:
         threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
     while True:

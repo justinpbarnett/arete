@@ -6,7 +6,22 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, diffguard, factory, gh, jev, lines, paths, pipeline, record, runner, state, tracker, util
+from . import (
+    config,
+    diffguard,
+    environment,
+    factory,
+    gh,
+    jev,
+    lines,
+    paths,
+    pipeline,
+    record,
+    runner,
+    state,
+    tracker,
+    util,
+)
 from .agent import NO_SESSION, Result
 from .factory import Outcome
 from .verify import Verified
@@ -124,7 +139,8 @@ class Job:
         if name not in ROLE_OF:
             return {}
         s = self.run.settings(ROLE_OF[name])
-        return {"runner": s.runner, "model": s.model, "effort": s.effort, "tier": s.tier, "kind": self.run.kind}
+        return {"runner": s.runner, "model": s.model, "effort": s.effort, "tier": s.tier, "kind": self.run.kind,
+                "env": runner.env_names(s.model, s.runner, self.cfg, self.run.repo, self.run.id)}
 
     def with_left(self, text: str) -> str:
         if not self.left_for_a_person:
@@ -272,7 +288,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
             shutil.copy2(src, dest)
     for cmd in layer.setup:
         with record.timed(run.id, "setup", command=cmd) as setup:
-            res = util.sh(cmd, cwd=job.ws, timeout=1200)
+            res = environment.sh(cmd, cfg, repo, cwd=job.ws, timeout=1200)
             setup["exit"] = res.returncode
         run.log(f"setup `{cmd}`: exit {res.returncode}")
         if res.returncode != 0:

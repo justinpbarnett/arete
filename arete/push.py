@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import config, diffguard, jev, outbound, paths, state, util
+from . import config, diffguard, environment, jev, outbound, paths, state, util
 from .emits import Emit, config_repo
 from .loops import Loop, as_list, blank, check_env, worktree_kinds
 
@@ -113,7 +113,7 @@ class Push(Emit):
         if "origin" not in util.git(["remote"], src, check=False).split():
             raise RuntimeError(f"{paths.short_path(src)} has no origin to push to")
         with branch_worktree(src, item["branch"], f"push-{run_id}") as wt:
-            sha = land(item, wt, src, base)
+            sha = land(item, wt, src, base, cfg)
         state.set_verdict_sha(run_id, sha)
         util.git(["branch", "-D", item["branch"]], src, check=False)
         return f"pushed {sha[:10]} to {base}; {fast_forward(src, base, sha)}"
@@ -198,13 +198,14 @@ def rebase_onto(wt: Path, base: str) -> None:
         raise NoLongerRebases(base, clashes, e) from e
 
 
-def land(item: dict, wt: Path, src: Path, base: str) -> str:
+def land(item: dict, wt: Path, src: Path, base: str, cfg: config.Config) -> str:
     for attempt in (1, 2):
         util.git(["fetch", "-q", "origin", base], src)
         util.git(["reset", "-q", "--hard"], wt)
         util.git(["clean", "-qfd"], wt)
         rebase_onto(wt, base)
-        gate = util.sh(item["check"], cwd=wt, timeout=item["timeout"], env=item["env"])
+        gate = environment.sh(item["check"], cfg, push_repo(cfg, item), sets=item["env"], cwd=wt,
+                              timeout=item["timeout"])
         if gate.returncode != 0:
             raise RuntimeError(f"`{item['check']}` exits {gate.returncode} after the rebase: "
                                f"{util.last_line((gate.stdout or '') + (gate.stderr or ''), 300)}")

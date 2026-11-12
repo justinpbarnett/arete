@@ -9,7 +9,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, gh, paths, record, runner, state, tracker, util, verify
+from . import config, environment, gh, paths, record, runner, state, tracker, util, verify
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
@@ -263,7 +263,7 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: AgentRun) -> config.R
             (wt / c).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, wt / c)
     for cmd in layer.setup:
-        if util.sh(cmd, cwd=wt, timeout=1200).returncode != 0:
+        if environment.sh(cmd, run.cfg or config.load(), repo, cwd=wt, timeout=1200).returncode != 0:
             raise RunFailed(f"setup `{cmd}` failed")
     commit_overlay(wt)
     return layer
@@ -356,7 +356,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                 dest = wt / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
-            res = util.sh(task.check, cwd=wt, timeout=timeout)
+            res = environment.sh(task.check, cfg, repo, cwd=wt, timeout=timeout)
             (run_dir / "check.log").write_text(res.stdout + res.stderr)
             run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
             if res.returncode != 0:
