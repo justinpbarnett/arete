@@ -136,6 +136,7 @@ class Verified:
     checks: list[dict] = field(default_factory=list)
     blocked_by: str = ""
     finished: bool = True
+    saved: str = ""
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:
@@ -162,6 +163,16 @@ class Verified:
     def screenshots(self, evidence: Path) -> list[Path]:
         names = [Path(c["screenshot"]).name for c in self.checks if (c.get("screenshot") or "").strip()]
         return [evidence / n for n in dict.fromkeys(names) if (evidence / n).is_file()][:MAX_SCREENSHOTS]
+
+    def requirements(self) -> list[dict]:
+        return [{"what": str(c.get("what") or "").strip(), "passed": bool(c.get("passed")),
+                 "evidence": self.evidence_of(c)} for c in self.checks]
+
+    def evidence_of(self, check: dict) -> str:
+        shot = Path(str(check.get("screenshot") or "")).name
+        if self.saved and shot and (found := Path(self.saved).parent / "evidence" / shot).is_file():
+            return os.path.abspath(found)
+        return self.saved
 
     def markdown(self, image_url: dict[str, str] | None = None) -> str:
         if self.verdict == "unverified":

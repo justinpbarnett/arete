@@ -189,7 +189,7 @@ STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Re
                      chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
-                     triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409}
+                     triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409, tasks.TrackerFailed: 502}
 
 
 def refusal_status(e: Exception) -> int | None:
@@ -325,9 +325,15 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith(LOOP_PATH):
                 return self.loop_action(*last_part(path, LOOP_PATH))
             if path.startswith(RUN_PATH):
-                run_id, action = last_part(path, RUN_PATH)
+                run_id, _, action = unquote(path[len(RUN_PATH):]).partition("/")
                 if action == "stop":
                     return control.stop_run(run_id)
+                if action == "answer":
+                    return tasks.reply(run_id, str(self.body().get("text") or ""))
+                if action == "resume":
+                    return tasks.resume(run_id, str(self.body().get("step") or ""))
+                if action.startswith("steps/"):
+                    return tasks.run_step(run_id, action[len("steps/"):], self.body().get("set") or {})
             if path.startswith(APPROVAL_PATH):
                 return control.decide(whole_number(unquote(path[len(APPROVAL_PATH):])),
                                       self.body().get("approve") is True)

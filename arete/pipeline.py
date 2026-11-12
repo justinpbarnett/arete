@@ -65,6 +65,7 @@ CHECKED_IN_USE_HEADING = "## Checked in use"
 SLOTS_LOCK = "run-slots"
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
+ANSWER_FILE = "answer.md"
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
 
@@ -78,6 +79,7 @@ PLAN_SCHEMA = {
         "estimated_lines": {"type": "integer", "minimum": 0},
         "verify": {"type": "string"},
         "left_for_a_person": {"type": "string"},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
         "split": {
             "type": "array",
             "items": {
@@ -300,6 +302,7 @@ class Run(AgentRun):
     answering: dict = field(default_factory=dict)
     path: str = ""
     alone: bool = False
+    facts: dict = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -703,6 +706,7 @@ class Script:
     continues: str = ""
     only: str = ""
     overrides: dict[str, dict] = field(default_factory=dict)
+    again: str = ""
 
     @property
     def run_fields(self) -> dict:
@@ -728,6 +732,17 @@ def flow_function(cfg: config.Config, name: str) -> Callable:
     return fn
 
 
+def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
+    return [sys.executable, str(script_file(cfg, name)), *args]
+
+
+def answer_text(asked_id: str) -> str:
+    try:
+        return (paths.RUNS_DIR / asked_id / ANSWER_FILE).read_text()
+    except OSError:
+        return ""
+
+
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
     from . import flows
     cfg = config.load()
@@ -739,7 +754,7 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if not adw:
         return [sys.executable, "-m", "arete.cli", "run", repo_name, str(tid), *flags]
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
-    return [sys.executable, str(script_file(cfg, name)), repo_name, str(tid), *flags]
+    return script_command(cfg, name, repo_name, str(tid), *flags)
 
 
 def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
@@ -753,6 +768,10 @@ def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
 
 
 def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script) -> str:
+    if script.again and not script.continues:
+        return "--from needs --continue"
+    if script.again and script.only:
+        return "--from and --only do not go together"
     if script.continues:
         row = state.run_get(script.continues) or {}
         if (row.get("repo"), str(row.get("issue"))) != (repo.name, str(tid)):
@@ -835,8 +854,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
-        flow = (flows.start(cfg, run, earlier[0] if restarting else {}, slot, script.continues, script.only)
-                if script else None)
+        flow = (flows.start(cfg, run, earlier[0] if restarting else {}, slot, script.continues, script.only,
+                            script.again) if script else None)
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if not dry_run and not run.alone:
@@ -875,7 +894,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
         run.log(f"done: {status} {pr_url or summary}")
         record.settle(run_id, status, summary=summary, pr_url=pr_url)
-        write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow)
+        write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow, run)
         if status == "skipped":
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in ("pr", "noop", "needs-info", "dry-run", "done") if passed is None else passed) else 1
@@ -893,15 +912,38 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple
     return "failed", why, ""
 
 
-def write_report(row: dict, flow: factory.Flow | None = None) -> None:
-    waits = lines.wait_minutes(row["id"])
-    record.note(row["id"], wait_minutes=json.dumps(waits))
-    report = {"prs": (row.get("pr_url") or "").split(), "minutes": run_minutes(row),
-              "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": waits}
+def write_report(row: dict, flow: factory.Flow | None = None, run: Run | None = None) -> None:
+    from . import flows
+    facts = run.facts if run else flows.seam_facts(row["id"])
+    fields = report_fields(row, facts)
+    record.note(row["id"], wait_minutes=json.dumps(fields["wait_minutes"]))
     if flow:
-        flow.respond(row.get("status") or "", **report)
+        flow.respond(**fields)
     else:
-        lines.write(row["id"], "report", status=row.get("status") or "", **report)
+        lines.write(row["id"], "report", **fields)
+
+
+def report_fields(row: dict, facts: dict) -> dict:
+    read = lines.read(row["id"])
+    asked = next((line for line in reversed(read) if line.get("event") == "question"), {})
+    return {"task": str(row.get("issue") or ""), "status": row.get("status") or "",
+            "prs": (row.get("pr_url") or "").split(), "summary": row.get("summary") or "",
+            "requirements": facts.get("requirements") or [], "assumptions": facts.get("assumptions") or [],
+            "left_for_a_person": facts.get("left_for_a_person") or "",
+            "review": facts.get("review") or report_review({}), "question": str(asked.get("summary") or ""),
+            "steps": factory.tally(row["id"]), "minutes": run_minutes(row),
+            "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": lines.wait_minutes(row["id"])}
+
+
+def report_review(review: dict) -> dict:
+    return {"verdict": str(review.get("verdict") or ""), "summary": str(review.get("summary") or ""),
+            "problems": [{"file": p["file"], "text": p["problem"], "severity": p["severity"]}
+                         for p in review_problems(review.get("problems"))]}
+
+
+def assumptions_of(plan: dict) -> list[str]:
+    listed = plan.get("assumptions")
+    return [a.strip() for a in listed if isinstance(a, str) and a.strip()] if isinstance(listed, list) else []
 
 
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
@@ -983,7 +1025,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         return "failed", f"could not read {run.ref}: {e}", ""
     lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
     if run.answering:
-        lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "")
+        lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
+                    text=answer_text(run.answering["id"]))
     approval = state.triage_approval(t.ref if repo.tracker == "jira" else tracker.ticket_name(repo.name, t.ref))
     if run.feedback:
         closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
@@ -1062,6 +1105,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                         json_schema=REVISE_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "revise step failed", res.text)
+        run.facts["left_for_a_person"] = left_for_a_person
         build_summary = res.structured.get("summary", "")
         replies = res.structured.get("replies") or []
         if not stage(checkouts, deny).files:
@@ -1091,6 +1135,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             return _ask(run, ws, checkouts,
                         split_comment(estimate, limit, split, tk.queue_hint, info, layer.config_file),
                         f"plan estimates {estimate} lines, over the {limit} line limit; split proposed")
+        run.facts.update(assumptions=assumptions_of(plan), left_for_a_person=left_for_a_person)
 
         res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
@@ -1131,6 +1176,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
 
     verified = verify_in_use(b, goal, build_summary)
     review = _review(b, plan_to_review, verified)
+    run.facts.update(requirements=verified.requirements(), review=report_review(review))
     if review.get("verdict") == "request_changes":
         problems = "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
         run.story.append(f"Review requested changes:\n{problems}")
@@ -1138,6 +1184,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         b.recheck("the review fixes")
         verified = verify_in_use(b, goal, build_summary)
         review = _review(b, plan_to_review, verified, "review2")
+        run.facts.update(requirements=verified.requirements(), review=report_review(review))
 
     draft_why = draft_reason(review.get("verdict") == "approve", verified)
     _learn(run, ws, layer.expertise_file, t.title, expertise, apply=True)
@@ -1712,6 +1759,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
         return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
     verified = verify.Verified.from_agent(res.structured)
+    verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
