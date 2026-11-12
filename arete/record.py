@@ -12,12 +12,13 @@ import sys
 import threading
 import time
 import zlib
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Self
 
 from . import agent, gh, paths, state, util
+from . import lines as run_lines
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -450,20 +451,93 @@ def find_record(run_id: str, step: str) -> Path | None:
     return None
 
 
-def raw_lines(path: Path) -> Iterator[str]:
-    with gzip.open(path, "rb") as f:
-        try:
-            for line in f:
-                if not line.endswith(b"\n"):
-                    return
-                if line.strip():
-                    yield line.decode(errors="replace").rstrip("\n")
-        except (EOFError, gzip.BadGzipFile, zlib.error):
+class AppendedLines:
+    def __init__(self, path: Path, compressed: bool = True):
+        self.path, self.offset, self.pending = path, 0, b""
+        self.decoder = zlib.decompressobj(wbits=31) if compressed else None
+        self.failed = False
+
+    def read(self) -> Iterator[str]:
+        if self.failed:
             return
+        try:
+            f = self.path.open("rb")
+        except FileNotFoundError:
+            return
+        with f:
+            f.seek(self.offset)
+            while chunk := f.read(64 * 1024):
+                self.offset += len(chunk)
+                while chunk:
+                    if self.decoder is not None:
+                        if self.decoder.eof:
+                            self.decoder = zlib.decompressobj(wbits=31)
+                        try:
+                            data = self.decoder.decompress(chunk)
+                        except zlib.error:
+                            self.failed = True
+                            return
+                        chunk = self.decoder.unused_data
+                    else:
+                        data, chunk = chunk, b""
+                    self.pending += data
+                    complete = self.pending.split(b"\n")
+                    self.pending = complete.pop()
+                    for line in complete:
+                        if line.strip():
+                            yield line.decode(errors="replace")
+
+
+def raw_lines(path: Path) -> Iterator[str]:
+    yield from AppendedLines(path).read()
+
+
+def run_status(run_id: str) -> str:
+    try:
+        row = state.run_get(run_id, connect=state.reader)
+    except sqlite3.Error:
+        return ""
+    return (row.get("status") or "") if row else ""
+
+
+def follow(run_id: str, step: str) -> Iterator[str]:
+    path = find_record(run_id, step)
+    if not path and (step in ("steps", TIMELINE) or run_status(run_id) != "running"):
+        raise FileNotFoundError(step)
+    source = AppendedLines(path) if path else None
+    timeline = AppendedLines(paths.record_dir(run_id) / TIMELINE)
+    report = AppendedLines(run_lines.path(run_id), compressed=False)
+    ended = False
+    while True:
+        if source is None and (path := find_record(run_id, step)):
+            source = AppendedLines(path)
+        if source is not None:
+            with contextlib.closing(source.read()) as available:
+                for line in available:
+                    result = next(entries([line]), {}).get("arete") == "result"
+                    yield line
+                    if result:
+                        return
+        if ended:
+            if source is None:
+                raise FileNotFoundError(step)
+            return
+        status = run_status(run_id)
+        ended = bool(status and status != "running")
+        for entry in entries(timeline.read()):
+            ended |= entry.get("kind") == "result"
+        for entry in entries(report.read()):
+            ended |= entry.get("event") == run_lines.END
+        if not ended:
+            time.sleep(run_lines.FOLLOW_POLL_SECONDS)
 
 
 def lines(path: Path) -> Iterator[dict]:
-    for line in raw_lines(path):
+    yield from entries(raw_lines(path))
+
+
+def entries(source: Iterable[str]) -> Iterator[dict]:
+    for line in source:
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -473,8 +547,12 @@ def lines(path: Path) -> Iterator[dict]:
 
 
 def events(path: Path) -> Iterator[dict]:
+    yield from normalized(lines(path))
+
+
+def normalized(source: Iterable[dict]) -> Iterator[dict]:
     seconds, read = 0.0, unread
-    for line in lines(path):
+    for line in source:
         own = line.pop("arete", None)
         if own == "clock":
             seconds = line.get("seconds", seconds)

@@ -366,6 +366,15 @@ On a remote device arete cannot read the work folder, so only the local secrets 
 claude reports a resumed session's running cost, so the header keeps what the session had cost before the call, and the closing `usage` total subtracts it to give the call's own cost, as the result line does.
 `--raw` prints the recorded lines as they were written.
 
+`arete record RUN_ID STEP --follow` prints existing normalized events and follows new ones live.
+`arete record RUN_ID STEP --raw -f` follows the stored lines instead. Each line is flushed even through a pipe.
+Following requires STEP and waits for its file to appear when the run is known to be running.
+It stops at that call's Arete result, even if the enclosing run is still active. If the call never records a result,
+it drains available complete lines and stops when the run's status, run report or timeline says the run ended.
+A missing run row alone does not mean the run ended. A run that ends without creating the requested step reports a missing-step error.
+Following starts at the beginning and stays on the selected file: `arete record RUN_ID plan-2.jsonl.gz -f`
+follows only the second attempt and never switches to another attempt.
+
 ## Run lines
 
 Each pipeline run also tells its story as JSON lines in `runs/<run_id>/run.jsonl` under the state folder, one object per line, so one file can be followed while the run works or read after it died.

@@ -9,6 +9,7 @@ import sys
 import textwrap
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import closing
 from typing import NoReturn
 
 from . import __version__, config, paths
@@ -936,8 +937,11 @@ def cmd_steps(args) -> int:
 def cmd_record(args) -> int:
     from . import record
 
+    if args.follow and not args.step:
+        print("arete record --follow requires STEP", file=sys.stderr)
+        return 2
     folder = paths.record_dir(args.run_id)
-    if not folder.is_dir():
+    if not folder.is_dir() and not args.follow:
         print(f"no record for run {args.run_id}", file=sys.stderr)
         return 1
     if not args.step:
@@ -945,12 +949,24 @@ def cmd_record(args) -> int:
         print_lines(record.raw_lines(timeline) if timeline.is_file() else [])
         print_lines(f.name for f in record.record_files(args.run_id))
         return 0
-    if not (path := record.find_record(args.run_id, args.step)):
-        names = ", ".join(f.name for f in record.record_files(args.run_id)) or "none"
-        print(f"no step {args.step} in run {args.run_id}; its records: {names}", file=sys.stderr)
+    if args.follow:
+        with closing(record.follow(args.run_id, args.step)) as source:
+            try:
+                print_lines(source if args.raw else (json.dumps(e, ensure_ascii=False)
+                            for e in record.normalized(record.entries(source))), flush=True)
+                return 0
+            except FileNotFoundError:
+                pass
+    elif path := record.find_record(args.run_id, args.step):
+        print_lines(record.raw_lines(path) if args.raw else (json.dumps(e, ensure_ascii=False)
+                    for e in record.events(path)))
+        return 0
+    if not folder.is_dir() and not record.run_status(args.run_id):
+        print(f"no record for run {args.run_id}", file=sys.stderr)
         return 1
-    print_lines(record.raw_lines(path) if args.raw else (json.dumps(e, ensure_ascii=False) for e in record.events(path)))
-    return 0
+    names = ", ".join(f.name for f in record.record_files(args.run_id)) or "none"
+    print(f"no step {args.step} in run {args.run_id}; its records: {names}", file=sys.stderr)
+    return 1
 
 
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
@@ -1031,10 +1047,10 @@ def cmd_replay(args) -> int:
     return 0
 
 
-def print_lines(lines: Iterable[str]) -> None:
+def print_lines(lines: Iterable[str], *, flush: bool = False) -> None:
     try:
         for line in lines:
-            print(line)
+            print(line, flush=flush)
         sys.stdout.flush()
     except BrokenPipeError:
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
@@ -1231,6 +1247,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_id")
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
+    p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")
     p.set_defaults(fn=cmd_record)
 
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
