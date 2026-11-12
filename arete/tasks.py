@@ -231,8 +231,9 @@ def resume(run_id: str, step: str = "") -> dict:
             raise control.Refused(f"run {run_id} ran on the classic path, so it cannot resume; start the ticket again "
                                   "with POST /api/tasks")
         tid = str(row["issue"])
-        step = step or next((str(line.get("step") or "") for line in factory.history(factory.chain(run_id))
-                             if line.get("result") != "pass"), "")
+        if not step and row["status"] == "failed":
+            step = next((str(line.get("step") or "") for line in reversed(factory.history(factory.chain(run_id)))
+                         if line.get("result") != "pass"), "")
         return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--continue", run_id,
                                                  *(["--from", step] if step else [])))
 
