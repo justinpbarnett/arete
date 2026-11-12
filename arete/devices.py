@@ -40,6 +40,7 @@ VM_NAME_CHARS = 60
 VM_PREFIX = "arete-"
 EXE_LOBBY = "exe.dev"
 EXE_VM_DOMAIN = ".exe.xyz"
+EXE_VMS_PRESENT_HOST_KEY_OF = EXE_LOBBY
 EXE_TAG = "arete"
 EXE_EGRESS = ("integrations", "all")
 EXE_BOOT_SECONDS = 120
@@ -169,8 +170,7 @@ def ssh_argv(d: Device) -> list[str]:
         argv += ["-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null", "-o", "KnownHostsCommand=none",
                  "-o", f"UserKnownHostsFile=\"{d.known_hosts.replace('%', '%%')}\""]
     if is_exe_vm(d.host):
-        # Every exe.dev VM presents exe.dev's own host key, so the known_hosts line for exe.dev verifies them all.
-        argv += ["-o", f"HostKeyAlias={EXE_LOBBY}"]
+        argv += ["-o", f"HostKeyAlias={EXE_VMS_PRESENT_HOST_KEY_OF}"]
     if d.port:
         argv += ["-p", str(d.port)]
     if d.identity:
@@ -446,11 +446,12 @@ class Clone:
 
     def delete(self, log) -> str:
         found = util.sh([*ssh_argv(self.device), f"qm config {self.vmid}"], timeout=60)
-        if found.returncode == 0 and f"name: {self.name}" in found.stdout.splitlines():
+        vmid_still_names_this_clone = found.returncode == 0 and f"name: {self.name}" in found.stdout.splitlines()
+        clone_gone_and_vmid_maybe_reused = found.returncode == 0 or "does not exist" in found.stderr
+        if vmid_still_names_this_clone:
             res = util.sh([*ssh_argv(self.device), f"qm stop {self.vmid} --skiplock 1; qm destroy {self.vmid} --purge 1"],
                           timeout=300)
-        elif found.returncode == 0 or "does not exist" in found.stderr:
-            # The clone is gone, and proxmox may have given its vmid to another VM since.
+        elif clone_gone_and_vmid_maybe_reused:
             return ""
         else:
             res = found
@@ -660,9 +661,12 @@ def reaches(attachment: str, vm_name: str, tags: list[str]) -> bool:
 
 
 def read_only(integration: dict) -> bool:
-    # exe.dev does not document the field that marks a github integration read-only, so any key spelled readonly counts.
     settings = {**integration, **integration_config(integration)}
-    return any(normal_name(key).replace("-", "") == "readonly" and is_true(value) for key, value in settings.items())
+    return any(is_any_spelling_of_readonly(key) and is_true(value) for key, value in settings.items())
+
+
+def is_any_spelling_of_readonly(undocumented_key) -> bool:
+    return normal_name(undocumented_key).replace("-", "") == "readonly"
 
 
 def integration_config(integration: dict) -> dict:
