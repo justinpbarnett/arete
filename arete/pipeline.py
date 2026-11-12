@@ -697,8 +697,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         path, broken = flows.wanted(repo), ""
     except (ValueError, TypeError) as e:
         path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
-    adw = path == flows.ADW and not repo.parts
-    if adw and not flows.has_origin(repo) or not adw and not repo.parts:
+    adw = path == flows.ADW
+    if not repo.parts and not (adw and flows.has_origin(repo)):
         print(f"{repo_name} has no github remote configured" + (" and no git remote origin, which [factory] path = "
                                                                "\"adw\" needs" if adw else broken))
         return 1
@@ -732,17 +732,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         opening_waits(run_id, run.answering, "" if dry_run else state.take_passed_over(repo.name, str(tid)))
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
-        if path == flows.ADW and repo.parts:
-            run.log("factory: [factory] path is adw, but the adw flow runs only on a repo with no GitHub name for now, "
-                    "so this run takes the classic path")
-        flow = flows.start(cfg, run, earlier[0] if restarting else {}) if adw else None
+        flow = flows.start(cfg, run, earlier[0] if restarting else {}, slot) if adw else None
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if not dry_run:
                 state.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
         try:
-            status, summary, pr_url = flows.feature(flow) if flow else _run(cfg, run, slot)
+            status, summary, pr_url = ((flows.revise if run.feedback else flows.feature)(flow) if flow
+                                       else _run(cfg, run, slot))
         except Stopped:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
@@ -1239,13 +1237,16 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
         pushed.append(c)
 
 
+CiFix = Callable[[str, str, str], Result]
+
+
 def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_prs: list[Checkout],
-             draft_why: str) -> str:
+             draft_why: str, fix: CiFix | None = None) -> str:
     run, max_rounds = b.run, b.run.settings("build").tries
     stopped_before = [c for c in pushed if stopped_by_ci(run, c)]
     rounds: list[ci.Round] = []
     try:
-        for current in ci_rounds(b, slot, branch, pushed, max_rounds):
+        for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
             publish_ci(run, pushed, ci.section(rounds, max_rounds))
     except Exception as e:
@@ -1292,7 +1293,8 @@ def set_draft(run: AgentRun, c: Checkout, draft: bool) -> bool:
     return True
 
 
-def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_rounds: int) -> Iterator[ci.Round]:
+def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_rounds: int,
+              fix: CiFix | None = None) -> Iterator[ci.Round]:
     run = b.run
     watched = list(pushed)
     not_caused: dict[tuple[str, str, str], str] = {}
@@ -1309,7 +1311,7 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
         if fresh:
             slot.take(run.log, run.waiting)
         try:
-            fix_summary = judge_ci(b, fresh, n, max_rounds, watched) if fresh else ""
+            fix_summary = judge_ci(b, fresh, n, max_rounds, watched, fix) if fresh else ""
         except RunFailed:
             yield current
             raise
@@ -1386,7 +1388,8 @@ def merge_moved_bases_for_ci_fix(b: Build, watched: list[Checkout]) -> str:
             "edit like any other.")
 
 
-def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: list[Checkout]) -> str:
+def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: list[Checkout],
+             fix: CiFix | None = None) -> str:
     run = b.run
     merged_base = merge_moved_bases_for_ci_fix(b, watched)
     logs = run.dir / "ci"
@@ -1397,10 +1400,10 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
                            for i, r in enumerate(reds, 1))
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
     left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""
-    res = b.resume(b.next_step("ci_fix"), prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures,
-                                                 diff=diff, checks=check_list(b.layer), merged_base=merged_base,
-                                                 left_for_a_person=left),
-                   json_schema=CI_FIX_SCHEMA)
+    name = b.next_step("ci_fix")
+    text = prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=check_list(b.layer),
+                  merged_base=merged_base, left_for_a_person=left)
+    res = fix(name, text, failures) if fix else b.resume(name, text, json_schema=CI_FIX_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         for r in reds:
             r.reason = "The CI fix step failed before it judged this check."
