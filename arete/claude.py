@@ -9,7 +9,7 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 from . import accounts, background, config, devices, environment, paths, util
@@ -20,6 +20,8 @@ from .agent import (
     UsageLimit,
     claude_tokens,
     json_from_text,
+    model_scope,
+    provider_reset,
 )
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -196,12 +198,13 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     if not (data := result_event(out)):
         error = util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500)
         return Result(ok=False, session=resume, error=error,
-                      usage_limit=usage_limit({}, error) if proc.returncode else None)
+                      usage_limit=usage_limit({}, proc.stderr + out, model))
 
     structured = data.get("structured_output")
     if structured is None and json_schema:
         structured = json_from_text(data.get("result", ""))
-    is_error = bool(data.get("is_error")) or data.get("subtype", "success") != "success"
+    is_error = (bool(data.get("is_error") or data.get("api_error") or data.get("errors"))
+                or data.get("subtype", "success") != "success")
     session = (Session(data["session_id"], float(data.get("total_cost_usd") or 0), "claude") if data.get("session_id")
                else resume)
     return Result(
@@ -213,7 +216,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=int(data.get("num_turns") or 0),
         error=(failure_reason(data) if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",
-        usage_limit=usage_limit(data, data.get("result", "") or "") if is_error else None,
+        usage_limit=usage_limit(data, failure_reason(data) + proc.stderr, model) if is_error or proc.returncode else None,
         raw=data,
         **claude_tokens(data.get("usage") or {}),
         api_seconds=round(float(data.get("duration_api_ms") or 0) / 1000, 2),
@@ -305,20 +308,24 @@ def tool_set(tools: list[str] | None, rules: list[str]) -> list[str]:
     return list(dict.fromkeys(built_in))
 
 
-def usage_limit(data: dict, text: str) -> UsageLimit | None:
-    if data.get("api_error") != "usage_limit_reached" and not USAGE_LIMIT_TEXT.search(text):
+def usage_limit(data: dict, text: str, model: str = "") -> UsageLimit | None:
+    text = text + "\n" + json.dumps(data, default=str)
+    model_only = bool(re.search(r"\bmodel[_ ]requires[_ ]usage[_ ]credits\b", text, re.IGNORECASE))
+    if not model_only and "usage_limit_reached" not in text and not USAGE_LIMIT_TEXT.search(text):
         return None
-    info = (data.get("api_error_params") or {}).get("rate_limit_info") or {}
+    info = accounts.mapping(accounts.mapping(data.get("api_error_params")).get("rate_limit_info"))
     legacy = LEGACY_LIMIT_RESET.search(text)
-    resets = float(info.get("resetsAt") or (legacy.group(1) if legacy else 0))
+    resets = provider_reset(data) or provider_reset(text)
+    if resets is None and legacy:
+        resets = provider_reset({"reset": legacy[1]})
     soonest = util.now() + timedelta(seconds=LIMIT_SLACK_SECONDS)
     if resets:
-        stamp = resets / 1000 if resets > MILLISECOND_STAMPS else resets
-        until = max(soonest, datetime.fromtimestamp(stamp, UTC) + timedelta(seconds=LIMIT_SLACK_SECONDS))
+        until = max(soonest, resets + timedelta(seconds=LIMIT_SLACK_SECONDS))
     else:
         until = util.now() + timedelta(seconds=LIMIT_RECHECK_SECONDS)
-    kind = str(info.get("rateLimitType") or "")
-    return UsageLimit(util.iso(until), LIMIT_SCOPES.get(kind, EVERY_MODEL), kind.replace("_", " "))
+    kind = str(info.get("rateLimitType") or next((k for k in LIMIT_SCOPES if k in text), ""))
+    scope = LIMIT_SCOPES.get(kind, model_scope(model) if model_only and not kind else EVERY_MODEL)
+    return UsageLimit(util.iso(until), scope, kind.replace("_", " "))
 
 
 def local_roots(folders: list[Path | str]) -> list[str]:

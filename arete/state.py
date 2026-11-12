@@ -18,6 +18,7 @@ PAID_STEP = (f"(CASE steps.auth_mode WHEN 'subscription' THEN 0 WHEN 'api_key' T
              f"({', '.join(repr(p) for p in sorted(KEY_PROVIDERS))}))) END)")
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
+REFRESH_SCOPE = "credential-refresh-v1:"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -902,25 +903,126 @@ def loop_spent_since(since: str, loop: str | None = None) -> float:
         return float(c.execute(q, args).fetchone()[0])
 
 
-def hold(scope: str, until: str, why: str) -> None:
-    with db() as c:
-        c.execute("INSERT OR REPLACE INTO holds (scope, until, why, ts) VALUES (?,?,?,?)", (scope, until, why, util.iso()))
-
-
-def holds(connect=db) -> list[dict]:
+def hold(scope: str, until: str, why: str, connect=db) -> None:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM holds WHERE until > ? ORDER BY until", (util.iso(),))]
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        links = refresh_links(c)
+        ts = util.iso()
+        for linked in linked_scopes(scope, links):
+            save_hold(c, linked, until, why, ts)
 
 
-def hold_until(scope: str) -> str:
-    with db() as c:
-        r = c.execute("SELECT until FROM holds WHERE scope = ? AND until > ?", (scope, util.iso())).fetchone()
-    return r["until"] if r else ""
+def save_hold(c, scope: str, until: str, why: str, ts: str) -> None:
+    c.execute("INSERT INTO holds (scope, until, why, ts) VALUES (?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
+              "until = CASE WHEN holds.until = '' OR excluded.until = '' THEN '' "
+              "ELSE max(holds.until, excluded.until) END, "
+              "why = CASE WHEN holds.until != '' AND (excluded.until = '' OR excluded.until > holds.until) "
+              "THEN excluded.why ELSE holds.why END, ts = max(holds.ts, excluded.ts)", (scope, until, why, ts))
 
 
-def clear_holds(scopes: list[str], set_before: str) -> None:
-    with db() as c:
-        c.executemany("DELETE FROM holds WHERE scope = ? AND ts < ?", [(s, set_before) for s in scopes])
+def holds(connect=db, include_indefinite: bool = False) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM holds WHERE scope NOT LIKE ? "
+                                           "AND (until > ? OR (? AND until = '')) ORDER BY until",
+                                           (REFRESH_SCOPE + "%", util.iso(), include_indefinite))]
+
+
+def active_hold(scope: str, connect=db, include_indefinite: bool = True) -> dict | None:
+    if scope.startswith(REFRESH_SCOPE):
+        return None
+    with connect() as c:
+        r = c.execute("SELECT * FROM holds WHERE scope = ? AND (until > ? OR (? AND until = ''))",
+                      (scope, util.iso(), include_indefinite)).fetchone()
+    return dict(r) if r else None
+
+
+def hold_until(scope: str, connect=db) -> str:
+    found = active_hold(scope, connect, include_indefinite=False)
+    return found["until"] if found else ""
+
+
+def clear_holds(scopes: list[str], set_before: str, connect=db) -> None:
+    with connect() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        links = refresh_links(c)
+        linked = {s for scope in scopes for s in linked_scopes(scope, links)}
+        c.executemany("DELETE FROM holds WHERE scope = ? AND ts < ?", [(s, set_before) for s in linked])
+
+
+def refresh_links(c) -> list[tuple[str, str, str, str]]:
+    links = []
+    for row in c.execute("SELECT scope, why FROM holds WHERE scope LIKE ?", (REFRESH_SCOPE + "%",)):
+        try:
+            before, after = row["scope"][len(REFRESH_SCOPE):].split(":")
+            previous, latest = json.loads(row["why"])
+            if before and after and all(isinstance(s, str) and s for s in (previous, latest)):
+                links.append((before, after, previous, latest))
+        except (ValueError, TypeError):
+            continue
+    return links
+
+
+def linked_scopes(scope: str, links: list[tuple[str, str, str, str]]) -> set[str]:
+    found, pending = set(), [scope]
+    while pending:
+        current = pending.pop()
+        if current in found:
+            continue
+        found.add(current)
+        for _, _, previous, latest in links:
+            for before, after in ((previous, latest), (latest, previous)):
+                if current.startswith(before):
+                    linked = after + current[len(before):]
+                    if linked not in found:
+                        pending.append(linked)
+    return found
+
+
+def refresh_continues(previous: str, latest: str, connect=db) -> bool:
+    if not previous or not latest:
+        return False
+    if previous == latest:
+        return True
+    with connect() as c:
+        links = refresh_links(c)
+    found, pending = set(), [previous]
+    while pending:
+        current = pending.pop()
+        if current == latest:
+            return True
+        if current not in found:
+            found.add(current)
+            pending.extend(after for before, after, _, _ in links if before == current and after not in found)
+    return False
+
+
+def record_refresh(before: str, after: str, previous: str, latest: str, connect=db) -> None:
+    if not all((before, after, previous, latest)) or before == after:
+        return
+    with connect() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        c.execute("INSERT OR IGNORE INTO holds (scope, until, why, ts) VALUES (?,?,?,?)",
+                  (REFRESH_SCOPE + before + ":" + after, "", json.dumps([previous, latest]), util.iso()))
+        links = refresh_links(c)
+        rows = c.execute("SELECT * FROM holds WHERE scope NOT LIKE ? AND (until = '' OR until > ?)",
+                         (REFRESH_SCOPE + "%", util.iso())).fetchall()
+        for row in rows:
+            for scope in linked_scopes(row["scope"], links) - {row["scope"]}:
+                save_hold(c, scope, row["until"], row["why"], row["ts"])
+
+
+def carry_holds(previous: str, latest: str, connect=db) -> None:
+    if not previous or not latest or previous == latest:
+        return
+    with connect() as c:
+        rows = c.execute("SELECT * FROM holds WHERE substr(scope, 1, ?) = ? AND (until = '' OR until > ?)",
+                         (len(previous), previous, util.iso())).fetchall()
+        for row in rows:
+            scope = latest + row["scope"][len(previous):]
+            save_hold(c, scope, row["until"], row["why"], row["ts"])
 
 
 def pass_over(repo: str, issue: str) -> None:

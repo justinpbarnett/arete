@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import json
 import math
 import os
@@ -13,10 +14,10 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, timedelta
 from pathlib import Path
 
-from . import accounts, claude, config, devices, environment, paths, util
+from . import accounts, claude, config, devices, environment, paths, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -24,7 +25,9 @@ from .agent import (
     Result,
     Session,
     UsageLimit,
+    credit_limit,
     json_from_text,
+    provider_reset,
     usage_totals,
 )
 
@@ -122,6 +125,7 @@ class Route:
     view: Path | None = field(default=None, repr=False, compare=False)
     refreshed: set[str] = field(default_factory=set, repr=False, compare=False)
     refreshed_secrets: set[str] = field(default_factory=set, repr=False, compare=False)
+    refreshed_auths: set[accounts.Auth] = field(default_factory=set, repr=False, compare=False)
     managed: ManagedCredential | None = field(default=None, repr=False)
     using_login: bool = False
     sensitive_files: tuple[Path, ...] = field(default=(), repr=False)
@@ -181,6 +185,41 @@ def managed_credential(provider: str, available: dict) -> ManagedCredential | No
             return ManagedCredential("adc", {"GOOGLE_CLOUD_PROJECT": project, "GOOGLE_CLOUD_LOCATION": location,
                                              "GOOGLE_APPLICATION_CREDENTIALS": str(path)}, (path,))
     return None
+
+
+def managed_material(credential: ManagedCredential, provider: str) -> list:
+    env = {n: v for n, v in credential.env.items() if n not in TRANSPORT_NAMES.get(provider, ())}
+    files = credential.files
+    if credential.kind == "profile":
+        files = tuple(paths.expand(env.get(name) or paths.HOME / ".aws" / filename).absolute()
+                      for name, filename in (("AWS_SHARED_CREDENTIALS_FILE", "credentials"), ("AWS_CONFIG_FILE", "config")))
+    values = []
+    for path in files:
+        try:
+            with path.open("rb") as source:
+                data = source.read(accounts.MAX_LOGIN_METADATA)
+            if credential.kind == "profile":
+                parser = configparser.RawConfigParser()
+                parser.read_string(data.decode())
+                profile = env.get("AWS_PROFILE", "default")
+                selected, visited = {}, set()
+                while profile and profile not in visited:
+                    visited.add(profile)
+                    section = profile if parser.has_section(profile) else "profile " + profile
+                    fields = dict(parser.items(section)) if parser.has_section(section) else {}
+                    selected[profile] = {k: v for k, v in fields.items()
+                                         if k.startswith(("aws_", "sso_")) or k in
+                                         ("role_arn", "source_profile", "credential_source", "credential_process",
+                                          "web_identity_token_file", "external_id", "role_session_name")}
+                    session = fields.get("sso_session", "")
+                    if parser.has_section("sso-session " + session):
+                        selected["sso-session " + session] = dict(parser.items("sso-session " + session))
+                    profile = fields.get("source_profile", "")
+                data = selected
+            values.append((str(path), accounts.fingerprint(data)))
+        except (OSError, ValueError, configparser.Error):
+            values.append((str(path), ""))
+    return [credential.kind, env, values]
 
 
 def credential_values(value) -> list[str]:
@@ -304,7 +343,8 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
                                          str(configured.get("baseUrl", ""))))
     local = local and provider != "openai-codex"
     login_held = bool(login and held(auth, resolved))
-    chosen_login = login and mode != "api_key" and (mode in ("login", "subscription") or not login_held or not has_key)
+    chosen_login = login and mode != "api_key" and (mode in ("login", "subscription") or auth.mode != "subscription"
+                                                   or not login_held or not has_key)
     error = ""
     if not provider:
         error = f"pi needs provider/model or defaultProvider in {owner.parent / 'settings.json'} before choosing credentials"
@@ -312,6 +352,19 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
         error = (f"pi {provider}: no usable login or supported key; checked {owner}, {KEYS_FILE} and Arete environment")
     chosen_auth = auth if chosen_login else accounts.Auth(
         "subscription" if mode in ("login", "subscription") and provider in accounts.PI_SUBSCRIPTIONS else "api_key")
+    if not chosen_login:
+        source_kind = ("managed" if managed else "configured" if key_name == "ARETE_PI_SELECTED_KEY" else
+                       "keys" if keys.get(key_name) else "environment")
+        credential_context = {n: available[n] for n in TRANSPORT_NAMES.get(provider, ()) if available.get(n)
+                              and re.search(r"REGION|PROJECT|ACCOUNT|RESOURCE|GATEWAY|BASE_URL|ENDPOINT", n)}
+        credential_context["baseUrl"] = configured.get("baseUrl", "")
+        material = managed_material(managed, provider) if managed else [key_name, key]
+        chosen_auth = replace(chosen_auth, provider=provider,
+                              generation=accounts.fingerprint("pi-managed" if managed else "pi-key", material),
+                              credential=accounts.fingerprint("credential-v1", "pi", provider, source_kind,
+                                                              str(owner) if source_kind == "configured" else
+                                                              str(KEYS_FILE) if source_kind == "keys" else "",
+                                                              material, credential_context))
     raw_credentials = credential_config(models)
     refs = {n for v in raw_credentials for pair in REFERENCES.findall(v) for n in pair if n}
     aliases = {n for values in providers.values() for n in values}
@@ -507,27 +560,32 @@ def authentication(model: str, passing=None, providers=None, remote=None) -> acc
     return accounts.Auth("api_key") if remote else select(model, passing, providers).auth
 
 
-def usage_limit(auth: accounts.Auth, provider: str, text: str) -> UsageLimit | None:
-    if not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|you.ve (?:hit|reached).{0,30}limit|"
-                     r"weekly limit|five.hour limit", text, re.IGNORECASE) and not claude.USAGE_LIMIT_TEXT.search(text):
+def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "") -> UsageLimit | None:
+    data = text
+    if auth.mode != "subscription":
+        return credit_limit(data)
+    text = data if isinstance(data, str) else json.dumps(data, default=str)
+    native_limit = claude.usage_limit({}, text, model) if auth.family == "claude" else None
+    if (not native_limit and not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|"
+                                          r"you.ve (?:hit|reached).{0,30}limit|weekly limit|five.hour limit",
+                                          text, re.IGNORECASE) and not claude.USAGE_LIMIT_TEXT.search(text)):
         return None
     from . import codex
 
-    reset = (re.search(r'''(?:resetsAt|reset_at|resetAt|reset|resets_at)["'\s:=]+(\d{10,16})(?!\d)''',
-                       text, re.IGNORECASE) or claude.LEGACY_LIMIT_RESET.search(text))
-    until = None
-    try:
-        if reset:
-            stamp = float(reset[1])
-            until = datetime.fromtimestamp(stamp / 1000 if stamp >= 1e12 else stamp, UTC)
-        else:
-            iso = re.search(r'''(?:resets?[_ ]?at|reset|try again at)["'\s:=]+'''
-                            r'(\d{4}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2}))', text, re.IGNORECASE)
-            until = (util.parse_iso(iso[1]) if iso else
-                     codex.reset_time(re.sub(r"\bresets?\s+(at\s+|in\s+)?", lambda m: "try again " +
-                                            (m[1] or "at "), text, flags=re.IGNORECASE)))
-    except (ValueError, OverflowError, OSError):
-        pass
+    legacy = claude.LEGACY_LIMIT_RESET.search(text)
+    until = provider_reset(data) or (provider_reset({"reset": legacy[1]}) if legacy else None)
+    if until is None:
+        for message in error_messages(data):
+            try:
+                iso = re.search(r'''(?:resets?[_ ]?at|reset|try again at)["'\s:=]+'''
+                                r'(\d{4}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2}))', message, re.IGNORECASE)
+                until = (util.parse_iso(iso[1]) if iso else
+                         codex.reset_time(re.sub(r"\bresets?\s+(at\s+|in\s+)?", lambda m: "try again " +
+                                                (m[1] or "at "), message, flags=re.IGNORECASE)))
+            except (ValueError, OverflowError, OSError):
+                continue
+            if until is not None:
+                break
     now = util.now()
     if until is None or until > now + timedelta(days=366):
         until = now + timedelta(seconds=claude.LIMIT_RECHECK_SECONDS)
@@ -536,8 +594,8 @@ def usage_limit(auth: accounts.Auth, provider: str, text: str) -> UsageLimit | N
     scope = claude.EVERY_MODEL if auth.family == "claude" else codex.LIMIT_SCOPE if auth.family == "codex" else provider
     if auth.family == "claude":
         kind = next((name for name in claude.LIMIT_SCOPES if name in text), "")
-        scope = claude.LIMIT_SCOPES.get(kind, scope)
-    return UsageLimit(util.iso(until), scope, "subscription")
+        scope = native_limit.scope if native_limit else claude.LIMIT_SCOPES.get(kind, scope)
+    return UsageLimit(util.iso(until.astimezone(UTC)), scope, "subscription")
 
 
 def login_unchanged(route: Route) -> bool:
@@ -545,8 +603,8 @@ def login_unchanged(route: Route) -> bool:
     if credential.get("type") != "oauth":
         return False
     latest = accounts.pi(route.provider, credential, str(route.owner))
-    return (latest.generation in {route.auth.generation, *route.refreshed} or
-            bool(route.auth.identity and latest.identity == route.auth.identity))
+    return (latest.generation in {route.auth.generation, *route.refreshed}
+            or state.refresh_continues(route.auth.generation, latest.generation))
 
 
 def observed_refresh(route: Route, event: dict) -> None:
@@ -557,7 +615,8 @@ def observed_refresh(route: Route, event: dict) -> None:
     if before.get("type") != "oauth" or after.get("type") != "oauth":
         return
     previous = accounts.fingerprint("pi", str(route.owner), route.provider, before)
-    if previous not in {route.auth.generation, *route.refreshed}:
+    if (previous not in {route.auth.generation, *route.refreshed}
+            and not state.refresh_continues(route.auth.generation, previous)):
         return
     latest = accounts.pi(route.provider, after, str(route.owner))
     markers = ("accountId", "accountUuid", "account_id", "account_uuid", "userId", "user_id")
@@ -566,7 +625,12 @@ def observed_refresh(route: Route, event: dict) -> None:
             return
     elif any(before.get(name) != after.get(name) for name in markers):
         return
+    earlier = accounts.pi(route.provider, before, str(route.owner))
+    prefixes = [accounts.scope(a, "")[:-2] if a.mode == "subscription" else accounts.scope(a, "credit")
+                for a in (earlier, latest)]
+    state.record_refresh(previous, latest.generation, *prefixes)
     route.refreshed.add(latest.generation)
+    route.refreshed_auths.add(latest)
 
 
 @contextmanager
@@ -622,6 +686,10 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
     elif selected and selected.using_login and not login_unchanged(selected):
         result = Result(ok=False, error=f"pi {selected.provider}: selected login changed or is no longer available",
                         runner="pi", model=selected.model, session=kw.get("resume", NO_SESSION))
+    elif (selected and selected.managed and selected.auth.generation !=
+          accounts.fingerprint("pi-managed", managed_material(selected.managed, selected.provider))):
+        result = Result(ok=False, error=f"pi {selected.provider}: selected credential changed or is no longer available",
+                        runner="pi", model=selected.model, session=kw.get("resume", NO_SESSION))
     else:
         folder = None
         try:
@@ -640,8 +708,6 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
         result.calls[0].call_seconds = result.call_seconds - sum(call.call_seconds for call in result.calls[1:])
     result.auth_mode = auth.mode
     result.provider = selected.provider if selected else result.provider
-    if not result.ok and auth.mode == "subscription":
-        result.usage_limit = usage_limit(auth, result.provider, result.error)
     resume = kw.get("resume", NO_SESSION)
     if selected and result.session.id:
         charged = sum(0 if c.auth_mode == "subscription" else kw.get("price", lambda r: r.cost_usd)(c)
@@ -727,7 +793,7 @@ def _run(
         return Result(ok=False, session=resume, error=f"pi not found: {e}", runner="pi", model=model)
     if cut_short_by:
         return cut_short(proc, resume, model, cut_short_by)
-    result = parse(proc, resume, model, json_schema)
+    result = parse(proc, resume, model, json_schema, auth)
     result.auth_mode = auth.mode
     if selected and result.session.id:
         result.session = replace(result.session, spent_usd=resume.spent_usd +
@@ -869,20 +935,46 @@ def events(stdout: str) -> list[dict]:
         line = line.strip()
         if line.startswith("{"):
             try:
-                out.append(json.loads(line))
+                if isinstance(event := json.loads(line), dict):
+                    out.append(event)
             except json.JSONDecodeError:
                 continue
     return out
 
 
-def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None) -> Result:
+def error_metadata(message: dict) -> dict:
+    return {k: v for k, v in message.items() if k not in ("content", "usage")}
+
+
+def error_messages(data) -> list[str]:
+    if isinstance(data, str):
+        try:
+            decoded = json.loads(data)
+        except ValueError:
+            return [data]
+        return error_messages(decoded) if isinstance(decoded, (dict, list)) else [data]
+    values = data.values() if isinstance(data, dict) else data if isinstance(data, list) else ()
+    return [message for value in values for message in error_messages(value)]
+
+
+def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None,
+          auth: accounts.Auth | None = None) -> Result:
+    provider = model.partition("/")[0]
+    auth = auth or accounts.Auth("subscription", "claude" if provider == "anthropic" else "", provider=provider)
     stream = events(proc.stdout)
     end = next((e for e in reversed(stream) if e.get("type") == "agent_end"), {})
     replies = [m for m in end.get("messages", []) if m.get("role") == "assistant"]
     if not replies:
         error = util.tail(proc.stderr or proc.stdout or f"exit {proc.returncode}", 1500)
+        diagnostics = [error_metadata(e) for e in stream if e.get("type") in ("error", "api_error", "turn.failed")
+                       or e.get("error") or e.get("api_error")]
+        diagnostics.extend(error_metadata(e["message"]) for e in stream
+                           if e.get("type") == "message_end" and isinstance(e.get("message"), dict)
+                           and e["message"].get("stopReason") == "error")
+        diagnostic = [*diagnostics, proc.stderr] if stream else proc.stderr or proc.stdout
         return Result(ok=False, session=resume, error=error, runner="pi", model=model,
-                      connection_failed=util.is_network_error(error))
+                      connection_failed=util.is_network_error(error),
+                      usage_limit=usage_limit(auth, provider, diagnostic, model))
     last = replies[-1]
     text = "".join(c.get("text", "") for c in last.get("content", []) if c.get("type") == "text")
     usages = [m.get("usage") or {} for m in replies]
@@ -897,6 +989,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=len(replies),
         error=error,
         connection_failed=failed and util.is_network_error(error),
+        usage_limit=usage_limit(auth, provider, [error_metadata(last), proc.stderr], model) if failed else None,
         raw={"stopReason": last.get("stopReason"), "usage": usages[-1]},
         **totals,
         first_context_tokens=first_context_tokens(proc.stdout),

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+
+from . import util
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
 READ_ONLY_TOOLS = frozenset({*READ_TOOLS, "LS"})
@@ -27,6 +31,70 @@ class UsageLimit:
     until: str
     scope: str
     kind: str = ""
+    billing: str = "subscription"
+
+
+def model_scope(model: str) -> str:
+    name = model.strip().lower().removeprefix("claude:").removeprefix("pi:")
+    return "model:" + name.removeprefix("anthropic/")
+
+
+def reset_at(value) -> datetime | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        stamp = float(value)
+        return datetime.fromtimestamp(stamp / 1000 if stamp >= 1e12 else stamp, UTC) if stamp else None
+    except (ValueError, TypeError, OverflowError, OSError):
+        try:
+            parsed = util.parse_iso(str(value))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+
+def provider_reset(data) -> datetime | None:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if (re.sub(r"[_-]", "", key).lower() in ("reset", "resetat", "resetsat", "resettime", "resetson")
+                    and (found := reset_at(value))):
+                return found
+        return next((found for value in data.values() if (found := provider_reset(value))), None)
+    if isinstance(data, list):
+        return next((found for value in data if (found := provider_reset(value))), None)
+    if isinstance(data, str):
+        try:
+            decoded = json.loads(data)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, (dict, list)) and (found := provider_reset(decoded)):
+            return found
+        match = re.search(r'''(?:resets?[_-]?(?:at|time|on)?)["'\s:=]+'''
+                          r'(\d{4}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2})|\d{10,16})(?!\d)',
+                          data, re.IGNORECASE)
+        return reset_at(match[1]) if match else None
+    return None
+
+
+def credit_limit(data) -> UsageLimit | None:
+    text = (data if isinstance(data, str) else json.dumps(data, default=str)).lower()
+    text = text.replace("_", " ").replace("-", " ")
+    explicit = re.search(r'\b(?:insufficient (?:quota|credits?|funds)|payment required|'
+                         r'billing (?:hard )?limit reached|(?:out of|not enough|no remaining) credits?|'
+                         r'no credits? (?:left|available)|'
+                         r'(?:request )?requires more credits)\b|'
+                         r'\b(?:credit balance|credits?|(?:billing|credit|spend(?:ing)?) (?:cap|limit|quota)) '
+                         r'(?:(?:is|are|was|were|has been|have been|already|fully|completely) )?'
+                         r'(?:insufficient|exhausted|depleted|exceeded|too low|reached)\b|'
+                         r'\b(?:insufficient|exhausted|depleted|exceeded) '
+                         r'(?:(?:your|the|all|available|remaining|monthly|daily|current) )*'
+                         r'(?:credits?|credit balance|billing quota|spend(?:ing)? (?:cap|limit))\b', text)
+    if not explicit:
+        return None
+    now = util.now()
+    reset = provider_reset(data)
+    until = max(now + timedelta(seconds=1), reset) if reset and reset > now else now + timedelta(hours=1)
+    return UsageLimit(util.iso(until), "credit", "credit", "credit")
 
 
 @dataclass

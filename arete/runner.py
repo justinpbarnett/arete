@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -32,6 +33,8 @@ from .agent import (
     READ_TOOLS,
     Result,
     Session,
+    UsageLimit,
+    model_scope,
     subscription,
 )
 
@@ -55,7 +58,6 @@ SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
-LIMIT_SCOPES = {"claude": (claude.EVERY_MODEL, *claude.LIMIT_SCOPES.values()), "codex": (codex.LIMIT_SCOPE,)}
 
 
 def route(model: str, runner: str = "") -> tuple[str, str]:
@@ -124,18 +126,28 @@ def metered(model: str, run_with: str = "", **context) -> bool:
 
 
 def limit_applies(scope: str, model: str) -> bool:
-    return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in model.lower()
+    if scope.startswith("model:"):
+        return scope == model_scope(model)
+    return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in re.split(r"[-_/.:]", model.lower())
 
 
 def auth_hold(auth: accounts.Auth, model: str, connect=state.db, unknown: str = "") -> dict | None:
-    if auth.mode != "subscription" or not (auth.identity or unknown):
+    if not (auth.identity or auth.credential or unknown):
         return None
-    scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model) if limit_applies(s, model)]
-    return next((h for h in reversed(state.holds(connect)) if h["scope"] in scopes), None)
+    scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
+    found = [h for h in state.holds(connect, include_indefinite=True) if h["scope"] in scopes]
+    return next((h for h in found if not h["until"]), found[-1] if found else None)
 
 
 def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
-    return LIMIT_SCOPES.get(auth.family, (provider_of(model),))
+    if auth.mode == "api_key":
+        return ("credit",)
+    if auth.family == "claude":
+        return (claude.EVERY_MODEL, *(s for s in claude.LIMIT_SCOPES.values() if limit_applies(s, model)),
+                model_scope(model))
+    if auth.family == "codex":
+        return (codex.LIMIT_SCOPE, model_scope(model))
+    return (auth.provider or provider_of(model), model_scope(model))
 
 
 def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=state.db,
@@ -162,7 +174,18 @@ def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Con
 
 
 def hold_words(hold: dict) -> str:
-    return f"{hold['why']}, waiting until {local_time(hold['until'])}"
+    return (f"{hold['why']}, waiting until {local_time(hold['until'])}" if hold["until"] else
+            f"{hold['why']}, held until cleared")
+
+
+def held_result(held: dict, auths: set[accounts.Auth], auth: accounts.Auth, which: str, name: str,
+                resume: Session, unknown: str) -> Result:
+    billing = "credit" if auth.mode == "api_key" else "subscription"
+    scope = next(s for a in auths for s in limit_scopes(a, name)
+                 if accounts.scope(a, s, unknown) == held["scope"])
+    return Result(ok=False, error=hold_words(held), runner=which, model=name,
+                  provider=auth.provider or provider_of(name), auth_mode=auth.mode, session=resume,
+                  usage_limit=UsageLimit(held["until"], scope, "credit" if billing == "credit" else "usage", billing))
 
 
 def local_time(stamp: str) -> str:
@@ -295,7 +318,12 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         else:
             auth = authentication(name, which, cfg=cfg, repo=repo, device=target) if which != REPLAY else accounts.Auth()
         unknown = "local-" + accounts.fingerprint(invocation, auth.generation)
-        if wait_out_limits and (held := usage_hold(name, which, cfg=cfg, auth=auth, unknown=unknown)):
+        auths = {auth, *(selected.refreshed_auths if selected else ())}
+        active = [h for a in auths if (h := usage_hold(name, which, cfg=cfg, auth=a, unknown=unknown))]
+        held = max(active, key=lambda h: (not h["until"], h["until"]), default=None)
+        if held:
+            if not wait_out_limits or not held["until"]:
+                return with_spent(held_result(held, auths, auth, which, name, resume, unknown), limited)
             say(hold_words(held))
             with waits("limit"):
                 wait_out(held["scope"], lambda auth=auth, name=name, pinned=pinned: not (which == "pi" and pinned) and
@@ -321,15 +349,17 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             on_launch(selected)
         res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind, auth)
         if not res.usage_limit:
-            if auth.mode == "subscription" and res.ok:
-                state.clear_holds([accounts.scope(auth, s, unknown) for s in limit_scopes(auth, name)
-                                   if limit_applies(s, res.model)], set_before=started)
+            if res.ok and which != REPLAY:
+                state.clear_holds([accounts.scope(a, s, unknown)
+                                   for a in {auth, *(selected.refreshed_auths if selected else ())}
+                                   for s in limit_scopes(a, name)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
         why = f"{which} {limit.kind or 'usage'} limit reached"
         scope = accounts.scope(auth, limit.scope, unknown)
-        state.hold(scope, limit.until, why)
-        if not wait_out_limits:
+        for a in {auth, *(selected.refreshed_auths if selected else ())}:
+            state.hold(accounts.scope(a, limit.scope, unknown), limit.until, why)
+        if not wait_out_limits or not limit.until:
             return with_spent(res, limited)
         limited.append(res)
         if which == "pi":
@@ -414,8 +444,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         res.provider = res.provider or provider_of(res.model)
         if which != REPLAY:
             res.auth_mode = auth.mode
-            if (auth.mode != "subscription" or
-                    (res.usage_limit and res.usage_limit.scope not in limit_scopes(auth, name))):
+            if res.usage_limit and (res.usage_limit.scope not in limit_scopes(auth, name) or
+                                   res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
                 res.usage_limit = None
         if res.calls:
             for call in res.calls:
