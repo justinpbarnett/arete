@@ -1871,6 +1871,9 @@ def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) ->
 
 
 def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[str, str]:
+    if run.layer and run.layer.verify and not run.layer.verify.publish_evidence:
+        run.log("evidence: publication disabled by the layer; screenshots stay in the run folder")
+        return {}
     shots = verified.screenshots(run.dir / "evidence")
     if not shots:
         return {}

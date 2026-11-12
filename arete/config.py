@@ -480,6 +480,7 @@ class Verify:
     ready_seconds: int = 180
     allow_bash: list[str] = field(default_factory=list)
     notes: str = ""
+    publish_evidence: bool = True
 
     @property
     def bash(self) -> list[str]:
@@ -573,7 +574,10 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.passes = environment_table(section(data, "environment"), layer=True).passes
     if "verify" in data:
         v = section(data, "verify")
-        layer.verify = Verify(start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
+        publish_evidence = v.get("publish_evidence", True)
+        if type(publish_evidence) is not bool:
+            raise ValueError("[verify] publish_evidence must be true or false")
+        layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip())
     return layer
