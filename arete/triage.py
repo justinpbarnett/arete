@@ -29,8 +29,7 @@ SPRINT_JQL = "sprint in openSprints() OR (sprint in closedSprints() AND sprint n
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent", "updated"]
 MAX_ASSUMPTIONS = 8
 THIN_WORDS = 6
-# research reasons stored by older versions end in a CLI command, which the dashboard leaves out
-OLD_RESEARCH_HINT = re.compile(r"; (check the ticket, then )?`arete research \S+ --run --force`( researches it anyway)?$")
+CLI_COMMAND_ENDING_OLDER_REASONS = re.compile(r"; (check the ticket, then )?`arete research \S+ --run --force`( researches it anyway)?$")
 OUTSIDE_SPRINT = "it is outside the sprint, so the research loop leaves it to you"
 NEEDS_FORCE = ("held", "parent", "answered")
 MARKUP = re.compile(r"\[[^\]]*\]|\{[^}]*\}|https?://\S+")
@@ -750,7 +749,7 @@ def research_progress(r: dict, report: dict | None) -> str:
                 "moved the ticket to done")
     again = ((", and the ticket changed since, so the loop checks it again" if in_sprint(r)
               else f", and the ticket changed since; {OUTSIDE_SPRINT}") if research_due(r, report) else "")
-    why = OLD_RESEARCH_HINT.sub("", report["error"] or "")
+    why = CLI_COMMAND_ENDING_OLDER_REASONS.sub("", report["error"] or "")
     if report["status"] == "done":
         unmoved = f"; {report['error']}" if report["error"] else ""
         return f"report ready {stamp(report['ts'])}{filed_words(report)}{unmoved}{again}"

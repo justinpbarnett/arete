@@ -183,12 +183,11 @@ def switch(name: str, enabled: bool) -> dict:
 
 
 def feed(run_id: str, after: int = 0) -> dict:
-    # a run settles in the same write as its end line, so reading the lines first never pairs that line with "running"
     lines = state.feed(run_id, after, connect=state.reader)
-    r = state.run_get(run_id, connect=state.reader)
-    if not r:
+    run_read_after_its_lines = state.run_get(run_id, connect=state.reader)
+    if not run_read_after_its_lines:
         raise NotFound(f"no run {run_id}")
-    return {"run": r, "lines": lines}
+    return {"run": run_read_after_its_lines, "lines": lines}
 
 
 def decide(approval_id: int, yes: bool) -> dict:

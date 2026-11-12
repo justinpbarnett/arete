@@ -250,7 +250,6 @@ MERGE_POLL_SECONDS = 5
 
 
 def merge_action(state: str, mergeable: str, auto_allowed: bool) -> str:
-    """merge, wait, auto or leave, from GitHub's mergeStateStatus and mergeable."""
     state, mergeable = (state or "UNKNOWN").upper(), (mergeable or "UNKNOWN").upper()
     if "UNKNOWN" in (state, mergeable):
         return "wait"
@@ -286,7 +285,6 @@ def repo_allows_auto_merge(repo: str) -> bool:
 
 def pr_merge_auto(repo: str, number: int, wait: float = MERGE_WAIT_SECONDS,
                   poll: float = MERGE_POLL_SECONDS) -> tuple[str, str]:
-    """Merge now, turn on auto merge, or leave the PR: ("merged", ""), ("auto", "") or ("left", reason)."""
     auto_allowed = repo_allows_auto_merge(repo)
     deadline = time.monotonic() + wait
     while True:

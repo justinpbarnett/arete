@@ -230,8 +230,7 @@ def write_files_through_repo(repo_path: Path, snapshot: str, dest: Path) -> None
     git(["checkout-index", "-a"], dest, timeout=600, env=env)
 
 
-def isolated_checkout(repo_path: Path, base: str, dest: Path) -> None:
-    # Not a worktree: a worktree shares the remote refs, so the agent could read the real fix from origin/main.
+def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> None:
     shutil.rmtree(dest, ignore_errors=True)
     sha = git(["rev-parse", f"{base}^{{commit}}"], repo_path).strip()
     dest.mkdir(parents=True)
@@ -299,7 +298,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         if not task.check and not task.verify:
             raise RunFailed("the task has neither `check` nor `verify`")
         fetch_origin(repo)
-        isolated_checkout(repo.path, base, wt)
+        checkout_without_origin_refs(repo.path, base, wt)
         run.log(f"checkout at {base}")
         layer = prepare(repo, src, wt, run)
         if prompts.label:

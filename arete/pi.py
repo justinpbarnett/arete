@@ -51,6 +51,10 @@ def is_pattern_rule(rule: str) -> bool:
     return "(" in rule
 
 
+def rules_for_throwaway_sandbox_without_git_credentials(disallowed_tools: list[str] | None) -> list[str]:
+    return [t for t in disallowed_tools or [] if not is_pattern_rule(t)]
+
+
 def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallowed_tools: list[str] | None) -> list[str]:
     granted = tools if tools is not None else [*(allowed_tools or []), *READ_TOOLS]
     allowed = set(allowed_tools or []) | set(READ_TOOLS)
@@ -151,8 +155,7 @@ def run(
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
     sandboxed = bool(remote and remote.exe_sandbox)
     if sandboxed:
-        # A sandbox is deleted after its run and holds no git credentials, so the rules against git writes guard nothing.
-        disallowed_tools = [t for t in disallowed_tools or [] if not is_pattern_rule(t)]
+        disallowed_tools = rules_for_throwaway_sandbox_without_git_credentials(disallowed_tools)
     names = tool_names(tools, allowed_tools, disallowed_tools)
     if (persist or resume.id) and not remote:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)

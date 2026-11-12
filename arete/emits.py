@@ -7,6 +7,7 @@ from .loops import FINDING_EVENT, Loop, as_list, find, worktree_kinds
 
 DIGESTS_DIR = paths.STATE_DIR / "digests"
 SEVERITIES = ("low", "medium", "high", "critical")
+FALL_BACK_TO_RUN_CONFIG_REPO = ""
 FINDING_SCHEMA = {
     "type": "object",
     "properties": {
@@ -145,7 +146,7 @@ class PullRequest(Emit):
     approving = "It pushes the branch and opens the pull request, so it can take a few seconds."
 
     def target_repo(self, item: dict) -> str:
-        return ""  # item["repo"] is the GitHub owner/name; the run that asked holds the config repo
+        return FALL_BACK_TO_RUN_CONFIG_REPO
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
         if loop.kind not in worktree_kinds():

@@ -12,10 +12,10 @@ from .evals import (
     DirSource,
     EvalRun,
     Source,
+    checkout_without_origin_refs,
     fetch_origin,
     grade,
     grade_failure,
-    isolated_checkout,
     load_tasks,
     prepare,
 )
@@ -202,14 +202,14 @@ def mine_one(cfg: config.Config, run: EvalRun, c: Candidate) -> Outcome:
     ticket = tracker.for_ticket(cfg, c.repo, str(c.run["issue"])).get(str(c.run["issue"]))
     wt = paths.WORKTREES_DIR / f"mine-{c.repo.name}-{run.task}"
     try:
-        isolated_checkout(c.repo.path, merge, wt)
+        checkout_without_origin_refs(c.repo.path, merge, wt)
         draft = write(cfg, run, c, ticket, wt, base, merge)
         if isinstance(draft, Outcome):
             return draft
         on_merge = graded_on(cfg, run, "merge commit", prepare(c.repo, Source(c.repo), wt, run), wt, draft)
         if on_merge.verdict != "pass":
             return Outcome("rejected", f"on the merge commit, {grade_failure(on_merge)}")
-        isolated_checkout(c.repo.path, base, wt)
+        checkout_without_origin_refs(c.repo.path, base, wt)
         on_base = graded_on(cfg, run, "base", prepare(c.repo, Source(c.repo), wt, run), wt, draft)
         if on_base.verdict == "pass":
             return Outcome("rejected", "the steps pass on the base too, so they do not test the change")

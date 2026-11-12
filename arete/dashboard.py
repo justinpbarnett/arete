@@ -411,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
         if not all(isinstance(x, list) and all(isinstance(t, str) for t in x) for x in (questions, answers)):
             raise Refusal(400, "Questions and answers take lists of text.")
         said = triage.send(config.load(), ref, questions, answers, str(b.get("repo") or ""))
-        return {"ref": ref, "said": f"{said} {start_poll()}"}
+        return {"ref": ref, "said": f"{said} {start_poll_without_failing_the_send()}"}
 
     def usage_row(self) -> dict:
         b = self.body()
@@ -581,14 +581,14 @@ def install_serve(inside_serve: bool) -> dict:
     return {"restarting": False, "said": util.first_line(said, 400)}
 
 
-def start_poll() -> str:
+def start_poll_without_failing_the_send() -> str:
     try:
         if not control.find_loop("poll").enabled:
             return "The poll loop is off, so it builds once you turn poll on."
         engine.launch("poll")
     except control.Busy:
         return "A poll is running now, so the next one picks it up."
-    except Exception as e:  # the ticket is already sent, so a poll that cannot start must not fail the send
+    except Exception as e:
         return f"The poll did not start: {util.first_line(str(e), 200)}."
     return "Started a poll to build it."
 
