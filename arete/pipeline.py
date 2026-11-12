@@ -2327,7 +2327,7 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
 def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
     out: dict[str, set[str]] = {}
     for r in cfg.repos:
-        if r.pipeline and r.parts and r.tracker == "jira":
+        if r.pipeline and runnable(r) and r.tracker == "jira":
             out.setdefault(r.jira_project or cfg.jira.project, set()).add(tracker.route_label(r))
     return out
 

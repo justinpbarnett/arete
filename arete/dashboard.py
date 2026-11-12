@@ -32,6 +32,7 @@ from . import (
     loops,
     paths,
     pipeline,
+    record,
     research,
     scaffold,
     sessions,
@@ -517,9 +518,12 @@ def run_ended(run_id: str) -> Callable[[], bool]:
 
     def ended() -> bool:
         nonlocal quiet_since
-        if (state.run_get(run_id, connect=state.reader) or {}).get("status") == "running":
-            quiet_since = None
-            return False
+        row = state.run_get(run_id, connect=state.reader) or {}
+        if row.get("status") == "running":
+            with record.dead(row) as run_is_dead:
+                if not run_is_dead:
+                    quiet_since = None
+                    return False
         quiet_since = quiet_since or time.monotonic()
         return time.monotonic() - quiet_since >= END_GRACE_SECONDS
 

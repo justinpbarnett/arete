@@ -7,7 +7,7 @@ from . import chat, config, control, gh, jira, paths, pipeline, state, tracker, 
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
-LATER = {True: "the poller starts it when a slot frees", False: "send it again when a slot frees"}
+POLLER_LATER = "the poller starts it when a slot frees"
 
 
 def title_of(prompt: str) -> str:
@@ -79,7 +79,9 @@ def held(cfg: config.Config, repo: config.Repo) -> str:
 
 def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
     state.pass_over(repo.name, tid)
-    return answer(tid, repo.name, "", "queued", f"{why}; {LATER[poller_picks]}")
+    later = POLLER_LATER if poller_picks else (
+        f'start task {tid} with {{"repo": "{repo.name}", "ticket": "{tid}"}} when a slot frees')
+    return answer(tid, repo.name, "", "queued", f"{why}; {later}")
 
 
 def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool) -> dict:
