@@ -624,6 +624,7 @@ start = "PORT={port} pnpm dev"
 url = "http://localhost:{port}"
 ready = "/"
 ready_seconds = 180
+publish_evidence = true
 notes = "Sign up only with addresses at example.test."
 
 [research]
@@ -649,6 +650,7 @@ path = "classic"
 | `verify.url` | Where the served app answers. Default `http://localhost:{port}`. |
 | `verify.ready`, `verify.ready_seconds` | Path arete waits on before the verifier starts, and how long. Any answer below 500 counts as ready. Defaults `/` and 180. |
 | `verify.allow_bash` | Bash patterns the verifier may run, on top of `curl` and `echo`. |
+| `verify.publish_evidence` | Boolean, default `true`. Set `false` to keep screenshots in the local run folder without uploading them or linking images in PRs. Verification and ordinary PR delivery still run. |
 | `verify.notes` | What the verifier must know: how to sign in, what not to touch, what is shared. |
 | `research.dir` | Folder, from the repo root, where arete files the reports of this repo's research tickets as pull requests. Leave it out and the reports stay in arete. See [Triage](#triage). |
 | `factory.path` | `classic` (default) or `adw`, which runs a ticket through the [adw flow](#the-adw-flow) on any repo. |
@@ -773,7 +775,7 @@ A replayed call is recorded like any other: its step row, its record header and 
 
 Checks passing is not the bar. After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw. Reading the code and running the test suite do not count as checks. The builder does not add tests unless the repo's own rules ask for them.
 
-- Pass: the evidence goes in the PR body. Screenshots are pushed to the orphan branch `arete/evidence` and linked from the body.
+- Pass: the verification report goes in the PR body. By default, screenshots are pushed to the orphan branch `arete/evidence` and linked from the body. Set the repo layer’s `[verify] publish_evidence = false` to retain screenshots locally without uploading them; both classic and ADW runs still deliver the PR and its text report.
 - Fail: the build session resumes with what failed, then the checks and the verifier run again, up to the verify step's `tries` (default `limits.max_attempts`).
 - Blocked: the verifier could not check something (a service it may not reach, a sign in it cannot finish). The PR opens as a draft and says what it would take.
 
