@@ -8,18 +8,19 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
-from . import ask, claude, config, devices, environment, guard, jev, paths, pi, record, replay, state, util
+from . import ask, claude, codex, config, devices, environment, guard, jev, paths, pi, record, replay, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
     READ_TOOLS,
-    SUBSCRIPTION_RUNNER,
     Result,
     Session,
+    subscription,
 )
 
 REPLAY = replay.RUNNER
-RUNNERS = ("claude", "pi", REPLAY)
+RUNNERS = ("claude", "pi", "codex", REPLAY)
+CODEX_NAMES = ("gpt-", "codex-")
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
 SECRET_SEARCH_DEPTH = 4
 BUDGET_FLOOR_USD = 0.005
@@ -37,7 +38,7 @@ SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
-LIMIT_SCOPES = (claude.EVERY_MODEL, *claude.LIMIT_SCOPES.values())
+LIMIT_SCOPES = {"claude": (claude.EVERY_MODEL, *claude.LIMIT_SCOPES.values()), "codex": (codex.LIMIT_SCOPE,)}
 
 
 def route(model: str, runner: str = "") -> tuple[str, str]:
@@ -46,7 +47,9 @@ def route(model: str, runner: str = "") -> tuple[str, str]:
         return prefix, rest
     if runner in RUNNERS:
         return runner, model
-    return ("pi" if "/" in model else "claude"), model
+    if "/" in model:
+        return "pi", model
+    return ("codex" if model.lower().startswith(CODEX_NAMES) else "claude"), model
 
 
 def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
@@ -56,7 +59,7 @@ def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
 
 def stands_for(model: str, run_with: str) -> tuple[str, str]:
     which, name = route(model, "" if run_with == REPLAY else run_with)
-    return (which if which != REPLAY else "pi" if "/" in name else "claude"), name
+    return (which if which != REPLAY else route(name)[0]), name
 
 
 def run_env(run_id: str) -> dict[str, str]:
@@ -68,6 +71,8 @@ def env_names(model: str, run_with: str, cfg: config.Config, repo: config.Repo |
     passing = environment.passed(cfg, repo)
     if which == "pi":
         return sorted(pi.agent_env(name, passing, cfg.environment.providers))
+    if which == "codex":
+        return sorted(codex.agent_env(passing, run_env(run_id)))
     return sorted(claude.agent_env(passing, run_env(run_id)))
 
 
@@ -81,18 +86,21 @@ def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: confi
 
 
 def metered(model: str, run_with: str = "") -> bool:
-    return route(model, run_with)[0] != SUBSCRIPTION_RUNNER
+    which = route(model, run_with)[0]
+    return not subscription(which, codex.login_provider() if which == "codex" else "")
 
 
 def limit_applies(scope: str, model: str) -> bool:
-    return scope == claude.EVERY_MODEL or scope in model.lower()
+    return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in model.lower()
 
 
 def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None) -> dict | None:
     which, name = route(model, run_with)
-    if which != "claude" or (cfg and cfg.replay.all):
+    if cfg and cfg.replay.all:
         return None
-    return next((h for h in reversed(state.holds(connect)) if limit_applies(h["scope"], name)), None)
+    scopes = LIMIT_SCOPES.get(which, ())
+    return next((h for h in reversed(state.holds(connect)) if h["scope"] in scopes and limit_applies(h["scope"], name)),
+                None)
 
 
 def hold_words(hold: dict) -> str:
@@ -126,7 +134,10 @@ def agent_problems(run_with: str, tools: list[str]) -> list[str]:
 
 
 def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
-    return SANDBOX_RUNS_PI if device.exe_sandbox and route(model, run_with)[0] == "claude" else ""
+    which = route(model, run_with)[0]
+    if which == "codex" and device.remote:
+        return codex.RUNS_LOCALLY
+    return SANDBOX_RUNS_PI if device.exe_sandbox and which == "claude" else ""
 
 
 def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:
@@ -159,8 +170,13 @@ def claude_login() -> tuple[bool, str]:
     return True, f"login good for {days:.0f} days"
 
 
+def codex_login() -> tuple[bool, str]:
+    ok, detail, _ = codex.login()
+    return ok, detail
+
+
 def cost_note(res: Result) -> str:
-    paid = "subscription" if res.runner == SUBSCRIPTION_RUNNER else util.paid_note(res.cost_usd)
+    paid = "subscription" if subscription(res.runner, res.provider) else util.paid_note(res.cost_usd)
     return f"({util.count(res.turns, 'turn')}, {paid})"
 
 
@@ -181,11 +197,13 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(),
         repo: config.Repo | None = None, **kw) -> Result:
     cfg = cfg or config.load()
-    which, name = chosen(model, runner or resume.runner, cfg)
+    which, name = chosen(model, runner or (resume.runner if not model else ""), cfg)
+    if resume.runner != which:
+        resume = NO_SESSION
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
     if target.remote:
         kw["remote"] = target
-    elif which in ("claude", "pi"):
+    elif which in ("claude", "pi", "codex"):
         repo = repo or cfg.repo_for_work_dir(cwd)
         kw["passing"] = environment.passed(cfg, repo)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
@@ -194,6 +212,10 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kw.pop("max_budget_usd", None)
         if not target.remote:
             kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo)
+    elif which == "codex":
+        kw.pop("max_budget_usd", None)
+        if not target.remote:
+            kw = local_codex(kw, cfg, trace[0], say, repo)
     elif which == "pi":
         kw["price"] = lambda reply: priced(reply, cfg)
         if not target.remote:
@@ -204,22 +226,23 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             say(hold_words(held))
             with waits("limit"):
                 wait_out(held["scope"])
-            say("the claude usage limit has lifted, going on")
+            say(f"the {which} usage limit has lifted, going on")
         started = util.iso()
         res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind)
         if not res.usage_limit:
-            if which == "claude" and res.ok:
-                state.clear_holds([s for s in LIMIT_SCOPES if limit_applies(s, res.model)], set_before=started)
+            if which in LIMIT_SCOPES and res.ok:
+                state.clear_holds([s for s in LIMIT_SCOPES[which] if limit_applies(s, res.model)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
-        state.hold(limit.scope, limit.until, f"claude {limit.kind or 'usage'} limit reached")
+        why = f"{which} {limit.kind or 'usage'} limit reached"
+        state.hold(limit.scope, limit.until, why)
         if not wait_out_limits:
             return res
         limited.append(res)
-        say(hold_words({"why": f"claude {limit.kind or 'usage'} limit reached", "until": limit.until}))
+        say(hold_words({"why": why, "until": limit.until}))
         with waits("limit"):
             wait_out(limit.scope)
-        say("the claude usage limit has lifted, going on")
+        say(f"the {which} usage limit has lifted, going on")
         if res.session.id and res.turns > 1 and kw.get("persist", True):
             prompt, resume = CONTINUE_AFTER_LIMIT, res.session
 
@@ -243,11 +266,14 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
-    hidden = record.secrets(*secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg))
+    found = secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg)
+    hidden = record.secrets(*found)
     started = time.monotonic()
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
         if which == REPLAY:
             res = replay.run(cwd, trace, cfg, rec.line, resume)
+        elif which == "codex":
+            res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line, hidden=found, **kw)
         else:
             res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, on_line=rec.line,
                                                              **kw)
@@ -294,6 +320,16 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), ask.rule()]
         kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), ask.note()]))
+    return kw
+
+
+def local_codex(kw: dict, cfg: config.Config, run_id: str, say: Callable[[str], None],
+                repo: config.Repo | None) -> dict:
+    kw = {**kw, "extra_env": run_env(run_id)}
+    if cfg.jev.guard and guard.wanted(kw.get("tools")):
+        kw["judge"] = True
+        if note := judge_note(cfg, kw["passing"], repo):
+            say(note)
     return kw
 
 

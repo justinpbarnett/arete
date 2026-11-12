@@ -6,7 +6,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import alerts, config, install, paths, runner, state, util
+from . import alerts, config, install, paths, runner, state, steps, util
 
 
 @dataclass
@@ -86,6 +86,36 @@ def check_probes(cfg: config.Config, force: bool = False) -> list[Check]:
 def check_claude_auth() -> list[Check]:
     ok, detail = runner.claude_login()
     return [Check("claude:auth", ok, detail)]
+
+
+def check_codex_auth(cfg: config.Config) -> list[Check]:
+    if not uses_codex(cfg):
+        return []
+    ok, detail = runner.codex_login()
+    return [Check("codex:auth", ok, detail)]
+
+
+def uses_codex(cfg: config.Config) -> bool:
+    from . import loops
+
+    if cfg.replay.all:
+        return False
+    layers = [None]
+    for repo in cfg.repos:
+        try:
+            layers.append(config.load_layer(repo.layer_dir))
+        except (ValueError, TypeError, OSError):
+            continue
+    for layer in layers:
+        for kind in ("", *config.KINDS):
+            for role in config.MODEL_ROLES:
+                try:
+                    if steps.resolve(cfg, layer, role, kind).runner == "codex":
+                        return True
+                except ValueError:
+                    continue
+    return any(not loop.error and any(runner.route(model, loop.runner)[0] == "codex"
+                                     for model in loop.agent_models(cfg)) for loop in loops.load_all(cfg))
 
 
 def check_hook() -> list[Check]:
@@ -186,6 +216,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_jobs, cfg),
         (check_probes, cfg, force_probes),
         (check_claude_auth,),
+        (check_codex_auth, cfg),
         (check_hook,),
         (check_disk,),
         (check_serve,),

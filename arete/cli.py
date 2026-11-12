@@ -298,6 +298,12 @@ def cmd_guard(args) -> int:
     return guard.main()
 
 
+def cmd_codex_guard(args) -> int:
+    from . import codex, runner
+
+    return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
+
+
 def cmd_background(args) -> int:
     from . import background
 
@@ -696,7 +702,7 @@ def cmd_loop(args) -> int:
                   + (f", repo {d['repo']}" if d["repo"] else ""))
             if d["model"]:
                 budget = (f"budget {d['budget_usd'] or '-'} per run, {d['daily_budget_usd'] or '-'} per day"
-                          if d["metered"] else "no budget, claude runs on the subscription")
+                          if d["metered"] else "no budget, it runs on a subscription")
                 print(f"  model {d['model']} {d['runner'] or ''} on {d['device']}, {budget}")
             if d["held"]:
                 print(f"  {d['held']}")
@@ -874,7 +880,7 @@ def cmd_costs(args) -> int:
         c = control.costs(args.days)
     except control.Refused as e:
         return refused(e)
-    print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; claude CLI steps ride the subscription and count nothing")
+    print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; claude and codex steps on a subscription count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
         for row in c[f"by_{group}"][:12]:
@@ -897,8 +903,8 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
         print_lines([*(json.dumps(g) for _, each in found for g in each["groups"]), json.dumps(waits)])
         return 0
     for by, each in found:
-        print(f"Every step by {by} in the last {each['days']:g} days. Cost is what each call reported; a claude CLI "
-              "step's is the API price, since it rides the subscription. `in` counts the input no cache served.")
+        print(f"Every step by {by} in the last {each['days']:g} days. Cost is what each call reported; a claude or "
+              "codex step's is the API price or 0, since it rides a subscription. `in` counts the input no cache served.")
         rows = [(by, "runs", "calls", "cost", "in", "cache rd", "cache wr", "out", "min", "api min")]
         rows += [(g["name"], str(g["runs"]), str(g["calls"]), f"${g['cost_usd']:.2f}",
                   f"{g['tokens_in'] - g['cache_read'] - g['cache_write']:,}", f"{g['cache_read']:,}",
@@ -1127,6 +1133,11 @@ def main(argv: list[str] | None = None) -> int:
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
     p.set_defaults(fn=cmd_guard)
 
+    p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
+                                           "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
+    p.add_argument("--judge", action="store_true")
+    p.set_defaults(fn=cmd_codex_guard)
+
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "
                                           "(reads a payload on stdin)")
@@ -1184,7 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("words", nargs="*", help="start: the first message; others: the session id, then send: the text")
     p.add_argument("--device", default="local")
     p.add_argument("--model", default="")
-    p.add_argument("--runner", default="", help="claude or pi; by the model when left out")
+    p.add_argument("--runner", default="", help="claude, pi or codex; by the model when left out")
     p.add_argument("--tools", default=None, help="comma separated; Read,Edit,Write,Glob,Grep,Bash by default")
     p.add_argument("--repo", default="", help="a repo name from the config; work in a new worktree of it on a device of kind local")
     p.add_argument("--budget", type=float, default=None, help="USD for the whole session")

@@ -385,7 +385,7 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     if loop.agent and (refusal := runner.device_refusal(loop.model_for(cfg), loop.runner, device)):
         problems.append(refusal)
     if loop.agent:
-        problems += [f"{reason}, so a loop run by pi cannot have {', '.join(tools)}"
+        problems += [f"{reason}, so a loop run by {runner.route(loop.model_for(cfg), loop.runner)[0]} cannot have {', '.join(tools)}"
                      for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
     if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "

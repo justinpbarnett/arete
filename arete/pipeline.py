@@ -31,6 +31,7 @@ from . import (
     jev,
     jira,
     lines,
+    outbound,
     paths,
     record,
     runner,
@@ -181,6 +182,10 @@ REJECTED_PR_LISTEN = timedelta(days=7)
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
     text = (prompts_dir / f"{name}.md").read_text()
     return Template(text).safe_substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
+
+
+def public_text(run: AgentRun, text: str) -> str:
+    return outbound.redact(text) if run.repo.public else text
 
 
 def bash_rules(patterns: list[str]) -> list[str]:
@@ -363,6 +368,7 @@ class Run(AgentRun):
     def say(self, body: str) -> str:
         if self.dry_run:
             return ""
+        body = public_text(self, body)
         err = self.say_on_prs(body) if self.feedback else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
         if err:
             self.log(f"tracker: {util.first_line(err, 300)}")
@@ -372,7 +378,7 @@ class Run(AgentRun):
         errors = []
         for url in self.feedback_prs:
             try:
-                gh.pr_comment(url, body)
+                gh.pr_comment(url, public_text(self, body))
             except gh.GhError as e:
                 errors.append(f"{url}: {e}")
         return "; ".join(errors)
@@ -672,8 +678,22 @@ class Build(TicketWork):
     left_for_a_person: str = ""
     check_commands: str = NO_CHECKS
     from_base: bool = False
+    plan_text: str = ""
+    build_summary: str = ""
 
     def resume(self, step: str, text: str, **kw) -> Result:
+        saved, selected = self.run.sessions.get("build", NO_SESSION), self.run.settings("build")
+        if saved.id and saved.runner != selected.runner:
+            plan = self.run.dir / "plan.md"
+            previous = util.read_json(self.run.dir / "build.json", {})
+            context = (f"The builder changed from {saved.runner} to {selected.runner}. Continue the existing work "
+                       f"in {self.ws}; inspect its current diff before editing.\n\n"
+                       f"## Issue {self.ticket.ref}: {self.ticket.title}\n\n{self.ticket.body}\n\n"
+                       f"{self.ticket.comments}\n\n## Saved plan\n\n"
+                       f"{self.plan_text or (plan.read_text() if plan.exists() else '')}\n\n"
+                       f"## Earlier builder summary\n\n{self.build_summary or previous.get('text', '')}\n\n"
+                       "Keep the current task's tool restrictions and never write git metadata or secret files.")
+            text = f"{context}\n\n## Current feedback\n\n{text}"
         return self.run.agent(step, text, self.ws, role="build", allowed_tools=self.tools,
                               disallowed_tools=runner.NO_GIT_WRITES, **kw)
 
@@ -1174,7 +1194,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
     b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=layer.timeout_minutes * 60,
               workspace=workspace, attachments=attachments, tools=build_rules, deny=deny, expertise=expertise,
-              left_for_a_person=left_for_a_person, check_commands=runs_checks)
+              left_for_a_person=left_for_a_person, check_commands=runs_checks,
+              plan_text=plan_text, build_summary=build_summary)
 
     attempts, tries = 1, run.settings("build").tries
     ok = b.check()
@@ -1298,7 +1319,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
                 size: str) -> str:
     problems = review.get("problems", [])
-    return (
+    return public_text(run, (
         f"## Summary\n\n{summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
         + left_block(left)
@@ -1309,7 +1330,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
         + ("" if run.feedback else
            f"<details><summary>Plan</summary>\n\n{cut_at_end(plan_text, PLAN_CHARS)}\n\n</details>\n\n")
         + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
-    )
+    ))
 
 
 def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: dict | None, draft_why: str,
@@ -1330,7 +1351,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
         try:
             if hold:
                 run.log(f"automerge left off on {c.pr}: {hold}")
-                gh.pr_comment(c.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
+                gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
                 continue
             try:
                 did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
@@ -1342,7 +1363,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
                 run.log(f"automerge enabled on {c.pr}")
             else:
                 run.log(f"automerge left {c.pr} for a person: {why}")
-                gh.pr_comment(c.pr, f"Automerge could not merge this PR: {why}. A person merges it.")
+                gh.pr_comment(c.pr, public_text(run, f"Automerge could not merge this PR: {why}. A person merges it."))
         except gh.GhError as e:
             run.log(f"automerge failed on {c.pr}: {e}")
 
@@ -1381,7 +1402,7 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
     left_synced = with_left_section(relinked_body, left)
     if left_synced != relinked_body:
         run.log(f"{pr}: {'wrote' if left else 'removed'} the {LEFT_TITLE} section")
-    return left_synced
+    return public_text(run, left_synced)
 
 
 def left_section(run: Run, text: str) -> str:
@@ -1648,7 +1669,7 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
 def publish_ci(run: AgentRun, pushed: list[Checkout], ci_section: str) -> None:
     for c in pushed:
         try:
-            gh.pr_edit_body(c.pr, ci.with_section(gh.pr_body(c.pr), ci_section))
+            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(gh.pr_body(c.pr), ci_section)))
         except gh.GhError as e:
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
@@ -1717,7 +1738,7 @@ def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
             threads[key] = said.get(f["gh_id"]) or said.get(f["thread"]) or threads.get(key) or fallback
     for (url, thread), text in threads.items():
         try:
-            gh.pr_reply(url, thread, text)
+            gh.pr_reply(url, thread, public_text(run, text))
         except gh.GhError as e:
             run.log(f"reply to comment {thread} on {url} failed: {util.first_line(str(e), 300)}")
 

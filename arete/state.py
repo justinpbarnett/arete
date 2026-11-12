@@ -7,12 +7,14 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 from . import paths, util
-from .agent import SUBSCRIPTION_RUNNER
+from .agent import KEY_PROVIDERS, SUBSCRIPTION_RUNNERS
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
-PAID_STEP = f"COALESCE(steps.runner, '') != '{SUBSCRIPTION_RUNNER}'"
+PAID_STEP = (f"NOT (COALESCE(steps.runner, '') IN ({', '.join(repr(r) for r in sorted(SUBSCRIPTION_RUNNERS))}) AND "
+             f"NOT (steps.runner = 'codex' AND COALESCE(steps.provider, '') IN "
+             f"({', '.join(repr(p) for p in sorted(KEY_PROVIDERS))})))")
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 SCHEMA = """

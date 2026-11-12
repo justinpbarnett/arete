@@ -55,12 +55,47 @@ A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete we
 
 ## Runners, devices and sessions
 
-A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `pi:` prefix forces pi, and a `replay:` prefix answers from files (see [Replay](#replay)). Claude and pi both report tokens and cost per step; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi spend only. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, though every sum arete shows you counts only what you pay. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
+A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `gpt-` or `codex-` name, in any case, runs on the `codex` CLI (see [Codex](#codex)); `openai/<model>` stays on pi. A `pi:` or `codex:` prefix forces that runner, and a `replay:` prefix answers from files (see [Replay](#replay)). Claude and pi both report tokens and cost per step, and codex reports tokens; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi and Codex API-key spend. Codex has no per-call dollar cap. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, though every sum arete shows you counts only what you pay. When claude reports a usage limit, the run waits until the limit resets and then goes on, resuming its session where it can. The serve holds queued loops that need the held model, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
 
 `claude -p` stays open after its answer until each command the agent started in the background ends, so a server left running holds a step to its time limit and loses its answer.
 Each claude step that can run commands is told to stop with TaskStop each background command that does not end on its own before it answers, even when its task asks to keep one running.
 On a local step, `arete background` runs as a Stop hook: when the agent answers while a background command still runs, it names the command and has the agent stop it and answer again, or end its turn again when it waits for a command that will end.
 A step that times out gets SIGTERM, and what is left of its processes 30 seconds later gets SIGKILL.
+
+### Codex
+
+The `codex` runner runs OpenAI models through the Codex CLI on your own `codex login`.
+A step picks it with `runner = "codex"` in a step table or a tier, a `codex:<model>` name, or a bare `gpt-` or `codex-` name.
+Each call runs `codex exec --json` with the folder as `-C`, the model as `-m`, the effort as `model_reasoning_effort` and the prompt on stdin.
+The step's session keeps codex's thread id with runner `codex`, and a later round resumes it with `codex exec resume <thread>`. Switching runners starts a fresh thread; repair prompts carry the saved ticket, plan and builder summary. Claude sessions never resume in Codex.
+Public PR reports and tracker comments pass through outbound redaction before publication; raw local evidence stays intact.
+A ChatGPT login is a subscription, as claude is: the step shows `subscription`, counts nothing in any sum, and still records its tokens.
+An API key login is metered, priced at the model's `[pricing]` price, since codex reports no cost.
+When codex reports a usage limit, codex steps wait under a hold of their own, so a codex limit never holds a claude step and a claude limit never holds a codex step.
+The heartbeat checks `codex login status` beside `claude auth status` once any step, role or configured loop resolves to codex, and raises `codex:auth` when you are logged out.
+Codex runs on the local device only; a loop or session that would run it on another device is refused in one line.
+
+Arete runs codex with your `CODEX_HOME` (default `~/.codex`) in place and copies nothing out of it.
+It passes `--ignore-user-config` and `--ignore-rules`, and turns off your own hooks, skills, memories, plugins, apps and MCP servers, so only the step's `mcp` servers load.
+Arete disables automatic project instruction loading with `project_doc_max_bytes=0`. Codex 0.167.2 still loads global `CODEX_HOME/AGENTS.md` or `AGENTS.override.md` despite that setting and `--ignore-user-config`, and exposes no switch to exclude them from `exec`. If either exists, or arete cannot check, it withholds the call before starting codex and explains why; your setup and login stay untouched. `arete steps` includes this limitation in its codex notes.
+When `instructions` holds `repo` (the codex default), arete supplies the repo's `AGENTS.md` files from the git root through the step's folder as developer instructions; `AGENTS.override.md` wins over `AGENTS.md` in each folder. Files above the repo and in `CODEX_HOME` stay out. `instructions = []` supplies none.
+When a caller supplies MCP environment values, they stay in the driver environment; only their names reach Codex's `env_vars` configuration, and those names are excluded from shell commands. Reserved login/environment variables and conflicting server values are refused.
+Only servers granted by `mcp__<server>` or `mcp__<server>__<tool>` rules are enabled. Exact tools receive `enabled_tools` and per-tool `approval_mode = "approve"`; an explicit whole-server grant sets `default_tools_approval_mode = "approve"`, while the shell keeps its own approval and network restrictions.
+An absolute executable named as the first word of an allowed `Bash(...)` rule gets read and execute access to that exact file. Adjacent private files, secrets, login directories and `gh` remain denied. Project `.codex/config.toml` or `.codex/hooks.json` is refused because it can override isolation.
+
+Codex always has a shell and file reads, so steps must include `Read`, `Glob` and `Grep`. It disables browser tools, subagents and web search; configured MCP servers stay separate.
+Its sandbox and the `arete codex-guard` PreToolUse hook keep the promises claude's tool rules keep:
+
+| Promise | claude | codex |
+|---|---|---|
+| No git writes | `--disallowedTools` rules, and no shell rule beyond read only git | The hook refuses every git command but a read (`status`, `diff`, `log`, `show`, `blame`, a branch or stash list and the like), and every `gh` command. It handles command strings and arrays, shell options such as `bash -lc`, wrappers such as `env`, and compound commands. This check applies wherever the git folder lives; the profile also keeps each writable root's `.git` and its resolved git/common directories read only, including inside temporary clones, and denies the `gh` executable. |
+| A read only step writes nothing | no write tools | A `read_only` permission profile: no file writes and no network. |
+| A build step writes only its worktree | write tools in the worktree | A `workspace_write` profile: the step's folder, its extra folders, `/tmp` and `$TMPDIR`, and no network. |
+| Secret files stay out | the guard hook | The profile denies every guard secret name pattern, including `.env.*` and `id_rsa*`, and credential directories recursively across the filesystem, including skipped dependency folders and arbitrary depths. It also excludes `CODEX_HOME`, both the active and original arete configuration directories, Claude's private directory and any additional known secret paths. Protection does not depend on file discovery or a command naming a secret. Matching example and template files are conservatively excluded too. The hook also refuses commands naming secrets and patches targeting them. |
+| The guard's judge | `arete guard` with JEV | The same JEV judge, run by the hook. |
+| A timeout stops the step | SIGTERM, then SIGKILL after 30 s | The same. |
+
+A timed out codex call keeps any thread id already emitted, so a later fix can resume it. Network access is off inside the agent sandbox, so a verify command cannot `curl` the served app; a configured Playwright MCP server runs outside that sandbox.
 
 Arete runs pi with a pi folder of its own, `~/.local/share/arete/pi-agent/`. It links `models.json` and `settings.json` from `~/.pi/agent/` and holds no logins. Keys for pi's providers go in `~/.config/arete/pi.env` as `NAME=value` lines, such as `OPENROUTER_API_KEY=...`. A loop then spends on a key you give arete, such as one with a weekly limit, and never on your own pi logins. A provider with no key there falls back to a key set in arete's own environment, and fails the step when there is none; the launchd serve sets no keys. A device other than `local` runs its own pi with its own logins.
 
@@ -74,7 +109,7 @@ dir = "/root"
 note = "Hetzner box"
 ```
 
-`arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `arete` and `ollama` it has.
+`arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `codex`, `arete` and `ollama` it has.
 Arete's ssh never forwards your ssh agent, so an agent on a device cannot use your keys.
 
 A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
@@ -187,7 +222,7 @@ arete session attach ID | stop ID | list
 
 `--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Sessions view starts one with the same choices, under New session.
 
-`arete costs` shows what you paid for model calls, by model, runner and loop. A step on the claude CLI rides the subscription and counts nothing there.
+`arete costs` shows what you paid for model calls, by model, runner and loop. A step on the claude CLI, or on codex with a ChatGPT login, rides the subscription and counts nothing there.
 
 `arete costs --by step|kind|model` counts every step instead, at the cost each call reported (a claude CLI step's is the API price), grouped by step name, by the task's kind (`feat`, `fix`) or by model, or by several in turn with `--by step kind model`, over the last `--days N` (default 7). Each row shows the runs (distinct runs in the group), calls, cost, input tokens no cache served (`in`), cache reads and cache writes, output tokens, minutes and API minutes. The minutes are each call's whole time; the API minutes are the part the model's API calls took, as the runner reports it (claude does, pi does not), so the rest went to tools. The last line gives the wait minutes of the runs started in that window, by cause. `--json` prints one JSON line per group and a last line with `wait_minutes`; `--json` alone groups by step. The plain `arete costs` stays the paid view.
 
@@ -213,13 +248,17 @@ It reads them from `~/.config/arete/pi.env` first, and from the server's environ
 When arete cannot tell the provider, the agent gets every name in `pi.env`.
 It also gets `ARETE_AGENT=1` and `PI_CODING_AGENT_DIR`.
 
+A codex agent adds `CODEX_HOME`, and never gets `CODEX_API_KEY`, `OPENAI_API_KEY` or the parent session's names above, even under `pass = ["*"]`.
+It also gets `ARETE_AGENT=1`.
+The commands it runs get only the list above, `ARETE_AGENT` and `ARETE_RUN_ID`, through codex's `shell_environment_policy`, so `CODEX_HOME` stays out of them.
+
 These commands start from the same list, plus the values arete sets for them, such as a loop check's `ARETE_RUN_ID` and `ARETE_SCRATCH`:
 
 - a layer's `[setup] commands`, `[checks]` and `[verify] start`
 - a loop's check and measure commands, and a `push` emit's gate check
 - an eval's setup commands and its held out check
 
-Arete's own commands keep the server's environment: git, gh and ssh, the sources and the heartbeat's probes, the installer, and `claude auth status`.
+Arete's own commands keep the server's environment: git, gh and ssh, the sources and the heartbeat's probes, the installer, `claude auth status` and `codex login status`.
 A device other than `local` keeps today's environment, since the device is its own machine.
 
 `[environment] pass` names more variables to pass, in `~/.config/arete/config.toml` for every repo, or in a repo's layer for that repo's agents and commands:
@@ -269,7 +308,7 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
 - PR feedback: JEV asks of each new comment you leave on an arete PR whether it asks for a change or a question the author should answer, logs the chance, and stores it with the comment. A comment under `feedback_skip` starts no revision; at the default of 0, none is skipped.
 - Miner: the digest leaves out the transcripts JEV is sure hold nothing to learn from, so it has room for the ones that do.
 - Sessions: when a session's context passes `compact_tokens` and JEV is sure the new message starts a different task, the session compacts before it takes the turn.
-- Guard: each local claude agent that can read files, write files or run commands runs `arete guard` as a PreToolUse hook. With no JEV call, it keeps the agent out of secret files (`.env`, keys, `~/.ssh`, cloud credentials), whether the agent reads or writes one or names one in a command. With JEV it also stops a command that would do harm git cannot undo (throw away uncommitted work, delete outside the working folder, force push, publish, drop data, send a message) and a command that would show or send a credential. A plain push or a new pull request goes through. The verify prompt tells the verifier to give a key it was not given a value that starts `arete-placeholder`, and that a request to localhost, 127.0.0.1 or [::1] reaches the product it started, so neither reads as a credential or an outside send. When anything goes wrong, it lets the call through. `[jev] guard = false` turns it off.
+- Guard: each local claude agent that can read files, write files or run commands runs `arete guard` as a PreToolUse hook. With no JEV call, it keeps the agent out of secret files (`.env`, keys, `~/.ssh`, cloud credentials), whether the agent reads or writes one or names one in a command. With JEV it also stops a command that would do harm git cannot undo (throw away uncommitted work, delete outside the working folder, force push, publish, drop data, send a message) and a command that would show or send a credential. A plain push or a new pull request goes through. The verify prompt tells the verifier to give a key it was not given a value that starts `arete-placeholder`, and that a request to localhost, 127.0.0.1 or [::1] reaches the product it started, so neither reads as a credential or an outside send. When anything goes wrong, it lets the call through. `[jev] guard = false` turns it off. A codex agent runs `arete codex-guard` as its PreToolUse hook instead, with the same judge; the secret file and git write rules there always run, and `guard = false` turns off only its judge (see [Codex](#codex)).
 - `arete ask QUESTION [PATHS] [--choice A B] [--score LOW HIGH] [-r] [--only ANSWER] [--json]` asks JEV about piped text, or about each file, sixteen at a time. Agents that can run commands get it, with a short note on when it pays: sort files before reading them, sort a test failure before digging in, check a diff against its task. An agent may ask only about files inside its working folder, and never about secret files.
 
 JEV uses the OpenRouter key the pi runner uses: `OPENROUTER_API_KEY` in `~/.config/arete/pi.env`, or in arete's environment.
@@ -294,7 +333,7 @@ A call outside any run gets a run id of its own that starts with `call-`.
 A second call with the same step name in one run gets `<step>-2.jsonl.gz`, then `-3`, and so on.
 The first line is a header with the runner, model, device, repo, commit, folder, prompt, system prompt, tools, JSON schema, budget, timeout and the session it resumes.
 When a call leaves the model to the runner's default, arete holds the header until the runner names the model it runs (claude's `init` event or pi's first reply), for at most 10 seconds, so the header names the model the default turned out to be.
-Then come the runner's own lines unchanged: claude's `stream-json` events or pi's `--mode json` events.
+Then come the runner's own lines unchanged: claude's `stream-json` events, pi's `--mode json` events, or codex's `exec --json` events after one `command` line with the argv arete ran.
 A clock line with the seconds since the start goes in before a runner line whenever a second or more has passed since the last one.
 The last line is the result: ok, error, text, structured answer, cost, tokens, first turn's input tokens, turns, model, session and seconds.
 A call that crashes ends with a result whose error starts with `crashed:`, and a call stopped on request (a stop from the CLI or the dashboard, or ctrl-c) ends with the error `stopped by request`.
@@ -645,21 +684,56 @@ A step is named by its `[models]` role. `implement` is a second name for `build`
 |-----|---------|
 | `tier` | A tier of the tier map in use, which sets `runner`, `provider` and `model`. |
 | `model` | The model. It wins over a tier at any level, and routes as in [Runners](#runners-devices-and-sessions). |
-| `runner` | `claude`, `pi` or `replay`. It wins over the runner the model name picks, but not over a `claude:`, `pi:` or `replay:` prefix. |
+| `runner` | `claude`, `pi`, `codex` or `replay`. It wins over the runner the model name picks, but not over a `claude:`, `pi:`, `codex:` or `replay:` prefix. |
 | `provider` | For pi, the provider put before a model name that does not start with it. |
-| `effort` | claude's `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) or pi's `--thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Left out, the runner's own default. |
+| `effort` | claude's `--effort` (`low`, `medium`, `high`, `xhigh`, `max`), pi's `--thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), or codex's `model_reasoning_effort` (`low`, `medium`, `high`, `xhigh`, `max`, `ultra`). Left out, the runner's own default. |
 | `timeout_minutes` | The step's time limit. Default `limits.timeout_minutes`; learn 15, uat 10. The checks keep `limits.timeout_minutes`. |
 | `tries` | For build, the fix attempts after failed checks and the CI fix rounds; for verify, the rounds of verify in use; for uat, the tries at the test steps. Default `limits.max_attempts`; uat 3. The other steps run once. |
 | `tools` | The built in tools the step may use, from `Read`, `Glob`, `Grep`, `LS`, `Edit`, `MultiEdit`, `Write` and `TodoWrite`. Default `Read`, `Glob`, `Grep`, `Edit`, `Write` and `TodoWrite` for build, `Read`, `Glob` and `Grep` for the rest. The layer's shell rules still apply on top. pi always grants `Read`, `Glob` and `Grep`, so a pi step lists them. |
-| `mcp` | Names of `[mcp.<name>]` servers from `~/.config/arete/config.toml`; a claude step loads those and no others. Default `[]`. verify also gets its own browser server when the layer serves an app, and that server wins over one of the same name. pi takes no servers. |
-| `instructions` | Which standing instruction files load: `user` (`~/.claude/CLAUDE.md`) and `repo` (the repo's `CLAUDE.md` and `CLAUDE.local.md`). Default both on claude, `[]` on pi. On claude, a value short of both becomes `--setting-sources`, which also leaves out that source's `settings.json`. pi runs with `--no-context-files` and takes only `[]`. |
+| `mcp` | Names of `[mcp.<name>]` servers from `~/.config/arete/config.toml`; claude and codex load those and no others. Default `[]`. verify also gets its own browser server when the layer serves an app, and that server wins over one of the same name. pi takes no servers. codex refuses servers with `env` values. |
+| `instructions` | Which standing instruction files load: `user` and `repo`. Default both on claude (`~/.claude/CLAUDE.md`, the repo's `CLAUDE.md` and `CLAUDE.local.md`), `[]` on pi, and `["repo"]` on codex (repo `AGENTS.md` or `AGENTS.override.md`, supplied as developer instructions with automatic project document loading disabled). codex refuses `user`; if the login has global instruction files that the CLI cannot exclude, the call is withheld automatically. On claude, a value short of both becomes `--setting-sources`, which also leaves out that source's `settings.json`. pi runs with `--no-context-files` and takes only `[]`. |
 | `session` | `resume` or `fresh`. With `resume`, a later round of the step (for build, a fix, review fix, verify fix or CI fix) continues the session of its earlier rounds; with `fresh`, each round is a new session whose prompt carries the failing output. Default `resume` for build, `fresh` for the rest. learn and uat keep no session, so they take only `fresh`. |
 
 Levels, where the last one to set a key wins: the defaults above, `[steps]` in `~/.config/arete/config.toml`, `[kinds.<kind>.steps]` there, `[steps]` in the repo's layer, then `[kinds.<kind>.steps]` there. A kind is `feat` or `fix`. A level that names a `model` also drops the `runner` and `provider` that lower levels set. A step with neither a model nor a tier takes its `[models]` role. The other roles, such as triage, chat and the miner, read `[models]` alone; `arete steps` shows `tools`, `mcp`, `instructions` and `session` for them too, but only the pipeline steps use those four.
 
-`[tiers.<map>]` lists tiers by name. A layer's `[tiers.<map>]` adds to the engine's map of the same name, or replaces a tier it names again. `[factory] tier_map` names the map in use; it may be left out when there is one map.
+`[tiers.<map>]` lists tiers by name. A layer's `[tiers.<map>]` adds to the engine's map of the same name, or replaces a tier it names again. `[factory] tier_map` names the map in use; it may be left out when there is one map. A repo layer's `tier_map` wins over the engine's choice and may supply the only selection. With several maps and no engine selection, validation of tiered steps waits for the repo layer; `arete steps` without `--repo` still requires an engine selection.
 
-Config load refuses, in one line that names the table: an unknown step, kind or key, a tier the map does not have, a runner other than `claude`, `pi` or `replay`, an effort the step's runner does not take, `tries` or `timeout_minutes` under 1, several tier maps with no `tier_map`, a `tier_map` with no such map, a tool outside the `tools` list above (`Bash` and `mcp__` names included), a pi step whose `tools` leave out a read tool, an `mcp` name with no `[mcp.<name>]`, any `mcp` or `instructions` on pi, an `instructions` value other than `user` and `repo`, a `session` other than `resume` and `fresh`, `resume` for learn or uat, and an `[mcp.<name>]` with an unknown key, with both or neither of `command` and `url`, or with `args` beside `url`. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
+To move every tiered step between Claude and OpenAI, define maps with matching tier names:
+
+```toml
+[tiers.claude]
+strong = { runner = "claude", model = "claude-opus-4-5" }
+fast = { runner = "claude", model = "claude-sonnet-4-5" }
+
+[tiers.openai]
+strong = { runner = "codex", model = "gpt-5.4" }
+fast = { runner = "codex", model = "gpt-5.4-mini" }
+
+[factory]
+tier_map = "openai"
+
+[steps.plan]
+tier = "strong"
+
+[steps.build]
+tier = "strong"
+
+[steps.review]
+tier = "fast"
+```
+
+Changing the one `tier_map` setting in the engine config switches all steps that name a tier. Set `[factory] tier_map = "openai"` in one repo's layer instead to switch only that repo. Explicit step models still win over tiers. Pick models available to your login from `codex debug models`.
+
+A step with no tier takes its `[models]` role, so switch that role with a `codex:` model too:
+
+```toml
+[models]
+learn = "codex:gpt-5.4-mini"
+```
+
+`openai/gpt-5.4-mini` keeps routing to pi on keys from `pi.env`. `arete steps --repo NAME` shows the resolved runners, models, instruction defaults and codex safety notes. For one adw run, `--set implement.runner=codex --set implement.model=gpt-5.4` overrides just build.
+
+Config load and step resolution refuse, in one line that names the table: an unknown step, kind or key, a tier the map does not have, a runner other than `claude`, `pi`, `codex` or `replay`, an effort the step's runner does not take (including `off` on codex), `tries` or `timeout_minutes` under 1, several tier maps with no engine or repo selection, a `tier_map` with no such map, a tool outside the `tools` list above (`Bash` and `mcp__` names included), a pi or codex step whose `tools` leave out a read tool, an `mcp` name with no `[mcp.<name>]`, any `mcp` or `instructions` on pi, `instructions = ["user"]` on codex, an `instructions` value other than `user` and `repo`, a `session` other than `resume` and `fresh`, `resume` for learn or uat, and an `[mcp.<name>]` with an unknown key, with both or neither of `command` and `url`, or with `args` beside `url`. Codex on an ssh or exe device is refused before starting a loop or session. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
 
 ## Replay
 

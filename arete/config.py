@@ -441,7 +441,7 @@ def load(path: Path | None = None) -> Config:
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     from . import steps
-    steps.check(cfg)
+    steps.check(cfg, defer_tiers=True)
     return cfg
 
 
@@ -508,6 +508,7 @@ class RepoLayer:
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
+    tier_map: str = ""
     passes: tuple[str, ...] = ()
 
     @property
@@ -566,6 +567,7 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.steps = step_tables(section(data, "steps"), "steps")
     layer.kinds = kind_tables(section(data, "kinds"), "kinds")
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
+    layer.tier_map = str(section(data, "factory").get("tier_map", "")).strip()
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     layer.passes = environment_table(section(data, "environment"), layer=True).passes

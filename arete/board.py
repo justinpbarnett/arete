@@ -20,7 +20,7 @@ from . import (
     triage,
     util,
 )
-from .agent import SUBSCRIPTION_RUNNER
+from .agent import subscription
 from .alerts import issue_link, opened_in
 
 RECENT_RUNS = 25
@@ -292,7 +292,7 @@ def run_board(run_id: str) -> dict:
     models: dict[tuple[str, str], dict] = {}
     for s in state.steps(run_id, connect=state.reader):
         key = (s["model"] or "no model", s["runner"] or "no runner")
-        row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": s["runner"] != SUBSCRIPTION_RUNNER,
+        row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": not subscription(s["runner"], s["provider"] or ""),
                                       "steps": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
         row["steps"] += 1
         row["tokens_in"] += s["tokens_in"] or 0
