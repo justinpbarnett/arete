@@ -12,9 +12,10 @@ from .agent import KEY_PROVIDERS, SUBSCRIPTION_RUNNERS
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
-PAID_STEP = (f"NOT (COALESCE(steps.runner, '') IN ({', '.join(repr(r) for r in sorted(SUBSCRIPTION_RUNNERS))}) AND "
+PAID_STEP = (f"(CASE steps.auth_mode WHEN 'subscription' THEN 0 WHEN 'api_key' THEN 1 ELSE "
+             f"NOT (COALESCE(steps.runner, '') IN ({', '.join(repr(r) for r in sorted(SUBSCRIPTION_RUNNERS))}) AND "
              f"NOT (steps.runner = 'codex' AND COALESCE(steps.provider, '') IN "
-             f"({', '.join(repr(p) for p in sorted(KEY_PROVIDERS))})))")
+             f"({', '.join(repr(p) for p in sorted(KEY_PROVIDERS))}))) END)")
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 SCHEMA = """
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS steps (
     runner TEXT,
     model TEXT,
     provider TEXT,
+    auth_mode TEXT DEFAULT '',
     ok INTEGER,
     cost_usd REAL DEFAULT 0,
     tokens_in INTEGER DEFAULT 0,
@@ -329,6 +331,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     sender TEXT NOT NULL,          -- you | arete
     text TEXT,
     cost REAL DEFAULT 0,
+    paid_usd REAL,
     ts TEXT
 );
 CREATE INDEX IF NOT EXISTS chat_messages_chat ON chat_messages (chat_id, id);
@@ -380,6 +383,7 @@ CREATE TABLE IF NOT EXISTS passed_over (
 );
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+              ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
               ("triage", "code", "ALTER TABLE triage ADD COLUMN code INTEGER"),
               ("triage", "kind", "ALTER TABLE triage ADD COLUMN kind TEXT DEFAULT ''"),
@@ -406,7 +410,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
                   ("effort", "TEXT DEFAULT ''"), ("tier", "TEXT DEFAULT ''"), ("try", "INTEGER DEFAULT 0"),
                   ("kind", "TEXT DEFAULT ''"), ("cache_read", "INTEGER DEFAULT 0"), ("cache_write", "INTEGER DEFAULT 0"),
-                  ("api_seconds", "REAL DEFAULT 0"))]]
+                  ("api_seconds", "REAL DEFAULT 0"), ("auth_mode", "TEXT DEFAULT ''"))]]
 
 
 @contextmanager
@@ -812,6 +816,9 @@ def take_messages(run_id: str) -> list[str]:
 
 CHAT_COLUMNS = ("title", "project", "created", "updated", "spent", "busy", "session", "session_spent", "runner",
                 "draft_title", "draft_body")
+CHAT_USAGE = ("(SELECT COALESCE(SUM(m.paid_usd), 0) FROM chat_messages m WHERE m.chat_id = chats.id) AS paid_usd, "
+              "(SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = chats.id "
+              "AND m.paid_usd IS NULL AND m.cost != 0) AS unclassified_messages")
 
 
 def chat_add(project: str) -> int:
@@ -822,18 +829,18 @@ def chat_add(project: str) -> int:
 
 def chat_get(chat_id: int) -> dict | None:
     with db() as c:
-        r = c.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        r = c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats WHERE id = ?", (chat_id,)).fetchone()
         return dict(r) if r else None
 
 
 def chats() -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM chats ORDER BY created DESC, id DESC")]
+        return [dict(r) for r in c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats ORDER BY created DESC, id DESC")]
 
 
 def chat_messages(chat_id: int) -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT sender, text, cost, ts FROM chat_messages WHERE chat_id = ? "
+        return [dict(r) for r in c.execute("SELECT sender, text, cost, paid_usd, ts FROM chat_messages WHERE chat_id = ? "
                                            "ORDER BY id", (chat_id,))]
 
 
@@ -847,13 +854,16 @@ def chat_claim(chat_id: int, text: str, title: str) -> bool:
         return bool(claimed)
 
 
-def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, **fields) -> None:
+def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_usd: float | None = None,
+             reported_cost: float | None = None, **fields) -> None:
     ts = util.iso()
+    reported_cost = cost if reported_cost is None else reported_cost
+    paid_usd = 0.0 if reported_cost == 0 and paid_usd is None else paid_usd
     with db() as c:
-        c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, ts) VALUES (?,?,?,?,?)",
-                  (chat_id, sender, text, cost, ts))
-        c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = ROUND(spent + ?, 2) WHERE id = ?",
-                  (*fields.values(), ts, cost, chat_id))
+        c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
+                  (chat_id, sender, text, reported_cost, paid_usd, ts))
+        c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",
+                  (*fields.values(), ts, reported_cost, chat_id))
 
 
 def chat_drop_draft(chat_id: int, title: str, body: str) -> None:

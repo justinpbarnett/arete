@@ -108,12 +108,12 @@ function paidParts(t, width) {
   return [
     el("p", { class: "readout" }, money(t.total_paid), el("small", { text: `paid in ${t.days.length} days` })),
     t.total_paid > 0 ? [
-      el("p", {}, `Only model calls you pay for count here. A run on the claude CLI rides your subscription, so it adds nothing. Today so far: ${money(today.paid)}.`),
+      el("p", {}, `Only model calls you pay for count here. Subscription calls add nothing, and retain their tokens. Today so far: ${money(today.paid)}.`),
       paidChart(t.days, width),
       el("h3", { text: "By model" }), paidTable(t.by_model),
       el("h3", { text: "By runner" }), paidTable(t.by_runner),
       el("h3", { text: "By loop or kind" }), paidTable(t.by_loop),
-    ] : quiet(`Nothing was paid in ${t.days.length} days: every model call ran on the subscription.`),
+    ] : quiet(`Nothing was paid in ${t.days.length} days. Subscription calls and zero-cost metered calls add nothing.`),
   ];
 }
 

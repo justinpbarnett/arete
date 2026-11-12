@@ -187,7 +187,8 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     recent = util.tail(log.read_text(errors="replace"), RECENT_CHARS) if log.exists() else ""
     log_line(spec, "you", prompt)
     left = None
-    if spec.budget_usd and runner.metered(spec.model, spec.runner or resume.runner):
+    if spec.budget_usd and runner.metered(spec.model, spec.runner or resume.runner, cfg=cfg,
+                                        repo=session_repo(spec, cfg), device=device):
         left = round(spec.budget_usd - record.metered_spent(spec.id), 2)
         if left <= runner.BUDGET_FLOOR_USD:
             log_line(spec, "error", f"the session budget of ${spec.budget_usd:g} is spent")

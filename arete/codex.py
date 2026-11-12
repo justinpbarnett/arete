@@ -7,12 +7,11 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import claude, config, environment, guard, paths, util
+from . import accounts, claude, config, environment, guard, paths, util
 from .agent import NO_SESSION, Result, Session, UsageLimit, json_from_text
 from .pi import SCHEMA_RULE
 
@@ -23,7 +22,6 @@ NEVER = (*claude.PARENT_SESSION_VARS, "CODEX_API_KEY", "OPENAI_API_KEY")
 AGENT_SETS = {"ARETE_AGENT": "1"}
 CHATGPT_PROVIDER = "chatgpt"
 KEY_PROVIDER = "openai"
-LOGIN_CACHE_SECONDS = 300
 READ_PROFILE, WRITE_PROFILE = "read_only", "workspace_write"
 PROFILE_BASE = {READ_PROFILE: ":read-only", WRITE_PROFILE: ":workspace"}
 WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "NotebookEdit"})
@@ -64,7 +62,6 @@ NOTES = ("read-only or workspace-write sandbox according to the step's tools; ne
          "repo instructions only; a login with global AGENTS.md instructions cannot be isolated and is refused",
          "only declared MCP servers/tools are enabled and preapproved; environment values stay out of argv")
 LEADING_WORD = re.compile(r"\w+=.*|-.*|\d+")
-logins: dict[str, tuple[float, str]] = {}
 
 
 def binary() -> str:
@@ -296,7 +293,29 @@ def command(
     return [*cmd, "-"]
 
 
-def run(
+def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
+    if remote:
+        return accounts.Auth()
+    env = agent_env(passing, extra)
+    folder = Path(env.get("CODEX_HOME") or Path(env.get("HOME", str(paths.HOME))) / ".codex")
+    data = accounts.read(folder / "auth.json")
+    try:
+        provider = "" if data else login(env)[2]
+    except (OSError, subprocess.SubprocessError):
+        provider = ""
+    return accounts.codex(data, str(folder), provider)
+
+
+def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
+    auth = auth or authentication(kw.get("passing"), kw.get("extra_env"), kw.get("remote"))
+    result = _run(*args, auth=auth, **kw)
+    result.auth_mode = auth.mode
+    if auth.mode != "subscription":
+        result.usage_limit = None
+    return result
+
+
+def _run(
     prompt: str,
     cwd: Path | str,
     *,
@@ -322,7 +341,9 @@ def run(
     judge: bool = False,
     hidden: list[Path | str] = (),
     on_line: Callable[[str], None] = lambda line: None,
+    auth: accounts.Auth | None = None,
 ) -> Result:
+    auth = auth if auth is not None else accounts.Auth()
     resume = resume if resume.runner == "codex" else NO_SESSION
     if remote:
         return Result(ok=False, session=resume, error=RUNS_LOCALLY, runner="codex", model=model)
@@ -352,7 +373,8 @@ def run(
         return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
     if json_schema:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
-    provider, before = login_provider(), thread_usage(resume.id)
+    provider = KEY_PROVIDER if auth.mode == "api_key" else CHATGPT_PROVIDER
+    before = thread_usage(resume.id)
     on_line(json.dumps({"arete": "command", "argv": cmd, "usage_before": before}) + "\n")
     session = resume
 
@@ -487,8 +509,8 @@ def reset_time(text: str) -> datetime | None:
     return None
 
 
-def login() -> tuple[bool, str, str]:
-    res = util.sh([binary(), "login", "status"], timeout=30, env=agent_env(), inherit=False)
+def login(env: dict | None = None) -> tuple[bool, str, str]:
+    res = util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env(), inherit=False)
     said = f"{res.stdout}\n{res.stderr}"
     if "ChatGPT" in said and res.returncode == 0:
         return True, "logged in with ChatGPT", CHATGPT_PROVIDER
@@ -500,14 +522,7 @@ def login() -> tuple[bool, str, str]:
 
 
 def login_provider() -> str:
-    at, provider = logins.get("provider", (0.0, ""))
-    if time.monotonic() - at > LOGIN_CACHE_SECONDS or not at:
-        try:
-            provider = login()[2] or CHATGPT_PROVIDER
-        except (OSError, subprocess.SubprocessError):
-            provider = CHATGPT_PROVIDER
-        logins["provider"] = (time.monotonic(), provider)
-    return provider
+    return KEY_PROVIDER if authentication().mode == "api_key" else CHATGPT_PROVIDER
 
 
 def git_write(command: str | list[str], rules: list[str], depth: int = 0) -> str:

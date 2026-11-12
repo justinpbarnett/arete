@@ -289,20 +289,24 @@ def run_board(run_id: str) -> dict:
     r = state.run_get(run_id, connect=state.reader)
     if not r:
         raise control.NotFound(f"nothing has the id {run_id}")
-    models: dict[tuple[str, str], dict] = {}
+    models: dict[tuple[str, str, bool], dict] = {}
     for s in state.steps(run_id, connect=state.reader):
-        key = (s["model"] or "no model", s["runner"] or "no runner")
-        row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": not subscription(s["runner"], s["provider"] or ""),
+        metered = not subscription(s["runner"], s["provider"] or "", s.get("auth_mode"))
+        key = (s["model"] or "no model", s["runner"] or "no runner", metered)
+        row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": metered,
+                                      "auth_mode": "api_key" if metered else "subscription", "paid": 0.0,
                                       "steps": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
         row["steps"] += 1
         row["tokens_in"] += s["tokens_in"] or 0
         row["tokens_out"] += s["tokens_out"] or 0
         row["cost_usd"] += s["cost_usd"] or 0
+        row["paid"] += (s["cost_usd"] or 0) if metered else 0
     spec = util.read_json(sessions.spec_file(run_id), {}) if r["kind"] == "session" else {}
     return {"now": util.iso(),
             "run": {**r, "ticket": ticket(r), "paid": state.paid_by_run([run_id], state.reader).get(run_id, 0)},
-            "models": sorted(({**m, "cost_usd": round(m["cost_usd"], 4)} for m in models.values()),
-                             key=lambda m: (-m["cost_usd"], m["model"])),
+            "models": sorted(({**m, "cost_usd": round(m["cost_usd"], 4), "paid": round(m["paid"], 4)}
+                              for m in models.values()),
+                             key=lambda m: (-m["cost_usd"], m["model"], m["runner"], m["metered"])),
             "approvals": [a for a in delivery.waiting(connect=state.reader) if a["run_id"] == run_id],
             "lines_from": "feed" if r["kind"] in FEED_KINDS else "log",
             "session": {"prompt": spec.get("prompt", ""), "tools": spec.get("tools", []),

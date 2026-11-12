@@ -71,7 +71,7 @@ A step picks it with `runner = "codex"` in a step table or a tier, a `codex:<mod
 Each call runs `codex exec --json` with the folder as `-C`, the model as `-m`, the effort as `model_reasoning_effort` and the prompt on stdin.
 The step's session keeps codex's thread id with runner `codex`, and a later round resumes it with `codex exec resume <thread>`. Switching runners starts a fresh thread; repair prompts carry the saved ticket, plan and builder summary. Claude sessions never resume in Codex.
 Public PR reports and tracker comments pass through outbound redaction before publication; raw local evidence stays intact.
-A ChatGPT login is a subscription, as claude is: the step shows `subscription`, counts nothing in any sum, and still records its tokens.
+A ChatGPT login is a subscription, as claude is: the step shows `subscription`, counts nothing in paid sums, and still records its reported cost and tokens.
 An API key login is metered, priced at the model's `[pricing]` price, since codex reports no cost.
 When codex reports a usage limit, codex steps wait under a hold of their own, so a codex limit never holds a claude step and a claude limit never holds a codex step.
 The heartbeat checks `codex login status` beside `claude auth status` once any step, role or configured loop resolves to codex, and raises `codex:auth` when you are logged out.
@@ -224,7 +224,7 @@ arete session attach ID | stop ID | list
 
 `--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Sessions view starts one with the same choices, under New session.
 
-`arete costs` shows what you paid for model calls, by model, runner and loop. A step on the claude CLI, or on codex with a ChatGPT login, rides the subscription and counts nothing there.
+`arete costs` shows what you paid for model calls, by model, runner and loop. A call's explicit authentication mode decides whether it uses a subscription and counts nothing there; older rows keep their runner/provider interpretation.
 
 `arete costs --by step|kind|model` counts every step instead, at the cost each call reported (a claude CLI step's is the API price), grouped by step name, by the task's kind (`feat`, `fix`) or by model, or by several in turn with `--by step kind model`, over the last `--days N` (default 7). Each row shows the runs (distinct runs in the group), calls, cost, input tokens no cache served (`in`), cache reads and cache writes, output tokens, minutes and API minutes. The minutes are each call's whole time; the API minutes are the part the model's API calls took, as the runner reports it (claude does, pi does not), so the rest went to tools. The last line gives the wait minutes of the runs started in that window, by cause. `--json` prints one JSON line per group and a last line with `wait_minutes`; `--json` alone groups by step. The plain `arete costs` stays the paid view.
 
@@ -334,6 +334,7 @@ Every agent call writes its runner's raw output to `runs/<run_id>/record/<step>.
 A call outside any run gets a run id of its own that starts with `call-`.
 A second call with the same step name in one run gets `<step>-2.jsonl.gz`, then `-3`, and so on.
 The first line is a header with the runner, model, device, repo, commit, folder, prompt, system prompt, tools, JSON schema, budget, timeout and the session it resumes.
+Headers, results, timeline `agent` marks and SQLite step rows also carry `auth_mode`: `subscription` or `api_key`. Runner and provider names stay unchanged. An empty or absent mode uses the historical interpretation: pi and replay are metered, Claude is subscription, and Codex is subscription except for its `openai` provider. Old rows are not backfilled from today's login. A crashed or interrupted record keeps its captured mode without inventing usage.
 When a call leaves the model to the runner's default, arete holds the header until the runner names the model it runs (claude's `init` event or pi's first reply), for at most 10 seconds, so the header names the model the default turned out to be.
 Then come the runner's own lines unchanged: claude's `stream-json` events, pi's `--mode json` events, or codex's `exec --json` events after one `command` line with the argv arete ran.
 A clock line with the seconds since the start goes in before a runner line whenever a second or more has passed since the last one.
@@ -343,6 +344,10 @@ Neither has a cost or a turn count, in its result or in its timeline mark, becau
 
 `steps.jsonl.gz` in the same folder is the run's timeline, one line per mark: `create` (a fresh sandbox), `lease`, `clone`, `boot`, `release`, `worktree`, `setup`, `check`, `diff` (with the staged patch), `agent` (one per call, naming its record file) and `result` (the run's final status).
 Each mark has its start time, and the marks that time something have their seconds.
+Classic `step_end` lines and saved step results include `auth_mode`, joining distinct modes with `, ` when a step retries across modes. Saved results also retain the `auth_modes` list and aggregate `paid_usd`. Seam `step_end` lines join distinct modes like their other call labels; a joined value describes several calls, not one authentication mode. Individual results keep their own mode. A pi schema restatement resolves authentication again before launching; its usage gets a separate step row, and the combined record result lists each call's mode, paid amount and usage in `calls`, alongside aggregate `auth_modes` and `paid_usd`.
+
+Subscription limit holds are qualified by subscription family, nonsecret account identity and limit scope. Matching Claude and pi anthropic account UUIDs share the `claude` family; matching Codex and pi openai-codex ChatGPT account IDs share `codex`. Claude's all-model, opus and sonnet limits remain distinct; Codex's limit covers its family. Different accounts never share a hold. An unknown identity can wait only within its own invocation. Old unqualified holds expire without becoming pi holds.
+Discovery reads login metadata separately from launching an agent. Opaque Claude OAuth credentials can use a read-only profile lookup with a short timeout, a response-size bound and no redirects. Only nonsecret identity snapshots and one-way fingerprints are cached; credentials and profile bodies never enter records. A changed credential, account or login directory invalidates discovery, including on bounded wakeups while waiting. Only a successful subscription call clears older applicable holds for its captured account and scope; API-key success cannot clear them. Reset slack, session continuation and original-prompt retries still apply. This foundation does not start using the owner's pi login or change replay execution.
 
 The files are gzip, not zstd, because arete runs on Python 3.13 with the standard library only, and zstd comes to the standard library in 3.14; the `.gz` suffix names the codec, so a switch later is a new suffix.
 `zcat`, `gzip -dc` and `zless` read them.
@@ -935,7 +940,7 @@ Each chat continues its own session and waits on its own answer, so several chat
 On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
 
 Money counts only what you pay, on the dashboard and everywhere else arete shows a sum: the CLI, a run's end line in its feed, PR bodies, research reports and eval results.
-A step on the `claude` CLI rides the subscription, so every paid sum leaves it out, a run's page says "subscription" for its claude models, and a run that paid nothing ends its feed with "nothing paid".
+Explicit subscription calls contribute no paid spend and retain all their tokens and reported cost. API-key calls contribute their cost even on a runner that also supports subscriptions. `arete costs` shows paid spend; `arete costs --by model` and other groupings show raw call cost and tokens, including subscription usage. Run details split the same model into subscription and metered rows when both occur, independent of call order. A zero-cost metered call says nothing paid without claiming subscription use. Chat stores each new reply's paid amount in `paid_usd` and its reported cost in `cost`, retaining full precision until display. Paid amounts show independently of the current login. Historical messages retain their old reported `cost` and a NULL `paid_usd`; the console labels those amounts as reported with payment unknown, rather than inferring billing from today's login. Chat paid totals sum only known paid amounts, while the stored `spent` total continues to track reported cost. Histories remain readable when a project leaves the configuration.
 
 ### API
 
@@ -996,7 +1001,7 @@ The `justfile` at the top of this checkout wraps these commands in `adw` recipes
 ## Rules
 
 - Agents run through `claude -p` on a Claude subscription, or through `pi` for other providers and local models. Never the API SDK, never `--bare`, never an `ANTHROPIC_API_KEY`, here or on a device.
-- A claude run takes no dollar cap and waits out a usage limit; budgets apply to pi alone.
+- A claude run takes no dollar cap and waits out a subscription usage limit; budgets count API-key spend. Codex has no per-call dollar cap.
 - A loop fed by outside text gets only the reading tools, and its events reach the agent fenced as data.
 - An agent on the `claude` CLI loads only the MCP servers its call names. The verifier names its browser and every other call names none, so the connectors and plugin servers of the account never load.
 - Agents never run git write commands, except pi in an exe.dev sandbox, which arete refuses when it could push and deletes after its run.

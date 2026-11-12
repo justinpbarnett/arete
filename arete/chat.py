@@ -43,7 +43,8 @@ class BadProject(ValueError):
 
 def summary(row: dict) -> dict:
     return {"id": row["id"], "title": row["title"], "project": row["project"], "created": row["created"],
-            "updated": row["updated"], "spent": row["spent"], "busy": bool(row["busy"]),
+            "updated": row["updated"], "spent": row["paid_usd"], "reported_cost": row["spent"],
+            "unclassified_messages": row["unclassified_messages"], "busy": bool(row["busy"]),
             "drafted": bool(row["draft_title"])}
 
 
@@ -62,8 +63,13 @@ def chat_row(chat_id: int) -> dict:
 def view(chat_id: int) -> dict:
     row = chat_row(chat_id)
     cfg = config.load()
+    try:
+        repo = cfg.repo(row["project"]) if row["project"] else arete_repo(cfg)
+    except config.UnknownRepo:
+        repo = None
     return {**summary(row), "folder": folder(row["project"]), "draft": draft_of(row, cfg),
-            "metered": runner.metered(cfg.model("chat"), row["runner"]), "messages": state.chat_messages(chat_id)}
+            "metered": runner.metered(cfg.model("chat"), row["runner"], cfg=cfg, repo=repo) if repo else None,
+            "messages": state.chat_messages(chat_id)}
 
 
 def draft_of(row: dict, cfg: config.Config) -> dict | None:
@@ -118,17 +124,18 @@ def send(chat_id: int, text: str) -> dict:
 
 
 def answer(chat_id: int, text: str, session: Session, project: str) -> None:
-    reply, cost, draft = "", 0.0, None
+    reply, cost, paid, draft = "", 0.0, 0.0, None
     try:
         result = ask(chat_id, text, session, project)
-        session, cost = result.session, result.cost_usd
+        session, cost, paid = result.session, result.cost_usd, result.paid_usd
         if result.ok:
             reply, draft = reply_and_draft(result)
         else:
             reply = f"The agent stopped: {result.error or result.text}"
     except Exception as e:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
-    state.chat_say(chat_id, "arete", reply, round(cost, 2), busy=0, session=session.id, session_spent=session.spent_usd,
+    state.chat_say(chat_id, "arete", reply, cost, paid_usd=paid,
+                   busy=0, session=session.id, session_spent=session.spent_usd,
                    runner=session.runner, **({"draft_title": draft["title"], "draft_body": draft["body"]} if draft else {}))
 
 
@@ -221,6 +228,7 @@ def ask(chat_id: int, text: str, session: Session, project: str) -> Result:
         text, work.path,
         trace=("chat", f"chat {chat_id}"),
         cfg=cfg,
+        repo=work,
         model=model,
         tools=[*runner.READ_TOOLS, "Bash"],
         allowed_tools=[*runner.READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",

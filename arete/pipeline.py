@@ -288,19 +288,20 @@ class AgentRun:
             if res.connection_failed:
                 self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
                 if util.wait_for_network():
-                    self.cost += res.cost_usd
-                    self.paid += res.paid_usd
+                    dropped = res
                     self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                     if res.session.id and res.turns > 1 and kw.get("persist", True):
                         res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
                                          **{**kw, "resume": res.session})
                     else:
                         res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+                    res = runner.with_spent(res, [dropped])
         if s and res.session.id:
             self.sessions[s.step] = res.session
         self.cost += res.cost_usd
         self.paid += res.paid_usd
         usage = {"runner": res.runner or which, "model": res.model or model, "effort": effort, "tier": tier,
+                 "auth_mode": ", ".join(res.modes),
                  "kind": kind, "cost_usd": round(self.cost - spent, 6), "tokens_in": res.tokens_in,
                  "tokens_out": res.tokens_out, "turns": res.turns, "cache_read": res.cache_read,
                  "cache_write": res.cache_write, "api_seconds": round(res.api_seconds, 2)}
@@ -310,6 +311,8 @@ class AgentRun:
             self.write_line("step_end", step=step, ok=res.ok, seconds=round(time.monotonic() - started, 1),
                             error=(res.error or "")[:500], **{"try": state.step_tries(self.id, step)}, **usage)
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
+                                   "auth_mode": usage["auth_mode"], "auth_modes": list(res.modes),
+                                   "paid_usd": res.paid_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error})
         self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} {runner.cost_note(res)}")
