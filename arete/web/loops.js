@@ -118,7 +118,7 @@ function loopAction(name, action, btn, place) {
 }
 
 function budgetWords(d) {
-  if (d.metered === false) return "none, claude runs on the subscription";
+  if (d.metered === false) return "none, calls use a subscription";
   return [d.budget_usd ? `${money(d.budget_usd)} a run` : "", d.daily_budget_usd ? `${money(d.daily_budget_usd)} a day` : ""].filter(Boolean).join(", ") || "none";
 }
 

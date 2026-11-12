@@ -1,14 +1,30 @@
 from __future__ import annotations
 
-import json
 import os
+import secrets
 import sys
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
-from . import ask, claude, codex, config, devices, environment, guard, jev, paths, pi, record, replay, state, util
+from . import (
+    accounts,
+    ask,
+    claude,
+    codex,
+    config,
+    devices,
+    environment,
+    guard,
+    jev,
+    paths,
+    pi,
+    record,
+    replay,
+    state,
+    util,
+)
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -85,22 +101,41 @@ def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: confi
             f"{paths.short_path(pi.KEYS_FILE)}")
 
 
-def metered(model: str, run_with: str = "") -> bool:
+def authentication(model: str, run_with: str = "", *, cfg: config.Config | None = None,
+                   repo: config.Repo | None = None, device: devices.Device | str = "local") -> accounts.Auth:
+    which, name = route(model, run_with)
+    if which == REPLAY or (cfg and cfg.replay.all):
+        return accounts.Auth()
+    cfg = cfg or config.load()
+    target = devices.resolve(device)
+    passing = environment.passed(cfg, repo)
+    remote = target if target.remote else None
+    if which == "pi":
+        return pi.authentication(name, passing, cfg.environment.providers, remote)
+    return (codex if which == "codex" else claude).authentication(passing, remote=remote)
+
+
+def metered(model: str, run_with: str = "", **context) -> bool:
     which = route(model, run_with)[0]
-    return not subscription(which, codex.login_provider() if which == "codex" else "")
+    auth = authentication(model, run_with, **context)
+    return not subscription(which, "", auth.mode)
 
 
 def limit_applies(scope: str, model: str) -> bool:
     return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in model.lower()
 
 
-def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None) -> dict | None:
+def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None,
+               repo: config.Repo | None = None, device: devices.Device | str = "local",
+               auth: accounts.Auth | None = None, unknown: str = "") -> dict | None:
     which, name = route(model, run_with)
-    if cfg and cfg.replay.all:
+    if which == REPLAY or (cfg and cfg.replay.all):
         return None
-    scopes = LIMIT_SCOPES.get(which, ())
-    return next((h for h in reversed(state.holds(connect)) if h["scope"] in scopes and limit_applies(h["scope"], name)),
-                None)
+    auth = auth or authentication(model, run_with, cfg=cfg, repo=repo, device=device)
+    if auth.mode != "subscription" or not (auth.identity or unknown):
+        return None
+    scopes = [accounts.scope(auth, s, unknown) for s in LIMIT_SCOPES.get(auth.family, ()) if limit_applies(s, name)]
+    return next((h for h in reversed(state.holds(connect)) if h["scope"] in scopes), None)
 
 
 def hold_words(hold: dict) -> str:
@@ -111,8 +146,10 @@ def local_time(stamp: str) -> str:
     return util.parse_iso(stamp).astimezone().strftime("%a %b %d %H:%M")
 
 
-def wait_out(scope: str) -> None:
+def wait_out(scope: str, changed: Callable[[], bool] = lambda: False) -> None:
     while until := state.hold_until(scope):
+        if changed():
+            return
         time.sleep(max(1.0, min(HOLD_CHECK_SECONDS, (util.parse_iso(until) - util.now()).total_seconds())))
 
 
@@ -153,11 +190,9 @@ def withheld(model: str, run_with: str, tools: list[str], device: devices.Device
 
 
 def claude_login() -> tuple[bool, str]:
-    res = util.sh([claude.binary(), "auth", "status"], timeout=30)
-    try:
-        status = json.loads(res.stdout)
-    except json.JSONDecodeError:
-        return False, f"claude auth status failed: {util.first_line(res.stderr or res.stdout) or f'exit {res.returncode}'}"
+    status = claude.auth_status()
+    if not status:
+        return False, "claude auth status failed"
     if not status.get("loggedIn"):
         return False, "claude CLI is not logged in"
     if not status.get("loginExpiresAt"):
@@ -176,7 +211,8 @@ def codex_login() -> tuple[bool, str]:
 
 
 def cost_note(res: Result) -> str:
-    paid = "subscription" if subscription(res.runner, res.provider) else util.paid_note(res.cost_usd)
+    paid = ("subscription" if subscription(res.runner, res.provider, res.auth_mode) and not res.paid_usd
+            else util.paid_note(res.paid_usd))
     return f"({util.count(res.turns, 'turn')}, {paid})"
 
 
@@ -221,33 +257,43 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         if not target.remote:
             kw["providers"] = cfg.environment.providers
     limited: list[Result] = []
+    invocation = secrets.token_hex(16)
     while True:
-        if wait_out_limits and (held := usage_hold(name, which, cfg=cfg)):
+        auth = authentication(name, which, cfg=cfg, repo=repo, device=target) if which != REPLAY else accounts.Auth()
+        unknown = "local-" + accounts.fingerprint(invocation, auth.generation)
+        if wait_out_limits and (held := usage_hold(name, which, cfg=cfg, auth=auth, unknown=unknown)):
             say(hold_words(held))
             with waits("limit"):
-                wait_out(held["scope"])
+                wait_out(held["scope"], lambda auth=auth: authentication(name, which, cfg=cfg, repo=repo,
+                                                                       device=target) != auth)
             say(f"the {which} usage limit has lifted, going on")
+            continue
         started = util.iso()
-        res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind)
+        res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind, auth)
         if not res.usage_limit:
-            if which in LIMIT_SCOPES and res.ok:
-                state.clear_holds([s for s in LIMIT_SCOPES[which] if limit_applies(s, res.model)], set_before=started)
+            if auth.mode == "subscription" and res.ok:
+                state.clear_holds([accounts.scope(auth, s, unknown) for s in LIMIT_SCOPES.get(auth.family, ())
+                                   if limit_applies(s, res.model)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
         why = f"{which} {limit.kind or 'usage'} limit reached"
-        state.hold(limit.scope, limit.until, why)
+        scope = accounts.scope(auth, limit.scope, unknown)
+        state.hold(scope, limit.until, why)
         if not wait_out_limits:
-            return res
+            return with_spent(res, limited)
         limited.append(res)
         say(hold_words({"why": why, "until": limit.until}))
         with waits("limit"):
-            wait_out(limit.scope)
+            wait_out(scope, lambda auth=auth: authentication(name, which, cfg=cfg, repo=repo, device=target) != auth)
         say(f"the {which} usage limit has lifted, going on")
         if res.session.id and res.turns > 1 and kw.get("persist", True):
             prompt, resume = CONTINUE_AFTER_LIMIT, res.session
 
 
 def with_spent(res: Result, earlier: list[Result]) -> Result:
+    if earlier:
+        res.aggregate_paid_usd = res.paid_usd + sum(r.paid_usd for r in earlier)
+        res.auth_modes = tuple(dict.fromkeys(mode for r in [*earlier, res] for mode in r.modes))
     res.cost_usd += sum(r.cost_usd for r in earlier)
     res.tokens_in += sum(r.tokens_in for r in earlier)
     res.tokens_out += sum(r.tokens_out for r in earlier)
@@ -259,8 +305,13 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
-            kind: str = "") -> Result:
+            kind: str = "", auth: accounts.Auth | None = None) -> Result:
+    auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
     header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
+              "auth_mode": auth.mode,
+              "provider": provider_of(name) or ("anthropic" if which == "claude" else
+                                                ("openai" if auth.mode == "api_key" else "chatgpt")
+                                                if which == "codex" else ""),
               "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
               "allowed_tools": kw.get("allowed_tools"), "disallowed_tools": kw.get("disallowed_tools"),
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
@@ -273,18 +324,30 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         if which == REPLAY:
             res = replay.run(cwd, trace, cfg, rec.line, resume)
         elif which == "codex":
-            res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line, hidden=found, **kw)
+            res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line, hidden=found, auth=auth, **kw)
         else:
             res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume, on_line=rec.line,
-                                                             **kw)
+                                                             auth=auth, **kw)
         res.runner = which
         res.model = res.model or name
         res.provider = res.provider or provider_of(res.model)
-        res.cost_usd = priced(res, cfg)
+        if which != REPLAY:
+            res.auth_mode = auth.mode
+            if (auth.mode != "subscription" or
+                    (res.usage_limit and res.usage_limit.scope not in LIMIT_SCOPES.get(auth.family, ()))):
+                res.usage_limit = None
+        if res.calls:
+            for call in res.calls:
+                call.cost_usd = priced(call, cfg)
+            res.cost_usd = sum(call.cost_usd for call in res.calls)
+            res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
+        else:
+            res.cost_usd = priced(res, cfg)
         rec.finish(res, time.monotonic() - started)
     if trace[0]:
-        record.step(trace[0], trace[1], res, time.monotonic() - started, effort=kw.get("effort", ""), tier=tier,
-                    kind=kind)
+        for call in res.calls or [res]:
+            record.step(trace[0], trace[1], call, call.call_seconds if res.calls else time.monotonic() - started,
+                        effort=kw.get("effort", ""), tier=tier, kind=kind)
     return res
 
 

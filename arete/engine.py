@@ -157,7 +157,8 @@ class LoopRun:
     def agent(self, step: str, prompt: str, cwd: Path, *, model: str = "", tools: list[str] | None = None,
               **kw) -> Result:
         model = model or self.loop.model_for(self.cfg)
-        left = self.room() if runner.metered(model, self.loop.runner) else None
+        left = self.room() if runner.metered(model, self.loop.runner, cfg=self.cfg, repo=loop_repo(self),
+                                           device=self.device) else None
         res = runner.run(prompt, cwd, model=model, runner=self.loop.runner, trace=(self.id, step), cfg=self.cfg,
                          tools=tools, allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left,
                          persist=False, timeout=self.loop.timeout_minutes * 60, device=self.device,

@@ -106,7 +106,13 @@ function switchChat(id) {
 
 function chatAbout(c) {
   const where = c.project ? `on ${c.project}, ${c.folder ? `in ${c.folder}` : "which left the config"}` : `no project, in arete's folder ${c.folder}`;
-  return `Started ${clock(c.created)} · ${where}${c.metered ? ` · ${money(c.spent)} so far` : ""}`;
+  const paid = c.unclassified_messages ? `${money(c.spent)} known paid · older payment amounts unknown` : `${money(c.spent)} paid so far`;
+  return `Started ${clock(c.created)} · ${where} · ${paid}`;
+}
+
+function messageCost(m) {
+  if (m.paid_usd != null) return m.paid_usd ? money(m.paid_usd) : "";
+  return m.cost ? `${money(m.cost)} reported · payment unknown` : "";
 }
 
 function drawChat(c) {
@@ -138,7 +144,7 @@ function drawChat(c) {
   chatSeen = seen;
   chatLength = c.messages.length;
   fill("messages", c.messages.length ? c.messages.map((m) => el("div", { class: `msg from-${m.sender}` },
-    el("div", { class: "who" }, withFigures([m.sender === "you" ? "You" : "Arete", clock(m.ts), c.metered && m.cost ? money(m.cost) : ""].filter(Boolean).join(" · "))),
+    el("div", { class: "who" }, withFigures([m.sender === "you" ? "You" : "Arete", clock(m.ts), messageCost(m)].filter(Boolean).join(" · "))),
     el("p", {}, withLinks(m.text))))
     : quiet(c.project ? `No messages yet. Ask about ${c.project}'s code, its checks, or how arete works on it.`
       : "No messages yet. Ask what is running, why a run failed, or what to change."));

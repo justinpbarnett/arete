@@ -16,7 +16,7 @@ from . import config, lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
-LABELS = ("runner", "model", "effort", "tier", "kind")
+LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode")
 COUNTS = ("tokens_in", "tokens_out", "turns", "cache_read", "cache_write")
 MAX_ERROR_CHARS = 500
 
@@ -82,7 +82,12 @@ def inside(run_id: str) -> Calls | None:
 
 
 def envelope(made: list[dict]) -> dict:
-    found = {k: ", ".join(dict.fromkeys(str(c[k]) for c in made if c.get(k))) for k in LABELS}
+    found = {}
+    for key in LABELS:
+        values = [str(c[key]) for c in made if c.get(key)]
+        if key == "auth_mode":
+            values = [mode for value in values for mode in value.split(", ")]
+        found[key] = ", ".join(dict.fromkeys(values))
     found["cost_usd"] = round(sum(float(c.get("cost_usd") or 0) for c in made), 6)
     found |= {k: sum(int(c.get(k) or 0) for c in made) for k in COUNTS}
     found["api_seconds"] = round(sum(float(c.get("api_seconds") or 0) for c in made), 2)

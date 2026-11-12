@@ -67,12 +67,12 @@ def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: st
     with state.db() as c:
         c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
                   " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
-                  " api_seconds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                  "(SELECT COUNT(*) + 1 FROM steps WHERE run_id = ? AND step = ?),?,?,?,?)",
+                  " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                  "(SELECT COUNT(*) + 1 FROM steps WHERE run_id = ? AND step = ?),?,?,?,?,?)",
                   (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
                    res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
                    res.first_context_tokens, effort or "", tier or "", run_id, name, kind or "", res.cache_read,
-                   res.cache_write, round(res.api_seconds, 2)))
+                   res.cache_write, round(res.api_seconds, 2), res.auth_mode))
         c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
                   "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
                   (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
@@ -352,17 +352,27 @@ class Recorder:
         self.end({"ok": res.ok, "error": res.error, "text": res.text, "structured": res.structured,
                   "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
                   "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model,
-                  "provider": res.provider, "session": res.session.id, "seconds": round(seconds, 1)})
+                  "provider": res.provider, "runner": res.runner, "auth_mode": res.auth_mode,
+                  "auth_modes": list(res.modes), "paid_usd": res.paid_usd,
+                  **({"calls": [{"runner": c.runner, "model": c.model, "provider": c.provider,
+                                "auth_mode": c.auth_mode, "cost_usd": c.cost_usd, "paid_usd": c.paid_usd,
+                                "tokens_in": c.tokens_in, "tokens_out": c.tokens_out} for c in res.calls]}
+                     if res.calls else {}),
+                  "session": res.session.id, "seconds": round(seconds, 1)})
 
     def end(self, result: dict) -> None:
         if self.ended:
             return
         self.ended = True
+        result = {"runner": self.runner, "model": self.model, "provider": self.header.get("provider", ""),
+                  "auth_mode": self.header.get("auth_mode", ""), **result}
         self.release()
         self.write({"arete": "result", **result})
         self.close()
         mark(self.run_id, "agent", at=self.at, step=self.step, record=self.path.name if self.path else "",
              runner=self.runner, model=result.get("model") or self.model, ok=result["ok"],
+             auth_mode=result["auth_mode"], provider=result.get("provider", self.header.get("provider", "")),
+             **{k: result[k] for k in ("auth_modes", "paid_usd") if k in result},
              seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
              **({"error": util.first_line(result["error"], 300)} if result["error"] else {}))
 

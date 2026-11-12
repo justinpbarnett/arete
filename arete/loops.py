@@ -130,10 +130,15 @@ class Loop:
         return [self.model_for(cfg), *([self.classify.get("model") or cfg.model("classify")] if self.classify else [])]
 
     def meters_spend(self, cfg: config.Config) -> bool:
-        return any(runner.metered(model, self.runner) for model in self.agent_models(cfg))
+        repo = self.work_repo(cfg) if self.repo else None
+        repo = (cfg.repo_for_path(repo.path) or repo) if repo else None
+        return any(runner.metered(model, self.runner, cfg=cfg, repo=repo, device=self.device)
+                   for model in self.agent_models(cfg))
 
     def usage_hold(self, cfg: config.Config, connect=state.db) -> str:
-        held = next(filter(None, (runner.usage_hold(model, self.runner, connect, cfg=cfg)
+        repo = self.work_repo(cfg) if self.repo else None
+        repo = (cfg.repo_for_path(repo.path) or repo) if repo else None
+        held = next(filter(None, (runner.usage_hold(model, self.runner, connect, cfg=cfg, repo=repo, device=self.device)
                                   for model in self.agent_models(cfg))), None)
         return runner.hold_words(held) if held else ""
 

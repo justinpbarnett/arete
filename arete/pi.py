@@ -7,10 +7,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
-from . import config, devices, environment, paths, util
+from . import accounts, claude, config, devices, environment, paths, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -176,7 +178,34 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
     return cmd
 
 
-def run(
+def authentication(model: str, passing=None, providers=None, remote=None) -> accounts.Auth:
+    if remote:
+        return accounts.Auth("api_key")
+    env = agent_env(model, passing, providers)
+    provider = model.split("/", 1)[0] if "/" in model else default_provider()
+    folder = Path(env["PI_CODING_AGENT_DIR"])
+    credential = accounts.read(folder / "auth.json").get(provider)
+    return accounts.pi(provider, credential, str(folder))
+
+
+def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
+    auth = auth or authentication(kw.get("model", ""), kw.get("passing"), kw.get("providers"), kw.get("remote"))
+    started = time.monotonic()
+    result = _run(*args, auth=auth, **kw)
+    result.call_seconds = time.monotonic() - started
+    if result.calls:
+        result.calls[0].call_seconds = result.call_seconds - sum(call.call_seconds for call in result.calls[1:])
+    result.auth_mode = auth.mode
+    if not result.ok and auth.mode == "subscription":
+        if auth.family == "claude":
+            result.usage_limit = claude.usage_limit({}, result.error)
+        elif auth.family == "codex":
+            from . import codex
+            result.usage_limit = codex.usage_limit(result.error)
+    return result
+
+
+def _run(
     prompt: str,
     cwd: Path | str,
     *,
@@ -200,7 +229,9 @@ def run(
     on_line: Callable[[str], None] = lambda line: None,
     passing: list[str] | None = None,
     providers: dict[str, tuple[str, ...]] | None = None,
+    auth: accounts.Auth | None = None,
 ) -> Result:
+    auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
                       session=resume, runner="pi", model=model)
@@ -236,15 +267,18 @@ def run(
         env = {**agent_env(model, passing, providers), **guard_env()}
     try:
         proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
-                                    lambda line: reply_cost(line, model, price), on_line)
+                                    lambda line: reply_cost(line, model, price, auth.mode), on_line)
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"pi not found: {e}", runner="pi", model=model)
     if cut_short_by:
         return cut_short(proc, resume, model, cut_short_by)
     result = parse(proc, resume, model, json_schema)
+    result.auth_mode = auth.mode
     if json_schema and result.ok and result.structured is None:
         restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT), on_line,
-                passing, providers)
+                passing, providers, price,
+                max(0, max_budget_usd - (0 if auth.mode == "subscription" else price(result)))
+                if max_budget_usd is not None else None)
     return result
 
 
@@ -267,13 +301,21 @@ def ending(stdout: str) -> str:
 
 def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd: Path | str,
             remote: devices.Device | None, timeout: float, on_line: Callable[[str], None],
-            passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None) -> None:
+            passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
+            price: Callable[[Result], float] = lambda reply: reply.cost_usd,
+            max_budget_usd: float | None = None) -> None:
     if not ending_text:
+        return
+    auth = authentication(model, passing, providers, remote)
+    if auth.mode != "subscription" and max_budget_usd is not None and max_budget_usd <= 0:
         return
     prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
               f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}\n\n{NO_ANSWER}")
     again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote, on_line=on_line,
-                passing=passing, providers=providers)
+                passing=passing, providers=providers, auth=auth, price=price, max_budget_usd=max_budget_usd)
+    result.calls = [replace(result, calls=[]), again]
+    result.aggregate_paid_usd = result.paid_usd + again.paid_usd
+    result.auth_modes = tuple(dict.fromkeys([*result.modes, *again.modes]))
     result.cost_usd += again.cost_usd
     result.tokens_in += again.tokens_in
     result.tokens_out += again.tokens_out
@@ -322,7 +364,9 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")
 
 
-def reply_cost(line: str, model: str, price: Callable[[Result], float]) -> float:
+def reply_cost(line: str, model: str, price: Callable[[Result], float], auth_mode: str = "") -> float:
+    if auth_mode == "subscription":
+        return 0.0
     try:
         message = json.loads(line).get("message") or {}
     except json.JSONDecodeError:
@@ -330,7 +374,7 @@ def reply_cost(line: str, model: str, price: Callable[[Result], float]) -> float
     if message.get("role") != "assistant":
         return 0.0
     provider = message.get("provider", "")
-    return price(Result(ok=True, runner="pi", provider=provider,
+    return price(Result(ok=True, runner="pi", provider=provider, auth_mode=auth_mode,
                         model=f"{provider}/{message.get('model')}" if provider else model,
                         **usage_totals([message.get("usage") or {}])))
 

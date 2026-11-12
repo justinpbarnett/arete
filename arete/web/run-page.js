@@ -28,13 +28,13 @@ function mergeFeed(id, { data, asked }) {
 
 function paidWords(r, models) {
   if (r.paid > 0) return money(r.paid);
-  return models.length ? "nothing, it ran on the subscription" : "nothing";
+  return models.length && models.every(m => !m.metered) ? "nothing, it ran on the subscription" : "nothing paid";
 }
 
 function modelTable(models) {
   return table("", [["Model"], ["Runner", "c-kind"], ["Calls", "num c-n"], ["Tokens in", "num c-rate wide-only"], ["Tokens out", "num c-rate wide-only"], ["Paid", "num c-cost"]],
     models.map((m) => el("tr", {}, cell(wrapAtSlashes(m.model)), cell(m.runner), cell(m.steps, "num"), cell(m.tokens_in.toLocaleString(), "num"),
-      cell(m.tokens_out.toLocaleString(), "num"), cell(m.metered ? money(m.cost_usd) : "subscription", "num"))), { stack: true });
+      cell(m.tokens_out.toLocaleString(), "num"), cell(m.metered ? money(m.paid) : "subscription", "num"))), { stack: true });
 }
 
 function drawRunDetail(pane, result, kind) {

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import background, config, devices, environment, paths, util
+from . import accounts, background, config, devices, environment, paths, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -113,7 +113,39 @@ def command(
     return cmd
 
 
-def run(
+def auth_status(env: dict | None = None) -> dict:
+    try:
+        res = util.sh([binary(), "auth", "status"], timeout=10, env=env if env is not None else agent_env(),
+                      inherit=False)
+        return accounts.mapping(json.loads(res.stdout)) if res.returncode == 0 else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
+def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
+    if remote:
+        return accounts.Auth("subscription", "claude")
+    env = agent_env(passing, extra)
+    folder = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME", str(paths.HOME))) / ".claude")
+    if token := env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return accounts.claude(token=token, source=str(folder))
+    status = auth_status(env)
+    account_file = folder / ".claude.json" if env.get("CLAUDE_CONFIG_DIR") else folder.parent / ".claude.json"
+    account = accounts.mapping(accounts.read(account_file).get("oauthAccount"))
+    credential = accounts.mapping(accounts.read(folder / ".credentials.json").get("claudeAiOauth"))
+    return accounts.claude(status, account, credential.get("accessToken", ""), str(folder))
+
+
+def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
+    auth = auth or authentication(kw.get("passing"), kw.get("extra_env"), kw.get("remote"))
+    result = _run(*args, **kw)
+    result.auth_mode = auth.mode
+    if auth.mode != "subscription":
+        result.usage_limit = None
+    return result
+
+
+def _run(
     prompt: str,
     cwd: Path | str,
     *,

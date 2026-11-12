@@ -880,7 +880,7 @@ def cmd_costs(args) -> int:
         c = control.costs(args.days)
     except control.Refused as e:
         return refused(e)
-    print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; claude and codex steps on a subscription count nothing")
+    print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; subscription calls count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
         for row in c[f"by_{group}"][:12]:
@@ -903,8 +903,8 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
         print_lines([*(json.dumps(g) for _, each in found for g in each["groups"]), json.dumps(waits)])
         return 0
     for by, each in found:
-        print(f"Every step by {by} in the last {each['days']:g} days. Cost is what each call reported; a claude or "
-              "codex step's is the API price or 0, since it rides a subscription. `in` counts the input no cache served.")
+        print(f"Every step by {by} in the last {each['days']:g} days. Cost is what each call reported; "
+              "subscription calls count here too. Paid totals exclude them. `in` counts the input no cache served.")
         rows = [(by, "runs", "calls", "cost", "in", "cache rd", "cache wr", "out", "min", "api min")]
         rows += [(g["name"], str(g["runs"]), str(g["calls"]), f"${g['cost_usd']:.2f}",
                   f"{g['tokens_in'] - g['cache_read'] - g['cache_write']:,}", f"{g['cache_read']:,}",

@@ -9,7 +9,9 @@ SUBSCRIPTION_RUNNERS = frozenset({"claude", "codex"})
 KEY_PROVIDERS = frozenset({"openai"})
 
 
-def subscription(runner: str, provider: str = "") -> bool:
+def subscription(runner: str, provider: str = "", auth_mode: str | None = "") -> bool:
+    if auth_mode in ("subscription", "api_key"):
+        return auth_mode == "subscription"
     return runner in SUBSCRIPTION_RUNNERS and not (runner == "codex" and provider in KEY_PROVIDERS)
 
 
@@ -48,10 +50,21 @@ class Result:
     model: str = ""
     provider: str = ""
     runner: str = ""
+    auth_mode: str = ""
+    aggregate_paid_usd: float | None = None
+    auth_modes: tuple[str, ...] = ()
+    calls: list[Result] = field(default_factory=list, repr=False)
+    call_seconds: float = 0.0
+
+    @property
+    def modes(self) -> tuple[str, ...]:
+        return self.auth_modes or ((self.auth_mode,) if self.auth_mode else ())
 
     @property
     def paid_usd(self) -> float:
-        return 0.0 if subscription(self.runner, self.provider) else self.cost_usd
+        if self.aggregate_paid_usd is not None:
+            return self.aggregate_paid_usd
+        return 0.0 if subscription(self.runner, self.provider, self.auth_mode) else self.cost_usd
 
 
 NO_SESSION = Session()
