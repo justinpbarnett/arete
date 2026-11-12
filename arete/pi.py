@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
-from . import devices, paths, util
+from . import config, devices, environment, paths, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -40,6 +41,7 @@ RESTATE_TIMEOUT = 600
 WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
 NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 
 
 def binary() -> str:
@@ -80,6 +82,29 @@ def agent_dir() -> Path:
             except FileExistsError:
                 pass
     return AGENT_DIR
+
+
+def default_provider() -> str:
+    settings = util.read_json(PI_HOME / "agent" / "settings.json", {})
+    provider = settings.get("defaultProvider") if isinstance(settings, dict) else ""
+    return provider if isinstance(provider, str) else ""
+
+
+def provider_names(provider: str, providers: dict[str, tuple[str, ...]]) -> list[str]:
+    return [re.sub(r"\W", "_", provider).upper() + "_*", *providers.get(provider, ())]
+
+
+def agent_env(model: str, passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
+              source=None) -> dict[str, str]:
+    if passing is None or providers is None:
+        cfg = config.load()
+        passing = environment.passed(cfg) if passing is None else passing
+        providers = cfg.environment.providers if providers is None else providers
+    keys = util.read_env_file(KEYS_FILE)
+    provider = model.split("/", 1)[0] if "/" in model else default_provider()
+    names = [*passing, *(provider_names(provider, providers) if provider else keys)]
+    return environment.build(names, {"ARETE_AGENT": "1", "PI_CODING_AGENT_DIR": str(AGENT_DIR)},
+                             never=PARENT_SESSION_VARS, source={**(os.environ if source is None else source), **keys})
 
 
 def can_confine(remote: bool) -> bool:
@@ -144,6 +169,8 @@ def run(
     instructions: list[str] | None = None,
     price: Callable[[Result], float] = lambda reply: reply.cost_usd,
     on_line: Callable[[str], None] = lambda line: None,
+    passing: list[str] | None = None,
+    providers: dict[str, tuple[str, ...]] | None = None,
 ) -> Result:
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
@@ -169,14 +196,13 @@ def run(
                           session=resume, runner="pi", model=model)
         cmd = write_confinement(cwd, add_dirs) + cmd
 
-    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
-    env["ARETE_AGENT"] = "1"
-    if not remote:
-        env |= util.read_env_file(KEYS_FILE)
-        env["PI_CODING_AGENT_DIR"] = str(agent_dir())
     cmd = [*cmd, "--", prompt]
     if remote:
+        env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, "ARETE_AGENT": "1"}
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir(remote),))
+    else:
+        agent_dir()
+        env = agent_env(model, passing, providers)
     try:
         proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
                                     lambda line: reply_cost(line, model, price), on_line)
@@ -186,7 +212,8 @@ def run(
         return cut_short(proc, resume, model, cut_short_by)
     result = parse(proc, resume, model, json_schema)
     if json_schema and result.ok and result.structured is None:
-        restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT), on_line)
+        restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT), on_line,
+                passing, providers)
     return result
 
 
@@ -208,12 +235,14 @@ def ending(stdout: str) -> str:
 
 
 def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd: Path | str,
-            remote: devices.Device | None, timeout: float, on_line: Callable[[str], None]) -> None:
+            remote: devices.Device | None, timeout: float, on_line: Callable[[str], None],
+            passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None) -> None:
     if not ending_text:
         return
     prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
               f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}\n\n{NO_ANSWER}")
-    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote, on_line=on_line)
+    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote, on_line=on_line,
+                passing=passing, providers=providers)
     result.cost_usd += again.cost_usd
     result.tokens_in += again.tokens_in
     result.tokens_out += again.tokens_out

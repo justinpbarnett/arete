@@ -140,12 +140,12 @@ def rate(instructions: str, levels: list[str]) -> dict:
     return {"type": "score", "instructions": instructions, "criteria": levels}
 
 
-def key() -> str:
-    return os.environ.get(KEY_NAME) or util.read_env_file(KEY_FILE).get(KEY_NAME, "")
+def key(env: dict[str, str] | None = None) -> str:
+    return (os.environ if env is None else env).get(KEY_NAME) or util.read_env_file(KEY_FILE).get(KEY_NAME, "")
 
 
-def ready(cfg: config.Config, repos: list[config.Repo | None] | None = None) -> bool:
-    return cfg.jev_allowed(repos or []) and bool(key())
+def ready(cfg: config.Config, repos: list[config.Repo | None] | None = None, env: dict[str, str] | None = None) -> bool:
+    return cfg.jev_allowed(repos or []) and bool(key(env))
 
 
 def clip(state: str | dict | list) -> str:

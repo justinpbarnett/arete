@@ -27,6 +27,8 @@ KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 FACTORY_PATHS = ("classic", "adw")
+ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
+ENV_KEYS = ("pass", "providers")
 
 
 class UnknownRepo(KeyError):
@@ -111,6 +113,12 @@ class ReplayConfig:
 
 
 @dataclass
+class Environment:
+    passes: tuple[str, ...] = ()
+    providers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+@dataclass
 class Job:
     label: str
     log: Path | None = None
@@ -139,6 +147,7 @@ class Config:
     jira: JiraConfig = field(default_factory=JiraConfig)
     jev: JevConfig = field(default_factory=JevConfig)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
+    environment: Environment = field(default_factory=Environment)
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
@@ -287,6 +296,27 @@ def replay_table(data) -> ReplayConfig:
     return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
 
 
+def variable_names(value, where: str) -> tuple[str, ...]:
+    if not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+        raise ValueError(f"{where}: must be a list of variable names, not {value!r}")
+    if bad := [v for v in value if not re.fullmatch(ENV_NAME, v)]:
+        raise ValueError(f"{where}: {bad[0]!r} is not a variable name; use a name such as HTTPS_PROXY, a prefix ending "
+                         "in *, or \"*\"")
+    return tuple(dict.fromkeys(value))
+
+
+def environment_table(data, layer: bool = False) -> Environment:
+    table = table_of(data, "environment")
+    if layer and "providers" in table:
+        raise ValueError("a layer's [environment] takes pass only; [environment.providers] goes in "
+                         f"{paths.short_path(paths.CONFIG_FILE)}")
+    if bad := sorted(set(table) - set(ENV_KEYS)):
+        raise ValueError(f"[environment]: unknown key {', '.join(bad)}; use {'pass' if layer else ', '.join(ENV_KEYS)}")
+    providers = {str(name): variable_names(names, f"[environment.providers] {name}")
+                 for name, names in table_of(table.get("providers", {}), "environment.providers").items()}
+    return Environment(variable_names(table.get("pass", []), "[environment] pass"), providers)
+
+
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
     if not path.exists():
@@ -408,6 +438,7 @@ def load(path: Path | None = None) -> Config:
         )
     cfg.replay = replay_table(data.get("replay") or {})
     cfg.mcp = mcp_tables(data.get("mcp") or {})
+    cfg.environment = environment_table(data.get("environment") or {})
     from . import steps
     steps.check(cfg)
     return cfg
@@ -476,6 +507,7 @@ class RepoLayer:
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
+    passes: tuple[str, ...] = ()
 
     @property
     def builder_bash(self) -> list[str]:
@@ -495,7 +527,7 @@ class RepoLayer:
 
 
 LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
-                  "factory"}
+                  "factory", "environment"}
 
 
 def load_layer(layer_dir: Path) -> RepoLayer:
@@ -528,6 +560,7 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.factory_path = str((data.get("factory") or {}).get("path", layer.factory_path)).strip()
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
+    layer.passes = environment_table(data.get("environment") or {}, layer=True).passes
     if "verify" in data:
         v = data["verify"]
         layer.verify = Verify(start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),

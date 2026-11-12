@@ -40,8 +40,9 @@ def sh(
     check: bool = False,
     env: dict | None = None,
     input: str | None = None,
+    inherit: bool = True,
 ) -> subprocess.CompletedProcess:
-    full_env = {**os.environ, **(env or {})}
+    full_env = {**(os.environ if inherit else {}), **(env or {})}
     try:
         res = subprocess.run(
             cmd,

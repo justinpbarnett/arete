@@ -116,7 +116,7 @@ just adw-wait RUN2
 |---|---|
 | `task` | the run started; names the ticket, kind, repo, title and script |
 | `answer` | this run carries the answer to an earlier run's question: `asked_in`, `question`, `text` |
-| `step_start` | a step began; names its model, runner and effort when it calls an agent |
+| `step_start` | a step began; names its model, runner and effort when it calls an agent, and in `env` the names of the variables that agent starts with, never their values |
 | `heartbeat` | the step is still working; every 30 seconds |
 | `step_end` | a step ended: `result` is `pass`, `fail`, `ask` or `stop`, with `error`, `cost_usd` and `seconds` |
 | `route` | the run continues an earlier one and took its finished steps |

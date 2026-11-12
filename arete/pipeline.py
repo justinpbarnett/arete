@@ -24,6 +24,7 @@ from . import (
     config,
     control,
     diffguard,
+    environment,
     factory,
     gh,
     jev,
@@ -250,15 +251,18 @@ class AgentRun:
             reach = s.agent_kw(self.cfg or config.load(), kw.pop("allowed_tools", ()), kw.pop("mcp_config", ""))
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(s.step, NO_SESSION) if s.session == "resume" else NO_SESSION, **kw}
-        which, model = runner.chosen(kw.get("model", ""), kw.get("runner", "") or kw.get("resume", NO_SESSION).runner,
-                                     kw.get("cfg") or self.cfg or config.load())
+        cfg = kw.get("cfg") or self.cfg or config.load()
+        run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
+        which, model = runner.chosen(kw.get("model", ""), run_with, cfg)
         effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost
         tier, kind = kw.setdefault("tier", s.tier if s else ""), kw.setdefault("kind", self.kind)
         kw.setdefault("waits", self.waiting)
+        kw.setdefault("repo", self.repo)
         seam = factory.inside(self.id)
         lined = self.writes_lines and seam is None
         if lined:
-            self.write_line("step_start", step=step, runner=which, model=model, effort=effort, tier=tier, kind=kind)
+            self.write_line("step_start", step=step, runner=which, model=model, effort=effort, tier=tier, kind=kind,
+                            env=runner.env_names(kw.get("model", ""), run_with, cfg, self.repo, self.id))
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         with lines.beating(self.id, step) if lined else nullcontext():
@@ -579,7 +583,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     with machine_to_itself(run):
         for name, cmd in layer.checks.items():
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = util.sh(cmd, cwd=cwd, timeout=timeout)
+                res = environment.sh(cmd, run.cfg or config.load(), run.repo, cwd=cwd, timeout=timeout)
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
@@ -1070,7 +1074,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             shutil.copy2(src, dest)
     for cmd in layer.setup:
         with record.timed(run.id, "setup", command=cmd) as setup:
-            res = util.sh(cmd, cwd=ws, timeout=1200)
+            res = environment.sh(cmd, cfg, repo, cwd=ws, timeout=1200)
             setup["exit"] = res.returncode
         run.log(f"setup `{cmd}`: exit {res.returncode}")
         if res.returncode != 0:
@@ -1740,7 +1744,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
     bash = b.read_bash + v.bash
     untracked_before = untracked_by_dir(b.git_dirs)
     try:
-        with verify.serving(v, b.ws, run.dir / f"{step}-server.log") as url:
+        with verify.serving(v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
             res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,

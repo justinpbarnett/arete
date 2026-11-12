@@ -22,6 +22,7 @@ from . import (
     devices,
     diffguard,
     emits,
+    environment,
     gh,
     jev,
     loops,
@@ -160,7 +161,7 @@ class LoopRun:
         res = runner.run(prompt, cwd, model=model, runner=self.loop.runner, trace=(self.id, step), cfg=self.cfg,
                          tools=tools, allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left,
                          persist=False, timeout=self.loop.timeout_minutes * 60, device=self.device,
-                         say=lambda text: self.log("wait", f"{step}: {text}"), **kw)
+                         say=lambda text: self.log("wait", f"{step}: {text}"), repo=loop_repo(self), **kw)
         record.note(self.id, model=res.model, runner=res.runner)
         self.log("step" if res.ok else "error", f"{step}: {res.runner} {res.model} {runner.cost_note(res)}"
                  + ("" if res.ok else f" failed: {res.error.strip()}"))
@@ -694,7 +695,8 @@ def drop_unstaged(wt: Path) -> None:
 
 
 def shell_result(run: LoopRun, command: str, wt: Path) -> subprocess.CompletedProcess:
-    res = util.sh(command, cwd=wt, timeout=run.loop.timeout_minutes * 60, env=loops.check_env(run.loop, run.id))
+    res = environment.sh(command, run.cfg, loop_repo(run), sets=loops.check_env(run.loop, run.id), cwd=wt,
+                         timeout=run.loop.timeout_minutes * 60)
     drop_unstaged(wt)
     return res
 
