@@ -565,7 +565,8 @@ def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, mod
     if auth.mode != "subscription":
         return credit_limit(data)
     text = data if isinstance(data, str) else json.dumps(data, default=str)
-    native_limit = claude.usage_limit({}, text, model) if auth.family == "claude" else None
+    native_limit = (claude.usage_limit(data, "\n".join([text, *error_messages(data)]), model)
+                    if auth.family == "claude" else None)
     if (not native_limit and not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|"
                                           r"you.ve (?:hit|reached).{0,30}limit|weekly limit|five.hour limit",
                                           text, re.IGNORECASE) and not claude.USAGE_LIMIT_TEXT.search(text)):
@@ -604,7 +605,10 @@ def login_unchanged(route: Route) -> bool:
         return False
     latest = accounts.pi(route.provider, credential, str(route.owner))
     return (latest.generation in {route.auth.generation, *route.refreshed}
-            or state.refresh_continues(route.auth.generation, latest.generation))
+            or state.refresh_continues(route.auth.generation, latest.generation)
+            or (route.auth.mode == latest.mode == "subscription" and
+                route.auth.provider == latest.provider == route.provider and route.auth.family == latest.family and
+                bool(route.auth.identity) and latest.identity == route.auth.identity))
 
 
 def observed_refresh(route: Route, event: dict) -> None:
@@ -942,8 +946,10 @@ def events(stdout: str) -> list[dict]:
     return out
 
 
-def error_metadata(message: dict) -> dict:
-    return {k: v for k, v in message.items() if k not in ("content", "usage")}
+def error_metadata(value):
+    if isinstance(value, dict):
+        return {k: error_metadata(v) for k, v in value.items() if k not in ("content", "usage", "messages")}
+    return [error_metadata(v) for v in value] if isinstance(value, list) else value
 
 
 def error_messages(data) -> list[str]:
@@ -964,13 +970,15 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     stream = events(proc.stdout)
     end = next((e for e in reversed(stream) if e.get("type") == "agent_end"), {})
     replies = [m for m in end.get("messages", []) if m.get("role") == "assistant"]
+    diagnostics = [error_metadata(e) for e in stream if e.get("type") in ("error", "api_error", "turn.failed")
+                   or ((e.get("error") or e.get("api_error")) and not str(e.get("type", "")).startswith("tool_")
+                       and not (isinstance(e.get("message"), dict)
+                                and e["message"].get("role") in ("user", "toolResult")))]
+    diagnostics.extend(error_metadata(e["message"]) for e in stream
+                       if e.get("type") == "message_end" and isinstance(e.get("message"), dict)
+                       and e["message"].get("role") == "assistant" and e["message"].get("stopReason") == "error")
     if not replies:
         error = util.tail(proc.stderr or proc.stdout or f"exit {proc.returncode}", 1500)
-        diagnostics = [error_metadata(e) for e in stream if e.get("type") in ("error", "api_error", "turn.failed")
-                       or e.get("error") or e.get("api_error")]
-        diagnostics.extend(error_metadata(e["message"]) for e in stream
-                           if e.get("type") == "message_end" and isinstance(e.get("message"), dict)
-                           and e["message"].get("stopReason") == "error")
         diagnostic = [*diagnostics, proc.stderr] if stream else proc.stderr or proc.stdout
         return Result(ok=False, session=resume, error=error, runner="pi", model=model,
                       connection_failed=util.is_network_error(error),
@@ -989,7 +997,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=len(replies),
         error=error,
         connection_failed=failed and util.is_network_error(error),
-        usage_limit=usage_limit(auth, provider, [error_metadata(last), proc.stderr], model) if failed else None,
+        usage_limit=usage_limit(auth, provider, [*diagnostics, error_metadata(last), proc.stderr], model) if failed else None,
         raw={"stopReason": last.get("stopReason"), "usage": usages[-1]},
         **totals,
         first_context_tokens=first_context_tokens(proc.stdout),

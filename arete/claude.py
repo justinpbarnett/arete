@@ -22,6 +22,7 @@ from .agent import (
     json_from_text,
     model_scope,
     provider_reset,
+    rate_limit_type,
 )
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -308,12 +309,12 @@ def tool_set(tools: list[str] | None, rules: list[str]) -> list[str]:
     return list(dict.fromkeys(built_in))
 
 
-def usage_limit(data: dict, text: str, model: str = "") -> UsageLimit | None:
+def usage_limit(data: dict | list | str, text: str, model: str = "") -> UsageLimit | None:
     text = text + "\n" + json.dumps(data, default=str)
-    model_only = bool(re.search(r"\bmodel[_ ]requires[_ ]usage[_ ]credits\b", text, re.IGNORECASE))
+    model_only = bool(re.search(r"\bmodel[_ ]requires[_ ]usage[_ ]credits\b|"
+                                r"(?:^|\n)You've reached your Fable limit\. Switch to another model", text, re.IGNORECASE))
     if not model_only and "usage_limit_reached" not in text and not USAGE_LIMIT_TEXT.search(text):
         return None
-    info = accounts.mapping(accounts.mapping(data.get("api_error_params")).get("rate_limit_info"))
     legacy = LEGACY_LIMIT_RESET.search(text)
     resets = provider_reset(data) or provider_reset(text)
     if resets is None and legacy:
@@ -323,7 +324,7 @@ def usage_limit(data: dict, text: str, model: str = "") -> UsageLimit | None:
         until = max(soonest, resets + timedelta(seconds=LIMIT_SLACK_SECONDS))
     else:
         until = util.now() + timedelta(seconds=LIMIT_RECHECK_SECONDS)
-    kind = str(info.get("rateLimitType") or next((k for k in LIMIT_SCOPES if k in text), ""))
+    kind = rate_limit_type(data) or rate_limit_type(text) or next((k for k in LIMIT_SCOPES if k in text), "")
     scope = LIMIT_SCOPES.get(kind, model_scope(model) if model_only and not kind else EVERY_MODEL)
     return UsageLimit(util.iso(until), scope, kind.replace("_", " "))
 

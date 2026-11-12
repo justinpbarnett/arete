@@ -36,7 +36,9 @@ class UsageLimit:
 
 def model_scope(model: str) -> str:
     name = model.strip().lower().removeprefix("claude:").removeprefix("pi:")
-    return "model:" + name.removeprefix("anthropic/")
+    name = name.removeprefix("anthropic/")
+    family = re.fullmatch(r"(?:claude-(?:\d+-)*)?(fable|opus|sonnet|haiku)(?:-(?:\d[\w.-]*|latest))?", name)
+    return "model:" + (family[1] if family else name)
 
 
 def reset_at(value) -> datetime | None:
@@ -74,6 +76,30 @@ def provider_reset(data) -> datetime | None:
                           data, re.IGNORECASE)
         return reset_at(match[1]) if match else None
     return None
+
+
+def rate_limit_type(data) -> str:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if (re.sub(r"[_-]", "", key).lower() == "ratelimittype"
+                    and isinstance(value, str) and value.strip()):
+                return value.strip()
+        return next((found for key, value in data.items() if key not in ("content", "usage", "messages")
+                     and (found := rate_limit_type(value))), "")
+    if isinstance(data, list):
+        return next((found for value in data if (found := rate_limit_type(value))), "")
+    if isinstance(data, str):
+        try:
+            decoded = json.loads(data)
+        except ValueError:
+            lines = data.splitlines()
+            if len(lines) > 1:
+                return next((found for line in lines if (found := rate_limit_type(line))), "")
+            match = re.search(r'''["']?rate[_-]?limit[_-]?type["']?\s*[:=]\s*["']?([A-Za-z_][\w-]*)''',
+                              data, re.IGNORECASE)
+            return match[1] if match and match[1].lower() not in ("null", "none", "undefined", "true", "false") else ""
+        return rate_limit_type(decoded) if isinstance(decoded, (dict, list, str)) and decoded != data else ""
+    return ""
 
 
 def credit_limit(data) -> UsageLimit | None:
