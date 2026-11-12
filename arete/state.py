@@ -13,6 +13,7 @@ OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url !=
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
 PAID_STEP = f"COALESCE(steps.runner, '') != '{SUBSCRIPTION_RUNNER}'"
+WHOLE_RUN = "COALESCE(only_step, '') = ''"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -398,7 +399,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
                   ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
-                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("wait_minutes", "TEXT"))],
+                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("wait_minutes", "TEXT"), ("only_step", "TEXT DEFAULT ''"))],
               ("steps", "first_context_tokens", "ALTER TABLE steps ADD COLUMN first_context_tokens INTEGER DEFAULT 0"),
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
                   ("effort", "TEXT DEFAULT ''"), ("tier", "TEXT DEFAULT ''"), ("try", "INTEGER DEFAULT 0"),
@@ -972,17 +973,19 @@ def vms_left_over(probes_created_before: str, connect=db) -> list[dict]:
             (probes_created_before,))]
 
 
-def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db) -> list[dict]:
+def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db, whole: bool = False) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "ORDER BY started DESC LIMIT ?", (repo, issue, limit))]
+                                           + (f"AND {WHOLE_RUN} " if whole else "")
+                                           + "ORDER BY started DESC LIMIT ?", (repo, issue, limit))]
 
 
 def interrupted_tickets(repo: str) -> list[str]:
     with db() as c:
-        rows = c.execute("SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? "
+        rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
                          "AND started = (SELECT MAX(started) FROM runs r2 WHERE r2.kind = 'pipeline' "
-                         "AND r2.repo = runs.repo AND r2.issue = runs.issue) ORDER BY started", (repo,))
+                         "AND r2.repo = runs.repo AND r2.issue = runs.issue AND COALESCE(r2.only_step, '') = '') "
+                         "ORDER BY started", (repo,))
         return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
 
 

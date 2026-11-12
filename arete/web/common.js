@@ -21,7 +21,7 @@ const SVG = "http://www.w3.org/2000/svg";
 const URL_IN_TEXT = /(https:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
 const HELD = Symbol("held");
 const TOGGLE_FORMS = [{ toggle: "launch-toggle", form: "launch", focus: "launch-prompt" }, { toggle: "loop-new-toggle", form: "loop-new", focus: "loop-new-sentence" }];
-const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
+const RUN_STATE = { done: "ok", pr: "ok", merged: "ok", noop: "ok", skipped: "ok", "dry-run": "ok", step: "ok", failed: "fault", interrupted: "fault", "needs-info": "caution", stopped: "caution" };
 
 let route = null;
 const lastQuery = {};

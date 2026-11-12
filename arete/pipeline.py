@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import tomllib
 from collections import Counter
@@ -206,6 +208,7 @@ class AgentRun:
     layer: config.RepoLayer | None = None
     kind: str = ""
     overrides: dict = field(default_factory=dict)
+    step_overrides: dict[str, dict] = field(default_factory=dict)
     sessions: dict[str, Session] = field(default_factory=dict)
     writes_lines: bool = True
 
@@ -235,7 +238,8 @@ class AgentRun:
         p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
 
     def settings(self, role: str) -> steps.Settings:
-        return steps.resolve(self.cfg or config.load(), self.layer, role, self.kind, self.overrides)
+        own = self.step_overrides.get(config.STEP_ALIASES.get(role, role), {})
+        return steps.resolve(self.cfg or config.load(), self.layer, role, self.kind, {**self.overrides, **own})
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         s = self.settings(role) if role else None
@@ -294,6 +298,8 @@ class Run(AgentRun):
     force: bool = False
     feedback: list[dict] = field(default_factory=list)
     answering: dict = field(default_factory=dict)
+    path: str = ""
+    alone: bool = False
 
     @property
     def ref(self) -> str:
@@ -351,6 +357,8 @@ class Run(AgentRun):
         return "; ".join(errors)
 
     def give_up(self, why: str) -> None:
+        if self.alone:
+            return
         self.enter(self.failed_state)
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
@@ -688,7 +696,81 @@ def split_comment(estimate: int, limit: int, split: list[dict], queue_hint: str,
     return "\n\n".join(parts)
 
 
-def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False) -> int:
+@dataclass
+class Script:
+    path: str
+    drive: Callable
+    continues: str = ""
+    only: str = ""
+    overrides: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def run_fields(self) -> dict:
+        return {"path": self.path, "alone": bool(self.only), "step_overrides": self.overrides}
+
+
+def script_file(cfg: config.Config, name: str) -> Path:
+    folder = cfg.adws or paths.ADWS_DIR
+    if not folder.is_dir():
+        raise FileNotFoundError(f"adws folder {folder} does not exist")
+    if not (found := folder / f"{name}.py").is_file():
+        raise FileNotFoundError(f"no adw script {found}")
+    return found
+
+
+def flow_function(cfg: config.Config, name: str) -> Callable:
+    found = script_file(cfg, name)
+    spec = importlib.util.spec_from_file_location(f"adws_{name}", found)
+    module = sys.modules[spec.name] = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if (fn := getattr(module, name, None)) is None:
+        raise AttributeError(f"{found} defines no function {name}, which a script in adws/ names after its file")
+    return fn
+
+
+def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
+    from . import flows
+    cfg = config.load()
+    flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
+    try:
+        adw = flows.wanted(cfg.repo(repo_name)) == flows.ADW
+    except (ValueError, TypeError):
+        adw = False
+    if not adw:
+        return [sys.executable, "-m", "arete.cli", "run", repo_name, str(tid), *flags]
+    name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
+    return [sys.executable, str(script_file(cfg, name)), repo_name, str(tid), *flags]
+
+
+def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
+    try:
+        command = run_command(repo_name, tid, force, dry_run)
+    except FileNotFoundError as e:
+        print(e)
+        return 1
+    sys.stdout.flush()
+    os.execv(command[0], command)
+
+
+def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script) -> str:
+    if script.continues:
+        row = state.run_get(script.continues) or {}
+        if (row.get("repo"), str(row.get("issue"))) != (repo.name, str(tid)):
+            return f"--continue {script.continues}: no run of {repo.name} {tid} has that id"
+    try:
+        layer = config.load_layer(repo.layer_dir)
+    except (ValueError, TypeError, OSError):
+        layer = None
+    for role, table in script.overrides.items():
+        try:
+            steps.resolve(cfg, layer, role, "", table)
+        except ValueError as e:
+            return f"--set: {e}"
+    return ""
+
+
+def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
+              script: Script | None = None) -> int:
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
@@ -697,7 +779,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         path, broken = flows.wanted(repo), ""
     except (ValueError, TypeError) as e:
         path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
-    adw = path == flows.ADW
+    adw = path == flows.ADW or script is not None
     if not repo.parts and not (adw and flows.has_origin(repo)):
         print(f"{repo_name} has no github remote configured" + (" and no git remote origin, which [factory] path = "
                                                                "\"adw\" needs" if adw else broken))
@@ -708,6 +790,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     except ValueError as e:
         print(f"{repo_name}: {e}")
         return 1
+    if adw and not script:
+        return exec_script(repo.name, tid, dry_run, force)
+    if script and (refusal := script_refusal(cfg, repo, tid, script)):
+        print(refusal)
+        return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
     lock = state.run_lock("pipeline", repo.name, tid)
     with util.lock(lock) as got:
@@ -722,25 +809,36 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
                 slot.hold()
-            earlier = state.ticket_runs(repo.name, tid, limit=1)
+            only = script.only if script else ""
+            earlier = [] if only else state.ticket_runs(repo.name, tid, limit=1, whole=True)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
-            run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid)
+            run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
+                                  only_step=only)
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=pending_feedback(repo.name, tid),
-                      answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {})
+                      answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
+                      **(script.run_fields if script else {}))
             run.dir.mkdir(parents=True, exist_ok=True)
-        opening_waits(run_id, run.answering, "" if dry_run else state.take_passed_over(repo.name, str(tid)))
+        opening_waits(run_id, run.answering,
+                      "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
-        flow = flows.start(cfg, run, earlier[0] if restarting else {}, slot) if adw else None
+        flow = (flows.start(cfg, run, earlier[0] if restarting else {}, slot, script.continues, script.only)
+                if script else None)
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
-            if not dry_run:
+            if not dry_run and not run.alone:
                 state.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
+        pr_url, passed = "", None
         try:
-            status, summary, pr_url = ((flows.revise if run.feedback else flows.feature)(flow) if flow
-                                       else _run(cfg, run, slot))
+            status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+            if flow and flow.only:
+                status, summary, passed = flows.alone(flow)
+        except factory.OnlyDone:
+            status, summary, passed = flows.alone(flow)
+        except factory.Refused as e:
+            status, summary = "failed", str(e)
         except Stopped:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
@@ -759,7 +857,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.enter("failed")
             run.say(f"I did not restart this after the interruption: {summary}. Remove "
                     f"`{tk.label_name('failed')}` to retry.")
-        if run.feedback and not dry_run:
+        if run.feedback and not dry_run and not run.alone:
             state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         if status == "failed":
             lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
@@ -768,7 +866,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow)
         if status == "skipped":
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
-        return 0 if status in ("pr", "noop", "needs-info", "dry-run", "done") else 1
+        return 0 if (status in ("pr", "noop", "needs-info", "dry-run", "done") if passed is None else passed) else 1
 
 
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple[str, str, str]:
@@ -2058,12 +2156,16 @@ def settle_abandoned_runs(cfg: config.Config) -> None:
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
-              tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])))
+              tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),
+              alone=bool(row.get("only_step")))
     run.dir.mkdir(parents=True, exist_ok=True)
     if row["status"] != "stopped":
         lines.write(row["id"], "error", step=lines.last_step(row["id"]), message=row.get("summary") or "")
     write_report(row)
-    if row["status"] == "stopped":
+    if run.alone:
+        run.log(f"{record.STOPPED if row['status'] == 'stopped' else record.INTERRUPTED}, a run of "
+                f"{row['only_step']} alone, so the ticket stays as it was")
+    elif row["status"] == "stopped":
         run.log(record.STOPPED)
         run.give_up("was stopped by request")
     elif row["status"] == "failed":
@@ -2154,7 +2256,7 @@ def no_free_slot(max_parallel: int) -> str:
 
 
 def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen:
-    return control.detach(["run", repo_name, tid, *(["--force"] if force else [])], RUNS_LOG)
+    return control.launch(run_command(repo_name, tid, force), RUNS_LOG)
 
 
 class NoFreeSlot(RuntimeError):

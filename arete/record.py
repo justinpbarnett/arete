@@ -125,8 +125,10 @@ def failed_on_crash(run_id: str):
 def dead_status(row: dict) -> str:
     if stop_asked(row["id"]):
         return "stopped"
+    if row.get("only_step"):
+        return "interrupted"
     if row["kind"] == "pipeline":
-        earlier = [r for r in state.ticket_runs(row["repo"], row["issue"], limit=3) if r["id"] != row["id"]]
+        earlier = [r for r in state.ticket_runs(row["repo"], row["issue"], limit=3, whole=True) if r["id"] != row["id"]]
         return "failed" if earlier and earlier[0]["status"] == "interrupted" else "interrupted"
     return "failed" if row["kind"] in FAILS_WHEN_DEAD else "interrupted"
 
