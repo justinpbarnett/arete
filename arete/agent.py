@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
 READ_ONLY_TOOLS = frozenset({*READ_TOOLS, "LS"})
-SUBSCRIPTION_RUNNER = "claude"
+SUBSCRIPTION_RUNNERS = frozenset({"claude", "codex"})
+KEY_PROVIDERS = frozenset({"openai"})
+
+
+def subscription(runner: str, provider: str = "") -> bool:
+    return runner in SUBSCRIPTION_RUNNERS and not (runner == "codex" and provider in KEY_PROVIDERS)
 
 
 @dataclass(frozen=True)
@@ -46,7 +51,7 @@ class Result:
 
     @property
     def paid_usd(self) -> float:
-        return 0.0 if self.runner == SUBSCRIPTION_RUNNER else self.cost_usd
+        return 0.0 if subscription(self.runner, self.provider) else self.cost_usd
 
 
 NO_SESSION = Session()

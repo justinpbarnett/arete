@@ -4,10 +4,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import claude, config, pi, runner
+from . import claude, codex, config, pi, runner
 
-EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS,
-           runner.REPLAY: tuple(dict.fromkeys([*claude.EFFORTS, *pi.THINKING_LEVELS]))}
+EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS, "codex": codex.EFFORTS,
+           runner.REPLAY: tuple(dict.fromkeys([*claude.EFFORTS, *pi.THINKING_LEVELS, *codex.EFFORTS]))}
+CODEX_INSTRUCTIONS = ("repo",)
 DEFAULTS = {"tools": tuple(runner.READ_TOOLS), "mcp": (), "session": "fresh"}
 BUILT_IN = {"build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
             "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3}}
@@ -30,6 +31,7 @@ class Settings:
     mcp: tuple[str, ...]
     instructions: tuple[str, ...]
     session: str
+    notes: tuple[str, ...] = ()
 
     @property
     def call(self) -> dict:
@@ -50,10 +52,10 @@ def mcp_config(cfg: config.Config, names, own: str = "") -> str:
 def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple[str, dict[str, dict[str, str]]]:
     own = layer.tiers if layer else {}
     maps = {name: {**cfg.tiers.get(name, {}), **own.get(name, {})} for name in dict.fromkeys([*cfg.tiers, *own])}
-    if cfg.tier_map:
-        if cfg.tier_map not in maps:
-            raise ValueError(f"[factory] tier_map '{cfg.tier_map}' names no [tiers.{cfg.tier_map}]")
-        return cfg.tier_map, maps[cfg.tier_map]
+    if picked := (layer.tier_map if layer else "") or cfg.tier_map:
+        if picked not in maps:
+            raise ValueError(f"[factory] tier_map '{picked}' names no [tiers.{picked}]")
+        return picked, maps[picked]
     if len(maps) > 1:
         raise ValueError(f"several tier maps ({', '.join(maps)}); pick one with [factory] tier_map")
     return next(iter(maps.items()), ("", {}))
@@ -75,8 +77,8 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
     if bad := [t for t in tools if t not in STEP_TOOLS]:
         raise ValueError(f"{where}: tools {', '.join(bad)} is not a built in tool a step takes; use "
                          f"{', '.join(STEP_TOOLS)}, since shell rules come from the layer and servers from mcp")
-    if which == "pi" and (missing := [t for t in runner.READ_TOOLS if t not in tools]):
-        raise ValueError(f"{where}: tools {', '.join(tools) or '[]'} leaves out {', '.join(missing)}, which pi always "
+    if which in ("pi", "codex") and (missing := [t for t in runner.READ_TOOLS if t not in tools]):
+        raise ValueError(f"{where}: tools {', '.join(tools) or '[]'} leaves out {', '.join(missing)}, which {which} always "
                          "grants; list them")
     if which == "pi" and mcp:
         raise ValueError(f"{where}: mcp {', '.join(mcp)} cannot load on pi, which runs with --no-mcp; run this step "
@@ -86,6 +88,9 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
     if which == "pi" and instructions:
         raise ValueError(f"{where}: instructions {', '.join(instructions)} cannot load on pi, which loads no "
                          "instruction files; use []")
+    if which == "codex" and "user" in instructions:
+        raise ValueError(f"{where}: instructions 'user' cannot load on codex, which runs without your own codex "
+                         "setup; use [\"repo\"] or []")
     if role in KEEPS_NO_SESSION and found["session"] == "resume":
         raise ValueError(f"{where}: session 'resume' needs a kept session and {role} keeps none; use fresh")
 
@@ -120,17 +125,27 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     effort = found.get("effort", "")
     if effort and effort not in EFFORTS[which]:
         raise ValueError(f"{where}: effort '{effort}' is not a level {which} takes; use {', '.join(EFFORTS[which])}")
-    instructions = found.get("instructions", () if which == "pi" else config.INSTRUCTIONS)
+    default = {"pi": (), "codex": CODEX_INSTRUCTIONS}.get(which, config.INSTRUCTIONS)
+    instructions = found.get("instructions", default)
     check_reach(where, cfg, role, which, found, instructions)
+    notes = codex.NOTES if which == "codex" else ()
     if cfg.replay.all:
+        name = f"codex:{name}" if which == "codex" and runner.route(name)[0] != which else name
         which = runner.REPLAY
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
-                    mcp=found["mcp"], instructions=instructions, session=found["session"])
+                    mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes)
 
 
-def check(cfg: config.Config, layer: config.RepoLayer | None = None) -> None:
-    tier_map(cfg, layer)
+def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_tiers: bool = False) -> None:
+    layer = layer or config.RepoLayer(dir=Path())
+    deferred = defer_tiers and not (layer.tier_map or cfg.tier_map) and len(set(cfg.tiers) | set(layer.tiers)) > 1
+    if not deferred:
+        tier_map(cfg, layer)
     for kind in ("", *config.KINDS):
         for role in config.MODEL_ROLES:
+            if deferred:
+                found = merged(cfg, layer, role, kind, {})
+                if found.get("tier") and not found.get("model"):
+                    continue
             resolve(cfg, layer, role, kind)

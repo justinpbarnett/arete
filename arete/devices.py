@@ -26,7 +26,7 @@ SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAli
 SSH_FAILED = 255
 SSH_FAILED_BEFORE_SENDING = re.compile(r"Could not resolve hostname|ssh: connect to host|kex_exchange_identification|"
                                        r"banner exchange|Host key verification failed|Permission denied \(")
-PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi arete ollama; do command -v $t >/dev/null && echo has:$t; "
+PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi codex arete ollama; do command -v $t >/dev/null && echo has:$t; "
          "done; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/gpu:/'")
 CLONE_BOOT_SECONDS = 180
 GUEST_HOST_KEYS = "sh -c 'cat /etc/ssh/ssh_host_*_key.pub'"

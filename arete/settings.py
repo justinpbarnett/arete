@@ -9,7 +9,8 @@ from . import config, paths, util
 PARALLEL_MAX = 8
 RUN_LIMITS = {"max_parallel": "Runs at once", "max_parallel_per_repo": "Runs per repo"}
 MODEL_ALIASES = ("opus", "sonnet", "haiku")
-MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+/[A-Za-z0-9._:-]+")
+MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+/[A-Za-z0-9._:-]+|"
+                      r"(?:codex:)?(?:gpt-|codex-)[A-Za-z0-9._:-]+|codex:[A-Za-z0-9._-]+")
 TABLE_HEADER = re.compile(r"\s*\[")
 
 
@@ -41,7 +42,7 @@ def model_from(role, value) -> str:
     text = str(value).strip()
     if text and text not in MODEL_ALIASES and not MODEL_ID.fullmatch(text):
         raise Refused(f"The {role.replace('_', ' ')} model takes opus, sonnet, haiku, a claude model id, a pi model "
-                      f"as provider/model, or nothing for its default{instead_of(text)}")
+                      f"as provider/model, a codex model id or codex:<model>, or nothing for its default{instead_of(text)}")
     return text
 
 

@@ -178,7 +178,7 @@ class Job:
                 timeout=self.layer.timeout_minutes * 60, workspace=self.workspace, attachments=self.attachments,
                 tools=pipeline.bash_rules(self.builder_bash), deny=diffguard.denied_paths(self.layer),
                 expertise=self.expertise, left_for_a_person=self.left_for_a_person, check_commands=self.checks,
-                from_base=self.run.alone)
+                from_base=self.run.alone, plan_text=self.plan_text, build_summary=self.build_summary)
         return self.built
 
     def staged(self) -> pipeline.Build:

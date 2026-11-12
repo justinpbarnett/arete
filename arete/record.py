@@ -559,8 +559,41 @@ def read_pi(e: dict) -> list[dict]:
     return out
 
 
+def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
+    before: dict = {}
+
+    def read(e: dict) -> list[dict]:
+        nonlocal before
+        if e.get("arete") == "command":
+            before = e.get("usage_before") or {}
+            return []
+        item = e.get("item") if isinstance(e.get("item"), dict) else {}
+        kind, at = item.get("type"), item.get("id", "")
+        if e.get("type") == "turn.completed" and isinstance(usage := e.get("usage"), dict):
+            return [{"kind": "usage", "total": True, "model": header.get("model", ""),
+                     "tokens_in": max(0, int(usage.get("input_tokens") or 0) - int(before.get("input_tokens") or 0)),
+                     "tokens_out": max(0, int(usage.get("output_tokens") or 0) - int(before.get("output_tokens") or 0)),
+                     "cost_usd": None}]
+        if e.get("type") == "item.started" and kind == "command_execution":
+            return [{"kind": "tool_call", "id": at, "name": "Bash", "input": {"command": item.get("command", "")}}]
+        if e.get("type") != "item.completed":
+            return []
+        if kind in ("agent_message", "reasoning"):
+            role = "assistant" if kind == "agent_message" else "thinking"
+            return [{"kind": "message", "role": role, "text": item.get("text", "")}]
+        if kind == "command_execution":
+            return [{"kind": "tool_result", "id": at, "name": "Bash", "text": item.get("aggregated_output", ""),
+                     "error": item.get("exit_code") not in (0, None)}]
+        if kind == "file_change":
+            return [{"kind": "tool_call", "id": at, "name": "apply_patch", "input": {"changes": item.get("changes")}}]
+        return []
+
+    return read
+
+
 READERS: dict[str, Callable[[dict], Callable[[dict], list[dict]]]] = {"claude": claude_reader,
-                                                                      "pi": lambda header: read_pi}
+                                                                      "pi": lambda header: read_pi,
+                                                                      "codex": codex_reader}
 
 
 def named_model(raw: str) -> str:
