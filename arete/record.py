@@ -29,7 +29,7 @@ RECORD_SUFFIX = ".jsonl.gz"
 TIMELINE = f"steps{RECORD_SUFFIX}"
 CLOCK_SECONDS = 1
 HEADER_WAIT_SECONDS = 10
-CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL", re.IGNORECASE)
+CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|^access$|^refresh$", re.IGNORECASE)
 PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL)
 SHORTEST_SECRET = 8
 REDACTED = "[redacted]"
@@ -198,8 +198,12 @@ def file_secrets(path: Path, every_value: bool = False) -> set[str]:
             found.add(util.env_value(raw))
         pairs = [(name, unquoted(value)) for name, value in NAMED_VALUE.findall(line)]
         found |= {value for name, value in pairs if CREDENTIAL_NAME.search(name) or looks_secret(value)}
-        if not sep and not pairs and looks_secret(word := re.split(r"[\s:]+", line)[-1].strip("'\",")):
-            found.add(word)
+        if not sep and not pairs:
+            if every_value:
+                found.add(line.strip("'\","))
+            word = re.split(r"[\s:]+", line)[-1].strip("'\",")
+            if every_value or looks_secret(word):
+                found.add(word)
     return found
 
 
@@ -374,7 +378,7 @@ class Recorder:
              auth_mode=result["auth_mode"], provider=result.get("provider", self.header.get("provider", "")),
              **{k: result[k] for k in ("auth_modes", "paid_usd") if k in result},
              seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
-             **({"error": util.first_line(result["error"], 300)} if result["error"] else {}))
+             **({"error": util.first_line(scrub(result["error"], self.hidden), 300)} if result["error"] else {}))
 
     def write(self, entry: dict) -> None:
         with self.lock:

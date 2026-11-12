@@ -186,17 +186,14 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     log = SESSIONS_DIR / spec.id / "session.log"
     recent = util.tail(log.read_text(errors="replace"), RECENT_CHARS) if log.exists() else ""
     log_line(spec, "you", prompt)
-    left = None
-    if spec.budget_usd and runner.metered(spec.model, spec.runner or resume.runner, cfg=cfg,
-                                        repo=session_repo(spec, cfg), device=device):
-        left = round(spec.budget_usd - record.metered_spent(spec.id), 2)
-        if left <= runner.BUDGET_FLOOR_USD:
-            log_line(spec, "error", f"the session budget of ${spec.budget_usd:g} is spent")
-            return resume
+
+    def remaining_budget():
+        return spec.budget_usd - record.metered_spent(spec.id) if spec.budget_usd else None
+
     resume = compacted(spec, cfg, device, prompt, recent, turn, resume)
     res = runner.run(prompt, spec.cwd, model=spec.model, runner=spec.runner, trace=(spec.id, f"turn {turn}"),
                      resume=resume, cfg=cfg, device=device, tools=spec.tools, allowed_tools=spec.tools,
-                     disallowed_tools=runner.NO_GIT_WRITES, max_budget_usd=left, timeout=TURN_TIMEOUT_SECONDS,
+                     disallowed_tools=runner.NO_GIT_WRITES, remaining_budget=remaining_budget, timeout=TURN_TIMEOUT_SECONDS,
                      say=lambda text: log_line(spec, "wait", text), repo=session_repo(spec, cfg))
     record.note(spec.id, model=res.model, runner=res.runner)
     note = runner.cost_note(res)

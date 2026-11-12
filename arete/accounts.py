@@ -16,6 +16,7 @@ MAX_METADATA = 64 * 1024
 MAX_LOGIN_METADATA = 4 * 1024 * 1024
 CACHE_SECONDS = 300
 CACHE_SIZE = 128
+PI_SUBSCRIPTIONS = frozenset({"anthropic", "openai", "openai-codex", "github-copilot", "xai", "kimi-coding", "meta"})
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,8 @@ def pi(provider: str, credential=None, source: str = "", lookup=None) -> Auth:
     credential = mapping(credential)
     generation = fingerprint("pi", source, provider, credential)
     if credential.get("type") != "oauth":
+        return Auth("api_key", generation=generation)
+    if provider not in PI_SUBSCRIPTIONS:
         return Auth("api_key", generation=generation)
     family = {"anthropic": "claude", "openai-codex": "codex"}.get(provider, "")
     if family == "claude":

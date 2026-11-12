@@ -6,7 +6,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import alerts, config, install, paths, runner, state, steps, util
+from . import accounts, alerts, config, devices, install, paths, pi, runner, state, steps, util
 
 
 @dataclass
@@ -93,6 +93,54 @@ def check_codex_auth(cfg: config.Config) -> list[Check]:
         return []
     ok, detail = runner.codex_login()
     return [Check("codex:auth", ok, detail)]
+
+
+def check_pi_auth(cfg: config.Config) -> list[Check]:
+    from . import loops
+
+    if cfg.replay.all:
+        return []
+    configured = accounts.mapping(pi.model_configuration().get("providers"))
+    names = set(configured) | set(accounts.read(pi.owner_dir() / "auth.json")) | set(cfg.environment.providers)
+    names |= {p for p in pi.KEY_NAMES if os.environ.get(pi.KEY_NAMES[p])}
+    keys = util.read_env_file(pi.KEYS_FILE)
+    names |= {p for p, n in pi.KEY_NAMES.items() if keys.get(n)}
+    if default := pi.default_provider():
+        names.add(default)
+    calls = [(f"{p}/*", None, "local") for p in names]
+    for repo in [None, *cfg.repos]:
+        try:
+            layer = config.load_layer(repo.layer_dir) if repo else None
+        except (ValueError, TypeError, OSError):
+            continue
+        for kind in ("", *config.KINDS):
+            for role in config.MODEL_ROLES:
+                try:
+                    step = steps.resolve(cfg, layer, role, kind)
+                    if step.runner == "pi":
+                        calls.append((step.model, repo, "local"))
+                except ValueError:
+                    continue
+    for loop in loops.load_all(cfg):
+        if not loop.error and not devices.resolve(loop.device).remote:
+            repo = loop.work_repo(cfg) if loop.repo else None
+            calls += [(runner.route(m, loop.runner)[1], repo, loop.device) for m in loop.agent_models(cfg)
+                      if runner.route(m, loop.runner)[0] == "pi"]
+    out = {}
+    for model, repo, device in calls:
+        selected = runner.pi_route(model, cfg, repo, device)
+        provider = selected.provider or "unspecified"
+        hold = runner.auth_hold(selected.auth, selected.model)
+        source = f"SDK-managed {selected.managed.kind}" if selected.managed else "key"
+        detail = ("missing login and key" if selected.error else "held login; waiting" if hold else
+                  f"login-backed ({'subscription' if selected.auth.mode == 'subscription' else 'metered'})"
+                  if selected.using_login else
+                  f"login held; using {source}" if selected.login_held and selected.key_available else
+                  source if selected.managed else "key-only" if selected.key_available else
+                  "unauthenticated local")
+        key = f"pi:{provider}:auth" + (f":{repo.name}" if repo else "")
+        out[key] = Check(key, not selected.error, f"{provider}: {detail}")
+    return list(out.values())
 
 
 def uses_codex(cfg: config.Config) -> bool:
@@ -217,6 +265,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_probes, cfg, force_probes),
         (check_claude_auth,),
         (check_codex_auth, cfg),
+        (check_pi_auth, cfg),
         (check_hook,),
         (check_disk,),
         (check_serve,),
