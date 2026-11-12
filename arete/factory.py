@@ -144,7 +144,8 @@ def amount(line: dict, key: str) -> float:
 def outcome_of(line: dict) -> Outcome:
     data, session = line.get("data"), line.get("session")
     session = session if isinstance(session, dict) else {}
-    return Outcome("pass", next=str(line.get("next") or ""), feedback=str(line.get("feedback") or ""),
+    return Outcome(str(line.get("result") or "pass"), next=str(line.get("next") or ""),
+                   feedback=str(line.get("feedback") or ""),
                    data=data if isinstance(data, dict) else {},
                    session=Session(str(session.get("id") or ""), float(amount(session, "spent_usd")),
                                    str(session.get("runner") or "")))
@@ -196,13 +197,18 @@ class Flow:
 
     def stored(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.skipped] if self.skipped < len(self.earlier) else {}
-        if line.get("step") != name or line.get("result") != "pass":
+        if line.get("step") != name or not self.takable(line):
             return None
         if not self.only and line.get("tree"):
             now = self.print_of(kw.get("tree") or line["tree"])
             if not now or now != self.last_prints.get(str(line["tree"])):
                 return None
         return outcome_of(line)
+
+    def takable(self, line: dict) -> bool:
+        if line.get("result") == "pass":
+            return True
+        return line.get("result") == "fail" and not line.get("error") and self.skipped + 1 < len(self.earlier)
 
     def print_of(self, folder: Path | str) -> str:
         key = os.path.abspath(folder)
