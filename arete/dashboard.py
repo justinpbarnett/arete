@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import glob
 import hashlib
 import json
@@ -44,7 +45,8 @@ from . import (
 )
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
-WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
+WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
+             ".js": "text/javascript; charset=utf-8"}
 CODE_MARK = b'<meta name="arete-code" content="">'
 TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
                   "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
@@ -96,8 +98,10 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
     for f, body in bodies.items():
         if f.name == "index.html":
             if CODE_MARK not in body:
-                raise RuntimeError(f"index.html lost {CODE_MARK.decode()}, so an open page could not tell when its code is old.")
-            served["/"] = (body.replace(CODE_MARK, f'<meta name="arete-code" content="{code}">'.encode()), WEB_TYPES[f.suffix])
+                raise RuntimeError(f"index.html lost {CODE_MARK.decode()}, so an open page could not tell when its "
+                                   "code is old.")
+            served["/"] = (body.replace(CODE_MARK, f'<meta name="arete-code" content="{code}">'.encode()),
+                           WEB_TYPES[f.suffix])
         else:
             served[f"/{f.name}"] = (body, WEB_TYPES[f.suffix])
     return code, served
@@ -185,8 +189,8 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409, chat.NoDraft: 409,
-                     chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
+STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
+                     chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
                      triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409, tasks.TrackerFailed: 502}
@@ -403,7 +407,8 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(400, "budget_usd is a number of dollars.")
         return sessions.launch(str(b.get("prompt", "")), device=str(b.get("device") or ""),
                                model=str(b.get("model") or ""), run_with=str(b.get("runner") or ""), tools=tools,
-                               repo=str(b.get("repo") or ""), budget_usd=None if budget in (None, "") else float(budget))
+                               repo=str(b.get("repo") or ""),
+                               budget_usd=None if budget in (None, "") else float(budget))
 
     def send_ticket(self, ref: str) -> dict:
         b = self.body()
@@ -539,7 +544,8 @@ def run_ended(run_id: str) -> Callable[[], bool]:
 
 def draft_choices() -> dict:
     cfg = config.load()
-    return {"repos": [r.name for r in cfg.repos], "models": sessions.known_models(cfg), "default_model": cfg.model("loop")}
+    return {"repos": [r.name for r in cfg.repos], "models": sessions.known_models(cfg),
+            "default_model": cfg.model("loop")}
 
 
 def research_ticket(ref: str, force: bool) -> dict:
@@ -616,27 +622,37 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     chat.recover()
     logins = Logins()
     waiting_for = ""
-    while True:
-        node = this_node(cfg.dashboard_owner)
-        try:
-            if node is None:
-                raise OSError("tailscale is not running or reports no address")
-            servers = open_servers(node, port, logins, inside_serve)
-        except OSError as e:
-            if str(e) != waiting_for:
-                say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
-                waiting_for = str(e)
-            time.sleep(RETRY_SECONDS)
-            continue
-        waiting_for = ""
-        for s in servers:
-            threading.Thread(target=s.serve_forever, daemon=True).start()
-        say(f"dashboard listening on port {port} at {', '.join(node.addresses)}")
-        util.write_json(paths.SERVER_FILE, {"pid": os.getpid(), "addresses": list(node.addresses), "port": port,
-                                            **paths.state_and_config(), "at": util.iso()})
-        while this_node(cfg.dashboard_owner) == node:
-            time.sleep(WATCH_SECONDS)
-        say("the tailnet address or owner changed; listening again")
-        for s in servers:
-            s.shutdown()
-            s.server_close()
+    atexit.register(forget_server)
+    try:
+        while True:
+            node = this_node(cfg.dashboard_owner)
+            try:
+                if node is None:
+                    raise OSError("tailscale is not running or reports no address")
+                servers = open_servers(node, port, logins, inside_serve)
+            except OSError as e:
+                if str(e) != waiting_for:
+                    say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
+                    waiting_for = str(e)
+                time.sleep(RETRY_SECONDS)
+                continue
+            waiting_for = ""
+            for s in servers:
+                threading.Thread(target=s.serve_forever, daemon=True).start()
+            say(f"dashboard listening on port {port} at {', '.join(node.addresses)}")
+            util.write_json(paths.SERVER_FILE, {"pid": os.getpid(), "addresses": list(node.addresses), "port": port,
+                                                **paths.state_and_config(), "at": util.iso()})
+            while this_node(cfg.dashboard_owner) == node:
+                time.sleep(WATCH_SECONDS)
+            say("the tailnet address or owner changed; listening again")
+            for s in servers:
+                s.shutdown()
+                s.server_close()
+    finally:
+        forget_server()
+
+
+def forget_server() -> None:
+    found = util.read_json(paths.SERVER_FILE, None)
+    if isinstance(found, dict) and found.get("pid") == os.getpid():
+        paths.SERVER_FILE.unlink(missing_ok=True)

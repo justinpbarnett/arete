@@ -44,6 +44,8 @@ With no `code`, the recipe failed on its own side. The start of `error` says why
 | `write each setting as key=value` | an `adw-step` setting has no `=` | fix the call |
 | `no run` | with no server, `adw-status <id>` and `adw-logs` read the local state, and it has no such run | check the id |
 
+A failed line that also has a `usage` field means the recipe's arguments did not parse, such as a missing id or an unknown flag; `usage` shows the form the command takes. Fix the call.
+
 When the server restarts on new code, `just adw-wait` connects again by itself and goes on from the last line it read.
 
 ## The recipes
@@ -119,7 +121,7 @@ just adw-wait RUN2
 | `step_start` | a step began; names its model, runner and effort when it calls an agent, and in `env` the names of the variables that agent starts with, never their values |
 | `heartbeat` | the step is still working; every 30 seconds |
 | `step_end` | a step ended: `result` is `pass`, `fail`, `ask` or `stop`, with `error`, `cost_usd` and `seconds` |
-| `route` | the run continues an earlier one and took its finished steps |
+| `route` | the run continues an earlier one and took its finished steps; it comes twice, once when the run starts and once with `after` and `skipped` when it runs its first step |
 | `wait` | the run waited on a usage limit, CI, a run slot or a person, with `minutes` |
 | `question` | the run asks the person: `summary` is the question in short, `question` the whole comment |
 | `error` | something failed: `step` and `message` |

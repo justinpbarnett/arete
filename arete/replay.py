@@ -19,7 +19,7 @@ SAMPLE_REPO = "replay-sample"
 SAMPLE_CHECK = f"grep -q {SAMPLE_WORD} {SAMPLE_FILE}"
 SAMPLE_NOTES = f"There is no app to start. Check with grep that {SAMPLE_FILE} holds the word {SAMPLE_WORD}."
 SCRATCH_CONFIG = "ARETE_CONFIG_DIR, since all = true sends every agent call to replay"
-SAMPLE_USAGE ={"ok": True, "cost_usd": 0, "tokens_in": 0, "tokens_out": 0, "turns": 1, "seconds": 0}
+SAMPLE_USAGE = {"ok": True, "cost_usd": 0, "tokens_in": 0, "tokens_out": 0, "turns": 1, "seconds": 0}
 SAMPLE_ANSWERS = {
     "plan": {"text": f"Add {SAMPLE_WORD} to {SAMPLE_FILE}.", "structured": {
         "plan": f"Add the word {SAMPLE_WORD} on a line of its own at the end of {SAMPLE_FILE}.",

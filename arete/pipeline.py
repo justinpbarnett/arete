@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -70,6 +71,11 @@ SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
+CHECKS_SCRIPT = "checks"
+NO_CHECKS = "(none configured)"
+SUMMARY_CHARS = 3000
+PLAN_CHARS = 6000
+CUT_MARK = " …"
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -98,6 +104,7 @@ REVIEW_SCHEMA = {
     "properties": {
         "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
         "summary": {"type": "string"},
+        "changes": {"type": "string"},
         "problems": {
             "type": "array",
             "items": {
@@ -241,17 +248,23 @@ class AgentRun:
         p = self.dir / name
         p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
 
+    @property
+    def config(self) -> config.Config:
+        if self.cfg is None:
+            self.cfg = config.load()
+        return self.cfg
+
     def settings(self, role: str) -> steps.Settings:
         own = self.step_overrides.get(config.STEP_ALIASES.get(role, role), {})
-        return steps.resolve(self.cfg or config.load(), self.layer, role, self.kind, {**self.overrides, **own})
+        return steps.resolve(self.config, self.layer, role, self.kind, {**self.overrides, **own})
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         s = self.settings(role) if role else None
         if s:
-            reach = s.agent_kw(self.cfg or config.load(), kw.pop("allowed_tools", ()), kw.pop("mcp_config", ""))
+            reach = s.agent_kw(self.config, kw.pop("allowed_tools", ()), kw.pop("mcp_config", ""))
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(s.step, NO_SESSION) if s.session == "resume" else NO_SESSION, **kw}
-        cfg = kw.get("cfg") or self.cfg or config.load()
+        cfg = kw.get("cfg") or self.config
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
         which, model = runner.chosen(kw.get("model", ""), run_with, cfg)
         effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost
@@ -335,7 +348,7 @@ class Run(AgentRun):
     def enter(self, status: str) -> None:
         if self.dry_run:
             return
-        others = [s for s in config.STATES if s != status]
+        others = [s for s in self.tracker.states if s != status]
         labeled, moved = self.tracker.label(self.tid, add=[status], remove=others), self.tracker.move(self.tid, status)
         for err in (labeled, moved):
             if err:
@@ -495,16 +508,17 @@ class Staged(diffguard.Diff):
     changed: list[Checkout] = field(default_factory=list)
 
 
-def stage(checkouts: list[Checkout], deny: list[str]) -> Staged:
+def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -> Staged:
     out = Staged()
     for c in checkouts:
         drop_untracked_bytecode(c.wt)
-        diff = diffguard.stage(c.wt, deny, prefix=c.prefix)
+        against = git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() if from_base else "HEAD"
+        diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
         if not diff.counts:
             continue
         out += diff
         out.changed.append(c)
-        out.patch += checkout_patch(c, diff.locks, "--cached")
+        out.patch += checkout_patch(c, diff.locks, "--cached", against)
     return out
 
 
@@ -583,7 +597,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     with machine_to_itself(run):
         for name, cmd in layer.checks.items():
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.cfg or config.load(), run.repo, cwd=cwd, timeout=timeout)
+                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=timeout)
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
@@ -655,6 +669,8 @@ class Build(TicketWork):
     staged: Staged = field(default_factory=Staged)
     committed_lines: int = 0
     left_for_a_person: str = ""
+    check_commands: str = NO_CHECKS
+    from_base: bool = False
 
     def resume(self, step: str, text: str, **kw) -> Result:
         return self.run.agent(step, text, self.ws, role="build", allowed_tools=self.tools,
@@ -664,8 +680,8 @@ class Build(TicketWork):
         ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout)
         return ok
 
-    def restage(self) -> Staged:
-        self.staged = stage(self.checkouts, self.deny)
+    def restage(self, *, from_base: bool | None = None) -> Staged:
+        self.staged = stage(self.checkouts, self.deny, self.from_base if from_base is None else from_base)
         record.mark(self.run.id, "diff", files=self.staged.files, lines=self.staged.lines, denied=self.staged.denied,
                     patch=self.staged.patch)
         return self.staged
@@ -674,11 +690,12 @@ class Build(TicketWork):
         staged = self.restage()
         if not staged.files:
             raise RunFailed(f"{after} undid every change")
-        why = staged.refusal(self.layer.max_diff_lines, earlier=self.committed_lines)
+        earlier = 0 if self.from_base else self.committed_lines
+        why = staged.refusal(self.layer.max_diff_lines, earlier=earlier)
         if staged.denied:
             raise RunFailed(f"{after} {why}")
         if why:
-            pushed = f"\n- pushed earlier in this run: {self.committed_lines}" if self.committed_lines else ""
+            pushed = f"\n- pushed earlier in this run: {earlier}" if earlier else ""
             raise RunFailed(f"after {after} {why}{planned}; split the work",
                             f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
 
@@ -729,6 +746,8 @@ def script_file(cfg: config.Config, name: str) -> Path:
 
 def flow_function(cfg: config.Config, name: str) -> Callable:
     found = script_file(cfg, name)
+    if str(found.parent) not in sys.path:
+        sys.path.insert(0, str(found.parent))
     spec = importlib.util.spec_from_file_location(f"adws_{name}", found)
     module = sys.modules[spec.name] = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -896,7 +915,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if run.feedback and not dry_run and not run.alone:
             state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         if status == "failed":
-            lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
+            if flow and flow.matching:
+                flow.route()
+            if not lines.ended_in_error(run_id, reply="respond" if flow else ""):
+                lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
         run.log(f"done: {status} {pr_url or summary}")
         record.settle(run_id, status, summary=summary, pr_url=pr_url)
         write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow, run)
@@ -1066,26 +1088,16 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         c.merged_base = True
     layer = resolve_layer(cfg, run, ws)
     run.cfg, run.layer, run.kind = cfg, layer, t.kind
-    for rel in layer.copy:
-        src = repo.path / rel
-        if src.exists():
-            dest = ws / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
-    for cmd in layer.setup:
-        with record.timed(run.id, "setup", command=cmd) as setup:
-            res = environment.sh(cmd, cfg, repo, cwd=ws, timeout=1200)
-            setup["exit"] = res.returncode
-        run.log(f"setup `{cmd}`: exit {res.returncode}")
-        if res.returncode != 0:
-            run.save("setup.log", res.stdout + res.stderr)
-            return _fail(run, f"setup command `{cmd}` failed")
+    if why := furnish(cfg, run, layer, ws):
+        return _fail(run, why)
 
     expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
     checks = check_list(layer)
+    check_commands, check_rules = check_script(run.dir, layer, ws)
+    runs_checks = check_calls(check_commands)
     reads = git_reads(checkouts)
-    builder_bash = layer.builder_bash + reads
-    commands = code_list(builder_bash)
+    builder_bash = layer.builder_bash + reads + check_rules
+    commands = code_list(layer.builder_bash + reads + check_commands)
     workspace = workspace_note(branch, checkouts)
     read_rules = bash_rules(config.DEFAULT_ALLOW_BASH + reads)
     build_rules = bash_rules(builder_bash)
@@ -1104,7 +1116,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
         res = run.agent("revise", prompt("revise", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                          body=t.body, comments=t.comments, attachments=attachments,
-                                         feedback=feedback, expertise=expertise, checks=checks,
+                                         feedback=feedback, expertise=expertise, checks=runs_checks,
                                          commands=commands, max_lines=limit),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=runner.NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA)
@@ -1144,7 +1156,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
 
         res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
-                                         expertise=expertise, checks=checks, commands=commands, max_lines=limit,
+                                         expertise=expertise, checks=runs_checks, commands=commands, max_lines=limit,
                                          estimate=estimate, verify=goal),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=runner.NO_GIT_WRITES)
         if not res.ok:
@@ -1161,14 +1173,15 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
     b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=layer.timeout_minutes * 60,
               workspace=workspace, attachments=attachments, tools=build_rules, deny=deny, expertise=expertise,
-              left_for_a_person=left_for_a_person)
+              left_for_a_person=left_for_a_person, check_commands=runs_checks)
 
     attempts, tries = 1, run.settings("build").tries
     ok = b.check()
     while not ok and attempts < tries:
         run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(b.report, 2500)}")
         attempts += 1
-        b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=tries, failures=b.report))
+        b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=tries, failures=b.report,
+                                          checks=runs_checks))
         ok = b.check()
     run.save("checks.md", b.report)
     record.note(run.id, attempts=attempts)
@@ -1203,19 +1216,9 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         return "dry-run", outcome, ""
 
     subject = fill_template(layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
-    problems = review.get("problems", [])
-    images = evidence_images(run, staged.changed[0], verified)
-    report_body = (
-        f"## Summary\n\n{build_summary.strip()[:3000]}\n\n"
-        + ("" if run.feedback else triage_block(approval))
-        + left_block(left_for_a_person)
-        + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
-        f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
-        + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
-        + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
-        + ("" if run.feedback else f"<details><summary>Plan</summary>\n\n{plan_text[:6000]}\n\n</details>\n\n")
-        + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
-    )
+    pr_report = report_body(run, summary=build_summary, review=review, verified=verified, left=left_for_a_person,
+                            images=evidence_images(run, staged.changed[0], verified), approval=approval,
+                            attempts=attempts, checks=checks, plan_text=plan_text, size=size)
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
@@ -1223,7 +1226,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     opened: list[Checkout] = []
     for c in staged.changed:
         if not c.pr:
-            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{link}\n\n{report_body}",
+            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{link}\n\n{pr_report}",
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
             opened.append(c)
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
@@ -1235,7 +1238,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
             if others:
-                gh.pr_edit_body(c.pr, f"{link}\n\n{report_body}{others}")
+                gh.pr_edit_body(c.pr, f"{link}\n\n{pr_report}{others}")
             continue
         body = gh.pr_body(c.pr)
         new_body = synced_pr_body(run, c.pr, body, t, left_for_a_person)
@@ -1244,7 +1247,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         if new_body != body:
             gh.pr_edit_body(c.pr, new_body)
         if c in pushed and c.pr not in run.feedback_prs:
-            gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
+            gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{pr_report}")
     try:
         ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why)
     except RunFailed as e:
@@ -1260,42 +1263,87 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                          for c in with_prs)
     if run.feedback:
         answer_feedback(run, replies, "Done in the latest push.")
-        run.say(f"Revised for your review.\n\n{report_body}\n\nCI: {ci_result}.")
+        run.say(f"Revised for your review.\n\n{pr_report}\n\nCI: {ci_result}.")
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
                 + ("" if not opened else draft_note(draft_why, verified)))
-    if not draft_why and layer.trust_level == "automerge" and approval and approval["sent_by"] == "triage":
-        run.log("automerge left off: triage approved the ticket, so a person merges it")
-    elif not draft_why and layer.trust_level == "automerge":
-        try:
-            risk = jev.risk(patch_from_base(opened), f"{t.title}\n\n{build_summary.strip()[:3000]}", cfg,
-                            trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [repo]) else None
-            hold = risk.hold if risk else ""
-        except jev.Unjudged as e:
-            run.log(f"automerge risk: JEV could not judge the diff: {e}")
-            hold = "JEV could not judge the diff"
-        for c in opened:
-            try:
-                if hold:
-                    run.log(f"automerge left off on {c.pr}: {hold}")
-                    gh.pr_comment(c.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
-                    continue
-                try:
-                    did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
-                except gh.GhError as e:
-                    did, why = "left", f"a GitHub call failed: {str(e).rstrip('.')}"
-                if did == "merged":
-                    run.log(f"automerged {c.pr}")
-                elif did == "auto":
-                    run.log(f"automerge enabled on {c.pr}")
-                else:
-                    run.log(f"automerge left {c.pr} for a person: {why}")
-                    gh.pr_comment(c.pr, f"Automerge could not merge this PR: {why}. A person merges it.")
-            except gh.GhError as e:
-                run.log(f"automerge failed on {c.pr}: {e}")
+    automerge(cfg, run, layer, approval, draft_why, opened, f"{t.title}\n\n{build_summary.strip()[:3000]}")
     urls = record_prs(run, branch, with_prs)
     remove_workspace(ws, checkouts)
     return "pr", outcome, urls
+
+
+def furnish(cfg: config.Config, run: Run, layer: config.RepoLayer, ws: Path) -> str:
+    for rel in layer.copy:
+        if (src := run.repo.path / rel).exists():
+            (dest := ws / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+    for cmd in layer.setup:
+        with record.timed(run.id, "setup", command=cmd) as setup:
+            res = environment.sh(cmd, cfg, run.repo, cwd=ws, timeout=1200)
+            setup["exit"] = res.returncode
+        run.log(f"setup `{cmd}`: exit {res.returncode}")
+        if res.returncode != 0:
+            run.save("setup.log", res.stdout + res.stderr)
+            return f"setup command `{cmd}` failed"
+    return ""
+
+
+def summary_of(review: dict, build_summary: str) -> str:
+    return cut_at_end(str(review.get("changes") or "").strip() or build_summary, SUMMARY_CHARS)
+
+
+def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verified, left: str,
+                images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
+                size: str) -> str:
+    problems = review.get("problems", [])
+    return (
+        f"## Summary\n\n{summary_of(review, summary)}\n\n"
+        + ("" if run.feedback else triage_block(approval))
+        + left_block(left)
+        + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
+        f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
+        + "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems)
+        + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
+        + ("" if run.feedback else
+           f"<details><summary>Plan</summary>\n\n{cut_at_end(plan_text, PLAN_CHARS)}\n\n</details>\n\n")
+        + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
+    )
+
+
+def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: dict | None, draft_why: str,
+              opened: list[Checkout], about: str) -> None:
+    if draft_why or layer.trust_level != "automerge":
+        return
+    if approval and approval["sent_by"] == "triage":
+        run.log("automerge left off: triage approved the ticket, so a person merges it")
+        return
+    try:
+        risk = jev.risk(patch_from_base(opened), about, cfg,
+                        trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
+        hold = risk.hold if risk else ""
+    except jev.Unjudged as e:
+        run.log(f"automerge risk: JEV could not judge the diff: {e}")
+        hold = "JEV could not judge the diff"
+    for c in opened:
+        try:
+            if hold:
+                run.log(f"automerge left off on {c.pr}: {hold}")
+                gh.pr_comment(c.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
+                continue
+            try:
+                did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
+            except gh.GhError as e:
+                did, why = "left", f"a GitHub call failed: {str(e).rstrip('.')}"
+            if did == "merged":
+                run.log(f"automerged {c.pr}")
+            elif did == "auto":
+                run.log(f"automerge enabled on {c.pr}")
+            else:
+                run.log(f"automerge left {c.pr} for a person: {why}")
+                gh.pr_comment(c.pr, f"Automerge could not merge this PR: {why}. A person merges it.")
+        except gh.GhError as e:
+            run.log(f"automerge failed on {c.pr}: {e}")
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Checkout], branch: str, summary: str,
@@ -1563,7 +1611,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
     left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""
     name = b.next_step("ci_fix")
-    text = prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=check_list(b.layer),
+    text = prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=b.check_commands,
                   merged_base=merged_base, left_for_a_person=left)
     res = fix(name, text, failures) if fix else b.resume(name, text, json_schema=CI_FIX_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
@@ -1721,7 +1769,7 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         if attempt == tries:
             break
         b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=tries,
-                                                   failures=verified.markdown(), checks=check_list(b.layer)))
+                                                   failures=verified.markdown(), checks=b.check_commands))
         b.recheck("fixing what the check in use found")
     b.run.story.append("Still failing in use after the last attempt.")
     _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, b.expertise, apply=False)
@@ -1823,7 +1871,35 @@ def draft_note(draft_why: str, verified: verify.Verified) -> str:
 
 
 def check_list(layer: config.RepoLayer) -> str:
-    return ", ".join(f"`{c}`" for c in layer.checks.values()) or "(none configured)"
+    return ", ".join(f"`{c}`" for c in layer.checks.values()) or NO_CHECKS
+
+
+def check_calls(commands: list[str]) -> str:
+    return code_list(commands) or NO_CHECKS
+
+
+def check_script(folder: Path, layer: config.RepoLayer, cwd: Path) -> tuple[list[str], list[str]]:
+    if not layer.checks:
+        return [], []
+    script = folder / CHECKS_SCRIPT
+    arms = "".join(f"{shlex.quote(name)}) exec sh -c {shlex.quote(cmd)} ;;\n" for name, cmd in layer.checks.items())
+    usage = shlex.quote(f"usage: {script} NAME, where NAME is one of: {', '.join(layer.checks)}")
+    folder.mkdir(parents=True, exist_ok=True)
+    script.write_text(f"#!/bin/sh\ncd {shlex.quote(str(cwd))} || exit 1\ncase \"${{1-}}\" in\n{arms}"
+                      f"*) echo {usage} >&2\n   exit 2 ;;\nesac\n")
+    script.chmod(0o755)
+    return [shlex.join([str(script), name]) for name in layer.checks], [f"{shlex.quote(str(script))} *"]
+
+
+def cut_at_end(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    room = max(0, limit - len(CUT_MARK))
+    head = text[:room + 1]
+    ends = (head.rfind("\n\n"), max(head.rfind(f"{p}{s}") + 1 for p in ".!?" for s in " \n"), head.rfind(" "))
+    at = next((at for at in ends if room // 2 < at <= room), room)
+    return head[:at].rstrip() + CUT_MARK
 
 
 def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:
@@ -2453,6 +2529,8 @@ def poll(dry_run: bool = False) -> int:
                         state.drop_passed_over(repo.name)
                     continue
                 tid, why = pick
+                if not dry_run:
+                    state.drop_passed_over(repo.name, keep=str(tid))
                 name = tracker.ticket_name(repo.name, tracker.for_ticket(cfg, repo, tid).ref(tid))
                 if waiting := held_back(cfg, repo.name, going, slots):
                     if not dry_run:

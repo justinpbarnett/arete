@@ -133,8 +133,8 @@ class Loop:
         return any(runner.metered(model, self.runner) for model in self.agent_models(cfg))
 
     def usage_hold(self, cfg: config.Config, connect=state.db) -> str:
-        held = next(filter(None, (runner.usage_hold(model, self.runner, connect) for model in self.agent_models(cfg))),
-                    None)
+        held = next(filter(None, (runner.usage_hold(model, self.runner, connect, cfg=cfg)
+                                  for model in self.agent_models(cfg))), None)
         return runner.hold_words(held) if held else ""
 
     def work_repo(self, cfg: config.Config) -> config.Repo:

@@ -64,6 +64,7 @@ class Repo:
 
 STATES = ("running", "pr", "failed", "needs-info")
 DELIVERED = "done"
+RUN_LABELS = (*STATES, DELIVERED)
 TASK_STATES = ("todo", *STATES, DELIVERED, "closed")
 TASK_FINISHED = (DELIVERED, "closed")
 RESEARCH_MOVES = ("running", "pr", "failed", DELIVERED)
@@ -511,7 +512,7 @@ class RepoLayer:
 
     @property
     def builder_bash(self) -> list[str]:
-        return self.allow_bash + list(self.checks.values()) + (self.verify.bash if self.verify else [])
+        return self.allow_bash + (self.verify.bash if self.verify else [])
 
     @property
     def config_file(self) -> Path:
@@ -530,39 +531,43 @@ LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify"
                   "factory", "environment"}
 
 
+def section(data: dict, name: str) -> dict:
+    return table_of(data.get(name, {}), name)
+
+
 def load_layer(layer_dir: Path) -> RepoLayer:
     layer = RepoLayer(dir=layer_dir)
     if not layer.config_file.exists():
         return layer
     data = tomllib.loads(layer.config_file.read_text())
-    setup = data.get("setup", {})
+    setup = section(data, "setup")
     layer.setup = list(setup.get("commands", []))
     layer.copy = list(setup.get("copy", []))
-    layer.checks = dict(data.get("checks", {}))
-    lim = data.get("limits", {})
+    layer.checks = dict(section(data, "checks"))
+    lim = section(data, "limits")
     layer.max_diff_lines = int(lim.get("max_diff_lines", layer.max_diff_lines))
     layer.deny = list(lim.get("deny", []))
     layer.max_attempts = int(lim.get("max_attempts", layer.max_attempts))
     layer.timeout_minutes = int(lim.get("timeout_minutes", layer.timeout_minutes))
-    agent = data.get("agent", {})
+    agent = section(data, "agent")
     layer.allow_bash = list(DEFAULT_ALLOW_BASH) + list(agent.get("allow_bash", []))
-    trust = data.get("trust", {})
+    trust = section(data, "trust")
     layer.trust_level = trust.get("level", "pr")
     layer.automerge_after = int(trust.get("automerge_after", 5))
-    g = data.get("git", {})
+    g = section(data, "git")
     layer.base_branch = g.get("base", "")
     layer.subject = g.get("subject", layer.subject)
     layer.branch = g.get("branch", layer.branch)
-    layer.research_dir = str(data.get("research", {}).get("dir", "")).strip().strip("/")
-    layer.tiers = tier_maps(data.get("tiers") or {}, "tiers")
-    layer.steps = step_tables(data.get("steps") or {}, "steps")
-    layer.kinds = kind_tables(data.get("kinds") or {}, "kinds")
-    layer.factory_path = str((data.get("factory") or {}).get("path", layer.factory_path)).strip()
+    layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")
+    layer.tiers = tier_maps(section(data, "tiers"), "tiers")
+    layer.steps = step_tables(section(data, "steps"), "steps")
+    layer.kinds = kind_tables(section(data, "kinds"), "kinds")
+    layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
-    layer.passes = environment_table(data.get("environment") or {}, layer=True).passes
+    layer.passes = environment_table(section(data, "environment"), layer=True).passes
     if "verify" in data:
-        v = data["verify"]
+        v = section(data, "verify")
         layer.verify = Verify(start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip())

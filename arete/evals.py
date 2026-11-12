@@ -19,7 +19,9 @@ from .pipeline import (
     RunFailed,
     TicketWork,
     bash_rules,
+    check_calls,
     check_list,
+    check_script,
     code_list,
     prompt,
     run_checks,
@@ -263,7 +265,7 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: AgentRun) -> config.R
             (wt / c).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, wt / c)
     for cmd in layer.setup:
-        if environment.sh(cmd, run.cfg or config.load(), repo, cwd=wt, timeout=1200).returncode != 0:
+        if environment.sh(cmd, run.config, repo, cwd=wt, timeout=1200).returncode != 0:
             raise RunFailed(f"setup `{cmd}` failed")
     commit_overlay(wt)
     return layer
@@ -309,7 +311,9 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
         checks = check_list(layer)
         timeout = task.timeout_minutes * 60
-        commands = code_list(layer.builder_bash)
+        check_commands, check_rules = check_script(run_dir, layer, wt)
+        runs_checks = check_calls(check_commands)
+        commands = code_list(layer.builder_bash + check_commands)
         workspace = ("You are in a checkout of its code on branch `main`. It has no `origin` remote, so compare with "
                      "`HEAD`, as in `git diff HEAD`.")
         res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
@@ -324,10 +328,10 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
-        tools = runner.BUILD_TOOLS + bash_rules(layer.builder_bash)
+        tools = runner.BUILD_TOOLS + bash_rules(layer.builder_bash + check_rules)
         res = run.agent("build", prompt("build", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name,
                                          title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
-                                         expertise=expertise, checks=checks, commands=commands,
+                                         expertise=expertise, checks=runs_checks, commands=commands,
                                          max_lines=layer.max_diff_lines, estimate=estimate,
                                          verify=in_use),
                         wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES, timeout=timeout)
@@ -339,7 +343,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         while not ok and attempts < layer.max_attempts:
             attempts += 1
             res = run.agent(f"fix{attempts}", prompt("fix", prompts.dir, attempt=attempts, max_attempts=layer.max_attempts,
-                                                     failures=report),
+                                                     failures=report, checks=runs_checks),
                             wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES,
                             resume=session, timeout=timeout)
             session = res.session

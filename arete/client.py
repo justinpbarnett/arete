@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -12,6 +13,7 @@ from . import config, lines, paths, util
 
 ENV = "ARETE_SERVER"
 CONNECT_SECONDS = 5
+PROBE_SECONDS = 1
 CALL_SECONDS = 120
 RETRY_SECONDS = 2
 RECONNECT_SECONDS = 120
@@ -52,7 +54,13 @@ def server() -> tuple[str, int]:
         raise Down(f"the arete server named in {where} works on {found.get('state')} with {found.get('config')}, "
                    f"not on {mine['state']} with {mine['config']}; set {ENV} to call it anyway")
     addresses = [str(a) for a in found["addresses"]]
-    return next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
+    host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
+    try:
+        socket.create_connection((host, port), timeout=PROBE_SECONDS).close()
+    except OSError as e:
+        raise Down(f"the arete server named in {where} does not answer on {address(host, port)} ({e}); start it "
+                   f"with `arete serve`, or set {ENV}") from None
+    return host, port
 
 
 def address(host: str, port: int) -> str:
