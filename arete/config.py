@@ -153,6 +153,7 @@ class Config:
     session_idle_hours: float = 2
     tiers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     tier_map: str = ""
+    adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
@@ -305,6 +306,10 @@ def load(path: Path | None = None) -> Config:
     )
     cfg.tiers = tier_maps(data.get("tiers") or {}, "tiers")
     cfg.tier_map = str((data.get("factory") or {}).get("tier_map", ""))
+    if (adws := (data.get("factory") or {}).get("adws")) is not None:
+        if not isinstance(adws, str):
+            raise TypeError(f"[factory] adws must be a folder path, not {adws!r}")
+        cfg.adws = path.parent / paths.expand(adws)
     cfg.steps = step_tables(data.get("steps") or {}, "steps")
     cfg.kinds = kind_tables(data.get("kinds") or {}, "kinds")
     serve = data.get("serve", {})

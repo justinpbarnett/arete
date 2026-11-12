@@ -21,6 +21,7 @@ LOCKS_DIR = STATE_DIR / "locks"
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
+ADWS_DIR = PACKAGE_DIR.parent / "adws"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 

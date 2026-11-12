@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -14,6 +15,7 @@ ADW = "adw"
 TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url")
 BUILD = "build"
 REVIEW_FIX = "review_fix"
+ROLE_OF = {"plan": "plan", "implement": BUILD, "revise": BUILD, "verify": "verify", "review": "review", "learn": "learn"}
 
 
 def wanted(repo: config.Repo) -> str:
@@ -29,10 +31,13 @@ def ran_on_seam(run_id: str) -> bool:
                for line in lines.read(run_id))
 
 
-def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.RunSlot | None = None) -> factory.Flow:
+def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.RunSlot | None = None,
+          continues: str = "", only: str = "") -> factory.Flow:
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.tid}"
-    continues = earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"]) else ""
-    return factory.Flow(run.id, continues=continues, ctx=Job(cfg, run, ws, slot=slot))
+    continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
+                              else "")
+    job = Job(cfg, run, ws, slot=slot)
+    return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels)
 
 
 @dataclass
@@ -97,6 +102,12 @@ class Job:
             self.b.restage()
         return self.b
 
+    def labels(self, name: str) -> dict:
+        if name not in ROLE_OF:
+            return {}
+        s = self.run.settings(ROLE_OF[name])
+        return {"runner": s.runner, "model": s.model, "effort": s.effort, "tier": s.tier, "kind": self.run.kind}
+
     def with_left(self, text: str) -> str:
         if not self.left_for_a_person:
             return text
@@ -159,11 +170,13 @@ class Job:
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored:
             opened(run, self.ticket)
-            run.enter("running")
+            if not run.alone:
+                run.enter("running")
 
 
 def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
-    lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=run.repo.name, title=t.title)
+    lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=run.repo.name, title=t.title,
+                **({"path": run.path} if run.path else {}))
     if run.answering:
         lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "")
 
@@ -221,7 +234,8 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                                                                  kind=t.kind, id=t.id, slug=pipeline.slug(t.title))
     if not run.dry_run:
         tk.prepare()
-    run.enter("running")
+    if not run.alone:
+        run.enter("running")
     if repo.parts and not run.dry_run:
         checkouts = pipeline.make_workspace(run.id, repo, main_layer.base_branch, branch, run.tid)[1]
     else:
@@ -605,51 +619,22 @@ def ended(flow: factory.Flow, outcome: Outcome) -> tuple[str, str, str]:
     return finish(flow, **outcome.data)
 
 
-def feature(flow: factory.Flow) -> tuple[str, str, str]:
-    return driven(flow, revising=False)
+def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
+    staged, _, outcome_text = change(flow.ctx)
+    flow.ctx.run.save("diff.patch", staged.patch)
+    return finish(flow, "dry-run", summary=outcome_text)
 
 
-def revise(flow: factory.Flow) -> tuple[str, str, str]:
-    return driven(flow, revising=True)
-
-
-def driven(flow: factory.Flow, revising: bool) -> tuple[str, str, str]:
+def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, str]]) -> tuple[str, str, str]:
     try:
-        return drive(flow, flow.ctx, revising)
+        return drive(flow)
     except pipeline.RunFailed as e:
         return finish(flow, "failed", why=e.why, detail=e.detail)
 
 
-def drive(flow: factory.Flow, job: Job, revising: bool) -> tuple[str, str, str]:
-    ws = str(job.ws)
-    head = [("revise", {"tree": ws})] if revising else [("plan", {}), ("implement", {"tree": ws, "round": BUILD})]
-    for name, kw in [("prepare", {"tree": ws}), *head]:
-        if not (outcome := step(flow, name, **kw)).passed:
-            return ended(flow, outcome)
-    tries = job.run.settings(BUILD).tries
-    attempt, outcome = 1, step(flow, "checks", tree=ws, attempt=1, tries=tries)
-    while not outcome.passed and attempt < tries:
-        attempt += 1
-        step(flow, "implement", tree=ws, round=f"fix{attempt}", feedback=outcome.feedback, attempt=attempt,
-             tries=tries)
-        outcome = step(flow, "checks", tree=ws, attempt=attempt, tries=tries)
-    if not outcome.passed:
-        step(flow, "learn", tree=ws, apply=False)
-        return finish(flow, "failed", why=f"checks still failing after {attempt} attempts")
-    step(flow, "verify", tree=ws)
-    if not (outcome := step(flow, "review")).passed:
-        step(flow, "implement", tree=ws, round=REVIEW_FIX, feedback=outcome.feedback)
-        if not (outcome := step(flow, "checks", tree=ws, after="the review fixes")).passed:
-            return finish(flow, "failed", why="the checks failed after the review fixes", detail=outcome.feedback)
-        step(flow, "verify", tree=ws)
-        step(flow, "review", second=True)
-    step(flow, "learn", tree=ws, apply=True)
-    if job.run.dry_run:
-        staged, _, outcome_text = change(job)
-        job.run.save("diff.patch", staged.patch)
-        return finish(flow, "dry-run", summary=outcome_text)
-    later = [("pr", {"tree": ws}), *([("ci", {"tree": ws})] if job.run.repo.parts else []), ("publish", {})]
-    for name, kw in later:
-        if not (outcome := step(flow, name, **kw)).passed:
-            break
-    return ended(flow, outcome)
+def alone(flow: factory.Flow) -> tuple[str, str, bool]:
+    found = [line for line in factory.ends(lines.read(flow.run_id)) if line.get("step") == flow.only]
+    if not found:
+        return "failed", f"the script never ran {flow.only}", False
+    said = util.first_line(str(found[-1].get("error") or found[-1].get("feedback") or ""), 300)
+    return "step", f"{flow.only} {found[-1]['result']}" + (f": {said}" if said else ""), found[-1]["result"] == "pass"

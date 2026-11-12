@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import inspect
 import json
 import os
 import shutil
@@ -10,7 +12,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import lines, util
+from . import config, lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
@@ -40,6 +42,10 @@ STEPS: dict[str, Callable[..., Outcome]] = {}
 
 
 class Refused(ValueError):
+    pass
+
+
+class OnlyDone(Exception):
     pass
 
 
@@ -166,11 +172,13 @@ def checked(name: str, value) -> Outcome:
 
 
 class Flow:
-    def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None) -> None:
+    def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None,
+                 labels: Callable[[str], dict] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         chained = chain(continues)
         self.run_id, self.continues, self.only, self.ctx = run_id, continues, only, ctx
+        self.labels = labels or (lambda name: {})
         self.earlier = history(chained)
         self.tries = tries_in([lines.read(run_id), *chained])
         self.last_prints = {str(line["tree"]): str(line.get("fingerprint") or "")
@@ -182,7 +190,7 @@ class Flow:
         if name not in STEPS:
             raise KeyError(f"no step {name}")
         if self.done:
-            return Outcome("stop", feedback=f"only {self.only} runs in this flow")
+            raise OnlyDone(f"only {self.only} runs in this flow")
         if self.matching:
             if name != self.only and (found := self.stored(name, kw)):
                 self.skipped += 1
@@ -199,6 +207,9 @@ class Flow:
         line = self.earlier[self.skipped] if self.skipped < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
+        if self.only and line.get("tree") and not os.path.isdir(line["tree"]):
+            raise Refused(f"only {self.only}: run {self.continues} removed its work folder {line['tree']} when it "
+                          f"ended, so a step can run alone only on a run whose folder is kept")
         if not self.only and line.get("tree"):
             now = self.print_of(kw.get("tree") or line["tree"])
             if not now or now != self.last_prints.get(str(line["tree"])):
@@ -224,7 +235,7 @@ class Flow:
 
     def run(self, name: str, args: tuple, kw: dict) -> Outcome:
         n = self.tries[name] = self.tries.get(name, 0) + 1
-        lines.write(self.run_id, "step_start", step=name, **{"try": n})
+        lines.write(self.run_id, "step_start", step=name, **{"try": n}, **self.labels(name))
         calls, started = Calls(self.run_id, name), time.monotonic()
         try:
             outcome = self.call(name, calls, args, kw)
@@ -271,3 +282,65 @@ class Flow:
         steps = {name: {"tries": n, "minutes": round(seconds / 60, 2), "cost_usd": round(cost, 6)}
                  for name, (n, seconds, cost) in tally.items()}
         return lines.write(self.run_id, "report", **{**fields, "status": status, "steps": steps})
+
+
+def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
+    table: dict[str, dict] = {}
+    for item in sets:
+        name, _, rest = item.partition(".")
+        key, eq, value = rest.partition("=")
+        if not (name and key and eq):
+            raise ValueError(f"--set {item}: write step.key=value")
+        table.setdefault(role_of.get(name, name), {})[key] = (
+            int(value) if key in config.STEP_COUNTS and value.isdigit()
+            else [v for v in value.split(",") if v] if key in config.STEP_LISTS else value)
+    return config.step_tables(table, "--set")
+
+
+def main(fn: Callable, argv: list[str] | None = None) -> None:
+    from . import flows, pipeline
+
+    p = argparse.ArgumentParser(description=f"run the {fn.__name__} flow on one ticket")
+    p.add_argument("repo")
+    p.add_argument("ticket", help="an issue number (35), a Jira key (ABC-1234) or a task id (t-1a2b)")
+    p.add_argument("--force", action="store_true", help="run a ticket the approval rules would skip")
+    p.add_argument("--dry-run", action="store_true", help="plan and build locally, no push, PR or tracker writes")
+    p.add_argument("--continue", dest="continues", default="", metavar="RUN",
+                   help="take the passing steps of this earlier run of the ticket")
+    p.add_argument("--only", default="", choices=sorted(STEPS),
+                   help="run this step alone, the steps before it from the stored outcomes")
+    p.add_argument("--set", dest="sets", action="append", default=[], metavar="STEP.KEY=VALUE",
+                   help="override one setting of one step; repeat for more")
+    args = p.parse_args(argv)
+    try:
+        table = overrides(args.sets, flows.ROLE_OF)
+    except (ValueError, TypeError) as e:
+        p.error(str(e))
+    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table)
+    try:
+        code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
+    except config.UnknownRepo as e:
+        raise SystemExit(str(e)) from None
+    raise SystemExit(code)
+
+
+def earlier(argv: list[str]) -> tuple[Callable, list[str]]:
+    from . import flows, pipeline
+
+    p = argparse.ArgumentParser(description="run one step of an earlier run alone, on the script that run used")
+    p.add_argument("run")
+    p.add_argument("step", choices=sorted(STEPS))
+    p.add_argument("settings", nargs="*", metavar="KEY=VALUE", help="override one setting of the step")
+    args = p.parse_args(argv)
+    if not (row := state.run_get(args.run)):
+        raise SystemExit(f"no run {args.run}")
+    if not (path := str(first(lines.read(args.run), "task").get("path") or "")):
+        raise SystemExit(f"run {args.run} did not run from a script in adws/; use arete run")
+    if args.settings and args.step not in flows.ROLE_OF:
+        p.error(f"{args.step} calls no agent, so it takes no settings")
+    try:
+        fn = pipeline.flow_function(config.load(), path)
+    except (FileNotFoundError, AttributeError) as e:
+        raise SystemExit(str(e)) from None
+    return fn, [row["repo"], str(row["issue"]), "--continue", args.run, "--only", args.step,
+                *(f"--set={args.step}.{s}" for s in args.settings)]
