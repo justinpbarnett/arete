@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS runs (
     repo TEXT,
     issue INTEGER,
     status TEXT NOT NULL,          -- running | pr | needs-info | skipped | noop | dry-run | failed | interrupted
-                                   -- | superseded | merged | rejected | done | stopped
+                                   -- | superseded | merged | rejected | done | stopped | step
     started TEXT NOT NULL,
     finished TEXT,
     attempts INTEGER DEFAULT 0,
@@ -923,9 +923,9 @@ def take_passed_over(repo: str, issue: str) -> str:
     return r["since"] if r else ""
 
 
-def drop_passed_over(repo: str) -> None:
+def drop_passed_over(repo: str, keep: str = "") -> None:
     with db() as c:
-        c.execute("DELETE FROM passed_over WHERE repo = ?", (repo,))
+        c.execute("DELETE FROM passed_over WHERE repo = ? AND issue != ?", (repo, str(keep)))
 
 
 def runs_marked_running(connect=db) -> list[dict]:

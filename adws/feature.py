@@ -3,9 +3,13 @@ from arete.flows import BUILD, REVIEW_FIX, end_dry_run, ended, finish, step
 
 
 def feature(flow):
+    return built(flow, [("plan", {}), ("implement", {"tree": str(flow.ctx.ws), "round": BUILD})])
+
+
+def built(flow, first):
     job = flow.ctx
     ws = str(job.ws)
-    for name, kw in [("prepare", {"tree": ws}), ("plan", {}), ("implement", {"tree": ws, "round": BUILD})]:
+    for name, kw in [("prepare", {"tree": ws}), *first]:
         if not (outcome := step(flow, name, **kw)).passed:
             return ended(flow, outcome)
     tries = job.run.settings(BUILD).tries

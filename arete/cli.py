@@ -9,6 +9,7 @@ import sys
 import textwrap
 from collections import Counter
 from collections.abc import Iterable
+from typing import NoReturn
 
 from . import __version__, config, paths
 
@@ -351,7 +352,7 @@ def run_followed(started: dict) -> int:
 
     client.emit(started)
     if not (run_id := started.get("run")):
-        return 1
+        return 0 if started.get("state") == "queued" else 1
     try:
         for line in client.followed(run_id):
             client.emit(line)
@@ -363,20 +364,26 @@ def run_followed(started: dict) -> int:
     return 1
 
 
-def task_shown(task_id: str, repo: str) -> int:
+def task_shown(task_id: str, repo: str, one_line: bool) -> int:
     from urllib.parse import quote
 
     from . import client
 
+    def show(found: dict) -> None:
+        if one_line:
+            client.emit(found)
+        else:
+            print(json.dumps(found, ensure_ascii=False, default=str, indent=2), flush=True)
+
     try:
-        client.emit(client.call("GET", f"/api/tasks/{quote(task_id, safe='')}"
-                                + (f"?repo={quote(repo, safe='')}" if repo else "")))
+        show(client.call("GET", f"/api/tasks/{quote(task_id, safe='')}"
+                         + (f"?repo={quote(repo, safe='')}" if repo else "")))
         return 0
     except client.Down:
         from . import control, gh, jira, tasks
 
         try:
-            client.emit(tasks.view(task_id, repo))
+            show(tasks.view(task_id, repo))
         except (control.NotFound, control.Refused, gh.GhError, jira.JiraError) as e:
             client.emit({"error": str(e)})
             return 1
@@ -392,7 +399,7 @@ def cmd_task(args) -> int:
     if args.action == "run":
         return client.say("POST", "/api/tasks", {"repo": args.repo, "ticket": args.ticket})
     if args.action == "show":
-        return client.steered(lambda: task_shown(args.id, args.repo))
+        return client.steered(lambda: task_shown(args.id, args.repo, args.json))
     if args.action == "add":
         body = " ".join(args.body).strip()
         if not body:
@@ -1064,17 +1071,38 @@ def cmd_session_args(args) -> int:
     return cmd_session(args)
 
 
+class Parser(argparse.ArgumentParser):
+    json_errors = False
+
+    def parse_known_args(self, args=None, namespace=None):
+        found, extra = super().parse_known_args(args, namespace)
+        if self.json_errors and extra:
+            self.error(f"unrecognized arguments: {' '.join(extra)}")
+        return found, extra
+
+    def error(self, message: str) -> NoReturn:
+        if not self.json_errors:
+            super().error(message)
+        print(json.dumps({"error": message, "usage": self.format_usage().strip()}), flush=True)
+        sys.exit(1)
+
+
+def steering(p: Parser) -> Parser:
+    p.json_errors = True
+    return p
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"arete {__version__}")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
 
     p = sub.add_parser("init", help="write the default global config")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
 
-    p = sub.add_parser("status", help="settings, heartbeat, alerts, recent runs; with --json, the live runs or one "
-                                      "run's steps as JSON lines")
+    p = steering(sub.add_parser("status", help="settings, heartbeat, alerts, recent runs; with --json, the live runs "
+                                               "or one run's steps as JSON lines"))
     p.add_argument("run_id", nargs="?", default="", help="with --json: this run's steps, then its report")
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
@@ -1174,15 +1202,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.set_defaults(fn=cmd_webhook)
 
-    p = sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop; with --by, every step "
-                                     "by step, task kind or model, and the wait minutes by cause")
+    p = steering(sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop; with --by, "
+                                              "every step by step, task kind or model, and the wait minutes by cause"))
     p.add_argument("--days", type=float, default=None)
     p.add_argument("--by", nargs="+", choices=("step", "kind", "model"), help="one grouping or several, in order")
     p.add_argument("--json", action="store_true", help="one JSON line per group, then one with the wait minutes")
     p.set_defaults(fn=cmd_costs)
 
-    p = sub.add_parser("steps", help="the model, runner, effort, timeout, tries, tools, mcp servers, instructions and "
-                                     "session each step resolves to, one JSON line per step")
+    p = steering(sub.add_parser("steps", help="the model, runner, effort, timeout, tries, tools, mcp servers, "
+                                              "instructions and session each step resolves to, one JSON line per step"))
     p.add_argument("--repo", default="", help="read this repo's layer too")
     p.add_argument("--kind", default="", choices=config.KINDS, help="resolve for this kind of ticket")
     p.set_defaults(fn=cmd_steps)
@@ -1194,8 +1222,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.set_defaults(fn=cmd_record)
 
-    p = sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, questions, "
-                                     "errors and the report")
+    p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
+                                              "questions, errors and the report"))
     p.add_argument("run_id")
     p.add_argument("-f", "--follow", action="store_true", help="keep printing new lines until the report line")
     p.add_argument("--from", dest="start", type=int, default=0, metavar="SEQ",
@@ -1203,29 +1231,30 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--step", default="", help="print only this step's lines")
     p.set_defaults(fn=cmd_lines)
 
-    p = sub.add_parser("wait", help="follow a run through the server, printing its step_end, question, error and "
-                                    "report lines, until the report or a question")
+    p = steering(sub.add_parser("wait", help="follow a run through the server, printing its step_end, question, "
+                                             "error and report lines, until the report or a question"))
     p.add_argument("run_id")
     p.set_defaults(fn=cmd_wait)
 
-    p = sub.add_parser("answer", help="answer the question of a run that ended needs-info, through the server, which "
-                                      "starts the next run")
+    p = steering(sub.add_parser("answer", help="answer the question of a run that ended needs-info, through the "
+                                               "server, which starts the next run"))
     p.add_argument("run_id")
     p.add_argument("text", nargs="+")
     p.set_defaults(fn=cmd_answer)
 
-    p = sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the server")
+    p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
+                                               "server"))
     p.add_argument("run_id")
     p.add_argument("--step", default="", help="run this step and every step after it again")
     p.set_defaults(fn=cmd_resume)
 
-    p = sub.add_parser("step", help="run one step of a run that ended alone, through the server")
+    p = steering(sub.add_parser("step", help="run one step of a run that ended alone, through the server"))
     p.add_argument("run_id")
     p.add_argument("step")
     p.add_argument("sets", nargs="*", metavar="KEY=VALUE", help="override one of the step's settings")
     p.set_defaults(fn=cmd_step)
 
-    p = sub.add_parser("stop", help="stop a running run, through the server")
+    p = steering(sub.add_parser("stop", help="stop a running run, through the server"))
     p.add_argument("run_id")
     p.set_defaults(fn=cmd_stop)
 
@@ -1247,7 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("task", help="local tasks, which have no tracker issue: add, list, show, reply to and close them; "
                                     "start one from a prompt or a ticket through the server")
-    tsub = p.add_subparsers(dest="action", required=True)
+    tsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
     t = tsub.add_parser("add", help="add a task to a repo and print its id")
     t.add_argument("--repo", required=True, help="a repo name from the config")
     t.add_argument("--title", default="", help="the body's first line by default")
@@ -1256,20 +1285,23 @@ def main(argv: list[str] | None = None) -> int:
     t = tsub.add_parser("list", help="one JSON line per task, oldest first")
     t.add_argument("--repo", default="")
     t.add_argument("--state", default="", choices=config.TASK_STATES)
-    t = tsub.add_parser("show", help="a task or a tracker item with its runs and children, as one JSON line")
+    t = steering(tsub.add_parser("show", help="a task or a tracker item with its runs and children, as indented JSON"))
     t.add_argument("id")
     t.add_argument("--repo", default="", help="the repo of a tracker item no run names yet")
+    t.add_argument("--json", action="store_true", help="print it as one JSON line")
     t = tsub.add_parser("reply", help="answer a task's question as its owner")
     t.add_argument("id")
     t.add_argument("text", nargs="+")
     t = tsub.add_parser("close", help="close a task")
     t.add_argument("id")
-    t = tsub.add_parser("start", help="add a task from a prompt and start it through the server; one JSON line")
+    t = steering(tsub.add_parser("start", help="add a task from a prompt and start it through the server; one JSON "
+                                               "line"))
     t.add_argument("--repo", required=True, help="a repo name from the config")
     t.add_argument("--kind", default="feat", choices=config.KINDS)
     t.add_argument("--title", default="", help="the prompt's first line by default")
     t.add_argument("prompt", nargs="+", help="what to do")
-    t = tsub.add_parser("run", help="start a tracker item or a task through the server, past its waits; one JSON line")
+    t = steering(tsub.add_parser("run", help="start a tracker item or a task through the server, past its waits; one "
+                                             "JSON line"))
     t.add_argument("repo")
     t.add_argument("ticket", help="an issue number, a Jira key or a task id")
     p.set_defaults(fn=cmd_task)

@@ -210,6 +210,8 @@ def fleet() -> list[dict]:
 
 def cost_window(days: float | None) -> tuple[float, str]:
     days = COST_DAYS if days is None else days
+    if days < 0:
+        raise Refused("--days must be 0 or more")
     try:
         return days, util.iso(util.now() - timedelta(days=days))
     except (OverflowError, ValueError) as e:

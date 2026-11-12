@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -9,10 +8,8 @@ from pathlib import Path
 from . import (
     config,
     diffguard,
-    environment,
     factory,
     gh,
-    jev,
     lines,
     paths,
     pipeline,
@@ -52,7 +49,49 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     job = Job(cfg, run, ws, slot=slot)
-    return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again)
+    return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
+                        restore=lambda line: restore(job, line))
+
+
+def remade(line: dict) -> tuple[str, list[pipeline.Checkout], str]:
+    data = line.get("data") if isinstance(line.get("data"), dict) else {}
+    branch, listed = str(data.get("branch") or ""), data.get("checkouts")
+    if line.get("step") != "prepare" or not branch or not isinstance(listed, list):
+        return branch, [], "only the folder of a prepare step can be made again"
+    made = [pipeline.Checkout(**{**c, "src": Path(c["src"]), "wt": Path(c["wt"])}) for c in listed]
+    try:
+        for c in made:
+            c.lease = pipeline.remote_head(c.src, branch)
+            if c.lease:
+                continue
+            if not c.revision:
+                return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
+                                      "and no starting revision was recorded")
+            local = util.git(["rev-parse", "--verify", f"refs/heads/{branch}"], c.src, check=False).strip()
+            if c.resumes or c.pr or local != c.revision:
+                return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
+                                      "and it was not left unchanged")
+    except RuntimeError as e:
+        return branch, made, f"arete could not look for its branch {branch} on origin: {e}"
+    return branch, made, ""
+
+
+def restore(job: Job, line: dict) -> str:
+    branch, made, why = remade(line)
+    if why:
+        return why
+    ws = Path(line["tree"])
+    try:
+        pipeline.remove_workspace(ws, made)
+        for c in made:
+            if c.lease:
+                pipeline.fetch(c.src, branch)
+            pipeline.add_worktree(c, branch, f"origin/{branch}" if c.lease else c.revision)
+            job.restored[str(c.wt)] = util.git(["rev-parse", "HEAD"], c.wt).strip() if c.lease else ""
+    except RuntimeError as e:
+        return f"arete could not make it again from origin/{branch}: {e}"
+    job.run.log(f"made {ws} again from origin/{branch}")
+    return pipeline.furnish(job.cfg, job.run, pipeline.checked_layer(job.cfg, Path(line["data"]["layer"])), ws)
 
 
 def facts(name: str, data: dict) -> dict:
@@ -104,6 +143,9 @@ class Job:
     pushed: list[str] = field(default_factory=list)
     changed: list[str] = field(default_factory=list)
     ci_result: str = ""
+    check_commands: list[str] = field(default_factory=list)
+    check_rules: list[str] = field(default_factory=list)
+    restored: dict[str, str] = field(default_factory=dict)
 
     @property
     def with_prs(self) -> list[pipeline.Checkout]:
@@ -114,7 +156,15 @@ class Job:
 
     @property
     def builder_bash(self) -> list[str]:
-        return self.layer.builder_bash + pipeline.git_reads(self.checkouts)
+        return self.layer.builder_bash + pipeline.git_reads(self.checkouts) + self.check_rules
+
+    @property
+    def commands(self) -> str:
+        return pipeline.code_list(self.layer.builder_bash + pipeline.git_reads(self.checkouts) + self.check_commands)
+
+    @property
+    def checks(self) -> str:
+        return pipeline.check_calls(self.check_commands)
 
     @property
     def workspace(self) -> str:
@@ -127,7 +177,8 @@ class Job:
                 cfg=self.cfg, run=self.run, ticket=self.ticket, ws=self.ws, checkouts=self.checkouts, layer=self.layer,
                 timeout=self.layer.timeout_minutes * 60, workspace=self.workspace, attachments=self.attachments,
                 tools=pipeline.bash_rules(self.builder_bash), deny=diffguard.denied_paths(self.layer),
-                expertise=self.expertise, left_for_a_person=self.left_for_a_person)
+                expertise=self.expertise, left_for_a_person=self.left_for_a_person, check_commands=self.checks,
+                from_base=self.run.alone)
         return self.built
 
     def staged(self) -> pipeline.Build:
@@ -201,7 +252,11 @@ class Job:
         self.expertise, self.approval = data["expertise"], data.get("approval")
         self.checkouts = [pipeline.Checkout(**{**c, "src": Path(c["src"]), "wt": Path(c["wt"])})
                           for c in data["checkouts"]]
+        for c in self.checkouts:
+            if str(c.wt) in self.restored:
+                c.lease = self.restored[str(c.wt)]
         self.layer = pipeline.checked_layer(self.cfg, Path(data["layer"]))
+        self.check_commands, self.check_rules = pipeline.check_script(run.dir, self.layer, self.ws)
         run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored:
@@ -281,19 +336,11 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
     for c in pipeline.merge_moved_bases(run, [c for c in checkouts if c.resumes]):
         c.merged_base = True
+    for c in checkouts:
+        c.revision = util.git(["rev-parse", "HEAD"], c.wt).strip()
     layer = pipeline.resolve_layer(cfg, run, job.ws)
-    for rel in layer.copy:
-        if (src := repo.path / rel).exists():
-            (dest := job.ws / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
-    for cmd in layer.setup:
-        with record.timed(run.id, "setup", command=cmd) as setup:
-            res = environment.sh(cmd, cfg, repo, cwd=job.ws, timeout=1200)
-            setup["exit"] = res.returncode
-        run.log(f"setup `{cmd}`: exit {res.returncode}")
-        if res.returncode != 0:
-            run.save("setup.log", res.stdout + res.stderr)
-            return end_as("fail", "failed", why=f"setup command `{cmd}` failed")
+    if why := pipeline.furnish(cfg, run, layer, job.ws):
+        return end_as("fail", "failed", why=why)
     approval = state.triage_approval(t.ref if repo.tracker == "jira" else tracker.ticket_name(repo.name, t.ref))
     return Outcome("pass", data={
         "ticket": {k: getattr(t, k) for k in TICKET_FIELDS}, "branch": branch,
@@ -312,7 +359,7 @@ def plan(flow: factory.Flow) -> Outcome:
     res = run.agent("plan", pipeline.prompt("plan", repo=run.repo.name, workspace=job.workspace, ref=t.ref,
                                             title=t.title, body=t.body, comments=t.comments,
                                             attachments=job.attachments, triage=job.triage, expertise=job.expertise,
-                                            commands=pipeline.code_list(job.builder_bash),
+                                            commands=job.commands,
                                             denied=pipeline.code_list(diffguard.denied_paths(layer)),
                                             max_lines=limit, checks=pipeline.check_list(layer)),
                     job.ws, role="plan", allowed_tools=pipeline.bash_rules(config.DEFAULT_ALLOW_BASH + reads),
@@ -352,8 +399,7 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     res = run.agent("revise", pipeline.prompt("revise", repo=run.repo.name, workspace=job.workspace, ref=t.ref,
                                               title=t.title, body=t.body, comments=t.comments,
                                               attachments=job.attachments, feedback=feedback, expertise=job.expertise,
-                                              checks=pipeline.check_list(layer),
-                                              commands=pipeline.code_list(job.builder_bash),
+                                              checks=job.checks, commands=job.commands,
                                               max_lines=layer.max_diff_lines),
                     job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
                     disallowed_tools=runner.NO_GIT_WRITES, json_schema=pipeline.REVISE_SCHEMA)
@@ -382,7 +428,8 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
     if round == REVIEW_FIX:
         res = job.b.resume(REVIEW_FIX, pipeline.prompt(REVIEW_FIX, problems=feedback))
     elif round != BUILD:
-        res = job.b.resume(round, pipeline.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback))
+        res = job.b.resume(round, pipeline.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
+                                                  checks=job.b.check_commands))
     else:
         return build(job)
     return Outcome("pass" if res.ok else "fail", data={"round": round},
@@ -394,8 +441,7 @@ def build(job: Job) -> Outcome:
     res = run.agent(BUILD, pipeline.prompt(BUILD, repo=run.repo.name, workspace=job.workspace, ref=t.ref,
                                            title=t.title, body=t.body, comments=t.comments,
                                            attachments=job.attachments, plan=job.plan_text, expertise=job.expertise,
-                                           checks=pipeline.check_list(layer),
-                                           commands=pipeline.code_list(job.builder_bash),
+                                           checks=job.checks, commands=job.commands,
                                            max_lines=layer.max_diff_lines, estimate=job.estimate, verify=job.goal),
                     job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
                     disallowed_tools=runner.NO_GIT_WRITES)
@@ -458,8 +504,8 @@ def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
     return Outcome("pass", data={"applied": apply})
 
 
-def change(job: Job) -> tuple[pipeline.Staged, str, str]:
-    staged = job.b.restage()
+def change(job: Job, staged: pipeline.Staged | None = None) -> tuple[pipeline.Staged, str, str]:
+    staged = job.b.restage() if staged is None else staged
     if not staged.files:
         raise pipeline.RunFailed("nothing was left to push, since the workspace holds no change")
     size = f"{len(staged.files)} files, {staged.lines} lines"
@@ -470,35 +516,49 @@ def change(job: Job) -> tuple[pipeline.Staged, str, str]:
 def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     b, run, t, tk = job.b, job.run, job.ticket, job.run.tracker
-    staged, size, outcome = change(job)
+    opened: list[pipeline.Checkout] = []
+    for c in job.checkouts if run.repo.parts else []:
+        if not c.pr and (found := gh.open_pr_url(c.github, job.branch)):
+            c.pr = found
+            opened.append(c)
+            run.log(f"found open {c.pr}, opened by an earlier try of this step")
+    fresh = b.restage(from_base=False)
+    staged = b.restage(from_base=True) if not fresh.files or b.from_base else fresh
+    staged, size, outcome = change(job, staged)
+    if not fresh.files:
+        for c in staged.changed:
+            head = util.git(["rev-parse", "HEAD"], c.wt).strip()
+            if pipeline.remote_head(c.src, job.branch) != head:
+                raise pipeline.RunFailed(f"nothing was left to push in {c.github}, and its checkout of "
+                                         f"{job.branch} does not match origin")
+            c.lease = head
+        b.committed_lines = max(b.committed_lines, staged.lines)
     subject = pipeline.fill_template(job.layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
+    draft_why = pipeline.draft_reason(job.review.get("verdict") == "approve", job.verified)
+    revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
+    if fresh.files:
+        b.staged = fresh
+        b.push(job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}")
+        b.staged = staged
     if not run.repo.parts:
-        b.push(job.branch, f"{tracker.with_ref(subject, t.ref)}\n\nArete-Run: {run.id}")
         record.note(run.id, branch=job.branch)
+        if draft_why:
+            return end_as("fail", "failed",
+                          why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return Outcome("pass", data={"summary": outcome, "prs": {}, "opened": [], "pushed": [], "draft_why": "",
                                      "changed": [c.github for c in staged.changed], "report_body": "",
                                      "committed_lines": b.committed_lines})
-    draft_why = pipeline.draft_reason(job.review.get("verdict") == "approve", job.verified)
-    review, problems, left = job.review, job.review.get("problems", []), job.left_for_a_person
-    checks = pipeline.check_list(job.layer)
+    left = job.left_for_a_person
     images = pipeline.evidence_images(run, staged.changed[0], job.verified)
-    report_body = (
-        f"## Summary\n\n{job.build_summary.strip()[:3000]}\n\n"
-        + ("" if run.feedback else pipeline.triage_block(job.approval))
-        + pipeline.left_block(left)
-        + f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown(images)}\n\n"
-        f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
-        + ("".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems) if problems else "")
-        + f"\n\n## Checks\n\nAll passed after {util.count(job.attempts, 'attempt')}: {checks}\n\n"
-        + ("" if run.feedback else f"<details><summary>Plan</summary>\n\n{job.plan_text[:6000]}\n\n</details>\n\n")
-        + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
-    )
-    revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
+    report_body = pipeline.report_body(run, summary=job.build_summary, review=job.review, verified=job.verified,
+                                       left=left, images=images, approval=job.approval, attempts=job.attempts,
+                                       checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size)
     link = tk.pr_link(t, whole=not left)
-    b.push(job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}")
-    opened: list[pipeline.Checkout] = []
+    opened = [c for c in opened if c in staged.changed]
     for c in staged.changed:
-        if not c.pr:
+        if c in opened:
+            gh.pr_edit_body(c.pr, f"{link}\n\n{report_body}")
+        elif not c.pr:
             c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), f"{link}\n\n{report_body}",
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
             opened.append(c)
@@ -531,6 +591,7 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
 def watch(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     run = job.run
+    job.b.from_base = False
 
     def fix(name: str, text: str, failures: str) -> Result:
         done = step(flow, "implement", tree=tree, round=name, feedback=failures, asks=text)
@@ -566,43 +627,9 @@ def publish(flow: factory.Flow) -> Outcome:
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {job.ci_result}."
                 + ("" if not opened else pipeline.draft_note(job.draft_why, job.verified)))
-    automerge(job, opened)
+    pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, opened,
+                       f"{job.ticket.title}\n\n{job.build_summary.strip()[:3000]}")
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
-
-
-def automerge(job: Job, opened: list[pipeline.Checkout]) -> None:
-    run, t, cfg = job.run, job.ticket, job.cfg
-    if job.draft_why or job.layer.trust_level != "automerge":
-        return
-    if job.approval and job.approval["sent_by"] == "triage":
-        run.log("automerge left off: triage approved the ticket, so a person merges it")
-        return
-    try:
-        risk = jev.risk(pipeline.patch_from_base(opened), f"{t.title}\n\n{job.build_summary.strip()[:3000]}", cfg,
-                        trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
-        hold = risk.hold if risk else ""
-    except jev.Unjudged as e:
-        run.log(f"automerge risk: JEV could not judge the diff: {e}")
-        hold = "JEV could not judge the diff"
-    for c in opened:
-        try:
-            if hold:
-                run.log(f"automerge left off on {c.pr}: {hold}")
-                gh.pr_comment(c.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
-                continue
-            try:
-                did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
-            except gh.GhError as e:
-                did, why = "left", f"a GitHub call failed: {str(e).rstrip('.')}"
-            if did == "merged":
-                run.log(f"automerged {c.pr}")
-            elif did == "auto":
-                run.log(f"automerge enabled on {c.pr}")
-            else:
-                run.log(f"automerge left {c.pr} for a person: {why}")
-                gh.pr_comment(c.pr, f"Automerge could not merge this PR: {why}. A person merges it.")
-        except gh.GhError as e:
-            run.log(f"automerge failed on {c.pr}: {e}")
 
 
 @factory.step("respond")
@@ -635,7 +662,7 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
 def done_comment(job: Job, summary: str) -> str:
     said = job.review
     problems = "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in said.get("problems", []))
-    return (f"Done: {summary}.\n\n## Summary\n\n{job.build_summary.strip()[:3000]}\n\n"
+    return (f"Done: {summary}.\n\n## Summary\n\n{pipeline.summary_of(said, job.build_summary)}\n\n"
             f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown()}\n\n"
             f"## Review\n\n**{said.get('verdict', 'none')}**: {said.get('summary', '')}\n{problems}\n\n"
             f"Run `{job.run.id}`, {util.paid_note(record.metered_spent(job.run.id))}.")

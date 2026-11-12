@@ -17,6 +17,7 @@ FOLLOW_POLL_SECONDS = 0.2
 END = "report"
 FIXED = ("ts", "run", "seq", "event")
 WAIT_CAUSES = ("limit", "ci", "slot", "person")
+TAIL_BYTES = 4096
 
 _writing = threading.Lock()
 
@@ -42,6 +43,21 @@ def seq_of(line: dict) -> int:
     return seq if type(seq) is int else 0
 
 
+def tail(f) -> tuple[int, bool]:
+    end = f.seek(0, 2)
+    f.seek(max(0, end - 1))
+    torn, size = bool(end) and f.read(1) != b"\n", TAIL_BYTES
+    while True:
+        start = max(0, end - size)
+        f.seek(start)
+        data = f.read(end - start)
+        if start:
+            data = data[data.find(b"\n") + 1:]
+        if (seq := next((seq_of(line) for line in reversed(whole(data)) if seq_of(line)), 0)) or not start:
+            return seq, torn
+        size *= 2
+
+
 def write(run_id: str, event: str, **fields) -> dict:
     line = {"ts": util.iso(), "run": run_id, "seq": 0, "event": event,
             **{k: v for k, v in fields.items() if k not in FIXED}}
@@ -50,11 +66,10 @@ def write(run_id: str, event: str, **fields) -> dict:
         target.parent.mkdir(parents=True, exist_ok=True)
         with _writing, open(target, "a+b") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            data = f.read()
-            line["ts"], line["seq"] = util.iso(), 1 + max(map(seq_of, whole(data)), default=0)
+            seq, torn = tail(f)
+            line["ts"], line["seq"] = util.iso(), seq + 1
             text = json.dumps(line, ensure_ascii=False, default=str)
-            f.write((b"\n" if data and not data.endswith(b"\n") else b"") + text.encode() + b"\n")
+            f.write((b"\n" if torn else b"") + text.encode() + b"\n")
             f.flush()
     except OSError as e:
         text = json.dumps(line, ensure_ascii=False, default=str)
@@ -100,6 +115,12 @@ def last_step(run_id: str) -> str:
                 "")
 
 
+def ended_in_error(run_id: str, reply: str = "") -> bool:
+    last = next((line for line in reversed(read(run_id)) if line.get("event") in ("error", "step_start")
+                 and not (reply and line.get("event") == "step_start" and line.get("step") == reply)), {})
+    return last.get("event") == "error"
+
+
 def wait_start(run_id: str, cause: str, at: str) -> None:
     write(run_id, "wait", cause=cause, phase="start", at=at)
 
@@ -125,12 +146,12 @@ def waiting(run_id: str, cause: str):
 
 
 def wait_minutes(run_id: str) -> dict:
-    found = dict.fromkeys(WAIT_CAUSES, 0.0)
+    found: dict[str, float] = {}
     for line in read(run_id):
         minutes = line.get("minutes")
-        if (line.get("event") == "wait" and line.get("phase") == "end" and line.get("cause") in found
+        if (line.get("event") == "wait" and line.get("phase") == "end" and line.get("cause") in WAIT_CAUSES
                 and type(minutes) in (int, float)):
-            found[line["cause"]] += minutes
+            found[line["cause"]] = found.get(line["cause"], 0.0) + minutes
     return {cause: round(minutes, 2) for cause, minutes in found.items()}
 
 

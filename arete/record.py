@@ -65,8 +65,8 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
 
 def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "") -> None:
     with state.db() as c:
-        c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out, turns,"
-                  " seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+        c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                  " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
                   " api_seconds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
                   "(SELECT COUNT(*) + 1 FROM steps WHERE run_id = ? AND step = ?),?,?,?,?)",
                   (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
@@ -158,7 +158,8 @@ def interrupt(row: dict, notes: Sequence[str] = ()) -> dict | None:
 def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> list[dict]:
     settled = []
     for row in state.runs_marked_running():
-        if (row["kind"] in TICKET_KINDS) != tickets or (util.now() - util.parse_iso(row["started"])).total_seconds() < SETTLE_GRACE_SECONDS:
+        if ((row["kind"] in TICKET_KINDS) != tickets
+                or (util.now() - util.parse_iso(row["started"])).total_seconds() < SETTLE_GRACE_SECONDS):
             continue
         with dead(row) as gone:
             if gone and (done := interrupt(row)):
@@ -350,8 +351,8 @@ class Recorder:
     def finish(self, res: agent.Result, seconds: float) -> None:
         self.end({"ok": res.ok, "error": res.error, "text": res.text, "structured": res.structured,
                   "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
-                  "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model, "provider": res.provider, "session": res.session.id,
-                  "seconds": round(seconds, 1)})
+                  "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model,
+                  "provider": res.provider, "session": res.session.id, "seconds": round(seconds, 1)})
 
     def end(self, result: dict) -> None:
         if self.ended:
@@ -515,8 +516,8 @@ def claude_reader(header: dict) -> Callable[[dict], list[dict]]:
             for b in blocks(message.get("content")):
                 if b.get("type") == "tool_result":
                     out.append({"kind": "tool_result", "id": b.get("tool_use_id", ""),
-                                "name": tool_names.get(b.get("tool_use_id", ""), ""), "text": block_text(b.get("content")),
-                                "error": bool(b.get("is_error"))})
+                                "name": tool_names.get(b.get("tool_use_id", ""), ""),
+                                "text": block_text(b.get("content")), "error": bool(b.get("is_error"))})
                 elif b.get("type") == "text":
                     out.append({"kind": "message", "role": "user", "text": b.get("text", "")})
         elif e.get("type") == "result":
@@ -551,8 +552,10 @@ def read_pi(e: dict) -> list[dict]:
                         "input": b.get("arguments")})
     if isinstance(usage := message.get("usage"), dict):
         totals, provider = agent.usage_totals([usage]), message.get("provider", "")
-        out.append({"kind": "usage", "model": f"{provider}/{message.get('model')}" if provider else message.get("model", ""),
-                    "tokens_in": totals["tokens_in"], "tokens_out": totals["tokens_out"], "cost_usd": totals["cost_usd"]})
+        out.append({"kind": "usage",
+                    "model": f"{provider}/{message.get('model')}" if provider else message.get("model", ""),
+                    "tokens_in": totals["tokens_in"], "tokens_out": totals["tokens_out"],
+                    "cost_usd": totals["cost_usd"]})
     return out
 
 

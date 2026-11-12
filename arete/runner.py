@@ -18,7 +18,7 @@ from .agent import (
     Session,
 )
 
-REPLAY = "replay"
+REPLAY = replay.RUNNER
 RUNNERS = ("claude", "pi", REPLAY)
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
 SECRET_SEARCH_DEPTH = 4
@@ -88,9 +88,9 @@ def limit_applies(scope: str, model: str) -> bool:
     return scope == claude.EVERY_MODEL or scope in model.lower()
 
 
-def usage_hold(model: str, run_with: str = "", connect=state.db) -> dict | None:
+def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None) -> dict | None:
     which, name = route(model, run_with)
-    if which != "claude":
+    if which != "claude" or (cfg and cfg.replay.all):
         return None
     return next((h for h in reversed(state.holds(connect)) if limit_applies(h["scope"], name)), None)
 
@@ -200,7 +200,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             kw["providers"] = cfg.environment.providers
     limited: list[Result] = []
     while True:
-        if wait_out_limits and (held := usage_hold(name, which)):
+        if wait_out_limits and (held := usage_hold(name, which, cfg=cfg)):
             say(hold_words(held))
             with waits("limit"):
                 wait_out(held["scope"])

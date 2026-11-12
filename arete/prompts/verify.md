@@ -43,6 +43,10 @@ $notes
 - Do what the user does: the commands they type, the requests their clients send, the clicks they make. Read
   the real output, not the code that makes it.
 - Shell commands you may run: $commands. Others are refused.
+- Arete's guard stops a command it reads as showing a credential or as harm git cannot undo. When a command needs a
+  key or token you were not given, give it a value that starts `arete-placeholder`, such as
+  `API_KEY=arete-placeholder-1 <command>`, so it carries no credential. A request to localhost, 127.0.0.1 or [::1]
+  reaches the product you started, not an outside service, so the guard counts it as reversible.
 - A step you could not do is not a failed check. Leave it out of `checks`. When the step is essential to know
   whether the change works, return `blocked` and name the step and what stopped you in `blocked_by`.
 - Do not edit files and do not fix what you find. Arete gives your findings to the builder.

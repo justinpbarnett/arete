@@ -13,6 +13,7 @@ START_LOCK = "task-start"
 STEER_LOCK = "task-steer"
 POLLER_LATER = "the poller starts it when a slot frees"
 RESUMABLE = ("interrupted", "stopped", "failed")
+MAX_ANSWER_CHARS = 20000
 
 
 class TrackerFailed(RuntimeError):
@@ -70,6 +71,8 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
             raise control.NotFound(f"no task {tid}")
         if row["repo"] != repo.name:
             raise control.Refused(f"{tid} is a task of {row['repo']}, not {repo.name}")
+        if row["state"] in config.TASK_FINISHED:
+            raise control.Refused(f"task {tid} is {row['state']}, so it does not start again; add a new task")
     return begin(cfg, repo, tid, force=force, poller_picks=False)
 
 
@@ -178,10 +181,12 @@ def command_of(cfg: config.Config, name: str, *args: str) -> list[str]:
 
 
 def reply(run_id: str, text: str) -> dict:
+    if not (text := text.strip()):
+        raise control.Refused("Give the answer in text")
+    if len(text) > MAX_ANSWER_CHARS:
+        raise control.Refused(f"the answer is {len(text)} characters; the most is {MAX_ANSWER_CHARS}")
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = run_of(run_id)
-        if not (text := text.strip()):
-            raise control.Refused("Give the answer in text")
         if row["status"] != "needs-info":
             raise control.Refused(f"run {run_id} is {row['status']}, so it has no question to answer")
         no_later_run(row)
@@ -223,8 +228,7 @@ def resume(run_id: str, step: str = "") -> dict:
             raise control.Refused(f"run {run_id} ended {row['status']}; a run resumes only when it ended "
                                   f"{', '.join(RESUMABLE[:-1])} or {RESUMABLE[-1]}")
         no_later_run(row)
-        if step and step_named(step) and not any(line.get("event") == "step_start" and line.get("step") == step
-                                                 for read in factory.chain(run_id) for line in read):
+        if step and step_named(step) and not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot resume from it")
         if not (path := script_path(row)) and flows.ran_on_seam(run_id):
             path = "revise" if pipeline.pending_feedback(row["repo"], str(row["issue"])) else "feature"
@@ -247,6 +251,8 @@ def run_step(run_id: str, step: str, sets) -> dict:
         if not (path := script_path(row)):
             raise control.Refused(f"run {run_id} did not run from a script in adws/, so a step cannot run alone on it")
         step_named(step)
+        if not factory.started(run_id, step):
+            raise control.Refused(f"run {run_id} never started {step}, so it cannot run it alone")
         if not isinstance(sets, dict) or not all(isinstance(k, str) and type(v) in (str, int, float)
                                                  for k, v in sets.items()):
             raise control.Refused('Give set as an object of setting names to strings or numbers, such as '
@@ -271,7 +277,8 @@ def removed_tree(run_id: str, step: str) -> str:
         if line.get("step") == step:
             return ""
         if line.get("tree") and not os.path.isdir(line["tree"]):
-            return str(line["tree"])
+            why = flows.remade(line)[2]
+            return f"{line['tree']}, and {why}" if why else ""
     return ""
 
 

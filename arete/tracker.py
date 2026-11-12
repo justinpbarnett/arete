@@ -16,7 +16,7 @@ FIX_LABELS = {"bug", "fix"}
 FIX_TYPES = {"bug", "fire", "incident", "problem"}
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "created", "updated", "creator", "reporter",
                "assignee", "parent", "attachment"]
-JIRA_STATE_LABELS = {f"agent-{s}" for s in config.STATES}
+JIRA_STATE_LABELS = {f"agent-{s}" for s in config.RUN_LABELS}
 JIRA_LABEL_ARETE_LEAVES = "agent-running"
 SEARCH_FIELDS = ["summary", "created", "labels"]
 MAX_AGENT_ISSUES = 1000
@@ -122,6 +122,7 @@ def for_ticket(cfg: config.Config, repo: config.Repo, tid: str | int) -> Tracker
 class GitHubTracker:
     name = "github"
     pr_labels = ("arete",)
+    states = config.STATES
 
     def __init__(self, repo: config.Repo):
         self.repo = repo
@@ -146,7 +147,7 @@ class GitHubTracker:
         return f"#{tid}"
 
     def todo(self) -> list[Ticket]:
-        skip = {self.label_name(s) for s in config.STATES}
+        skip = {self.label_name(s) for s in config.RUN_LABELS}
         out = []
         self._bodies, self._open = {}, {}
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
@@ -241,6 +242,7 @@ class GitHubTracker:
 class JiraTracker:
     name = "jira"
     pr_labels: tuple[str, ...] = ()
+    states = config.RUN_LABELS
 
     def __init__(self, repo: config.Repo, jcfg: config.JiraConfig):
         self.repo = repo
@@ -378,6 +380,7 @@ class JiraTracker:
 class LocalTracker:
     name = "local"
     pr_labels: tuple[str, ...] = ()
+    states = config.RUN_LABELS
 
     def __init__(self, repo: config.Repo):
         self.repo = repo
@@ -459,7 +462,7 @@ Tracker = GitHubTracker | JiraTracker | LocalTracker
 
 
 def item_state(tk: Tracker, t: Ticket) -> str:
-    return next((s for s in config.STATES if tk.label_name(s) in t.labels), "open" if t.open else "closed")
+    return next((s for s in config.RUN_LABELS if tk.label_name(s) in t.labels), "open" if t.open else "closed")
 
 
 def task_state(tid: str) -> str | None:

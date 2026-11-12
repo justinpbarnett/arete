@@ -44,3 +44,6 @@ a problem. When the check in use was blocked or not set up, judge the diff on it
 
 List each problem with the file, what is wrong, and severity: blocker, major, or minor. List only what must be fixed before merge, and any listed problem, minor included, means `request_changes`, never `approve`.
 Do not request changes for style preferences. Keep `summary` to three sentences.
+
+In `changes`, say what the change does for its user, in a short paragraph or a few bullets. It opens the PR's
+Summary, so describe the change, not your review of it.
