@@ -28,6 +28,8 @@ SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 PI_HOME = paths.HOME / ".pi"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
 KEYS_FILE = paths.PI_KEYS_FILE
+GUARD_FILE = paths.PACKAGE_DIR / "pi_guard.mjs"
+GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls"})
 SHARED_SETTINGS = ("models.json", "settings.json")
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
@@ -107,6 +109,31 @@ def agent_env(model: str, passing: list[str] | None = None, providers: dict[str,
                              never=PARENT_SESSION_VARS, source={**(os.environ if source is None else source), **keys})
 
 
+def guard_env(auth_paths: list[Path] | None = None) -> dict[str, str]:
+    roots = [PI_HOME, AGENT_DIR, paths.CONFIG_DIR,
+             *(paths.HOME / p for p in (".claude", ".codex", ".gemini", ".ssh", ".aws", ".docker", ".kube",
+                                       ".gnupg", ".password-store", ".config/gh", ".config/gcloud",
+                                       ".config/opencode", ".local/share/opencode")),
+             *(Path(os.environ[p]) for p in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR")
+               if os.environ.get(p)),
+             Path("/proc"), Path("/dev")]
+    auth = [PI_HOME / "agent" / "auth.json", AGENT_DIR / "auth.json", *(auth_paths or [])]
+    files = [KEYS_FILE, paths.CONFIG_FILE,
+             *(paths.HOME / p for p in (".netrc", ".npmrc", ".pypirc", ".git-credentials")),
+             PI_HOME / "agent" / "models.json",
+             PI_HOME / "agent" / "settings.json", paths.HOME / ".claude" / ".credentials.json",
+             paths.HOME / ".codex" / "auth.json", paths.HOME / ".gemini" / "oauth_creds.json",
+             paths.HOME / ".aws" / "credentials", paths.HOME / ".config" / "gh" / "hosts.yml",
+             paths.HOME / ".config" / "gcloud" / "application_default_credentials.json",
+             paths.HOME / ".config" / "opencode" / "auth.json",
+             paths.HOME / ".local" / "share" / "opencode" / "auth.json"]
+    for path in auth:
+        files.extend((path, path.resolve(), Path(str(path) + ".lock"), Path(str(path.resolve()) + ".lock")))
+    return {"ARETE_PI_GUARD_PATHS": json.dumps({"roots": list(map(str, roots)), "files": list(map(str, files)),
+                                              "write_roots": [str(paths.PACKAGE_DIR)],
+                                              "write_files": [str(GUARD_FILE)]})}
+
+
 def can_confine(remote: bool) -> bool:
     return not remote and sys.platform == "darwin" and bool(shutil.which("sandbox-exec"))
 
@@ -129,6 +156,8 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
             remote: devices.Device | None = None) -> list[str]:
     cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp"]
+    if not remote:
+        cmd += ["--extension", str(GUARD_FILE)]
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
     if model:
         cmd += ["--model", model]
@@ -184,6 +213,8 @@ def run(
     if sandboxed:
         disallowed_tools = rules_for_throwaway_sandbox_without_git_credentials(disallowed_tools)
     names = tool_names(tools, allowed_tools, disallowed_tools)
+    if not remote:
+        names = [name for name in names if name in GUARDED_TOOLS]
     if (persist or resume.id) and not remote:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     cmd = command(names, model=model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
@@ -202,7 +233,7 @@ def run(
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir(remote),))
     else:
         agent_dir()
-        env = agent_env(model, passing, providers)
+        env = {**agent_env(model, passing, providers), **guard_env()}
     try:
         proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
                                     lambda line: reply_cost(line, model, price), on_line)
