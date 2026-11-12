@@ -632,8 +632,8 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
         for s in servers:
             threading.Thread(target=s.serve_forever, daemon=True).start()
         say(f"dashboard listening on port {port} at {', '.join(node.addresses)}")
-        util.write_json(paths.DASHBOARD_FILE, {"pid": os.getpid(), "addresses": list(node.addresses), "port": port,
-                                               **paths.state_and_config(), "at": util.iso()})
+        util.write_json(paths.SERVER_FILE, {"pid": os.getpid(), "addresses": list(node.addresses), "port": port,
+                                            **paths.state_and_config(), "at": util.iso()})
         while this_node(cfg.dashboard_owner) == node:
             time.sleep(WATCH_SECONDS)
         say("the tailnet address or owner changed; listening again")

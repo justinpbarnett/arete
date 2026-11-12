@@ -366,7 +366,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`, `dashboard.json`)
+- State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`, `server.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -851,7 +851,7 @@ Each of these commands makes one call to the server and prints JSON lines and no
 | `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
 
-They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, process id, state folder and config file to `dashboard.json` in the state folder. The commands call that server while its process is alive and it works on the same state folder and config file as they do. `ARETE_SERVER=http://HOST:PORT` names a server and skips that check. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
+They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, process id, state folder and config file to `server.json` in the state folder. The commands call that server while its process is alive and it works on the same state folder and config file as they do. `ARETE_SERVER=http://HOST:PORT` names a server and skips that check. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
 
 A failed command prints one line with `error` and no `event`, with `code` when the server answered with an HTTP status, and exits 1. A `step_end` line or a step row with an `error` field is a step's error, not the command's. When no server works on the state, the readers (`task show`, `lines` and `status --json`) read the local state instead, and the others print one `error` line and exit 1. When a stream of lines drops, as it does when serve restarts on new code, `wait`, `lines --follow` and `arete run` connect again and go on from the last line they read. They give up with an `error` line when the run ended with no `report` line, or when no line came for 2 minutes.
 

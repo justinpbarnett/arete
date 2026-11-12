@@ -43,7 +43,7 @@ def named_server(wanted: str) -> tuple[str, int]:
 def server() -> tuple[str, int]:
     if wanted := os.environ.get(ENV, "").strip():
         return named_server(wanted)
-    found, mine = util.read_json(paths.DASHBOARD_FILE, None), paths.state_and_config()
+    found, mine = util.read_json(paths.SERVER_FILE, None), paths.state_and_config()
     where = paths.short_path(paths.STATE_DIR)
     if not isinstance(found, dict) or not (found.get("addresses") and found.get("port")) \
             or not util.pid_alive(found.get("pid")):
