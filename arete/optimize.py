@@ -295,13 +295,13 @@ def phase(s: Search, folder: Path, tag: str, split: str, arms: dict, champion: s
           pinned: dict[str, dict] | None = None) -> Path:
     file = folder / f"{tag}.jsonl"
     exp = experiment.build(manifest(s.fields, tag, split, arms, champion), carried(folder, file), follow=True)
-    for arm, recorded in (pinned or {}).items():
-        if recorded and exp.design["arms"][arm]["fingerprints"] != recorded:
-            raise Refused(f"the prompts or context of candidate {arm} changed since it was selected; "
-                          "pass --out for a new folder")
     if environment(exp) != s.environment or any(s.task_evidence.get(n) != t for n, t in exp.design["tasks"].items()):
         raise Refused("the fixed steps, grader, harness, prompts, tasks or live baseline changed since the search "
                       "began; pass --out for a new folder")
+    for arm, recorded in (pinned or {}).items():
+        if recorded and exp.design["arms"][arm]["fingerprints"] != recorded:
+            raise Refused(f"the prompts, context or tools of candidate {arm} changed since it was selected; "
+                          "pass --out for a new folder")
     if code := experiment.drive(exp, file):
         why = next((e["why"] for e in reversed(events(file)) if e.get("event") == "stop"), "stopped")
         append(folder / "trail.jsonl", {"event": "stop", "phase": tag, "why": why, "code": code, "at": util.iso()})
