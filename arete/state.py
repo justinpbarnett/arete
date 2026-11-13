@@ -382,6 +382,27 @@ CREATE TABLE IF NOT EXISTS passed_over (
     since TEXT NOT NULL,           -- when the poller first passed this ready ticket over for want of a slot
     PRIMARY KEY (repo, issue)
 );
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    class TEXT NOT NULL,
+    source TEXT NOT NULL,
+    repo TEXT DEFAULT '',
+    signature TEXT DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'open',
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    count INTEGER DEFAULT 1,
+    evidence TEXT DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
+CREATE TABLE IF NOT EXISTS incident_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS incident_notes_incident ON incident_notes (incident, id);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
@@ -715,6 +736,63 @@ def prune(days: float = 14) -> None:
         c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
         c.execute("DELETE FROM queue WHERE run_id IS NOT NULL AND enqueued < ?", (since,))
         c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
+        old = util.iso(util.now() - timedelta(days=days * 4))
+        c.execute("DELETE FROM incident_notes WHERE ts < ?", (since,))
+        c.execute("DELETE FROM incident_notes WHERE incident IN (SELECT id FROM incidents WHERE last_seen < ?)", (old,))
+        c.execute("DELETE FROM incidents WHERE last_seen < ?", (old,))
+
+
+def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signature: str, count: int,
+                   evidence: str) -> tuple[int, bool]:
+    now = util.iso()
+    row = c.execute("SELECT id, count FROM incidents WHERE fingerprint = ? AND state = 'open'",
+                    (fingerprint,)).fetchone()
+    if row:
+        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ? WHERE id = ?",
+                  (count, now, evidence, row["id"]))
+        note = f"seen again: {count} more from {source}, {row['count'] + count} in all"
+        opened, incident_id = False, row["id"]
+    else:
+        incident_id = c.execute("INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, "
+                                "last_seen, count, evidence) VALUES (?,?,?,?,?,?,?,?,?)",
+                                (fingerprint, kind, source, repo, signature, now, now, count, evidence)).lastrowid
+        note, opened = f"opened: {kind}, {count} from {source}", True
+    c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, now, note))
+    return incident_id, opened
+
+
+def record_incident(*args) -> tuple[int, bool]:
+    with db() as c:
+        return write_incident(c, *args)
+
+
+def commit_scan(incident_rows: list[tuple], cursor_rows: list[tuple[str, str, bool, str]]) -> list[bool]:
+    with db() as c:
+        opened = [write_incident(c, *row)[1] for row in incident_rows]
+        for source, value, ok, detail in cursor_rows:
+            c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
+                      (source, value, util.iso(), int(ok), detail[:500]))
+        return opened
+
+
+def add_incident_note(incident_id: int, note: str) -> None:
+    with db() as c:
+        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, util.iso(), note))
+
+
+def incidents(connect=db, limit: int = 200) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM incidents ORDER BY last_seen DESC, id DESC LIMIT ?",
+                                           (limit,))]
+
+
+def incident(incident_id: int, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+        if not r:
+            return None
+        notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
+        return {**dict(r), "notes": [dict(n) for n in notes]}
 
 
 def add_metric(name: str, value: float, loop: str = "", run_id: str = "") -> None:

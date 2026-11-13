@@ -95,6 +95,14 @@ def check_codex_auth(cfg: config.Config) -> list[Check]:
     return [Check("codex:auth", ok, detail)]
 
 
+def check_oncall(cfg: config.Config) -> list[Check]:
+    if not cfg.oncall.enabled:
+        return []
+    from . import oncall
+    ok, detail = oncall.health()
+    return [Check("oncall:scan", ok, detail)]
+
+
 def check_pi_auth(cfg: config.Config) -> list[Check]:
     from . import loops
 
@@ -284,6 +292,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_disk,),
         (check_serve,),
         (check_loops, cfg),
+        (check_oncall, cfg),
     ):
         crash_key = f"heartbeat:{fn.__name__}"
         try:
