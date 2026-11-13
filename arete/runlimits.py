@@ -42,9 +42,9 @@ def metadata(run_id: str, name: str) -> dict:
         value = json.loads(artifact(run_id, name).read_text())
     except FileNotFoundError:
         return {}
-    if not isinstance(value, dict):
-        raise ValueError(f"run {run_id} has invalid {name}")
-    return value
+    if isinstance(value, dict):
+        return value
+    raise ValueError(f"run {run_id} has invalid {name}")
 
 
 def family(run_id: str) -> list[str]:
