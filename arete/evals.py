@@ -71,6 +71,15 @@ class EvalRun(AgentRun):
     def where(self) -> str:
         return f"eval {self.repo.name}/{self.task}"
 
+    def repair_limit(self, layer) -> int:
+        return self.settings("check_repair").tries if self.trial else layer.max_attempts
+
+    def gate(self, layer, wt: Path, task, timeout: float) -> tuple[bool, str]:
+        return run_checks(layer, wt, [wt], self, self.time_for(timeout))
+
+    def may_repair(self, attempts: int, limit: int) -> bool:
+        return attempts < limit
+
 
 @dataclass
 class Prompts:
@@ -391,10 +400,10 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
             result["why"] = "build step failed"
             return result
         session, attempts, summary = res.session, 1, res.text
-        max_attempts = run.settings("check_repair").tries if run.trial else layer.max_attempts
-        ok, report = run_checks(layer, wt, [wt], run, run.time_for(timeout))
+        max_attempts = run.repair_limit(layer)
+        ok, report = run.gate(layer, wt, task, timeout)
         try:
-            while not ok and attempts < max_attempts:
+            while not ok and run.may_repair(attempts, max_attempts):
                 attempts += 1
                 fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
                              checks=runs_checks)
@@ -404,7 +413,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                 fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
                                     which, wt, task, plan, summary, fix))
                 session, summary = res.session, res.text
-                ok, report = run_checks(layer, wt, [wt], run, run.time_for(timeout))
+                ok, report = run.gate(layer, wt, task, timeout)
         except RunFailed:
             result["repairs"] = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
             raise
