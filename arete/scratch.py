@@ -26,9 +26,12 @@ SLOTS = ("config/config.toml", "state/arete.db", "fixtures/config.toml", "fixtur
 MAX_LISTED = 500
 MAX_SAVED_BYTES = 16 * 1024 * 1024
 HOOK = {"root": "", "id": "", "saves": ""}
-AUTHORITY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/arete/verification-authority"
+try:
+    AUTHORITY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/arete/verification-authority"
+except KeyError:
+    AUTHORITY = paths.NOWHERE
 LEASES: dict[str, int] = {}
-RUN_BASELINES: dict[str, set[int] | None] = {}
+RUN_BASELINES: dict[str, dict[int, int] | None] = {}
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
 GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
               "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
@@ -73,7 +76,7 @@ def encoded(value) -> bytes:
 def registry(create: bool = False):
     from . import pi
 
-    if not pi.can_confine(False) or os.getuid() == 0:
+    if not pi.can_confine(False) or os.getuid() == 0 or AUTHORITY == paths.NOWHERE:
         raise ConfinementUnavailable("local producers cannot protect the scratch authority store")
     if create:
         with paths.directory_fd(AUTHORITY.parent) as parent:
@@ -145,17 +148,15 @@ def records(strict: bool = False) -> list[dict]:
                     except (OSError, ValueError, KeyError, TypeError):
                         if strict:
                             raise
-                        continue
     except OSError:
         if strict:
             raise
-        pass
     return found
 
 
 def pending(workspace: Path) -> bool:
     try:
-        return any(d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), workspace.absolute())
+        return any(d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), workspace.resolve())
                    for d in records(True))
     except (OSError, ValueError, KeyError, TypeError):
         return os.path.lexists(AUTHORITY)
@@ -254,38 +255,41 @@ def producing(a: Attempt | None):
         PRODUCING.reset(token)
 
 
-def process_tree() -> dict[int, int]:
+def process_ids(workspace: str = "") -> dict[int, int]:
     if not paths.ON_MAC:
         raise ConfinementUnavailable("producer lifetime inspection unavailable")
     lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     lib.proc_listpids.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_int)
     lib.proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
-    size = lib.proc_listpids(4, os.getuid(), None, 0)
-    if size <= 0:
-        raise OSError(errno.EBUSY, "producer enumeration unavailable")
-    pids = (ctypes.c_int * (size // 4 + 1024))()
-    size = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids))
-    if size <= 0 or size >= ctypes.sizeof(pids):
-        raise OSError(errno.EBUSY, "producer enumeration incomplete")
-    found = {}
-    for pid in pids[:size // 4]:
-        if not pid or pid == os.getpid():
-            continue
-        info = (ctypes.c_uint64 * 7)()
-        if lib.proc_pidinfo(pid, 17, 0, info, ctypes.sizeof(info)) != ctypes.sizeof(info):
-            raise OSError(errno.EBUSY, "producer changed during enumeration")
-        parent = (ctypes.c_uint32 * 16)()
-        after = (ctypes.c_uint64 * 7)()
-        if (lib.proc_pidinfo(pid, 13, 0, parent, ctypes.sizeof(parent)) != ctypes.sizeof(parent)
-                or lib.proc_pidinfo(pid, 17, 0, after, ctypes.sizeof(after)) != ctypes.sizeof(after)
-                or after[2] != info[2]):
-            raise OSError(errno.EBUSY, "producer ancestry changed during enumeration")
-        found[info[2]] = info[3] if parent[1] != 1 else 0
-    return found
-
-
-def process_ids() -> set[int]:
-    return set(process_tree())
+    box = ctypes.CDLL(None)
+    box.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    found: dict[int, int] = {}
+    for _ in range(50):
+        pids = (ctypes.c_int * (max(lib.proc_listpids(4, os.getuid(), None, 0), 0) // 4 + 1024))()
+        size = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids))
+        settled = 0 < size < ctypes.sizeof(pids)
+        for pid in pids[:max(size, 0) // 4]:
+            info, after, parent = (ctypes.c_uint64 * 7)(), (ctypes.c_uint64 * 7)(), (ctypes.c_uint32 * 16)()
+            if not pid or pid == os.getpid():
+                continue
+            if lib.proc_pidinfo(pid, 17, 0, info, ctypes.sizeof(info)) != ctypes.sizeof(info):
+                kinfo, length = ctypes.create_string_buffer(648), ctypes.c_size_t(648)
+                box.sysctl((ctypes.c_int * 4)(1, 14, 1, pid), 4, kinfo, ctypes.byref(length), None, ctypes.c_size_t(0))
+                settled = settled and length.value == 648 and kinfo.raw[36] == 5
+                continue
+            if info[2] in found:
+                continue
+            outside = workspace and (box.sandbox_check(pid, None, 0) == 0 or box.sandbox_check(
+                pid, b"file-write-create", 1, ctypes.c_char_p(os.fsencode(workspace))) == 1)
+            if (lib.proc_pidinfo(pid, 13, 0, parent, ctypes.sizeof(parent)) != ctypes.sizeof(parent)
+                    or lib.proc_pidinfo(pid, 17, 0, after, ctypes.sizeof(after)) != ctypes.sizeof(after)
+                    or after[2] != info[2]):
+                settled = False
+                continue
+            found[info[2]] = -1 if outside else info[3] if parent[1] != 1 else 0
+        if settled:
+            return found
+    raise OSError(errno.EBUSY, "producer changed during enumeration")
 
 
 def producer_group(a: Attempt, producer: str, group: int | None) -> None:
@@ -307,9 +311,9 @@ def protected_command(command, cwd=None):
     if not pi.can_confine(False):
         return command
     lib = ctypes.CDLL(None)
-    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
-    if all(lib.sandbox_check(os.getpid(), op, 1, os.fsencode(AUTHORITY)) == 1
-           for op in (b"file-read-data", b"file-write-data")):
+    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    if AUTHORITY.is_dir() and all(lib.sandbox_check(os.getpid(), op, 1, ctypes.c_char_p(os.fsencode(AUTHORITY))) == 1
+                                  for op in (b"file-read-data", b"file-write-data")):
         return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
     return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False) + words
@@ -330,20 +334,16 @@ def service_command(a: Attempt, command: str) -> list[str]:
 
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
     a = PRODUCING.get()
-    if a is None:
-        if actor_confined:
-            return subprocess.Popen(*args, **kwargs)
-        command, *rest = args
-        if kwargs.pop("shell", False):
-            command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
-        args = (protected_command(command, kwargs.get("cwd")), *rest)
+    if a is None and actor_confined:
         return subprocess.Popen(*args, **kwargs)
-    producer = secrets.token_hex(16)
-    producer_group(a, producer, None)
-    kwargs.pop("process_group", None)
     command, *rest = args
     if kwargs.pop("shell", False):
         command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
+    if a is None:
+        return subprocess.Popen(protected_command(command, kwargs.get("cwd")), *rest, **kwargs)
+    producer = secrets.token_hex(16)
+    producer_group(a, producer, None)
+    kwargs.pop("process_group", None)
     if not actor_confined:
         with registry() as (fd, key):
             if load(fd, key, a.selector)["state"] == "active":
@@ -376,7 +376,7 @@ def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
 def producers_done(data: dict) -> bool:
     if "producers" not in data or "before" not in data:
         return False
-    current, unrelated = process_tree(), set(data["before"])
+    current, unrelated = process_ids(data["attempt"]["workspace"]), {-1, *data["before"]}
     while descendants := {child for child, parent in current.items() if parent in unrelated} - unrelated:
         unrelated.update(descendants)
     if current.keys() - unrelated:
@@ -460,10 +460,6 @@ def authorized() -> Attempt | None:
                 return a
     except (OSError, ValueError, KeyError, TypeError):
         return None
-
-
-def bound_root() -> Path | None:
-    return Path(a.root) if (a := authorized()) else None
 
 
 @contextmanager

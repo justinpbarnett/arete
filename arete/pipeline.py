@@ -2340,7 +2340,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.log(f"{step}: preserved {util.count(len(moved), 'fixture')} from the scratch folder at "
                         f"{archived}")
             if kept:
-                run.log(f"{step}: kept the scratch folder {attempt.root}, and with it the worktree")
+                fixture_blocker = "Verification scratch resources remain unresolved; the workspace is retained."
+                run.log(f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree")
         finally:
             restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
@@ -2374,14 +2375,15 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
     for d, name in untracked_added_since(untracked_before):
         f = d / name
-        if any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
+        if scratch.pending(d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
             continue
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
             remove_untracked(d, name)
     for d in untracked_before:
-        git(["checkout", "-q", "--", "."], d)
+        if not scratch.pending(d):
+            git(["checkout", "-q", "--", "."], d)
 
 
 def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[str, str]:
