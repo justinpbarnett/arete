@@ -15,7 +15,6 @@ TITLE_CHARS = 120
 SENDER_LABELS = {"you": "You", "arete": "Arete", "tool": "Tool"}
 SUMMARY_BUDGET_USD = 0.25
 SUMMARY_TIMEOUT_SECONDS = 120
-MIN_CUT_CHARS = 6
 MAX_TOOL_NOTES = 30
 NOTE_CHARS = 400
 NOTE_RESULT_CHARS = 200
@@ -165,10 +164,10 @@ def size_of(*parts: str) -> int:
     return routing.request_tokens("\n\n".join(p for p in parts if p), "", None)
 
 
-def newest_within(messages: list[dict], limit: int) -> list[dict]:
+def newest_within(messages: list[dict], limit: int, ahead: str = "") -> list[dict]:
     kept: list[dict] = []
     for message in reversed(messages):
-        if size_of(render_all([message, *kept])) > limit:
+        if size_of(ahead, render_all([message, *kept])) > limit:
             break
         kept.insert(0, message)
     return kept
@@ -185,13 +184,20 @@ def longest_fit(most: int, fits, least: int = 0) -> int:
     return low
 
 
-def cut_to(message: dict, limit: int) -> dict:
+def pieces_of(message: dict, limit: int) -> list[dict]:
     if size_of(render(message)) <= limit:
-        return message
-    text = message["text"]
-    keep = longest_fit(len(text), lambda n: size_of(render({**message, "text": util.both_ends(text, n)})) <= limit,
-                       MIN_CUT_CHARS)
-    return {**message, "text": util.both_ends(text, keep)}
+        return [message]
+    pieces: list[dict] = []
+    rest = message["text"]
+    while rest:
+        take = longest_fit(len(rest), lambda n, rest=rest: size_of(render({**message, "text": rest[:n]})) <= limit, 1)
+        pieces.append({**message, "text": rest[:take]})
+        rest = rest[take:]
+    return pieces
+
+
+def summary_limit(cfg: config.Config) -> int:
+    return cfg.chat.context_tokens // 4
 
 
 def capped(summary: str, limit: int) -> str:
@@ -200,11 +206,10 @@ def capped(summary: str, limit: int) -> str:
 
 def batches_of(messages: list[dict], limit: int) -> list[list[dict]]:
     batches: list[list[dict]] = [[]]
-    for message in messages:
-        cut = cut_to(message, limit)
-        if batches[-1] and size_of(render_all([*batches[-1], cut])) > limit:
+    for piece in (p for message in messages for p in pieces_of(message, limit)):
+        if batches[-1] and size_of(render_all([*batches[-1], piece])) > limit:
             batches.append([])
-        batches[-1].append(cut)
+        batches[-1].append(piece)
     return batches
 
 
@@ -217,10 +222,10 @@ def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config) -
             timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=SUMMARY_BUDGET_USD, wait_out_limits=False,
             trace=("chat", f"chat {chat_id} summary"), cfg=cfg)
         cost, paid = cost + res.cost_usd, paid + res.paid_usd
-        summary = res.text.strip() if res.ok else ""
+        summary = capped(res.text.strip(), summary_limit(cfg)) if res.ok else ""
         if not summary:
             return "", cost, paid
-    return capped(summary, cfg.chat.context_tokens // 4), cost, paid
+    return summary, cost, paid
 
 
 def sections_of(summary: str, shown: list[dict], left_out: int, row: dict, text: str) -> str:
@@ -239,7 +244,7 @@ def sections_of(summary: str, shown: list[dict], left_out: int, row: dict, text:
 def context_for(chat_id: int, text: str, message_id: int, cfg: config.Config) -> tuple[str, float, float]:
     row = chat_row(chat_id)
     budget = cfg.chat.context_tokens
-    summary = row["summary"] or ""
+    summary = capped(row["summary"] or "", summary_limit(cfg))
     fresh = [m for m in state.chat_messages(chat_id) if row["summarized_to"] < m["id"] < message_id]
     if size_of(summary, render_all(fresh)) <= budget:
         return sections_of(summary, fresh, 0, row, text), 0.0, 0.0
@@ -249,7 +254,7 @@ def context_for(chat_id: int, text: str, message_id: int, cfg: config.Config) ->
     if written:
         state.chat_summarize(chat_id, written, old[-1]["id"])
         return sections_of(written, recent, 0, row, text), cost, paid
-    shown = newest_within(fresh, budget - size_of(summary))
+    shown = newest_within(fresh, budget, summary)
     return sections_of(summary, shown, len(fresh) - len(shown), row, text), cost, paid
 
 
