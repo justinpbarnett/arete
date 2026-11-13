@@ -28,7 +28,23 @@ ADW = "adw"
 TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url")
 BUILD = "build"
 REVIEW_FIX = "review_fix"
+CHECK_REPAIR = "check_repair"
+REVIEW_REPAIR = "review_repair"
+CI_REPAIR = "ci_repair"
 ROLE_OF = {"plan": "plan", "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn"}
+SETTABLE = {**ROLE_OF, CHECK_REPAIR: CHECK_REPAIR, REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
+
+
+def atom_of(name: str, kw: dict) -> str:
+    if name == "repair":
+        return REVIEW_REPAIR
+    if name != "implement":
+        return ROLE_OF.get(name, "")
+    if kw.get("asks"):
+        return CI_REPAIR
+    if str(kw.get("round") or BUILD).startswith(REVIEW_FIX):
+        return REVIEW_REPAIR
+    return BUILD if kw.get("round", BUILD) == BUILD else CHECK_REPAIR
 
 
 def wanted(repo: config.Repo) -> str:
@@ -218,12 +234,13 @@ class Job:
             self.b.restage()
         return self.b
 
-    def labels(self, name: str) -> dict:
-        if name not in ROLE_OF:
+    def labels(self, name: str, kw: dict | None = None) -> dict:
+        atom = atom_of(name, kw or {})
+        if not atom:
             return {}
-        s = self.run.settings(ROLE_OF[name])
+        s = self.run.settings(atom)
         return {"runner": s.runner, "model": s.model, "effort": s.effort, "tier": s.tier, "kind": self.run.kind,
-                "env": runner.env_names(s.model, s.runner, self.cfg, self.run.repo, self.run.id)}
+                "env": runner.env_names(s.model, s.runner, self.cfg, self.run.repo, self.run.id), "atom": s.step}
 
     def with_left(self, text: str) -> str:
         if not self.left_for_a_person:
@@ -488,7 +505,7 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
                                               attachments=job.attachments, plan=found.plan, source=found.run_id,
                                               findings=findings, expertise=job.expertise, checks=job.checks,
                                               commands=job.commands, max_lines=layer.max_diff_lines),
-                    job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
+                    job.ws, role=REVIEW_REPAIR, allowed_tools=pipeline.bash_rules(job.builder_bash),
                     disallowed_tools=runner.NO_GIT_WRITES)
     if not res.ok:
         return end_as("fail", "failed", why="repair step failed", said=res.text)
@@ -508,16 +525,17 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
               tries: int = 1, asks: str = "") -> Outcome:
     job: Job = flow.ctx
     run = job.run
+    atom = atom_of("implement", {"round": round, "asks": asks})
     if asks:
-        res = job.b.resume(round, asks, json_schema=pipeline.CI_FIX_SCHEMA)
+        res = job.b.resume(round, asks, role=atom, json_schema=pipeline.CI_FIX_SCHEMA)
         return Outcome("pass" if res.ok and isinstance(res.structured, dict) else "fail",
                        data={"round": round, "failures": feedback, "verdicts": res.structured, "said": res.text},
                        session=run.sessions.get(BUILD, NO_SESSION))
     if round.startswith(REVIEW_FIX):
-        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback))
+        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback), role=atom)
     elif round != BUILD:
         res = job.b.resume(round, pipeline.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
-                                                  checks=job.b.check_commands))
+                                                  checks=job.b.check_commands), role=atom)
     else:
         return build(job)
     return Outcome("pass" if res.ok else "fail", data={"round": round},

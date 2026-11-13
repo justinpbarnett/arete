@@ -384,6 +384,7 @@ class Recorder:
         mark(self.run_id, "agent", at=self.at, step=self.step, record=self.path.name if self.path else "",
              runner=self.runner, model=result.get("model") or self.model, ok=result["ok"],
              auth_mode=result["auth_mode"], provider=result.get("provider", self.header.get("provider", "")),
+             **({"atom": self.header["atom"]} if self.header.get("atom") else {}),
              **{k: result[k] for k in ("auth_modes", "paid_usd", "credential", "effort") if k in result},
              seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
              **({"error": util.first_line(scrub(result["error"], self.hidden), 300)} if result["error"] else {}))
