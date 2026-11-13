@@ -251,6 +251,10 @@ def with_section(body: str, ci_section: str) -> str:
     return f"{SECTION.sub('', body).rstrip()}\n\n{ci_section}"
 
 
-def stopped(body: str) -> bool:
+def stopped_section(body: str) -> str:
     found = SECTION.search(body or "")
-    return bool(found) and STOPPED in found.group(0)
+    return found.group(0).strip() if found and STOPPED in found.group(0) else ""
+
+
+def stopped(body: str) -> bool:
+    return bool(stopped_section(body))

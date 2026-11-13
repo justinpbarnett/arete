@@ -78,7 +78,7 @@ def cmd_init(args) -> int:
 
 
 def cmd_status(args) -> int:
-    from . import board, control
+    from . import board, control, record
 
     if args.json:
         return status_lines(args.run_id)
@@ -102,6 +102,7 @@ def cmd_status(args) -> int:
     show(snap["alerts"], "the alerts", print_alerts)
     show(snap["recent"], "the recent runs", print_recent)
     show(snap["proposals"], "the miner proposals", print_proposals)
+    show(board.panel(record.store), "the record store", lambda s: print_records(s, cfg.retention))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
     show(snap["triage"], "triage", print_triage)
@@ -181,6 +182,17 @@ def print_recent(runs: list[dict]) -> None:
         print("recent runs:")
         print_table([(r["id"], r["kind"], r["ticket"], r["status"], util.paid_note(r["paid"]), r["pr_url"] or r["summary"])
                      for r in runs], 200)
+
+
+def print_records(s: dict, limits) -> None:
+    from . import record, util
+
+    kept = f"kept {limits.days:g} days, up to {limits.max_gb:g} GB"
+    if not s["oldest"]:
+        print(f"records: none ({kept}), {s['pins']} pinned")
+        return
+    print(f"records: {record.size_text(s['bytes'])} in {util.count(s['records'], 'record')} ({kept}), "
+          f"oldest {s['oldest']['run_id']} written {when(s['oldest']['written'])}, {s['pins']} pinned")
 
 
 def print_proposals(p: dict) -> None:
@@ -1114,6 +1126,18 @@ def cmd_document(args) -> int:
 def cmd_record(args) -> int:
     from . import record
 
+    if args.run_id in ("pin", "unpin"):
+        if not args.step:
+            print("usage: arete record pin|unpin RUN_ID", file=sys.stderr)
+            return 2
+        try:
+            (record.pin if args.run_id == "pin" else record.unpin)(args.step)
+        except LookupError as e:
+            print(e, file=sys.stderr)
+            return 1
+        print(f"pinned {args.step}: its record stays until `arete record unpin {args.step}`" if args.run_id == "pin"
+              else f"unpinned {args.step}: its record ages out like any other")
+        return 0
     if args.follow and not args.step:
         print("arete record --follow requires STEP", file=sys.stderr)
         return 2
@@ -1573,8 +1597,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_document)
 
     p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
-                                      "events")
-    p.add_argument("run_id")
+                                      "events; `pin RUN_ID` and `unpin RUN_ID` keep a record from rotating out")
+    p.add_argument("run_id", help="a run id, or pin RUN_ID or unpin RUN_ID")
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle")
+RETENTION_KEYS = ("days", "max_gb")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -131,6 +133,12 @@ class AskConfig:
     settle: bool = True
 
 
+@dataclass(frozen=True)
+class Retention:
+    days: float = 30
+    max_gb: float = 20
+
+
 @dataclass
 class Environment:
     passes: tuple[str, ...] = ()
@@ -208,6 +216,7 @@ class Config:
     research_search_workers: int = 3
     research_search_share: float = 0.6
     ask: AskConfig = field(default_factory=AskConfig)
+    retention: Retention = field(default_factory=Retention)
     document: dict = field(default_factory=dict)
     oncall: OncallConfig = field(default_factory=OncallConfig)
 
@@ -438,6 +447,19 @@ def ask_table(data) -> AskConfig:
     if type(settle) is not bool:
         raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
     return AskConfig(max_per_run=limit, settle=settle)
+
+
+def retention_table(data) -> Retention:
+    table = table_of(data, "retention")
+    if bad := sorted(set(table) - set(RETENTION_KEYS)):
+        raise ValueError(f"[retention]: unknown key {', '.join(bad)}; use {', '.join(RETENTION_KEYS)}")
+    found = {}
+    for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb)):
+        value = table.get(key, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"[retention] {key} must be a number above 0, not {value!r}")
+        found[key] = value
+    return Retention(**found)
 
 
 def research_table(data) -> dict:
@@ -708,6 +730,7 @@ def load(path: Path | None = None) -> Config:
     cfg.research_search_workers = research["search_workers"]
     cfg.research_search_share = research["search_share"]
     cfg.ask = ask_table(data.get("ask") or {})
+    cfg.retention = retention_table(data.get("retention") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)
     from . import steps
