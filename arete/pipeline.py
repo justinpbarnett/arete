@@ -24,7 +24,6 @@ from . import (
     ci,
     config,
     control,
-    devices,
     diffguard,
     environment,
     factory,
@@ -34,7 +33,6 @@ from . import (
     lines,
     outbound,
     paths,
-    pi,
     record,
     runner,
     state,
@@ -229,6 +227,7 @@ class AgentRun:
     step_overrides: dict[str, dict] = field(default_factory=dict)
     sessions: dict[str, Session] = field(default_factory=dict)
     writes_lines: bool = True
+    step_calls: dict[str, int] = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -280,14 +279,21 @@ class AgentRun:
         kw.setdefault("repo", self.repo)
         seam = factory.inside(self.id)
         lined = self.writes_lines and seam is None
-        if lined and which == "pi" and not devices.resolve(kw.get("device", "local")).remote:
-            kw["on_launch"] = lambda selected: self.write_line(
-                "step_start", step=step, runner=which, model=selected.model, effort=effort, tier=tier, kind=kind,
-                provider=selected.provider, auth_mode=selected.auth.mode,
-                env=pi.launch_env_names(selected))
-        elif lined:
-            self.write_line("step_start", step=step, runner=which, model=model, effort=effort, tier=tier, kind=kind,
-                            env=runner.env_names(kw.get("model", ""), run_with, cfg, self.repo, self.id))
+        if s:
+            kw.setdefault("settings", s)
+        if self.writes_lines:
+            def announce(route: dict) -> None:
+                fields = {k: route.get(k) for k in ("runner", "model", "provider", "auth_mode", "credential",
+                                                    "billing", "effort", "requested_effort", "tier", "position",
+                                                    "requested", "env", "skipped", "launch") if k in route}
+                if seam is None:
+                    self.write_line("step_start", step=step, kind=kind, **fields)
+                else:
+                    self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kind, **fields)
+
+            kw["on_launch"] = announce
+        attempt_no = self.step_calls[step] = max(state.step_tries(self.id, step), self.step_calls.get(step, 0)) + 1
+        kw["try_no"] = attempt_no
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         with lines.beating(self.id, step) if lined else nullcontext():
@@ -307,8 +313,8 @@ class AgentRun:
             self.sessions[s.step] = res.session
         self.cost += res.cost_usd
         self.paid += res.paid_usd
-        usage = {"runner": res.runner or which, "model": res.model or model, "effort": effort, "tier": tier,
-                 "auth_mode": ", ".join(res.modes),
+        usage = {"runner": res.runner or which, "model": res.model or model, "effort": res.effort or effort, "tier": tier,
+                 "credential": res.credential, "auth_mode": ", ".join(res.modes),
                  "provider": res.provider,
                  "kind": kind, "cost_usd": round(self.cost - spent, 6), "tokens_in": res.tokens_in,
                  "tokens_out": res.tokens_out, "turns": res.turns, "cache_read": res.cache_read,
@@ -317,12 +323,13 @@ class AgentRun:
             seam.add(error="" if res.ok else res.error or "", **usage)
         else:
             self.write_line("step_end", step=step, ok=res.ok, seconds=round(time.monotonic() - started, 1),
-                            error=(res.error or "")[:500], **{"try": state.step_tries(self.id, step)}, **usage)
+                            error=(res.error or "")[:500], **{"try": attempt_no}, **usage)
         self.save(f"{step}.json", {"ok": res.ok, "session": res.session.id, "cost": res.cost_usd,
                                    "auth_mode": usage["auth_mode"], "auth_modes": list(res.modes),
                                    "paid_usd": res.paid_usd,
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
-                                   "error": res.error})
+                                   "error": res.error, "runner": usage["runner"], "model": usage["model"],
+                                   "skipped": res.skipped})
         self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} {runner.cost_note(res)}")
         return res
 
@@ -693,18 +700,25 @@ class Build(TicketWork):
     build_summary: str = ""
 
     def resume(self, step: str, text: str, **kw) -> Result:
-        saved, selected = self.run.sessions.get("build", NO_SESSION), self.run.settings("build")
-        if saved.id and saved.runner != selected.runner:
+        saved = self.run.sessions.get("build", NO_SESSION)
+        settings = self.run.settings("build")
+
+        def switched(which: str) -> str:
             plan = self.run.dir / "plan.md"
             previous = util.read_json(self.run.dir / "build.json", {})
-            context = (f"The builder changed from {saved.runner} to {selected.runner}. Continue the existing work "
+            context = (f"The builder changed from {saved.runner} to {which}. Continue the existing work "
                        f"in {self.ws}; inspect its current diff before editing.\n\n"
                        f"## Issue {self.ticket.ref}: {self.ticket.title}\n\n{self.ticket.body}\n\n"
                        f"{self.ticket.comments}\n\n## Saved plan\n\n"
                        f"{self.plan_text or (plan.read_text() if plan.exists() else '')}\n\n"
                        f"## Earlier builder summary\n\n{self.build_summary or previous.get('text', '')}\n\n"
                        "Keep the current task's tool restrictions and never write git metadata or secret files.")
-            text = f"{context}\n\n## Current feedback\n\n{text}"
+            return f"{context}\n\n## Current feedback\n\n{text}"
+
+        if saved.id and settings.session == "resume":
+            kw["fresh_prompt"] = switched
+        elif saved.id and saved.runner != settings.runner:
+            text = switched(settings.runner)
         return self.run.agent(step, text, self.ws, role="build", allowed_tools=self.tools,
                               disallowed_tools=runner.NO_GIT_WRITES, **kw)
 

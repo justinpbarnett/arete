@@ -68,6 +68,27 @@ class Candidate:
     price: Quote | None
     state: str
     detail: str
+    mode: str = ""
+    until: str = ""
+
+
+@dataclass(frozen=True)
+class Request:
+    chain: tuple[Link, ...]
+    fallback: bool
+    tools: tuple[str, ...]
+    mcp: tuple[str, ...]
+    effort: str
+    instructions: tuple[str, ...] | None = None
+    denied: tuple[str, ...] = ()
+
+    def effort_on(self, which: str) -> str:
+        return nearest_effort(which, self.effort)
+
+    def instructions_on(self, which: str) -> tuple[str, ...]:
+        from . import steps
+
+        return steps.default_instructions(which) if self.instructions is None else self.instructions
 
 
 @dataclass(frozen=True)
@@ -88,6 +109,10 @@ def nearest_effort(which: str, effort: str) -> str:
         return ""
     lower = [level for level in EFFORT_ORDER[:EFFORT_ORDER.index(effort)] if level in levels]
     return lower[-1] if lower else ""
+
+
+def route_key(found: Candidate) -> tuple:
+    return found.runner, identity(found.runner, found.model), found.credential
 
 
 def claude_id(name: str) -> str:
@@ -292,57 +317,63 @@ class Discovery:
                 return f"instructions {', '.join(settings.instructions_on('pi'))} cannot load on pi"
             if runner.WRITING_TOOLS & set(settings.tools) and not pi.can_confine(False):
                 return pi.NO_CONFINEMENT_REASON
-        if way.runner in ("pi", "codex") and (missing := [t for t in runner.READ_TOOLS if t not in settings.tools]):
+        fallback = not (way.link.requested and way.runner == way.link.runner)
+        if (way.runner in ("pi", "codex") and fallback
+                and (missing := [t for t in runner.READ_TOOLS if t not in settings.tools])):
             return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
+        if way.runner == "codex" and fallback and (
+                loose := [d for d in settings.denied if d not in runner.NO_GIT_WRITES]):
+            return f"codex cannot hold the denial of {', '.join(loose)}"
         if way.runner == "codex" and "user" in settings.instructions_on("codex"):
             return "instructions user cannot load on codex, which runs without your own codex setup"
         return ""
 
-    def judge(self, way: Way, settings, remaining: float | None) -> tuple[str, str]:
+    def judge(self, way: Way, settings, remaining: float | None) -> tuple[str, str, str]:
         if why := runner.device_refusal(way.model, way.runner, self.device):
-            return "excluded", why
+            return "excluded", why, ""
         if why := self.incompatible(way, settings):
-            return "incompatible", why
+            return "incompatible", why, ""
         auth = accounts.Auth()
         if way.runner == "pi":
             selected = self.probe(way.model, way.mode)
             if selected.token_error:
-                return "refused", record.scrub(selected.token_error, selected.hidden)
+                return "refused", record.scrub(selected.token_error, selected.hidden), ""
             if way.mode == "login" and not selected.login_available:
-                return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store"
+                return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store", ""
             if way.mode == "api_key" and not selected.key_available:
-                return "missing_key", f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
+                found = f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
+                return "missing_key", found, ""
             if selected.error:
-                return "unavailable", record.scrub(selected.error, selected.hidden)
+                return "unavailable", record.scrub(selected.error, selected.hidden), ""
             auth, model = selected.auth, selected.model
         elif way.runner == "codex":
             auth, model = self.codex_auth(), way.model
             if auth.mode == "":
-                return "missing_login", "codex CLI is not logged in; run `codex login`"
+                return "missing_login", "codex CLI is not logged in; run `codex login`", ""
         elif way.runner == "claude":
             auth, model = self.claude_auth(), way.model
             if self.device.remote:
-                return "ready", "claude login is not checked on a remote device"
+                return "ready", "claude login is not checked on a remote device", ""
             status = self.claude_status()
             if not status or not status.get("loggedIn") or (status.get("authMethod") or status.get("auth_mode")) in API_KEY_METHODS:
-                return "missing_login", "claude CLI is not logged in with a plan; run `claude auth login`"
+                return "missing_login", "claude CLI is not logged in with a plan; run `claude auth login`", ""
             if expired(status.get("loginExpiresAt")):
-                return "expired_login", "claude login expired; run `claude auth login`"
+                return "expired_login", "claude login expired; run `claude auth login`", ""
         else:
-            return "ready", ""
+            return "ready", "", ""
         if hold := runner.auth_hold(auth, model, self.connect):
-            return "held", runner.hold_words(hold)
+            return "held", runner.hold_words(hold), hold["until"]
         if way.billing == "paid" and remaining is not None and remaining <= runner.BUDGET_FLOOR_USD:
-            return "budget_spent", f"the daily loop budget has {max(remaining, 0):.4f} USD left"
-        return "ready", ""
+            return "budget_spent", f"the daily loop budget has {max(remaining, 0):.4f} USD left", ""
+        return "ready", "", ""
 
     def candidate(self, way: Way, settings, remaining: float | None) -> Candidate:
         link = way.link
-        state_name, detail = self.judge(way, settings, remaining)
+        state_name, detail, until = self.judge(way, settings, remaining)
         return Candidate(0, way.model, way.runner, self.provider(way), way.credential, way.billing, link.tier,
                          link.position, link.requested, settings.effort_on(way.runner),
                          settings.instructions_on(way.runner), self.quote(way) if way.billing == "paid" else None,
-                         state_name, " ".join(detail.split()))
+                         state_name, " ".join(detail.split()), way.mode, until)
 
     def provider(self, way: Way) -> str:
         if way.runner == "claude":

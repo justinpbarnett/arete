@@ -64,15 +64,17 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
                 raise
 
 
-def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "") -> None:
+def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "",
+         try_no: int = 0) -> None:
     with state.db() as c:
         c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
                   " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
                   " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                  "(SELECT COUNT(*) + 1 FROM steps WHERE run_id = ? AND step = ?),?,?,?,?,?)",
+                  "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                  "?,?,?,?,?)",
                   (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
                    res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                   res.first_context_tokens, effort or "", tier or "", run_id, name, kind or "", res.cache_read,
+                   res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
                    res.cache_write, round(res.api_seconds, 2), res.auth_mode))
         c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
                   "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
@@ -358,7 +360,8 @@ class Recorder:
                   "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
                   "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model,
                   "provider": res.provider, "runner": res.runner, "auth_mode": res.auth_mode,
-                  "auth_modes": list(res.modes), "paid_usd": res.paid_usd,
+                  "auth_modes": list(res.modes), "paid_usd": res.paid_usd, "credential": res.credential,
+                  "effort": res.effort, "requested_effort": res.requested_effort, "skipped": res.skipped,
                   **({"calls": [{"runner": c.runner, "model": c.model, "provider": c.provider,
                                 "auth_mode": c.auth_mode, "cost_usd": c.cost_usd, "paid_usd": c.paid_usd,
                                 "tokens_in": c.tokens_in, "tokens_out": c.tokens_out} for c in res.calls]}
@@ -377,7 +380,7 @@ class Recorder:
         mark(self.run_id, "agent", at=self.at, step=self.step, record=self.path.name if self.path else "",
              runner=self.runner, model=result.get("model") or self.model, ok=result["ok"],
              auth_mode=result["auth_mode"], provider=result.get("provider", self.header.get("provider", "")),
-             **{k: result[k] for k in ("auth_modes", "paid_usd") if k in result},
+             **{k: result[k] for k in ("auth_modes", "paid_usd", "credential", "effort") if k in result},
              seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
              **({"error": util.first_line(scrub(result["error"], self.hidden), 300)} if result["error"] else {}))
 
@@ -548,6 +551,19 @@ def entries(source: Iterable[str]) -> Iterator[dict]:
 
 def events(path: Path) -> Iterator[dict]:
     yield from normalized(lines(path))
+
+
+def last_message(path: Path, notice: re.Pattern[str] | None = None) -> str:
+    found = ""
+    try:
+        for event in events(path):
+            text = str(event.get("text") or "").strip()
+            if (event.get("kind") == "message" and event.get("role") == "assistant" and text
+                    and not (notice and notice.search(text))):
+                found = text
+    except OSError:
+        return ""
+    return found
 
 
 def normalized(source: Iterable[dict]) -> Iterator[dict]:
