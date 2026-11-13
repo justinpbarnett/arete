@@ -129,6 +129,7 @@ export default function (pi) {
         });
     }
     pi.on("tool_call", (event, ctx) => {
+        if (event.toolName === "ask_owner") return undefined;
         try {
             if (!tools.has(event.toolName)) return { block: true, reason };
             const writing = event.toolName === "edit" || event.toolName === "write";

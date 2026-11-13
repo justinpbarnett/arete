@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, lines, state, util
+from . import asks, config, lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
@@ -331,6 +331,11 @@ class Flow:
         lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels)
         try:
             outcome = self.call(name, calls, args, kw)
+        except asks.Asked as e:
+            outcome = Outcome("ask", feedback=asks.summary(e.sent), data={"ask_ids": e.ask_ids, "call": e.call},
+                              session=e.session)
+            self.end(name, n, outcome, "", calls, started, kw)
+            raise
         except Exception as e:
             self.failed(name, n, e, calls, started, kw)
             raise

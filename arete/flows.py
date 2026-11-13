@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import (
+    asks,
     config,
     diffguard,
     document,
@@ -580,7 +581,8 @@ def plan(flow: factory.Flow) -> Outcome:
                                             attachments=job.attachments, triage=job.triage, expertise=job.expertise,
                                             commands=job.commands,
                                             denied=pipeline.code_list(diffguard.denied_paths(layer)),
-                                            max_lines=limit, checks=pipeline.check_list(layer)),
+                                            max_lines=limit, checks=pipeline.check_list(layer),
+                                            owner=run.owner_note),
                     job.ws, role="plan", allowed_tools=pipeline.bash_rules(config.DEFAULT_ALLOW_BASH + reads),
                     json_schema=pipeline.PLAN_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
@@ -591,9 +593,7 @@ def plan(flow: factory.Flow) -> Outcome:
     estimate = int(found.get("estimated_lines") or 0)
     if found.get("ambiguous") and found.get("question"):
         run.log("plan: ambiguous, asking the author")
-        return end_as("ask", "ask", summary=found["question"],
-                      comment=f"Before I build this I need one answer:\n\n{found['question']}\n\n"
-                              f"Reply here, then remove the `{info}` label and I will pick it up.")
+        raise run.owner_ask("plan", [asks.text_ask(str(found["question"]))], res.session)
     if estimate > limit:
         split = [s for s in found.get("split") or [] if isinstance(s, dict) and s.get("title")]
         run.log(f"plan: about {estimate} lines, over the {limit} line limit; proposing a {len(split)} part split")
@@ -619,7 +619,7 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
                                               title=t.title, body=t.body, comments=t.comments,
                                               attachments=job.attachments, feedback=feedback, expertise=job.expertise,
                                               checks=job.checks, commands=job.commands,
-                                              max_lines=layer.max_diff_lines),
+                                              max_lines=layer.max_diff_lines, owner=run.owner_note),
                     job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
                     disallowed_tools=runner.NO_GIT_WRITES, json_schema=pipeline.REVISE_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
@@ -660,7 +660,8 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
                                               title=t.title, body=t.body, comments=t.comments,
                                               attachments=job.attachments, plan=found.plan, source=found.run_id,
                                               findings=findings, expertise=job.expertise, checks=job.checks,
-                                              commands=job.commands, max_lines=layer.max_diff_lines),
+                                              commands=job.commands, max_lines=layer.max_diff_lines,
+                                              owner=run.owner_note),
                     job.ws, role=REVIEW_REPAIR, allowed_tools=pipeline.bash_rules(job.builder_bash),
                     disallowed_tools=runner.NO_GIT_WRITES)
     if not res.ok:
@@ -704,7 +705,8 @@ def build(job: Job) -> Outcome:
                                            title=t.title, body=t.body, comments=t.comments,
                                            attachments=job.attachments, plan=job.plan_text, expertise=job.expertise,
                                            checks=job.checks, commands=job.commands,
-                                           max_lines=layer.max_diff_lines, estimate=job.estimate, verify=job.goal),
+                                           max_lines=layer.max_diff_lines, estimate=job.estimate, verify=job.goal,
+                                           owner=run.owner_note),
                     job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
                     disallowed_tools=runner.NO_GIT_WRITES)
     if not res.ok:
@@ -954,14 +956,15 @@ def publish(flow: factory.Flow) -> Outcome:
 
 @factory.step("respond")
 def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", detail: str = "", comment: str = "",
-            summary: str = "", status: str = "", replies: list[dict] | None = None, prs: bool = False) -> Outcome:
+            summary: str = "", status: str = "", replies: list[dict] | None = None, prs: bool = False,
+            asked: list[dict] | None = None) -> Outcome:
     job: Job = flow.ctx
     run, pr_url = job.run, ""
     if ending == "failed":
         status, summary, _ = pipeline._fail(run, why, said, detail)
         pr_url = pipeline.record_prs(run, job.branch, job.with_prs) if prs else ""
     elif ending == "ask":
-        status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary)
+        status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary, asked)
     elif ending == "nothing":
         status, summary, pr_url = pipeline.nothing_to_build(run, job.ticket, job.ws, job.checkouts, job.branch,
                                                             summary, job.left_for_a_person)
@@ -983,6 +986,7 @@ def done_comment(job: Job, summary: str) -> str:
     said = job.review
     problems = "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in said.get("problems", []))
     return (f"Done: {summary}.\n\n## Summary\n\n{job.document or pipeline.summary_of(said, job.build_summary)}\n\n"
+            f"{pipeline.assumed_block(job.run)}"
             f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown()}\n\n"
             f"## Review\n\n**{said.get('verdict', 'none')}**: {said.get('summary', '')}\n{problems}\n\n"
             f"Run `{job.run.id}`, {util.paid_note(record.metered_spent(job.run.id))}.")
@@ -1021,6 +1025,12 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
         return drive(flow)
     except pipeline.RunFailed as e:
         return finish(flow, "failed", why=e.why, detail=e.detail)
+    except asks.Asked as e:
+        reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
+        return finish(flow, "ask", summary=reached + asks.summary(e.sent),
+                      comment=asks.comment(e.sent, flow.ctx.run.tracker.label_name("needs-info"), e.limit),
+                      asked=[{"ask_id": ask_id, "step": e.step, "call": e.call, "questions": ask["questions"]}
+                             for ask_id, ask in zip(e.ask_ids, e.sent, strict=True)])
 
 
 def alone(flow: factory.Flow) -> tuple[str, str, bool]:
