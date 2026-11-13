@@ -12,6 +12,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import config, environment, paths, scratch, util
 from .util import git
@@ -51,14 +52,32 @@ class ServerError(RuntimeError):
     pass
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def free_port(avoid: frozenset[int] = frozenset()) -> int:
+    while True:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in avoid:
+            return port
+
+
+def port_refusal(v: config.Verify) -> str:
+    if not v.start:
+        return ""
+    try:
+        parts = urlsplit(v.url)
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return ""
+    if port not in scratch.dashboard_ports():
+        return ""
+    return (f"The verify URL {v.url} uses port {port}, which the live dashboard or a running arete serve uses; "
+            "use {port} so verification gets a free port.")
 
 
 def with_free_ports(v: config.Verify) -> config.Verify:
-    ports = {name: free_port() for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
+    avoid = scratch.dashboard_ports()
+    ports = {name: free_port(avoid) for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
 
     def filled(text: str) -> str:
         return PORT_FIELD.sub(lambda m: str(ports[m.group(1)]), text)

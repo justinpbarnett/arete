@@ -138,9 +138,9 @@ def install_launchd() -> int:
         retire(label(name))
     pl = serve_plist()
     dest = serve_file("mac")
-    util.sh(["launchctl", "bootout", f"{_domain()}/{pl['Label']}"], timeout=30)
+    util.sh(["launchctl", "bootout", f"{_domain()}/{pl['Label']}"], timeout=30, keeps=("launch",))
     dest.write_bytes(plistlib.dumps(pl))
-    res = util.sh(["launchctl", "bootstrap", _domain(), str(dest)], timeout=30)
+    res = util.sh(["launchctl", "bootstrap", _domain(), str(dest)], timeout=30, keeps=("launch",))
     print(f"{pl['Label']}: " + ("loaded" if res.returncode == 0 else f"bootstrap failed: {util.first_line(res.stderr)}"))
     return 0 if res.returncode == 0 else 1
 
@@ -160,7 +160,7 @@ def install_systemd() -> int:
 def remove_agent(lb: str) -> bool:
     if not agent_file(lb).exists():
         return False
-    util.sh(["launchctl", "bootout", f"{_domain()}/{lb}"], timeout=30)
+    util.sh(["launchctl", "bootout", f"{_domain()}/{lb}"], timeout=30, keeps=("launch",))
     agent_file(lb).unlink()
     return True
 
