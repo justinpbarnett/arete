@@ -28,6 +28,11 @@ $base_log
   after it checks your result, and deletes the `__pycache__` your commands leave, so do not mention it.
 - Shell commands you may run: $commands. Others are refused.
 - Never edit `.agents/`, CI workflows, or env files.
+- Optional validation must be cache-free and must not change files: no formatters or `--fix`, no installs, and nothing
+  that writes caches, build output or other files. Run Ruff as `uvx ruff check --no-cache ...` (arete also sets
+  `RUFF_NO_CACHE`). Skip any check that cannot run without writing outside the listed files, because arete's own
+  checks run it later. Any new or changed file outside the listed conflicts, including ignored files and caches, makes
+  arete stop the merge.
 - This is attempt $attempt of $tries; $feedback.
 
 ## What to return
