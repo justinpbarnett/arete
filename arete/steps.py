@@ -96,6 +96,14 @@ def chain_of(requested: tuple[str, str, str], tier: str, entries: tuple[dict[str
     return tuple(chain)
 
 
+def chain_for(cfg: config.Config, layer: config.RepoLayer | None, which: str, name: str, effort: str,
+              explicit: tuple[str, ...] | None) -> tuple[tuple[routing.Link, ...], bool]:
+    layer = layer or config.RepoLayer(dir=Path())
+    tier, entries = tier_of(cfg, layer, "", routing.identity(which, name))
+    requested = routing.source_route({"model": name, "runner": which})
+    return chain_of(requested, tier, entries, effort, explicit), cfg.routing_fallback and layer.routing_fallback
+
+
 def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple[str, dict[str, tuple[dict[str, str], ...]]]:
     own = layer.tiers if layer else {}
     maps = {name: {**cfg.tiers.get(name, {}), **own.get(name, {})} for name in dict.fromkeys([*cfg.tiers, *own])}

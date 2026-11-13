@@ -216,7 +216,8 @@ def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     if not switch or switch.value is not True or not switch.sure(cfg.jev.confidence):
         return resume
     res = runner.run("/compact", spec.cwd, model=spec.model, runner="claude", trace=(spec.id, f"turn {turn} compact"),
-                     resume=resume, cfg=cfg, device=device, timeout=TURN_TIMEOUT_SECONDS, repo=session_repo(spec, cfg))
+                     resume=resume, cfg=cfg, device=device, timeout=TURN_TIMEOUT_SECONDS, repo=session_repo(spec, cfg),
+                     fallback=False)
     log_line(spec, "compact" if res.ok else "error",
              f"compacted {tokens:,} tokens of context before a new task (JEV {switch.note()}) {runner.cost_note(res)}"
              if res.ok else f"compaction failed: {util.first_line(res.error)}")

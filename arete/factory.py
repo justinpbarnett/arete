@@ -64,6 +64,7 @@ class Calls:
     run_id: str
     step: str
     made: list[dict] = field(default_factory=list)
+    n: int = 0
 
     def add(self, error: str = "", **usage) -> None:
         self.made.append({**usage, "error": error})
@@ -165,7 +166,8 @@ def outcome_of(line: dict) -> Outcome:
                    feedback=str(line.get("feedback") or ""),
                    data=data if isinstance(data, dict) else {},
                    session=Session(str(session.get("id") or ""), float(amount(session, "spent_usd")),
-                                   str(session.get("runner") or "")))
+                                   str(session.get("runner") or ""), str(session.get("credential") or ""),
+                                   str(session.get("account") or ""), str(session.get("generation") or "")))
 
 
 def checked(name: str, value) -> Outcome:
@@ -262,7 +264,7 @@ class Flow:
 
     def run(self, name: str, args: tuple, kw: dict) -> Outcome:
         n = self.tries[name] = self.tries.get(name, 0) + 1
-        calls, started = Calls(self.run_id, name), time.monotonic()
+        calls, started = Calls(self.run_id, name, n=n), time.monotonic()
         try:
             labels = self.labels(name)
         except Exception as e:

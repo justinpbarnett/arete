@@ -358,7 +358,8 @@ class Recorder:
                   "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
                   "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model,
                   "provider": res.provider, "runner": res.runner, "auth_mode": res.auth_mode,
-                  "auth_modes": list(res.modes), "paid_usd": res.paid_usd,
+                  "auth_modes": list(res.modes), "paid_usd": res.paid_usd, "credential": res.credential,
+                  "effort": res.effort, "requested_effort": res.requested_effort, "skipped": res.skipped,
                   **({"calls": [{"runner": c.runner, "model": c.model, "provider": c.provider,
                                 "auth_mode": c.auth_mode, "cost_usd": c.cost_usd, "paid_usd": c.paid_usd,
                                 "tokens_in": c.tokens_in, "tokens_out": c.tokens_out} for c in res.calls]}
@@ -377,7 +378,7 @@ class Recorder:
         mark(self.run_id, "agent", at=self.at, step=self.step, record=self.path.name if self.path else "",
              runner=self.runner, model=result.get("model") or self.model, ok=result["ok"],
              auth_mode=result["auth_mode"], provider=result.get("provider", self.header.get("provider", "")),
-             **{k: result[k] for k in ("auth_modes", "paid_usd") if k in result},
+             **{k: result[k] for k in ("auth_modes", "paid_usd", "credential", "effort") if k in result},
              seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
              **({"error": util.first_line(scrub(result["error"], self.hidden), 300)} if result["error"] else {}))
 
@@ -548,6 +549,19 @@ def entries(source: Iterable[str]) -> Iterator[dict]:
 
 def events(path: Path) -> Iterator[dict]:
     yield from normalized(lines(path))
+
+
+def last_message(path: Path, notice: re.Pattern[str] | None = None) -> str:
+    found = ""
+    try:
+        for event in events(path):
+            text = str(event.get("text") or "").strip()
+            if (event.get("kind") == "message" and event.get("role") == "assistant" and text
+                    and not (notice and notice.search(text))):
+                found = text
+    except OSError:
+        return ""
+    return found
 
 
 def normalized(source: Iterable[dict]) -> Iterator[dict]:
