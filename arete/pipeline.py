@@ -160,6 +160,9 @@ RESOLVE_SCHEMA = {
     "properties": {"resolved": {"type": "boolean"}, "summary": {"type": "string"}},
     "required": ["resolved", "summary"],
 }
+DISPOSABLE_DIRS = {"__pycache__", "node_modules", ".venv", "venv", ".pytest_cache", ".ruff_cache", ".mypy_cache",
+                   ".tox", ".next", ".turbo", ".cache", "dist", "build", "target", "coverage"}
+DISPOSABLE_FILES = {".DS_Store"}
 CONFLICT_MARKER = re.compile(r"^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)( |$)", re.MULTILINE)
 CI_FIX_SCHEMA = {
     "type": "object",
@@ -490,11 +493,71 @@ def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
             git(["worktree", "prune"], c.src, check=False)
 
 
-def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str) -> tuple[Path, list[Checkout]]:
+def made_copy(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
+    return (rel in copies and (source / rel).is_file() and (ws / rel).is_file()
+            and (ws / rel).read_bytes() == (source / rel).read_bytes())
+
+
+def disposable(rel: str) -> bool:
+    parts = rel.rstrip("/").split("/")
+    return parts[-1] in DISPOSABLE_FILES or any(p in DISPOSABLE_DIRS or p.endswith(".egg-info") for p in parts)
+
+
+def owned(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
+    return not disposable(rel) and not made_copy(ws, source, copies, rel)
+
+
+def ignored_files(wt: Path) -> list[str]:
+    return [r[3:] for r in util.git_records(["status", "--porcelain", "--ignored=matching",
+                                             "--untracked-files=normal"], wt) if r.startswith("!! ")]
+
+
+def unexamined(ws: Path, examined: set[Path], source: Path, copies: list[str]) -> list[str]:
+    if ws in examined or not ws.is_dir():
+        return []
+    found = []
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if Path(root, d) not in examined and d not in DISPOSABLE_DIRS]
+        names = (Path(root, f).relative_to(ws).as_posix() for f in files)
+        found += [rel for rel in names if owned(ws, source, copies, rel)]
+    return sorted(found)
+
+
+def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> str:
+    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
+    for c in checkouts:
+        if c.wt not in examined:
+            continue
+        try:
+            edits = [n for n in uncommitted(c.wt) if not made_copy(ws, source, copies, c.prefix + n)]
+            ignored = [n for n in ignored_files(c.wt) if owned(ws, source, copies, c.prefix + n)]
+            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip()
+        except RuntimeError as e:
+            return f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it is: {e}"
+        if edits or ignored or ahead != "0":
+            what = (f"uncommitted edits ({', '.join(edits[:5])})" if edits
+                    else f"git-ignored files that are not build output ({', '.join(ignored[:5])})" if ignored
+                    else f"{util.count(int(ahead), 'commit')} that are not on origin")
+            return (f"the existing worktree {c.wt} of {c.github} holds {what}, so arete did not make it again and "
+                    "left them as they are; move or remove them, then run again")
+    if others := unexamined(ws, examined, source, copies):
+        return (f"the existing workspace {ws} holds files outside this repo's worktrees ({', '.join(others[:5])}), "
+                "so arete did not make it again and left them as they are; move or remove them, then run again")
+    return ""
+
+
+def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
+    if why := kept_work(ws, checkouts, source, copies):
+        raise RunFailed(why)
+    remove_workspace(ws, checkouts)
+
+
+def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
+                   copies: list[str]) -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
     checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
                  for p in repo.parts]
-    remove_workspace(ws, checkouts)
+    clear_workspace(ws, checkouts, repo.path, copies)
     for c in checkouts:
         with record.timed(run_id, "clone", repo=c.github, base=c.base, branch=branch, path=str(c.wt)) as clone:
             fetch(c.src, c.base)
@@ -548,6 +611,11 @@ def git_reads(checkouts: list[Checkout]) -> list[str]:
 class Staged(diffguard.Diff):
     patch: str = ""
     changed: list[Checkout] = field(default_factory=list)
+    merged: list[Checkout] = field(default_factory=list)
+
+    @property
+    def empty(self) -> bool:
+        return not self.files and not self.merged
 
 
 def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -> Staged:
@@ -556,15 +624,25 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
         drop_untracked_bytecode(c.wt)
         against = git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() if from_base else "HEAD"
         diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
-        if not diff.counts:
+        merged = pending_merge(c)
+        if merged and not from_base:
+            brought = diffguard.between(c.wt, c.lease, c.merge, prefix=c.prefix).counts
+            diff.counts = {name: 0 for name in brought} | diff.counts
+        if merged:
+            out.merged.append(c)
+        elif not diff.counts:
             continue
         out += diff
         out.changed.append(c)
         out.patch += checkout_patch(c, diff.locks, "--cached", against)
-        if c.resolved and not from_base:
+        if merged and c.resolved and not from_base:
             out.patch += git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
                               c.base_commit, "HEAD", "--", *c.resolved], c.wt)
     return out
+
+
+def pending_merge(c: Checkout) -> bool:
+    return bool(c.merge and c.lease) and git(["rev-list", "--count", f"{c.lease}..{c.merge}"], c.wt).strip() != "0"
 
 
 def checkout_patch(c: Checkout, locks: list[str], *revs: str) -> str:
@@ -754,7 +832,7 @@ class Build(TicketWork):
 
     def require_valid_diff(self, after: str, planned: str = "") -> None:
         staged = self.restage()
-        if not staged.files:
+        if staged.empty:
             raise RunFailed(f"{after} undid every change")
         earlier = 0 if self.from_base else self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
         why = staged.refusal(self.layer.max_diff_lines, earlier=earlier)
@@ -1183,12 +1261,12 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         tk.prepare()
     run.enter("running")
 
-    ws, checkouts = make_workspace(run.id, repo, main_layer.base_branch, branch, t.id)
-    for c in checkouts:
-        run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
-    run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
-    note_fresh_bases(checkouts)
     try:
+        ws, checkouts = make_workspace(run.id, repo, main_layer.base_branch, branch, t.id, main_layer.copy)
+        for c in checkouts:
+            run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
+        run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
+        note_fresh_bases(checkouts)
         merge_moved_bases(run, [c for c in checkouts if c.resumes], main_layer, t)
     except RunFailed as e:
         return _fail(run, e.why, detail=e.detail)
@@ -1231,7 +1309,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         run.facts["left_for_a_person"] = left_for_a_person
         build_summary = res.structured.get("summary", "")
         replies = res.structured.get("replies") or []
-        if not stage(checkouts, deny).files:
+        if stage(checkouts, deny).empty:
             return answer_without_changes(run, ws, checkouts, branch, build_summary, replies)
     else:
         res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
@@ -1540,6 +1618,8 @@ def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
 
 def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
     for c in changed:
+        if not git(["diff", "--cached", "--name-only"], c.wt).strip():
+            continue
         try:
             util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         except RuntimeError as e:
@@ -1656,7 +1736,7 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
 
 def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int) -> None:
     staged = b.restage()
-    if not staged.files:
+    if staged.empty:
         raise RunFailed(f"{names} failed, caused by this PR, and the CI fix step changed nothing", ci.red_list(caused))
     if no_pr := [c.github for c in staged.changed if not c.pr]:
         raise RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",

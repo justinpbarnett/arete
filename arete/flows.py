@@ -52,7 +52,6 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
     job = Job(cfg, run, ws, slot=slot)
     if continues and not only and (moved := base_moved(continues)):
         run.log(f"{moved} since run {continues} prepared, so this run prepares again and redoes every step after it")
-        job.kept = unsaved_work(continues)
         again = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
                         restore=lambda line: restore(job, line))
@@ -63,26 +62,6 @@ def prepared_data(continues: str) -> dict:
                 if line.get("step") == "prepare" and line.get("result") == "pass"]
     data = prepared[-1].get("data") if prepared else None
     return data if isinstance(data, dict) else {}
-
-
-def unsaved_work(continues: str) -> str:
-    data = prepared_data(continues)
-    for c in data.get("checkouts") or []:
-        wt = Path(c.get("wt") or "")
-        if not (wt / ".git").exists():
-            continue
-        try:
-            edits = pipeline.uncommitted(wt)
-            kept = util.git(["rev-parse", "-q", "--verify", f"origin/{data.get('branch')}"], wt, check=False).strip()
-            ahead = util.git(["rev-list", "--first-parent", "--no-merges", "--count",
-                              f"{kept or c.get('base_commit') or 'HEAD'}..HEAD"], wt, check=False).strip()
-        except RuntimeError:
-            continue
-        if edits or ahead not in ("", "0"):
-            what = f"uncommitted edits ({', '.join(edits[:5])})" if edits else "commits that are not on origin"
-            return (f"{c.get('github')} holds {what} in {wt}, so arete did not prepare it again for the moved base "
-                    "and left them as they are")
-    return ""
 
 
 def base_moved(continues: str) -> str:
@@ -164,7 +143,6 @@ class Job:
     cfg: config.Config
     run: pipeline.Run
     ws: Path
-    kept: str = ""
     ticket: tracker.Ticket = field(default_factory=lambda: tracker.Ticket("", "", ""))
     branch: str = ""
     checkouts: list[pipeline.Checkout] = field(default_factory=list)
@@ -231,7 +209,7 @@ class Job:
         return self.built
 
     def staged(self) -> pipeline.Build:
-        if not self.b.staged.files:
+        if self.b.staged.empty:
             self.b.restage()
         return self.b
 
@@ -326,12 +304,12 @@ def end_as(result: str, kind: str, **fields) -> Outcome:
     return Outcome(result, feedback=fields.get("why") or fields.get("summary") or "", data={"ending": kind, **fields})
 
 
-def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path) -> list[pipeline.Checkout]:
+def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies: list[str]) -> list[pipeline.Checkout]:
     repo = run.repo
     checkouts = [pipeline.Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
                                    base or util.origin_default_branch(repo.path / p.dir))
                  for p in repo.parts or [config.Part("", repo.name)]]
-    pipeline.remove_workspace(ws, checkouts)
+    pipeline.clear_workspace(ws, checkouts, repo.path, copies)
     for c in checkouts:
         with record.timed(run.id, "clone", repo=c.github, base=c.base, branch=branch, path=str(c.wt)) as clone:
             pipeline.fetch(c.src, c.base)
@@ -381,17 +359,16 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         tk.prepare()
     if not run.alone:
         run.enter("running")
-    if job.kept:
-        return end_as("fail", "failed", why=job.kept)
-    if repo.parts and not run.dry_run:
-        checkouts = pipeline.make_workspace(run.id, repo, main_layer.base_branch, branch, run.tid)[1]
-    else:
-        checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws)
-    for c in checkouts:
-        run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
-    run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
-    pipeline.note_fresh_bases(checkouts)
     try:
+        if repo.parts and not run.dry_run:
+            checkouts = pipeline.make_workspace(run.id, repo, main_layer.base_branch, branch, run.tid,
+                                                main_layer.copy)[1]
+        else:
+            checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
+        for c in checkouts:
+            run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
+        run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
+        pipeline.note_fresh_bases(checkouts)
         pipeline.merge_moved_bases(run, [c for c in checkouts if c.resumes], main_layer, t)
     except pipeline.RunFailed as e:
         return end_as("fail", "failed", why=e.why, detail=e.detail)
@@ -465,7 +442,7 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if not res.ok or not isinstance(res.structured, dict):
         return end_as("fail", "failed", why="revise step failed", said=res.text)
     summary, replies = res.structured.get("summary", ""), res.structured.get("replies") or []
-    if not pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).files:
+    if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
         "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
@@ -505,7 +482,7 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
                     disallowed_tools=runner.NO_GIT_WRITES)
     if not res.ok:
         return end_as("fail", "failed", why="repair step failed", said=res.text)
-    if not pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).files:
+    if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("fail", "failed", said=res.text,
                       why=f"the builder changed nothing for the findings of run {found.run_id}, so they stay "
                           "unresolved")
@@ -611,7 +588,7 @@ def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
 
 def change(job: Job, staged: pipeline.Staged | None = None) -> tuple[pipeline.Staged, str, str]:
     staged = job.b.restage() if staged is None else staged
-    if not staged.files:
+    if staged.empty:
         raise pipeline.RunFailed("nothing was left to push, since the workspace holds no change")
     size = f"{len(staged.files)} files, {staged.lines} lines"
     return staged, size, f"{size}, review {job.review.get('verdict')}, in use {job.verified.verdict}"
@@ -636,9 +613,9 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             raise pipeline.RunFailed(f"{c.pr} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
                                      f"pushed nothing for the repair of run {run.repairs}")
     fresh = b.restage(from_base=False)
-    staged = b.restage(from_base=True) if not fresh.files or b.from_base else fresh
+    staged = b.restage(from_base=True) if fresh.empty or b.from_base else fresh
     staged, size, outcome = change(job, staged)
-    if not fresh.files:
+    if fresh.empty:
         for c in staged.changed:
             head = util.git(["rev-parse", "HEAD"], c.wt).strip()
             if pipeline.remote_head(c.src, job.branch) != head:
@@ -650,7 +627,7 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
     draft_why = pipeline.draft_reason(job.review, job.verified, job.reviews)
     revised = ("Revised for the review feedback on the PR.\n\n" if run.feedback else
                f"Repairs the review findings of run {run.repairs}.\n\n" if run.repairs else "")
-    if fresh.files:
+    if not fresh.empty:
         b.staged = fresh
         b.push(job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}")
         b.staged = staged
