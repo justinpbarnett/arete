@@ -24,6 +24,12 @@ ENV_NAME = paths.SCRATCH_ENV
 FOLDERS = ("fixtures", "config", "state", "out")
 SLOTS = ("config/config.toml", "state/arete.db", "fixtures/config.toml", "fixtures/fixture.db", "out/output.txt")
 MAX_LISTED = 500
+MAX_DIAGNOSTIC = 16000
+EXISTED = "existed before the attempt"
+LINKED = "has more than one link"
+ELSEWHERE = "on another device"
+UNCLASSIFIED = "cannot be classified"
+MISSING = "registered entry missing"
 MAX_SAVED_BYTES = 16 * 1024 * 1024
 HOOK = {"root": "", "id": "", "saves": ""}
 try:
@@ -592,11 +598,71 @@ def context(command: str, cwd: str) -> str:
         return ""
 
 
-def unknown_fd(a: Attempt, root: int) -> list[str]:
+def filesystem(fd: int) -> str:
+    if not paths.ON_MAC:
+        return ""
+    lib = ctypes.CDLL(None, use_errno=True)
+    call = getattr(lib, "fstatfs$INODE64", None) or lib.fstatfs
+    call.argtypes = (ctypes.c_int, ctypes.c_char_p)
+    buffer = ctypes.create_string_buffer(2168)
+    if call(fd, buffer):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return buffer.raw[72:88].split(b"\0")[0].decode("ascii", "replace")
+
+
+def creation_floor(a: Attempt, root_fd: int) -> int | None:
+    try:
+        if filesystem(root_fd) != "apfs":
+            return None
+    except OSError:
+        return None
+    if set(a.directories) - {"", *FOLDERS} or set(a.files) - {".gitignore", *SLOTS}:
+        return None
+    recorded = [a.directories[n] for n in ("", *FOLDERS) if n in a.directories]
+    recorded += [a.files[n] for n in (".gitignore", *SLOTS) if n in a.files]
+    if not recorded or any(device != a.directories[""][0] for device, _ in recorded):
+        return None
+    inodes = [inode for _, inode in recorded]
+    if inodes != sorted(set(inodes)):
+        return None
+    return inodes[-1]
+
+
+def refusal(st: os.stat_result, device: int, least: int | None) -> str:
+    if st.st_dev != device:
+        return ELSEWHERE
+    if least is None:
+        return UNCLASSIFIED
+    if not stat.S_ISDIR(st.st_mode) and st.st_nlink != 1:
+        return LINKED
+    if st.st_ino <= least:
+        return EXISTED
+    return ""
+
+
+def examined(folder: int, prefix: str, names, device: int, least: int | None, failed: dict, waiting: list) -> None:
+    for name in names:
+        try:
+            st = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        except OSError as error:
+            failed[prefix + name] = f"{UNCLASSIFIED}: {type(error).__name__}"
+            continue
+        reason = refusal(st, device, least)
+        if reason:
+            failed[prefix + name] = reason
+        elif stat.S_ISDIR(st.st_mode):
+            waiting.append((prefix + name, identity(st)))
+
+
+def unknown_fd(a: Attempt, root: int) -> dict[str, str]:
     checked(os.fstat(root), a.directories[""], True)
+    device, least = a.directories[""][0], creation_floor(a, root)
     names = set(os.listdir(root))
     expected = {n for n in a.directories if n} | {n for n in a.files if "/" not in n}
-    found = list(names - expected) + ["missing:" + n for n in expected - names]
+    failed = {"missing:" + n: MISSING for n in expected - names}
+    waiting: list[tuple[str, list[int]]] = []
+    examined(root, "", names - expected, device, least, failed, waiting)
     for name in names & expected:
         if name in a.files:
             checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.files[name])
@@ -605,15 +671,35 @@ def unknown_fd(a: Attempt, root: int) -> list[str]:
                 checked(os.fstat(folder), a.directories[name], True)
                 children = set(os.listdir(folder))
                 wanted = {n.partition("/")[2] for n in a.files if n.startswith(name + "/")}
-                found += [name + "/" + n for n in children - wanted]
-                found += ["missing:" + name + "/" + n for n in wanted - children]
+                failed.update({"missing:" + name + "/" + n: MISSING for n in wanted - children})
+                examined(folder, name + "/", children - wanted, device, least, failed, waiting)
                 for child in children & wanted:
                     checked(os.stat(child, dir_fd=folder, follow_symlinks=False), a.files[name + "/" + child])
             checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.directories[name], True)
-    return sorted(found)
+    while waiting:
+        path, expected_identity = waiting.pop()
+        try:
+            with paths.directory_fd(Path(path), root) as folder:
+                if identity(os.fstat(folder)) != expected_identity:
+                    raise OSError(errno.ESTALE, "resource replaced")
+                examined(folder, path + "/", os.listdir(folder), device, least, failed, waiting)
+        except OSError as error:
+            failed[path] = f"{UNCLASSIFIED}: {type(error).__name__}"
+    return failed
 
 
-def unknown(a: Attempt) -> list[str]:
+def named(failed: dict[str, str]) -> dict:
+    kept: list[str] = []
+    size = 0
+    for name in sorted(failed):
+        size += 2 * len(json.dumps(name)) + len(failed[name])
+        if len(kept) >= MAX_LISTED or size > MAX_DIAGNOSTIC:
+            break
+        kept.append(name)
+    return {"unknown_entries": kept, "reasons": {n: failed[n] for n in kept}, "omitted": len(failed) - len(kept)}
+
+
+def unknown(a: Attempt) -> dict[str, str]:
     with root_fd(a) as root:
         return unknown_fd(a, root)
 
@@ -753,9 +839,9 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
                 data = load(fd, key, a.selector)
                 data["snapshot"] = archived
                 store(fd, key, data)
-            unknown_entries = unknown(a)
-            if unknown_entries:
-                data["diagnostic"] = {"retained_root": a.root, "unknown_entries": unknown_entries[:MAX_LISTED]}
+            failed = unknown(a)
+            if failed:
+                data["diagnostic"] = {"retained_root": a.root, **named(failed)}
                 store(fd, key, data)
                 return archived, saved, kept
             kept = cleanup(a, data, fd, key)
@@ -835,9 +921,11 @@ def note(a: Attempt | None) -> str:
     return ("## Disposable fixtures\n\nHarness paths (data): " + json.dumps({"root": a.root, "slots": SLOTS}) +
             "\n\nUse these empty engine-created slots for fake configuration, SQLite state and output; rewrite them "
             "in place. Set ARETE_CONFIG_DIR and ARETE_STATE_DIR to this root's config and state folders. "
-            "Arbitrary entries and imported files have no ownership claim and keep the worktree retained. "
+            "Files and folders that you or the service create here are verification output: Arete archives them "
+            "with the scratch root, and they gain no ownership claim with the guard. Entries moved or hard-linked "
+            "in from elsewhere keep the worktree retained. "
             "Arete snapshots owned bytes, then archives the validated scratch root in protected evidence. "
-            "Unknown or replaced entries keep the worktree retained; failed preservation is retried by polling. "
+            "Imported, hard-linked or replaced entries keep the worktree retained; failed preservation is retried by polling. "
             "Scratch fixtures do not change the delivered implementation. Never copy real credentials or live state. "
             "Use fake transports before product calls. Unsupported confinement supplies no enhanced authority. "
             "The guard supplies authenticated snapshots as context; guards and JEV remain authoritative. "
