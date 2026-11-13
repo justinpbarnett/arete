@@ -6,7 +6,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import accounts, alerts, config, devices, install, paths, pi, runner, state, steps, util
+from . import accounts, alerts, codex, config, devices, install, paths, pi, runner, state, steps, util
 
 
 @dataclass
@@ -93,6 +93,13 @@ def check_codex_auth(cfg: config.Config) -> list[Check]:
         return []
     ok, detail = runner.codex_login()
     return [Check("codex:auth", ok, detail)]
+
+
+def check_codex_cleanup(cfg: config.Config) -> list[Check]:
+    if not uses_codex(cfg):
+        return []
+    found = codex.cleanup()
+    return [Check("codex:cleanup", found.status == "able", f"{found.status}: {found.detail}", "warn")]
 
 
 def check_oncall(cfg: config.Config) -> list[Check]:
@@ -287,6 +294,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_probes, cfg, force_probes),
         (check_claude_auth,),
         (check_codex_auth, cfg),
+        (check_codex_cleanup, cfg),
         (check_pi_auth, cfg),
         (check_hook,),
         (check_disk,),

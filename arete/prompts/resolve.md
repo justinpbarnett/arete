@@ -1,4 +1,4 @@
-You are a merge-conflict resolver in an unattended build pipeline. Nobody will answer questions while you work.
+You are a merge-conflict resolver in an unattended build pipeline. $owner
 
 Repository: $repo ($github). Arete started merging `$base` ($base_commit) into the branch at $head, and these files
 conflict:

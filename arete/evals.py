@@ -13,7 +13,9 @@ from . import config, environment, gh, paths, record, runner, scratch, state, tr
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
+    MAX_DIFF_IN_PROMPT,
     PLAN_SCHEMA,
+    REVIEW_SCHEMA,
     AgentRun,
     Checkout,
     RunFailed,
@@ -24,6 +26,7 @@ from .pipeline import (
     check_script,
     code_list,
     prompt,
+    review_problems,
     run_checks,
     use_product,
 )
@@ -57,6 +60,8 @@ class Task:
 class EvalRun(AgentRun):
     task: str = ""
     trial: str = ""
+    reviews: bool = False
+    checks_required: bool = False
 
     @property
     def ref(self) -> str:
@@ -309,6 +314,26 @@ def switched_prompt(which: str, wt: Path, task: Task, plan: str, summary: str, f
             f"\n\n## Current feedback\n\n{feedback}")
 
 
+def hidden_check(cfg: config.Config, repo: config.Repo, task: Task, wt: Path, timeout: float):
+    for rel, data in task.hidden_files.items():
+        dest = wt / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    return environment.sh(task.check, cfg, repo, cwd=wt, timeout=timeout)
+
+
+def review(run: EvalRun, wt: Path, task: Task, plan: str, report: str, evidence: str, diff: str, workspace: str,
+           timeout: float) -> int:
+    res = run.agent("review", prompt("review", repo=run.repo.name, workspace=workspace, ref=task.name,
+                                     title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
+                                     checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT)),
+                    wt, role="review", allowed_tools=bash_rules(config.DEFAULT_ALLOW_BASH),
+                    json_schema=REVIEW_SCHEMA, timeout=timeout)
+    if not res.ok or not isinstance(res.structured, dict):
+        raise RunFailed("review step failed")
+    return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
+
+
 def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run_id: str, dry_run: bool,
              prompts: Prompts, run: EvalRun | None = None) -> dict:
     run = run or EvalRun(id=run_id, repo=repo, dir=paths.RUNS_DIR / run_id / task.name, dry_run=dry_run,
@@ -319,7 +344,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
     wt = paths.WORKTREES_DIR / "-".join(filter(None, ["eval", repo.name, task.name, run.trial]))
     started = time.time()
     result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "paid": 0.0, "seconds": 0.0,
-              "repairs": 0, "failures": []}
+              "repairs": 0, "failures": [], "checks": "", "verify": "", "hidden": "", "blocking": None}
     try:
         if not task.check and not task.verify:
             raise RunFailed("the task has neither `check` nor `verify`")
@@ -384,26 +409,33 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
             result["repairs"] = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
             raise
         result["repairs"] = attempts - 1
+        result["checks"] = "pass" if ok else "fail"
         git(["add", "-A"], wt)
-        (run_dir / "diff.patch").write_text(git(["diff", "--cached", "HEAD"], wt))
-        failures = []
+        diff = git(["diff", "--cached", "HEAD"], wt)
+        (run_dir / "diff.patch").write_text(diff)
+        failures = ["repo checks failing"] if run.checks_required and not ok else []
+        evidence ="No check in use ran for this task."
         if task.verify:
             graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
+            result["verify"] = graded.verdict
+            evidence = graded.markdown()
             if graded.verdict != "pass":
                 failures.append(grade_failure(graded))
+        if run.reviews:
+            blocking = review(run, wt, task, plan, report, evidence, diff, workspace, run.time_for(timeout))
+            result["blocking"] = blocking
+            if blocking:
+                failures.append(util.count(blocking, "blocking review finding"))
         if task.check:
-            for rel, data in task.hidden_files.items():
-                dest = wt / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(data)
-            res = environment.sh(task.check, cfg, repo, cwd=wt, timeout=run.time_for(timeout))
+            res = hidden_check(cfg, repo, task, wt, run.time_for(timeout))
+            result["hidden"] = "pass" if res.returncode == 0 else "fail"
             (run_dir / "check.log").write_text(res.stdout + res.stderr)
             run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
             if res.returncode != 0:
                 failures.append(f"check exit {res.returncode}")
         result["passed"] = not failures
         result["failures"] = failures
-        result["why"] = "; ".join(failures) + ("" if ok or not failures else ", repo checks failing")
+        result["why"] = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
         return result
     except RunFailed as e:
         result["why"] = e.why

@@ -15,7 +15,23 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arete import claude, config, diffguard, factory, gh, lines, paths, pipeline, record, runlimits, state, tracker, util
+from arete import (
+    claude,
+    cli,
+    config,
+    diffguard,
+    factory,
+    gh,
+    lines,
+    paths,
+    pipeline,
+    record,
+    runlimits,
+    serve,
+    state,
+    tracker,
+    util,
+)
 
 
 class Isolated(unittest.TestCase):
@@ -697,7 +713,7 @@ class KeptEditsTests(Isolated):
         util.git(["checkout", "-q", "main"], src)
 
     def test_next_run_continues_on_the_kept_edits_over_the_pr_head(self):
-        ws, first = self.parked_edit()
+        _, first = self.parked_edit()
         kept, pr_head = self.head(first.wt), util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
         run = self.made_run()
         _, checkouts = self.start(run)
@@ -708,7 +724,7 @@ class KeptEditsTests(Isolated):
         self.assertEqual(pipeline.stage(checkouts, []).files, ["edit.txt"])
 
     def test_reset_worktree_is_refused_naming_both_commits(self):
-        ws, first = self.parked_edit()
+        _, first = self.parked_edit()
         kept = self.head(first.wt)
         util.git(["reset", "-q", "--hard", "HEAD~1"], first.wt)
         with self.assertRaises(pipeline.RunFailed) as refused:
@@ -718,7 +734,7 @@ class KeptEditsTests(Isolated):
         self.assertTrue((first.wt / ".git").exists())
 
     def test_moved_branch_is_merged_into_the_kept_edits(self):
-        ws, first = self.parked_edit()
+        _, first = self.parked_edit()
         kept = self.head(first.wt)
         self.push_from_elsewhere("moved.txt", "moved\n")
         new_head = util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
@@ -755,9 +771,9 @@ class KeptEditsTests(Isolated):
         wt, pr_head = checkouts[0].wt, self.head(checkouts[0].wt)
         (wt / "edit.txt").write_text("edit\n")
         staged = pipeline.stage(checkouts, [])
-        with patch.object(pipeline, "remote_head", return_value="someone-else"):
-            with self.assertRaises(pipeline.RunFailed):
-                pipeline.commit_and_push(checkouts, staged.changed, self.BRANCH, "work")
+        with patch.object(pipeline, "remote_head", return_value="someone-else"), \
+                self.assertRaises(pipeline.RunFailed):
+            pipeline.commit_and_push(checkouts, staged.changed, self.BRANCH, "work")
         committed = self.head(wt)
         self.assertNotEqual(committed, pr_head)
         pipeline.keep_edits(run)
@@ -806,16 +822,128 @@ class KeptEditsTests(Isolated):
         self.assertTrue(any(line.get("carried") == earlier for line in lines.read("later")))
 
     def test_conflicting_move_with_a_failed_resolver_leaves_the_kept_commit(self):
-        ws, first = self.parked_edit("shared.txt", "mine\n")
+        _, first = self.parked_edit("shared.txt", "mine\n")
         kept = self.head(first.wt)
         self.push_from_elsewhere("shared.txt", "theirs\n")
         run = self.made_run()
         _, checkouts = self.start(run)
-        with patch.object(pipeline, "resolve_conflicts", side_effect=pipeline.RunFailed("resolver failed")):
-            with self.assertRaises(pipeline.RunFailed):
-                pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        with patch.object(pipeline, "resolve_conflicts", side_effect=pipeline.RunFailed("resolver failed")), \
+                self.assertRaises(pipeline.RunFailed):
+            pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
         self.assertEqual(self.head(checkouts[0].wt), kept)
         self.assertEqual(util.git(["status", "--short"], checkouts[0].wt).strip(), "")
+
+
+class RecordRetentionTests(Isolated):
+    def written(self, rid, days, size=1000):
+        folder = paths.record_dir(rid)
+        folder.mkdir(parents=True)
+        (folder / "call.jsonl.gz").write_bytes(b"x" * size)
+        (folder.parent / "run.log").write_text("log\n")
+        at = time.time() - days * 86400
+        os.utime(folder / "call.jsonl.gz", (at, at))
+        os.utime(folder, (at, at))
+        return folder
+
+    def proposal(self, run_id, evidence):
+        state.add_proposal(run_id, {"layer": "repo", "repo": "r", "file": "f", "change": "c", "why": "w",
+                                    "evidence": evidence, "confidence": 0.9}, "hand")
+
+    def test_age_removes_only_the_old_record(self):
+        old, new = self.written("pip-old", 40), self.written("pip-new", 2)
+        found = record.prune(30, 20)
+        self.assertEqual([r.run_id for r in found.removed], ["pip-old"])
+        self.assertFalse(old.exists())
+        self.assertTrue((old.parent / "run.log").is_file())
+        self.assertTrue(new.exists())
+
+    def test_size_removes_oldest_first(self):
+        folders = [self.written(f"pip-{n}", d) for n, d in (("a", 3), ("b", 2), ("c", 1))]
+        found = record.prune(30, 1500 / record.GB)
+        self.assertEqual([r.run_id for r in found.removed], ["pip-a", "pip-b"])
+        self.assertEqual([f.exists() for f in folders], [False, False, True])
+        self.assertFalse(found.over)
+
+    def test_pinned_and_cited_records_stay_until_released(self):
+        pinned, by_run, by_text = (self.written(n, 40) for n in ("pip-pinned", "pip-run", "pip-text"))
+        record.pin("pip-pinned")
+        self.proposal("pip-run", [])
+        self.proposal("min-x", ["run pip-text at 10:00"])
+        self.assertEqual(record.prune(30, 20).removed, ())
+        record.unpin("pip-pinned")
+        state.move_proposal(1, ("hand",), "rejected")
+        self.assertEqual([r.run_id for r in record.prune(30, 20).removed], ["pip-pinned", "pip-run"])
+        self.assertTrue(by_text.exists())
+        state.move_proposal(2, ("hand",), "skipped")
+        record.prune(30, 20)
+        self.assertFalse(by_text.exists())
+        self.assertFalse(pinned.exists() or by_run.exists())
+
+    def test_running_and_fresh_records_stay_over_the_limit(self):
+        rid = record.start("pipeline", repo="r", issue=1)
+        running = self.written(rid, 40, 5000)
+        fresh = self.written("pip-fresh", 0, 5000)
+        found = record.prune(30, 1 / record.GB)
+        self.assertEqual(found.removed, ())
+        self.assertTrue(found.over)
+        self.assertTrue(running.exists() and fresh.exists())
+
+    def test_symlinked_run_folder_is_never_scanned_or_removed(self):
+        target = self.written("pip-real", 40)
+        (paths.RUNS_DIR / "alias").symlink_to(paths.RUNS_DIR / "pip-real", target_is_directory=True)
+        self.assertEqual([r.run_id for r in record.stored()], ["pip-real"])
+        record.pin("pip-real")
+        self.assertEqual(record.prune(30, 20).removed, ())
+        self.assertTrue(target.exists())
+
+    def test_unreadable_record_is_left_out_of_the_scan(self):
+        self.written("pip-a", 40)
+        self.written("pip-b", 40)
+        real = os.walk
+
+        def walk(top, *args, onerror=None, **kwargs):
+            if "pip-a" in str(top):
+                onerror(PermissionError("denied"))
+                return iter(())
+            return real(top, *args, onerror=onerror, **kwargs)
+
+        with patch.object(os, "walk", walk):
+            self.assertEqual([r.run_id for r in record.stored()], ["pip-b"])
+
+    def test_retention_table(self):
+        self.assertEqual(config.retention_table({}), config.Retention(30, 20))
+        self.assertEqual(config.retention_table({"days": 0.5}), config.Retention(0.5, 20))
+        for bad in ({"days": 0}, {"max_gb": "x"}, {"days": True}, {"weeks": 1}):
+            with self.assertRaises(ValueError):
+                config.retention_table(bad)
+
+    def test_pin_commands(self):
+        self.written("pip-a", 1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["record", "pin", "pip-a"]), 0)
+            self.assertEqual(state.record_pins(), {"pip-a"})
+            self.assertEqual(cli.main(["record", "pin", "nope"]), 1)
+            self.assertEqual(cli.main(["record", "pin"]), 2)
+            self.assertEqual(cli.main(["record", "unpin", "pip-a"]), 0)
+            self.assertEqual(cli.main(["record", "unpin", "pip-a"]), 1)
+            self.assertEqual(cli.main(["record", "pip-a"]), 0)
+
+    def test_serve_prune_removes_records_and_prunes_state_once(self):
+        old = self.written("pip-old", 40)
+        server = serve.Server()
+        with patch.object(state, "prune") as pruned:
+            server.prune()
+        pruned.assert_called_once_with()
+        self.assertFalse(old.exists())
+
+    def test_store_reports_size_oldest_and_pins(self):
+        self.written("pip-a", 5, 1000)
+        self.written("pip-b", 1, 500)
+        record.pin("pip-b")
+        found = record.store()
+        self.assertEqual((found["bytes"], found["records"], found["pins"]), (1500, 2, 1))
+        self.assertEqual(found["oldest"]["run_id"], "pip-a")
+        self.assertEqual(record.size_text(1500), "1.5 KB")
 
 
 if __name__ == "__main__":
