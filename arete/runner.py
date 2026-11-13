@@ -290,6 +290,10 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if resume.runner != which:
         resume = NO_SESSION
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
+    if refusal and target.remote:
+        trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
+        return attempt(which, name, prompt, cwd, resume, cfg, trace, trace[0] or record.new_id("call"), target,
+                       {**kw, "remote": target, "budget_error": refusal}, tier, kind, accounts.Auth(), route)
     if which == "pi" and target.remote:
         return Result(ok=False, error=pi.REMOTE_AUTH_UNVERIFIED, runner=which, model=name,
                       provider=provider_of(name), session=resume)

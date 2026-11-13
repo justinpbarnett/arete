@@ -14,7 +14,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from string import Template
@@ -276,8 +276,10 @@ class AgentRun:
         if s and s.requires.declared and not cfg.replay.all:
             size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
             found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer)
-            picked = routing.select(found, s, request_tokens=size)
-            kw["route"] = routing.described_selection(picked, s, size)
+            servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers", {})
+            effective = replace(s, mcp=tuple(dict.fromkeys((*s.mcp, *servers))))
+            picked = routing.select(found, effective, request_tokens=size)
+            kw["route"] = routing.described_selection(picked, effective, size)
             if picked.error:
                 kw["refusal"] = picked.error
             elif alternative := picked.route:
