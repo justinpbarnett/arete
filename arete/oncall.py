@@ -220,6 +220,13 @@ def run_line(line: str) -> dict | None:
     return row if isinstance(row, dict) and all(k in row for k in lines.FIXED if k != "ts") else None
 
 
+def same_owner(line: str, row: dict | None) -> bool:
+    other = run_line(line)
+    if row is None:
+        return other is None
+    return other is not None and other["run"] == row["run"]
+
+
 def run_text(row: dict) -> str:
     said = util.first_line(str(row.get("message") or row.get("error") or ""), 300)
     return f"{row['event']} {row.get('step') or ''}: {said}".strip()
@@ -330,6 +337,12 @@ def owner_text(cfg: config.Config, incident: dict) -> tuple[str, str]:
     return vision, scope
 
 
+def policies(cfg: config.Config, source: str) -> frozenset[tuple[str, str]]:
+    found = {(s.vision or cfg.oncall.vision, s.scope or cfg.oncall.scope) for s in cfg.oncall.sources
+             if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))}
+    return frozenset(found or {(cfg.oncall.vision, cfg.oncall.scope)})
+
+
 def questions(cfg: config.Config, incident: dict) -> dict[str, dict]:
     vision, scope = owner_text(cfg, incident)
     asking = {"injection": jev.yes_no(jev.INJECTION), "actionable": jev.yes_no(ACTIONABLE)}
@@ -359,9 +372,12 @@ def owner_run(row: dict) -> str:
     if row["class"] == STALLED:
         return ""
     where = Path(row["source"])
-    if where.name != lines.FILE or where.parent.parent != paths.RUNS_DIR:
+    if where.name == lines.FILE and where.parent.parent == paths.RUNS_DIR:
+        run_id = where.parent.name
+    else:
+        run_id = next((str(r["run"]) for r in map(run_line, str(row.get("evidence") or "").splitlines()) if r), "")
+    if not run_id:
         return ""
-    run_id = where.parent.name
     found = state.run_get(run_id) or {}
     if found.get("status") == "running" and not process_gone(found):
         return run_id
@@ -394,6 +410,9 @@ def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, row: dict) -> tu
     for name, text in zip(("vision", "scope"), owner_text(cfg, row), strict=True):
         if not text:
             return UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0
+    if len(policies(cfg, row["source"])) > 1:
+        why = "more than one [[oncall.source]] vision or scope applies to this file, so the owner decides"
+        return UNSURE, least, why, answers, 0
     return WAKE, least, "actionable, fits the vision and is in scope", answers, 0
 
 
@@ -447,7 +466,7 @@ def decide(cfg: config.Config, budget: int = MAX_ASKS) -> dict:
     counts: dict[str, int] = {}
     now = util.iso()
     ask = []
-    for row in sorted(state.open_incidents(), key=lambda r: r["id"]):
+    for row in state.incidents_to_decide():
         if not due(row, now):
             continue
         if owner := owner_run(row):
@@ -486,11 +505,13 @@ def known_twins(cfg: config.Config, rows: list[tuple], budget: int = MAX_ASKS) -
     line, injection_line = thresholds(cfg)
     fresh, candidates = [], []
     homes = {r["id"]: origin_repo(r["source"], r["repo"]) for r in open_rows}
+    rules = {r["id"]: policies(cfg, r["source"]) for r in open_rows}
     for row in rows:
         home = origin_repo(row[2], row[3])
-        same = [r for r in open_rows if homes[r["id"]] == home][:TWINS_OFFERED]
+        rule = policies(cfg, row[2])
+        same = [r for r in open_rows if homes[r["id"]] == home and rules[r["id"]] == rule][:TWINS_OFFERED]
         if (row[0] not in known and same and not refused(cfg, home)
-                and not owner_run({"class": row[1], "source": row[2]})):
+                and not owner_run({"class": row[1], "source": row[2], "evidence": row[6]})):
             fresh.append(row)
             candidates.append(same)
     fresh, candidates = fresh[:budget], candidates[:budget]
@@ -513,7 +534,8 @@ def known_twins(cfg: config.Config, rows: list[tuple], budget: int = MAX_ASKS) -
             said = (f"decided {IGNORE} (confidence {flagged.confidence:.2f}): {injected(flagged)}; "
                     f"injection yes {flagged.confidence:.2f}")
             marks[row[0]] = (fields, said)
-        elif a and flagged and a.value != "new" and a.value in q["twin"]["criteria"] and a.sure(line):
+        elif (a and flagged and flagged.value is False and flagged.sure(line) and a.value != "new"
+              and a.value in q["twin"]["criteria"] and a.sure(line)):
             note = (f"JEV matches a differently worded symptom to this incident ({a.note()}): "
                     f"{outbound.plain(row[4], 200)}")
             matched.append((row[0], int(str(a.value)[1:]), note))
@@ -556,8 +578,14 @@ class Watch:
                     text, i = f"Traceback: {final}".strip(), last + 1
             else:
                 continue
-            window = rows[max(0, begin - CONTEXT_LINES):last + CONTEXT_LINES + 1]
-            self.add(classify(text, row), origin.scope, text, name, origin.repo, window)
+            near = rows[max(0, begin - CONTEXT_LINES):last + CONTEXT_LINES + 1]
+            window = [r for r in near if same_owner(r, row)]
+            repo, scope = origin.repo, origin.scope
+            if row and not repo:
+                repo = (state.run_get(str(row["run"])) or {}).get("repo") or ""
+                if repo:
+                    scope = f"{origin.scope}:{repo}"
+            self.add(classify(text, row), scope, text, name, repo, window)
 
     def follow(self, group: str, watched: list[str], origin: Origin) -> None:
         stored, marks = cursor_value(PREFIX + group)

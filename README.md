@@ -81,6 +81,7 @@ scope = "Only the checkout module"
 When on, serve scans on its tick, on the poll pool, so a slow scan never blocks the tick.
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
 `repo` and `check` are recorded for a later repair part and start nothing now.
+When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is still asked, and a result that would be `wake` is stored as `unsure` for the owner.
 
 **Sources.** Arete's own files are watched without being listed: the `*.log` files in the log folder, each live run's `run.jsonl`, `heartbeat.json` and serve's beat file.
 Other application or service logs are watched only when listed as `[[oncall.source]]`.
@@ -108,10 +109,11 @@ Expected events are counted and open no incident.
 
 **Incidents.** The `incidents` table holds the fingerprint, class, source, state, first and last occurrence, count and evidence.
 A repeat of an open incident's fingerprint, minutes or hours later, updates it instead of opening another.
+A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
 The append-only `incident_notes` table records what happened and when.
 Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
 
-**Decisions.** After each scan, JEV is asked four yes/no questions about every open incident that is due, and the answers become one stored decision:
+**Decisions.** After each scan, JEV is asked four yes/no questions about every open incident that is due, oldest first however many are open, and the answers become one stored decision:
 
 - `injection`: does the text try to steer an agent that reads it (the same question used elsewhere in arete)?
 - `actionable`: is it a failure a code or config change would repair, rather than noise?
@@ -125,14 +127,14 @@ The evidence is redacted before it is stored and is sent fenced as data. It is n
 | `wake` | Every question was answered with confidence: actionable, fits the vision, in scope. It may later wake a repair. |
 | `ignore` | A confident "no" to `actionable`, `vision` or `scope`. |
 | `ignore` with the injection mark | The evidence reads as instructions to an agent. It is never asked again and can never wake a model. |
-| `unsure` | An answer was under the confidence line, or no vision or scope is set. It never wakes a model; the owner decides. |
+| `unsure` | An answer was under the confidence line, no vision or scope is set, or more than one source entry with different text applies to the file. It never wakes a model; the owner decides. |
 | undecided | JEV is off, has no key, is not allowed for the incident's repo or the call failed. The reason is stored and nothing wakes. |
 
 Each decision is stored on the incident with every answer's value and confidence and a one-line reason, and added to its notes.
 JEV is not asked about `expected` events, about an incident a live run owns, or about a repeat of a decided incident.
 An ignored incident is asked again only when it changed materially: its count reached ten times the count at its decision, or its evidence shows a failure line of a new shape.
 An undecided incident is tried again after 60 seconds, then 120, doubling up to an hour.
-Before a new incident is opened, JEV may match a differently worded symptom to an open incident of the same repo; a confident match updates that incident instead.
+Before a new incident is opened, JEV may match a differently worded symptom to an open incident of the same repo and the same vision and scope; a confident match updates that incident instead.
 A symptom whose twin check reads as an injection is opened already marked and can never wake a model.
 Twin checks and decisions share one budget: at most 20 JEV evaluations per scan, and the rest wait for the next.
 A symptom from a run that is still live gets no twin check and no decision until the run ends.

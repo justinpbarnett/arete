@@ -675,8 +675,9 @@ def reply(state, questions):
 
 def fake(items, cfg):
     with open(CALLS, "a") as f:
-        f.write(json.dumps([{"ids": sorted(q), "instructions": {k: v["instructions"] for k, v in q.items()}}
-                            for _, q in items]) + "\\n")
+        f.write(json.dumps([{"ids": sorted(q), "instructions": {k: v["instructions"] for k, v in q.items()},
+                             "text": t, "options": sorted(q["twin"]["criteria"]) if "twin" in q else []}
+                            for t, q in items]) + "\\n")
     return [reply(state, questions) for state, questions in items]
 
 oncall.ask_jev = fake
@@ -970,6 +971,172 @@ class Decisions(Scratch):
         self.scanned()
         one = self.only()
         self.assertEqual(one["decision"], "wake")
+
+    def started(self, repo, issue):
+        res = self.py(f"from arete import record\nprint(record.start('pipeline', repo={repo!r}, issue={issue}, "
+                      "pid=999999))")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        run = res.stdout.strip()
+        self.sql("UPDATE runs SET status = 'failed' WHERE id = ?", run)
+        return run
+
+    def test_an_old_undecided_incident_behind_500_decided_ones_is_asked(self):
+        self.baseline()
+        columns = ("fingerprint, class, source, repo, signature, first_seen, last_seen, count, evidence, "
+                   "decision, confidence, reason, decided_count")
+        self.sql(f"INSERT INTO incidents ({columns}) VALUES ('old', 'unexpected', 'app.log', '', 'old undecided', "
+                 "'2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 1, 'OLD EVIDENCE worker died', '', 0.0, '', 0)")
+        self.sql("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) "
+                 f"INSERT INTO incidents ({columns}) SELECT 'n' || i, 'unexpected', 'app.log', '', 'newer ' || i, "
+                 "?, ?, 1, 'e', 'wake', 0.9, 'r', 1 FROM n", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z")
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        (batch,) = self.calls()
+        self.assertEqual(len(batch), 1)
+        self.assertIn("OLD EVIDENCE", batch[0]["text"])
+        ((decision, reason),) = self.sql("SELECT decision, reason FROM incidents WHERE fingerprint = 'old'")
+        self.assertEqual(decision, "wake")
+        self.assertTrue(reason)
+
+    def test_twin_candidates_follow_the_source_policy(self):
+        base = Path(self.tmp.name)
+        a, b, c = (base / f"{n}.log" for n in "abc")
+        text = DECIDING
+        for log in (a, c):
+            text += f'[[oncall.source]]\npath = "{log}"\n'
+        text += f'[[oncall.source]]\npath = "{b}"\nscope = "Only the mailer module"\n'
+        self.write_config(text)
+        for log in (a, b, c):
+            log.write_text("2026-11-13T10:00:00Z INFO started\n")
+        rules = {"ledger": {"twin": ["i1", 0.95]}, "crashed": {"twin": ["i1", 0.95]}}
+        self.scanned(rules)
+        self.append(self.failure_line("payment worker died: KeyError amount"), to=a)
+        self.scanned(rules)
+        self.calls()
+        self.append(self.failure_line("payments ledger write failed: KeyError"), to=b)
+        self.scanned(rules)
+        (batch,) = self.calls()
+        self.assertEqual([q["ids"] for q in batch], [FOUR])
+        self.assertIn("Only the mailer module", batch[0]["instructions"]["scope"])
+        rows = {r[0]: r for r in self.sql("SELECT id, source, decision, count, evidence FROM incidents")}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[2][1], rows[2][2]), (str(b), "wake"))
+        self.assertEqual(rows[1][3], 1)
+        self.assertNotIn("ledger", rows[1][4])
+        self.append(self.failure_line("payment worker crashed: KeyError on amount"), to=c)
+        self.scanned(rules)
+        (batch,) = self.calls()
+        self.assertEqual([q["options"] for q in batch if q["options"]], [["i1", "new"]])
+        rows = {r[0]: r for r in self.sql("SELECT id, count FROM incidents")}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1][1], 2)
+
+    def test_a_run_row_in_an_arete_folder_log_keeps_the_repo_of_its_run(self):
+        self.write_config(DECIDING + f'[[repo]]\nname = "demo"\npath = "{self.tmp.name}"\njev = false\n')
+        run = self.started("demo", 7)
+        self.baseline()
+        row = {"ts": "2026-11-13T12:00:00Z", "run": run, "seq": 9, "event": "error", "step": "build",
+               "message": "boom in the demo build"}
+        self.append(json.dumps(row), to=self.logs / "runs.log")
+        self.scanned()
+        self.assertEqual(self.calls(), [])
+        rows = self.sql("SELECT decision, repo, reason FROM incidents")
+        self.assertEqual(rows, [("", "demo", "JEV is not allowed for repo demo")])
+
+    def test_run_rows_from_two_repos_never_share_an_incident(self):
+        (Path(self.tmp.name) / "shop").mkdir()
+        self.write_config(DECIDING + f'[[repo]]\nname = "shop"\npath = "{Path(self.tmp.name) / "shop"}"\n'
+                          f'[[repo]]\nname = "demo"\npath = "{self.tmp.name}"\njev = false\n')
+        self.baseline()
+
+        def failure(repo, issue, context):
+            run = self.started(repo, issue)
+            path = self.state / "runs" / run / "run.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rows = [{"ts": "2026-11-13T12:00:00Z", "run": run, "seq": 8, "event": "note", "step": "build",
+                     "message": context},
+                    {"ts": "2026-11-13T12:00:01Z", "run": run, "seq": 9, "event": "error", "step": "build",
+                     "message": "build broke with exit 2"}]
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+        down = {"build broke": {"error": "HTTP 503"}}
+        failure("shop", 1, "shop context")
+        self.assertEqual(self.scanned(down)["decisions"], {"undecided": 1})
+        self.calls()
+        failure("demo", 2, "DEMO PRIVATE CONTEXT")
+        self.scanned(down)
+        self.sql("UPDATE incidents SET retry_at = ''")
+        self.scanned()
+        sent = [q["text"] for batch in self.calls() for q in batch]
+        self.assertFalse([t for t in sent if "DEMO PRIVATE" in t])
+        rows = self.sql("SELECT repo, decision, reason, evidence FROM incidents ORDER BY repo")
+        self.assertEqual([r[0] for r in rows], ["demo", "shop"])
+        self.assertEqual(rows[1][1], "wake")
+        self.assertNotIn("DEMO PRIVATE", rows[1][3])
+        self.assertEqual(rows[0][1:3], ("", "JEV is not allowed for repo demo"))
+
+    def test_a_live_run_with_no_run_file_still_owns_its_incident(self):
+        code = ("import os\nfrom arete import record\n"
+                "print(record.start('pipeline', repo='demo', issue=7, pid=os.getppid()))")
+        run = self.py(code).stdout.strip().splitlines()[-1]
+        self.baseline()
+        failure = {"ts": "2026-11-13T12:00:00Z", "run": run, "seq": 9, "event": "error", "step": "build",
+                   "message": "boom in the demo build"}
+        self.append(json.dumps(failure), to=self.logs / "runs.log")
+        self.scanned()
+        self.assertEqual(self.calls(), [])
+        ((decision, repo, reason),) = self.sql("SELECT decision, repo, reason FROM incidents")
+        self.assertEqual((decision, repo), ("", "demo"))
+        self.assertIn("owns it", reason)
+
+    def test_a_twin_answer_with_an_unsure_injection_answer_is_not_merged(self):
+        self.baseline()
+        rules = {"crashed": {"twin": ["i1", 0.95], "injection": 0.49}}
+        self.append(self.failure_line("payment worker died: KeyError amount"))
+        self.scanned(rules)
+        self.calls()
+        self.append(self.failure_line("payment worker crashed: KeyError on amount"))
+        self.scanned(rules)
+        rows = {r[0]: r for r in self.sql("SELECT id, count, decision FROM incidents")}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1][1:], (1, "wake"))
+
+    def test_interleaved_run_rows_in_one_log_never_carry_another_repos_context(self):
+        (Path(self.tmp.name) / "shop").mkdir()
+        self.write_config(DECIDING + f'[[repo]]\nname = "shop"\npath = "{Path(self.tmp.name) / "shop"}"\n'
+                          f'[[repo]]\nname = "demo"\npath = "{self.tmp.name}"\njev = false\n')
+        demo, shop = self.started("demo", 2), self.started("shop", 1)
+        self.baseline()
+
+        def row(run, seq, event, message):
+            return json.dumps({"ts": "2026-11-13T12:00:00Z", "run": run, "seq": seq, "event": event,
+                               "step": "build", "message": message})
+
+        self.append(row(demo, 8, "note", "DEMO PRIVATE CONTEXT"), row(shop, 9, "error", "build broke with exit 2"),
+                    row(demo, 10, "note", "DEMO PRIVATE AFTER"), to=self.logs / "runs.log")
+        self.scanned()
+        sent = [q["text"] for batch in self.calls() for q in batch]
+        self.assertFalse([t for t in sent if "DEMO PRIVATE" in t])
+        rows = self.sql("SELECT repo, decision, evidence FROM incidents")
+        self.assertEqual([r[:2] for r in rows], [("shop", "wake")])
+        self.assertNotIn("DEMO PRIVATE", rows[0][2])
+
+    def test_two_source_entries_with_different_scopes_never_wake(self):
+        app = Path(self.tmp.name) / "app"
+        app.mkdir()
+        mailer = app / "mailer.log"
+        mailer.write_text("2026-11-13T10:00:00Z INFO started\n")
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{mailer}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        self.calls()
+        self.append(self.failure_line("payments ledger write failed: KeyError"), to=mailer)
+        self.assertEqual(self.scanned()["decisions"], {"unsure": 2})
+        self.assertEqual(self.ids(), [[FOUR, FOUR]])
+        rows = self.sql("SELECT decision, reason FROM incidents")
+        self.assertEqual(len(rows), 2)
+        for decision, reason in rows:
+            self.assertEqual(decision, "unsure")
+            self.assertIn("owner decides", reason)
 
 
 if __name__ == "__main__":

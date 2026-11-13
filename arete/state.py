@@ -823,6 +823,13 @@ def open_incidents(limit: int = 500) -> list[dict]:
                                            "ORDER BY last_seen DESC, id DESC LIMIT ?", (limit,))]
 
 
+def incidents_to_decide() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM incidents WHERE state = 'open' AND injection = 0 AND class != 'expected' "
+            "AND decision IN ('', 'ignore') ORDER BY id")]
+
+
 def known_fingerprints() -> set[str]:
     with db() as c:
         return {r[0] for r in c.execute(
