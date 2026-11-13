@@ -29,7 +29,7 @@ def has_arete_mark(body: str | None) -> bool:
 def auth_token() -> str:
     if paths.ISOLATED:
         return ""
-    res =util.sh(["gh", "auth", "token"], timeout=10)
+    res = util.sh(["gh", "auth", "token"], timeout=10)
     return res.stdout.strip() if res.returncode == 0 else ""
 
 

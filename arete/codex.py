@@ -188,9 +188,9 @@ def owner_hooks_off() -> dict[str, dict]:
     return off
 
 
-def guard_hook(judge: bool) -> list[str]:
+def guard_hook(judge: bool, scratch: tuple[str, ...] = ()) -> list[str]:
     entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); from arete.cli import main; raise SystemExit(main())"
-    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else [])])
+    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else []), *scratch])
     entry = [{"matcher": "*", "hooks": [{"type": "command", "command": hook, "timeout": guard.HOOK_TIMEOUT_SECONDS}]}]
     off = owner_hooks_off()
     return [*setting("hooks.PreToolUse", entry), *(setting("hooks.state", off) if off else [])]
@@ -257,6 +257,7 @@ def command(
     passing: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     hidden: list[Path | str] = (),
+    scratch: tuple[str, ...] = (),
 ) -> list[str]:
     try:
         if any((home() / name).exists() for name in ("AGENTS.override.md", "AGENTS.md")):
@@ -288,7 +289,7 @@ def command(
         system = "\n\n".join(filter(None, [system, repo_instructions(cwd)]))
     if system:
         cmd += setting("developer_instructions", system)
-    cmd += guard_hook(judge)
+    cmd += guard_hook(judge, scratch)
     cmd += mcp_settings(mcp_config, allowed_tools)
     return [*cmd, "-"]
 
@@ -342,6 +343,7 @@ def _run(
     hidden: list[Path | str] = (),
     on_line: Callable[[str], None] = lambda line: None,
     auth: accounts.Auth | None = None,
+    scratch: tuple[str, ...] = (),
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth()
     resume = resume if resume.runner == "codex" else NO_SESSION
@@ -368,7 +370,7 @@ def _run(
     try:
         cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                       system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, instructions=instructions,
-                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden)
+                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch)
     except ValueError as e:
         return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
     if json_schema:
@@ -515,7 +517,7 @@ def reset_time(text: str) -> datetime | None:
 def login(env: dict | None = None) -> tuple[bool, str, str]:
     if paths.ISOLATED:
         return False, paths.ISOLATED_LOGINS, ""
-    res =util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env(), inherit=False)
+    res = util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env(), inherit=False)
     said = f"{res.stdout}\n{res.stderr}"
     if "ChatGPT" in said and res.returncode == 0:
         return True, "logged in with ChatGPT", CHATGPT_PROVIDER

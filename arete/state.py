@@ -417,7 +417,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
 @contextmanager
 def db():
     paths.ensure_dirs()
-    conn = sqlite3.connect(paths.DB_FILE, timeout=30)
+    conn = sqlite3.connect(paths.safe_db(paths.DB_FILE), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     for table, column, sql in MIGRATIONS:
@@ -437,7 +437,7 @@ def ensure_schema() -> None:
 
 @contextmanager
 def reader():
-    conn = sqlite3.connect(f"{paths.DB_FILE.absolute().as_uri()}?mode=ro", uri=True, timeout=30)
+    conn = sqlite3.connect(f"{paths.safe_db(paths.DB_FILE).absolute().as_uri()}?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -636,11 +636,6 @@ def mark_seen(source: str, keys: list[str]) -> None:
     with db() as c:
         c.executemany("INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
                       [(source, str(k), util.iso()) for k in keys])
-
-
-def forget_seen(source: str, keys: list[str]) -> None:
-    with db() as c:
-        c.executemany("DELETE FROM seen WHERE source = ? AND key = ?", [(source, str(k)) for k in keys])
 
 
 def cursor(source: str) -> dict | None:

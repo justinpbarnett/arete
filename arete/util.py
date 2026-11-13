@@ -345,9 +345,11 @@ def lock_is_held(name: str) -> bool:
 
 def read_env_file(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
-    if not path.exists():
+    try:
+        text = paths.read_confined(path).decode()
+    except FileNotFoundError:
         return out
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue

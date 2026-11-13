@@ -380,9 +380,10 @@ def environment_table(data, layer: bool = False) -> Environment:
 
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
-    if not path.exists():
+    try:
+        data = tomllib.loads(paths.read_confined(path).decode())
+    except FileNotFoundError:
         return Config()
-    data = tomllib.loads(path.read_text())
     cfg = Config(
         alert_repo=data.get("alert_repo", ""),
         global_repo=data.get("global_repo", "ai"),

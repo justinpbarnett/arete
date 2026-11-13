@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import paths
+
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 LOOKUP_TIMEOUT = 3
 MAX_METADATA = 64 * 1024
@@ -42,8 +44,7 @@ def mapping(value) -> dict:
 
 def read(path: Path) -> dict:
     try:
-        with path.open("rb") as source:
-            data = source.read(MAX_LOGIN_METADATA + 1)
+        data = paths.read_confined(path, MAX_LOGIN_METADATA + 1)
         return mapping(json.loads(data)) if len(data) <= MAX_LOGIN_METADATA else {}
     except (OSError, ValueError):
         return {}

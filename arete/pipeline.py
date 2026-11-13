@@ -2190,42 +2190,41 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
         run.add_dirs.append(evidence)
     untracked_before = untracked_by_dir(b.git_dirs)
     try:
-        grant = scratch.make(run.id, step, b.ws)
+        attempt = scratch.make(run.id, step, b.ws, run.dir)
     except OSError as e:
         return verify.Verified("blocked", "The check in use did not start.", finished=False,
                                blocked_by=f"Arete could not make the scratch folder: {util.first_line(str(e), 300)}")
     try:
-        run.log(f"{step}: scratch folder {grant.root}")
-        v = verify.with_scratch(verify.with_free_ports(b.layer.verify), grant.root)
+        run.log(f"{step}: scratch folder {attempt.root}")
+        v = verify.with_scratch(verify.with_free_ports(b.layer.verify), attempt.root)
         bash = b.read_bash + v.bash
         with verify.serving(v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo,
-                            sets={scratch.ENV_NAME: grant.root}) as url:
+                            sets={scratch.ENV_NAME: attempt.root}) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
             res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
-                                         scratch=scratch.note(grant),
+                                         scratch=scratch.note(attempt),
                                          commands=code_list(bash), checks=check_list(b.layer), **values),
                             b.ws, role="verify",
                             allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
-                            mcp_config=verify.mcp_config(evidence) if url else "")
+                            mcp_config=verify.mcp_config(evidence) if url else "",
+                            scratch=scratch.hook_args(attempt, run.dir))
     except verify.ServerError as e:
         run.log(f"{step}: the app did not start")
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
-            keep = run.dir / f"{step}-scratch-kept" / grant.token
-            moved, kept = scratch.end(grant, run.dir / f"{step}-scratch.json", keep)
-            gone = not os.path.lexists(grant.root)
-            run.log(f"{step}: " + (f"removed the scratch folder {grant.root}" if gone else
-                                   f"kept the scratch folder {grant.root}, and with it the worktree") + (
-                f", moved {util.count(len(moved), 'file')} Arete could not show the attempt made to {keep}"
-                if moved else "") + (f", left {util.count(len(kept), 'file')} it could not move in place" if kept
-                                     else ""))
+            archived, moved, kept = scratch.end(attempt, run.dir)
+            if moved:
+                run.log(f"{step}: moved {util.count(len(moved), 'entry', 'entries')} from the scratch folder to "
+                        f"{archived}")
+            if kept:
+                run.log(f"{step}: kept the scratch folder {attempt.root}, and with it the worktree")
         finally:
-            restore_worktrees(untracked_before, evidence, Path(grant.root))
+            restore_worktrees(untracked_before, evidence, Path(attempt.root))
     if not res.ok or not isinstance(res.structured, dict):
         return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
@@ -2720,9 +2719,15 @@ class SkipLog:
 
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
-    record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
-    for root in scratch.sweep():
-        print(f"removed the scratch folder {root} of a run that died")
+    record.reap(tickets=True, then=lambda row: settle_died(cfg, row))
+
+
+def settle_died(cfg: config.Config, row: dict) -> None:
+    try:
+        tell_ticket_run_died(cfg, row)
+    finally:
+        for root in scratch.recover(paths.RUNS_DIR / row["id"]):
+            print(f"moved the scratch folder {root} of a run that died to its run folder")
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:

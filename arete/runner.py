@@ -39,6 +39,7 @@ from .agent import (
     model_scope,
     subscription,
 )
+from .scratch import hook_command
 
 REPLAY = replay.RUNNER
 RUNNERS = ("claude", "pi", "codex", REPLAY)
@@ -268,7 +269,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         repo: config.Repo | None = None, remaining_budget: Callable[[], float | None] | None = None,
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
-        **kw) -> Result:
+        scratch: tuple[str, ...] = (), **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
     which, name = chosen(model, run_with, cfg)
@@ -285,7 +286,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if not target.remote:
         repo = repo or cfg.repo_for_work_dir(cwd)
     trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw), resume,
-                remaining_budget, kw.get("max_budget_usd"))
+                remaining_budget, kw.get("max_budget_usd"), scratch=tuple(scratch))
     from . import routing
 
     limited: list[Result] = []
@@ -359,6 +360,7 @@ class Trip:
     pinned: dict = field(default_factory=dict)
     floors: dict = field(default_factory=dict)
     launched: bool = False
+    scratch: tuple[str, ...] = ()
 
 
 @dataclass
@@ -545,11 +547,11 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo)
+            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, trip.scratch)
     elif which == "codex":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_codex(kw, cfg, trace[0], say, repo)
+            kw = local_codex(kw, cfg, trace[0], say, repo, trip.scratch)
     elif which == "pi":
         kw["price"] = lambda reply: priced(reply, cfg)
         kw["max_budget_usd"] = picked.budget
@@ -693,10 +695,14 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
 
 
 def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: Callable[[str], None],
-                 repo: config.Repo | None) -> dict:
+                 repo: config.Repo | None, scratch: tuple[str, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings()
+        if scratch:
+            for group in kw["settings"]["hooks"]["PreToolUse"]:
+                for hook in group["hooks"]:
+                    hook["command"] = hook_command(hook["command"], list(scratch))
         if runs_bash(kw) and (note := judge_note(cfg, kw["passing"], repo)):
             say(note)
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
@@ -706,10 +712,12 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
 
 
 def local_codex(kw: dict, cfg: config.Config, run_id: str, say: Callable[[str], None],
-                repo: config.Repo | None) -> dict:
+                repo: config.Repo | None, scratch: tuple[str, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["judge"] = True
+        if scratch:
+            kw["scratch"] = tuple(scratch)
         if note := judge_note(cfg, kw["passing"], repo):
             say(note)
     return kw

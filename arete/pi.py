@@ -103,7 +103,7 @@ SAFE_HEADERS = {"accept": r"application/json|text/event-stream", "content-type":
 
 def owner_dir() -> Path:
     if paths.ISOLATED:
-        return ((paths.STATE_DIR if paths.SCRATCH_STATE else paths.NOWHERE) / "pi-agent").absolute()
+        return (paths.SCRATCH_STATE and paths.confined(paths.STATE_DIR / "pi-agent")) or paths.NOWHERE / "pi-agent"
     return paths.expand(os.environ.get("PI_CODING_AGENT_DIR") or PI_HOME / "agent").absolute()
 
 
@@ -211,8 +211,7 @@ def managed_material(credential: ManagedCredential, provider: str) -> list:
     values = []
     for path in files:
         try:
-            with path.open("rb") as source:
-                data = source.read(accounts.MAX_LOGIN_METADATA)
+            data = paths.read_confined(path, accounts.MAX_LOGIN_METADATA)
             if credential.kind == "profile":
                 parser = configparser.RawConfigParser()
                 parser.read_string(data.decode())
@@ -307,7 +306,7 @@ def sanitized(value):
 
 def model_configuration(folder: Path | None = None) -> dict:
     try:
-        text = ((folder or owner_dir()) / "models.json").read_text(encoding="utf-8-sig")
+        text = paths.read_confined((folder or owner_dir()) / "models.json").decode("utf-8-sig")
         strings = r'"(?:\\.|[^"\\])*"'
         text = re.sub(strings + r'|//[^\n]*', lambda m: m[0] if m[0].startswith('"') else "", text)
         text = re.sub(strings + r'|,(\s*[}\]])', lambda m: m[1] or m[0], text)
@@ -324,6 +323,8 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
         providers = cfg.environment.providers if providers is None else providers
         local_providers = cfg.local_providers
     owner = Path(owner_auth).absolute() if owner_auth is not None else owner_dir() / "auth.json"
+    if paths.ISOLATED:
+        owner, source = paths.confined(owner) or paths.NOWHERE / "auth.json", {}
     settings = accounts.read(owner.parent / "settings.json")
     models = model_configuration(owner.parent)
     provider, sep, name = model.partition("/")
@@ -344,7 +345,7 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     login = login and provider != "anthropic"
     auth = accounts.pi(provider, credential, str(owner)) if login else accounts.Auth("api_key")
     keys = util.read_env_file(KEYS_FILE)
-    source = ({} if paths.ISOLATED else os.environ) if source is None else source
+    source = os.environ if source is None else source
     token_error = plan_token_error(source.items()) or plan_token_error(keys.items(), f"{KEYS_FILE} variable ")
     available = {**source, **keys}
     configured = accounts.mapping(accounts.mapping(models.get("providers")).get(provider))
@@ -509,7 +510,10 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
 
 
 def default_provider() -> str:
-    settings = util.read_json(owner_dir() / "settings.json", {})
+    try:
+        settings = json.loads(paths.read_confined(owner_dir() / "settings.json"))
+    except (OSError, ValueError):
+        settings = {}
     provider = settings.get("defaultProvider") if isinstance(settings, dict) else ""
     return provider if isinstance(provider, str) else ""
 
