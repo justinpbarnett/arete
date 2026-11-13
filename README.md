@@ -980,6 +980,27 @@ Every GitHub write (`issue_create`, `pr_create`, comments, replies, closing comm
 
 Public links such as `https://github.com/o/r/pull/1` and the local tracker are not touched.
 
+### Compare writers
+
+`arete writers` compares candidate routes for the writer atom (the `document` step) with team preference and plain-code factual checks. It reads a private layer outside the repo, so real messages, tickets and voice samples never land in a public tree, and it changes no route, tier or config.
+
+- `<layer>/writers/config.toml`: `raters` (whole number from 1, default 2) and `[candidates.NAME]` tables, 2 to 26, each with one or more of `tier`, `runner`, `provider`, `model`, `effort`. Two candidates may not resolve to the same runner, model and effort.
+- `<layer>/writers/cases/*.json`: 15 to 20 cases, each an `arete document` brief of kind `message`, `ticket` or `doc` plus `evidence`, a list with one entry for each acceptance condition: the phrases, any one of which shows the condition was met. Voice examples and soft word targets come from the layer's `[document]` settings.
+
+Actions:
+
+- `arete writers sample FOLDER` writes a synthetic replay fixture (repo, layer, 15 cases, 45 answers) and prints the `[replay]` and `[[repo]]` lines to add to a scratch config.
+- `arete writers run REPO [--dry-run]` sends every case to every candidate once with the same prompt and the soft length targets, with no retry, and saves the run. Labels `A`, `B`, `C` are drawn at random for each case and kept only in the private run file. `--dry-run` lists the candidates and cases and calls nothing. The calls show in `arete costs` as `writer.<candidate>.<case>` steps.
+- `arete writers export RUN [--out FILE]` prints the rating view: each case's brief and its texts under their labels, with empty `naturalness`, `brevity`, `clarity`, `edits` and `seconds`. It holds the private cases, so keep it private; the labels hide the candidates, and it carries no name, route, cost or fault.
+- `arete writers rate RUN FILE [--rater NAME]` imports a filled view for one rater and replaces that rater's earlier import. Empty values are accepted and count as missing.
+- `arete writers report RUN [--json]` prints the result by channel and for all.
+
+Ratings: `naturalness`, `brevity` and `clarity` from 1 to 5, `edits` from 0 (none) to 3 (rewrite), and `seconds` spent making the text sendable. The preference is the mean of the three scales. The report gives each candidate's preference with a 95% interval over cases, edits, writing seconds, words, texts over target, charged and reference cost and latency. Reference cost is `unknown` when any call has none. Agreement is the share of text pairs, rated by two raters on all three scales, that both order the same way.
+
+Missing requirements, invented facts and damaged commands are counted separately by code, never by a model or an AI detector: a missing requirement is a dropped keep string or warning, a left-out supplied value or an acceptance condition none of whose evidence phrases appears; an invented fact is a handle, date or day word the brief lacks; a damaged command is a changed or dropped code span or line. A candidate with any failed or flawed text in a channel cannot be proposed for that channel, however short and well rated it is.
+
+The result is `unreviewed` until every text has all five values from at least `raters` raters; an unreviewed report proposes nothing. Once reviewed, the proposal is the eligible candidate with the highest preference, with its lead over the next one and whether the interval is clear of zero. Proposals only.
+
 ## CI
 
 After the push, the run waits for the checks on the PR. It waits up to 30 minutes, or 3 minutes when no check reports at all. The run frees its `max_parallel` slot for the wait, so another ticket can start, and takes a slot back before a CI fix step. Arete compares each failed check with the same check on the head of the base branch.
