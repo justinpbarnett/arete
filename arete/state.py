@@ -417,13 +417,13 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
 @contextmanager
 def db():
     paths.ensure_dirs()
-    conn = sqlite3.connect(paths.safe_db(paths.DB_FILE), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    for table, column, sql in MIGRATIONS:
-        if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
-            conn.execute(sql)
+    conn = paths.connect_db(paths.DB_FILE)
     try:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        for table, column, sql in MIGRATIONS:
+            if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                conn.execute(sql)
         yield conn
         conn.commit()
     finally:
@@ -437,7 +437,7 @@ def ensure_schema() -> None:
 
 @contextmanager
 def reader():
-    conn = sqlite3.connect(f"{paths.safe_db(paths.DB_FILE).absolute().as_uri()}?mode=ro", uri=True, timeout=30)
+    conn = paths.connect_db(paths.DB_FILE, readonly=True)
     conn.row_factory = sqlite3.Row
     try:
         yield conn

@@ -1,9 +1,12 @@
 import errno
+import fcntl
 import os
 import re
+import sqlite3
 import stat
 import sys
-from contextlib import contextmanager
+import threading
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 HOME = Path.home()
@@ -17,6 +20,8 @@ ISOLATED_LOGINS = "scratch config and state never use this machine's logins, key
 ISOLATED_REFUSAL = (f"arete: refusing to start: with {SCRATCH_ENV}, or ARETE_CONFIG_DIR or ARETE_STATE_DIR in a scratch "
                     f"folder, the config and state folders must both sit, without links, in the one scratch folder "
                     f"selected for isolation (unset ones go to its config and state folders)")
+DB_LOCK = threading.Lock()
+DB_THREAD = threading.local()
 
 
 def inside_scratch(d: Path) -> bool:
@@ -65,13 +70,18 @@ def confined(p: Path) -> Path | None:
 
 
 @contextmanager
-def directory_fd(p: Path, parent: int | None = None):
+def directory_fd(p: Path, parent: int | None = None, create: bool = False):
     parts = p.parts
     if ".." in parts or (parent is not None and p.is_absolute()):
         raise PermissionError("directory traversal refused")
     fd = os.dup(parent) if parent is not None else os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in parts if parent is not None else p.absolute().parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = next_fd
@@ -105,19 +115,49 @@ def read_confined(p: Path, limit: int | None = None) -> bytes:
         raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p)) from e
 
 
-def plain_or_missing(p: Path) -> bool:
+class FixtureConnection(sqlite3.Connection):
+    def close(self):
+        super().close()
+        self.handles.close()
+
+
+def connect_db(p: Path, readonly: bool = False) -> sqlite3.Connection:
+    if not ISOLATED:
+        target = f"{p.absolute().as_uri()}?mode=ro" if readonly else p
+        return sqlite3.connect(target, uri=readonly, timeout=30)
+    if not ON_MAC or confined(p) is None:
+        raise PermissionError("isolated state requires a supported confined database path")
+    if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30):
+        raise PermissionError("nested or busy isolated state access refused")
+    DB_THREAD.active = True
+    handles, conn = ExitStack(), None
+    handles.callback(DB_LOCK.release)
+    handles.callback(setattr, DB_THREAD, "active", False)
     try:
-        st = os.lstat(p)
-    except FileNotFoundError:
-        return True
-    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.getuid()
-
-
-def safe_db(p: Path) -> Path:
-    if ISOLATED and not all(confined(f) is not None and plain_or_missing(f)
-                            for f in (p, *(Path(f"{p}{end}") for end in ("-wal", "-shm", "-journal")))):
-        raise PermissionError(errno.EPERM, "refused a state database that is linked or leaves its scratch folder", str(p))
-    return p
+        parent = handles.enter_context(directory_fd(p.absolute().parent))
+        fcntl.flock(parent, fcntl.LOCK_EX)
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                os.stat(p.name + suffix, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise PermissionError("existing isolated database sidecar refused")
+        flags = os.O_RDONLY if readonly else os.O_RDWR | os.O_CREAT
+        fd = os.open(p.name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
+        handles.callback(os.close, fd)
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid()
+                or os.pread(fd, 20, 0)[18:20] == b"\x02\x02"):
+            raise PermissionError("linked, non-plain or WAL isolated state database refused")
+        conn = sqlite3.connect(f"file:/dev/fd/{fd}?mode={'ro' if readonly else 'rw'}", uri=True,
+                               timeout=30, factory=FixtureConnection)
+        conn.handles = handles
+        if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
+            raise PermissionError("isolated state requires disposable memory journaling")
+        return conn
+    except BaseException:
+        conn.close() if conn is not None else handles.close()
+        raise
 
 
 def isolated_dirs() -> tuple[Path, Path]:
@@ -199,4 +239,11 @@ def draft_dir(run_id: str) -> Path:
 
 def ensure_dirs() -> None:
     for d in (STATE_DIR, RUNS_DIR, WORKTREES_DIR, LOCKS_DIR, LOG_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+        if ISOLATED:
+            root = scratch_root(STATE_DIR)
+            if root is None:
+                raise PermissionError("isolated state directory unavailable")
+            with directory_fd(root) as parent, directory_fd(d.absolute().relative_to(root), parent, create=True):
+                pass
+        else:
+            d.mkdir(parents=True, exist_ok=True)
