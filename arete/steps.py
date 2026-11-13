@@ -132,8 +132,10 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
     else:
         settings, own_route = {"timeout_minutes": layer.timeout_minutes, "tries": layer.max_attempts, **DEFAULTS,
                                **BUILT_IN.get(role, {})}, True
+    explicit_runner = False
     for level in (cfg.steps.get(role), cfg.kinds.get(kind, {}).get(role), layer.steps.get(role),
                   layer.kinds.get(kind, {}).get(role), overrides):
+        explicit_runner = explicit_runner or bool(level and "runner" in level)
         if level and "model" in level:
             settings = {k: v for k, v in settings.items() if k not in MODEL_SOURCE}
             own_route = True
@@ -142,7 +144,7 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
             own_route = True
         settings.update(level or {})
     if base:
-        settings["explicit_route"] = own_route
+        settings["explicit_route"] = own_route or explicit_runner
     return settings
 
 
