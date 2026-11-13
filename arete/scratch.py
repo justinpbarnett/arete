@@ -263,8 +263,8 @@ def process_ids(workspace: str = "") -> dict[int, int]:
     lib.proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
     box = ctypes.CDLL(None)
     box.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
-    found: dict[int, int] = {}
     for _ in range(50):
+        found: dict[int, int] = {}
         pids = (ctypes.c_int * (max(lib.proc_listpids(4, os.getuid(), None, 0), 0) // 4 + 1024))()
         size = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids))
         settled = 0 < size < ctypes.sizeof(pids)
@@ -381,11 +381,6 @@ def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
 def producers_done(data: dict) -> bool:
     if "producers" not in data or "before" not in data:
         return False
-    current, unrelated = process_ids(data["attempt"]["workspace"]), {-1, *data["before"]}
-    while descendants := {child for child, parent in current.items() if parent in unrelated} - unrelated:
-        unrelated.update(descendants)
-    if current.keys() - unrelated:
-        return False
     for group in data["producers"].values():
         if isinstance(group, dict) and group.get("gated") is True:
             group = group["group"]
@@ -401,7 +396,10 @@ def producers_done(data: dict) -> bool:
             except PermissionError:
                 return False
             return False
-    return True
+    current, unrelated = process_ids(data["attempt"]["workspace"]), {-1, *data["before"]}
+    while descendants := {child for child, parent in current.items() if parent in unrelated} - unrelated:
+        unrelated.update(descendants)
+    return not current.keys() - unrelated
 
 
 def workspace_busy(a: Attempt) -> bool:
@@ -761,24 +759,20 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
             except (OSError, ValueError, KeyError, TypeError):
                 pass
     finally:
-        if matched and (lease := LEASES.pop(a.selector, None)) is not None:
+        if matched and not kept and (lease := LEASES.pop(a.selector, None)) is not None:
             os.close(lease)
     return archived, saved, kept
 
 
 def retain(a: Attempt) -> None:
-    try:
-        with registry() as (fd, key):
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            data = load(fd, key, a.selector)
-            if data["attempt"] != asdict(a):
-                return
-            data["state"] = "retained"
-            data["diagnostic"] = "producer shutdown unconfirmed; authority revoked and worktree retained"
-            store(fd, key, data)
-    finally:
-        if lease := LEASES.pop(a.selector, None):
-            os.close(lease)
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load(fd, key, a.selector)
+        if data["attempt"] != asdict(a):
+            return
+        data["state"] = "retained"
+        data["diagnostic"] = "producer shutdown unconfirmed; authority revoked and worktree retained"
+        store(fd, key, data)
 
 
 def recover_pending() -> list[str]:
