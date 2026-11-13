@@ -643,7 +643,7 @@ class PushedPrDraftTests(unittest.TestCase):
     def reads(self):
         return [a for a, _ in self.calls if "isDraft,headRefOid" in a]
 
-    def found_run(self, held=False, feedback=False, pushed=False, moved=False):
+    def found_run(self, held=False, feedback=False, pushed=False, moved=False, preset=False, legacy=False):
         from arete import flows, tracker
         root = Path(tempfile.mkdtemp(dir=self.root))
         origin, wt = root / "origin.git", root / "wt"
@@ -662,7 +662,8 @@ class PushedPrDraftTests(unittest.TestCase):
         (wt / "a.txt").write_text("b\n")
         sh(wt, "commit", "-qam", "change by the earlier run")
         sh(wt, "push", "-q", "-u", "origin", "work")
-        c = pipeline.Checkout("", "fixture/repo", wt, wt, "main", lease=sh(wt, "rev-parse", "HEAD"), resumes=True)
+        c = pipeline.Checkout("", "fixture/repo", wt, wt, "main", pr=self.URL if preset else "",
+                              lease=sh(wt, "rev-parse", "HEAD"), resumes=True)
         self.remote_head = "f" * 40 if moved else c.lease
         self.calls.clear()
         self.logs.clear()
@@ -685,7 +686,8 @@ class PushedPrDraftTests(unittest.TestCase):
                                  synced_pr_body=lambda run, url, body, t, left: body,
                                  answer_feedback=lambda *a, **k: None):
             out = flows.pr(SimpleNamespace(ctx=job), str(wt))
-            job.published(out.data, stored=False)
+            stored = {k: v for k, v in out.data.items() if k not in ("found", "drafted", "ci_stopped")}
+            job.published(stored if legacy else out.data, stored=False)
             flows.publish(SimpleNamespace(ctx=job))
         return out.data
 
@@ -752,6 +754,15 @@ class PushedPrDraftTests(unittest.TestCase):
         job.published({"prs": {}, "opened": ["fixture/repo"], "pushed": [], "changed": ["fixture/repo"],
                        "draft_why": "", "report_body": "", "summary": "", "committed_lines": 0}, stored=False)
         self.assertEqual(job.found, [])
+
+    def test_pr_outcome_stored_before_ci_stopped_was_kept_leaves_a_standing_pr_alone(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self.draft = True
+                self.found_run(preset=True, legacy=legacy)
+                self.assertEqual(len(self.names("pr", "ready")), 0 if legacy else 1)
+                self.assertEqual(len(self.names("pr", "merge")), 0 if legacy else 1)
+                self.assertEqual(self.draft, legacy)
 
     def test_pushed_draft_is_marked_ready_then_merged(self):
         ready = pipeline.ready_pushed(self.run, [self.c], [], "")

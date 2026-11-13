@@ -382,7 +382,7 @@ class Job:
         for c in self.checkouts:
             c.pr = data["prs"].get(c.github, c.pr)
         self.opened, self.pushed, self.changed = data["opened"], data["pushed"], data["changed"]
-        self.drafted, self.ci_stopped = data.get("drafted", []), data.get("ci_stopped", [])
+        self.drafted, self.ci_stopped = data.get("drafted", []), data.get("ci_stopped", data["changed"])
         self.found = data.get("found", [])
         self.draft_why, self.report_body, self.summary = data["draft_why"], data["report_body"], data["summary"]
         self.b.committed_lines = data["committed_lines"]
