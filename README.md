@@ -77,7 +77,7 @@ Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, de
 **Sources.** Arete's own files are watched without being listed: the `*.log` files in the log folder, each live run's `run.jsonl`, `heartbeat.json` and serve's beat file.
 Other application or service logs are watched only when listed as `[[oncall.source]]`.
 
-**Cursors.** Each file has a durable cursor (`oncall:` in the `cursors` table) holding its offset, inode and a hash of the bytes before the offset.
+**Cursors.** Each file has a durable cursor (`oncall:` in the `cursors` table) holding its offset, inode and a hash of the bytes before the offset, and what it last saw of the rotated `.1` file, so a rotation is found when nothing had been read yet and a drained `.1` is not read twice.
 A first sight of a file reads nothing old; a file that appears later is read from its start.
 Rotation, including the copy-then-truncate of `arete install`'s log rotation, truncation and a restart neither replay old lines nor lose new ones.
 A scan reads at most 1,000,000 bytes per file; the rest waits for the next scan.
@@ -91,8 +91,8 @@ Each event then gets a class without a model:
 | `unexpected` | A failure nothing else explains. |
 | `heartbeat` | A check failing in `heartbeat.json` across two or more beats. |
 | `stalled` | A run marked running whose `run.jsonl` heartbeats stopped or whose process is gone. |
-| `orchestration` | Serve's `tick failed`, a broken loop or a poll error. |
-| `expected` | A check or repair step failing inside a run, normal backoff and retries, quota and limit waits, or a failure of a ticket that already has a live run. |
+| `orchestration` | Serve's `tick failed`, a broken loop, a poll error, a dropped queue item, a failed VM sweep or new code that does not import. |
+| `expected` | A check or repair step failing inside a run, a run that ends because its own checks still fail after a repair, normal backoff and retries, quota and limit waits, or a failure of a ticket that already has a live run. |
 
 Expected events are counted and open no incident.
 

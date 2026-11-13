@@ -26,11 +26,12 @@ EXPECTED_TEXT = re.compile(
     r"limit reached|waiting until|held until cleared|trying another route|waiting for the network|tries again"
     r"|\bretry(?:ing)?\b|\bbackoff\b|back off|rate.?limit|\b429\b|usage limit|no run slot is free|already running"
     r"|already has \d+ runs? going|is running; stop it or wait|check \S+: FAIL \(exit"
-    r"|checks (?:still failing|failed on attempt)"
+    r"|checks (?:still failing|failed on attempt)|the checks failed after"
     r"|\b(?:fix\d+|review_fix\w*|ci_\w*fix\w*|(?:check|review|ci)_repair\w*): FAILED", re.IGNORECASE)
 ORCHESTRATION_TEXT = re.compile(r"tick failed:|poll failed:|dropped queue item|sweeping left-over VMs failed"
                                 r"|new code does not import|: loop broken:")
 OWN_LINE = re.compile(r"\bon-call\b")
+URL_ONLY_END = re.compile(r"\] done: failed https?://\S+$")
 TRACEBACK = "Traceback (most recent call last):"
 CHAINED = re.compile(r"During handling of the above exception|The above exception was the direct cause")
 REPAIR_STEPS = ("check_repair", "review_repair", "ci_repair")
@@ -85,16 +86,51 @@ def drain(name: str, pending: list) -> tuple[list[str], list | None]:
     return data.decode("utf-8", "replace").splitlines(), ([end, digest(older, end)] if end < size else None)
 
 
+def stamp(name: str) -> list | None:
+    try:
+        info = os.stat(name + ".1")
+    except OSError:
+        return None
+    return [info.st_ino, info.st_size, info.st_mtime_ns]
+
+
+def whole_digest(name: str, end: int) -> str | None:
+    try:
+        with open(name, "rb") as f:
+            h, left = hashlib.sha1(), end
+            while left > 0 and (chunk := f.read(min(left, 1 << 20))):
+                h.update(chunk)
+                left -= len(chunk)
+    except OSError:
+        return None
+    return h.hexdigest() if left == 0 else None
+
+
+def still_holds(name: str, size: int, older: list, inode: int, same: int) -> bool:
+    head = min(older[1], MAX_READ)
+    return (inode == same and size >= older[1]
+            and whole_digest(name, head) == whole_digest(name + ".1", head)
+            and digest(name, older[1]) == digest(name + ".1", older[1]))
+
+
+def parts(mark: list, now: list | None) -> tuple[list | None, list | None]:
+    return (mark[3] if len(mark) > 3 else None), (mark[4] if len(mark) > 4 else now)
+
+
 def gone(name: str, mark: list | None) -> tuple[list[str], list | None]:
     if mark is None:
         return [], mark
-    pending = mark[3] if len(mark) > 3 else None
-    if not pending and mark[0] > 0 and digest(name + ".1", mark[0]) == mark[2]:
-        pending, mark = [mark[0], mark[2]], [0, mark[1], "", None]
-    if not pending:
-        return [], mark
-    older, pending = drain(name, pending)
-    return older, [mark[0], mark[1], mark[2], pending]
+    now = stamp(name)
+    pending, seen = parts(mark, now)
+    if not pending and now:
+        if mark[0] == 0:
+            remainder = now != seen
+        else:
+            remainder = digest(name + ".1", mark[0]) == mark[2]
+        if remainder:
+            pending, mark = [mark[0], mark[2]], [0, mark[1], "", None]
+    older, pending = drain(name, pending) if pending else ([], None)
+    return older, [mark[0], mark[1], mark[2], pending, now]
 
 
 def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list | None]:
@@ -103,13 +139,20 @@ def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list
     except OSError:
         return gone(name, mark)
     size, inode = info.st_size, info.st_ino
+    now = stamp(name)
     if baseline:
-        return [], [size, inode, digest(name, size) or "", None]
-    offset, pending = 0, None
+        return [], [size, inode, digest(name, size) or "", None, now]
+    offset, pending, seen, noted = 0, None, now, now
     if mark is not None:
-        offset, pending = mark[0], (mark[3] if len(mark) > 3 else None)
+        offset = mark[0]
+        pending, seen = parts(mark, now)
         if sources.log_start(mark[:2], size, inode) != offset or digest(name, offset) != mark[2]:
             pending, offset = ([offset, mark[2]] if offset > 0 else pending), 0
+        elif offset == 0 and not pending and now and now != seen:
+            if still_holds(name, size, now, inode, mark[1]):
+                noted = seen
+            else:
+                pending = [0, ""]
     end = min(size, offset + MAX_READ)
     if (got := sources.read_lines(name, offset, end)) is None:
         return [], mark
@@ -117,11 +160,11 @@ def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list
     if upto is None:
         upto = end if end - offset >= MAX_READ else offset
     older, pending = drain(name, pending) if pending else ([], None)
-    return older + rows, [upto, inode, digest(name, upto) or "", pending]
+    return older + rows, [upto, inode, digest(name, upto) or "", pending, noted]
 
 
 def undrained(name: str, mark: list) -> bool:
-    if any(mark[3:]):
+    if parts(mark, None)[0]:
         return True
     try:
         more = sources.read_lines(name, mark[0], min(os.stat(name).st_size, mark[0] + MAX_READ))
@@ -252,13 +295,14 @@ class Watch:
             line, begin, row = rows[i], i, run_line(rows[i])
             last = i
             i += 1
-            if OWN_LINE.search(line):
+            if OWN_LINE.search(line) or URL_ONLY_END.search(line):
                 continue
             if row:
                 if not run_failure(row) or (origin.folder and lines.path(str(row["run"])).exists()):
                     continue
                 text = run_text(row)
-            elif origin.pattern.search(line) or EXPECTED_TEXT.search(line):
+            elif (origin.pattern.search(line) or EXPECTED_TEXT.search(line)
+                  or (origin.folder and ORCHESTRATION_TEXT.search(line))):
                 text = line
                 if TRACEBACK in line:
                     last, final = traceback_end(rows, begin)
@@ -355,10 +399,11 @@ def said(summary: dict) -> str:
 
 
 def scan_once(cfg: config.Config) -> dict:
-    row, previous = cursor_value(SCAN)
+    _, previous = cursor_value(SCAN)
+    started = util.iso()
     watch = Watch(cfg)
     watch.follow("logs", [str(p) for p in sorted(paths.LOG_DIR.glob("*.log"))], Origin("arete", folder=True))
-    watch.follow("runs", watch.run_files(row["polled"] if row else None), Origin("arete"))
+    watch.follow("runs", watch.run_files((previous or {}).get("since")), Origin("arete"))
     for source in cfg.oncall.sources:
         files = sorted(glob.glob(str(paths.expand(source.path))))
         pattern = re.compile(source.pattern or sources.LOG_PATTERN)
@@ -370,7 +415,7 @@ def scan_once(cfg: config.Config) -> dict:
     summary = {"sources": watch.sources, "lines": watch.lines, "events": len(watch.found), "opened": opened,
                "updated": updated, "expected": expected}
     total = (previous or {}).get("expected", 0) + expected
-    state.set_cursor(SCAN, json.dumps({"expected": total, "last": summary}), True, said(summary))
+    state.set_cursor(SCAN, json.dumps({"expected": total, "last": summary, "since": started}), True, said(summary))
     return summary
 
 

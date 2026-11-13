@@ -53,9 +53,13 @@ class Scratch(unittest.TestCase):
         self.append(*rows or ("2026-11-13T10:00:00Z INFO started",))
         self.scan()
 
-    def sql(self, query):
-        with sqlite3.connect(self.state / "arete.db") as c:
-            return c.execute(query).fetchall()
+    def sql(self, query, *params):
+        c = sqlite3.connect(self.state / "arete.db")
+        try:
+            with c:
+                return c.execute(query, params).fetchall()
+        finally:
+            c.close()
 
     def error(self, n, stamp="10:05:00"):
         return f"2026-11-13T{stamp}Z ERROR payment job 4f2a9c1e-1111-2222-3333-44445555666{n} failed after {n}0s: db"
@@ -142,6 +146,27 @@ class Files(Scratch):
         self.assertIn("1 expected", self.scan())
         self.assertEqual(self.incidents(), [])
 
+    def test_every_serve_orchestration_message_opens_its_own_incident(self):
+        self.baseline()
+        gone = "new code does not import, so serve keeps the code it started with: "
+        texts = ["watch: dropped queue item 17, the loop is off or gone",
+                 "watch: dropped queue item 21, its run could not start, the second time",
+                 gone + "ModuleNotFoundError: No module named 'arete.gone'",
+                 "tick failed: OperationalError: database is locked",
+                 "watch#0: poll failed: TimeoutError: timed out",
+                 "sweeping left-over VMs failed: OSError: no route to host"]
+        self.append(*(f"2026-11-13T13:00:0{n}Z {t}" for n, t in enumerate(texts)), to=self.logs / "serve.log")
+        self.scan()
+        found = self.incidents()
+        self.assertEqual((len(found), {i["class"] for i in found}), (6, {"orchestration"}))
+        self.append("2026-11-13T14:00:00Z watch: dropped queue item 18, the loop is off or gone",
+                    "2026-11-13T14:00:01Z " + gone + "ModuleNotFoundError: No module named 'arete.other'",
+                    to=self.logs / "serve.log")
+        self.scan()
+        found = self.incidents()
+        self.assertEqual(len(found), 6)
+        self.assertEqual(sorted(i["count"] for i in found), [1, 1, 1, 1, 2, 2])
+
     def test_secrets_and_home_paths_never_reach_the_database(self):
         self.baseline()
         self.append("2026-11-13T12:30:00Z ERROR upstream rejected zzsecretvalue12345 at /Users/someone/app " + "word " * 1500)
@@ -163,6 +188,128 @@ class Files(Scratch):
         self.scan()
         (one,) = self.incidents()
         self.assertEqual(one["source"], str(other))
+
+
+class Rotation(Scratch):
+    def rotate(self, rename):
+        older = self.log.with_name("app.log.1")
+        if rename:
+            self.log.rename(older)
+            self.log.write_text("")
+        else:
+            older.write_bytes(self.log.read_bytes())
+            self.log.write_text("")
+
+    def check(self, rename, more):
+        self.log.write_text("")
+        self.scan()
+        self.append(self.error(1))
+        self.rotate(rename)
+        if more:
+            self.append(self.error(2, "10:06:00"))
+        self.assertIn("1 opened", self.scan())
+        want = 2 if more else 1
+        self.assertEqual([i["count"] for i in self.incidents()], [want])
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [want])
+        self.append(self.error(3, "10:07:00"))
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [want + 1])
+
+    def test_copy_truncate_at_offset_zero(self):
+        self.check(False, False)
+
+    def test_copy_truncate_at_offset_zero_with_new_lines(self):
+        self.check(False, True)
+
+    def test_rename_at_offset_zero(self):
+        self.check(True, False)
+
+    def test_rename_at_offset_zero_with_new_lines(self):
+        self.check(True, True)
+
+    def test_rename_with_a_scan_during_the_gap(self):
+        self.log.write_text("")
+        self.scan()
+        self.append(self.error(1))
+        self.log.rename(self.log.with_name("app.log.1"))
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [1])
+        self.append(self.error(2, "10:06:00"))
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [2])
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [2])
+
+    def test_an_old_rotated_file_is_never_read(self):
+        self.log.with_name("app.log.1").write_text("ERROR old rotated failure\n")
+        self.log.write_text("")
+        self.scan()
+        self.scan()
+        self.assertEqual(self.incidents(), [])
+        self.append(self.error(1))
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [1])
+
+    def test_a_renamed_file_with_a_different_prefix_and_shared_suffix_is_read(self):
+        suffix = "".join(f"2026-11-13T10:00:00Z INFO steady line {n} " + "x" * 20 + "\n" for n in range(20))
+        self.log.write_text("")
+        self.scan()
+        self.append(self.error(1))
+        self.log.write_text(self.log.read_text() + suffix)
+        self.log.rename(self.log.with_name("app.log.1"))
+        self.log.write_text("2026-11-13T10:00:00Z INFO fresh start\n" + suffix)
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [1])
+
+    def test_identical_repeated_lines_across_a_rename_are_both_counted(self):
+        self.log.write_text("")
+        self.scan()
+        self.append(self.error(1))
+        self.log.rename(self.log.with_name("app.log.1"))
+        self.append(self.error(1))
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [2])
+
+    def test_comparing_a_large_copy_hashes_a_bounded_number_of_bytes(self):
+        code = ("import hashlib, os, sys\n"
+                "from arete import oncall\n"
+                "body = b'INFO ' + b'z' * 95 + b'\\n'\n"
+                "data = body * 30000\n"
+                "name = os.path.join(sys.argv[1], 'big.log')\n"
+                "open(name, 'wb').write(data)\n"
+                "open(name + '.1', 'wb').write(data)\n"
+                "seen = []\n"
+                "real = hashlib.sha1\n"
+                "class Counting:\n"
+                "    def __init__(self): self.h = real()\n"
+                "    def update(self, b): seen.append(len(b)); self.h.update(b)\n"
+                "    def hexdigest(self): return self.h.hexdigest()\n"
+                "oncall.hashlib.sha1 = lambda *a: Counting() if not a else real(*a)\n"
+                "older = oncall.stamp(name)\n"
+                "inode = os.stat(name).st_ino\n"
+                "print(oncall.still_holds(name, len(data), older, inode, inode), sum(seen), oncall.MAX_READ)\n"
+                "open(name, 'r+b').write(b'X')\n"
+                "print(oncall.still_holds(name, len(data), older, inode, inode))")
+        res = subprocess.run([sys.executable, "-c", code, str(self.logs)], cwd=ROOT, text=True,
+                             capture_output=True, env=self.env)
+        first, second = res.stdout.splitlines()
+        held, hashed, limit = first.split()
+        self.assertEqual(held, "True", res.stderr)
+        self.assertLessEqual(int(hashed), 2 * int(limit) + 1024)
+        self.assertEqual(second, "False")
+
+    def test_a_copy_not_yet_truncated_is_not_read_twice(self):
+        self.log.write_text("")
+        self.scan()
+        self.append(self.error(1))
+        self.log.with_name("app.log.1").write_bytes(self.log.read_bytes())
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [1])
+        self.log.write_text("")
+        self.append(self.error(2, "10:06:00"))
+        self.scan()
+        self.assertEqual([i["count"] for i in self.incidents()], [2])
 
 
 class Backlogs(Scratch):
@@ -192,8 +339,7 @@ class Backlogs(Scratch):
         failure = {"ts": "2026-11-13T12:00:00Z", "run": run, "seq": 9, "event": "error", "step": "build",
                    "message": "boom"}
         target.write_text(self.FILLER * 11000 + json.dumps(failure) + "\n")
-        with sqlite3.connect(self.state / "arete.db") as c:
-            c.execute("UPDATE runs SET status = 'done', started = '2020-01-01T00:00:00Z' WHERE id = ?", (run,))
+        self.sql("UPDATE runs SET status = 'done', started = '2020-01-01T00:00:00Z' WHERE id = ?", run)
         self.scan()
         self.assertEqual(self.incidents(), [])
         self.scan()
@@ -229,6 +375,79 @@ class Backlogs(Scratch):
         (one,) = self.incidents()
         self.assertEqual(one["count"], 3)
         self.assertIn("database unavailable", one["signature"])
+
+    def run_jsonl(self, run, *rows):
+        return [json.dumps({"ts": "2026-11-13T12:00:00Z", "run": run, "seq": n, **row})
+                for n, row in enumerate(rows, 1)]
+
+    def test_a_run_that_fails_its_checks_after_review_fixes_is_expected(self):
+        run = self.start_run()
+        target = self.state / "runs" / run / "run.jsonl"
+        target.parent.mkdir(parents=True)
+        target.write_text("")
+        self.baseline()
+        ended = {"event": "error", "step": "respond", "message": "the checks failed after the review fixes"}
+        seq = self.run_jsonl(run, {"event": "step_start", "step": "implement", "try": 2, "atom": "review_repair"},
+                             {"event": "step_end", "step": "implement", "try": 2, "result": "pass", "ok": True,
+                              "atom": "review_repair"},
+                             {"event": "step_start", "step": "checks", "try": 3},
+                             {"event": "step_end", "step": "checks", "try": 3, "result": "fail", "ok": False,
+                              "next": "implement"},
+                             {"event": "step_start", "step": "respond"},
+                             {"event": "step_end", "step": "respond", "ok": True}, ended)
+        self.append(*seq, to=target)
+        self.append("2026-11-13T12:00:00Z [demo#7] check unit: FAIL (exit 1)",
+                    "2026-11-13T12:00:01Z [demo#7] failed: the checks failed after the review fixes",
+                    seq[-1],
+                    "2026-11-13T12:00:02Z [demo#7] done: failed the checks failed after the review fixes",
+                    to=self.logs / "runs.log")
+        out = self.scan()
+        self.assertIn("0 opened", out)
+        self.assertIn("5 expected", out)
+        self.assertEqual(self.incidents(), [])
+        self.assertIn("5 expected events counted", self.arete().stdout)
+        self.append(*self.run_jsonl(run, {"event": "error", "step": "build", "message": "crashed: KeyError: 'title'"}),
+                    to=target)
+        self.scan()
+        (one,) = self.incidents()
+        self.assertEqual(one["class"], "unexpected")
+
+    def test_checks_failing_after_a_ci_or_in_use_fix_are_expected(self):
+        self.baseline()
+        used = "the checks failed after fixing what the check in use found"
+        errors = [json.dumps({"ts": "2026-11-13T12:00:03Z", "run": "pip-gone", "seq": n, "event": "error",
+                              "step": "respond", "message": m})
+                  for n, m in enumerate(("the checks failed after the CI fix", used), 1)]
+        self.append("2026-11-13T12:00:00Z [demo#7] failed: the checks failed after the CI fix",
+                    "2026-11-13T12:00:01Z [demo#7] done: failed https://github.com/demo/demo/pull/5",
+                    f"2026-11-13T12:00:02Z [demo#7] failed: {used}",
+                    f"2026-11-13T12:00:03Z [demo#7] done: failed {used}", *errors, to=self.logs / "runs.log")
+        self.assertIn("0 opened", self.scan())
+        self.assertEqual(self.incidents(), [])
+
+    def test_a_run_that_starts_and_ends_during_a_slow_scan_is_read_by_the_next(self):
+        self.baseline()
+        code = ("import time\n"
+                "from arete import config, lines, oncall, record, state\n"
+                "original = oncall.Watch.run_files\n"
+                "def slow(self, since):\n"
+                "    found = original(self, since)\n"
+                "    run = record.start('pipeline', repo='demo', issue=9)\n"
+                "    lines.write(run, 'error', step='build', message='boom during the scan')\n"
+                "    with state.db() as c:\n"
+                "        c.execute(\"UPDATE runs SET status = 'failed' WHERE id = ?\", (run,))\n"
+                "    time.sleep(1.2)\n"
+                "    return found\n"
+                "oncall.Watch.run_files = slow\n"
+                "oncall.scan(config.load())")
+        self.assertEqual(self.py(code).returncode, 0)
+        self.assertEqual(self.incidents(), [])
+        self.scan()
+        (one,) = self.incidents()
+        self.assertEqual(one["class"], "unexpected")
+        self.assertIn("boom during the scan", one["signature"])
+        self.scan()
+        self.assertEqual(self.incidents()[0]["count"], 1)
 
     def test_scan_interrupted_before_recording_loses_nothing(self):
         self.baseline()
@@ -322,8 +541,7 @@ class Others(Scratch):
         self.assertEqual(out[0], "[True]")
         self.assertIn("last scan crashed: boom", out[1])
         self.scan()
-        with sqlite3.connect(self.state / "arete.db") as c:
-            c.execute("UPDATE cursors SET polled = '2026-11-13T00:00:00Z' WHERE source = 'oncall:scan'")
+        self.sql("UPDATE cursors SET polled = '2026-11-13T00:00:00Z' WHERE source = 'oncall:scan'")
         self.assertIn("stale", self.py("from arete import config, heartbeat\n"
                                        "print(heartbeat.check_oncall(config.load())[0].detail)").stdout)
         self.write_config("")
@@ -334,9 +552,8 @@ class Others(Scratch):
         self.baseline()
         self.append(self.error(1))
         self.scan()
-        with sqlite3.connect(self.state / "arete.db") as c:
-            c.execute("UPDATE incidents SET last_seen = '2020-01-01T00:00:00Z'")
-            c.execute("UPDATE incident_notes SET ts = '2020-01-01T00:00:00Z'")
+        self.sql("UPDATE incidents SET last_seen = '2020-01-01T00:00:00Z'")
+        self.sql("UPDATE incident_notes SET ts = '2020-01-01T00:00:00Z'")
         self.assertEqual(self.py("from arete import state; state.prune()").returncode, 0)
         self.assertEqual(self.sql("SELECT (SELECT count(*) FROM incidents), (SELECT count(*) FROM incident_notes)"),
                          [(0, 0)])
