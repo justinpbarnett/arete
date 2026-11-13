@@ -1073,6 +1073,41 @@ def cmd_prices(args) -> int:
     return 0
 
 
+def cmd_writers(args) -> int:
+    from pathlib import Path
+
+    from . import util, writers
+
+    words = args.words
+    counts = {"sample": 1, "run": 1, "export": 1, "rate": 2, "report": 1}
+    if len(words) != counts[args.action]:
+        print("usage: arete writers sample FOLDER | run REPO [--dry-run] | export RUN [--out FILE] | "
+              "rate RUN FILE [--rater NAME] | report RUN [--json]", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print_lines(writers.sample(Path(words[0])))
+        elif args.action == "run":
+            return writers.run(words[0], args.dry_run)
+        elif args.action == "export":
+            found = writers.export(words[0])
+            if args.out:
+                util.write_json(Path(args.out), found)
+                print(json.dumps({"run": words[0], "out": args.out,
+                                  "texts": sum(len(c["texts"]) for c in found["cases"])}))
+            else:
+                print(json.dumps(found, indent=2))
+        elif args.action == "rate":
+            print(json.dumps(writers.rate(words[0], words[1], args.rater)))
+        else:
+            found = writers.report(words[0])
+            print(json.dumps(found) if args.json else "\n".join(writers.report_lines(found)))
+    except (writers.Refused, ValueError, TypeError, OSError, config.UnknownRepo) as e:
+        print(f"arete writers: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
     from . import lines, state
 
@@ -1376,6 +1411,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("action", choices=("import", "diff", "recompute"))
     p.add_argument("words", nargs="*", help="diff [FILE], import FILE, or recompute RUN_ID STEP")
     p.set_defaults(fn=cmd_prices)
+
+    p = sub.add_parser("writers", help="compare owner-configured writer routes with blinded team ratings and "
+                                       "factual checks; proposals only")
+    p.add_argument("action", choices=("sample", "run", "export", "rate", "report"))
+    p.add_argument("words", nargs="*", help="sample FOLDER, run REPO, export RUN, rate RUN FILE or report RUN")
+    p.add_argument("--dry-run", action="store_true", help="run: list the candidates and cases without a call")
+    p.add_argument("--out", metavar="FILE", help="export: write the rating view to FILE")
+    p.add_argument("--rater", default="", metavar="NAME", help="rate: the rater, instead of the file's rater")
+    p.add_argument("--json", action="store_true", help="report: one JSON line")
+    p.set_defaults(fn=cmd_writers)
 
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))
