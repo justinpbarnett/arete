@@ -191,6 +191,36 @@ def claude_tokens(usage: dict) -> dict:
             "cache_write": int(usage.get("cache_creation_input_tokens") or 0)}
 
 
+class Cut(Exception):
+    pass
+
+
+def streamed_turn(line: str, seen: dict) -> dict | None:
+    if '"usage"' not in line:
+        return None
+    try:
+        data = json.loads(line)
+        message = data.get("message") or {}
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        if data.get("type") == "message_end" and message.get("role") == "assistant":
+            return usage_totals([usage])
+        if data.get("type") == "assistant":
+            ident = message.get("id")
+            tokens = claude_tokens(usage)
+            before = seen.get(ident) if ident is not None else None
+            if ident is not None:
+                seen[ident] = {k: max(v, (before or {}).get(k, 0)) for k, v in tokens.items()}
+            grown = {k: max(0, v - (before or {}).get(k, 0)) for k, v in tokens.items()}
+            if before is not None and not any(grown.values()):
+                return None
+            return {"cost_usd": 0.0, **grown, "turns": 0 if before is not None else 1}
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        return None
+    return None
+
+
 def fenced_json(text: str):
     decoder = json.JSONDecoder()
     answer = None
