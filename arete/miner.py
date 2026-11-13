@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 from collections import Counter, defaultdict
 from datetime import timedelta
 from pathlib import Path
@@ -10,6 +11,7 @@ from string import Template
 from . import (
     auditor,
     config,
+    devices,
     diffguard,
     evals,
     gh,
@@ -17,6 +19,7 @@ from . import (
     jev,
     paths,
     record,
+    runlimits,
     runner,
     state,
     util,
@@ -36,6 +39,15 @@ HEADLESS_ENTRYPOINT = "sdk-cli"
 LEARNABLE = ("In this digest of a person working with a coding agent, does the person correct the agent, interrupt it, "
              "reject a tool call, repeat an instruction they gave before, or state a lasting preference or fact about "
              "themselves, or does the agent hit the same failure more than once?")
+LEARNABLE_RUN = ("In this digest of one unattended run of a coding agent pipeline, does a step fail, get retried or "
+                 "repaired, hit a limit, or run long, or does the agent hit the same failure more than once?")
+UNRECORDED_KINDS = ("miner", "eval", "experiment", "draft")
+SIGNAL_WEIGHTS = {"failed": 8, "retry": 4, "budget": 2, "long": 1}
+LONG_RUN_MINUTES = runlimits.Policy().max_run_minutes / 2
+MAX_RECORDED_RUNS = 50
+MAX_RUN_ITEMS = 40
+RECORDED_TAG = re.compile(r"</?recorded-runs", re.IGNORECASE)
+RECORDED_SHARE = 2
 MAX_MINER_DIFF = 200
 GLOBAL_RULES = "harness/claude/CLAUDE.md"
 GLOBAL_GLOBS = ["skills/**", GLOBAL_RULES]
@@ -197,17 +209,149 @@ def collect(hours: float) -> list[dict]:
     return sorted(out, key=lambda d: -d["signal"])
 
 
-def worth_mining(cfg: config.Config, run_id: str, sessions: list[dict]) -> list[dict]:
-    asked = [s for s in sessions if cfg.jev_allowed([cfg.repo_for_path(s["cwd"]) if s["cwd"] else None])]
+def recorded_repo(cfg: config.Config, d: dict) -> config.Repo | None:
+    try:
+        return cfg.repo(d["repo"]) if d["repo"] else None
+    except KeyError:
+        return None
+
+
+def may_ask_jev(cfg: config.Config, d: dict, recorded: bool) -> bool:
+    if recorded:
+        repo = recorded_repo(cfg, d)
+        return (repo is not None or not d["repo"]) and cfg.jev_allowed([repo])
+    return cfg.jev_allowed([cfg.repo_for_path(d["cwd"]) if d["cwd"] else None])
+
+
+def worth_mining(cfg: config.Config, run_id: str, sessions: list[dict], recorded: bool = False) -> list[dict]:
+    asked = [s for s in sessions if may_ask_jev(cfg, s, recorded)]
     if not asked or not jev.ready(cfg):
         return sessions
-    replies = jev.ask_many([("\n".join(s["items"]), {"learn": jev.yes_no(LEARNABLE)}) for s in asked], cfg,
+    question, noun = (LEARNABLE_RUN, "recorded run") if recorded else (LEARNABLE, "session")
+    replies = jev.ask_many([("\n".join(s["items"]), {"learn": jev.yes_no(question)}) for s in asked], cfg,
                            trace=(run_id, "miner jev"))
     quiet = {s["session"] for s, r in zip(asked, replies, strict=True)
              if (a := r.answers.get("learn")) and a.value is False and a.sure(cfg.jev.confidence)}
     if quiet:
-        print(f"{util.iso()} miner: JEV set aside {util.count(len(quiet), 'session')} with nothing to learn from")
+        print(f"{util.iso()} miner: JEV set aside {util.count(len(quiet), noun)} with nothing to learn from")
     return [s for s in sessions if s["session"] not in quiet]
+
+
+def tag_free(text) -> str:
+    text = str(text if text is not None else "")
+    while (found := RECORDED_TAG.sub("", text)) != text:
+        text = found
+    return text
+
+
+def clean(text, n: int) -> str:
+    return _short(tag_free(text), n)
+
+
+def signals_of(run: dict) -> list[str]:
+    calls, failed = run["calls"], run["failed_steps"]
+    names = Counter(c["step"] for c in calls)
+    found = []
+    if run["status"] == "failed" or failed or not all(c["ok"] for c in calls):
+        found.append("failed")
+    if (any(n > 1 for n in run["tries"].values()) or any(n > 1 for n in names.values())
+            or any(c["step"].startswith(runlimits.REPAIR_NAMES) for c in calls)
+            or any(f["kind"] in runlimits.REPAIRS for f in failed)):
+        found.append("retry")
+    if run["parked"]:
+        found.append("budget")
+    if run["seconds"] / 60 - run["wait_minutes"] >= LONG_RUN_MINUTES:
+        found.append("long")
+    return found
+
+
+def tool_error_lines(path: Path, name: str) -> list[str]:
+    calls, errors, last, result = {}, [], None, None
+    for e in record.numbered_events(path):
+        if e["kind"] == "tool_call":
+            calls[e.get("id")] = e
+        elif e["kind"] == "tool_result" and e.get("error"):
+            errors.append(e)
+        elif e["kind"] == "message" and e.get("role") == "assistant" and str(e.get("text") or "").strip():
+            last = e
+        elif e["kind"] == "result" and e.get("ok") is False:
+            result = e
+    out = []
+    for e in errors[-6:]:
+        call = calls.get(e.get("id")) or {"input": {}}
+        inp = call.get("input")
+        detail = ""
+        if isinstance(inp, dict):
+            detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("description") or ""
+        out.append(f"[{name}:{e['line']}] TOOL ERROR {clean(e.get('name'), 60)}({clean(detail, 120)}): "
+                   f"{clean(e.get('text'), 300)}")
+    if last:
+        out.append(f"[{name}:{last['line']}] AGENT: {clean(last.get('text'), 400)}")
+    if result:
+        out.append(f"[{name}:{result['line']}] RESULT: {clean(result.get('error'), 300)}")
+    return out
+
+
+def run_digest(run: dict) -> dict:
+    signals = signals_of(run)
+    items = [f"summary: {clean(run['summary'], 300)}"]
+    if run["parked"]:
+        items.append(f"parked: {clean(run['parked'], 300)}")
+    for m in run["marks"]:
+        if m.get("kind") == "check" and m.get("exit") not in (0, None):
+            items.append(f"check {clean(m.get('name'), 60)} failed (exit {clean(m.get('exit'), 10)}) "
+                         f"after {m.get('seconds') or 0:.0f} s")
+    names = Counter(c["step"] for c in run["calls"])
+    for c in run["calls"]:
+        quoted = []
+        if c["record"] and (not c["ok"] or names[c["step"]] > 1 or c["step"].startswith(runlimits.REPAIR_NAMES)):
+            name = clean(c["record"], 80)
+            try:
+                quoted = tool_error_lines(paths.record_dir(run["id"]) / c["record"], name)
+            except (OSError, ValueError, TypeError, KeyError):
+                quoted = [f"record {name} could not be read"]
+        result_quoted = any("] RESULT: " in line for line in quoted)
+        error = f": {clean(c['error'], 300)}" if c["error"] and not result_quoted else ""
+        items.append(f"call {clean(c['step'], 60)} ({clean(c['runner'], 30)} {clean(c['model'], 60)}): "
+                     f"{'ok' if c['ok'] else 'failed'} after {c['seconds']:.0f} s{error}")
+        items += quoted
+    return {"session": run["id"], "cwd": "", "items": items[:MAX_RUN_ITEMS], "signal": sum(SIGNAL_WEIGHTS[s] for s in signals),
+            "repo": run["repo"] or "", "signals": signals, "kind": run["kind"], "issue": run["issue"],
+            "status": run["status"], "minutes": max(0, run["seconds"] / 60 - run["wait_minutes"])}
+
+
+def collect_runs(since: str) -> tuple[list[dict], int]:
+    flagged, clean_runs = [], 0
+    for row in record.runs_since(since):
+        if row["kind"] in UNRECORDED_KINDS:
+            continue
+        run = record.read_run(row["id"])
+        if not run:
+            continue
+        if signals := signals_of(run):
+            flagged.append((sum(SIGNAL_WEIGHTS[s] for s in signals), run))
+        else:
+            clean_runs += 1
+    flagged.sort(key=lambda w: w[1]["started"], reverse=True)
+    flagged.sort(key=lambda w: -w[0])
+    return [run_digest(run) for _, run in flagged[:MAX_RECORDED_RUNS]], clean_runs
+
+
+def render_runs(digests: list[dict], limit: int) -> tuple[str, int]:
+    parts, used, n = [], 0, 0
+    for d in digests:
+        head = (f"## run {clean(d['session'], 120)} ({clean(d['kind'], 30)}, repo: {clean(d['repo'], 60) or 'none'}, "
+                f"ticket: {clean(d['issue'], 60) if d['issue'] not in (None, '') else 'none'}, "
+                f"status: {clean(d['status'], 30)}, {d['minutes']:.0f} min; signals: {', '.join(d['signals'])})")
+        block = head + "\n" + "\n".join(d["items"]) + "\n"
+        if used + len(block) > limit:
+            block = block[: max(0, limit - used)]
+            if len(block) < 400:
+                break
+        parts.append(block)
+        used += len(block)
+        n += 1
+    return "\n".join(parts), n
 
 
 def render_digest(cfg: config.Config, sessions: list[dict], limit: int) -> tuple[str, int]:
@@ -334,7 +478,44 @@ def repo_relative(repo: config.Repo, f: str) -> str:
     return f
 
 
-def allowed(cfg: config.Config, p: dict) -> tuple[bool, str]:
+def whole_word(term: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<!\w){re.escape(term)}(?!\w)")
+
+
+def private_patterns(cfg: config.Config, target: config.Repo, runs: list[dict]) -> list[tuple[str, re.Pattern[str]]]:
+    found = []
+    for r in cfg.repos:
+        if r.name not in (target.name, cfg.arete_repo, cfg.global_repo):
+            found += [("another repository", whole_word(t)) for t in {r.name, r.github, r.github.rsplit("/", 1)[-1]} if t]
+    for d in runs:
+        found.append(("a ticket or run", whole_word(d["session"])))
+        issue = str(d.get("issue") if d.get("issue") is not None else "")
+        if issue.isdigit():
+            found.append(("a ticket or run", re.compile(rf"#{issue}(?!\d)")))
+        elif issue:
+            found.append(("a ticket or run", whole_word(issue)))
+    try:
+        remote = [d for d in devices.load() if d.kind != "local"]
+    except devices.DeviceError:
+        remote = []
+    hosts = {socket.gethostname(), socket.gethostname().split(".")[0]}
+    hosts |= {t for d in remote for t in (d.name, d.host) if t}
+    found += [("a host", whole_word(h)) for h in hosts if h]
+    found += [("a person", whole_word(paths.HOME.name)), ("a person", re.compile(re.escape(str(paths.HOME))))]
+    return found
+
+
+def public_wording_refusal(cfg: config.Config, repo: config.Repo, p: dict, runs: list[dict]) -> str:
+    if repo.name != cfg.arete_repo and not repo.public:
+        return ""
+    text = f"{p['change']}\n{p['why']}"
+    for what, pattern in private_patterns(cfg, repo, runs):
+        if pattern.search(text):
+            return f"names {what}; proposals for a public repo stay in general terms"
+    return ""
+
+
+def allowed(cfg: config.Config, p: dict, runs: tuple | list = ()) -> tuple[bool, str]:
     if p["layer"] == "memory":
         return False, "memory facts are listed in arete status, not PRs"
     if float(p.get("confidence", 0)) < MIN_CONFIDENCE:
@@ -350,6 +531,8 @@ def allowed(cfg: config.Config, p: dict) -> tuple[bool, str]:
         return False, f"{f} stays human edited: arete does not rewrite its own grader, eval writer or miner"
     if not is_harness_file(cfg, repo, f):
         return False, f"{f} is not a harness file"
+    if refusal := public_wording_refusal(cfg, repo, p, list(runs)):
+        return False, refusal
     p["repo"], p["file"] = repo.name, f
     return True, ""
 
@@ -485,10 +668,11 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
             with util.repo_lock(repo.path):
                 git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
-        body = ["Fixes mined from recent sessions where an agent needed correcting.", ""]
+        body = ["Fixes mined from recent sessions and recorded runs where an agent needed correcting.", ""]
+        keep_evidence = not (repo.public or repo.name == cfg.arete_repo)
         for i, p in enumerate(landed, 1):
             ev = ", ".join(p.get("evidence", [])[:4])
-            body.append(f"{i}. `{p['file']}`: {p['why']}" + ("" if repo.public else f" (sessions {ev})"))
+            body.append(f"{i}. `{p['file']}`: {p['why']}" + (f" (evidence {ev})" if keep_evidence else ""))
         if repo.name == cfg.arete_repo and any(util.matches_any(f, [ARETE_PROMPT_GLOB]) for f in diff.files):
             body += ["", "The pipeline reads its prompts from the arete checkout, so pull that checkout after the merge."]
         body += ["", f"Run `{run_id}`. {res.text.strip()[:1500]}", "",
@@ -506,6 +690,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
 def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:
     paths.ensure_dirs()
     cfg = config.load()
+    given = hours
     hours = hours or cfg.miner_lookback_hours
     with util.lock(state.run_lock("miner")) as got:
         if not got:
@@ -513,7 +698,7 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
             return 0
         run_id = record.new_id("min") if dry_run else record.start("miner", lock=state.run_lock("miner"))
         try:
-            code = _run(cfg, run_id, hours, dry_run, apply)
+            code = _run(cfg, run_id, hours, dry_run, apply, recorded_since(cfg, given))
             if not dry_run:
                 mark_loop("mine", code == 0)
             return code
@@ -525,35 +710,49 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
             return 1
 
 
-def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bool) -> int:
+def recorded_since(cfg: config.Config, hours: float | None) -> str:
+    if hours:
+        return util.iso(util.now() - timedelta(hours=hours))
+    last = state.runs(kind="miner", statuses=("pr", "noop"), limit=1)
+    return last[0]["started"] if last else util.iso(util.now() - timedelta(hours=cfg.miner_lookback_hours))
+
+
+def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bool, since: str) -> int:
     if not dry_run:
         sync_feedback()
-    sessions = worth_mining(cfg, run_id, collect(hours))
-    digest, used = render_digest(cfg, sessions, cfg.miner_max_digest_chars)
-    print(f"{util.iso()} miner: {len(sessions)} sessions with signal, {used} in digest, {len(digest)} chars")
+    sessions_found = collect(hours)
+    flagged, clean_runs = collect_runs(since)
+    flagged = worth_mining(cfg, run_id, flagged, recorded=True)
+    records, recorded_used = render_runs(flagged, cfg.miner_max_digest_chars // RECORDED_SHARE)
+    sessions = worth_mining(cfg, run_id, sessions_found)
+    digest, used = render_digest(cfg, sessions, cfg.miner_max_digest_chars - len(records))
+    print(f"miner {run_id}: {len(sessions)} sessions with signal, {used} in digest, "
+          f"{len(flagged)} recorded runs with signal since {since} ({clean_runs} clean left out), "
+          f"{recorded_used} in digest, {len(digest) + len(records)} chars")
+    records = records or f"(no recorded run since {since} failed, needed a retry, hit a budget or ran long)"
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
     pr_feedback = state.feedback_since(util.iso(util.now() - timedelta(hours=hours)))
-    if not sessions and not audit_wants_fixes and not pr_feedback:
-        record.settle(run_id, "noop", summary="no human sessions in window")
-        return 0
     mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
-    if not mine_repos:
-        record.settle(run_id, "noop", summary="no repo with mine = true is checked out here")
-        return 0
-    repos = "\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
+    repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
         pending=_fmt(state.proposals(status=["applied", "pending", "hand", "approve", "filing"])),
         rejected=_fmt(state.proposals(status=["rejected"])),
         events=render_events(cfg, hours), digest=digest, audit=auditor.latest_findings(),
-        feedback=render_feedback(pr_feedback),
+        feedback=render_feedback(pr_feedback), records=records, since=since,
     )
     run_dir = paths.RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(text)
-    res = runner.run(text, mine_repos[0].path, model=cfg.model("miner"), allowed_tools=runner.READ_TOOLS,
-                     json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]],
+    if not sessions and not flagged and not audit_wants_fixes and not pr_feedback:
+        record.settle(run_id, "noop", summary="no sessions or recorded runs in window")
+        return 0
+    if not mine_repos:
+        record.settle(run_id, "noop", summary="no repo with mine = true is checked out here")
+        return 0
+    res =runner.run(text, mine_repos[0].path, model=cfg.model("miner"), tools=runner.READ_TOOLS,
+                     allowed_tools=runner.READ_TOOLS, json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]],
                      trace=(run_id, "mine"))
     (run_dir / "result.json").write_text(json.dumps({"ok": res.ok, "cost": res.cost_usd, "structured": res.structured,
                                                      "error": res.error}, indent=2))
@@ -564,7 +763,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
     props = res.structured.get("proposals", [])[:MAX_PROPOSALS]
     by_repo: dict[str, list[dict]] = defaultdict(list)
     for p in props:
-        ok, why = allowed(cfg, p)
+        ok, why = allowed(cfg, p, flagged)
         by_hand = ok and util.matches_any(p["file"], diffguard.CLAUDE_CODE_GUARDED)
         held = ok and awaits_approval(cfg, p)
         mark = "->" if ok and not by_hand and not held else "  "

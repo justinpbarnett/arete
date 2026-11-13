@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -9,9 +10,10 @@ from typing import Literal
 from . import outbound, paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research", "research_plan", "explain", "document")
+               "classify", "loop", "session", "research", "research_plan", "research_search",
+               "explain", "document")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
-                   "research": "opus", "research_plan": "opus", "explain": "haiku"}
+                   "research": "opus", "research_plan": "opus", "research_search": "sonnet", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
 INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify"}
 STEP_ROLES = (*MODEL_ROLES, *INHERITS)
@@ -37,6 +39,7 @@ KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle", "expire_days")
+RETENTION_KEYS = ("days", "max_gb")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -131,6 +134,12 @@ class AskConfig:
     expire_days: float = 7
 
 
+@dataclass(frozen=True)
+class Retention:
+    days: float = 30
+    max_gb: float = 20
+
+
 @dataclass
 class Environment:
     passes: tuple[str, ...] = ()
@@ -204,7 +213,11 @@ class Config:
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
     research_planner: bool = False
+    research_search: bool = False
+    research_search_workers: int = 3
+    research_search_share: float = 0.6
     ask: AskConfig = field(default_factory=AskConfig)
+    retention: Retention = field(default_factory=Retention)
     document: dict = field(default_factory=dict)
     oncall: OncallConfig = field(default_factory=OncallConfig)
 
@@ -440,14 +453,39 @@ def ask_table(data) -> AskConfig:
     return AskConfig(max_per_run=limit, settle=settle, expire_days=days)
 
 
-def research_table(data) -> bool:
+def retention_table(data) -> Retention:
+    table = table_of(data, "retention")
+    if bad := sorted(set(table) - set(RETENTION_KEYS)):
+        raise ValueError(f"[retention]: unknown key {', '.join(bad)}; use {', '.join(RETENTION_KEYS)}")
+    found = {}
+    for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb)):
+        value = table.get(key, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"[retention] {key} must be a number above 0, not {value!r}")
+        found[key] = value
+    return Retention(**found)
+
+
+def research_table(data) -> dict:
     table = table_of(data, "research")
-    if bad := sorted(set(table) - {"planner"}):
-        raise ValueError(f"[research]: unknown key {', '.join(bad)}; use planner")
+    keys = ("planner", "search", "search_workers", "search_share")
+    if bad := sorted(set(table) - set(keys)):
+        raise ValueError(f"[research]: unknown key {', '.join(bad)}; use {', '.join(keys)}")
     planner = table.get("planner", False)
     if type(planner) is not bool:
         raise ValueError(f"[research] planner must be true or false, not {planner!r}")
-    return planner
+    search = table.get("search", False)
+    if type(search) is not bool:
+        raise ValueError(f"[research] search must be true or false, not {search!r}")
+    if search and not planner:
+        raise ValueError("[research] search needs planner = true, because the planner sets the search tasks")
+    workers = table.get("search_workers", Config.research_search_workers)
+    if type(workers) is not int or not 1 <= workers <= 8:
+        raise ValueError(f"[research] search_workers must be a whole number from 1 to 8, not {workers!r}")
+    share = table.get("search_share", Config.research_search_share)
+    if type(share) not in (int, float) or not 0 < share < 1:
+        raise ValueError(f"[research] search_share must be a number above 0 and under 1, not {share!r}")
+    return {"planner": planner, "search": search, "search_workers": workers, "search_share": float(share)}
 
 
 def oncall_source(entry, repos: list[Repo]) -> OncallSource:
@@ -690,8 +728,13 @@ def load(path: Path | None = None) -> Config:
     cfg.oncall = oncall_table(data.get("oncall") or {}, cfg.repos)
     cfg.replay = replay_table(data.get("replay") or {})
     cfg.mcp = mcp_tables(data.get("mcp") or {})
-    cfg.research_planner = research_table(data.get("research") or {})
+    research = research_table(data.get("research") or {})
+    cfg.research_planner = research["planner"]
+    cfg.research_search = research["search"]
+    cfg.research_search_workers = research["search_workers"]
+    cfg.research_search_share = research["search_share"]
     cfg.ask = ask_table(data.get("ask") or {})
+    cfg.retention = retention_table(data.get("retention") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)
     from . import steps

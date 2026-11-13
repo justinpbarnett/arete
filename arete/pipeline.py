@@ -1751,6 +1751,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             run.log(f"pushed to {c.pr}")
     pushed = [c for c in staged.changed if c not in opened]
     with_prs = [c for c in checkouts if c.pr]
+    ci_stopped: list[Checkout] = []
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
@@ -1758,6 +1759,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                 gh.pr_edit_body(c.pr, f"{link}\n\n{pr_report}{others}")
             continue
         body = gh.pr_body(c.pr)
+        if c in pushed and ci.stopped(body):
+            ci_stopped.append(c)
         new_body = synced_pr_body(run, c.pr, body, t, left_for_a_person)
         if opened:
             new_body = with_siblings(new_body, others)
@@ -1765,6 +1768,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             gh.pr_edit_body(c.pr, new_body)
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{pr_report}")
+    drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
     try:
         ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why)
     except RunFailed as e:
@@ -1783,8 +1787,9 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         run.say(f"Revised for your review.\n\n{pr_report}\n\nCI: {ci_result}.")
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
-                + ("" if not opened else draft_note(draft_why, verified)))
-    automerge(cfg, run, layer, approval, draft_why, opened, f"{t.title}\n\n{build_summary.strip()[:3000]}")
+                + published_note(draft_why, verified, opened, drafted))
+    automerge(cfg, run, layer, approval, draft_why, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
+              f"{t.title}\n\n{build_summary.strip()[:3000]}")
     urls = record_prs(run, branch, with_prs)
     remove_workspace(ws, checkouts)
     return "pr", outcome, urls
@@ -2024,15 +2029,70 @@ def drafted_note(drafted: list[Checkout], with_prs: list[Checkout]) -> str:
     return "The PR is now a draft." if len(with_prs) == 1 else "The PRs are now drafts."
 
 
-def set_draft(run: AgentRun, c: Checkout, draft: bool) -> bool:
+def set_draft(run: AgentRun, c: Checkout, draft: bool, by: str = "ci") -> bool:
     now = "a draft" if draft else "ready for review"
     try:
         gh.pr_set_draft(c.pr, draft)
     except gh.GhError as e:
-        run.log(f"ci: could not mark {c.pr} {now}: {util.first_line(str(e), 300)}")
+        run.log(f"{by}: could not mark {c.pr} {now}: {util.first_line(str(e), 300)}")
         return False
-    run.log(f"ci: marked {c.pr} {now}")
+    run.log(f"{by}: marked {c.pr} {now}")
     return True
+
+
+def own_draft_state(run: AgentRun, c: Checkout) -> bool | None:
+    try:
+        draft, head = gh.pr_draft_and_head(c.pr)
+    except gh.GhError as e:
+        run.log(f"pr: left {c.pr} as it is: arete could not read its state: {util.first_line(str(e), 300)}")
+        return None
+    if not head or not c.lease:
+        run.log(f"pr: left {c.pr} as it is: arete could not compare its head with this run's push")
+        return None
+    if head != c.lease:
+        run.log(f"pr: left {c.pr} as it is: its head is {head[:12]}, not the {c.lease[:12]} this run pushed or "
+                "checked again, so someone changed it after the run started")
+        return None
+    return draft
+
+
+def hold_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout],
+                draft_why: str) -> list[Checkout]:
+    if not draft_why or run.repairs or run.feedback:
+        return []
+    held = []
+    for c in pushed:
+        if c in ci_stopped:
+            continue
+        draft = own_draft_state(run, c)
+        if draft is None:
+            continue
+        if draft or set_draft(run, c, True, "pr"):
+            held.append(c)
+    return held
+
+
+def ready_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout],
+                 draft_why: str) -> list[Checkout]:
+    if draft_why or run.repairs or run.feedback:
+        return []
+    ready = []
+    for c in pushed:
+        if c in ci_stopped:
+            continue
+        draft = own_draft_state(run, c)
+        if draft is None:
+            continue
+        if not draft or set_draft(run, c, False, "pr"):
+            ready.append(c)
+    return ready
+
+
+def published_note(draft_why: str, verified: verify.Verified, opened: list[Checkout],
+                   drafted: list[Checkout]) -> str:
+    if drafted:
+        return draft_note(draft_why, verified, pushed=True)
+    return draft_note(draft_why, verified) if opened else ""
 
 
 def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_rounds: int,
@@ -2585,9 +2645,9 @@ def draft_reason(review: dict, verified: verify.Verified, reviews: int = 0) -> s
     return "the review did not approve it"
 
 
-def draft_note(draft_why: str, verified: verify.Verified, kept: bool = False) -> str:
+def draft_note(draft_why: str, verified: verify.Verified, kept: bool = False, pushed: bool = False) -> str:
     blocked_by = f" {verified.blocked_by}" if verified.verdict == "blocked" else ""
-    lead = "The PR stays a draft" if kept else "The new PRs are drafts"
+    lead = "The PR stays a draft" if kept else "The PRs are drafts" if pushed else "The new PRs are drafts"
     return f"\n\n{lead}: {draft_why}.{blocked_by}".rstrip() if draft_why else ""
 
 

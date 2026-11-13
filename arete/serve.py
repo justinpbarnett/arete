@@ -150,7 +150,7 @@ class Server:
         self.dispatch({x.name: x for x in reversed(every_loop)})
         self.start_approval_jobs()
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
-            state.prune()
+            self.prune()
             self.pruned = time.monotonic()
         if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
             self.sweep = self.pool.submit(self.sweep_vms)
@@ -162,6 +162,22 @@ class Server:
             self.say(f"expiring asks: {type(e).__name__}: {e}")
         self.ticks += 1
         self.beat(every_loop, live)
+
+    def prune(self) -> None:
+        state.prune()
+        limits = self.cfg.retention
+        try:
+            found = record.prune(limits.days, limits.max_gb)
+        except Exception as e:
+            self.say(f"record prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+            return
+        if found.removed:
+            self.say(f"records: removed {util.count(len(found.removed), 'record')} "
+                     f"({record.size_text(sum(r.size for r in found.removed))}), "
+                     f"{found.left} left ({record.size_text(found.left_bytes)})")
+        if found.over:
+            self.say(f"records: {record.size_text(found.left_bytes)} is over max_gb {limits.max_gb:g}; every record "
+                     "left is pinned, cited by a pending proposal, running or written in the last hour")
 
     def schedule(self, loop: Loop, st: dict, now: datetime) -> None:
         t = loop.trigger
