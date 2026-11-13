@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import paths
+from . import outbound, paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research", "research_plan", "explain")
+               "classify", "loop", "session", "research", "research_plan", "explain", "document")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
                    "research": "opus", "research_plan": "opus", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
@@ -28,6 +28,10 @@ MCP_KEYS = ("command", "args", "url")
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 TIER_KEYS = ("runner", "provider", "model")
 PAYMENT_MODES = ("subscription", "api_key", "local")
+DOCUMENT_KINDS = ("message", "ticket", "pr", "doc")
+DOCUMENT_KEYS = ("enabled", "voice", "style", "words")
+DOCUMENT_WORDS = {"message": (20, 60), "ticket": (80, 140)}
+WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
@@ -177,6 +181,7 @@ class Config:
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
     research_planner: bool = False
+    document: dict = field(default_factory=dict)
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -424,11 +429,71 @@ def environment_table(data, layer: bool = False) -> Environment:
     return Environment(variable_names(table.get("pass", []), "[environment] pass"), providers)
 
 
+def voice_file(entry, folder: Path) -> str:
+    if not isinstance(entry, str):
+        raise TypeError(f"[document] voice: must be a list of file names, not {entry!r}")
+    named = Path(entry)
+    found = (folder / named).resolve()
+    if (named.is_absolute() or ".." in named.parts or not found.is_relative_to(folder.resolve())
+            or not found.is_file()):
+        raise ValueError(f"[document] voice: {entry!r} is not a file in {paths.short_path(folder)}")
+    return str(found)
+
+
+def word_range(kind: str, value) -> tuple[int, int]:
+    whole = isinstance(value, list) and len(value) == 2 and all(type(n) is int for n in value)
+    if kind not in WORD_KINDS or not whole or not 1 <= value[0] <= value[1]:
+        raise ValueError(f"[document] words: {kind} must be two whole numbers, low then high, from 1 up, "
+                         f"for {', '.join(WORD_KINDS)}; got {value!r}")
+    return value[0], value[1]
+
+
+def document_table(data, folder: Path) -> dict:
+    table = table_of(data, "document")
+    if bad := sorted(set(table) - set(DOCUMENT_KEYS)):
+        raise ValueError(f"[document]: unknown key {', '.join(bad)}; use {', '.join(DOCUMENT_KEYS)}")
+    found = {}
+    if "enabled" in table:
+        if type(table["enabled"]) is not bool:
+            raise ValueError(f"[document] enabled must be true or false, not {table['enabled']!r}")
+        found["enabled"] = table["enabled"]
+    if "style" in table:
+        if not isinstance(table["style"], str):
+            raise ValueError(f"[document] style must be a string, not {table['style']!r}")
+        found["style"] = table["style"].strip()
+    if "voice" in table:
+        if not isinstance(table["voice"], list):
+            raise ValueError(f"[document] voice must be a list of file names, not {table['voice']!r}")
+        found["voice"] = tuple(dict.fromkeys(voice_file(entry, folder) for entry in table["voice"]))
+    if "words" in table:
+        words = table_of(table["words"], "document.words")
+        found["words"] = {kind: word_range(kind, value) for kind, value in words.items()}
+    return found
+
+
+@dataclass(frozen=True)
+class Document:
+    enabled: bool = False
+    voice: tuple[str, ...] = ()
+    style: str = ""
+    words: dict[str, tuple[int, int]] = field(default_factory=lambda: dict(DOCUMENT_WORDS))
+
+
+def document_for(cfg: Config, repo: Repo | None = None, layer: RepoLayer | None = None) -> Document:
+    own = dict(layer.document) if layer else {}
+    if not (repo and repo.layer and not repo.layer.resolve().is_relative_to(repo.path.resolve())):
+        own.pop("voice", None)
+    found = {**cfg.document, **own}
+    return Document(found.get("enabled", False), tuple(found.get("voice", ())), found.get("style", ""),
+                    {**DOCUMENT_WORDS, **cfg.document.get("words", {}), **own.get("words", {})})
+
+
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
-    if not path.exists():
+    try:
+        data = tomllib.loads(paths.read_confined(path).decode())
+    except FileNotFoundError:
         return Config()
-    data = tomllib.loads(path.read_text())
     cfg = Config(
         alert_repo=data.get("alert_repo", ""),
         global_repo=data.get("global_repo", "ai"),
@@ -551,6 +616,7 @@ def load(path: Path | None = None) -> Config:
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.research_planner = research_table(data.get("research") or {})
     cfg.environment = environment_table(data.get("environment") or {})
+    cfg.document = document_table(data.get("document") or {}, path.parent)
     from . import steps
     steps.check(cfg, defer_tiers=True)
     return cfg
@@ -592,6 +658,8 @@ class Verify:
     allow_bash: list[str] = field(default_factory=list)
     notes: str = ""
     publish_evidence: bool = True
+    preflight: dict[str, str] = field(default_factory=dict)
+    preflight_seconds: float = 30
 
     @property
     def bash(self) -> list[str]:
@@ -614,6 +682,10 @@ class RepoLayer:
     subject: str = "{kind}: {title}"
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
+    max_repair_cycles: int = 2
+    max_run_minutes: int = 60
+    max_verify_minutes: int = 20
+    parallel_checks: bool = False
     verify: Verify | None = None
     research_dir: str = ""
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
@@ -626,6 +698,7 @@ class RepoLayer:
     factory_path: str = FACTORY_PATHS[0]
     tier_map: str = ""
     passes: tuple[str, ...] = ()
+    document: dict = field(default_factory=dict)
 
     @property
     def builder_bash(self) -> list[str]:
@@ -645,7 +718,7 @@ class RepoLayer:
 
 
 LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
-                  "factory", "environment", "routing"}
+                  "factory", "environment", "routing", "document"}
 
 
 def section(data: dict, name: str) -> dict:
@@ -669,6 +742,14 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.deny = list(lim.get("deny", []))
     layer.max_attempts = int(lim.get("max_attempts", layer.max_attempts))
     layer.timeout_minutes = int(lim.get("timeout_minutes", layer.timeout_minutes))
+    for name in ("max_repair_cycles", "max_run_minutes", "max_verify_minutes"):
+        value = lim.get(name, getattr(layer, name))
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"[limits] {name} must be a positive integer")
+        setattr(layer, name, value)
+    layer.parallel_checks = lim.get("parallel_checks", False)
+    if type(layer.parallel_checks) is not bool:
+        raise ValueError("[limits] parallel_checks must be true or false")
     agent = section(data, "agent")
     layer.allow_bash = list(DEFAULT_ALLOW_BASH) + list(agent.get("allow_bash", []))
     trust = section(data, "trust")
@@ -690,12 +771,22 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     layer.passes = environment_table(section(data, "environment"), layer=True).passes
+    layer.document = document_table(section(data, "document"), layer_dir)
     if "verify" in data:
         v = section(data, "verify")
         publish_evidence = v.get("publish_evidence", True)
         if type(publish_evidence) is not bool:
             raise ValueError("[verify] publish_evidence must be true or false")
+        preflight = table_of(v.get("preflight", {}), "verify.preflight")
+        if any(not isinstance(name, str) or not name.strip() or not isinstance(command, str) or not command.strip()
+               for name, command in preflight.items()):
+            raise ValueError("[verify.preflight] must map names to nonempty command strings")
+        seconds = v.get("preflight_seconds", Verify.preflight_seconds)
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= 300:
+            raise ValueError("[verify] preflight_seconds must be greater than 0 and at most 300")
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
-                              allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip())
+                              allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),
+                              preflight=dict(preflight), preflight_seconds=float(seconds))
+        outbound.keep_verify_private(layer.verify.url)
     return layer

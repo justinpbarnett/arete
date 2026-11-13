@@ -8,7 +8,7 @@ import sys
 from fnmatch import fnmatch
 from pathlib import Path
 
-from . import config, jev, record, util
+from . import config, jev, record, scratch, util
 from .agent import Result
 
 FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit")
@@ -106,7 +106,8 @@ def judged(command: str, cwd: str, cfg: config.Config) -> str:
     if not jev.ready(cfg, [cfg.repo_for_work_dir(cwd)]):
         return ""
     shown = PLACEHOLDER.sub("", command).strip() or command
-    reply = jev.ask(f"Working directory: {cwd}\n\nCommand:\n{shown}",
+    context = scratch.context(command, cwd)
+    reply = jev.ask(f"{context}Working directory: {cwd}\n\nCommand:\n{shown}",
                     {"effect": jev.pick(EFFECT, EFFECTS), "secrets": jev.yes_no(SECRETS)}, cfg, note=False)
     effect, secrets = reply.answers.get("effect"), reply.answers.get("secrets")
     irreversible = effect.probabilities.get("irreversible", 0.0) if effect else 0.0

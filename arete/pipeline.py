@@ -16,7 +16,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from string import Template
@@ -27,6 +27,7 @@ from . import (
     config,
     control,
     diffguard,
+    document,
     environment,
     factory,
     gh,
@@ -37,7 +38,9 @@ from . import (
     paths,
     record,
     routing,
+    runlimits,
     runner,
+    scratch,
     state,
     steps,
     tracker,
@@ -75,6 +78,7 @@ SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
+MAX_STARTS_PER_POLL = 64
 CHECKS_SCRIPT = "checks"
 NO_CHECKS = "(none configured)"
 SUMMARY_CHARS = 3000
@@ -239,6 +243,7 @@ class AgentRun:
     sessions: dict[str, Session] = field(default_factory=dict)
     writes_lines: bool = True
     step_calls: dict[str, int] = field(default_factory=dict)
+    budget: runlimits.Budget | None = None
 
     @property
     def ref(self) -> str:
@@ -279,6 +284,8 @@ class AgentRun:
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         s = self.settings(role) if role else None
+        if self.budget:
+            self.budget.charge(step, s.step if s else role)
         if s:
             reach = s.agent_kw(self.config, kw.pop("allowed_tools", ()), kw.pop("mcp_config", ""))
             kw = {**s.call, **reach,
@@ -508,15 +515,64 @@ def add_worktree(c: Checkout, branch: str, start: str) -> None:
         git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
 
 
-def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
+def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
+    found = []
+    for d in {ws, *(c.wt for c in checkouts)}:
+        if scratch.pending(d):
+            found.append(d)
+        try:
+            try:
+                d.lstat()
+            except FileNotFoundError:
+                continue
+            if d.is_symlink():
+                found.append(d)
+                continue
+            for root, dirs, files in os.walk(d, onerror=lambda e, found=found, d=d: found.append(d)):
+                found += [Path(root, n) for n in dirs + files if n.startswith(paths.SCRATCH_PREFIX)]
+                dirs[:] = [n for n in dirs if n != ".git" and not n.startswith(paths.SCRATCH_PREFIX)]
+        except OSError:
+            found.append(d)
+    return found
+
+
+def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
+    if scratch_left(ws, checkouts):
+        return False
+    made = made_before(ws)
+    salt = str(made.get(SALT_KEY) or "")
+
+    def unknown_outside(examined: set[Path]) -> bool:
+        try:
+            return any(not (salt and made.get(n) == fingerprint(ws / n, salt))
+                       for n in unexamined(ws, examined))
+        except OSError:
+            return True
+
+    if unknown_outside({c.wt for c in checkouts if (c.wt / ".git").exists()}):
+        return False
     for c in checkouts:
         with util.repo_lock(c.src):
+            if scratch_left(ws, checkouts):
+                return False
+            if (c.wt / ".git").exists():
+                try:
+                    if any(not (salt and made.get(c.prefix + n) == fingerprint(c.wt / n, salt))
+                           for n in [*ignored_files(c.wt), *untracked_files(c.wt)]):
+                        return False
+                except (OSError, RuntimeError):
+                    return False
             git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
+    if scratch_left(ws, checkouts) or unknown_outside(set()):
+        return False
     shutil.rmtree(ws, ignore_errors=True)
+    if os.path.lexists(ws):
+        return False
     made_record(ws).unlink(missing_ok=True)
     for c in checkouts:
         with util.repo_lock(c.src):
             git(["worktree", "prune"], c.src, check=False)
+    return True
 
 
 def made_copy(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
@@ -586,6 +642,8 @@ SALT_KEY = "\0salt"
 
 
 def note_made(ws: Path, checkouts: list[Checkout]) -> None:
+    if scratch_left(ws, checkouts):
+        return
     try:
         names = leftovers(ws, checkouts) if ws.is_dir() else []
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
@@ -637,9 +695,12 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
 
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
+    if scratch_left(ws, checkouts):
+        raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
     if why := kept_work(ws, checkouts, source, copies):
         raise RunFailed(why)
-    remove_workspace(ws, checkouts)
+    if not remove_workspace(ws, checkouts):
+        raise RunFailed("workspace removal withheld to preserve scratch resources")
 
 
 def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
@@ -663,7 +724,8 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
 
 def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False) -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
-    remove_workspace(c.wt, [c])
+    if not remove_workspace(c.wt, [c]):
+        raise RunFailed("worktree removal withheld to preserve existing resources")
     fetch(c.src, base)
     if resume:
         fetch(c.src, branch)
@@ -813,7 +875,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
         return True, "no checks configured"
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
-    with machine_to_itself(run):
+    with nullcontext() if layer.parallel_checks else machine_to_itself(run):
         for name, cmd in layer.checks.items():
             with record.timed(run.id, "check", name=name, command=cmd) as check:
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=timeout)
@@ -1001,7 +1063,12 @@ def flow_function(cfg: config.Config, name: str) -> Callable:
 
 
 def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
-    return [sys.executable, str(script_file(cfg, name)), *args]
+    script = script_file(cfg, name).resolve()
+    if script.parent == paths.ADWS_DIR.resolve():
+        entrypoint = (f"import sys, runpy; sys.path[:0] = {[str(paths.PACKAGE_DIR.parent), str(script.parent)]!r}; "
+                      f"runpy.run_path({str(script)!r}, run_name='__main__')")
+        return [sys.executable, "-I", "-c", entrypoint, *args]
+    return scratch.protected_command([sys.executable, str(script), *args])
 
 
 def answer_text(asked_id: str) -> str:
@@ -1020,7 +1087,7 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     except (ValueError, TypeError):
         adw = False
     if not adw:
-        return [sys.executable, "-m", "arete.cli", "run", repo_name, str(tid), "--local", *flags]
+        return control.command(["run", repo_name, str(tid), "--local", *flags])
     newest = state.ticket_runs(repo_name, str(tid), limit=1, whole=True)
     if newest and newest[0]["status"] == "interrupted" and repaired_by(newest[0]["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
@@ -1087,6 +1154,10 @@ def runnable(repo: config.Repo) -> bool:
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
               script: Script | None = None) -> int:
+    try:
+        producer_baseline = scratch.process_ids()
+    except OSError:
+        producer_baseline = None
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
@@ -1112,6 +1183,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        try:
+            layer = config.load_layer(repo.layer_dir)
+            budget_history = state.ticket_runs(repo.name, tid, limit=1)
+            blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
+        except (ValueError, OSError) as e:
+            print(f"could not validate the process budget: {e}")
+            return 2
+        if blocked and not dry_run:
+            print(blocked)
+            return 2
         if script and script.repairs and (later := state.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
             return 1
@@ -1130,6 +1211,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                        ) if script else ""
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
+            scratch.RUN_BASELINES[run_id] = producer_baseline
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
@@ -1151,9 +1233,24 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
         pr_url, passed = "", None
         try:
-            status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+            parent = (script.repairs or script.continues if script else "") or (
+                earlier[0]["id"] if earlier and earlier[0]["status"] not in ("done", "merged", "rejected") else "")
+            if budget_history and budget_history[0]["status"] not in ("done", "merged", "rejected"):
+                parent = budget_history[0]["id"]
+            run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), "" if reset_budget else parent)
+            with run.budget.watching():
+                run.budget.capture(tk.get(tid))
+                status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
+        except runlimits.Parked as e:
+            reason = str(e)
+            status, summary = "failed", f"parked: {reason}; branch and evidence retained, workspace left in place. {runlimits.RETRY}"
+            kept = run.budget.park(reason)
+            record.note(run.id, **kept)
+            pr_url = kept["pr_url"]
+            run.log(summary)
+            run.enter("failed")
         except factory.OnlyDone:
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
@@ -1502,9 +1599,14 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
     outcome = f"{size}, review {review.get('verdict')}, in use {verified.verdict}"
+    written = document.pr_text(run, t, summary_of(review, build_summary), review, verified, size, draft_why, cfg, layer)
 
     if run.dry_run:
         run.save("diff.patch", staged.patch)
+        run.save("pr_body.md", outbound.screen(report_body(
+            run, summary=build_summary, review=review, verified=verified, left=left_for_a_person, images={},
+            approval=approval, attempts=attempts, checks=checks, plan_text=plan_text, size=size, held=draft_why,
+            written=written)))
         run.log(f"dry run: {outcome}; worktree kept at {ws}")
         return "dry-run", outcome, ""
 
@@ -1512,7 +1614,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     pr_report = report_body(run, summary=build_summary, review=review, verified=verified, left=left_for_a_person,
                             images=evidence_images(run, staged.changed[0], verified), approval=approval,
                             attempts=attempts, checks=checks, plan_text=plan_text, size=size,
-                            held=draft_why)
+                            held=draft_why, written=written)
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
@@ -1589,10 +1691,10 @@ def summary_of(review: dict, build_summary: str) -> str:
 
 def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
-                size: str, held: str = "") -> str:
+                size: str, held: str = "", written: str = "") -> str:
     problems = review.get("problems", [])
     return public_text(run, (
-        f"## Summary\n\n{summary_of(review, summary)}\n\n"
+        f"## Summary\n\n{written or summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
         + left_block(left)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
@@ -1681,9 +1783,10 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
 
 def left_section(run: Run, text: str) -> str:
     if len(text) <= MAX_LEFT_FOR_A_PERSON_CHARS:
-        return text
-    return (f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
-            f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
+        return outbound.screen(text)
+    return outbound.screen(
+        f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
+        f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
 
 
 def left_block(left: str) -> str:
@@ -2170,6 +2273,7 @@ def review_problems(listed) -> list[dict]:
             for p in listed if isinstance(p, dict)]
 
 
+@runlimits.verification
 def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     if not b.layer.verify:
         b.run.log("verify: the layer has no [verify] section, so nothing checks the change in use")
@@ -2200,33 +2304,83 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:
     run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
     step = b.next_step(step_name)
+    if ready := verify.preflight(v, b.ws, b.cfg, run.repo):
+        run.save(f"{step}-preflight.json", json.dumps(asdict(ready), indent=2))
+        run.log(f"{step}: preflight {ready.verdict}")
+        if ready.verdict == "blocked":
+            ready.saved = os.path.abspath(run.dir / f"{step}-preflight.md")
+            run.save(f"{step}-preflight.md", ready.markdown())
+            return ready
     evidence = run.dir / "evidence"
     evidence.mkdir(exist_ok=True)
     if evidence not in run.add_dirs:
         run.add_dirs.append(evidence)
-    bash = b.read_bash + v.bash
     untracked_before = untracked_by_dir(b.git_dirs)
+    attempt = None
     try:
-        with verify.serving(v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo) as url:
+        attempt = scratch.make(run.id, step, b.ws, run.dir)
+    except (OSError, ValueError) as e:
+        run.log(f"{step}: trusted scratch unavailable: {util.first_line(str(e), 300)}")
+    agent_started, agent_finished = False, False
+    lifetime = {"stopped": True}
+    fixture_blocker = ""
+    try:
+        if attempt:
+            run.log(f"{step}: scratch folder {attempt.root}")
+            v = verify.with_scratch(v, attempt.root)
+        else:
+            run.log(f"{step}: ordinary verification without trusted scratch authority")
+            if verify.SCRATCH_FIELD in v.start:
+                fixture_blocker = "Required service needs unavailable scratch fixtures for start command: " + json.dumps(v.start)
+                v = replace(v, start="", url="", notes=v.notes + "\n" + fixture_blocker)
+        bash = b.read_bash + v.bash
+        with verify.serving(
+                v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo,
+                sets={scratch.ENV_NAME: attempt.root} if attempt else None, lifetime=lifetime,
+                attempt=attempt) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
+            agent_started = True
             res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
+                                         scratch=scratch.note(attempt),
                                          commands=code_list(bash), checks=check_list(b.layer), **values),
                             b.ws, role=role,
                             allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
-                            mcp_config=verify.mcp_config(evidence) if url else "")
+                            mcp_config=verify.mcp_config(evidence) if url else "",
+                            scratch=attempt)
+            agent_finished = True
+    except scratch.ConfinementUnavailable as e:
+        return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
+                               blocked_by=util.first_line(str(e), 300))
     except verify.ServerError as e:
         run.log(f"{step}: the app did not start")
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
-        restore_worktrees(untracked_before, evidence)
+        try:
+            if not attempt:
+                archived, moved, kept = "", [], []
+            elif not lifetime["stopped"] or (agent_started and not agent_finished):
+                scratch.retain(attempt)
+                archived, moved, kept = "", [], [attempt.root]
+            else:
+                archived, moved, kept = scratch.end(attempt, run.dir)
+            if moved:
+                run.log(f"{step}: preserved {util.count(len(moved), 'fixture')} from the scratch folder at "
+                        f"{archived}")
+            if kept:
+                fixture_blocker = "Verification scratch resources remain unresolved; the workspace is retained."
+                run.log(f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree")
+        finally:
+            restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
         return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
     verified = verify.Verified.from_agent(res.structured)
+    if fixture_blocker and verified.verdict == "pass":
+        verified.verdict, verified.blocked_by = "blocked", fixture_blocker
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
@@ -2252,12 +2406,15 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
     for d, name in untracked_added_since(untracked_before):
         f = d / name
+        if scratch.pending(d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
+            continue
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
             remove_untracked(d, name)
     for d in untracked_before:
-        git(["checkout", "-q", "--", "."], d)
+        if not scratch.pending(d):
+            git(["checkout", "-q", "--", "."], d)
 
 
 def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[str, str]:
@@ -2683,7 +2840,8 @@ def cleanup_worktrees(days: float = 7) -> None:
     cutoff = util.now().timestamp() - days * 86400
     for d in paths.WORKTREES_DIR.glob("*"):
         try:
-            if d.is_dir() and d.stat().st_mtime < cutoff:
+            if (d.is_dir() and not d.is_symlink() and d.stat().st_mtime < cutoff and not scratch_left(d, [])
+                    and not unexamined(d, set())):
                 shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
@@ -2716,6 +2874,15 @@ class SkipLog:
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
+
+
+def retry_scratch() -> None:
+    for root in scratch.recover_pending():
+        print(f"preserved and finalized verification scratch {root}")
+    for data in scratch.records():
+        if data["state"] in ("pending", "retained", "preserved") and data["diagnostic"]:
+            print("verification scratch retained: " + json.dumps({"run": data["attempt"]["run_id"],
+                  "attempt": data["attempt"]["selector"], "diagnostic": data["diagnostic"]}, ensure_ascii=True))
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
@@ -2865,10 +3032,10 @@ def sources(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
 
 
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
-                other_routes: set[str] = frozenset()) -> tracker.Ticket | None:
+                other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
     for source in sources(repo, tk):
         for t in source.todo():
-            if other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
+            if str(t.id) in excluded or other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
                 continue
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
@@ -2886,17 +3053,17 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
 
 
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
-              other_routes: set[str]) -> tuple[str, str] | None:
-    fresh = next_ticket(repo, tk, skips, other_routes)
+              other_routes: set[str], excluded: set[str] = frozenset()) -> tuple[str, str] | None:
+    fresh = next_ticket(repo, tk, skips, other_routes, excluded)
     for tid in state.interrupted_tickets(repo.name):
-        if not state.issue_running(repo.name, tid):
+        if str(tid) not in excluded and not state.issue_running(repo.name, tid):
             return tid, "restarting after an interruption"
     for tid in state.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=FEEDBACK_QUIET_MINUTES))):
-        if not state.issue_running(repo.name, tid):
+        if str(tid) not in excluded and not state.issue_running(repo.name, tid):
             return tid, "revising the PR for your review comments"
     for source in sources(repo, tk):
         for t in source.replied():
-            if state.issue_running(repo.name, t.id):
+            if str(t.id) in excluded or state.issue_running(repo.name, t.id):
                 continue
             if other_routes & set(t.labels):
                 skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
@@ -2908,6 +3075,28 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
     return (fresh.id, fresh.title) if fresh else None
 
 
+def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
+                  discovery: routing.Discovery, layer: config.RepoLayer) -> str:
+    if cfg.replay.all:
+        return ""
+    first = ("plan", "build")
+    newest = state.ticket_runs(repo.name, ticket.id, limit=1, whole=True)
+    if (layer.factory_path == "adw" and newest and newest[0]["status"] == "interrupted"
+            and repaired_by(newest[0]["id"])):
+        first = ("review_repair",)
+    elif pending_feedback(repo.name, ticket.id):
+        first = ("build",)
+    for role in (*first, *(("verify",) if layer.verify else ()), "review"):
+        setting = steps.resolve(cfg, layer, role, ticket.kind)
+        if setting.runner == runner.REPLAY:
+            continue
+        routes = discovery.routes(setting)
+        if not any(route.state == "ready" for route in routes):
+            reason = routing.held_words(routes) or "; ".join(dict.fromkeys(route.detail for route in routes))
+            return f"{role} has no eligible route" + (f": {reason}" if reason else "")
+    return ""
+
+
 def poll(dry_run: bool = False) -> int:
     paths.ensure_dirs()
     cfg = config.load()
@@ -2915,6 +3104,8 @@ def poll(dry_run: bool = False) -> int:
         if not got:
             print(f"{util.iso()} poll already running")
             return 0
+        if not dry_run:
+            retry_scratch()
         if any(r.parts or r.tracker != "local" for r in cfg.repos) and not network_up_or_skip("poll", dry_run):
             return 0
         errors: list[str] = []
@@ -2940,6 +3131,7 @@ def poll(dry_run: bool = False) -> int:
         skips = SkipLog({} if dry_run else util.read_json(SKIPPED_FILE, {}))
         routes = jira_routes_by_project(cfg)
         reached_clients: dict[str, jira.Client] = {}
+        contexts = []
         for repo in sorted(pipeline_repos, key=lambda r: (r.name not in restarting, starts.get(r.name, ""))):
             try:
                 tk = tracker.for_repo(cfg, repo)
@@ -2947,27 +3139,56 @@ def poll(dry_run: bool = False) -> int:
                 if isinstance(tk, tracker.JiraTracker):
                     other_routes = routes.get(tk.project, set()) - {tk.route}
                     reached_clients.setdefault(tk.project, tk.client)
-                pick = next_pick(repo, tk, skips, other_routes)
-                if not pick:
-                    if not dry_run:
-                        state.drop_passed_over(repo.name)
-                    continue
-                tid, why = pick
-                if not dry_run:
-                    state.drop_passed_over(repo.name, keep=str(tid))
-                name = tracker.ticket_name(repo.name, tracker.for_ticket(cfg, repo, tid).ref(tid))
-                if waiting := held_back(cfg, repo.name, going, slots):
-                    if not dry_run:
-                        state.pass_over(repo.name, str(tid))
-                    print(f"{util.iso()} {name}: waiting, {waiting}")
-                else:
-                    print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
-                    if not dry_run:
-                        spawn_run(repo.name, tid)
-                    slots -= 1
+                layer = config.load_layer(repo.layer_dir)
+                contexts.append((repo, tk, other_routes, layer,
+                                 routing.Discovery(cfg, repo, priced=False, layer=layer), set()))
             except Exception as e:
                 failed(repo.name, e)
                 skips.keep_repo(repo.name)
+        examined, exhausted = 0, set()
+        while examined < MAX_STARTS_PER_POLL:
+            progressed = False
+            for repo, tk, other_routes, layer, discovery, selected in contexts:
+                if repo.name in exhausted or examined >= MAX_STARTS_PER_POLL:
+                    continue
+                try:
+                    pick = next_pick(repo, tk, skips, other_routes, selected)
+                    if not pick:
+                        exhausted.add(repo.name)
+                        if not dry_run:
+                            state.drop_passed_over(repo.name)
+                        continue
+                    tid, why = pick
+                    selected.add(str(tid))
+                    examined += 1
+                    progressed = True
+                    source = tracker.for_ticket(cfg, repo, tid)
+                    name = tracker.ticket_name(repo.name, source.ref(tid))
+                    if waiting := held_back(cfg, repo.name, going, slots):
+                        exhausted.add(repo.name)
+                        if not dry_run:
+                            state.pass_over(repo.name, str(tid))
+                        print(f"{util.iso()} {name}: waiting, {waiting}")
+                        continue
+                    blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
+                    ticket = source.get(tid)
+                    blocked = blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, discovery, layer)
+                    if blocked:
+                        skips.note(name, ticket, blocked, repo.name)
+                        print(f"{util.iso()} {name}: {blocked}")
+                        continue
+                    print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
+                    if not dry_run:
+                        state.drop_passed_over(repo.name, keep=str(tid))
+                        spawn_run(repo.name, tid)
+                    slots -= 1
+                    going[repo.name] += 1
+                except Exception as e:
+                    failed(repo.name, e)
+                    skips.keep_repo(repo.name)
+                    exhausted.add(repo.name)
+            if not progressed:
+                break
         for project, client in reached_clients.items():
             try:
                 for t in tracker.jira_unrouted(project, routes.get(project, set()), client):
