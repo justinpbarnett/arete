@@ -80,6 +80,7 @@ class Request:
     mcp: tuple[str, ...]
     effort: str
     instructions: tuple[str, ...] | None = None
+    denied: tuple[str, ...] = ()
 
     def effort_on(self, which: str) -> str:
         return nearest_effort(which, self.effort)
@@ -316,9 +317,13 @@ class Discovery:
                 return f"instructions {', '.join(settings.instructions_on('pi'))} cannot load on pi"
             if runner.WRITING_TOOLS & set(settings.tools) and not pi.can_confine(False):
                 return pi.NO_CONFINEMENT_REASON
-        if (way.runner in ("pi", "codex") and not (way.link.requested and way.runner == way.link.runner)
+        fallback = not (way.link.requested and way.runner == way.link.runner)
+        if (way.runner in ("pi", "codex") and fallback
                 and (missing := [t for t in runner.READ_TOOLS if t not in settings.tools])):
             return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
+        if way.runner == "codex" and fallback and (
+                loose := [d for d in settings.denied if d not in runner.NO_GIT_WRITES]):
+            return f"codex cannot hold the denial of {', '.join(loose)}"
         if way.runner == "codex" and "user" in settings.instructions_on("codex"):
             return "instructions user cannot load on codex, which runs without your own codex setup"
         return ""

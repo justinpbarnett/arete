@@ -523,7 +523,7 @@ def steps(run_id: str, connect=db) -> list[dict]:
 
 def step_tries(run_id: str, step: str) -> int:
     with db() as c:
-        return c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
+        return c.execute("SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
 
 
 def steps_since(since: str, connect=db, paid_only: bool = False) -> list[dict]:

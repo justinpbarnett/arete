@@ -267,7 +267,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(),
         repo: config.Repo | None = None, remaining_budget: Callable[[], float | None] | None = None,
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
-        fresh_prompt: Callable[[str], str] | None = None, **kw) -> Result:
+        fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
     which, name = chosen(model, run_with, cfg)
@@ -278,11 +278,12 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                       provider=provider_of(name), session=kept)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
+    try_no = try_no or (state.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
     if which == REPLAY:
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0])})
         return attempt(which, name, prompt, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
-                       accounts.Auth(), {"launch": 1})
+                       accounts.Auth(), {"launch": 1}, try_no)
     if not target.remote:
         repo = repo or cfg.repo_for_work_dir(cwd)
     trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw), resume,
@@ -316,7 +317,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         on_launch(route)
         started = util.iso()
         res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
-                      tier, kind, picked.auth, route)
+                      tier, kind, picked.auth, route, try_no)
         res.credential, res.effort, res.requested_effort, res.skipped = (
             chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
         if res.session.id:
@@ -375,12 +376,19 @@ class Stopped:
     picked: Picked
 
 
+def reach(kw: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    granted = kw["tools"] if kw.get("tools") is not None else (kw.get("allowed_tools") or [])
+    denied = tuple(dict.fromkeys(kw.get("disallowed_tools") or []))
+    bare = tuple(t for t in dict.fromkeys(granted)
+                 if "(" not in t and not t.startswith("mcp__") and t not in denied)
+    return bare, denied
+
+
 def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: str, settings, fallback: bool,
                 kw: dict):
     from . import routing, steps
 
-    bare = [t for t in dict.fromkeys([*(kw.get("tools") or []), *(kw.get("allowed_tools") or [])])
-            if "(" not in t and not t.startswith("mcp__")]
+    bare, denied = reach(kw)
     try:
         servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers") or {}
     except (ValueError, AttributeError):
@@ -398,7 +406,7 @@ def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: 
         except (ValueError, OSError):
             layer = None
         chain, allowed = steps.chain_for(cfg, layer, which, name, effort, explicit)
-    return routing.Request(chain, allowed and fallback, tuple(bare), tuple(servers), effort, explicit)
+    return routing.Request(chain, allowed and fallback, bare, tuple(servers), effort, explicit, denied)
 
 
 def passed_over(found, why: str, detail: str, until: str = "") -> dict:
@@ -563,7 +571,7 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
-            kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None) -> Result:
+            kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0) -> Result:
     auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
     route = route or {}
     header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
@@ -644,7 +652,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     if trace[0]:
         for call in res.calls or [res]:
             record.step(trace[0], trace[1], call, call.call_seconds if res.calls else time.monotonic() - started,
-                        effort=kw.get("effort", ""), tier=tier, kind=kind)
+                        effort=kw.get("effort", ""), tier=tier, kind=kind, try_no=try_no)
     return res
 
 

@@ -227,6 +227,7 @@ class AgentRun:
     step_overrides: dict[str, dict] = field(default_factory=dict)
     sessions: dict[str, Session] = field(default_factory=dict)
     writes_lines: bool = True
+    step_calls: dict[str, int] = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -291,7 +292,8 @@ class AgentRun:
                     self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kind, **fields)
 
             kw["on_launch"] = announce
-        attempt_no = state.step_tries(self.id, step) + 1
+        attempt_no = self.step_calls[step] = max(state.step_tries(self.id, step), self.step_calls.get(step, 0)) + 1
+        kw["try_no"] = attempt_no
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         with lines.beating(self.id, step) if lined else nullcontext():

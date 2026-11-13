@@ -45,6 +45,10 @@ class Settings:
         return self.instructions if self.instructions_explicit else default_instructions(which)
 
     @property
+    def denied(self) -> tuple[str, ...]:
+        return ()
+
+    @property
     def call(self) -> dict:
         return {"model": self.model, "runner": self.runner, "effort": self.effort_on(self.runner),
                 "timeout": self.timeout_minutes * 60}
