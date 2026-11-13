@@ -58,6 +58,8 @@ PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 ANTHROPIC_LOGIN_REASON = "a Claude plan login runs only on the claude runner"
 ANTHROPIC_KEY_REQUIRED = (f"pi anthropic: {ANTHROPIC_LOGIN_REASON}; "
                           "put an Anthropic Console key in pi.env or use claude:<model>")
+REMOTE_AUTH_UNVERIFIED = ("pi cannot validate or isolate credentials on a remote device; "
+                          "run pi locally or use the claude runner")
 KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azure": "AZURE_OPENAI_API_KEY",
              "amazon-bedrock": "AWS_BEARER_TOKEN_BEDROCK",
              "google": "GEMINI_API_KEY", "google-vertex": "GOOGLE_CLOUD_API_KEY", "huggingface": "HF_TOKEN",
@@ -101,6 +103,10 @@ SAFE_HEADERS = {"accept": r"application/json|text/event-stream", "content-type":
 
 def owner_dir() -> Path:
     return paths.expand(os.environ.get("PI_CODING_AGENT_DIR") or PI_HOME / "agent").absolute()
+
+
+def remote_refusal(remote: devices.Device | str | None) -> str:
+    return REMOTE_AUTH_UNVERIFIED if remote and devices.resolve(remote).remote else ""
 
 
 @dataclass(frozen=True)
@@ -566,6 +572,9 @@ def sessions_dir(remote: devices.Device | None) -> str:
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
             persist: bool = True, add_dirs: list[Path] | None = None,
             remote: devices.Device | None = None) -> list[str]:
+    if refusal := remote_refusal(remote):
+        raise ValueError(refusal)
+    remote = None
     cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp"]
     if not remote:
@@ -589,7 +598,7 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
 
 
 def authentication(model: str, passing=None, providers=None, remote=None) -> accounts.Auth:
-    return accounts.Auth("api_key") if remote else select(model, passing, providers).auth
+    return accounts.Auth() if remote_refusal(remote) else select(model, passing, providers).auth
 
 
 def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "") -> UsageLimit | None:
@@ -706,12 +715,13 @@ def refresh_channel(route: Route | None, env: dict):
 
 
 def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None, **kw) -> Result:
-    if kw.get("remote"):
-        selected = None
-    else:
-        selected = selected or select(kw.get("model", ""), kw.get("passing"), kw.get("providers"))
-        auth = selected.auth
-        kw["model"] = selected.model
+    if refusal := remote_refusal(kw.get("remote")):
+        return Result(ok=False, error=refusal, runner="pi", model=kw.get("model", ""),
+                      session=kw.get("resume", NO_SESSION))
+    kw["remote"] = None
+    selected = selected or select(kw.get("model", ""), kw.get("passing"), kw.get("providers"))
+    auth = selected.auth
+    kw["model"] = selected.model
     auth = auth or accounts.Auth("api_key")
     if auth.mode == "subscription":
         kw["max_budget_usd"] = None
@@ -781,10 +791,9 @@ def _run(
     auth: accounts.Auth | None = None,
     selected: Route | None = None,
 ) -> Result:
-    if remote:
-        return Result(ok=False, error="pi cannot validate or isolate credentials on a remote device; "
-                                      "run pi locally or use the claude runner",
-                      session=resume, runner="pi", model=model)
+    if refusal := remote_refusal(remote):
+        return Result(ok=False, error=refusal, session=resume, runner="pi", model=model)
+    remote = None
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
@@ -873,6 +882,9 @@ def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd
             passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
             price: Callable[[Result], float] = lambda reply: reply.cost_usd,
             max_budget_usd: float | None = None, selected: Route | None = None) -> None:
+    if refusal := remote_refusal(remote):
+        result.ok, result.error, result.structured = False, refusal, None
+        return
     if not ending_text:
         return
     auth = selected.auth if selected else authentication(model, passing, providers, remote)

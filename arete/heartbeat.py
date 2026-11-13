@@ -122,7 +122,7 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
                 except ValueError:
                     continue
     for loop in loops.load_all(cfg):
-        if not loop.error and not devices.resolve(loop.device).remote:
+        if not loop.error:
             repo = loop.work_repo(cfg) if loop.repo else None
             calls += [(runner.route(m, loop.runner)[1], repo, loop.device, True) for m in loop.agent_models(cfg)
                       if runner.route(m, loop.runner)[0] == "pi"]
@@ -144,6 +144,8 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
             detail += "; paid api_key route"
         optional_anthropic = not required and selected.error == pi.ANTHROPIC_KEY_REQUIRED
         key = f"pi:{provider}:auth" + (f":{repo.name}" if repo else "")
+        if devices.resolve(device).remote:
+            key += f":{devices.resolve(device).name}"
         check = Check(key, not selected.error or optional_anthropic, f"{provider}: {detail}")
         if key not in out or out[key].ok:
             out[key] = check
