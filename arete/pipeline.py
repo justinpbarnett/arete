@@ -16,7 +16,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from string import Template
@@ -2271,8 +2271,15 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:
-    run, t = b.run, b.ticket
+    run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
     step = b.next_step(step_name)
+    if ready := verify.preflight(v, b.ws, b.cfg, run.repo):
+        run.save(f"{step}-preflight.json", json.dumps(asdict(ready), indent=2))
+        run.log(f"{step}: preflight {ready.verdict}")
+        if ready.verdict == "blocked":
+            ready.saved = os.path.abspath(run.dir / f"{step}-preflight.md")
+            run.save(f"{step}-preflight.md", ready.markdown())
+            return ready
     evidence = run.dir / "evidence"
     evidence.mkdir(exist_ok=True)
     if evidence not in run.add_dirs:
@@ -2287,7 +2294,6 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     lifetime = {"stopped": True}
     fixture_blocker = ""
     try:
-        v = verify.with_free_ports(b.layer.verify)
         if attempt:
             run.log(f"{step}: scratch folder {attempt.root}")
             v = verify.with_scratch(v, attempt.root)
