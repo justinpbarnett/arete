@@ -1177,7 +1177,7 @@ It never uses, replaces or removes a mapping it did not record, and when the por
 Its own mapping stays when the dashboard stops, and the next start on that port reuses it.
 It removes the mapping only when a certificate is ready for a dashboard on that port and every mapping on the port is its own; otherwise remove it by hand with `tailscale serve --https=PORT off`.
 A dashboard moved to another port therefore leaves the old mapping and its record where they were.
-While its mapping is, or may be, on the port the dashboard keeps listening on 127.0.0.1 only, trusting Tailscale's login header from loopback alone.
+While its mapping is, or may be, on the port the dashboard keeps listening on 127.0.0.1 only, trusting Tailscale's login header from loopback alone. That listener stays open while Tailscale reports no address, while arete tries again for a certificate every hour, and when the tailnet name, address or owner changes. arete closes it only after `tailscale serve status` shows its mapping gone.
 A second dashboard on the same state folder and port waits and changes nothing.
 On scratch state the dashboard asks for no certificate and changes no mapping.
 When the fallback fails too, the dashboard serves plain HTTP as before and tries for a certificate again every hour.

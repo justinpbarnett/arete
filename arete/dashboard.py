@@ -842,14 +842,12 @@ class Front:
     tls: ssl.SSLContext | None = None
     fronted: bool = False
     why: str = ""
-    settled: bool = True
 
 
 @dataclass(frozen=True)
 class Claim:
     behind: bool
     why: str = ""
-    settled: bool = True
 
 
 def say(text: str) -> None:
@@ -859,6 +857,12 @@ def say(text: str) -> None:
 def close_all(servers: list[Server]) -> None:
     for s in servers:
         s.server_close()
+
+
+def stop_listener(server: Server | None) -> None:
+    if server is not None:
+        server.shutdown()
+        server.server_close()
 
 
 def open_servers(addresses: tuple[str, ...], port: int, node: Node, logins: Logins,
@@ -947,7 +951,7 @@ def claim_proxy(host: Tailscale, node: Node, port: int) -> Claim:
     record = proxy_record(port)
     before = serve_status(host)
     if before is None:
-        return Claim(record is not None, "tailscale serve status cannot be read", settled=record is None)
+        return Claim(record is not None, "tailscale serve status cannot be read")
     on_port = before.get(port, {})
     if record:
         mine = owned(record, on_port, port)
@@ -972,7 +976,7 @@ def claim_proxy(host: Tailscale, node: Node, port: int) -> Claim:
         failed = f" ({util.first_line(str(e), 200)})"
     after = serve_status(host)
     if after is None:
-        return Claim(True, "tailscale serve status cannot be read", settled=False)
+        return Claim(True, "tailscale serve status cannot be read")
     made = after.get(port, {})
     if not made:
         drop_proxy_record(port)
@@ -985,7 +989,8 @@ def claim_proxy(host: Tailscale, node: Node, port: int) -> Claim:
     return Claim(True)
 
 
-def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_serve: bool) -> Front:
+def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_serve: bool,
+               kept: Server | None = None) -> Front:
     opened = open_servers(node.addresses, port, node, logins, inside_serve)
     try:
         tls, reason = None, ""
@@ -995,20 +1000,28 @@ def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_se
         except (CertError, ssl.SSLError, OSError) as e:
             reason = f"no certificate ({util.first_line(str(e), 200)})"
         if tls and release_proxy(host, port):
+            stop_listener(kept)
             for s in opened:
                 s.tls = tls
             return Front("https", opened, tls=tls)
         close_all(opened)
         opened = []
-        loopback = Server(LOOPBACK, port, node, FrontedLogins(), inside_serve, handler=FrontedHandler)
-        opened = [loopback]
+        loopback = kept
+        if loopback is None:
+            loopback = Server(LOOPBACK, port, node, FrontedLogins(), inside_serve, handler=FrontedHandler)
+            opened = [loopback]
         claim = Claim(True, f"arete's tailscale serve mapping on port {port} is still there") if tls \
             else claim_proxy(host, node, port)
         why = "; ".join(x for x in (reason, claim.why) if x)
         if claim.behind:
-            return Front("http", opened, fronted=True, why=why, settled=claim.settled)
-        close_all(opened)
-        opened = open_servers(node.addresses, port, node, logins, inside_serve)
+            return Front("http", [loopback], fronted=True, why=why)
+        if kept is None:
+            close_all(opened)
+            opened = []
+            opened = open_servers(node.addresses, port, node, logins, inside_serve)
+        else:
+            opened = open_servers(node.addresses, port, node, logins, inside_serve)
+            stop_listener(kept)
         return Front("http", opened, why=why)
     except BaseException:
         close_all(opened)
@@ -1026,14 +1039,22 @@ def record_server(node: Node, port: int, front: Front) -> None:
         say(f"cannot write the server file ({e.strerror or e}); the CLI will not find this dashboard")
 
 
-def watch(host: Tailscale, owner: str, node: Node, port: int, front: Front) -> str:
+CERTIFICATE_RETRY = "trying for a certificate again"
+
+
+def watch(host: Tailscale, owner: str, node: Node, front: Front) -> str:
     certificate_due = time.monotonic() + (RENEW_SECONDS if front.tls else CERT_RETRY_SECONDS)
     renewal_failed = False
     reload_pending = False
-    while host.node(owner) == node:
+    while True:
+        now = host.node(owner)
+        if now != node and not (front.fronted and now is None):
+            return "the tailnet address or owner changed"
         time.sleep(WATCH_SECONDS)
-        if time.monotonic() < certificate_due:
+        if now is None or time.monotonic() < certificate_due:
             continue
+        if front.fronted:
+            return CERTIFICATE_RETRY
         try:
             reload_pending = fetch_certificate(host, node.name) or reload_pending
             if front.tls and reload_pending:
@@ -1046,17 +1067,11 @@ def watch(host: Tailscale, owner: str, node: Node, port: int, front: Front) -> s
             if front.tls and not renewal_failed:
                 say(f"the certificate was not renewed ({util.first_line(str(e), 200)}); keeping the old one")
             renewal_failed = True
-            if not front.settled:
-                return "checking the tailscale serve mapping again"
             continue
         renewal_failed = False
         if not front.tls:
-            if not front.fronted or release_proxy(host, port):
-                return "a certificate is ready"
-            certificate_due = time.monotonic() + CERT_RETRY_SECONDS
-            continue
+            return "a certificate is ready"
         certificate_due = time.monotonic() + RENEW_SECONDS
-    return "the tailnet address or owner changed"
 
 
 def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale | None = None) -> NoReturn:
@@ -1069,17 +1084,23 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
     hold = util.lock_file(f"dashboard-{port}")
     held = False
     waiting_for = ""
+    kept: Server | None = None
+    kept_front: Front | None = None
+    last_line = ""
     atexit.register(forget_server)
     try:
         while True:
             node = host.node(cfg.dashboard_owner)
+            if kept is not None and kept_front is not None and node is not None and node != kept.node:
+                kept.node = node
+                record_server(node, port, kept_front)
             try:
                 if node is None:
                     raise OSError("tailscale is not running or reports no address")
                 held = held or util.flock_now(hold)
                 if not held:
                     raise OSError(f"another dashboard on this state holds port {port}")
-                front = open_front(host, node, port, logins, inside_serve)
+                front = open_front(host, node, port, logins, inside_serve, kept)
             except OSError as e:
                 if str(e) != waiting_for:
                     say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
@@ -1088,14 +1109,23 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
                 continue
             waiting_for = ""
             for s in front.servers:
-                threading.Thread(target=s.serve_forever, daemon=True).start()
-            say(listening_line(node, port, front))
+                if s is not kept:
+                    threading.Thread(target=s.serve_forever, daemon=True).start()
+            line = listening_line(node, port, front)
+            if line != last_line:
+                say(line)
+                last_line = line
             record_server(node, port, front)
-            reason = watch(host, cfg.dashboard_owner, node, port, front)
-            say(f"{reason}; listening again")
+            reason = watch(host, cfg.dashboard_owner, node, front)
+            kept = front.servers[0] if front.fronted else None
+            kept_front = front if front.fronted else None
+            if reason != CERTIFICATE_RETRY:
+                say(f"{reason}; listening again")
             for s in front.servers:
-                s.shutdown()
-                s.server_close()
+                if s is not kept:
+                    stop_listener(s)
+            if kept is None:
+                forget_server()
     finally:
         forget_server()
 
