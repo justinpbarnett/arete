@@ -7,7 +7,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import UTC, timedelta
 
-from . import accounts, claude, codex, config, devices, environment, paths, pi, record, runner, state, util
+from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, record, runner, state, util
 from .agent import model_scope
 
 CLAUDE_PI_MODELS = {"fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
@@ -63,6 +63,7 @@ class Quote:
     cache_read: float | None = None
     cache_write: float | None = None
     source: str = ""
+    applied: dict | None = None
 
     @property
     def total(self) -> float | None:
@@ -436,12 +437,15 @@ class Discovery:
             found.append(Way(link, "pi", link.model, "pi_key", "paid", "api_key"))
         return found
 
-    def quote(self, way: Way) -> Quote:
+    def quote(self, way: Way, request_tokens: int = 0) -> Quote:
         if not self.priced:
             return Quote()
         rate = self.cfg.pricing.get(way.model) or self.cfg.pricing.get(f"{way.runner}:{way.model}")
         if rate:
             return Quote(rate[0], rate[1], source="pricing")
+        snapshot = self.remembered("price_snapshot", prices.load)
+        if found := prices.applied(snapshot, way.runner, (way.model,), util.now(), request_tokens or None):
+            return Quote(*prices.per_million_usd(found), source="snapshot", applied=found)
         if way.runner != "pi":
             return Quote()
         if found := local_quote(way.model, self.probe(way.model, way.mode)):
@@ -571,7 +575,7 @@ class Discovery:
         state_name, detail, until = self.judge(way, settings, remaining, request_tokens)
         return Candidate(0, way.model, way.runner, self.provider(way), way.credential, way.billing, link.tier,
                          link.position, link.requested, settings.effort_on(way.runner),
-                         settings.instructions_on(way.runner), self.quote(way) if way.billing == "paid" else None,
+                         settings.instructions_on(way.runner), self.quote(way, request_tokens) if way.billing == "paid" else None,
                          state_name, " ".join(detail.split()),
                          self.capabilities(way) if settings.requires.declared else None, way.mode, until)
 
@@ -627,7 +631,8 @@ def described(candidates: list[Candidate]) -> list[dict]:
     for c in candidates:
         price = None if c.price is None else {
             "input": c.price.input, "output": c.price.output, "cache_read": c.price.cache_read,
-            "cache_write": c.price.cache_write, "total": c.price.total, "source": c.price.source}
+            "cache_write": c.price.cache_write, "total": c.price.total, "source": c.price.source,
+            "quote": c.price.applied}
         rows.append({"order": c.order, "model": c.model, "runner": c.runner, "provider": c.provider,
                      "credential": c.credential, "billing": c.billing, "tier": c.tier, "position": c.position,
                      "requested": c.requested, "effort": c.effort, "instructions": list(c.instructions),
