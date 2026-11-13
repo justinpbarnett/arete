@@ -117,6 +117,8 @@ def command(
 
 
 def auth_status(env: dict | None = None) -> dict:
+    if paths.ISOLATED:
+        return {}
     try:
         res = util.sh([binary(), "auth", "status"], timeout=10, env=env if env is not None else agent_env(),
                       inherit=False)
@@ -128,6 +130,8 @@ def auth_status(env: dict | None = None) -> dict:
 def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
     if remote:
         return accounts.Auth("subscription", "claude")
+    if paths.ISOLATED:
+        return accounts.Auth()
     env = agent_env(passing, extra)
     folder = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME", str(paths.HOME))) / ".claude")
     if token := env.get("CLAUDE_CODE_OAUTH_TOKEN"):

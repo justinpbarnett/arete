@@ -102,6 +102,8 @@ SAFE_HEADERS = {"accept": r"application/json|text/event-stream", "content-type":
 
 
 def owner_dir() -> Path:
+    if paths.ISOLATED:
+        return ((paths.STATE_DIR if paths.SCRATCH_STATE else paths.NOWHERE) / "pi-agent").absolute()
     return paths.expand(os.environ.get("PI_CODING_AGENT_DIR") or PI_HOME / "agent").absolute()
 
 
@@ -342,7 +344,7 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     login = login and provider != "anthropic"
     auth = accounts.pi(provider, credential, str(owner)) if login else accounts.Auth("api_key")
     keys = util.read_env_file(KEYS_FILE)
-    source = os.environ if source is None else source
+    source = ({} if paths.ISOLATED else os.environ) if source is None else source
     token_error = plan_token_error(source.items()) or plan_token_error(keys.items(), f"{KEYS_FILE} variable ")
     available = {**source, **keys}
     configured = accounts.mapping(accounts.mapping(models.get("providers")).get(provider))

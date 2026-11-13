@@ -294,7 +294,7 @@ def command(
 
 
 def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
-    if remote:
+    if remote or paths.ISOLATED:
         return accounts.Auth()
     env = agent_env(passing, extra)
     folder = Path(env.get("CODEX_HOME") or Path(env.get("HOME", str(paths.HOME))) / ".codex")
@@ -513,7 +513,9 @@ def reset_time(text: str) -> datetime | None:
 
 
 def login(env: dict | None = None) -> tuple[bool, str, str]:
-    res = util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env(), inherit=False)
+    if paths.ISOLATED:
+        return False, paths.ISOLATED_LOGINS, ""
+    res =util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env(), inherit=False)
     said = f"{res.stdout}\n{res.stderr}"
     if "ChatGPT" in said and res.returncode == 0:
         return True, "logged in with ChatGPT", CHATGPT_PROVIDER

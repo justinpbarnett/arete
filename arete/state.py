@@ -638,6 +638,11 @@ def mark_seen(source: str, keys: list[str]) -> None:
                       [(source, str(k), util.iso()) for k in keys])
 
 
+def forget_seen(source: str, keys: list[str]) -> None:
+    with db() as c:
+        c.executemany("DELETE FROM seen WHERE source = ? AND key = ?", [(source, str(k)) for k in keys])
+
+
 def cursor(source: str) -> dict | None:
     with db() as c:
         r = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()

@@ -7,7 +7,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from . import util
+from . import paths, util
 
 ARETE_MARK = "<!-- arete -->"
 NO_ISSUE = "Could not resolve to an issue"
@@ -27,7 +27,9 @@ def has_arete_mark(body: str | None) -> bool:
 
 @functools.cache
 def auth_token() -> str:
-    res = util.sh(["gh", "auth", "token"], timeout=10)
+    if paths.ISOLATED:
+        return ""
+    res =util.sh(["gh", "auth", "token"], timeout=10)
     return res.stdout.strip() if res.returncode == 0 else ""
 
 

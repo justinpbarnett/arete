@@ -277,6 +277,8 @@ def openrouter_prices() -> dict[str, dict]:
                     for name, rates in cached["models"].items()}
     except (AttributeError, KeyError, OSError, TypeError, ValueError):
         pass
+    if paths.ISOLATED:
+        return {}
     request = urllib.request.Request(OPENROUTER_URL, headers={"Accept": "application/json", "User-Agent": "arete"})
     try:
         with urllib.request.build_opener(accounts.NoRedirect).open(request, timeout=PRICE_TIMEOUT_SECONDS) as response:

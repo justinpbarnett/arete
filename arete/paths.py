@@ -7,9 +7,22 @@ CONFIG_DIR = Path(os.environ.get("ARETE_CONFIG_DIR", HOME / ".config" / "arete")
 STATE_DIR = Path(os.environ.get("ARETE_STATE_DIR", HOME / ".local" / "share" / "arete"))
 ON_MAC = sys.platform == "darwin"
 LOG_DIR = Path(os.environ.get("ARETE_LOG_DIR", HOME / "Library" / "Logs" / "arete" if ON_MAC else STATE_DIR / "logs"))
+SCRATCH_PREFIX = ".arete-scratch-"
+SCRATCH_ENV = "ARETE_VERIFY_SCRATCH"
+NOWHERE = Path("/var/empty/arete-isolated")
+
+
+def inside_scratch(d: Path) -> bool:
+    return any(part.startswith(SCRATCH_PREFIX) for part in (*d.absolute().parts, *Path(os.path.realpath(d)).parts))
+
+
+SCRATCH_CONFIG = inside_scratch(CONFIG_DIR)
+SCRATCH_STATE = inside_scratch(STATE_DIR)
+ISOLATED = bool(os.environ.get(SCRATCH_ENV)) or SCRATCH_CONFIG or SCRATCH_STATE
+ISOLATED_LOGINS = "scratch config and state never use this machine's logins, keys or price lookups"
 
 CONFIG_FILE = CONFIG_DIR / "config.toml"
-PI_KEYS_FILE = CONFIG_DIR / "pi.env"
+PI_KEYS_FILE = (CONFIG_DIR if SCRATCH_CONFIG or not ISOLATED else NOWHERE) / "pi.env"
 EVENTS_FILE = STATE_DIR / "events.jsonl"
 DB_FILE = STATE_DIR / "arete.db"
 RUNS_DIR = STATE_DIR / "runs"

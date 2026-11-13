@@ -484,7 +484,19 @@ def add_worktree(c: Checkout, branch: str, start: str) -> None:
         git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
 
 
+def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
+    found = []
+    for d in {ws, *(c.wt for c in checkouts)}:
+        if not d.is_dir() or d.is_symlink():
+            continue
+        found += [p for p in d.iterdir() if p.name.startswith(paths.SCRATCH_PREFIX) and not p.is_symlink()
+                  and p.is_dir() and any(True for _ in p.iterdir())]
+    return found
+
+
 def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
+    if scratch_left(ws, checkouts):
+        return
     for c in checkouts:
         with util.repo_lock(c.src):
             git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
@@ -563,7 +575,8 @@ SALT_KEY = "\0salt"
 
 def note_made(ws: Path, checkouts: list[Checkout]) -> None:
     try:
-        names = leftovers(ws, checkouts) if ws.is_dir() else []
+        names = [n for n in (leftovers(ws, checkouts) if ws.is_dir() else [])
+                 if not any(part.startswith(paths.SCRATCH_PREFIX) for part in Path(n).parts)]
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         if names or heads:
             salt = os.urandom(16).hex()
@@ -2201,11 +2214,16 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
-            kept = scratch.end(grant, run.dir / f"{step}-scratch.json")
-            run.log(f"{step}: removed the scratch folder {grant.root}"
-                    + (f", kept {util.count(len(kept), 'file')} that existed before it" if kept else ""))
+            keep = run.dir / f"{step}-scratch-kept" / grant.token
+            moved, kept = scratch.end(grant, run.dir / f"{step}-scratch.json", keep)
+            gone = not os.path.lexists(grant.root)
+            run.log(f"{step}: " + (f"removed the scratch folder {grant.root}" if gone else
+                                   f"kept the scratch folder {grant.root}, and with it the worktree") + (
+                f", moved {util.count(len(moved), 'file')} Arete could not show the attempt made to {keep}"
+                if moved else "") + (f", left {util.count(len(kept), 'file')} it could not move in place" if kept
+                                     else ""))
         finally:
-            restore_worktrees(untracked_before, evidence)
+            restore_worktrees(untracked_before, evidence, Path(grant.root))
     if not res.ok or not isinstance(res.structured, dict):
         return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
@@ -2232,9 +2250,11 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
 
 
-def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
+def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path, left: Path | None = None) -> None:
     for d, name in untracked_added_since(untracked_before):
         f = d / name
+        if left and left in Path(os.path.realpath(d)).joinpath(name).parents:
+            continue
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
