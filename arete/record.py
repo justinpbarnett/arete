@@ -560,6 +560,63 @@ def events(path: Path) -> Iterator[dict]:
     yield from normalized(lines(path))
 
 
+def numbered_events(path: Path) -> Iterator[dict]:
+    number = 0
+
+    def numbered() -> Iterator[dict]:
+        nonlocal number
+        for number, raw in enumerate(raw_lines(path), 1):
+            yield from entries([raw])
+
+    for event in normalized(numbered()):
+        yield {**event, "line": number}
+
+
+def runs_since(since: str) -> list[dict]:
+    with state.db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status != 'running' "
+                                           "AND COALESCE(finished, started) >= ? ORDER BY started", (since,))]
+
+
+def read_run(run_id: str) -> dict | None:
+    row = state.run_get(run_id)
+    if not row:
+        return None
+    try:
+        marks = list(lines(paths.record_dir(run_id) / TIMELINE))
+    except OSError:
+        marks = []
+    try:
+        parked = util.read_json(paths.RUNS_DIR / run_id / "parked.json", {})
+    except OSError:
+        parked = {}
+    try:
+        waited = sum(run_lines.wait_minutes(run_id).values())
+    except OSError:
+        waited = 0
+    rows = state.steps(run_id)
+    tries: dict[str, int] = {}
+    for r in rows:
+        tries[r["step"]] = max(tries.get(r["step"], 0), r["try"] or 0)
+    try:
+        seconds = (util.parse_iso(row["finished"]) - util.parse_iso(row["started"])).total_seconds()
+    except (TypeError, ValueError):
+        seconds = 0
+    return {
+        "id": run_id, "kind": row["kind"], "repo": row["repo"], "issue": row["issue"], "status": row["status"],
+        "summary": row["summary"], "started": row["started"], "finished": row["finished"],
+        "seconds": max(0, seconds), "wait_minutes": waited,
+        "parked": str(parked.get("reason") or "") if isinstance(parked, dict) else "",
+        "marks": marks,
+        "calls": [{"step": m.get("step", ""), "record": m.get("record", ""), "runner": m.get("runner", ""),
+                   "model": m.get("model", ""), "ok": bool(m.get("ok")), "error": m.get("error", ""),
+                   "seconds": m.get("seconds") or 0} for m in marks if m.get("kind") == "agent"],
+        "tries": tries,
+        "failed_steps": [{"step": r["step"], "try": r["try"], "error": r["error"], "kind": r["kind"]}
+                         for r in rows if not r["ok"]],
+    }
+
+
 def last_message(path: Path, notice: re.Pattern[str] | None = None) -> str:
     found = ""
     try:
