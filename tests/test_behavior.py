@@ -103,10 +103,10 @@ class OfflineWorkflowTests(unittest.TestCase):
                        TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
-import importlib.util, json, runpy, sys, urllib.request
+import importlib.util, json, os, runpy, sys, urllib.request
 from pathlib import Path
 from unittest import mock
-from arete import accounts, config, factory, gh, paths, pipeline, record, replay, runner, state
+from arete import accounts, config, factory, gh, paths, pipeline, record, replay, runlimits, runner, state
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
@@ -153,11 +153,59 @@ if scenario == "edited-after-held-pr":
         connection.execute("UPDATE tasks SET body = ? WHERE id = ?",
                            ("Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", task))
 feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
-try:
-    factory.main(feature, ["replay-sample", task, "--force"])
-except SystemExit:
-    pass
-row = state.ticket_runs("replay-sample", task, whole=True)[0]
+def forced():
+    try:
+        factory.main(feature, ["replay-sample", task, "--force"])
+    except SystemExit:
+        pass
+    return state.ticket_runs("replay-sample", task, whole=True)[0]
+if scenario.startswith("held-scratch"):
+    layer, answer = root / "sample/layer/config.toml", root / "sample/replay/verify.json"
+    plain, passing = layer.read_text(), answer.read_text()
+    prefix = paths.SCRATCH_PREFIX + "0123456789abcdef"
+    holding = f"mkdir -p {prefix} && echo '*' > {prefix}/.gitignore && " + replay.SAMPLE_CHECK
+    commit = "git -c user.name=fixture -c user.email=fixture@localhost -c commit.gpgsign=false commit -q --allow-empty -m local"
+    layer.write_text(plain.replace(json.dumps(replay.SAMPLE_CHECK), json.dumps(holding)) +
+                     "\n[setup]\ncommands = [" + json.dumps(commit) + "]\n")
+    answer.write_text(json.dumps(json.loads(passing) | {"seconds": 30}))
+    with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_verify_minutes=.05)):
+        parked = forced()
+    layer.write_text(plain)
+    answer.write_text(passing)
+    ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+    saved = pipeline.made_record(ws).read_text()
+    made = json.loads(saved)
+    result = {"parked": parked["summary"], "recorded": [k for k in made if not k.startswith("\0")],
+              "head_recorded": made.get(pipeline.head_key(pipeline.Checkout("", "", ws, ws, "main"))) == pipeline.git(["rev-parse", "HEAD"], ws).strip(),
+              "unpushed": pipeline.git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], ws).strip(),
+              "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")]}
+    with state.db() as c:
+        c.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Add kumquat on a last line of its own", task))
+    refused = forced()
+    result["while_held"] = refused["summary"]
+    result["record_kept"] = pipeline.made_record(ws).read_text() == saved
+    for fd in list(scratch.LEASES.values()):
+        os.close(fd)
+    scratch.LEASES.clear()
+    with mock.patch.object(scratch, "holders", return_value=[]):
+        pipeline.retry_scratch()
+    (root / "finalized").mkdir()
+    for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
+        p.rename(root / "finalized" / p.name)
+    if scenario == "held-scratch-edited":
+        with (ws / "notes.txt").open("a") as out:
+            out.write("edited by hand\n")
+    row = forced()
+    events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+    result |= {"status": row["status"], "summary": row["summary"],
+               "prepared": [e.get("result") for e in events if e.get("event") == "step_end" and e.get("step") == "prepare"],
+               "origin": pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git"),
+               "edited": (ws / "notes.txt").exists() and "edited by hand" in (ws / "notes.txt").read_text()}
+    branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
+    result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git") if len(branches) == 1 else ""
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
+row = forced()
 events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
                 if e.get("event") == "step_end" and e.get("step") == "verify"]
@@ -176,7 +224,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
 '''
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
             result = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario],
-                                    cwd=root, env=env, text=True, capture_output=True, timeout=45)
+                                    cwd=root, env=env, text=True, capture_output=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in result.stdout.splitlines()
                            if line.startswith("BEHAVIOR_RESULT=")), None)
@@ -188,6 +236,29 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
+
+    def test_run_parked_with_scratch_held_records_its_work_without_scratch(self):
+        result = self.workflow("held-scratch")
+        self.assertIn("parked", result["parked"])
+        self.assertIn("notes.txt", result["recorded"])
+        self.assertFalse([n for n in result["recorded"] if ".arete-scratch-" in n])
+        self.assertTrue(result["held"])
+        self.assertTrue(result["head_recorded"])
+        self.assertEqual(result["unpushed"], "1")
+        self.assertIn("unresolved or unknown scratch resources", result["while_held"])
+        self.assertTrue(result["record_kept"])
+        self.assertEqual(result["prepared"], ["pass"])
+        self.assertEqual(result["status"], "done")
+        self.assertNotIn("no record of", result["summary"])
+        self.assertIn("kumquat", result["published"])
+
+    def test_file_edited_after_parked_run_still_stops_forced_run(self):
+        result = self.workflow("held-scratch-edited")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["prepared"], ["fail"])
+        self.assertIn("no record of leaving there (notes.txt)", result["summary"])
+        self.assertTrue(result["edited"])
+        self.assertEqual(result["origin"].strip(), "refs/heads/main")
 
     def test_behavioral_check_failure_stops_before_verification_or_publication(self):
         result = self.workflow("failed-check")
@@ -214,6 +285,34 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("left out 3 earlier repair cycles", result["log"])
         self.assertEqual(result["budget"]["left_out"], [result["old"]])
         self.assertEqual(result["budget"]["parents"], [])
+
+
+class FailedPrepareHistoryTests(unittest.TestCase):
+    @staticmethod
+    def end(step, result="pass", **extra):
+        return {"event": "step_end", "step": step, "result": result, **extra}
+
+    def test_failed_prepare_run_adds_nothing(self):
+        a = [self.end("prepare"), self.end("plan"), self.end("verify", "fail")]
+        b = [{"event": "route", "skipped": 0}, self.end("prepare", "fail"), self.end("respond")]
+        history = arete.factory.history([b, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "verify"])
+        self.assertTrue(arete.factory.reopening([b, a]))
+        self.assertFalse(arete.factory.reopening([a]))
+
+    def test_redone_join_puts_own_prepare_first(self):
+        a = [self.end("prepare", n=1), self.end("plan"), self.end("implement")]
+        c = [{"event": "route", "skipped": 2, "redone": 1}, self.end("prepare", n=2), self.end("verify")]
+        history = arete.factory.history([c, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "implement", "verify"])
+        self.assertEqual(history[0]["n"], 2)
+
+    def test_failed_prepare_is_not_takable_but_other_fails_are(self):
+        flow = object.__new__(arete.factory.Flow)
+        flow.earlier, flow.redone, flow.skipped = [self.end("prepare", "fail"), self.end("verify", "fail"), {}], 0, 0
+        self.assertFalse(flow.takable(flow.earlier[0]))
+        flow.skipped = 1
+        self.assertTrue(flow.takable(flow.earlier[1]))
 
 
 @unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")

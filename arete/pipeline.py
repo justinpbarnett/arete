@@ -72,6 +72,7 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
 SLOTS_LOCK = "run-slots"
+SLOT_KINDS = ("pipeline", "experiment")
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
@@ -282,6 +283,15 @@ class AgentRun:
                              {**self.overrides, **self.step_overrides.get(role, {})},
                              self.step_overrides.get(config.INHERITS.get(role, ""), {}))
 
+    def time_for(self, seconds: float) -> float:
+        return seconds
+
+    def wait_for_network(self) -> bool:
+        return util.wait_for_network()
+
+    def retry_kw(self) -> dict:
+        return {}
+
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         s = self.settings(role) if role else None
         if self.budget:
@@ -338,14 +348,15 @@ class AgentRun:
             res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
             if res.connection_failed:
                 self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
-                if util.wait_for_network():
+                if self.wait_for_network():
                     dropped = res
                     self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                     if res.session.id and res.turns > 1 and kw.get("persist", True):
                         res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
-                                         **{**kw, "resume": res.session})
+                                         **{**kw, "resume": res.session, **self.retry_kw()})
                     else:
-                        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+                        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                                         **{**kw, **self.retry_kw()})
                     res = runner.with_spent(res, [dropped])
         if s and res.session.id:
             self.sessions[config.INHERITS.get(s.step, s.step)] = res.session
@@ -641,11 +652,15 @@ def head_key(c: Checkout) -> str:
 SALT_KEY = "\0salt"
 
 
+def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
+    return [n for n in names
+            if not any(part.startswith(paths.SCRATCH_PREFIX) for part in Path(n).parts)
+            and not any(h.is_relative_to(ws / n) for h in held)]
+
+
 def note_made(ws: Path, checkouts: list[Checkout]) -> None:
-    if scratch_left(ws, checkouts):
-        return
     try:
-        names = leftovers(ws, checkouts) if ws.is_dir() else []
+        names = outside_scratch(ws, leftovers(ws, checkouts), scratch_left(ws, checkouts)) if ws.is_dir() else []
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         if names or heads:
             salt = os.urandom(16).hex()
@@ -658,7 +673,7 @@ def note_made(ws: Path, checkouts: list[Checkout]) -> None:
     made_record(ws).unlink(missing_ok=True)
 
 
-def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> str:
+def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True) -> str:
     made = made_before(ws)
     salt = str(made.get(SALT_KEY) or "")
 
@@ -673,7 +688,7 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
         try:
             edits = unknown([c.prefix + n for n in uncommitted(c.wt)])
             ignored = unknown([c.prefix + n for n in ignored_files(c.wt)])
-            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip()
+            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip() if commits else "0"
             if made.get(head_key(c)) == git(["rev-parse", "HEAD"], c.wt).strip():
                 ahead = "0"
         except (RuntimeError, OSError) as e:
@@ -878,7 +893,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     with nullcontext() if layer.parallel_checks else machine_to_itself(run):
         for name, cmd in layer.checks.items():
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=timeout)
+                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
@@ -1245,7 +1260,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             current = tk.get(tid) if fresh else None
             run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh)
             with run.budget.watching():
-                run.budget.capture(current or tk.get(tid))
+                if not (flow and flow.refusal):
+                    run.budget.capture(current or tk.get(tid))
                 status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
@@ -2310,6 +2326,10 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:
     run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
     step = b.next_step(step_name)
+    if refusal := verify.port_refusal(v):
+        run.log(f"{step}: {refusal}")
+        return verify.Verified("blocked", "Verification cannot use a port the live dashboard serves.",
+                               blocked_by=refusal, finished=False)
     if ready := verify.preflight(v, b.ws, b.cfg, run.repo):
         run.save(f"{step}-preflight.json", json.dumps(asdict(ready), indent=2))
         run.log(f"{step}: preflight {ready.verdict}")
@@ -2921,9 +2941,9 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
         run.say(f"Run `{run.id}` {record.INTERRUPTED}; I will start it again.")
 
 
-def holding(rows: list[dict], lock_kind: str) -> list[dict]:
+def holding(rows: list[dict], lock_kind: str, kinds: tuple[str, ...] = ("pipeline",)) -> list[dict]:
     return [r for r in rows
-            if r["kind"] == "pipeline" and util.lock_is_held(state.run_lock(lock_kind, r["repo"], r["issue"]))]
+            if r["kind"] in kinds and util.lock_is_held(state.run_lock(lock_kind, r["repo"], r["issue"]))]
 
 
 def live_pipeline_runs() -> list[dict]:
@@ -2931,7 +2951,7 @@ def live_pipeline_runs() -> list[dict]:
 
 
 def runs_in_slots() -> list[dict]:
-    return holding(state.runs_marked_running(), "slot")
+    return holding(state.runs_marked_running(), "slot", SLOT_KINDS)
 
 
 def runs_waiting_for_a_slot() -> list[dict]:

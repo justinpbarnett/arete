@@ -122,7 +122,7 @@ just adw-wait RUN2
 | `step_start` | a step began; names its model, runner, credential, effort and `skipped` routes when it calls an agent, once per launch if a limit moves the call to another route, and in `env` the names of the variables that agent starts with, never their values |
 | `heartbeat` | the step is still working; every 30 seconds |
 | `step_end` | a step ended: `result` is `pass`, `fail`, `ask` or `stop`, with `error`, `cost_usd` and `seconds` |
-| `route` | the run continues an earlier one and took its finished steps; it comes twice, once when the run starts and once with `after` and `skipped` when it runs its first step |
+| `route` | the run continues an earlier one and took its finished steps; it comes twice, once when the run starts and once with `after` and `skipped` when it runs its first step; a run preparing again after a failed `prepare` writes it once more before that `prepare` |
 | `wait` | the run waited on a usage limit, CI, a run slot or a person, with `minutes` |
 | `question` | the run asks the person: `summary` is the question in short, `question` the whole comment |
 | `error` | something failed: `step` and `message` |

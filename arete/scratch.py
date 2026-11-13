@@ -355,14 +355,34 @@ def producer_group(a: Attempt, producer: str, group: int | None) -> None:
         store(fd, key, data)
 
 
-def protected_command(command, cwd=None):
+def sandboxed() -> bool:
+    lib = ctypes.CDLL(None)
+    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    return lib.sandbox_check(os.getpid(), None, 0) == 1
+
+
+def dashboard_ports() -> frozenset[int]:
+    from . import config, util
+
+    found = {config.DASHBOARD_PORT}
+    try:
+        found.add(int(config.load().dashboard_port))
+    except (OSError, ValueError, TypeError):
+        pass
+    record = util.read_json(paths.SERVER_FILE, None)
+    if isinstance(record, dict) and isinstance(record.get("port"), int):
+        found.add(record["port"])
+    return frozenset(found)
+
+
+def protected_command(command, cwd=None, keeps=()):
     from . import pi
 
     if not pi.can_confine(False):
         return command
-    lib = ctypes.CDLL(None)
-    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
-    if lib.sandbox_check(os.getpid(), None, 0) == 1:
+    if sandboxed():
+        lib = ctypes.CDLL(None)
+        lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
         try:
             os.lstat(AUTHORITY)
         except OSError:
@@ -371,7 +391,8 @@ def protected_command(command, cwd=None):
                for op in (b"file-read-data", b"file-write-data")):
             return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
-    return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False) + words
+    return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False,
+                                keeps=tuple(keeps)) + words
 
 
 def service_command(a: Attempt, command: str) -> list[str]:
@@ -384,7 +405,7 @@ def service_command(a: Attempt, command: str) -> list[str]:
     hidden = (AUTHORITY.parent, home / ".local/share/arete", home / "Library/Application Support/arete",
               *(home / n for n in (*guard.SECRET_DIRS, ".claude", ".codex", ".pi")))
     return pi.write_confinement(Path(a.workspace), [], hidden=hidden, agent_roots=False,
-                                peers=paths.WORKTREES_DIR, secrets_denied=True) + ["/bin/sh", "-c", command]
+                                peers=paths.WORKTREES_DIR, secrets_denied=True, unix_confined=True) + ["/bin/sh", "-c", command]
 
 
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:

@@ -5,10 +5,11 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from . import config, paths, record, state, util
-from .agent import NO_SESSION, Result, Session
+from .agent import NO_SESSION, Result, Session, usage_totals
 
 ENV = "ARETE_REPLAY_DIR"
 RUNNER = "replay"
@@ -55,7 +56,7 @@ def failed(error: str) -> Result:
 
 
 def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Callable[[str], None],
-        resume: Session = NO_SESSION) -> Result:
+        resume: Session = NO_SESSION, timeout: float | None = None) -> Result:
     if not (where := folder(cfg)):
         return failed(f"replay: no answer folder; set [replay] dir in {paths.short_path(paths.CONFIG_FILE)} or {ENV}")
     name = answer_name(*trace)
@@ -83,10 +84,19 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
                      session=resume if resume.id else Session(str(answer.get("session") or uuid.uuid4().hex), 0.0,
                                                               RUNNER))
         seconds = max(0.0, float(answer.get("seconds") or 0))
-    except (TypeError, ValueError) as e:
+        turns = [{"input": int(t.get("tokens_in") or 0), "output": int(t.get("tokens_out") or 0),
+                  "cost": {"total": float(t.get("cost_usd") or 0)}} for t in answer.get("stream") or []]
+        if turns:
+            res = replace(res, turns=len(turns), **usage_totals(turns))
+    except (TypeError, ValueError, AttributeError) as e:
         return failed(f"replay: {answer_file} has a bad value: {e}")
     if not res.ok and not res.error:
         res.error = f"replay: {answer_file} says ok is false"
+    if timeout and seconds > timeout:
+        time.sleep(max(0.0, timeout))
+        return failed(f"replay: {answer_file} takes {seconds:g} seconds and the timeout is {timeout:g}")
+    for turn in turns:
+        on_line(json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": turn}}))
     time.sleep(seconds)
     if patched and (applied := util.sh(["git", "apply", str(patch_file)], cwd=cwd)).returncode != 0:
         return failed(f"replay: {patch_file} does not apply: {util.first_line(applied.stderr or applied.stdout)}")
