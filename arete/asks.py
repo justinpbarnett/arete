@@ -25,6 +25,8 @@ NOTE = (f"You have a tool named `{TOOL}` (`{RULE}` where tools carry a server pr
         "the owner has, such as a secret that is in no file, do not guess and do not only say so in your answer: call "
         f"`{TOOL}` with the question (kind `secret` and `name` for a variable), finish what does not depend on it, then "
         "end your turn. If your tool list does not show it, load it by searching for its name first.\n\n" + GUIDE)
+WITHHELD = (f"The `{TOOL}` tool is not available in this call, because the call holds trusted scratch. {NOBODY} "
+            "When the work needs something only the owner has, do not guess: say what is missing in your answer.")
 SETTLE = ("Can this run safely take the first option of every question, each of which is recommended, without asking "
           "its owner? Answer yes only when every choice is easy to undo, small, and fits the ticket.")
 DESCRIPTION = ("Ask the owner of this run something only they can answer. " + GUIDE +

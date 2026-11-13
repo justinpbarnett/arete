@@ -631,13 +631,6 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     kw["effort"] = picked.candidate.effort
     kw["instructions"] = list(picked.candidate.instructions)
     asking = bool(kw.pop("ask_owner", False)) and not target.remote
-    if asking:
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.NOTE]))
-    if asking and which in ("claude", "codex"):
-        kw["mcp_config"] = asks.with_server(kw.get("mcp_config") or "")
-        kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), asks.RULE]
-    elif asking and which == "pi":
-        kw["ask_owner"] = True
     if target.remote:
         kw["remote"] = target
     else:
@@ -654,6 +647,15 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
             kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
         kw["verification_attempt"] = trip.scratch
+    if asking and hook:
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.WITHHELD]))
+    elif asking:
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.NOTE]))
+        if which in ("claude", "codex"):
+            kw["mcp_config"] = asks.with_server(kw.get("mcp_config") or "")
+            kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), asks.RULE]
+        elif which == "pi":
+            kw["ask_owner"] = True
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:

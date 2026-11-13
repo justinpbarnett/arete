@@ -87,7 +87,7 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
         return failed(f"replay: {answer_file} has a bad value: {e}")
     if not res.ok and not res.error:
         res.error = f"replay: {answer_file} says ok is false"
-    calls = answer.get("tool_calls") or []
+    calls = answer.get("tool_calls", [])
     if not isinstance(calls, list) or not all(isinstance(c, dict) and isinstance(c.get("name"), str) for c in calls):
         return failed(f"replay: {answer_file} has a bad value: tool_calls is not a list of objects with a name")
     for call in calls:

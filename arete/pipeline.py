@@ -411,9 +411,10 @@ class Run(AgentRun):
             return super().agent(step, text, cwd, role, **kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
         while res.record and (ask := asks.found(record.events(paths.record_dir(self.id) / res.record))):
-            self.owner_ask(step, ask, res.session)
+            kept = res.session if kw.get("persist", True) else NO_SESSION
+            self.owner_ask(step, ask, kept)
             res = super().agent(step, asks.settled_message(ask), cwd, role, ask_owner=True,
-                                **{**kw, "resume": res.session, "resume_only": True})
+                                **{**kw, "resume": kept, "resume_only": True})
         return res
 
     def owner_ask(self, step: str, ask: dict, session: Session) -> None:
@@ -1921,6 +1922,8 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
         for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
             publish_ci(run, pushed, ci.section(rounds, max_rounds))
+    except asks.Asked:
+        raise
     except Exception as e:
         failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
         drafted = [c for c in with_prs if set_draft(run, c, True)]
@@ -2415,6 +2418,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                             mcp_config=verify.mcp_config(evidence) if url else "",
                             scratch=attempt)
             agent_finished = True
+    except asks.Asked:
+        agent_finished = True
+        raise
     except scratch.ConfinementUnavailable as e:
         return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
                                blocked_by=util.first_line(str(e), 300))
