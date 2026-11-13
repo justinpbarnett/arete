@@ -12,7 +12,6 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import timedelta
 from pathlib import Path
 
 from . import (
@@ -72,21 +71,9 @@ class OverBudget(Exception):
     pass
 
 
-def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) -> tuple[str, float] | None:
-    day_ago = util.iso(util.now() - timedelta(days=1))
-    limits = []
-    if loop.budget_usd:
-        limits.append(("run budget", loop.budget_usd - spent_this_run))
-    if loop.daily_budget_usd:
-        limits.append(("daily loop budget", loop.daily_budget_usd - state.loop_spent_since(day_ago, loop.name)))
-    if cfg.daily_budget_usd:
-        limits.append(("daily budget for all loops", cfg.daily_budget_usd - state.loop_spent_since(day_ago)))
-    return min(limits, key=lambda x: x[1]) if limits else None
-
-
 def spent_limit(loop: Loop, cfg: config.Config) -> str:
-    tightest = tightest_limit(loop, cfg) if loop.meters_spend(cfg) else None
-    return tightest[0] if tightest and tightest[1] <= runner.BUDGET_FLOOR_USD else ""
+    tightest = loops.tightest_limit(loop, cfg)
+    return tightest[0] if tightest and tightest[1] <= runner.BUDGET_FLOOR_USD and loop.budget_blocked(cfg) else ""
 
 
 class StoppedByAgent(Exception):
@@ -146,13 +133,11 @@ class LoopRun:
             f.write(f"{util.iso()} [{self.loop.name}] {text}\n")
 
     def room(self) -> float | None:
-        tightest = tightest_limit(self.loop, self.cfg, record.metered_spent(self.id))
+        tightest = loops.tightest_limit(self.loop, self.cfg, record.metered_spent(self.id))
         if not tightest:
             return None
-        name, left = tightest
-        if left <= runner.BUDGET_FLOOR_USD:
-            raise OverBudget(f"{name} is spent")
-        return round(left, 2)
+        left = tightest[1]
+        return left if left <= runner.BUDGET_FLOOR_USD else round(left, 2)
 
     def agent(self, step: str, prompt: str, cwd: Path, *, model: str = "", tools: list[str] | None = None,
               **kw) -> Result:
@@ -162,6 +147,9 @@ class LoopRun:
                          remaining_budget=self.room,
                          persist=False, timeout=self.loop.timeout_minutes * 60, device=self.device,
                          say=lambda text: self.log("wait", f"{step}: {text}"), repo=loop_repo(self), **kw)
+        if runner.out_of_budget(res):
+            limit = loops.tightest_limit(self.loop, self.cfg, record.metered_spent(self.id))
+            raise OverBudget(f"{limit[0] if limit else 'budget'} is spent")
         record.note(self.id, model=res.model, runner=res.runner)
         self.log("step" if res.ok else "error", f"{step}: {res.runner} {res.model} {runner.cost_note(res)}"
                  + ("" if res.ok else f" failed: {res.error.strip()}"))

@@ -45,6 +45,10 @@ class Settings:
         return self.instructions if self.instructions_explicit else default_instructions(which)
 
     @property
+    def denied(self) -> tuple[str, ...]:
+        return ()
+
+    @property
     def call(self) -> dict:
         return {"model": self.model, "runner": self.runner, "effort": self.effort_on(self.runner),
                 "timeout": self.timeout_minutes * 60}
@@ -96,6 +100,14 @@ def chain_of(requested: tuple[str, str, str], tier: str, entries: tuple[dict[str
         if entry.get("model") and routing.identity(which, name) != wanted:
             chain.append(link(which, name, provider, len(chain)))
     return tuple(chain)
+
+
+def chain_for(cfg: config.Config, layer: config.RepoLayer | None, which: str, name: str, effort: str,
+              explicit: tuple[str, ...] | None) -> tuple[tuple[routing.Link, ...], bool]:
+    layer = layer or config.RepoLayer(dir=Path())
+    tier, entries = tier_of(cfg, layer, "", routing.identity(which, name))
+    requested = routing.source_route({"model": name, "runner": which})
+    return chain_of(requested, tier, entries, effort, explicit), cfg.routing_fallback and layer.routing_fallback
 
 
 def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple[str, dict[str, tuple[dict[str, str], ...]]]:

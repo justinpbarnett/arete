@@ -25,6 +25,9 @@ PRICE_FRESH = timedelta(hours=6)
 PRICE_TIMEOUT_SECONDS = 5
 PRICE_MAX_BYTES = 8 * 1024 * 1024
 PAID_RANK = {"pi_oauth": 0, "pi_key": 1, "cli_key": 2}
+PAYMENT_OF = {"cli_login": "subscription", "pi_login": "subscription", "cli_key": "api_key", "pi_key": "api_key",
+              "pi_oauth": "api_key", "local": "local"}
+SERVES = {"anthropic": ("claude", "pi"), "openai": ("codex", "pi")}
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,27 @@ class Candidate:
     price: Quote | None
     state: str
     detail: str
+    mode: str = ""
+    until: str = ""
+
+
+@dataclass(frozen=True)
+class Request:
+    chain: tuple[Link, ...]
+    fallback: bool
+    tools: tuple[str, ...]
+    mcp: tuple[str, ...]
+    effort: str
+    instructions: tuple[str, ...] | None = None
+    denied: tuple[str, ...] = ()
+
+    def effort_on(self, which: str) -> str:
+        return nearest_effort(which, self.effort)
+
+    def instructions_on(self, which: str) -> tuple[str, ...]:
+        from . import steps
+
+        return steps.default_instructions(which) if self.instructions is None else self.instructions
 
 
 @dataclass(frozen=True)
@@ -88,6 +112,10 @@ def nearest_effort(which: str, effort: str) -> str:
         return ""
     lower = [level for level in EFFORT_ORDER[:EFFORT_ORDER.index(effort)] if level in levels]
     return lower[-1] if lower else ""
+
+
+def route_key(found: Candidate) -> tuple:
+    return found.runner, identity(found.runner, found.model), found.credential
 
 
 def claude_id(name: str) -> str:
@@ -133,6 +161,94 @@ def entry_problem(entry: dict) -> str:
         wrong = (lowered.startswith("claude-") or model_scope(name).removeprefix("model:") in CLAUDE_FAMILIES
                  or "/" in name or provider not in ("", "openai"))
     return f"runner '{which}' cannot run model '{entry['model']}'" if wrong else ""
+
+
+def payment_of(credential: str, auth_mode: str = "") -> str:
+    if credential == "local":
+        return "local"
+    if credential not in PAYMENT_OF:
+        return ""
+    return "api_key" if PAYMENT_OF[credential] == "api_key" or auth_mode == "api_key" else "subscription"
+
+
+def incompatible(way: Way, settings, device: devices.Device) -> str:
+    if way.runner == "pi":
+        if settings.mcp:
+            return f"mcp {', '.join(settings.mcp)} cannot load on pi, which runs with --no-mcp"
+        if settings.instructions_on("pi"):
+            return f"instructions {', '.join(settings.instructions_on('pi'))} cannot load on pi"
+        if runner.WRITING_TOOLS & set(settings.tools) and not pi.can_confine(False):
+            return pi.NO_CONFINEMENT_REASON
+    fallback = not (way.link.requested and way.runner == way.link.runner)
+    if way.runner == "pi" and fallback and "Bash" in settings.tools and not device.exe_sandbox:
+        return runner.PI_HOLDS_NO_BASH_RULES
+    if (way.runner in ("pi", "codex") and fallback
+            and (missing := [t for t in runner.READ_TOOLS if t not in settings.tools])):
+        return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
+    if way.runner == "codex" and fallback and (
+            loose := [d for d in settings.denied if d not in runner.NO_GIT_WRITES]):
+        return f"codex cannot hold the denial of {', '.join(loose)}"
+    if way.runner == "codex" and "user" in settings.instructions_on("codex"):
+        return "instructions user cannot load on codex, which runs without your own codex setup"
+    return ""
+
+
+def outlook(cfg: config.Config, repo: config.Repo | None, device: devices.Device | str, model: str, run_with: str = "",
+            tools: list[str] | None = None, denied=(), remaining: float | None = None,
+            connect=state.db) -> list[Candidate]:
+    which, name = runner.chosen(model, run_with, cfg)
+    if which == runner.REPLAY:
+        return []
+    request = runner.request_for(cfg, repo, which, name, None, True, {"tools": tools, "disallowed_tools": list(denied)})
+    return Discovery(cfg, repo, device, connect, priced=False).routes(request, remaining)
+
+
+def held_words(found: list[Candidate]) -> str:
+    holds = [c for c in found if c.state == "held"]
+    if not holds or any(c.state == "ready" for c in found):
+        return ""
+    return min(holds, key=lambda c: (not c.until, util.parse_iso(c.until).timestamp() if c.until else 0.0)).detail
+
+
+def can_charge(found: list[Candidate]) -> bool:
+    return any(c.billing == "paid" and c.state in ("ready", "held", "budget_spent") for c in found)
+
+
+def budget_blocked(found: list[Candidate]) -> bool:
+    return (not any(c.state in ("ready", "held") for c in found)) and any(c.state == "budget_spent" for c in found)
+
+
+def modes_for(cfg: config.Config, repo: config.Repo | None) -> tuple[str, ...]:
+    try:
+        return config.allowed_payment_modes(cfg, config.load_layer(repo.layer_dir) if repo else None)
+    except (ValueError, TypeError, OSError):
+        return ()
+
+
+POSSIBLE_MODES = {"claude": ("subscription",), "codex": ("subscription", "api_key"),
+                  "pi": ("subscription", "api_key", "local")}
+
+
+def policy_fit(which: str, modes: tuple[str, ...]) -> str:
+    possible = POSSIBLE_MODES.get(which)
+    if not possible or any(m in modes for m in possible):
+        return ""
+    return f"[routing] payment_modes allows {', '.join(modes) or 'no mode'}; {which} routes are {' or '.join(possible)}"
+
+
+def fit_refusal(request: Request, device: devices.Device, modes: tuple[str, ...] | None = None) -> str:
+    first = ""
+    for link in request.chain if request.fallback else request.chain[:1]:
+        vendor, _ = identity(link.runner, link.model)
+        serving = SERVES.get(vendor, (link.runner,)) if request.fallback else (link.runner,)
+        for which in serving:
+            way = Way(link, which, link.model, "", "")
+            why = (policy_fit(which, modes) if modes is not None else "") or runner.device_refusal(
+                link.model, which, device) or incompatible(way, request, device)
+            if not why:
+                return ""
+            first = first or why
+    return first
 
 
 def number(value) -> float | None:
@@ -205,11 +321,13 @@ def paid_key(found: Candidate) -> tuple:
 
 class Discovery:
     def __init__(self, cfg: config.Config, repo: config.Repo | None = None, device: devices.Device | str = "local",
-                 connect=state.db):
+                 connect=state.db, priced: bool = True):
         self.cfg = cfg
         self.repo = repo
         self.device = devices.resolve(device)
         self.connect = connect
+        self.priced = priced
+        self.modes = modes_for(cfg, repo)
         self.passing = environment.passed(cfg, repo)
         self.probes: dict[tuple[str, str], pi.Route] = {}
         self.cache: dict[str, object] = {}
@@ -273,6 +391,8 @@ class Discovery:
         return found
 
     def quote(self, way: Way) -> Quote:
+        if not self.priced:
+            return Quote()
         rate = self.cfg.pricing.get(way.model) or self.cfg.pricing.get(f"{way.runner}:{way.model}")
         if rate:
             return Quote(rate[0], rate[1], source="pricing")
@@ -285,64 +405,62 @@ class Discovery:
         return Quote()
 
     def incompatible(self, way: Way, settings) -> str:
-        if way.runner == "pi":
-            if settings.mcp:
-                return f"mcp {', '.join(settings.mcp)} cannot load on pi, which runs with --no-mcp"
-            if settings.instructions_on("pi"):
-                return f"instructions {', '.join(settings.instructions_on('pi'))} cannot load on pi"
-            if runner.WRITING_TOOLS & set(settings.tools) and not pi.can_confine(False):
-                return pi.NO_CONFINEMENT_REASON
-        if way.runner in ("pi", "codex") and (missing := [t for t in runner.READ_TOOLS if t not in settings.tools]):
-            return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
-        if way.runner == "codex" and "user" in settings.instructions_on("codex"):
-            return "instructions user cannot load on codex, which runs without your own codex setup"
-        return ""
+        return incompatible(way, settings, self.device)
 
-    def judge(self, way: Way, settings, remaining: float | None) -> tuple[str, str]:
+    def policy_refusal(self, credential: str, auth_mode: str = "") -> str:
+        mode = payment_of(credential, auth_mode)
+        if not mode or mode in self.modes:
+            return ""
+        return (f"[routing] payment_modes allows {', '.join(self.modes) or 'no mode'}; this route is {mode}")
+
+    def judge(self, way: Way, settings, remaining: float | None) -> tuple[str, str, str]:
+        if why := self.policy_refusal(way.credential):
+            return "policy", why, ""
         if why := runner.device_refusal(way.model, way.runner, self.device):
-            return "excluded", why
+            return "excluded", why, ""
         if why := self.incompatible(way, settings):
-            return "incompatible", why
+            return "incompatible", why, ""
         auth = accounts.Auth()
         if way.runner == "pi":
             selected = self.probe(way.model, way.mode)
             if selected.token_error:
-                return "refused", record.scrub(selected.token_error, selected.hidden)
+                return "refused", record.scrub(selected.token_error, selected.hidden), ""
             if way.mode == "login" and not selected.login_available:
-                return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store"
+                return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store", ""
             if way.mode == "api_key" and not selected.key_available:
-                return "missing_key", f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
+                found = f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
+                return "missing_key", found, ""
             if selected.error:
-                return "unavailable", record.scrub(selected.error, selected.hidden)
+                return "unavailable", record.scrub(selected.error, selected.hidden), ""
             auth, model = selected.auth, selected.model
         elif way.runner == "codex":
             auth, model = self.codex_auth(), way.model
             if auth.mode == "":
-                return "missing_login", "codex CLI is not logged in; run `codex login`"
+                return "missing_login", "codex CLI is not logged in; run `codex login`", ""
         elif way.runner == "claude":
             auth, model = self.claude_auth(), way.model
             if self.device.remote:
-                return "ready", "claude login is not checked on a remote device"
+                return "ready", "claude login is not checked on a remote device", ""
             status = self.claude_status()
             if not status or not status.get("loggedIn") or (status.get("authMethod") or status.get("auth_mode")) in API_KEY_METHODS:
-                return "missing_login", "claude CLI is not logged in with a plan; run `claude auth login`"
+                return "missing_login", "claude CLI is not logged in with a plan; run `claude auth login`", ""
             if expired(status.get("loginExpiresAt")):
-                return "expired_login", "claude login expired; run `claude auth login`"
+                return "expired_login", "claude login expired; run `claude auth login`", ""
         else:
-            return "ready", ""
-        if hold := runner.auth_hold(auth, model, self.connect):
-            return "held", runner.hold_words(hold)
+            return "ready", "", ""
         if way.billing == "paid" and remaining is not None and remaining <= runner.BUDGET_FLOOR_USD:
-            return "budget_spent", f"the daily loop budget has {max(remaining, 0):.4f} USD left"
-        return "ready", ""
+            return "budget_spent", f"the daily loop budget has {max(remaining, 0):.4f} USD left", ""
+        if hold := runner.auth_hold(auth, model, self.connect):
+            return "held", runner.hold_words(hold), hold["until"]
+        return "ready", "", ""
 
     def candidate(self, way: Way, settings, remaining: float | None) -> Candidate:
         link = way.link
-        state_name, detail = self.judge(way, settings, remaining)
+        state_name, detail, until = self.judge(way, settings, remaining)
         return Candidate(0, way.model, way.runner, self.provider(way), way.credential, way.billing, link.tier,
                          link.position, link.requested, settings.effort_on(way.runner),
                          settings.instructions_on(way.runner), self.quote(way) if way.billing == "paid" else None,
-                         state_name, " ".join(detail.split()))
+                         state_name, " ".join(detail.split()), way.mode, until)
 
     def provider(self, way: Way) -> str:
         if way.runner == "claude":
@@ -363,6 +481,9 @@ class Discovery:
                 paid = not local and selected.auth.mode != "subscription"
                 credential = ("local" if local else "pi_oauth" if selected.using_login and paid else
                               "pi_login" if selected.using_login else "pi_key")
+                if (not local and "subscription" in self.modes and self.policy_refusal(credential)
+                        and selected.provider in accounts.PI_SUBSCRIPTIONS and self.probe(link.model, "login").login_available):
+                    selected, credential, paid = self.probe(link.model, "login"), "pi_login", False
                 ways = [Way(link, "pi", selected.model, credential, "paid" if paid else "free",
                             "" if local else "login" if selected.using_login else "api_key")]
             elif link.runner == "codex" and self.codex_auth().mode == "api_key":
@@ -397,11 +518,13 @@ def described(candidates: list[Candidate]) -> list[dict]:
         rows.append({"order": c.order, "model": c.model, "runner": c.runner, "provider": c.provider,
                      "credential": c.credential, "billing": c.billing, "tier": c.tier, "position": c.position,
                      "requested": c.requested, "effort": c.effort, "instructions": list(c.instructions),
-                     "price": price, "state": c.state, "detail": c.detail})
+                     "price": price, "state": c.state, "detail": c.detail,
+                     "payment_mode": payment_of(c.credential)})
     return rows
 
 
 def loop_budget_left(cfg: config.Config) -> float | None:
     if not cfg.daily_budget_usd:
         return None
-    return cfg.daily_budget_usd - state.loop_spent_since(util.iso(util.now() - timedelta(days=1)))
+    return cfg.daily_budget_usd - state.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None,
+                                                         cfg.local_providers)

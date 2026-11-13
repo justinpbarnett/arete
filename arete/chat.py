@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 
 from . import board, config, gh, paths, pipeline, runner, state, util
-from .agent import NO_SESSION, Result, Session
+from .agent import Result, Session
 
 CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
 OLD_CHAT_FILE = paths.STATE_DIR / "chat.json"
@@ -68,7 +68,8 @@ def view(chat_id: int) -> dict:
     except config.UnknownRepo:
         repo = None
     return {**summary(row), "folder": folder(row["project"]), "draft": draft_of(row, cfg),
-            "metered": runner.metered(cfg.model("chat"), row["runner"], cfg=cfg, repo=repo) if repo else None,
+            "metered": runner.metered(cfg.model("chat"), row["runner"], cfg=cfg, repo=repo,
+                                     tools=[*runner.READ_TOOLS, "Bash"]) if repo else None,
             "messages": state.chat_messages(chat_id)}
 
 
@@ -217,8 +218,6 @@ def project_section(repo: config.Repo) -> str:
 def ask(chat_id: int, text: str, session: Session, project: str) -> Result:
     cfg = config.load()
     model = cfg.model("chat")
-    if session.runner and session.runner != runner.route(model)[0]:
-        session = NO_SESSION
     util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends()})
     arete = arete_repo(cfg)
     work = cfg.repo(project) if project else arete
