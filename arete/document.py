@@ -16,8 +16,7 @@ SCHEMA = {"type": "object", "properties": {"title": {"type": "string"}, "text": 
 CHECK_SAW_CHARS = 300
 TICKET_BODY_CHARS = 4000
 VOICE_LINE_CHARS = 400
-MIN_VOICE_LINE = 30
-CODE_SPAN = re.compile(r"`([^`\n]+)`")
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 WARNING_LINE = re.compile(r"^\W*(?:warning|caution|danger|important|prerequisites?|requires?|before you start)\b",
                           re.IGNORECASE)
 HANDLE = re.compile(r"(?<![\w@.])@[A-Za-z0-9_][\w-]*")
@@ -90,7 +89,7 @@ def brief_from(data: dict) -> Brief:
     return Brief(**found)
 
 
-def code_in(text: str, *, fenced_only: bool = False) -> list[str]:
+def code_in(text: str, *, fenced_only: bool = False, inline_only: bool = False) -> list[str]:
     found, fence = [], ""
     for line in text.splitlines():
         stripped = line.strip()
@@ -99,12 +98,12 @@ def code_in(text: str, *, fenced_only: bool = False) -> list[str]:
             if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
                     and not marker[2].strip()):
                 fence = ""
-            elif stripped:
+            elif stripped and not inline_only:
                 found.append(line)
         elif marker and (marker[1][0] == "~" or "`" not in marker[2]):
             fence = marker[1]
         elif not fenced_only:
-            found += [m.strip() for m in CODE_SPAN.findall(line) if m.strip()]
+            found += [m[2].strip() for m in CODE_SPAN.finditer(line) if m[2].strip()]
     return found
 
 
@@ -147,10 +146,7 @@ def invented(brief: Brief, text: str) -> list[str]:
 def voice_lines(files: tuple[str, ...]) -> list[str]:
     found = []
     for name in files:
-        try:
-            found += [line.strip() for line in Path(name).read_text().splitlines()]
-        except OSError:
-            continue
+        found += [line.strip() for line in Path(name).read_text().splitlines()]
     return [line for line in found if line]
 
 
@@ -159,6 +155,11 @@ def voice_pieces(samples: list[str]) -> list[str]:
     for line in samples:
         pieces += [line, line[:VOICE_LINE_CHARS], *SENTENCE_END.split(line)]
     return pieces
+
+
+def plain_code_in(span: str, text: str) -> bool:
+    return re.search(r"(?<![\w`/-])" + re.escape(span) + r"(?=[ \t]*(?:$|[.,;:!?](?:\s|$)))",
+                     text, re.MULTILINE) is not None
 
 
 def faults(brief: Brief, text: str, samples: list[str], title: str = "") -> list[str]:
@@ -172,12 +173,17 @@ def faults(brief: Brief, text: str, samples: list[str], title: str = "") -> list
         required = {line for source in sources for line in code_in(source, fenced_only=True)} - set(brief.drop)
         said_code = set(code_in(text, fenced_only=True))
         found += [f"changed fenced code line `{line}`" for line in sorted(required - said_code) if line in text]
+        required_inline = {span for source in sources for span in code_in(source, inline_only=True)} - set(brief.drop)
+        said_inline = set(code_in(text, inline_only=True)) | said_code
+        if re.search(r"\b(?:plain[ -]?text|sms)\b", brief.channel or "plain text", re.IGNORECASE):
+            said_inline.update(span for span in required_inline if plain_code_in(span, text))
+        found += [f"changed inline code span `{span}`" for span in sorted(required_inline - said_inline) if span in text]
     if brief.kind == "message":
         found += [f"left out the {name}, {value}" for name in SUPPLIED if (value := getattr(brief, name))
                   and not supplied_in(value, text)]
     found += [f"names {t}, which the brief does not supply" for t in invented(brief, whole)]
-    known, said = brief_text(brief), flat(whole)
-    if any(len(piece) >= MIN_VOICE_LINE and flat(piece) in said and flat(piece) not in known
+    known = brief_text(brief)
+    if any(piece.strip() and supplied_in(piece, whole) and not supplied_in(piece, known)
            for piece in voice_pieces(samples)):
         found.append("repeats a voice example")
     if REASONING_TAG.search(whole):
@@ -227,23 +233,27 @@ def measured(text: str, title: str, source: str, problems, target, tries: int, b
 
 
 def write(brief: Brief, cfg: config.Config, *, repo=None, layer=None, run=None) -> Written:
-    s = run.settings("document") if run is not None else steps.resolve(cfg, layer, "document")
-    doc = config.document_for(cfg, repo, layer)
-    samples = voice_lines(doc.voice)
-    target = doc.words.get(brief.kind)
-    text, feedback, problems, n = fill(brief, doc, samples, target), "", [], 0
-    for n in range(1, s.tries + 1):
-        res = ask(text + feedback, s, cfg, repo, layer, run)
-        found = res.structured if res.ok and isinstance(res.structured, dict) else {}
-        said = str(found.get("text") or "").strip()
-        title = str(found.get("title") or "").strip() if brief.kind == "ticket" else ""
-        problems = (faults(brief, said, samples, title) if res.ok
-                    else [util.first_line(res.error or "the writer gave no answer")])
-        if not problems:
-            return measured(said, title, "writer", (), target, n, brief)
-        if res.usage_limit:
-            break
-        feedback = refusal(problems)
+    target, n = None, 0
+    try:
+        s = run.settings("document") if run is not None else steps.resolve(cfg, layer, "document")
+        doc = config.document_for(cfg, repo, layer)
+        target = doc.words.get(brief.kind)
+        samples = voice_lines(doc.voice)
+        text, feedback, problems = fill(brief, doc, samples, target), "", []
+        for n in range(1, s.tries + 1):
+            res = ask(text + feedback, s, cfg, repo, layer, run)
+            found = res.structured if res.ok and isinstance(res.structured, dict) else {}
+            said = str(found.get("text") or "").strip()
+            title = str(found.get("title") or "").strip() if brief.kind == "ticket" else ""
+            problems = (faults(brief, said, samples, title) if res.ok
+                        else [util.first_line(res.error or "the writer gave no answer")])
+            if not problems:
+                return measured(said, title, "writer", (), target, n, brief)
+            if res.usage_limit:
+                break
+            feedback = refusal(problems)
+    except (OSError, UnicodeError, RuntimeError) as e:
+        problems = [f"the writer failed ({type(e).__name__})"]
     if brief.draft.strip():
         return measured(brief.draft, "", "draft", problems, target, n, brief)
     return Written("", "", "fallback", tuple(problems), 0, target, n)
@@ -268,12 +278,16 @@ def pr_brief(ticket, changes: str, review: dict, verified, size: str, held: str)
 
 
 def pr_text(run, ticket, changes: str, review: dict, verified, size: str, held: str, cfg: config.Config, layer) -> str:
-    if not config.document_for(cfg, run.repo, layer).enabled:
-        return ""
-    done = write(pr_brief(ticket, changes, review, verified, size, held), cfg, repo=run.repo, layer=layer, run=run)
-    if done.source != "writer":
-        run.log(f"document: kept the build summary: {util.first_line('; '.join(done.faults), 300)}")
-        return ""
-    run.save("document.md", done.text)
-    run.log(f"document: wrote the PR text, {util.count(done.words, 'word')}")
-    return done.text
+    try:
+        if not config.document_for(cfg, run.repo, layer).enabled:
+            return ""
+        done = write(pr_brief(ticket, changes, review, verified, size, held), cfg, repo=run.repo, layer=layer, run=run)
+        if done.source == "writer":
+            run.save("document.md", done.text)
+            run.log(f"document: wrote the PR text, {util.count(done.words, 'word')}")
+            return done.text
+        problems = done.faults
+    except (OSError, UnicodeError, RuntimeError) as e:
+        problems = (f"the writer failed ({type(e).__name__})",)
+    run.log(f"document: kept the build summary: {util.first_line('; '.join(problems), 300)}")
+    return ""

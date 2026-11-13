@@ -134,7 +134,7 @@ def registered(text: str) -> str:
         return text
     pattern = (r"(?<![\w.@/-])(?:[\w.+-]+@)?(?:" + "|".join(re.escape(n) for n in names)
                + r")(?::\d+)?(?![\w-]|\.\w)")
-    return re.sub(pattern, PRIVATE_ADDRESS, text, flags=re.IGNORECASE)
+    return re.sub(re.escape(PRIVATE_ADDRESS) + "|" + pattern, PRIVATE_ADDRESS, text, flags=re.IGNORECASE)
 
 
 def screen(text: str) -> str:
