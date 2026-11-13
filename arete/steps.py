@@ -44,7 +44,8 @@ class Settings:
 
     @property
     def call(self) -> dict:
-        return {"model": self.model, "runner": self.runner, "effort": self.effort, "timeout": self.timeout_minutes * 60}
+        return {"model": self.model, "runner": self.runner, "effort": self.effort_on(self.runner),
+                "timeout": self.timeout_minutes * 60}
 
     def agent_kw(self, cfg: config.Config, rules=(), own_mcp: str = "") -> dict:
         return {"allowed_tools": [*self.tools, *rules, *(f"mcp__{n}" for n in self.mcp)],
@@ -168,8 +169,6 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
         raise ValueError(f"{where}: runner '{hint}' is not one of {', '.join(runner.RUNNERS)}")
     which, name, provider = routing.source_route(source)
     effort = found.get("effort", "")
-    if effort and effort not in EFFORTS[which]:
-        raise ValueError(f"{where}: effort '{effort}' is not a level {which} takes; use {', '.join(EFFORTS[which])}")
     instructions = found.get("instructions", default_instructions(which))
     check_reach(where, cfg, role, which, found, instructions)
     notes = codex.NOTES if which == "codex" else ()
@@ -181,11 +180,21 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
         which = runner.REPLAY
         entries = ()
     explicit = tuple(found["instructions"]) if "instructions" in found else None
+    chain = chain_of((which, name, provider), link_tier, entries, effort, explicit)
+    fallback = cfg.routing_fallback and layer.routing_fallback
+    runners = {link.runner for link in chain if fallback or link.requested}
+    if fallback:
+        runners.update({"openai": "codex", "anthropic": "claude"}[vendor]
+                       for link in chain if (vendor := routing.identity(link.runner, link.model)[0])
+                       in ("openai", "anthropic"))
+    supported = {level for run_with in runners for level in EFFORTS[run_with]}
+    if effort and effort not in supported:
+        raise ValueError(f"{where}: effort '{effort}' is not a level its routes take; use "
+                         f"{', '.join(level for level in routing.EFFORT_ORDER if level in supported)}")
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
                     mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,
-                    chain=chain_of((which, name, provider), link_tier, entries, effort, explicit),
-                    fallback=cfg.routing_fallback and layer.routing_fallback,
+                    chain=chain, fallback=fallback,
                     instructions_explicit=explicit is not None)
 
 

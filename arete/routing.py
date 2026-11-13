@@ -10,7 +10,8 @@ from datetime import UTC, timedelta
 from . import accounts, claude, codex, config, devices, environment, paths, pi, record, runner, state, util
 from .agent import model_scope
 
-CLAUDE_PI_MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"}
+CLAUDE_PI_MODELS = {"fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
+                    "haiku": "claude-haiku-5-5"}
 VENDORS = {"openai-codex": "openai", "openai": "openai", "anthropic": "anthropic"}
 CLAUDE_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 API_KEY_METHODS = ("api_key", "apiKey", "api-key")
@@ -48,7 +49,7 @@ class Quote:
 
     @property
     def total(self) -> float | None:
-        return None if self.input is None or self.output is None else self.input + self.output
+        return None if self.input is None or self.output is None else number(self.input + self.output)
 
 
 @dataclass(frozen=True)
@@ -146,7 +147,8 @@ def number(value) -> float | None:
 
 def per_million(value) -> float | None:
     found = number(value)
-    return None if found is None else round(found * 1e6, 6)
+    scaled = None if found is None else number(found * 1e6)
+    return None if scaled is None else round(scaled, 6)
 
 
 def openrouter_prices() -> dict[str, dict]:
@@ -154,7 +156,9 @@ def openrouter_prices() -> dict[str, dict]:
     try:
         cached = util.read_json(file, {})
         if isinstance(cached.get("models"), dict) and util.now() - util.parse_iso(cached["fetched"]) < PRICE_FRESH:
-            return cached["models"]
+            return {name: {key: number(accounts.mapping(rates).get(key))
+                           for key in ("input", "output", "cache_read", "cache_write")}
+                    for name, rates in cached["models"].items()}
     except (AttributeError, KeyError, OSError, TypeError, ValueError):
         pass
     request = urllib.request.Request(OPENROUTER_URL, headers={"Accept": "application/json", "User-Agent": "arete"})
@@ -242,8 +246,11 @@ class Discovery:
         vendor, ident = identity(link.runner, link.model)
         if vendor == "anthropic":
             native = link.model if link.runner == "claude" else link.model.partition("/")[2]
-            return [Way(link, "claude", native, "cli_login", "free"),
-                    Way(link, "pi", f"anthropic/{ident}", "pi_key", "paid", "api_key")]
+            keyed = f"anthropic/{ident}"
+            probe = self.probe(keyed, "")
+            key = (Way(link, "pi", keyed, "local", "free") if probe.local or probe.provider in self.cfg.local_providers
+                   else Way(link, "pi", keyed, "pi_key", "paid", "api_key"))
+            return [Way(link, "claude", native, "cli_login", "free"), key]
         if vendor == "openai":
             native = link.model if link.runner == "codex" else ident
             cli = (Way(link, "codex", native, "cli_key", "paid") if self.codex_auth().mode == "api_key"
@@ -347,8 +354,23 @@ class Discovery:
     def routes(self, settings, remaining_budget: float | None = None) -> list[Candidate]:
         seen = set()
         found = []
-        for link in settings.chain:
-            for way in self.ways(link):
+        for link in settings.chain if settings.fallback else settings.chain[:1]:
+            if settings.fallback:
+                ways = self.ways(link)
+            elif link.runner == "pi":
+                selected = self.probe(link.model, "")
+                local = selected.local or selected.provider in self.cfg.local_providers
+                paid = not local and selected.auth.mode != "subscription"
+                credential = ("local" if local else "pi_oauth" if selected.using_login and paid else
+                              "pi_login" if selected.using_login else "pi_key")
+                ways = [Way(link, "pi", selected.model, credential, "paid" if paid else "free",
+                            "" if local else "login" if selected.using_login else "api_key")]
+            elif link.runner == "codex" and self.codex_auth().mode == "api_key":
+                ways = [Way(link, link.runner, link.model, "cli_key", "paid")]
+            else:
+                ways = [Way(link, link.runner, link.model, "replay" if link.runner == runner.REPLAY else
+                            "cli_login", "free")]
+            for way in ways:
                 key = (way.runner, identity(way.runner, way.model), way.credential)
                 if key not in seen:
                     seen.add(key)

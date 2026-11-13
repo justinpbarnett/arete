@@ -315,6 +315,15 @@ def routing_fallback(data) -> bool:
     return value
 
 
+def price_rate(value, where: str) -> float:
+    from .routing import number
+
+    found = number(value)
+    if found is None:
+        raise ValueError(f"{where}: price must be a finite nonnegative number")
+    return found
+
+
 def replay_table(data) -> ReplayConfig:
     table = table_of(data, "replay")
     if bad := sorted(set(table) - set(REPLAY_KEYS)):
@@ -376,9 +385,10 @@ def load(path: Path | None = None) -> Config:
     cfg.session_idle_hours = float(serve.get("session_idle_hours", cfg.session_idle_hours))
     pricing = data.get("pricing", {})
     cfg.local_providers = list(pricing.get("local_providers", cfg.local_providers))
-    cfg.pricing = {str(m): (float(r["input"]) if "input" in r else None, float(r["output"]) if "output" in r else None)
+    cfg.pricing = {str(m): tuple(price_rate(r[k], f"[pricing.models.{m}] {k}") if k in r else None
+                                for k in ("input", "output"))
                    for m, r in (pricing.get("models") or {}).items()}
-    cfg.routing_fallback = routing_fallback(data.get("routing") or {})
+    cfg.routing_fallback = routing_fallback(data.get("routing", {}))
     j = data.get("jira", {})
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
