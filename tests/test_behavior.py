@@ -970,6 +970,107 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
         self.assertGreater(r["final"], r["ran"], shown)
 
 
+class WorkerRecoveryTests(unittest.TestCase):
+    SCRIPT = r'''
+import contextlib, importlib.util, io, json, os, sys
+from pathlib import Path
+from arete import cli, experiment, paths, record, workers
+root, mode = Path(sys.argv[1]), sys.argv[2]
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(list(argv))
+    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+sample, results = root / "sample", root / "results.jsonl"
+manifest = sample / "workers.toml"
+if mode == "setup":
+    paths.CONFIG_FILE.write_text("\n".join(workers.sample(sample)) + "\n")
+    call("prices", "import", str(sample / "prices.json"))
+    manifest.write_text(manifest.read_text().replace("repeats = 2", "repeats = 1"))
+    raise SystemExit(0)
+if mode != "finish":
+    finished, original = [0], record.Recorder.finish
+    def dies(self, res, seconds):
+        finished[0] += 1
+        if finished[0] == int(mode):
+            os._exit(9)
+        original(self, res, seconds)
+    record.Recorder.finish = dies
+ran = call("benchmark", "run", str(manifest), "--out", str(results))
+trials = [e for e in experiment.events(results) if e.get("event") == "trial"]
+print("BEHAVIOR_RESULT=" + json.dumps({"run": ran, "trials": trials, "report": workers.report(results)}))
+'''
+
+    def test_a_run_killed_mid_trial_keeps_every_launch_and_never_prices_a_dead_call_as_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+            codes = []
+            for mode in ("setup", "1", "5", "finish"):
+                done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), mode], cwd=root, env=env,
+                                      text=True, capture_output=True, timeout=600, check=False)
+                codes.append(done.returncode)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            r = json.loads(output)
+        shown = json.dumps(r, indent=1)
+        self.assertEqual(codes, [0, 9, 9, 0], shown)
+        self.assertEqual(r["run"]["code"], 0, shown)
+        cut = {(t["task"], t["arm"]): t for t in r["trials"] if t["status"] == "interrupted"}
+        self.assertEqual(set(cut), {("small-patch", "direct"), ("test-work", "cheap")}, shown)
+        first = cut[("small-patch", "direct")]
+        self.assertEqual([(a["phase"], a["launched"], a["tariff_usd"]) for a in first["attempts"]],
+                         [("worker", True, None)], shown)
+        self.assertEqual(first["unpriced_attempts"], 1, shown)
+        later = cut[("test-work", "cheap")]
+        self.assertEqual([(a["phase"], a["launched"], a["tariff_usd"], a.get("gate")) for a in later["attempts"]],
+                         [("worker", True, 0.01, "fail"), ("worker", True, None, None)], shown)
+        self.assertEqual(later["unpriced_attempts"], 1, shown)
+        arms = r["report"]["arms"]
+        self.assertEqual((arms["direct"]["worker_attempts"], arms["direct"]["tariff_usd"]), (5, None), shown)
+        self.assertEqual((arms["cheap"]["worker_attempts"], arms["cheap"]["escalation_attempts"]), (10, 2), shown)
+        self.assertIsNone(arms["cheap"]["tariff_worker_usd"], shown)
+        self.assertIsNone(arms["cheap"]["tariff_usd"], shown)
+        self.assertEqual(arms["absent"]["tariff_usd"], 0.12, shown)
+        for arm in ("cheap", "absent"):
+            self.assertIn("never counted as free", r["report"]["against"][arm]["verdict"], shown)
+
+    def test_a_trial_line_without_worker_attempts_is_not_priced(self):
+        from arete import workers
+
+        design = {"accept": {"confidence": 0.95}, "workers": {"kinds": {"t": "patch"}}}
+        lost = {"event": "trial", "task": "t", "arm": "a", "repeat": 1, "status": "interrupted",
+                "charged_usd": 0.0, "reference_usd": 0.0}
+        self.assertIsNone(workers.arm_row("a", [lost], design)["tariff_usd"])
+        self.assertEqual(workers.arm_row("a", [{**lost, "attempts": []}], design)["tariff_usd"], 0)
+
+    def test_an_arm_with_an_unaccounted_trial_prices_no_phase(self):
+        from arete import workers
+
+        design = {"accept": {"confidence": 0.95}, "workers": {"kinds": {"t": "patch"}}}
+        lost = {"event": "trial", "task": "t", "arm": "a", "repeat": 1, "status": "interrupted",
+                "charged_usd": 0.0, "reference_usd": 0.0, "unpriced_attempts": 2}
+        priced = {**lost, "repeat": 2, "unpriced_attempts": 0, "reference_usd": 0.08,
+                  "attempts": [{"phase": workers.WORKER, "launched": True, "tariff_usd": 0.08}]}
+        row = workers.arm_row("a", [priced, lost], design)
+        self.assertEqual((row["tariff_worker_usd"], row["tariff_escalation_usd"], row["tariff_usd"]), (None, None, None))
+        row = workers.arm_row("a", [priced], design)
+        self.assertEqual((row["tariff_worker_usd"], row["tariff_usd"]), (0.08, 0.08))
+
+
 class MinerRecordedRunTests(unittest.TestCase):
     PRELUDE = r'''
 import contextlib, io, json, sys

@@ -267,7 +267,7 @@ def unavailable(exp: experiment.Experiment) -> dict[str, str]:
     return missing
 
 
-def drive(bench: Bench, path: Path) -> int:
+def drive(bench: Bench, path: Path, hands_off: frozenset = frozenset(), shown=None) -> int:
     exp = bench.exp
     found = experiment.events(path)
     experiment.check_design(exp, path, found)
@@ -282,10 +282,12 @@ def drive(bench: Bench, path: Path) -> int:
     try:
         with clock.saving():
             prove(bench, path, clock)
-            missing = unavailable(exp)
+            found_missing = unavailable(exp)
+        missing = {arm: why for arm, why in found_missing.items() if arm not in hands_off}
         experiment.append(path, {"event": "availability", "at": util.iso(), "arms": missing})
-        for arm, why in missing.items():
-            print(f"unavailable {arm}: {why}", flush=True)
+        for arm, why in found_missing.items():
+            print(f"unavailable {arm}: {why}" + ("; its escalation route takes the work" if arm in hands_off else ""),
+                  flush=True)
         baseline = exp.accept["baseline"]
         if baseline in missing:
             raise experiment.Refused(f"the baseline {baseline} is unavailable: {missing[baseline]}")
@@ -301,7 +303,7 @@ def drive(bench: Bench, path: Path) -> int:
     except (KeyboardInterrupt, pipeline.Stopped):
         experiment.append(path, {"event": "stop", "why": "interrupted", "at": util.iso()})
         code = experiment.INTERRUPT_EXIT
-    print(render(report(path)))
+    print(shown(path) if shown else render(report(path)))
     return code
 
 
