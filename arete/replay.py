@@ -106,6 +106,9 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
         if asks.is_ask(call["name"]):
             text, error = asks.reply(call.get("input"))
             on_line(json.dumps({"type": "tool_result", "id": at, "name": call["name"], "text": text, "error": error}))
+        elif isinstance(call.get("result"), str):
+            on_line(json.dumps({"type": "tool_result", "id": at, "name": call["name"], "text": call["result"],
+                                "error": bool(call.get("error"))}))
     time.sleep(seconds)
     if patched and (applied := util.sh(["git", "apply", str(patch_file)], cwd=cwd)).returncode != 0:
         return failed(f"replay: {patch_file} does not apply: {util.first_line(applied.stderr or applied.stdout)}")

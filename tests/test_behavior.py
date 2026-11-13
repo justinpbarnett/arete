@@ -173,12 +173,120 @@ if scenario == "edited-after-held-pr":
         connection.execute("UPDATE tasks SET body = ? WHERE id = ?",
                            ("Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", task))
 feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
-def forced():
+def forced(*extra):
     try:
-        factory.main(feature, ["replay-sample", task, "--force"])
+        factory.main(feature, ["replay-sample", task, "--force", *extra])
     except SystemExit:
         pass
     return state.ticket_runs("replay-sample", task, whole=True)[0]
+if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits", "kept-push-then-fail") or scenario.startswith(("failed-resume", "failed-again")):
+    layer, replays, src, origin = root / "sample/layer/config.toml", root / "sample/replay", root / "sample/repo", root / "sample/origin.git"
+    plain, stock = layer.read_text(), (replays / "build.patch").read_text()
+    ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+    branch = pipeline.fill_template(config.RepoLayer.branch, config.RepoLayer.branch, kind="feat", id=task, slug=pipeline.slug("Add kumquat"))
+    prompts, real_run = [], runner.run
+    def spying(prompt, cwd, **kw):
+        prompts.append((kw.get("trace"), prompt))
+        return real_run(prompt, cwd, **kw)
+    runner.run = spying
+    def og(*args):
+        return pipeline.git(list(args), origin).strip()
+    def commit_in_src(name, message, ref):
+        (src / name).write_text(name + "\n")
+        pipeline.git(["add", name], src)
+        pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message], src)
+        pipeline.git(["push", "-q", "origin", ref], src)
+    def edit_spec(text):
+        with state.db() as c:
+            c.execute("UPDATE tasks SET body = ? WHERE id = ?", (text, task))
+    if scenario.startswith(("failed-resume", "failed-again")):
+        layer.write_text(plain.replace("grep -q kumquat", "grep -q quince"))
+        failed = forced()
+        layer.write_text(plain)
+        kept_head, last, mid = pipeline.git(["rev-parse", "HEAD"], ws).strip(), failed, {}
+        if "unrecorded" in scenario:
+            (ws / "hand.txt").write_text("hand\n")
+            pipeline.git(["add", "hand.txt"], ws)
+            pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "hand\n\nArete-Run: " + failed["id"]], ws)
+        before = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+        if "moved" in scenario:
+            pipeline.git(["checkout", "-q", "main"], src)
+            commit_in_src("moved.txt", "move main", "HEAD:main")
+        if "reopened" in scenario:
+            layer.write_text(plain + '\n[setup]\ncommands = ["exit 3"]\n')
+            last = mid = forced("--continue", failed["id"])
+            layer.write_text(plain)
+            mid["log"] = (paths.RUNS_DIR / mid["id"] / "run.log").read_text()
+        if "only-prepare" in scenario:
+            try:
+                factory.main(feature, ["replay-sample", task, "--continue", failed["id"], "--only", "prepare"])
+            except SystemExit:
+                pass
+            mid = state.ticket_runs("replay-sample", task)[0]
+            mid["unmoved"] = pipeline.git(["rev-parse", "HEAD"], ws).strip() == before
+        resuming = scenario in ("failed-resume-moved", "failed-resume-only-prepare-moved")
+        if not resuming:
+            (replays / "build.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+        again = ["--from", "prepare"] if "again-prepare" in scenario else ["--from", "checks"] if resuming else []
+        row = forced("--continue", last["id"], *again)
+        log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+        published = "refs/heads/" + branch in og("for-each-ref", "--format=%(refname)", "refs/heads")
+        result = {"failed": failed["summary"], "status": row["status"], "summary": row["summary"], "log": log,
+                  "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
+                  "steps": [s["step"] for s in state.steps(row["id"])], "failed_id": failed["id"],
+                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved")},
+                  "unmoved": ws.exists() and pipeline.git(["rev-parse", "HEAD"], ws).strip() == before,
+                  "moved": og("show", f"{branch}:moved.txt") if "moved" in scenario and published else "",
+                  "published": og("show", f"{branch}:notes.txt") if published else "",
+                  "kept_published": published and pipeline.util.sh(["git", "merge-base", "--is-ancestor", kept_head, branch], cwd=origin).returncode == 0,
+                  "head_parents": og("log", "-1", "--format=%P", branch).split() if published else [], "main": og("rev-parse", "main"),
+                  "trailers": og("log", "--format=%B", f"main..{branch}") if published else "", "prompts": [t[1] for t, _ in prompts if t and t[0] == row["id"]]}
+        print("BEHAVIOR_RESULT=" + json.dumps(result))
+        raise SystemExit(0)
+    seed = ""
+    if scenario in ("kept-park-pushed", "kept-removed"):
+        pipeline.git(["checkout", "-q", "--detach"], src)
+        commit_in_src("seed.txt", "seed", f"HEAD:refs/heads/{branch}")
+        pipeline.git(["checkout", "-q", "main"], src)
+        seed = og("rev-parse", f"refs/heads/{branch}")
+    if scenario == "park-no-edits":
+        plan = replays / "plan.json"
+        answer = plan.read_text()
+        plan.write_text(json.dumps(json.loads(answer) | {"seconds": 30}))
+        policy = runlimits.Policy(max_run_minutes=.03)
+    else:
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace("[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+        layer.write_text(plain.replace("grep -q kumquat", "grep -q quince"))
+        policy = runlimits.Policy(max_repair_cycles=0)
+    with mock.patch.object(runlimits.Policy, "of", return_value=policy):
+        parked = forced()
+    layer.write_text(plain)
+    head = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+    result = {"parked": parked["summary"], "head": head, "main": og("rev-parse", "main"), "seed": seed,
+              "message": pipeline.git(["log", "-1", "--format=%B"], ws).strip(),
+              "parent": pipeline.git(["rev-parse", "-q", "--verify", "HEAD~1"], ws, check=False).strip(), "dirty": pipeline.git(["status", "--short"], ws).strip(),
+              "parked_id": parked["id"], "recorded": json.loads(runlimits.artifact(parked["id"], "parked.json").read_text()),
+              "origin": og("for-each-ref", "--format=%(refname)", "refs/heads")}
+    if scenario == "kept-removed":
+        pipeline.git(["worktree", "remove", "--force", str(ws)], src)
+        pipeline.git(["branch", "-D", branch], src)
+    edit_spec("Add kumquat on a last line of its own, and quince")
+    if scenario == "kept-push-then-fail":
+        from arete import flows
+        factory.STEPS["publish"] = lambda flow: flows.end_as("fail", "failed", why="publishing failed after the push")
+    if scenario in ("kept-park", "kept-park-pushed", "kept-push-then-fail"):
+        (replays / "build.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+    if scenario == "park-no-edits":
+        plan.write_text(answer)
+    row = forced()
+    log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+    result |= {"status": row["status"], "summary": row["summary"], "id": row["id"], "log": log,
+               "trailers": og("log", "--format=%B", f"main..{branch}") if "refs/heads/" + branch in og("for-each-ref", "--format=%(refname)", "refs/heads") else "",
+               "published": og("show", f"{branch}:notes.txt"),
+               "onto_recorded": [k for k in pipeline.made_before(ws) if k.startswith("\0onto")],
+               "build_prompt": next((p for t, p in prompts if t and t[0] == row["id"] and t[1] == "build"), "")}
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
 if scenario.startswith("held-scratch"):
     layer, answer = root / "sample/layer/config.toml", root / "sample/replay/verify.json"
     plain, passing = layer.read_text(), answer.read_text()
@@ -196,6 +304,7 @@ if scenario.startswith("held-scratch"):
     saved = pipeline.made_record(ws).read_text()
     made = json.loads(saved)
     result = {"parked": parked["summary"], "recorded": [k for k in made if not k.startswith("\0")],
+              "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip(),
               "head_recorded": made.get(pipeline.head_key(pipeline.Checkout("", "", ws, ws, "main"))) == pipeline.git(["rev-parse", "HEAD"], ws).strip(),
               "unpushed": pipeline.git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], ws).strip(),
               "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")],
@@ -214,6 +323,7 @@ if scenario.startswith("held-scratch"):
         (root / "finalized").mkdir()
         for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
             p.rename(root / "finalized" / p.name)
+    (root / "sample/replay/build.patch").unlink()
     if scenario == "held-scratch-edited":
         with (ws / "notes.txt").open("a") as out:
             out.write("edited by hand\n")
@@ -430,7 +540,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
     def test_run_parked_with_scratch_held_records_its_work_without_scratch(self):
         result = self.workflow("held-scratch")
         self.assertIn("parked", result["parked"])
-        self.assertIn("notes.txt", result["recorded"])
+        self.assertIn("Arete-Run: ", result["kept"])
         look = ".arete-scratch-0123456789abcdef"
         engine = [n for n in result["held"] if n != look]
         self.assertIn(look, result["held"])
@@ -443,7 +553,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
             self.assertIn(look, result["left"])
             self.assertFalse([n for n in result["recorded"] if ".arete-scratch-" in n])
         self.assertTrue(result["head_recorded"])
-        self.assertEqual(result["unpushed"], "1")
+        self.assertEqual(result["unpushed"], "2")
         self.assertIn("unresolved or unknown scratch resources", result["while_held"])
         self.assertTrue(result["record_kept"])
         self.assertEqual(result["prepared"], ["pass"])
@@ -458,6 +568,129 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("no record of leaving there (notes.txt)", result["summary"])
         self.assertTrue(result["edited"])
         self.assertEqual(result["origin"].strip(), "refs/heads/main")
+
+    def assert_parked_with_kept_edits(self, result):
+        self.assertIn("parked:", result["parked"])
+        self.assertIn("workspace left in place", result["parked"])
+        self.assertIn(f"Arete-Run: {result['parked_id']}", result["message"])
+        self.assertEqual(result["dirty"], "")
+        self.assertEqual(result["recorded"]["kept"], {".": {"head": result["head"], "onto": result["parent"]}})
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("left unpushed", result["build_prompt"])
+        self.assertIn(f"Arete-Run: {result['parked_id']}", result["trailers"])
+        self.assertIn(f"Arete-Run: {result['id']}", result["trailers"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+
+    def test_forced_run_after_a_park_continues_from_the_kept_edits(self):
+        result = self.workflow("kept-park")
+        self.assert_parked_with_kept_edits(result)
+        self.assertEqual(result["parent"], result["main"])
+        self.assertEqual(result["origin"].strip(), "refs/heads/main")
+
+    def test_run_that_pushes_kept_edits_then_fails_records_no_stale_kept_head(self):
+        result = self.workflow("kept-push-then-fail")
+        self.assertEqual(result["status"], "failed", result["summary"])
+        self.assertIn("publishing failed", result["summary"])
+        self.assertIn(f"Arete-Run: {result['parked_id']}", result["trailers"])
+        self.assertEqual(result["onto_recorded"], [])
+
+    def test_forced_run_after_a_park_continues_on_top_of_the_pushed_branch(self):
+        result = self.workflow("kept-park-pushed")
+        self.assert_parked_with_kept_edits(result)
+        self.assertEqual(result["parent"], result["seed"])
+        self.assertIn("continuing commits already pushed", result["log"])
+
+    def test_forced_run_after_the_owner_removes_the_parked_worktree_starts_from_origin(self):
+        result = self.workflow("kept-removed")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn(f"Arete-Run: {result['parked_id']}", result["message"])
+        self.assertNotIn(result["parked_id"], result["trailers"])
+        self.assertNotIn("left unpushed", result["build_prompt"])
+        self.assertIn("kumquat", result["published"])
+        self.assertNotIn("quince", result["published"])
+
+    def test_park_without_edits_keeps_nothing(self):
+        result = self.workflow("park-no-edits")
+        self.assertIn("parked:", result["parked"])
+        self.assertNotIn("edits kept", result["parked"])
+        self.assertEqual(result["head"], result["main"])
+        self.assertEqual(result["recorded"]["kept"], {})
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertNotIn("left unpushed", result["log"])
+
+    def test_resume_after_main_moved_continues_from_the_failed_runs_edits(self):
+        result = self.workflow("failed-resume-moved")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("so this run prepares again, keeps the plan and the build", result["log"])
+        self.assertIn("merged `origin/main` into the edits the last run kept", result["log"])
+        self.assertNotIn("plan", result["steps"])
+        self.assertNotIn("build", result["steps"])
+        self.assertIn("kumquat", result["published"])
+        self.assertEqual(result["moved"], "moved.txt")
+        self.assertIn(result["main"], result["head_parents"])
+        self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
+
+    def test_resume_after_a_renewed_prepare_failed_past_its_merge_continues_from_the_kept_edits(self):
+        result = self.workflow("failed-resume-reopened-moved")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["mid"]["status"], "failed")
+        self.assertIn("setup command `exit 3` failed", result["mid"]["summary"])
+        self.assertIn("merged `origin/main` into the edits the last run kept", result["mid"]["log"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertTrue(result["kept_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+        self.assertEqual(result["moved"], "moved.txt")
+        self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
+        self.assertIn(f"Arete-Run: {result['mid']['id']}", result["trailers"])
+
+    def test_prepare_run_alone_leaves_kept_edits_for_the_resume_after_main_moved(self):
+        result = self.workflow("failed-resume-only-prepare-moved")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["mid"]["only_step"], "prepare")
+        self.assertEqual(result["mid"]["status"], "failed")
+        self.assertIn("a prepare run alone would change them outside that chain", result["mid"]["summary"])
+        self.assertIn(f"`arete resume {result['failed_id']}` publishes them", result["mid"]["summary"])
+        self.assertTrue(result["mid"]["unmoved"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("merged `origin/main` into the edits the last run kept", result["log"])
+        self.assertTrue(result["kept_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertEqual(result["moved"], "moved.txt")
+        self.assertIn(result["main"], result["head_parents"])
+        self.assertNotIn(f"Arete-Run: {result['mid']['id']}", result["trailers"])
+
+    def assert_prepared_again_on_the_kept_edits(self, result):
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertNotIn("preparing again would drop them", result["summary"])
+        self.assertIn("left unpushed", result["log"])
+        self.assertIn("plan", result["steps"])
+        self.assertTrue(result["kept_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+        self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
+
+    def test_preparing_a_failed_run_again_continues_from_its_kept_edits(self):
+        result = self.workflow("failed-again-prepare")
+        self.assert_prepared_again_on_the_kept_edits(result)
+        self.assertEqual(result["moved"], "")
+
+    def test_preparing_a_failed_run_again_after_main_moved_continues_from_its_kept_edits(self):
+        result = self.workflow("failed-again-prepare-moved")
+        self.assert_prepared_again_on_the_kept_edits(result)
+        self.assertEqual(result["moved"], "moved.txt")
+        self.assertIn("merged `origin/main` into the edits the last run kept", result["log"])
+
+    def test_preparing_again_over_a_chain_commit_with_no_kept_record_is_still_held(self):
+        result = self.workflow("failed-again-prepare-unrecorded")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("preparing again would drop them", result["summary"])
+        self.assertEqual(result["steps"], [])
+        self.assertTrue(result["unmoved"])
+        self.assertEqual(result["published"], "")
 
     def test_behavioral_check_failure_stops_before_verification_or_publication(self):
         result = self.workflow("failed-check")
@@ -2103,6 +2336,197 @@ class PushedPrDraftTests(unittest.TestCase):
         pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
         self.assertEqual(len(self.names("pr", "ready")), 1)
         self.assertEqual(self.names("pr", "merge"), [])
+
+
+class ChatContextTests(unittest.TestCase):
+    PRELUDE = r'''
+import json, sys, time
+from pathlib import Path
+from arete import chat, config, paths, record, state
+
+root = Path(sys.argv[1])
+answers = root / "replay"
+
+
+def put(name, body):
+    (answers / f"{name}.json").write_text(json.dumps(body))
+
+
+def reply(text):
+    return {"text": "", "structured": {"reply": text, "issue_title": "", "issue_body": ""}}
+
+
+def take(chat_id, text):
+    chat.send(chat_id, text)
+    deadline = time.monotonic() + 60
+    while chat.view(chat_id)["busy"]:
+        assert time.monotonic() < deadline, "the chat never finished"
+        time.sleep(0.05)
+    return chat.view(chat_id)
+
+
+def header(name):
+    return next(record.lines(paths.record_dir("chat") / f"{name}{record.RECORD_SUFFIX}"), {})
+
+
+def answer_of(n):
+    return "chat-1" if n == 1 else f"chat-1{n}"
+
+
+def record_of(n):
+    return "chat-1" if n == 1 else f"chat-1-{n}"
+
+
+def summary_answer_of(k):
+    return "chat-1-summary" if k == 1 else f"chat-1-summary{k}"
+
+
+def summary_records():
+    return sorted(p.name for p in paths.record_dir("chat").glob(f"chat-1-summary*{record.RECORD_SUFFIX}"))
+
+
+def summary_header(k):
+    return header("chat-1-summary" if k == 1 else f"chat-1-summary-{k}")
+
+
+def result(**fields):
+    print("BEHAVIOR_RESULT=" + json.dumps(fields))
+
+
+state.ensure_schema()
+assert chat.new("")["id"] == 1
+'''
+
+    def scratch(self, body):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay", "home", "tmp"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text(
+                f'[replay]\nall = true\ndir = "{root / "replay"}"\n\n[chat]\ncontext_tokens = 100\n\n[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=180, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            return json.loads(output)
+
+    FRUITS = r'''
+fruits = ["APRICOT" + " word" * 18, "PLUM" + " word" * 18, "PEAR" + " word" * 18, "And now?"]
+'''
+
+    def test_each_turn_is_a_fresh_call_built_from_the_saved_messages(self):
+        found = self.scratch(r'''
+put("chat-1", {**reply("The poll ran at noon."),
+               "tool_calls": [{"name": "Bash", "input": {"command": "arete status"}, "result": "poll: last ran 12:00"}]})
+put("chat-12", reply("Noted."))
+one = take(1, "When did APRICOT poll run?")
+take(1, "Thanks")
+result(senders=[m["sender"] for m in one["messages"]], first=header("chat-1")["prompt"], second=header("chat-1-2"))
+''')
+        self.assertEqual(found["senders"], ["you", "tool", "arete"])
+        self.assertEqual(found["first"], "When did APRICOT poll run?")
+        self.assertIsNone(found["second"].get("resume"))
+        for part in ("When did APRICOT poll run?", "Tool: Bash: arete status → poll: last ran 12:00", "The poll ran at noon."):
+            self.assertIn(part, found["second"]["prompt"])
+
+    def test_saved_history_over_the_budget_is_summarized_and_the_newest_messages_stay(self):
+        found = self.scratch(self.FRUITS + r'''
+for n in range(1, 5):
+    put(answer_of(n), reply(f"Reply {n}."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK the owner asked about two fruits."})
+counts = []
+for n, text in enumerate(fruits, 1):
+    last = take(1, text)
+    counts.append(len(summary_records()))
+result(counts=counts, summary=last["summary"], prompt=header(record_of(4))["prompt"], model=summary_header(1).get("model"),
+       summary_prompt=summary_header(1).get("prompt", ""))
+''')
+        self.assertEqual(found["counts"], [0, 0, 0, 1])
+        self.assertEqual(found["model"], "haiku")
+        self.assertTrue(found["summary"].startswith("SUMMARYMARK"))
+        prompt = found["prompt"]
+        self.assertIn("SUMMARYMARK", prompt)
+        self.assertIn("You: PEAR" + " word" * 18, prompt)
+        self.assertIn("Arete: Reply 3.", prompt)
+        self.assertNotIn("APRICOT", prompt)
+        self.assertNotIn("PLUM", prompt)
+        self.assertTrue(prompt.endswith("And now?"))
+
+    def test_a_long_new_message_alone_writes_no_summary(self):
+        found = self.scratch(r'''
+put("chat-1", reply("Reply 1."))
+put("chat-12", reply("Reply 2."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK wrongly written."})
+long = "long " * 120
+take(1, "When did APRICOT poll run?")
+last = take(1, long)
+result(records=summary_records(), summary=last["summary"], prompt=header(record_of(2))["prompt"], long=long)
+''')
+        self.assertEqual(found["records"], [])
+        self.assertEqual(found["summary"], "")
+        self.assertIn("You: When did APRICOT poll run?", found["prompt"])
+        self.assertIn("Arete: Reply 1.", found["prompt"])
+        self.assertTrue(found["prompt"].endswith(found["long"]))
+        self.assertNotIn("left out", found["prompt"])
+
+    def test_a_long_message_in_another_script_is_batched_within_the_budget(self):
+        found = self.scratch(r'''
+put("chat-1", reply("Reply 1."))
+put("chat-12", reply("Reply 2."))
+for k in range(1, 7):
+    put(summary_answer_of(k), {"text": "摘" * 200})
+take(1, "汉" * 200)
+last = take(1, "And now?")
+records = summary_records()
+result(counts=[summary_header(k)["prompt"].count("汉") for k in range(1, len(records) + 1)],
+       sizes=[chat.size_of(chat.render({"sender": "you", "text": "汉" * summary_header(k)["prompt"].count("汉")}))
+              for k in range(1, len(records) + 1)],
+       summary_size=chat.size_of(last["summary"]), summarized_to=state.chat_get(1)["summarized_to"],
+       chinese_id=state.chat_messages(1)[0]["id"])
+''')
+        self.assertGreaterEqual(len(found["counts"]), 2)
+        self.assertEqual(sum(found["counts"]), 200)
+        self.assertTrue(all(size <= 100 for size in found["sizes"]), found["sizes"])
+        self.assertLessEqual(found["summary_size"], 25)
+        self.assertEqual(found["summarized_to"], found["chinese_id"])
+
+    def test_a_failed_summary_keeps_the_saved_summary_and_messages_within_the_budget(self):
+        found = self.scratch(self.FRUITS + r'''
+turns = [*fruits, "FIG" + " word" * 18, "Still there?"]
+for n in range(1, 7):
+    put(answer_of(n), reply(f"Reply {n}."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK the owner asked about two fruits."})
+put(summary_answer_of(2), {"ok": False, "error": "the summary model is down"})
+counts = []
+for n, text in enumerate(turns, 1):
+    if n == 6:
+        saved = chat.view(1)["messages"]
+        before = chat.view(1)["summary"]
+    last = take(1, text)
+    counts.append(len(summary_records()))
+prompt = header(record_of(6))["prompt"]
+kept = [m for m in saved if chat.render(m) in prompt]
+result(counts=counts, before=before, summary=last["summary"], prompt=prompt, last=last["messages"][-1]["text"],
+       size=chat.size_of(last["summary"], chat.render_all(kept)), kept=len(kept))
+''')
+        self.assertEqual(found["counts"], [0, 0, 0, 1, 1, 2])
+        self.assertTrue(found["before"].startswith("SUMMARYMARK"))
+        self.assertEqual(found["summary"], found["before"])
+        prompt = found["prompt"]
+        self.assertIn(found["summary"], prompt)
+        self.assertIn("left out because their summary could not be written", prompt)
+        self.assertIn("You: FIG" + " word" * 18, prompt)
+        self.assertIn("Arete: Reply 5.", prompt)
+        self.assertNotIn("PEAR", prompt)
+        self.assertGreater(found["kept"], 0)
+        self.assertLessEqual(found["size"], 100)
+        self.assertEqual(found["last"], "Reply 6.")
 
 
 if __name__ == "__main__":

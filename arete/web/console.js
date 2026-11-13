@@ -144,7 +144,7 @@ function drawChat(c) {
   chatSeen = seen;
   chatLength = c.messages.length;
   fill("messages", c.messages.length ? c.messages.map((m) => el("div", { class: `msg from-${m.sender}` },
-    el("div", { class: "who" }, withFigures([m.sender === "you" ? "You" : "Arete", clock(m.ts), messageCost(m)].filter(Boolean).join(" · "))),
+    el("div", { class: "who" }, withFigures([{ you: "You", tool: "Tool" }[m.sender] || "Arete", clock(m.ts), messageCost(m)].filter(Boolean).join(" · "))),
     el("p", {}, withLinks(m.text))))
     : quiet(c.project ? `No messages yet. Ask about ${c.project}'s code, its checks, or how arete works on it.`
       : "No messages yet. Ask what is running, why a run failed, or what to change."));
