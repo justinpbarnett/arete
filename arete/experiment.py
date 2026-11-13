@@ -86,6 +86,7 @@ class Experiment:
     checks_required: bool = False
     skip: frozenset = frozenset()
     make_run: Callable | None = None
+    recovered: Callable | None = None
 
 
 def unknown(table: dict, allowed: tuple[str, ...], where: str) -> None:
@@ -539,7 +540,8 @@ def settle_interrupted(exp: Experiment, path: Path) -> None:
     written = {e.get("run") for e in found if e.get("event") == "trial"}
     for begun in (e for e in found if e.get("event") == "start" and e.get("run") not in written):
         record.settle(begun["run"], "interrupted", summary=record.INTERRUPTED)
-        append(path, trial_line(exp, path, begun, "interrupted", last_alive(found, begun["run"])))
+        append(path, trial_line(exp, path, begun, "interrupted", last_alive(found, begun["run"]),
+                                outcomes=exp.recovered(begun["run"]) if exp.recovered else None))
 
 
 @dataclass

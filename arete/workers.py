@@ -20,6 +20,7 @@ BRIEF = {"plan": "No planner ran. The task above is the whole brief: do what it 
          "estimated_lines": 0, "verify": ""}
 QUOTE = "the quote lives on this line"
 SAMPLE_REPO = "workers-sample"
+LAUNCH_FILE = "worker-launches.json"
 PER_STEP = {"cheap": 0.01, "strong": 0.03}
 
 
@@ -108,7 +109,7 @@ def load(path: Path) -> implbench.Bench:
     held = {arm: {**b, "escalation": resolved_escalation(exp, arm, b["escalation"])} for arm, b in arms.items()}
     design = {**exp.design, "workers": {"kinds": kinds, "references": references, "arms": held}}
     return implbench.Bench(replace(exp, design=design, digest=experiment.sha_json(design)[:12], checks_required=True,
-                                   make_run=worker_run), kinds, references)
+                                   make_run=worker_run, recovered=recovered), kinds, references)
 
 
 def declared(path: Path) -> bool:
@@ -132,6 +133,37 @@ def call_entry(call: dict) -> dict:
     return {"runner": call.get("runner"), "model": call.get("model"), "provider": call.get("provider"),
             "tokens_in": call.get("tokens_in") or 0, "tokens_out": call.get("tokens_out") or 0,
             "cost_usd": call.get("cost_usd") or 0, "tariff": quote, "tariff_usd": None if unpriced else usd}
+
+
+def launch_file(run_id: str) -> Path:
+    return paths.RUNS_DIR / run_id / LAUNCH_FILE
+
+
+def accounted(run_id: str, launches: list[dict]) -> list[dict]:
+    files = record.record_files(run_id)
+    ends = [launch["start"] for launch in launches[1:]] + [len(files)]
+    found = []
+    for launch, end in zip(launches, ends, strict=True):
+        framed = [experiment.framed(f) for f in files[launch["start"]:end]] if launch["launched"] else []
+        found.append([r for h, r in framed if r and not h.get("refused") and h.get("step") == launch["step"]])
+    return [attempt_entry(n, launch, results) for n, (launch, results) in enumerate(zip(launches, found), 1)]
+
+
+def outcomes_of(run_id: str, launches: list[dict], handoff: str) -> dict:
+    attempts = accounted(run_id, launches)
+    first = attempts[0] if attempts else {}
+    return {"attempts": attempts, "handoff": handoff,
+            "first_pass": len(attempts) == 1 and first["phase"] == WORKER and first.get("gate") == "pass",
+            "unpriced_attempts": sum(a["launched"] and a["tariff_usd"] is None for a in attempts)}
+
+
+def recovered(run_id: str) -> dict:
+    kept = util.read_json(launch_file(run_id), None)
+    if isinstance(kept, dict):
+        return outcomes_of(run_id, kept.get("launches") or [], kept.get("handoff") or "")
+    unaccounted = len(record.record_files(run_id))
+    return {"handoff": "", "first_pass": False, "unpriced_attempts": unaccounted,
+            **({} if unaccounted else {"attempts": []})}
 
 
 def attempt_entry(n: int, launch: dict, results: list[dict]) -> dict:
@@ -190,6 +222,7 @@ class WorkerRun(experiment.TrialRun):
         if not res.ok and len(self.launches) == before and res.error.startswith(runner.NO_ROUTE):
             self.launches.append(self.launch_of(step, {"runner": res.runner, "model": res.model,
                                                        "provider": res.provider}, False))
+            self.keep()
         return res
 
     def launch_of(self, step: str, route: dict, launched: bool) -> dict:
@@ -206,24 +239,20 @@ class WorkerRun(experiment.TrialRun):
         super().write_line(event, **fields)
         if launching:
             self.launches.append(self.launch_of(fields["step"], fields, True))
+            self.keep()
+
+    def keep(self) -> None:
+        util.write_json(launch_file(self.id), {"launches": self.launches, "handoff": self.handoff})
 
     def in_phase(self) -> int:
         return sum(launch["phase"] == self.phase for launch in self.launches)
-
-    def accounted(self) -> list[dict]:
-        files = record.record_files(self.id)
-        ends = [launch["start"] for launch in self.launches[1:]] + [len(files)]
-        found = []
-        for launch, end in zip(self.launches, ends, strict=True):
-            framed = [experiment.framed(f) for f in files[launch["start"]:end]] if launch["launched"] else []
-            found.append([r for h, r in framed if r and not h.get("refused") and h.get("step") == launch["step"]])
-        return [attempt_entry(n, launch, results) for n, (launch, results) in enumerate(zip(self.launches, found), 1)]
 
     def hand_off(self, why: str) -> bool:
         escalation = self.bounds.get("escalation")
         if not escalation or self.phase == ESCALATION:
             return False
         self.phase, self.handoff, self.failure = ESCALATION, why, ""
+        self.keep()
         self.step_overrides = {**self.step_overrides, "build": escalation["route"],
                                "check_repair": escalation["route"]}
         self.log(f"handing the task to {escalation['runner']} {escalation['model']}: {why}")
@@ -249,6 +278,7 @@ class WorkerRun(experiment.TrialRun):
             ok, report = self.task_gate(task, wt, timeout)
         last = self.launches[-1]
         last.update(gate="pass" if ok else "fail", changed=changed, seconds=round(time.monotonic() - last["began"], 2))
+        self.keep()
         stalled = not ok and self.stalled(changed, report)
         self.failure = report
         under = self.in_phase() < self.allowed()
@@ -278,11 +308,7 @@ class WorkerRun(experiment.TrialRun):
         return self.going
 
     def outcomes(self) -> dict:
-        attempts = self.accounted()
-        first = attempts[0] if attempts else {}
-        return {"attempts": attempts, "handoff": self.handoff,
-                "first_pass": len(attempts) == 1 and first["phase"] == WORKER and first.get("gate") == "pass",
-                "unpriced_attempts": sum(a["launched"] and a["tariff_usd"] is None for a in attempts)}
+        return outcomes_of(self.id, self.launches, self.handoff)
 
 
 def worker_run(exp: experiment.Experiment, arm: str, given: dict) -> WorkerRun:
@@ -335,9 +361,10 @@ def kind_rows(design: dict, finished: list[dict]) -> dict:
 
 
 def accounted_for(trial: dict) -> bool:
-    recorded = trial.get("reference_usd")
-    listed = sum(a.get("tariff_usd") or 0 for a in trial.get("attempts") or [])
-    return recorded is not None and abs(recorded - listed) < 1e-6
+    recorded, attempts = trial.get("reference_usd"), trial.get("attempts")
+    if recorded is None or not isinstance(attempts, list):
+        return False
+    return abs(recorded - sum(a.get("tariff_usd") or 0 for a in attempts)) < 1e-6
 
 
 def arm_row(arm: str, trials: list[dict], design: dict) -> dict:

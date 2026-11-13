@@ -1411,6 +1411,8 @@ An arm hands the task to its escalation route when the worker reaches its attemp
 
 Each `trial` line adds `attempts` (every launch, with its endpoint, tokens, cost, applied tariff, gate result, whether the patch changed and seconds, including calls that never launched), `first_pass` (the first worker attempt passed its gate), `handoff` (the reason, or empty) and `unpriced_attempts`. The report counts every failed attempt and escalation in acceptance, seconds and cost, and shows first-pass success apart from eventual success, per arm and per kind. The tariff total uses the endpoint's applicable rate, pinned by the price snapshot's observation time. A launched attempt with no rate, or only a conditional rate that is not proven for the call, makes the total read `unknown`; unknown is never compared and never counted as free.
 
+A trial keeps its launches in `worker-launches.json` in its run folder as it goes. When a killed run is resumed, its interrupted trial line is rebuilt from that file and the trial's records, so its attempts, handoff and costs still count. A launch whose call left no result reads unpriced, and a trial line with no attempt list makes the arm's tariff `unknown`.
+
 Nothing in `config.toml`, a layer, `tries` or routing changes: the escalation exists only inside the trial.
 
 ```
