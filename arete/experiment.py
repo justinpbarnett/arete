@@ -221,14 +221,28 @@ def fingerprints(repo: config.Repo, layer: config.RepoLayer) -> dict:
             "tools": sha_json([layer.builder_bash, layer.checks, denied_paths(layer), runner.NO_GIT_WRITES])}
 
 
-def arm_fingerprints(base: dict, s: steps.Settings) -> dict:
+def mcp_definitions(cfg: config.Config, s: steps.Settings) -> str:
+    return sha_json({n: cfg.mcp.get(n) for n in s.mcp})
+
+
+def arm_fingerprints(base: dict, cfg: config.Config, s: steps.Settings) -> dict:
     return {"prompt": sha(base["prompt"], json.dumps(list(s.instructions_on(s.runner)))),
             "context": base["context"],
-            "tools": sha(base["tools"], json.dumps([list(s.tools), list(s.mcp)]))}
+            "tools": sha(base["tools"], json.dumps([list(s.tools), list(s.mcp)]), mcp_definitions(cfg, s))}
 
 
-def effective(s: steps.Settings) -> str:
-    return sha(json.dumps(asdict(s), sort_keys=True, default=str))
+def effective(cfg: config.Config, s: steps.Settings) -> str:
+    return sha(json.dumps(asdict(s), sort_keys=True, default=str), mcp_definitions(cfg, s))
+
+
+def unstoppable(cfg: config.Config, atom: str, arms: dict, frozen: dict, grader: steps.Settings) -> None:
+    held = {**{f"arm {n}": (s, atom) for n, s in arms.items()}, **{f"step {r}": (s, r) for r, s in frozen.items()},
+            "the grader": (grader, "grade")}
+    for label, (s, role) in held.items():
+        which = runner.chosen(s.model, s.runner, cfg)[0]
+        structured = role in ("plan", "grade")
+        if why := runner.CANNOT_STOP.get(which) or (runner.CANNOT_GATE.get(which) if structured else None):
+            raise Refused(f"{label}: {why}")
 
 
 def freeze(cfg: config.Config, layer: config.RepoLayer, atom: str, baseline: dict) -> dict[str, dict]:
@@ -272,18 +286,20 @@ def load(path: Path) -> Experiment:
     limits = read_limits(section(data, "limits"))
     shared = fingerprints(repo, layer)
     frozen = freeze(cfg, layer, atom, given[accept["baseline"]])
+    held = {role: steps.resolve(cfg, layer, role, "", frozen.get(role)) for role in ATOMS if role != atom}
+    unstoppable(cfg, atom, settings, held, grader)
     design = {
         "name": name, "repo": repo.name, "atom": atom, "repeats": repeats, "cache_policy": cache_policy,
         "accept": accept,
         "arms": {n: {**given[n], "runner": s.runner, "model": s.model, "provider": s.provider, "tier": s.tier,
-                     "effort": s.effort, "settings": effective(s), "fingerprints": arm_fingerprints(shared, s)}
+                     "effort": s.effort, "settings": effective(cfg, s),
+                     "fingerprints": arm_fingerprints(shared, cfg, s)}
                  for n, s in settings.items()},
-        "frozen": {role: {"overrides": frozen.get(role, {}),
-                          "settings": effective(steps.resolve(cfg, layer, role, "", frozen.get(role)))}
-                   for role in ATOMS if role != atom},
+        "frozen": {role: {"overrides": frozen.get(role, {}), "settings": effective(cfg, s)}
+                   for role, s in held.items()},
         "tasks": {n: {"split": splits[n], "base": t.base, "evidence": evidence(t)} for n, t in tasks.items()},
         "grader": {"runner": grader.runner, "model": grader.model, "effort": grader.effort,
-                   "settings": effective(grader), "verify": sha_json(asdict(layer.verify)) if layer.verify else "",
+                   "settings": effective(cfg, grader), "verify": sha_json(asdict(layer.verify)) if layer.verify else "",
                    "prompt": sha((paths.PROMPTS_DIR / "grade.md").read_bytes())},
         "fingerprints": shared,
     }
@@ -389,11 +405,13 @@ def framed(path: Path) -> tuple[dict, dict | None]:
     return header, result
 
 
-def usage(exp: Experiment, run_id: str) -> dict:
+def usage(exp: Experiment, arm: str, run_id: str) -> dict:
     rows = state.steps(run_id)
     charged = state.paid_by_run([run_id], local_providers=exp.cfg.local_providers).get(run_id, 0.0)
     records = [framed(f) for f in record.record_files(run_id)]
     header, result = next(((h, r) for h, r in records if h.get("atom") == exp.atom), ({}, None))
+    launched = bool(header) and not header.get("refused")
+    asked = exp.design["arms"][arm]
     reference, unpriced = 0.0, 0
     for _, r in records:
         if r is None or r.get("tokens_in") is None:
@@ -404,13 +422,15 @@ def usage(exp: Experiment, run_id: str) -> dict:
             unpriced += 1
 
     def seen(key: str):
-        return (result or {}).get(key) or header.get(key) or ""
+        return (result or {}).get(key) or header.get(key) or (asked.get(key, "") if not launched else "")
 
     return {
+        "targeted_step": "launched" if launched else "never launched",
         "route": {**{k: seen(k) for k in ("runner", "model", "provider", "tier", "credential", "billing",
                                           "auth_mode")},
                   "position": header.get("position"), "requested": header.get("requested")},
-        "effort": seen("effort"), "requested_effort": seen("requested_effort"),
+        "effort": seen("effort"), "requested_effort": seen("requested_effort") or (
+            asked["effort"] if not launched else ""),
         "endpoint": {"provider": seen("provider"), "device": header.get("device", ""),
                      "credential": seen("credential"), "billing": seen("billing"), "auth_mode": seen("auth_mode")},
         "cache_policy": exp.cache_policy,
@@ -428,7 +448,7 @@ def usage(exp: Experiment, run_id: str) -> dict:
 def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: float, accepted: bool = False,
                failures: list[str] | None = None, repairs: int = 0) -> dict:
     task, arm = begun["task"], begun["arm"]
-    used = usage(exp, begun["run"])
+    used = usage(exp, arm, begun["run"])
     used["wait_seconds"] = round(used["wait_seconds"] + slot_seconds(events(path), begun), 2)
     return {"event": "trial", "at": util.iso(), "task": task, "split": exp.splits[task],
             "base": exp.tasks[task].base, "arm": arm, "repeat": begun["repeat"], "attempt": begun["attempt"],
@@ -494,7 +514,7 @@ class TrialRun(evals.EvalRun):
         return steps.resolve(self.config, self.layer, role, self.kind,
                              {**self.overrides, **self.step_overrides.get(role, {})})
 
-    def budget(self, seconds: float) -> float:
+    def time_for(self, seconds: float) -> float:
         left = self.seconds_left()
         if left <= 0:
             self.stop(reached(self.limits, replace(self.used(), seconds=self.limits["minutes"] * 60)))
@@ -503,16 +523,21 @@ class TrialRun(evals.EvalRun):
     def dollars_left(self) -> float:
         return max(0.0, self.limits["spend_usd"] - self.used().spend)
 
+    def tokens_left(self) -> int:
+        return max(0, self.limits["tokens"] - self.used().tokens)
+
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw):
         if why := reached(self.limits, self.used()):
             self.stop(why)
         left = self.seconds_left()
         given = kw.get("timeout") or (self.settings(role).timeout_minutes * 60 if role else left)
         self.call_timeout = min(given, left)
-        kw.update(timeout=self.call_timeout, wait_out_limits=False, remaining_budget=self.dollars_left)
+        kw.update(timeout=self.call_timeout, wait_out_limits=False, remaining_budget=self.dollars_left,
+                  remaining_tokens=self.tokens_left)
         res = super().agent(step, text, cwd, role, **kw)
-        if not res.ok and res.error.startswith(runner.NO_ROUTE):
-            self.stopped_by = res.error
+        if not res.ok and not self.stopped_by:
+            self.stopped_by = (res.error if res.error.startswith(runner.NO_ROUTE)
+                               else reached(self.limits, self.used()))
         return res
 
 
@@ -838,8 +863,8 @@ def signed(value: float) -> str:
 
 
 def cost_line(label: str, total: float | None, each: float | None, accepted: int) -> str:
-    per = "no accepted task" if not accepted else money(each)
-    return f"  {label}: {money(total)} over every attempt, {per} per accepted task"
+    per = f"{money(each)} per accepted task" if accepted else "no accepted task"
+    return f"  {label}: {money(total)} over every attempt, {per}"
 
 
 def render_arm(a: dict, confidence: float, baseline: str) -> list[str]:

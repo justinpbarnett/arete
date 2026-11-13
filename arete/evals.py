@@ -273,7 +273,7 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.Re
             (wt / c).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, wt / c)
     for cmd in layer.setup:
-        if environment.sh(cmd, run.config, repo, cwd=wt, timeout=run.budget(1200)).returncode != 0:
+        if environment.sh(cmd, run.config, repo, cwd=wt, timeout=run.time_for(1200)).returncode != 0:
             raise RunFailed(f"setup `{cmd}` failed")
     commit_overlay(wt)
     return layer
@@ -299,6 +299,14 @@ def step_call(cfg: config.Config, run: EvalRun, role: str, tools: list[str], rul
     if run.trial:
         return {"role": role, "allowed_tools": rules}
     return {"model": cfg.model(config.INHERITS.get(role, role)), "allowed_tools": tools + rules}
+
+
+def switched_prompt(which: str, wt: Path, task: Task, plan: str, summary: str, feedback: str) -> str:
+    return (f"The earlier session cannot continue on {which}. Continue the existing work in {wt}; inspect its "
+            f"current diff before editing.\n\n## Task {task.name}: {task.title}\n\n{task.prompt}\n\n"
+            f"## Saved plan\n\n{plan}\n\n## Earlier builder summary\n\n{summary}\n\n"
+            "Keep the current task's tool restrictions and never write git metadata or secret files."
+            f"\n\n## Current feedback\n\n{feedback}")
 
 
 def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run_id: str, dry_run: bool,
@@ -357,23 +365,25 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         if not res.ok:
             result["why"] = "build step failed"
             return result
-        session, attempts = res.session, 1
+        session, attempts, summary = res.session, 1, res.text
         max_attempts = run.settings("check_repair").tries if run.trial else layer.max_attempts
-        ok, report = run_checks(layer, wt, [wt], run, run.budget(timeout))
+        ok, report = run_checks(layer, wt, [wt], run, run.time_for(timeout))
         while not ok and attempts < max_attempts:
             attempts += 1
-            res = run.agent(f"fix{attempts}", prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts,
-                                                     failures=report, checks=runs_checks),
-                            wt, **step_call(cfg, run, "check_repair", runner.BUILD_TOOLS, rules),
-                            disallowed_tools=runner.NO_GIT_WRITES, resume=session, timeout=timeout)
-            session = res.session
-            ok, report = run_checks(layer, wt, [wt], run, run.budget(timeout))
+            fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
+                         checks=runs_checks)
+            res = run.agent(f"fix{attempts}", fix, wt, **step_call(cfg, run, "check_repair", runner.BUILD_TOOLS, rules),
+                            disallowed_tools=runner.NO_GIT_WRITES, resume=session, timeout=timeout,
+                            fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
+                                which, wt, task, plan, summary, fix))
+            session, summary = res.session, res.text
+            ok, report = run_checks(layer, wt, [wt], run, run.time_for(timeout))
         result["repairs"] = attempts - 1
         git(["add", "-A"], wt)
         (run_dir / "diff.patch").write_text(git(["diff", "--cached", "HEAD"], wt))
         failures = []
         if task.verify:
-            graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.budget(timeout))
+            graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
             if graded.verdict != "pass":
                 failures.append(grade_failure(graded))
         if task.check:
@@ -381,7 +391,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                 dest = wt / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
-            res = environment.sh(task.check, cfg, repo, cwd=wt, timeout=run.budget(timeout))
+            res = environment.sh(task.check, cfg, repo, cwd=wt, timeout=run.time_for(timeout))
             (run_dir / "check.log").write_text(res.stdout + res.stderr)
             run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
             if res.returncode != 0:

@@ -283,7 +283,7 @@ class AgentRun:
                              {**self.overrides, **self.step_overrides.get(role, {})},
                              self.step_overrides.get(config.INHERITS.get(role, ""), {}))
 
-    def budget(self, seconds: float) -> float:
+    def time_for(self, seconds: float) -> float:
         return seconds
 
     def wait_for_network(self) -> bool:
@@ -889,7 +889,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     with nullcontext() if layer.parallel_checks else machine_to_itself(run):
         for name, cmd in layer.checks.items():
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.budget(timeout))
+                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
