@@ -287,6 +287,168 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["budget"]["parents"], [])
 
 
+class OptimizeTests(unittest.TestCase):
+    FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
+
+    def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
+        from arete import experiment, optimize
+
+        def trials(arm, outcomes, cost):
+            return [{"event": "trial", "task": "t", "split": "validation", "arm": arm, "repeat": n, "status": "done",
+                     "accepted": ok, "charged_usd": charged, "reference_usd": cost, "repairs": 0, "calls": 2,
+                     "tokens_in": 1, "tokens_out": 1, "wall_seconds": seconds}
+                    for n, ok in enumerate(outcomes, 1)]
+
+        accept = {"baseline": "champ", "split": "validation", "min_pairs": 6, "min_difference": 0.0,
+                  "confidence": 0.95}
+        rows = trials("champ", champion, 0.01) + trials("cand", candidate, reference)
+        done = {experiment.key_of(t): t for t in rows}
+        pair = experiment.pairing(done, "champ", "cand", "validation", 0.95)
+        verdict = experiment.judge(pair, accept)
+        return optimize.decide(experiment.arm_summary("cand", rows, 0.95), experiment.arm_summary("champ", rows, 0.95),
+                               pair, verdict, self.FLOOR)
+
+    def test_a_clear_quality_win_is_promoted_on_quality(self):
+        found = self.decision([False] * 6, [True] * 6)
+        self.assertEqual((found["promote"], found["reason"]), (True, "promote on quality"))
+
+    def test_a_cheaper_candidate_under_the_quality_floor_is_not_promoted(self):
+        found = self.decision([True] * 6, [True, True, True, False, False, False], reference=0.002)
+        self.assertEqual((found["promote"], found["reason"]), (False, "no promotion: under the quality floor"))
+
+    def test_a_noisy_tie_at_equal_cost_is_not_a_win(self):
+        found = self.decision([True] * 6, [True] * 6)
+        self.assertEqual((found["promote"], found["reason"]), (False, "no promotion: noisy tie"))
+
+    def test_missing_costs_and_tiny_samples_block_promotion(self):
+        self.assertEqual(self.decision([False] * 6, [True] * 6, reference=None)["reason"],
+                         "no promotion: missing costs")
+        self.assertEqual(self.decision([False] * 3, [True] * 3)["reason"], "no promotion: insufficient evidence")
+
+    def test_a_cheaper_candidate_at_held_quality_is_promoted_on_economics(self):
+        found = self.decision([True] * 6, [True] * 6, reference=0.005)
+        self.assertEqual((found["promote"], found["reason"]), (True, "promote on economics"))
+        slower = self.decision([True] * 6, [True] * 6, reference=0.005, seconds=2.0)
+        self.assertTrue(slower["promote"])
+
+    def test_a_multiline_list_is_replaced_whole_and_nothing_else_moves(self):
+        import tomllib
+
+        from arete import optimize
+
+        text = '[a]\nx = 1\n\n[steps.build]\nmodel = "m"\ntools = [\n  "Read",\n  "Edit",\n]\neffort = "low"\n\n[z]\ny = 2\n'
+        after = optimize.edited(text, "steps.build", {"tools": ["Read", "Grep"], "mcp": ["one"]})
+        want = tomllib.loads(text)
+        want["steps"]["build"].update(tools=["Read", "Grep"], mcp=["one"])
+        self.assertEqual(tomllib.loads(after), want)
+        lines = after.splitlines(keepends=True)
+        optimize.write_key(lines, "steps.build", "tools", None)
+        self.assertNotIn("tools", tomllib.loads("".join(lines))["steps"]["build"])
+        self.assertEqual(tomllib.loads("".join(lines))["z"], {"y": 2})
+
+    def test_a_winner_that_needs_prompts_is_not_applied_in_part(self):
+        from arete import optimize
+
+        end = {"champion": "p", "overrides": {"model": "m", "prompts": "/x"}}
+        self.assertIn("prompts", optimize.undeployable(end))
+        self.assertEqual(optimize.undeployable({"overrides": {"model": "m"}}), "")
+
+    def test_the_sample_search_promotes_applies_and_rolls_back_one_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = r'''
+import contextlib, importlib.util, io, json, os, sys
+from pathlib import Path
+from arete import cli, optimize, paths
+root = Path(sys.argv[1])
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(list(argv))
+    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
+plan, config_file = str(root / "sample/plan.toml"), paths.CONFIG_FILE
+before = config_file.read_bytes()
+folder = paths.STATE_DIR / "experiments" / "sample-search"
+trail = lambda: [json.loads(line) for line in (folder / "trail.jsonl").read_text().splitlines()]
+holdout = lambda: sum('"event": "trial"' in line for line in (folder / "holdout.jsonl").read_text().splitlines())
+r = {"prices": call("prices", "import", str(root / "sample/prices.json"))["code"]}
+r["dry"] = call("experiment", "optimize", plan, "--dry-run")
+r["dry_wrote"] = (paths.STATE_DIR / "experiments").exists()
+r["search"] = call("experiment", "optimize", plan)
+r["holdout"] = holdout()
+r["again"] = call("experiment", "optimize", plan)
+r["holdout_again"] = holdout()
+r["preview"] = call("experiment", "promote", str(folder))
+r["preview_same"] = config_file.read_bytes() == before
+os.chmod(config_file.parent, 0o500)
+r["failed"] = call("experiment", "promote", str(folder), "--apply")
+os.chmod(config_file.parent, 0o700)
+r["failed_same"] = config_file.read_bytes() == before
+r["failed_events"] = [e.get("status") for e in trail() if e["event"] == "apply"]
+r["apply"] = call("experiment", "promote", str(folder), "--apply")
+after = config_file.read_text().splitlines()
+r["changed"] = [[a, b] for a, b in zip(before.decode().splitlines(), after) if a != b]
+r["same_length"] = len(after) == len(before.decode().splitlines())
+r["apply_again"] = call("experiment", "promote", str(folder), "--apply")
+r["rollback"] = call("experiment", "promote", str(folder), "--rollback")
+r["rolled_back"] = config_file.read_bytes() == before
+r["rollback_again"] = call("experiment", "promote", str(folder), "--rollback")
+print("BEHAVIOR_RESULT=" + json.dumps(r))
+'''
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
+                                  capture_output=True, timeout=600)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            r = json.loads(output)
+        shown = json.dumps(r, indent=1)
+        self.assertEqual(r["prices"], 0, shown)
+        self.assertEqual((r["dry"]["code"], r["dry_wrote"]), (0, False), shown)
+        self.assertIn("candidate twin", r["dry"]["out"])
+        self.assertEqual(r["search"]["code"], 0, shown)
+        out = r["search"]["out"]
+        self.assertIn("stronger: train fixed 6, broke 0: proposed", out)
+        self.assertIn("promoted: stronger", out)
+        self.assertIn("validation accepted 3 of 6 against 6 of 6: no promotion: under the quality floor", out)
+        self.assertIn("validation accepted 6 of 6 against 6 of 6: no promotion: noisy tie", out)
+        self.assertIn("promoted: none", out)
+        self.assertIn("result: promote stronger over baseline", out)
+        self.assertEqual((r["holdout"], r["holdout_again"]), (12, 12), shown)
+        self.assertEqual(r["again"]["code"], 0, shown)
+        self.assertIn("-model = \"scratch-a\"", r["preview"]["out"])
+        self.assertIn("+model = \"scratch-b\"", r["preview"]["out"])
+        self.assertIn("dry run: nothing was written", r["preview"]["out"])
+        self.assertTrue(r["preview_same"])
+        self.assertEqual(r["failed"]["code"], 1, shown)
+        self.assertIn("apply failed", r["failed"]["err"])
+        self.assertIn("config.toml is unchanged", r["failed"]["err"])
+        self.assertTrue(r["failed_same"])
+        self.assertEqual(r["failed_events"], ["failed"])
+        self.assertEqual(r["apply"]["code"], 0, shown)
+        self.assertEqual(r["changed"], [['model = "scratch-a"', 'model = "scratch-b"']], shown)
+        self.assertTrue(r["same_length"])
+        self.assertIn("already applied", r["apply_again"]["out"])
+        self.assertEqual(r["rollback"]["code"], 0, shown)
+        self.assertTrue(r["rolled_back"])
+        self.assertEqual(r["rollback_again"]["code"], 1, shown)
+        self.assertIn("nothing applied", r["rollback_again"]["err"])
+
+
 @unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
 class WriterRegressionTests(unittest.TestCase):
     def write(self, brief, answer, *, voice=""):

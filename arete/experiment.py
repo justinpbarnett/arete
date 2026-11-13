@@ -23,7 +23,8 @@ ATOMS = ("plan", "build", "check_repair")
 FIXED_GRADERS = ("verify", "eval_grade")
 SPLITS = ("train", "validation", "holdout")
 TOP_KEYS = ("name", "repo", "atom", "repeats", "cache_policy", "arms", "tasks", "accept", "limits")
-ARM_KEYS = ("tier", "runner", "provider", "model", "effort")
+EXTRA_KEYS = ("prompts", "context")
+ARM_KEYS = ("tier", "runner", "provider", "model", "effort", "tools", "mcp", "instructions", *EXTRA_KEYS)
 ROUTE_KEYS = ("tier", "runner", "provider", "model")
 ALIVE_SECONDS = 10
 TASK_KEYS = ("base", "split")
@@ -48,6 +49,18 @@ class Capped(Exception):
 
 
 @dataclass
+class Totals:
+    spend: float = 0.0
+    calls: int = 0
+    tokens: int = 0
+    seconds: float = 0.0
+
+    def plus(self, other: Totals) -> Totals:
+        return Totals(self.spend + other.spend, self.calls + other.calls, self.tokens + other.tokens,
+                      self.seconds + other.seconds)
+
+
+@dataclass
 class Experiment:
     name: str
     cfg: config.Config
@@ -65,14 +78,9 @@ class Experiment:
     frozen: dict[str, dict]
     design: dict
     digest: str
-
-
-@dataclass
-class Totals:
-    spend: float = 0.0
-    calls: int = 0
-    tokens: int = 0
-    seconds: float = 0.0
+    extras: dict[str, dict] = field(default_factory=dict)
+    carried: Totals = field(default_factory=Totals)
+    follow: bool = False
 
 
 def unknown(table: dict, allowed: tuple[str, ...], where: str) -> None:
@@ -128,19 +136,36 @@ def content(src: evals.Source, rel: str) -> bytes:
     return link.encode() if link is not None else src.read(rel)
 
 
-def base_commit(repo: config.Repo, name: str, base: str) -> str:
+def commit_of(repo: config.Repo, where: str, base: str) -> str:
     if not HEX.fullmatch(base):
-        raise Refused(f"tasks.{name}: base {base!r} must be 7 to 40 hex digits of a commit")
+        raise Refused(f"{where} {base!r} must be 7 to 40 hex digits of a commit")
     found = util.sh(["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"], cwd=repo.path, timeout=30)
     if found.returncode != 0 or not found.stdout.strip():
-        raise Refused(f"tasks.{name}: base {base} is not a commit in {repo.name}")
+        raise Refused(f"{where} {base} is not a commit in {repo.name}")
     return found.stdout.strip()
 
 
-def read_arms(cfg: config.Config, layer: config.RepoLayer, atom: str, table: dict) -> tuple[dict, dict]:
+def base_commit(repo: config.Repo, name: str, base: str) -> str:
+    return commit_of(repo, f"tasks.{name}: base", base)
+
+
+def read_extras(repo: config.Repo, name: str, entry: dict) -> dict:
+    found = {}
+    if "prompts" in entry:
+        folder = paths.expand(text(entry, "prompts", f"arms.{name}."))
+        if missing := evals.Prompts(folder).missing():
+            raise Refused(f"arms.{name}: prompts {paths.short_path(folder)} has no {', '.join(missing)}")
+        found["prompts"] = str(folder)
+    if "context" in entry:
+        found["context"] = commit_of(repo, f"arms.{name}: context", text(entry, "context", f"arms.{name}."))
+    return found
+
+
+def read_arms(cfg: config.Config, layer: config.RepoLayer, atom: str, table: dict,
+              repo: config.Repo) -> tuple[dict, dict, dict]:
     if len(table) < 2:
         raise Refused("arms: name two or more arms")
-    given, resolved = {}, {}
+    given, resolved, extras = {}, {}, {}
     for name, entry in table.items():
         if not NAME.fullmatch(name):
             raise Refused(f"arms.{name}: a name takes only letters, digits, _ and -")
@@ -148,11 +173,13 @@ def read_arms(cfg: config.Config, layer: config.RepoLayer, atom: str, table: dic
             raise Refused(f"arms.{name} must be a table")
         unknown(entry, ARM_KEYS, f"arms.{name}")
         try:
-            given[name] = config.step_table(entry, f"arms.{name}")
+            given[name] = config.step_table({k: v for k, v in entry.items() if k not in EXTRA_KEYS}, f"arms.{name}")
             resolved[name] = steps.resolve(cfg, layer, atom, "", given[name])
         except ValueError as e:
             raise Refused(f"arm {name}: {e}") from e
-    return given, resolved
+        if extra := read_extras(repo, name, entry):
+            extras[name] = extra
+    return given, resolved, extras
 
 
 def read_tasks(repo: config.Repo, table: dict) -> tuple[dict[str, evals.Task], dict[str, str]]:
@@ -212,11 +239,12 @@ def read_limits(table: dict) -> dict:
     return found
 
 
-def fingerprints(repo: config.Repo, layer: config.RepoLayer) -> dict:
-    src = evals.Source(repo)
+def fingerprints(repo: config.Repo, layer: config.RepoLayer, prompts_dir: Path = paths.PROMPTS_DIR,
+                 ref: str = "") -> dict:
+    src = evals.Source(repo, ref)
     harness = [part for f in sorted(evals.harness_files(src)) for part in (f, content(src, f))]
     expertise = layer.expertise_file.read_bytes() if layer.expertise_file.exists() else b""
-    return {"prompt": sha(*[(paths.PROMPTS_DIR / f"{n}.md").read_bytes() for n in evals.BUILDER_PROMPTS]),
+    return {"prompt": sha(*[(prompts_dir / f"{n}.md").read_bytes() for n in evals.BUILDER_PROMPTS]),
             "context": sha(*harness, expertise),
             "tools": sha_json([layer.builder_bash, layer.checks, denied_paths(layer), runner.NO_GIT_WRITES])}
 
@@ -245,10 +273,16 @@ def unstoppable(cfg: config.Config, atom: str, arms: dict, frozen: dict, grader:
             raise Refused(f"{label}: {why}")
 
 
-def freeze(cfg: config.Config, layer: config.RepoLayer, atom: str, baseline: dict) -> dict[str, dict]:
+def followers(atom: str, follow: bool) -> list[str]:
+    return [r for r, b in config.INHERITS.items() if b == atom and r in ATOMS] if follow else []
+
+
+def freeze(cfg: config.Config, layer: config.RepoLayer, atom: str, baseline: dict,
+           follow: bool = False) -> dict[str, dict]:
     route = {k: v for k, v in baseline.items() if k in ROUTE_KEYS}
     return {role: route for role in ATOMS
-            if role != atom and route and not steps.resolve(cfg, layer, role, "").model}
+            if role != atom and role not in followers(atom, follow) and route
+            and not steps.resolve(cfg, layer, role, "").model}
 
 
 def evidence(task: evals.Task) -> str:
@@ -257,7 +291,10 @@ def evidence(task: evals.Task) -> str:
 
 
 def load(path: Path) -> Experiment:
-    data = tomllib.loads(path.read_text())
+    return build(tomllib.loads(path.read_text()))
+
+
+def build(data: dict, carried: Totals | None = None, follow: bool = False) -> Experiment:
     unknown(data, TOP_KEYS, "the manifest")
     name = text(data, "name")
     if not NAME.fullmatch(name):
@@ -280,20 +317,30 @@ def load(path: Path) -> Experiment:
         grader = steps.resolve(cfg, layer, "eval_grade", "")
     except (ValueError, OSError) as e:
         raise Refused(f"repo {repo.name}: {e}") from e
-    given, settings = read_arms(cfg, layer, atom, section(data, "arms"))
+    given, settings, extras = read_arms(cfg, layer, atom, section(data, "arms"), repo)
     tasks, splits = read_tasks(repo, section(data, "tasks"))
     accept = read_accept(section(data, "accept"), given, splits)
     limits = read_limits(section(data, "limits"))
     shared = fingerprints(repo, layer)
-    frozen = freeze(cfg, layer, atom, given[accept["baseline"]])
-    held = {role: steps.resolve(cfg, layer, role, "", frozen.get(role)) for role in ATOMS if role != atom}
-    unstoppable(cfg, atom, settings, held, grader)
+    frozen = freeze(cfg, layer, atom, given[accept["baseline"]], follow)
+    following = followers(atom, follow)
+    held = {role: steps.resolve(cfg, layer, role, "", frozen.get(role)) for role in ATOMS
+            if role != atom and role not in following}
+    inherited = {n: {role: steps.resolve(cfg, layer, role, "", None, given[n]) for role in following}
+                 for n in settings}
+    unstoppable(cfg, atom, settings,
+                {**held, **{f"{role} of arm {n}": s for n, roles in inherited.items() for role, s in roles.items()}},
+                grader)
+    own = {n: fingerprints(repo, layer, Path(x.get("prompts", paths.PROMPTS_DIR)), x.get("context", ""))
+           for n, x in extras.items()}
     design = {
         "name": name, "repo": repo.name, "atom": atom, "repeats": repeats, "cache_policy": cache_policy,
         "accept": accept,
         "arms": {n: {**given[n], "runner": s.runner, "model": s.model, "provider": s.provider, "tier": s.tier,
                      "effort": s.effort, "settings": effective(cfg, s),
-                     "fingerprints": arm_fingerprints(shared, cfg, s)}
+                     "fingerprints": arm_fingerprints(own.get(n, shared), cfg, s),
+                     **{k: paths.short_path(v) if k == "prompts" else v for k, v in extras.get(n, {}).items()},
+                     **({"inheritors": {r: effective(cfg, s2) for r, s2 in inherited[n].items()}} if follow else {})}
                  for n, s in settings.items()},
         "frozen": {role: {"overrides": frozen.get(role, {}), "settings": effective(cfg, s)}
                    for role, s in held.items()},
@@ -305,7 +352,7 @@ def load(path: Path) -> Experiment:
     }
     digest = sha_json(design)[:12]
     return Experiment(name, cfg, repo, layer, atom, repeats, cache_policy, given, settings, tasks, splits, accept,
-                      limits, frozen, design, digest)
+                      limits, frozen, design, digest, extras, carried or Totals(), follow)
 
 
 def default_path(name: str) -> Path:
@@ -477,6 +524,8 @@ class TrialRun(evals.EvalRun):
     began: float = field(default_factory=time.monotonic)
     call_timeout: float = 0.0
     stopped_by: str = ""
+    pinned: config.RepoLayer | None = None
+    follow: bool = False
 
     def used(self) -> Totals:
         rows = state.steps(self.id)
@@ -511,8 +560,9 @@ class TrialRun(evals.EvalRun):
 
     def settings(self, role: str):
         role = config.STEP_ALIASES.get(role, role)
-        return steps.resolve(self.config, self.layer, role, self.kind,
-                             {**self.overrides, **self.step_overrides.get(role, {})})
+        return steps.resolve(self.config, self.pinned or self.layer, role, self.kind,
+                             {**self.overrides, **self.step_overrides.get(role, {})},
+                             self.step_overrides.get(config.INHERITS.get(role, ""), {}) if self.follow else None)
 
     def time_for(self, seconds: float) -> float:
         left = self.seconds_left()
@@ -631,12 +681,15 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
             started = time.monotonic()
             trial = TrialRun(id=run_id, repo=exp.repo, dir=paths.RUNS_DIR / run_id, cfg=exp.cfg, task=task,
                              trial=f"{arm}-{repeat}", step_overrides=trial_overrides(exp, arm), limits=exp.limits,
-                             before=replace(used, seconds=used.seconds + waited))
+                             pinned=exp.layer, follow=exp.follow, before=replace(used, seconds=used.seconds + waited))
             trial.dir.mkdir(parents=True, exist_ok=True)
             try:
                 with alive(path, run_id, started), replay_folder(exp, task, arm, repeat):
-                    result = evals.run_task(exp.cfg, exp.repo, evals.Source(exp.repo), exp.tasks[task], run_id, False,
-                                            evals.Prompts(), run=trial)
+                    extra = exp.extras.get(arm, {})
+                    prompts = evals.Prompts(Path(extra["prompts"]), paths.short_path(extra["prompts"])) \
+                        if "prompts" in extra else evals.Prompts()
+                    result = evals.run_task(exp.cfg, exp.repo, evals.Source(exp.repo, extra.get("context", "")),
+                                            exp.tasks[task], run_id, False, prompts, run=trial)
             except (KeyboardInterrupt, pipeline.Stopped):
                 record.settle(run_id, "stopped", summary=record.STOPPED)
                 append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started))
@@ -658,7 +711,7 @@ def work(exp: Experiment, path: Path) -> int:
         found = events(path)
         if (task, arm, repeat) in completed(found):
             continue
-        used = totals_of(found)
+        used = totals_of(found).plus(exp.carried)
         try:
             if why := reached(exp.limits, used):
                 raise Capped(why)
@@ -707,8 +760,10 @@ def dry_run(exp: Experiment, path: Path) -> int:
     out = [f"experiment {exp.name} (design {exp.digest}): atom {exp.atom} on {exp.repo.name}",
            f"results file: {paths.short_path(path)}"]
     for name, s in exp.settings.items():
+        extra = "".join(f", {k} {paths.short_path(v) if k == 'prompts' else v[:12]}"
+                        for k, v in exp.extras.get(name, {}).items())
         out.append(f"arm {name}: runner {s.runner}, model {s.model}, effort {s.effort or 'default'}, "
-                   f"tier {s.tier or 'none'}, timeout {s.timeout_minutes} minutes")
+                   f"tier {s.tier or 'none'}, timeout {s.timeout_minutes} minutes{extra}")
     out.append(f"grader (fixed): runner {grader['runner']}, model {grader['model']}, "
                f"effort {grader['effort'] or 'default'}")
     for name, t in exp.tasks.items():
@@ -729,14 +784,18 @@ def run(manifest: Path, out: str = "", dry: bool = False) -> int:
     path = paths.expand(out) if out else default_path(exp.name)
     if dry:
         return dry_run(exp, path)
+    return exclusive(exp.repo.name, lambda: drive(exp, path))
+
+
+def exclusive(repo_name: str, job) -> int:
     paths.ensure_dirs()
-    with util.lock(state.run_lock("experiment", exp.repo.name)) as got:
+    with util.lock(state.run_lock("experiment", repo_name)) as got:
         if not got:
-            print(f"an experiment is already running for {exp.repo.name}")
+            print(f"an experiment is already running for {repo_name}")
             return 0
         earlier = signal.signal(signal.SIGTERM, terminate)
         try:
-            return drive(exp, path)
+            return job()
         finally:
             signal.signal(signal.SIGTERM, earlier)
 
