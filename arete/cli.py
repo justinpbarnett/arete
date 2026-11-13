@@ -294,14 +294,22 @@ def cmd_hook(args) -> int:
 
 
 def cmd_guard(args) -> int:
-    from . import guard
+    from . import guard, scratch
 
+    scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     return guard.main()
 
 
-def cmd_codex_guard(args) -> int:
-    from . import codex, runner
+def scratch_hook(p) -> None:
+    p.add_argument("--scratch", default="", help="the verification attempt's scratch folder, set by arete")
+    p.add_argument("--scratch-id", default="", help="selector for protected harness authority; never proves ownership")
+    p.add_argument("--scratch-saves", default="", help="must match the authenticated evidence destination")
 
+
+def cmd_codex_guard(args) -> int:
+    from . import codex, runner, scratch
+
+    scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
 
 
@@ -985,6 +993,37 @@ def cmd_steps(args) -> int:
     return 0
 
 
+def cmd_document(args) -> int:
+    from pathlib import Path
+
+    from . import document, outbound
+
+    try:
+        raw = sys.stdin.read() if args.brief == "-" else Path(args.brief).read_text()
+        data = json.loads(raw)
+        if args.draft and isinstance(data, dict):
+            data["draft"] = Path(args.draft).read_text()
+        brief = document.brief_from(data)
+        cfg = config.load()
+        repo = cfg.repo(args.repo) if args.repo else None
+        layer = config.load_layer(repo.layer_dir) if repo else None
+        written = document.write(brief, cfg, repo=repo, layer=layer)
+    except (ValueError, TypeError, OSError, config.UnknownRepo) as e:
+        print(f"arete document: {e}", file=sys.stderr)
+        return 2
+    if args.text:
+        sys.stdout.write(written.text if written.text.endswith("\n") else written.text + "\n")
+    else:
+        shown = {"kind": brief.kind, "source": written.source, "title": written.title, "text": written.text,
+                 "words": written.words, "target": written.target,
+                 "over_target": bool(written.target and written.words > written.target[1]), "kept": written.kept,
+                 "faults": list(written.faults), "tries": written.tries}
+        if brief.kind != "doc":
+            shown["screened"] = outbound.screen(written.text)
+        print(json.dumps(shown))
+    return 0 if written.source == "writer" else 1
+
+
 def cmd_record(args) -> int:
     from . import record
 
@@ -1237,11 +1276,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: keeps them out of secret files and, with JEV, "
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
+    scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
     p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
                                            "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
+    scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
 
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
@@ -1332,6 +1373,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", default="", help="read this repo's layer too")
     p.add_argument("--kind", default="", choices=config.KINDS, help="resolve for this kind of ticket")
     p.set_defaults(fn=cmd_steps)
+
+    p = sub.add_parser("document", help="write a short message, ticket, PR text or doc edit from a JSON brief of "
+                                        "verified facts; prints one JSON line")
+    p.add_argument("brief", metavar="BRIEF", help="a JSON file, or - for standard input")
+    p.add_argument("--repo", default="", help="use this repo's layer, its [document] settings and voice files")
+    p.add_argument("--draft", default="", metavar="FILE", help="an existing text to keep, edited as little as possible")
+    p.add_argument("--text", action="store_true", help="print the text alone")
+    p.set_defaults(fn=cmd_document)
 
     p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
                                       "events")

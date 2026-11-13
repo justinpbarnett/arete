@@ -8,9 +8,11 @@ from pathlib import Path
 from . import (
     config,
     diffguard,
+    document,
     factory,
     gh,
     lines,
+    outbound,
     paths,
     pipeline,
     record,
@@ -31,7 +33,8 @@ REVIEW_FIX = "review_fix"
 CHECK_REPAIR = "check_repair"
 REVIEW_REPAIR = "review_repair"
 CI_REPAIR = "ci_repair"
-ROLE_OF = {"plan": "plan", "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn"}
+ROLE_OF = {"plan": "plan", "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn",
+           "document": "document"}
 SETTABLE = {**ROLE_OF, CHECK_REPAIR: CHECK_REPAIR, REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
 
 
@@ -185,6 +188,7 @@ class Job:
     replies: list[dict] = field(default_factory=list)
     attempts: int = 1
     report_body: str = ""
+    document: str = ""
     draft_why: str = ""
     summary: str = ""
     opened: list[str] = field(default_factory=list)
@@ -279,6 +283,8 @@ class Job:
             self.b.steps = Counter(data["names"])
         elif name == "review" and "review" in data:
             self.review, self.reviews = data["review"], data.get("attempt", 0)
+        elif name == "document" and outcome.passed:
+            self.document = data.get("text", "")
         elif name == "pr" and outcome.passed:
             self.published(data, stored)
         elif name == "ci" and outcome.passed:
@@ -614,6 +620,21 @@ def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
     return Outcome("pass", data={"applied": apply})
 
 
+def documents(job: Job) -> bool:
+    return config.document_for(job.cfg, job.run.repo, job.layer).enabled
+
+
+@factory.step("document")
+def write_document(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    staged = job.staged().staged
+    size = f"{len(staged.files)} files, {staged.lines} lines"
+    text = document.pr_text(job.run, job.ticket, pipeline.summary_of(job.review, job.build_summary), job.review,
+                            job.verified, size, pipeline.draft_reason(job.review, job.verified, job.reviews),
+                            job.cfg, job.layer)
+    return Outcome("pass", data={"text": text})
+
+
 def change(job: Job, staged: pipeline.Staged | None = None) -> tuple[pipeline.Staged, str, str]:
     staged = job.b.restage() if staged is None else staged
     if staged.empty:
@@ -672,7 +693,7 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
     report_body = pipeline.report_body(run, summary=job.build_summary, review=job.review, verified=job.verified,
                                        left=left, images=images, approval=job.approval, attempts=job.attempts,
                                        checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size,
-                                       held=draft_why)
+                                       held=draft_why, written=job.document)
     link = tk.pr_link(t, whole=not left)
     opened = [c for c in opened if c in staged.changed]
     for c in staged.changed:
@@ -786,7 +807,7 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
 def done_comment(job: Job, summary: str) -> str:
     said = job.review
     problems = "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in said.get("problems", []))
-    return (f"Done: {summary}.\n\n## Summary\n\n{pipeline.summary_of(said, job.build_summary)}\n\n"
+    return (f"Done: {summary}.\n\n## Summary\n\n{job.document or pipeline.summary_of(said, job.build_summary)}\n\n"
             f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown()}\n\n"
             f"## Review\n\n**{said.get('verdict', 'none')}**: {said.get('summary', '')}\n{problems}\n\n"
             f"Run `{job.run.id}`, {util.paid_note(record.metered_spent(job.run.id))}.")
@@ -809,8 +830,14 @@ def ended(flow: factory.Flow, outcome: Outcome) -> tuple[str, str, str]:
 
 
 def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
-    staged, _, outcome_text = change(flow.ctx)
-    flow.ctx.run.save("diff.patch", staged.patch)
+    job = flow.ctx
+    staged, size, outcome_text = change(job)
+    job.run.save("diff.patch", staged.patch)
+    job.run.save("pr_body.md", outbound.screen(pipeline.report_body(
+        job.run, summary=job.build_summary, review=job.review, verified=job.verified,
+        left=job.left_for_a_person, images={}, approval=job.approval, attempts=job.attempts,
+        checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size,
+        held=pipeline.draft_reason(job.review, job.verified, job.reviews), written=job.document)))
     return finish(flow, "dry-run", summary=outcome_text)
 
 

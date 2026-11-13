@@ -9,7 +9,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, environment, gh, paths, record, runner, state, tracker, util, verify
+from . import config, environment, gh, paths, record, runner, scratch, state, tracker, util, verify
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
@@ -130,7 +130,8 @@ class Source:
 
     def read(self, rel: str) -> bytes:
         if self.ref:
-            res = subprocess.run(["git", "show", f"{self.ref}:{rel}"], cwd=self.repo.path, capture_output=True,
+            res = subprocess.run(scratch.protected_command(["git", "show", f"{self.ref}:{rel}"], self.repo.path),
+                                 cwd=self.repo.path, capture_output=True,
                                  timeout=60, check=False)
             if res.returncode != 0:
                 raise FileNotFoundError(rel)

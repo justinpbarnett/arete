@@ -30,6 +30,7 @@ from . import (
     state,
     util,
 )
+from . import scratch as verification_scratch
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -271,7 +272,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
-        **kw) -> Result:
+        scratch: verification_scratch.Attempt | None = None, **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
     which, name = chosen(model, run_with, cfg)
@@ -297,7 +298,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     size = routing_size(prompt, settings, kw)
     active = layer if layer is not None else layer_of(repo)
     trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
-                remaining_budget, kw.get("max_budget_usd"), layer=active)
+                remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch)
     from . import routing
 
     limited: list[Result] = []
@@ -347,8 +348,9 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         on_launch(route)
         started = util.iso()
-        res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
-                      tier, kind, picked.auth, route, try_no, atom)
+        with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
+            res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
+                          tier, kind, picked.auth, route, try_no, atom)
         res.credential, res.effort, res.requested_effort, res.skipped = (
             chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
         if res.session.id:
@@ -388,6 +390,7 @@ class Trip:
     pinned: dict = field(default_factory=dict)
     floors: dict = field(default_factory=dict)
     launched: bool = False
+    scratch: verification_scratch.Attempt | None = None
     barred: dict = field(default_factory=dict)
     layer: config.RepoLayer | None = None
 
@@ -629,14 +632,26 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["remote"] = target
     else:
         kw["passing"] = environment.passed(cfg, repo)
+    hook = ()
+    kw.pop("verification_attempt", None)
+    if trip.scratch:
+        try:
+            hook = verification_scratch.activate(trip.scratch, which, bool(target.remote), kw.get("add_dirs", ()),
+                                                 kw.get("mcp_config", ""))
+        except (OSError, ValueError, KeyError, TypeError):
+            hook = ()
+        if not hook:
+            say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
+            kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
+        kw["verification_attempt"] = trip.scratch
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo)
+            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook)
     elif which == "codex":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_codex(kw, cfg, trace[0], say, repo)
+            kw = local_codex(kw, cfg, trace[0], say, repo, hook)
     elif which == "pi":
         kw["price"] = lambda reply: priced(reply, cfg)
         kw["max_budget_usd"] = picked.budget
@@ -726,7 +741,9 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         elif which == REPLAY:
             res = replay.run(cwd, trace, cfg, rec.line, resume, kw.get("timeout"))
         elif which == "codex":
-            res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line, hidden=found, auth=auth, **kw)
+            protected = [verification_scratch.AUTHORITY, paths.WORKTREES_DIR]
+            res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line,
+                            hidden=[*found, *protected], auth=auth, **kw)
         else:
             res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume,
                                                              on_line=safe_line if selected else rec.line,
@@ -804,10 +821,14 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
 
 
 def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: Callable[[str], None],
-                 repo: config.Repo | None) -> dict:
+                 repo: config.Repo | None, scratch: tuple[str, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings()
+        if scratch:
+            for group in kw["settings"]["hooks"]["PreToolUse"]:
+                for hook in group["hooks"]:
+                    hook["command"] = verification_scratch.hook_command(hook["command"], list(scratch))
         if runs_bash(kw) and (note := judge_note(cfg, kw["passing"], repo)):
             say(note)
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
@@ -817,10 +838,12 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
 
 
 def local_codex(kw: dict, cfg: config.Config, run_id: str, say: Callable[[str], None],
-                repo: config.Repo | None) -> dict:
+                repo: config.Repo | None, scratch: tuple[str, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["judge"] = True
+        if scratch:
+            kw["scratch"] = tuple(scratch)
         if note := judge_note(cfg, kw["passing"], repo):
             say(note)
     return kw

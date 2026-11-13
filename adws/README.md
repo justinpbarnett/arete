@@ -6,7 +6,7 @@ This is the guide for an agent that starts and follows arete's runs: a session l
 
 A **task** is one piece of work in a repo from the config. It is a local task with an id like `t-1a2b`, made from a prompt, or a tracker item: a GitHub issue number or a Jira key.
 
-A **run** is one process that takes a task through the steps of the [adw flow](../README.md#the-adw-flow): `prepare`, `plan`, `implement`, `checks`, `verify`, `review`, `learn`, `pr`, `ci`, `publish` and `respond`. A run has an id of its own, and every recipe after the first one takes that id.
+A **run** is one process that takes a task through the steps of the [adw flow](../README.md#the-adw-flow): `prepare`, `plan`, `implement`, `checks`, `verify`, `review`, `learn`, `document` (when `[document]` is on), `pr`, `ci`, `publish` and `respond`. A run has an id of its own, and every recipe after the first one takes that id.
 
 A task has many runs. An answer, a resume and a step each start a **new** run with a **new** id. Always wait on the id the last recipe printed, never on the old one.
 
@@ -141,7 +141,7 @@ just adw-wait RUN2
 | `noop` | there was nothing to change |
 | `skipped` | the run did not start its work; `summary` says why, such as a wait that still holds |
 | `step` | a run of one step alone (`just adw-step`); look at that step's `step_end` |
-| `dry-run` | a dry run ended after `learn` |
+| `dry-run` | a dry run ended after `learn`, or after `document` when it is on |
 
 ## On a question
 

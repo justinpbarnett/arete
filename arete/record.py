@@ -30,7 +30,7 @@ RECORD_SUFFIX = ".jsonl.gz"
 TIMELINE = f"steps{RECORD_SUFFIX}"
 CLOCK_SECONDS = 1
 HEADER_WAIT_SECONDS = 10
-CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|^access$|^refresh$", re.IGNORECASE)
+CREDENTIAL_NAME = paths.CREDENTIAL_NAME
 PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL)
 SHORTEST_SECRET = 8
 REDACTED = "[redacted]"
@@ -185,7 +185,7 @@ def file_secrets(path: Path, every_value: bool = False) -> set[str]:
     try:
         if path.stat().st_size > LARGEST_SECRET_FILE:
             return set()
-        text = path.read_text(errors="replace")
+        text = paths.read_confined(path).decode(errors="replace")
     except OSError:
         return set()
     found = set(PRIVATE_KEY.findall(text))
