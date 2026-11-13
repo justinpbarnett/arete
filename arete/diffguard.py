@@ -12,7 +12,7 @@ ALWAYS_DENY = [".agents/config.toml", ".github/workflows/**", ".env", ".env.*", 
                *CLAUDE_CODE_GUARDED]
 LOCKFILES = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb", "uv.lock", "poetry.lock",
              "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock"}
-NEVER_STAGED = [":(exclude,glob)**/__pycache__/**"]
+NEVER_STAGED = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/.local/state/gh/**", ":(exclude,glob)**/.config/gh/**"]
 
 
 def denied_paths(layer: config.RepoLayer) -> list[str]:

@@ -172,9 +172,9 @@ def load(path: Path) -> Search:
     rounds = read_rounds(data)
     fields["accept"] = experiment.read_accept({**accept_table, "baseline": BASELINE, "split": "validation"},
                                               {BASELINE: {}}, {n: t["split"] for n, t in tasks.items()})
-    built = [experiment.build(manifest(fields, "check", "train", {BASELINE: {}, **r["candidates"]}, BASELINE),
+    built = [experiment.designed(manifest(fields, "check", "train", {BASELINE: {}, **r["candidates"]}, BASELINE),
                               follow=True) for r in rounds]
-    others = [experiment.build(manifest(fields, "check", split, {BASELINE: {}, **rounds[0]["candidates"]}, BASELINE),
+    others = [experiment.designed(manifest(fields, "check", split, {BASELINE: {}, **rounds[0]["candidates"]}, BASELINE),
                                follow=True) for split in ("validation", "holdout")]
     base = snapshot(built[0])
     evidence_of = {n: t for exp in (built[0], *others) for n, t in exp.design["tasks"].items()}
@@ -294,7 +294,7 @@ def carried(folder: Path, own: Path) -> Totals:
 def phase(s: Search, folder: Path, tag: str, split: str, arms: dict, champion: str,
           pinned: dict[str, dict] | None = None) -> Path:
     file = folder / f"{tag}.jsonl"
-    exp = experiment.build(manifest(s.fields, tag, split, arms, champion), carried(folder, file), follow=True)
+    exp = experiment.designed(manifest(s.fields, tag, split, arms, champion), carried(folder, file), follow=True)
     if environment(exp) != s.environment or any(s.task_evidence.get(n) != t for n, t in exp.design["tasks"].items()):
         raise Refused("the fixed steps, grader, harness, prompts, tasks or live baseline changed since the search "
                       "began; pass --out for a new folder")

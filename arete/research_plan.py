@@ -89,6 +89,14 @@ def problems(plan, family: list[str]) -> list[str]:
     return found
 
 
+def known(paid) -> bool:
+    return type(paid) in (float, int) and math.isfinite(paid) and paid >= 0
+
+
+def plus(a: float, b: float) -> float:
+    return float(Decimal(str(a)) + Decimal(str(b)))
+
+
 @dataclass
 class Budget:
     usd: float
@@ -115,6 +123,9 @@ class Budget:
     def short(self, usd: float, seconds: float) -> bool:
         return bool(self.error) or not (math.isfinite(usd) and math.isfinite(seconds)) or (
             usd <= runner.BUDGET_FLOOR_USD or seconds < MIN_CALL_SECONDS)
+
+    def add(self, paid: float) -> None:
+        self.spent_usd = plus(self.spent_usd, paid)
 
     def wait_until(self, until: str, deadline: float) -> bool:
         started = time.monotonic()
@@ -143,11 +154,11 @@ class Budget:
                              **kw)
             paid = res.paid_usd
             self.elapsed()
-            if type(paid) not in (float, int) or not math.isfinite(paid) or paid < 0:
+            if not known(paid):
                 self.error = f"the research call's paid cost is unknown; known prior spend is {util.money(self.spent_usd)}"
             else:
-                spent = float(Decimal(str(spent)) + Decimal(str(paid)))
-                self.spent_usd = float(Decimal(str(self.spent_usd)) + Decimal(str(paid)))
+                spent = plus(spent, paid)
+                self.add(paid)
                 if spent > usd:
                     self.error = "the research call exceeded its allowance; its incurred cost is recorded"
             if time.monotonic() > deadline:
