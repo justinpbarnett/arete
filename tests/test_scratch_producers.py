@@ -4,7 +4,6 @@ import fcntl
 import io
 import os
 import secrets
-import shlex
 import subprocess
 import sys
 import tempfile

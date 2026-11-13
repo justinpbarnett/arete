@@ -24,7 +24,8 @@ class Job:
 
 def printed(target: str) -> str | None:
     try:
-        done = subprocess.run([LAUNCHCTL, "print", target], check=False, capture_output=True, text=True, timeout=10)
+        done = subprocess.run([LAUNCHCTL, "print", target], check=False, capture_output=True, text=True, errors="replace",
+                              timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout if done.returncode == 0 else None

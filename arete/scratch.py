@@ -190,9 +190,12 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
         raise ValueError("scratch requires a pinned run and step")
     with registry(True) as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
-        if any(d["state"] != "done"
-               and overlap(Path(d["attempt"]["workspace"]), ws) for d in records()):
-            raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt")
+        unresolved = [d for d in records() if d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), ws)]
+        if unresolved:
+            held = named_holders([h for d in unresolved if isinstance(d.get("diagnostic"), dict)
+                                  for h in d["diagnostic"].get("holders", [])])
+            raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt"
+                          + (f" held by {held}" if held else ""))
         selector, token = secrets.token_hex(32), secrets.token_hex(8)
         root = ws / f"{PREFIX}{token}"
         directories, files = {}, {}
