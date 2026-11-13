@@ -403,6 +403,7 @@ CREATE TABLE IF NOT EXISTS incident_notes (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS incident_notes_incident ON incident_notes (incident, id);
+CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
@@ -1300,6 +1301,33 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
         )
 
 
+SETTLED_PROPOSALS = ("merged", "rejected", "skipped", "filed")
+
+
+def pin_record(run_id: str) -> bool:
+    with db() as c:
+        return c.execute("INSERT OR IGNORE INTO record_pins (run_id, pinned) VALUES (?, ?)",
+                         (run_id, util.iso())).rowcount > 0
+
+
+def unpin_record(run_id: str) -> bool:
+    with db() as c:
+        return c.execute("DELETE FROM record_pins WHERE run_id = ?", (run_id,)).rowcount > 0
+
+
+def record_pins(connect=db) -> set[str]:
+    with connect() as c:
+        return {r["run_id"] for r in c.execute("SELECT run_id FROM record_pins")}
+
+
+def runs_cited_by_pending_proposals(run_ids, connect=db) -> set[str]:
+    marks = ",".join("?" * len(SETTLED_PROPOSALS))
+    with connect() as c:
+        rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",
+                         SETTLED_PROPOSALS).fetchall()
+    return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
+
+
 def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> list[dict]:
     q, args = "SELECT * FROM proposals", []
     if status:
@@ -1438,6 +1466,12 @@ def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why:
     with db() as c:
         c.execute("INSERT OR REPLACE INTO mined (pr_url, repo, issue, run_id, status, why, task, ts) "
                   "VALUES (?,?,?,?,?,?,?,?)", (pr_url, repo, issue, run_id, status, why, task, util.iso()))
+
+
+def mined_row(pr_url: str) -> dict:
+    with db() as c:
+        row = c.execute("SELECT * FROM mined WHERE pr_url = ?", (pr_url,)).fetchone()
+    return dict(row) if row else {}
 
 
 def mined_urls() -> set[str]:
