@@ -11,10 +11,12 @@ EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS, "codex": codex.EF
 CODEX_INSTRUCTIONS = ("repo",)
 DEFAULTS = {"tools": tuple(runner.READ_TOOLS), "mcp": (), "session": "fresh"}
 BUILT_IN = {"build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
-            "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3}}
+            "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
+            "research_plan": {"timeout_minutes": 10, "tries": 2}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
-KEEPS_NO_SESSION = ("learn", "uat")
+KEEPS_NO_SESSION = ("learn", "uat", "research_plan")
+READ_ONLY = ("research_plan",)
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,13 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
 
 def check_reach(where: str, cfg: config.Config, role: str, which: str, found: dict, instructions: tuple) -> None:
     tools, mcp = found["tools"], found["mcp"]
+    if role in READ_ONLY:
+        if acting := [t for t in tools if t not in runner.READ_ONLY_TOOLS]:
+            raise ValueError(f"{where}: tools {', '.join(acting)} would let {role} change files; it is read only, "
+                             "so use Read, Glob, Grep and LS")
+        if mcp:
+            raise ValueError(f"{where}: mcp {', '.join(mcp)} cannot load on {role}, which is read only and takes "
+                             "no servers")
     if bad := [t for t in tools if t not in STEP_TOOLS]:
         raise ValueError(f"{where}: tools {', '.join(bad)} is not a built in tool a step takes; use "
                          f"{', '.join(STEP_TOOLS)}, since shell rules come from the layer and servers from mcp")
