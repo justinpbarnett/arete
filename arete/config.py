@@ -157,12 +157,13 @@ class Config:
     dashboard_owner: str = ""
     loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
     queues: dict[str, int] = field(default_factory=dict)
-    pricing: dict[str, tuple[float, float]] = field(default_factory=dict)
+    pricing: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     local_providers: list[str] = field(default_factory=lambda: ["ollama"])
     daily_budget_usd: float | None = None
     session_idle_hours: float = 2
-    tiers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     tier_map: str = ""
+    routing_fallback: bool = True
     adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
@@ -280,15 +281,48 @@ def kind_tables(data, where: str) -> dict[str, dict[str, dict]]:
     return kinds
 
 
-def tier_maps(data, where: str) -> dict[str, dict[str, dict[str, str]]]:
-    maps: dict[str, dict[str, dict[str, str]]] = {}
+def tier_maps(data, where: str) -> dict[str, dict[str, tuple[dict[str, str], ...]]]:
+    from . import routing
+
+    maps: dict[str, dict[str, tuple[dict[str, str], ...]]] = {}
     for name, tiers in table_of(data, where).items():
         maps[name] = {}
-        for tier, entry in table_of(tiers, f"{where}.{name}").items():
-            if bad := sorted(set(table_of(entry, f"{where}.{name}.{tier}")) - set(TIER_KEYS)):
-                raise ValueError(f"[{where}.{name}] {tier}: unknown key {', '.join(bad)}; use {', '.join(TIER_KEYS)}")
-            maps[name][tier] = {k: str(v) for k, v in entry.items()}
+        for tier, found in table_of(tiers, f"{where}.{name}").items():
+            listed = isinstance(found, list)
+            if listed and not found:
+                raise ValueError(f"[{where}.{name}] {tier}: needs at least one table")
+            entries = []
+            for n, entry in enumerate(found if listed else [found], 1):
+                label = f"[{where}.{name}] {tier}" + (f" entry {n}" if listed else "")
+                if not isinstance(entry, dict):
+                    raise TypeError(f"{label}: must be a table, not {entry!r}")
+                if bad := sorted(set(entry) - set(TIER_KEYS)):
+                    raise ValueError(f"{label}: unknown key {', '.join(bad)}; use {', '.join(TIER_KEYS)}")
+                entry = {k: str(v) for k, v in entry.items()}
+                if problem := routing.entry_problem(entry):
+                    raise ValueError(f"{label}: {problem}")
+                entries.append(entry)
+            maps[name][tier] = tuple(entries)
     return maps
+
+
+def routing_fallback(data) -> bool:
+    table = table_of(data, "routing")
+    if bad := sorted(set(table) - {"fallback"}):
+        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback")
+    value = table.get("fallback", True)
+    if type(value) is not bool:
+        raise ValueError(f"[routing] fallback must be true or false, not {value!r}")
+    return value
+
+
+def price_rate(value, where: str) -> float:
+    from .routing import number
+
+    found = number(value)
+    if found is None:
+        raise ValueError(f"{where}: price must be a finite nonnegative number")
+    return found
 
 
 def replay_table(data) -> ReplayConfig:
@@ -362,8 +396,10 @@ def load(path: Path | None = None) -> Config:
     cfg.session_idle_hours = float(serve.get("session_idle_hours", cfg.session_idle_hours))
     pricing = data.get("pricing", {})
     cfg.local_providers = list(pricing.get("local_providers", cfg.local_providers))
-    cfg.pricing = {str(m): (float(r.get("input", 0)), float(r.get("output", 0)))
+    cfg.pricing = {str(m): tuple(price_rate(r[k], f"[pricing.models.{m}] {k}") if k in r else None
+                                for k in ("input", "output"))
                    for m, r in (pricing.get("models") or {}).items()}
+    cfg.routing_fallback = routing_fallback(data.get("routing", {}))
     j = data.get("jira", {})
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
@@ -517,7 +553,8 @@ class RepoLayer:
     timeout_minutes: int = 45
     verify: Verify | None = None
     research_dir: str = ""
-    tiers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
+    routing_fallback: bool = True
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
@@ -542,7 +579,7 @@ class RepoLayer:
 
 
 LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
-                  "factory", "environment"}
+                  "factory", "environment", "routing"}
 
 
 def section(data: dict, name: str) -> dict:
@@ -577,6 +614,7 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")
     layer.tiers = tier_maps(section(data, "tiers"), "tiers")
+    layer.routing_fallback = routing_fallback(section(data, "routing"))
     layer.steps = step_tables(section(data, "steps"), "steps")
     layer.kinds = kind_tables(section(data, "kinds"), "kinds")
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()

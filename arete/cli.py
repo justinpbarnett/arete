@@ -917,7 +917,7 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import runner, steps
+    from . import routing, runner, steps
 
     where = ""
     try:
@@ -931,6 +931,7 @@ def cmd_steps(args) -> int:
     except (ValueError, TypeError) as e:
         print(f"{where}{e}", file=sys.stderr)
         return 1
+    found = None if cfg.replay.all else routing.Discovery(cfg, repo)
     for s in sheet:
         notes = list(s.notes)
         if s.runner == "pi" and not cfg.replay.all:
@@ -941,7 +942,9 @@ def cmd_steps(args) -> int:
                 notes.append(selected.error)
             elif selected.provider == "anthropic" and selected.key_available:
                 notes.append("pi anthropic: paid api_key route (Anthropic Console key)")
-        print(json.dumps({**dataclasses.asdict(s), "notes": notes}))
+        remaining = routing.loop_budget_left(cfg) if s.step in ("loop", "classify") else None
+        routes = routing.described(found.routes(s, remaining)) if found else []
+        print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes}))
     return 0
 
 

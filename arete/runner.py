@@ -270,7 +270,7 @@ def priced(res: Result, cfg: config.Config) -> float:
         return res.cost_usd
     rate = cfg.pricing.get(res.model) or cfg.pricing.get(f"{res.runner}:{res.model}")
     if rate:
-        return (res.tokens_in * rate[0] + res.tokens_out * rate[1]) / 1_000_000
+        return (res.tokens_in * (rate[0] or 0) + res.tokens_out * (rate[1] or 0)) / 1_000_000
     if res.runner == "pi" and (res.provider or provider_of(res.model)) in cfg.local_providers:
         return 0.0
     return res.cost_usd

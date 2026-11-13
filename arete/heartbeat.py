@@ -101,7 +101,8 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
     if cfg.replay.all:
         return []
     configured = accounts.mapping(pi.model_configuration().get("providers"))
-    names = set(configured) | set(accounts.read(pi.owner_dir() / "auth.json")) | set(cfg.environment.providers)
+    stored = accounts.read(pi.owner_dir() / "auth.json")
+    names = set(configured) | set(stored) | set(cfg.environment.providers)
     names |= {p for p in pi.KEY_NAMES if os.environ.get(pi.KEY_NAMES[p])}
     keys = util.read_env_file(pi.KEYS_FILE)
     names |= {p for p, n in pi.KEY_NAMES.items() if keys.get(n)}
@@ -146,8 +147,12 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
         key = f"pi:{provider}:auth" + (f":{repo.name}" if repo else "")
         if devices.resolve(device).remote:
             key += f":{devices.resolve(device).name}"
-        check = Check(key, not selected.error or optional_anthropic, f"{provider}: {detail}")
-        if key not in out or out[key].ok:
+        missing = (f"pi {provider}: no usable login or supported key; checked {selected.owner}, "
+                   f"{pi.KEYS_FILE} and Arete environment")
+        optional_missing = not required and selected.error == missing
+        check = Check(key, not selected.error or optional_anthropic, f"{provider}: {detail}",
+                      "warn" if optional_missing else "fail")
+        if key not in out or out[key].ok or out[key].severity == "warn" and check.severity == "fail":
             out[key] = check
     return list(out.values())
 
@@ -289,7 +294,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
 
     actions = []
     for c in checks:
-        if c.ok:
+        if c.ok or c.severity == "warn":
             msg = alerts.clear_alert(cfg.alert_repo, c.key, dry_run)
         elif c.severity == "fail":
             msg = alerts.raise_alert(cfg.alert_repo, c.key, f"{c.key} failing", c.detail, dry_run)
