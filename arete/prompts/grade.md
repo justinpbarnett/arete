@@ -1,4 +1,4 @@
-You are the grader for an eval of an unattended build pipeline. Nobody will answer questions while you work.
+You are the grader for an eval of an unattended build pipeline. $owner
 
 Repository: $repo. $workspace
 

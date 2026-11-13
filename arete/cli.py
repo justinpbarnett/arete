@@ -305,6 +305,12 @@ def cmd_codex_guard(args) -> int:
     return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
 
 
+def cmd_mcp_ask(args) -> int:
+    from . import asks
+
+    return asks.check(sys.stdin, sys.stdout) if args.check else asks.serve(sys.stdin, sys.stdout)
+
+
 def cmd_background(args) -> int:
     from . import background
 
@@ -1189,6 +1195,11 @@ def main(argv: list[str] | None = None) -> int:
                                            "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
     p.set_defaults(fn=cmd_codex_guard)
+
+    p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "
+                                       "validates one call read from stdin")
+    p.add_argument("--check", action="store_true")
+    p.set_defaults(fn=cmd_mcp_ask)
 
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "

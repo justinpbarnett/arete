@@ -27,6 +27,7 @@ PAYMENT_MODES = ("subscription", "api_key", "local")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
+ASK_KEYS = ("max_per_run", "settle")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -115,6 +116,12 @@ class ReplayConfig:
 
 
 @dataclass
+class AskConfig:
+    max_per_run: int = 3
+    settle: bool = True
+
+
+@dataclass
 class Environment:
     passes: tuple[str, ...] = ()
     providers: dict[str, tuple[str, ...]] = field(default_factory=dict)
@@ -171,6 +178,7 @@ class Config:
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
     research_planner: bool = False
+    ask: AskConfig = field(default_factory=AskConfig)
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -347,6 +355,18 @@ def replay_table(data) -> ReplayConfig:
     return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
 
 
+def ask_table(data) -> AskConfig:
+    table = table_of(data, "ask")
+    if bad := sorted(set(table) - set(ASK_KEYS)):
+        raise ValueError(f"[ask]: unknown key {', '.join(bad)}; use {', '.join(ASK_KEYS)}")
+    limit, settle = table.get("max_per_run", 3), table.get("settle", True)
+    if type(limit) is not int or limit < 0:
+        raise ValueError(f"[ask] max_per_run must be a whole number of at least 0, not {limit!r}")
+    if type(settle) is not bool:
+        raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
+    return AskConfig(max_per_run=limit, settle=settle)
+
+
 def research_table(data) -> bool:
     table = table_of(data, "research")
     if bad := sorted(set(table) - {"planner"}):
@@ -503,6 +523,7 @@ def load(path: Path | None = None) -> Config:
     cfg.replay = replay_table(data.get("replay") or {})
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.research_planner = research_table(data.get("research") or {})
+    cfg.ask = ask_table(data.get("ask") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     from . import steps
     steps.check(cfg, defer_tiers=True)

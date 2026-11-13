@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from . import config, paths, record, state, util
+from . import asks, config, paths, record, state, util
 from .agent import NO_SESSION, Result, Session
 
 ENV = "ARETE_REPLAY_DIR"
@@ -84,6 +84,15 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
         return failed(f"replay: {answer_file} has a bad value: {e}")
     if not res.ok and not res.error:
         res.error = f"replay: {answer_file} says ok is false"
+    calls = answer.get("tool_calls") or []
+    if not isinstance(calls, list) or not all(isinstance(c, dict) and isinstance(c.get("name"), str) for c in calls):
+        return failed(f"replay: {answer_file} has a bad value: tool_calls is not a list of objects with a name")
+    for call in calls:
+        at = uuid.uuid4().hex
+        on_line(json.dumps({"type": "tool_call", "id": at, "name": call["name"], "input": call.get("input")}))
+        if asks.is_ask(call["name"]):
+            text, error = asks.reply(call.get("input"))
+            on_line(json.dumps({"type": "tool_result", "id": at, "name": call["name"], "text": text, "error": error}))
     time.sleep(seconds)
     if patched and (applied := util.sh(["git", "apply", str(patch_file)], cwd=cwd)).returncode != 0:
         return failed(f"replay: {patch_file} does not apply: {util.first_line(applied.stderr or applied.stdout)}")

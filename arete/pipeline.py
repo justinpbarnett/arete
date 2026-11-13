@@ -23,6 +23,7 @@ from string import Template
 from typing import TextIO
 
 from . import (
+    asks,
     ci,
     config,
     control,
@@ -191,6 +192,7 @@ REJECTED_PR_LISTEN = timedelta(days=7)
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
     text = (prompts_dir / f"{name}.md").read_text()
+    values.setdefault("owner", asks.NOBODY)
     return Template(text).safe_substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
 
 
@@ -242,6 +244,10 @@ class AgentRun:
     @property
     def ref(self) -> str:
         return ""
+
+    @property
+    def owner_note(self) -> str:
+        return asks.NOBODY
 
     @property
     def where(self) -> str:
@@ -356,10 +362,51 @@ class Run(AgentRun):
     facts: dict = field(default_factory=dict)
     repairs: str = ""
     workspace: tuple[Path, list[Checkout]] | None = None
+    asks_made: int = 0
 
     @property
     def ref(self) -> str:
         return self.tracker.ref(self.tid)
+
+    @property
+    def asks_owner(self) -> bool:
+        return factory.inside(self.id) is not None
+
+    @property
+    def owner_note(self) -> str:
+        return asks.GUIDE if self.asks_owner else asks.NOBODY
+
+    def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
+        if not self.asks_owner:
+            return super().agent(step, text, cwd, role, **kw)
+        res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
+        while res.record and (ask := asks.found(record.events(paths.record_dir(self.id) / res.record))):
+            self.owner_ask(step, ask, res.session)
+            res = super().agent(step, asks.settled_message(ask), cwd, role, ask_owner=True,
+                                **{**kw, "resume": res.session, "resume_only": True})
+        return res
+
+    def owner_ask(self, step: str, ask: dict, session: Session) -> None:
+        self.asks_made += 1
+        ask_id, limit = f"{self.id}-a{self.asks_made}", self.config.ask.max_per_run
+        seam = factory.inside(self.id).step
+        if self.asks_made > limit:
+            raise asks.Asked(ask, ask_id, seam, step, session, limit=limit)
+        if (self.config.ask.settle and asks.settles(ask) and session.id and jev.ready(self.config, [self.repo])
+                and self.settled_by_jev(step, ask)):
+            return
+        raise asks.Asked(ask, ask_id, seam, step, session)
+
+    def settled_by_jev(self, step: str, ask: dict) -> bool:
+        state_text = f"Step: {step}\nThe ask, with every question, option and description:\n{json.dumps(ask, indent=1)}"
+        reply = jev.ask(state_text, {"settle": jev.yes_no(asks.SETTLE)}, self.config, trace=(self.id, f"{step} ask jev"))
+        answer = reply.answers.get("settle")
+        if not answer or answer.yes < asks.SETTLE_AT:
+            return False
+        self.log(f"{step}: took the recommended options without asking the owner ({answer.note()})")
+        lines.write(self.id, "ask_settled", ask_id=f"{self.id}-a{self.asks_made}", step=factory.inside(self.id).step,
+                    call=step, choices=asks.choices(ask), p=round(answer.yes, 3))
+        return True
 
     @property
     def where(self) -> str:
@@ -1193,7 +1240,8 @@ def report_fields(row: dict, facts: dict) -> dict:
     asked = next((line for line in reversed(read) if line.get("event") == "question"), {})
     return {"task": str(row.get("issue") or ""), "status": row.get("status") or "",
             "prs": (row.get("pr_url") or "").split(), "summary": row.get("summary") or "",
-            "requirements": facts.get("requirements") or [], "assumptions": facts.get("assumptions") or [],
+            "requirements": facts.get("requirements") or [],
+            "assumptions": [*(facts.get("assumptions") or []), *asks.assumed(factory.chain(row["id"]))],
             "left_for_a_person": facts.get("left_for_a_person") or "", "held": facts.get("held") or "",
             "review": facts.get("review") or report_review({}), "question": str(asked.get("summary") or ""),
             "steps": factory.tally(row["id"]), "minutes": run_minutes(row),
@@ -1245,8 +1293,9 @@ def run_minutes(row: dict) -> float:
     return round((util.parse_iso(row["finished"]) - util.parse_iso(row["started"])).total_seconds() / 60, 1)
 
 
-def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str) -> tuple[str, str, str]:
-    lines.write(run.id, "question", question=comment, summary=summary[:300])
+def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str,
+         ask: dict | None = None) -> tuple[str, str, str]:
+    lines.write(run.id, "question", question=comment, summary=summary[:300], **(ask or {}))
     run.say(comment)
     run.enter("needs-info")
     remove_workspace(ws, checkouts)
@@ -1566,6 +1615,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
         f"## Summary\n\n{summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
         + left_block(left)
+        + assumed_block(run)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
         + "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems)
@@ -1655,6 +1705,13 @@ def left_section(run: Run, text: str) -> str:
         return text
     return (f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
             f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
+
+
+def assumed_block(run: Run) -> str:
+    taken = asks.assumed(factory.chain(run.id))
+    if not taken:
+        return ""
+    return "## Assumed\n\nArete took these recommended options without asking:\n" + "".join(f"- {c}\n" for c in taken) + "\n"
 
 
 def left_block(left: str) -> str:
@@ -1917,7 +1974,8 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
                       conflicts="\n".join(f"- `{p}`" for p in conflicts),
                       branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
                       base_log=git(["log", "--oneline", "-n30", "HEAD..MERGE_HEAD"], c.wt),
-                      commands=code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback)
+                      commands=code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
+                      owner=run.owner_note)
         try:
             res = run.agent(round_name("resolve", n), text, c.wt, role="build",
                             allowed_tools=bash_rules(layer.builder_bash), disallowed_tools=runner.NO_GIT_WRITES,
@@ -2183,7 +2241,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
             res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
-                                         commands=code_list(bash), checks=check_list(b.layer), **values),
+                                         commands=code_list(bash), checks=check_list(b.layer),
+                                         owner=run.owner_note, **values),
                             b.ws, role="verify",
                             allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,

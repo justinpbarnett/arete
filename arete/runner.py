@@ -15,6 +15,7 @@ from pathlib import Path
 from . import (
     accounts,
     ask,
+    asks,
     claude,
     codex,
     config,
@@ -315,7 +316,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
                  "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
                  "position": chosen_route.position, "requested": chosen_route.requested,
-                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env")), "skipped": skipped, "launch": launches}
+                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env"), launch_kw.get("ask_owner", False)), "skipped": skipped, "launch": launches}
         on_launch(route)
         started = util.iso()
         res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
@@ -538,6 +539,14 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     which = picked.candidate.runner
     kw["effort"] = picked.candidate.effort
     kw["instructions"] = list(picked.candidate.instructions)
+    asking = bool(kw.pop("ask_owner", False)) and not target.remote
+    if asking:
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.NOTE]))
+    if asking and which in ("claude", "codex"):
+        kw["mcp_config"] = asks.with_server(kw.get("mcp_config") or "")
+        kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), asks.RULE]
+    elif asking and which == "pi":
+        kw["ask_owner"] = True
     if target.remote:
         kw["remote"] = target
     else:
@@ -560,9 +569,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
 
 
 def launch_env(picked: Picked, cfg: config.Config, repo: config.Repo | None, run_id: str,
-               extra: dict | None = None) -> list[str]:
+               extra: dict | None = None, asking: bool = False) -> list[str]:
     if picked.selected:
-        return sorted({*pi.launch_env_names(picked.selected), *(extra or {})})
+        return sorted({*pi.launch_env_names(picked.selected), *(extra or {}), *(["ARETE_ASK_TOOL"] if asking else [])})
     passing = environment.passed(cfg, repo)
     return sorted((codex if picked.candidate.runner == "codex" else claude).agent_env(
         passing, {**(extra or {}), **run_env(run_id)}))
@@ -608,7 +617,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         hidden.extend(selected.hidden)
         hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
                            key=len, reverse=True)
-        header["env"] = sorted({*pi.launch_env_names(selected), *(kw.get("extra_env") or {})})
+        header["env"] = sorted({*pi.launch_env_names(selected), *(kw.get("extra_env") or {}),
+                                *(["ARETE_ASK_TOOL"] if kw.get("ask_owner") else [])})
         header["provider"] = selected.provider
     def refresh_hidden():
         if selected and selected.using_login:

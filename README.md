@@ -417,6 +417,8 @@ The run log, the `<step>.json` files, the tables and the records stay as they we
 - `again=<step>` with `continues` takes no stored outcome for the last call of that step, so that call and every step after it run again; earlier calls of the step, such as the first `implement` before a fix round, are still taken.
 - `flow.respond(status, **fields)` writes the `report` line.
 
+Every agent step of an adw run has the `ask_owner` tool (claude and codex through the stdio MCP server `arete mcp-ask`, merged into the step's `mcp_config`; pi through the extension `arete/pi_ask.mjs`). A call holds 1 to 4 questions of kind `choice`, `text`, `secret` or `done`, plus `why` and `tried`; `arete/asks.py` validates it and the tool replies at once, never blocking. After the call, `pipeline.Run.agent` reads the ask from the call's record and ends the step with the `ask` result, its session on the `step_end` line, and a `question` line with `ask_id`, `step`, `questions` and `summary`. The run ends `needs-info`, the tracker comment lists the questions, and a reply starts a new run. When `[ask] settle` is on and every question is a `choice` with a recommended option, JEV is asked whether the run can take the recommendations without its owner; at 0.9 or more the step's session resumes in the same run, an `ask_settled` line is written, and the choices appear as assumptions in the report and the PR. The plan step's ambiguity is an ask with one `text` question on this path.
+
 ### The adw flow
 
 `[factory] path` in a layer is `classic` (the default) or `adw`; any other value fails the layer's load. The switch works on every repo. A repo with a `github` name gets its PRs, CI watch, ticket comment and merge as a classic run does. A repo with no `github` name needs a git remote `origin`, or `arete run` refuses it as before, and gets a pushed branch.
@@ -513,6 +515,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. See [Triage](#triage). |
+| `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. See [The seam](#the-seam). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
@@ -830,6 +833,7 @@ dir = "~/replay/answers"
 | `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `first_context_tokens`, `cache_read`, `cache_write`, `api_seconds` | What the call reports. Default 0. |
 | `session` | The session id the call reports when it resumes none. Default a new random id; a call that resumes a session reports that one. |
 | `seconds` | How long the call sleeps before it answers. Default 0. |
+| `tool_calls` | A list of `{"name", "input"}` the call records as tool calls before it answers; a call named `ask_owner` also records the tool's reply, so a replay step can ask. |
 
 When `<dir>/<step>.patch` exists, arete applies it to the call's folder with `git apply` before it answers, even when the answer fails; this is how a replayed build changes files. No answer folder, a missing file, a file that is not one JSON object, a bad value and a patch that does not apply each fail the step with an error that names the folder setting or the file.
 
