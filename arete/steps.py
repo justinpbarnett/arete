@@ -10,7 +10,7 @@ EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS, "codex": codex.EF
            runner.REPLAY: tuple(dict.fromkeys([*claude.EFFORTS, *pi.THINKING_LEVELS, *codex.EFFORTS]))}
 CODEX_INSTRUCTIONS = ("repo",)
 DEFAULTS = {"tools": tuple(runner.READ_TOOLS), "mcp": (), "session": "fresh"}
-BUILT_IN = {"build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
+BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
             "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
             "research_plan": {"timeout_minutes": 10, "tries": 2},
             "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()}}
@@ -236,7 +236,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     requires = routing.Requirements(
         modalities=tuple(found.get("modalities", ())), min_context=found.get("min_context", 0),
         structured_output=found.get("structured_output", False), data_handling=tuple(found.get("data_handling", ())),
-        floor=floor, approved=floors.get(floor, ()))
+        floor=floor, approved=floors.get(floor, ()), directory_cleanup=found.get("directory_cleanup", False))
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
                     mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,

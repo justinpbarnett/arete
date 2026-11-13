@@ -1,5 +1,5 @@
 You are the builder in an unattended build pipeline. Arete's own final review of the open PR for this issue still
-requested changes. Nobody will answer questions while you work.
+requested changes. $owner
 
 Repository: $repo. $workspace
 
