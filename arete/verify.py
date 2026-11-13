@@ -86,7 +86,7 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
     failed = next((check for check in checks if not check["passed"]), None)
     return Verified("blocked" if failed else "pass", "Verification prerequisites are unavailable." if failed else
                     "Configured verification prerequisites passed.", checks,
-                    blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "")
+                    blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
 
 
 @contextmanager

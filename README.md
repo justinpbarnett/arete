@@ -910,6 +910,21 @@ A replayed call is recorded like any other: its step row, its record header and 
 
 ## Verify in use
 
+Run Arete's durable behavioral checks with `uv run python -m unittest discover -s tests -v`. They exercise complete offline workflows against a local tracker and a local bare Git origin, including rejected checks, blocked verification and rejected reviews. Writer regressions preserve warning and prerequisite bodies, complete commands and code indentation, and keep synthetic private voice text out of captured GitHub publication. Add the same command under `[checks]` in Arete's layer so these cases run before model verification on every candidate branch.
+
+Configure cheap environment prerequisites under `[verify.preflight]`:
+
+```toml
+[verify]
+preflight_seconds = 30
+
+[verify.preflight]
+python = "python3 -c 'import sqlite3, tempfile'"
+git = "git --version"
+```
+
+These named probes run in the worktree with the layer's command environment before the app or verifier starts. They share one time budget, default 30 seconds and maximum 300. The first failure or timeout records the command, exit and output in `<step>-preflight.json` and `<step>-preflight.md`, then marks verification blocked without a model call or implementation repair. Successful prerequisite evidence stays in the run directory; the verifier still checks the product's behavior. Use `[checks]` for product assertions and `[verify.preflight]` for requirements such as an available runtime or fixture transport. Existing tool permissions, guards and route capability rules remain authoritative.
+
 Checks passing is not the bar. After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw. Reading the code and running the test suite do not count as checks. The builder does not add tests unless the repo's own rules ask for them.
 
 - Pass: the verification report goes in the PR body. By default, screenshots are pushed to the orphan branch `arete/evidence` and linked from the body. Set the repo layer’s `[verify] publish_evidence = false` to retain screenshots locally without uploading them; both classic and ADW runs still deliver the PR and its text report.
