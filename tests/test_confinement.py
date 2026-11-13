@@ -130,6 +130,42 @@ class ProfileTests(unittest.TestCase):
                 self.assertTrue(done.returncode == 0 or "sandbox_apply" in done.stderr, done.stderr)
 
 
+@unittest.skipUnless(paths.SEARCH_ONLY and os.getuid() != 0, "search-only folders cannot be checked here")
+class WalkTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.closed = self.root / "worktrees"
+        self.scratch_root = self.closed / "ws" / ".arete-scratch-0123456789abcdef"
+        for name in ("config", "state"):
+            (self.scratch_root / name).mkdir(parents=True)
+        self.scratch_root.chmod(0o700)
+        self.closed.chmod(0o100)
+        self.addCleanup(self.closed.chmod, 0o700)
+
+    def test_the_walk_passes_a_folder_it_may_search_but_not_list(self):
+        with self.assertRaises(PermissionError):
+            os.listdir(self.closed)
+        with paths.directory_fd(self.scratch_root) as fd:
+            self.assertEqual(sorted(os.listdir(fd)), ["config", "state"])
+        (self.root / "link").symlink_to(self.closed)
+        with self.assertRaises(OSError):
+            with paths.directory_fd(self.root / "link" / "ws"):
+                pass
+
+    def test_isolated_state_opens_below_a_folder_it_cannot_list(self):
+        state = self.scratch_root / "state"
+        env = {**os.environ, "ARETE_CONFIG_DIR": str(self.scratch_root / "config"), "ARETE_STATE_DIR": str(state),
+               "ARETE_LOG_DIR": str(state / "logs"), "ARETE_WORKTREES_DIR": str(state / "worktrees"),
+               scratch.ENV_NAME: str(self.scratch_root)}
+        boot = f"import sys; sys.path.insert(0, {str(SOURCE)!r}); from arete import state; state.ensure_schema()"
+        done = subprocess.run([sys.executable, "-I", "-c", boot], env=env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertTrue((state / "arete.db").exists())
+        self.assertTrue((state / "worktrees").is_dir())
+
+
 @unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK),
                      "sandbox-exec is unavailable on this platform")
 class EscapeTests(unittest.TestCase):
@@ -365,6 +401,19 @@ class EscapeTests(unittest.TestCase):
             except OSError:
                 time.sleep(.5)
         self.assertEqual(statuses, {"/": 200, "/api/health": 200}, log.read_text()[-2000:])
+
+    def test_peer_folders_stay_closed_inside_the_service_profile(self):
+        peer = self.root / "worktrees" / "peer"
+        peer.mkdir()
+        (peer / "f").write_text("peer-data")
+        service = self.profiles()["service"]
+        for name, command in (("list", ["/bin/ls", str(peer.parent)]), ("read", ["/bin/cat", str(peer / "f")])):
+            with self.subTest(name):
+                outside = subprocess.run(command, cwd=self.ws, capture_output=True, text=True)
+                self.assertIn("peer", outside.stdout)
+                inside = subprocess.run(service(command), cwd=self.ws, capture_output=True, text=True)
+                self.assertNotEqual(inside.returncode, 0)
+                self.assertNotIn("peer", inside.stdout)
 
 
 if __name__ == "__main__":
