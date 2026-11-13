@@ -110,6 +110,7 @@ Expected events are counted and open no incident.
 **Incidents.** The `incidents` table holds the fingerprint, class, source, state, first and last occurrence, count and evidence.
 A repeat of an open incident's fingerprint, minutes or hours later, updates it instead of opening another.
 A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
+The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines from files under the same set as its own file.
 The append-only `incident_notes` table records what happened and when.
 Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
 

@@ -1138,6 +1138,61 @@ class Decisions(Scratch):
             self.assertEqual(decision, "unsure")
             self.assertIn("owner decides", reason)
 
+    def test_an_exact_repeat_from_a_file_under_another_policy_opens_its_own_incident(self):
+        app = Path(self.tmp.name) / "app"
+        app.mkdir()
+        worker, mailer = app / "worker.log", app / "mailer.log"
+        for log in (worker, mailer):
+            log.write_text("2026-11-13T10:00:00Z INFO started\n")
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{mailer}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.append("2026-11-13T10:06:00Z INFO worker context", line, to=worker)
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        self.calls()
+        self.append("2026-11-13T10:06:00Z INFO mailer context", line, to=mailer)
+        self.assertEqual(self.scanned()["decisions"], {"unsure": 2})
+        self.assertEqual(self.ids(), [[FOUR, FOUR]])
+        rows = self.sql("SELECT source, decision, count, evidence FROM incidents ORDER BY id")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0][:3], (str(worker), "wake", 1))
+        self.assertIn("worker context", rows[0][3])
+        self.assertNotIn("mailer", rows[0][3])
+        self.assertEqual([r[:3] for r in rows[1:]], [(str(mailer), "unsure", 1)] * 2)
+        self.append(line, to=worker)
+        self.scanned()
+        self.assertEqual(self.calls(), [])
+        self.assertEqual([r[0] for r in self.sql("SELECT count FROM incidents ORDER BY id")], [2, 1, 1])
+        self.append(line, to=worker)
+        self.append(line, to=mailer)
+        self.scanned()
+        self.assertEqual(self.calls(), [])
+        self.assertEqual([r[0] for r in self.sql("SELECT count FROM incidents ORDER BY id")], [3, 2, 2])
+
+    def test_an_open_incident_whose_file_changed_policy_never_takes_a_repeat_from_another_policy(self):
+        app = Path(self.tmp.name) / "app"
+        app.mkdir()
+        worker, mailer = app / "worker.log", app / "mailer.log"
+        for log in (worker, mailer):
+            log.write_text("2026-11-13T10:00:00Z INFO started\n")
+        broad = DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+        self.write_config(broad)
+        self.scanned()
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.append(line, to=mailer)
+        self.scanned()
+        self.write_config(broad + f'[[oncall.source]]\npath = "{mailer}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        self.calls()
+        self.append(line, to=worker)
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        self.assertEqual(self.ids(), [[FOUR]])
+        self.append(line, to=worker)
+        self.scanned()
+        rows = self.sql("SELECT source, count FROM incidents ORDER BY id")
+        self.assertEqual(rows, [(str(mailer), 1), (str(worker), 2)])
+
 
 if __name__ == "__main__":
     unittest.main()

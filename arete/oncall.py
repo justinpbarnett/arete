@@ -60,6 +60,7 @@ REPAIR_STEPS = ("check_repair", "review_repair", "ci_repair")
 @dataclass(frozen=True)
 class Origin:
     scope: str
+    home: frozenset[tuple[str, str]]
     repo: str = ""
     pattern: re.Pattern = FAILURE
     folder: bool = False
@@ -330,17 +331,29 @@ def thresholds(cfg: config.Config) -> tuple[float, float]:
 
 
 def owner_text(cfg: config.Config, incident: dict) -> tuple[str, str]:
-    vision, scope = cfg.oncall.vision, cfg.oncall.scope
     for s in cfg.oncall.sources:
         if fnmatch.fnmatchcase(incident["source"], str(paths.expand(s.path))):
-            return s.vision or vision, s.scope or scope
-    return vision, scope
+            return entry_policy(cfg, s)
+    return entry_policy(cfg)
+
+
+def entry_policy(cfg: config.Config, entry: config.OncallSource | None = None) -> tuple[str, str]:
+    if entry is None:
+        return cfg.oncall.vision, cfg.oncall.scope
+    return entry.vision or cfg.oncall.vision, entry.scope or cfg.oncall.scope
 
 
 def policies(cfg: config.Config, source: str) -> frozenset[tuple[str, str]]:
-    found = {(s.vision or cfg.oncall.vision, s.scope or cfg.oncall.scope) for s in cfg.oncall.sources
-             if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))}
-    return frozenset(found or {(cfg.oncall.vision, cfg.oncall.scope)})
+    found = {entry_policy(cfg, s) for s in cfg.oncall.sources if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))}
+    return frozenset(found or {entry_policy(cfg)})
+
+
+def bounded(scope: str, rule: frozenset[tuple[str, str]]) -> str:
+    return f"{scope}\n{json.dumps(sorted(rule))}"
+
+
+def fingerprint_of(kind: str, scope: str, signature: str) -> str:
+    return hashlib.sha1(f"{kind}\n{scope}\n{signature}".encode()).hexdigest()[:16]
 
 
 def questions(cfg: config.Config, incident: dict) -> dict[str, dict]:
@@ -499,8 +512,8 @@ def decision_line(row: dict) -> str:
     return f"{row['decision']} {row['confidence']:.2f}{mark}: {row['reason']}"
 
 
-def known_twins(cfg: config.Config, rows: list[tuple], budget: int = MAX_ASKS) -> tuple[list, dict, int]:
-    known = state.known_fingerprints()
+def known_twins(cfg: config.Config, rows: list[tuple], known: dict[str, str],
+                budget: int = MAX_ASKS) -> tuple[list, dict, int]:
     open_rows = [r for r in state.open_incidents() if not r["injection"]]
     line, injection_line = thresholds(cfg)
     fresh, candidates = [], []
@@ -559,6 +572,8 @@ class Watch:
 
     def consider(self, name: str, rows: list[str], origin: Origin) -> None:
         self.lines += len(rows)
+        rule = policies(self.cfg, name)
+        policy_scope = origin.scope if rule == origin.home else bounded(origin.scope, rule)
         i = 0
         while i < len(rows):
             line, begin, row = rows[i], i, run_line(rows[i])
@@ -580,11 +595,11 @@ class Watch:
                 continue
             near = rows[max(0, begin - CONTEXT_LINES):last + CONTEXT_LINES + 1]
             window = [r for r in near if same_owner(r, row)]
-            repo, scope = origin.repo, origin.scope
+            repo, scope = origin.repo, policy_scope
             if row and not repo:
                 repo = (state.run_get(str(row["run"])) or {}).get("repo") or ""
                 if repo:
-                    scope = f"{origin.scope}:{repo}"
+                    scope = f"{policy_scope}:{repo}"
             self.add(classify(text, row), scope, text, name, repo, window)
 
     def follow(self, group: str, watched: list[str], origin: Origin) -> None:
@@ -655,15 +670,19 @@ class Watch:
     def store(self) -> tuple[int, int, int]:
         events = [e for e in self.found.values() if e.kind != EXPECTED]
         hidden = record.secrets() if events else ()
+        held = state.known_fingerprints() if events else {}
         rows = []
         for e in events:
             signature = outbound.redact(sources.signature(record.scrub(e.signature, hidden)))
             if e.kind == ORCHESTRATION:
                 signature = signature.removeprefix("<time> ")
             evidence = outbound.redact(record.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
-            fingerprint = hashlib.sha1(f"{e.kind}\n{e.scope}\n{signature}".encode()).hexdigest()[:16]
+            fingerprint = fingerprint_of(e.kind, e.scope, signature)
+            rule = policies(self.cfg, e.source)
+            if fingerprint in held and policies(self.cfg, held[fingerprint]) != rule:
+                fingerprint = fingerprint_of(e.kind, bounded(e.scope, rule), signature)
             rows.append((fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence))
-        matched, marks, self.asks = known_twins(self.cfg, rows)
+        matched, marks, self.asks = known_twins(self.cfg, rows, held)
         opened = sum(state.commit_scan(rows, self.cursors, matched, marks))
         return opened, len(events) - opened, len(self.found) - len(events)
 
@@ -681,12 +700,15 @@ def scan_once(cfg: config.Config) -> dict:
     _, previous = cursor_value(SCAN)
     started = util.iso()
     watch = Watch(cfg)
-    watch.follow("logs", [str(p) for p in sorted(paths.LOG_DIR.glob("*.log"))], Origin("arete", folder=True))
-    watch.follow("runs", watch.run_files((previous or {}).get("since")), Origin("arete"))
+    everywhere = frozenset({entry_policy(cfg)})
+    logs = [str(p) for p in sorted(paths.LOG_DIR.glob("*.log"))]
+    watch.follow("logs", logs, Origin("arete", everywhere, folder=True))
+    watch.follow("runs", watch.run_files((previous or {}).get("since")), Origin("arete", everywhere))
     for source in cfg.oncall.sources:
         files = sorted(glob.glob(str(paths.expand(source.path))))
         pattern = re.compile(source.pattern or sources.LOG_PATTERN)
-        watch.follow(f"path:{source.path}", files, Origin(source.path, source.repo, pattern))
+        own = frozenset({entry_policy(cfg, source)})
+        watch.follow(f"path:{source.path}", files, Origin(source.path, own, source.repo, pattern))
     watch.heartbeat()
     watch.serve()
     watch.stalls()

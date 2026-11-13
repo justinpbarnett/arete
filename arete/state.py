@@ -831,11 +831,12 @@ def incidents_to_decide() -> list[dict]:
             "AND decision IN ('', 'ignore') ORDER BY id")]
 
 
-def known_fingerprints() -> set[str]:
+def known_fingerprints() -> dict[str, str]:
     with db() as c:
-        return {r[0] for r in c.execute(
-            "SELECT fingerprint FROM incidents WHERE state = 'open' UNION SELECT a.fingerprint FROM incident_aliases a "
-            "JOIN incidents i ON i.id = a.incident WHERE i.state = 'open'")}
+        held = {r[0]: r[1] for r in c.execute("SELECT a.fingerprint, i.source FROM incident_aliases a JOIN incidents i "
+                                              "ON i.id = a.incident WHERE i.state = 'open'")}
+        held.update((r[0], r[1]) for r in c.execute("SELECT fingerprint, source FROM incidents WHERE state = 'open'"))
+        return held
 
 
 def update_incident(incident_id: int, note: str = "", **fields) -> None:
