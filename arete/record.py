@@ -23,7 +23,7 @@ from . import lines as run_lines
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
 STOPPED = "stopped by request"
-ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva"}
+ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva", "experiment": "exp"}
 FAILS_WHEN_DEAD = ("miner", "eval")
 TICKET_KINDS = ("pipeline",)
 RECORD_SUFFIX = ".jsonl.gz"

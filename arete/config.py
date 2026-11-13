@@ -152,6 +152,20 @@ class Probe:
     timeout: int = 180
 
 
+@dataclass(frozen=True)
+class OncallSource:
+    path: str
+    pattern: str = ""
+    repo: str = ""
+    check: str = ""
+
+
+@dataclass(frozen=True)
+class OncallConfig:
+    enabled: bool = False
+    sources: tuple[OncallSource, ...] = ()
+
+
 @dataclass
 class Config:
     alert_repo: str = ""
@@ -190,6 +204,7 @@ class Config:
     research_planner: bool = False
     ask: AskConfig = field(default_factory=AskConfig)
     document: dict = field(default_factory=dict)
+    oncall: OncallConfig = field(default_factory=OncallConfig)
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -428,6 +443,39 @@ def research_table(data) -> bool:
     return planner
 
 
+def oncall_source(entry, repos: list[Repo]) -> OncallSource:
+    table = table_of(entry, "oncall.source")
+    keys = ("path", "pattern", "repo", "check")
+    if bad := sorted(set(table) - set(keys)):
+        raise ValueError(f"[[oncall.source]]: unknown key {', '.join(bad)}; use {', '.join(keys)}")
+    for key in keys:
+        if not isinstance(table.get(key, ""), str):
+            raise TypeError(f"[[oncall.source]] {key} must be a string, not {table[key]!r}")
+    if not table.get("path", "").strip():
+        raise ValueError("[[oncall.source]] needs a path")
+    if table.get("pattern"):
+        try:
+            re.compile(table["pattern"])
+        except re.error as e:
+            raise ValueError(f"[[oncall.source]] pattern {table['pattern']!r} is not a regex: {e}") from e
+    if table.get("repo") and table["repo"] not in {r.name for r in repos}:
+        raise ValueError(f"[[oncall.source]] repo {table['repo']!r} is not a [[repo]] in the config")
+    return OncallSource(**{key: table.get(key, "") for key in keys})
+
+
+def oncall_table(data, repos: list[Repo]) -> OncallConfig:
+    table = table_of(data, "oncall")
+    if bad := sorted(set(table) - {"enabled", "source"}):
+        raise ValueError(f"[oncall]: unknown key {', '.join(bad)}; use enabled, source")
+    enabled = table.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError(f"[oncall] enabled must be true or false, not {enabled!r}")
+    entries = table.get("source", [])
+    if not isinstance(entries, list):
+        raise TypeError(f"[oncall] source must be a list of [[oncall.source]] tables, not {entries!r}")
+    return OncallConfig(enabled, tuple(oncall_source(entry, repos) for entry in entries))
+
+
 def variable_names(value, where: str) -> tuple[str, ...]:
     if not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
         raise ValueError(f"{where}: must be a list of variable names, not {value!r}")
@@ -632,6 +680,7 @@ def load(path: Path | None = None) -> Config:
                 timeout=int(p.get("timeout", 180)),
             )
         )
+    cfg.oncall = oncall_table(data.get("oncall") or {}, cfg.repos)
     cfg.replay = replay_table(data.get("replay") or {})
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.research_planner = research_table(data.get("research") or {})

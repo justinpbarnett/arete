@@ -564,7 +564,8 @@ def can_confine(remote: bool) -> bool:
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
                       *, hidden: tuple[Path, ...] = (), restrict_writes: bool = True,
-                      agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False) -> list[str]:
+                      agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False,
+                      keeps: tuple[str, ...] = (), unix_confined: bool = False) -> list[str]:
     hidden = tuple(dict.fromkeys((*hidden, scratch.AUTHORITY)))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
@@ -579,7 +580,7 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
         params += ["-D", f"AUTH={auth_path.resolve()}", "-D", f"LOCK={auth_path.resolve()}.lock"]
     for i, path in enumerate(hidden):
         params += ["-D", f"H{i}={path.resolve()}"]
-        profile += f'(deny file-read* file-write* (subpath (param "H{i}")))'
+        profile += f'(deny file-read* file-write* file-link (subpath (param "H{i}")))'
     if peers:
         params += ["-D", f"PEERS={peers.resolve()}", "-D", f"WORK={cwd.resolve()}"]
         profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
@@ -602,7 +603,42 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     for i, path in enumerate(sorted(ancestors)):
         params += ["-D", f"A{i}={path}"]
         profile += f'(deny file-write* (literal (param "A{i}")))'
+    if "launch" not in keeps:
+        profile += '(deny lsopen)(deny appleevent-send)(deny job-creation)'
+    if unix_confined:
+        params += ["-D", f"UNIX={cwd.resolve()}"]
+        profile += ('(deny network-outbound (subpath "/"))(allow network-outbound (subpath (param "UNIX")) '
+                    '(subpath "/private/tmp") (subpath "/private/var/folders"))')
+    folders, sockets = command_sockets(keeps)
+    for i, folder in enumerate(folders):
+        params += ["-D", f"SF{i}={folder}"]
+        profile += f'(deny network-outbound (subpath (param "SF{i}")))'
+    for i, sock in enumerate(sockets):
+        params += ["-D", f"SL{i}={sock}"]
+        profile += f'(deny network-outbound (literal (param "SL{i}")))'
+    for port in sorted(scratch.dashboard_ports()):
+        profile += f'(deny network-outbound (remote tcp "*:{int(port)}"))'
     return ["/usr/bin/sandbox-exec", *params, "-p", profile]
+
+
+def command_sockets(keeps: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
+    uid = os.getuid()
+    folders = [f"/private/tmp/tmux-{uid}"]
+    if tmpdir := os.environ.get("TMUX_TMPDIR"):
+        folders.append(str(Path(tmpdir).resolve() / f"tmux-{uid}"))
+    folders += [str(paths.HOME / p) for p in (".docker/run", ".colima", ".orbstack/run", ".rd",
+                                              "Library/Containers/com.docker.docker/Data")]
+    sockets = []
+    if tmux := os.environ.get("TMUX", "").split(",")[0]:
+        sockets.append(tmux)
+    sockets += ["/private/var/run/docker.sock", str(Path("/var/run/docker.sock").resolve())]
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith("unix://"):
+        sockets.append(host.removeprefix("unix://"))
+    agent = os.environ.get("SSH_AUTH_SOCK", "")
+    if agent and "ssh-agent" not in keeps and os.path.isabs(agent):
+        sockets += [agent, str(Path(agent).resolve())]
+    return list(dict.fromkeys(folders)), list(dict.fromkeys(sockets))
 
 
 def sessions_dir(remote: devices.Device | None) -> str:

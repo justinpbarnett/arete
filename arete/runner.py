@@ -36,10 +36,12 @@ from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
     READ_TOOLS,
+    Cut,
     Result,
     Session,
     UsageLimit,
     model_scope,
+    streamed_turn,
     subscription,
 )
 
@@ -63,6 +65,9 @@ SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 NO_ROUTE = "no route can run this call"
+CANNOT_GATE = {"pi": "pi restates a structured answer in a second launch that cannot be gated against the calls "
+                     "and time limits"}
+CANNOT_STOP = {"codex": "codex reports usage only when its turn ends, so it cannot stop a call at a token or spend limit"}
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
 
 
@@ -273,7 +278,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
-        scratch: verification_scratch.Attempt | None = None, **kw) -> Result:
+        scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
+        **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
     which, name = chosen(model, run_with, cfg)
@@ -291,7 +297,10 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if which == REPLAY and (cfg.replay.all or not (settings and settings.requires.declared)):
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
-        return attempt(which, name, prompt, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
+        text = fresh_prompt(which) if fresh_prompt and resume.id and not kept.id else prompt
+        if remaining_tokens:
+            kw = {**kw, "max_tokens": remaining_tokens()}
+        return attempt(which, name, text, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
                        accounts.Auth(), {"launch": 1, **({"selection": route} if route else {})}, try_no,
                        atom)
     if not target.remote:
@@ -299,7 +308,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     size = routing_size(prompt, settings, kw)
     active = layer if layer is not None else layer_of(repo)
     trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
-                remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch)
+                remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
+                tokens=remaining_tokens, structured=kw.get("json_schema") is not None)
     from . import routing
 
     limited: list[Result] = []
@@ -395,6 +405,56 @@ class Trip:
     scratch: verification_scratch.Attempt | None = None
     barred: dict = field(default_factory=dict)
     layer: config.RepoLayer | None = None
+    tokens: Callable[[], int] | None = None
+    structured: bool = False
+
+
+@dataclass
+class Meter:
+    tokens: int | None
+    usd: float | None
+    charged: Callable[[Result], float]
+    seen: Result
+    on_lost: Callable[[Result], None] = lambda seen: None
+    ids: dict = field(default_factory=dict)
+
+    def watching(self, on_line: Callable[[str], None]) -> Callable[[str], None]:
+        if self.tokens is None and self.usd is None:
+            return on_line
+
+        def watched(line: str) -> None:
+            on_line(line)
+            if turn := streamed_turn(line, self.ids):
+                self.add(turn)
+
+        return watched
+
+    def add(self, turn: dict) -> None:
+        seen = self.seen
+        seen.turns += turn.get("turns", 1)
+        seen.cost_usd += turn["cost_usd"]
+        for key in ("tokens_in", "tokens_out", "cache_read", "cache_write"):
+            setattr(seen, key, getattr(seen, key) + turn[key])
+        used = seen.tokens_in + seen.tokens_out
+        if self.tokens is not None and used >= self.tokens:
+            raise Cut(f"stopped at the {self.tokens} tokens left under the limit, after {used}")
+        if self.usd is not None and (spent := self.charged(seen)) >= self.usd:
+            raise Cut(f"stopped at the ${self.usd:.4f} left under the limit, after ${spent:.4f}")
+
+    def guard(self, call: Callable[..., Result], *args, **kw) -> Result:
+        try:
+            res = call(*args, **kw)
+        except Cut as cut:
+            return replace(self.seen, error=str(cut))
+        except BaseException:
+            if self.seen.turns:
+                self.on_lost(replace(self.seen, error="interrupted"))
+            raise
+        reported = res.tokens_in or res.tokens_out or res.cost_usd or res.calls
+        if reported or not self.seen.turns:
+            return res
+        keys = ("turns", "cost_usd", "tokens_in", "tokens_out", "cache_read", "cache_write")
+        return replace(res, **{k: getattr(self.seen, k) for k in keys})
 
 
 @dataclass
@@ -519,6 +579,10 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
         key = routing.route_key(candidate)
         if key in trip.barred:
             skipped.append(passed_over(candidate, "ineligible", trip.barred[key]))
+            continue
+        if trip.tokens is not None and (why := CANNOT_STOP.get(candidate.runner)
+                                        or (CANNOT_GATE.get(candidate.runner) if trip.structured else None)):
+            skipped.append(passed_over(candidate, "ineligible", why))
             continue
         remaining = None
         if candidate.billing == "paid" and candidate.state in ("ready", "held"):
@@ -656,8 +720,13 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), asks.RULE]
         elif which == "pi":
             kw["ask_owner"] = True
+    if trip.tokens is not None:
+        kw["max_tokens"] = trip.tokens()
     if which == "claude":
-        kw.pop("max_budget_usd", None)
+        if trip.tokens is not None:
+            kw["max_budget_usd"] = picked.budget
+        else:
+            kw.pop("max_budget_usd", None)
         if not target.remote:
             kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook)
     elif which == "codex":
@@ -712,6 +781,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
               "allowed_tools": kw.get("allowed_tools"), "disallowed_tools": kw.get("disallowed_tools"),
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
+              "budget_tokens": kw.get("max_tokens"), "refused": kw.get("budget_error", ""),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
     if atom:
@@ -747,20 +817,31 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     refresh_hidden()
     started = time.monotonic()
     at = util.now()
+    max_tokens = kw.pop("max_tokens", None)
+    on_local = route.get("credential") == "local"
+
+    def keep_lost(seen: Result) -> None:
+        seen.cost_usd = 0.0 if on_local else priced(seen, cfg)
+        if trace[0]:
+            record.step(trace[0], trace[1], seen, time.monotonic() - started, effort=kw.get("effort", ""),
+                        tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "")
+
+    meter = Meter(max_tokens, kw.get("max_budget_usd") if max_tokens is not None else None,
+                  lambda r: priced(r, cfg),
+                  Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode), keep_lost)
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
         budget_error = kw.pop("budget_error", "")
         if budget_error:
             res = Result(ok=False, error=budget_error, session=resume, runner=which, model=name)
         elif which == REPLAY:
-            res = replay.run(cwd, trace, cfg, rec.line, resume)
+            res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"))
         elif which == "codex":
             protected = [verification_scratch.AUTHORITY, paths.WORKTREES_DIR]
             res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line,
                             hidden=[*found, *protected], auth=auth, **kw)
         else:
-            res = (pi.run if which == "pi" else claude.run)(prompt, cwd, model=name, resume=resume,
-                                                             on_line=safe_line if selected else rec.line,
-                                                             auth=auth, **kw)
+            res = meter.guard(pi.run if which == "pi" else claude.run, prompt, cwd, model=name, resume=resume,
+                              on_line=meter.watching(safe_line if selected else rec.line), auth=auth, **kw)
         res.runner = which
         res.model = res.model or name
         res.provider = res.provider or provider_of(res.model)
@@ -769,7 +850,6 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             if res.usage_limit and (res.usage_limit.scope not in limit_scopes(auth, name) or
                                    res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
                 res.usage_limit = None
-        on_local = route.get("credential") == "local"
         if res.calls:
             for call in res.calls:
                 call.cost_usd = 0.0 if on_local else priced(call, cfg)
