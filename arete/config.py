@@ -433,10 +433,11 @@ def voice_file(entry, folder: Path) -> str:
     if not isinstance(entry, str):
         raise TypeError(f"[document] voice: must be a list of file names, not {entry!r}")
     named = Path(entry)
-    found = folder / named
-    if named.is_absolute() or ".." in named.parts or not found.is_file():
+    found = (folder / named).resolve()
+    if (named.is_absolute() or ".." in named.parts or not found.is_relative_to(folder.resolve())
+            or not found.is_file()):
         raise ValueError(f"[document] voice: {entry!r} is not a file in {paths.short_path(folder)}")
-    return str(found.resolve())
+    return str(found)
 
 
 def word_range(kind: str, value) -> tuple[int, int]:

@@ -28,7 +28,7 @@ def plain(text, n: int) -> str:
 
 PRIVATE_ADDRESS = "[private address]"
 PRIVATE_SUFFIXES = (".localhost", ".ts.net", ".local", ".internal", ".lan")
-ORIGIN = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://(?:[^\s/@?#]+@)?"
+ORIGIN = re.compile(r"(?:(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):|(?<![\w/]))//(?:[^\s/@?#]+@)?"
                     r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)(?::\d+)?")
 BARE_PRIVATE = re.compile(r"(?<![\w.@/-])(?:[\w.+-]+@)?(?:localhost:\d+|fd7a:115c:a1e0:[0-9A-Fa-f:]+"
                           r"|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.ts\.net(?::\d+)?"
@@ -38,8 +38,12 @@ extra_hosts: set[str] = set()
 own_hosts: list[str] | None = None
 
 
+def normalized_host(host: str) -> str:
+    return host.strip().lower().strip("[]")
+
+
 def keep_private(*hosts: str) -> None:
-    extra_hosts.update(h for h in (h.strip().lower() for h in hosts if h) if h and h != "localhost")
+    extra_hosts.update(h for h in (normalized_host(h) for h in hosts if h) if h and h != "localhost")
 
 
 def machine_hosts() -> list[str]:
@@ -57,7 +61,7 @@ def machine_hosts() -> list[str]:
                       if isinstance(d, dict)]
         except (OSError, ValueError, AttributeError):
             pass
-        own_hosts = [h.lower() for h in dict.fromkeys(found) if len(h) >= 4 and not h.isalpha()]
+        own_hosts = [normalized_host(h) for h in dict.fromkeys(found) if len(h) >= 4 and not h.isalpha()]
     return own_hosts
 
 
@@ -79,13 +83,14 @@ def private_ipv4(octets: list[int]) -> bool:
 
 
 def private_host(host: str) -> bool:
-    host = host.lower()
-    if host.startswith("["):
-        return host == "[::1]" or host.startswith("[fd7a:115c:a1e0:")
+    host = normalized_host(host)
+    if host in extra_hosts or host in machine_hosts():
+        return True
+    if ":" in host:
+        return host == "::1" or host.startswith("fd7a:115c:a1e0:")
     if (octets := ipv4_octets(host)) is not None:
         return private_ipv4(octets)
-    return (host == "localhost" or host.endswith(PRIVATE_SUFFIXES) or "." not in host
-            or host in extra_hosts or host in machine_hosts())
+    return host == "localhost" or host.endswith(PRIVATE_SUFFIXES) or "." not in host
 
 
 def screen_origin(found: re.Match) -> str:
@@ -102,6 +107,7 @@ def screen_bare(found: re.Match) -> str:
 
 def registered(text: str) -> str:
     names = sorted({*extra_hosts, *machine_hosts()}, key=len, reverse=True)
+    names = [variant for name in names for variant in ((f"[{name}]", name) if ":" in name else (name,))]
     if not names:
         return text
     pattern = (r"(?<![\w.@/-])(?:[\w.+-]+@)?(?:" + "|".join(re.escape(n) for n in names)

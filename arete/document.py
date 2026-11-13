@@ -91,12 +91,18 @@ def brief_from(data: dict) -> Brief:
 
 
 def code_in(text: str) -> list[str]:
-    found, fenced = [], False
+    found, fence = [], ""
     for line in text.splitlines():
-        if line.strip().startswith("```"):
-            fenced = not fenced
-        elif fenced:
-            found += [line.strip()] if line.strip() else []
+        stripped = line.strip()
+        marker = re.fullmatch(r"(`{3,}|~{3,})(.*)", stripped)
+        if fence:
+            if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+                    and not marker[2].strip()):
+                fence = ""
+            elif stripped:
+                found.append(stripped)
+        elif marker and (marker[1][0] == "~" or "`" not in marker[2]):
+            fence = marker[1]
         else:
             found += [m.strip() for m in CODE_SPAN.findall(line) if m.strip()]
     return found
@@ -196,7 +202,8 @@ def ask(text: str, s: steps.Settings, cfg: config.Config, repo, layer, run):
         cwd = run.dir / "document"
         shutil.rmtree(cwd, ignore_errors=True)
         cwd.mkdir(parents=True)
-        return run.agent("document", text, cwd, role="document", json_schema=SCHEMA, persist=False)
+        return run.agent("document", text, cwd, role="document", json_schema=SCHEMA, persist=False,
+                         wait_out_limits=False)
     with tempfile.TemporaryDirectory() as empty:
         return runner.run(text, empty, **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
                           instructions=list(s.instructions), json_schema=SCHEMA, persist=False,
