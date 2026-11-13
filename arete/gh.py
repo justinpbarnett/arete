@@ -252,6 +252,11 @@ def pr_set_draft(url: str, draft: bool) -> None:
     gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
+def pr_draft_and_head(url: str) -> tuple[bool, str]:
+    row = gh_json(["pr", "view", url, "--json", "isDraft,headRefOid"]) or {}
+    return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
+
+
 MERGE_NOW = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 MERGE_LATER = {"BLOCKED", "BEHIND"}
 MERGE_WAIT_SECONDS = 120
