@@ -22,7 +22,7 @@ A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work
 | Loop | Kind | When | What it does |
 |------|------|------|--------------|
 | `heartbeat` | command | hourly, and when serve starts | Checks serve's beat, the loops, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
-| `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
+| `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, plus arete's own recorded runs that failed, needed a retry, hit a budget or ran long, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
 | `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
 | `poll` | command | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. `arete run REPO TICKET` runs one ticket by hand. |
 | `eval` | command | weekly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `arete eval mine` writes new tasks from merged arete PRs. |
@@ -384,7 +384,7 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
 - Triage: JEV asks whether a ticket asks for a change to a repo and what kind of ticket it is. A ticket it gives a chance of a code change at or under `triage_skip` settles with no model call, as research when JEV is sure it is research and as work for a person otherwise; one under even odds settles the same way when JEV is sure of research or person. Before arete sends a ticket to the pipeline or the research agent, JEV screens its text for instructions to an agent, and a ticket it flags waits for you.
 - Research: when a researched ticket changes, JEV reads what changed in its text against the report's summary and asks whether the change asks something different or adds a fact, decision, limit, deadline or resource the report should use. Under a chance of `research_rerun`, the report stands with no agent call. Before a ticket's first report, JEV reads it against the reports already done for its parent, its siblings and its children, and picks the one that already delivers what it asks, or none. At a chance of `research_answered` or more that one does, the ticket links that report instead of a new run. See [Triage](#triage).
 - PR feedback: JEV asks of each new comment you leave on an arete PR whether it asks for a change or a question the author should answer, logs the chance, and stores it with the comment. A comment under `feedback_skip` starts no revision; at the default of 0, none is skipped.
-- Miner: the digest leaves out the transcripts JEV is sure hold nothing to learn from, so it has room for the ones that do.
+- Miner: the digest leaves out the transcripts JEV is sure hold nothing to learn from, so it has room for the ones that do. The gate also leaves out recorded runs JEV is sure hold nothing to learn from; a run from a `jev = false` repo is never sent.
 - Sessions: when a session's context passes `compact_tokens` and JEV is sure the new message starts a different task, the session compacts before it takes the turn.
 - Guard: each local claude agent that can read files, write files or run commands runs `arete guard` as a PreToolUse hook. With no JEV call, it keeps the agent out of secret files (`.env`, keys, `~/.ssh`, cloud credentials), whether the agent reads or writes one or names one in a command. With JEV it also stops a command that would do harm git cannot undo (throw away uncommitted work, delete outside the working folder, force push, publish, drop data, send a message) and a command that would show or send a credential. A plain push or a new pull request goes through. The verify prompt tells the verifier to give a key it was not given a value that starts `arete-placeholder`, and that a request to localhost, 127.0.0.1 or [::1] reaches the product it started, so neither reads as a credential or an outside send. When anything goes wrong, it lets the call through. `[jev] guard = false` turns it off. A codex agent runs `arete codex-guard` as its PreToolUse hook instead, with the same judge; the secret file and git write rules there always run, and `guard = false` turns off only its judge (see [Codex](#codex)).
 - `arete ask QUESTION [PATHS] [--choice A B] [--score LOW HIGH] [-r] [--only ANSWER] [--json]` asks JEV about piped text, or about each file, sixteen at a time. Agents that can run commands get it, with a short note on when it pays: sort files before reading them, sort a test failure before digging in, check a diff against its task. An agent may ask only about files inside its working folder, and never about secret files.
@@ -452,6 +452,13 @@ it drains available complete lines and stops when the run's status, run report o
 A missing run row alone does not mean the run ended. A run that ends without creating the requested step reports a missing-step error.
 Following starts at the beginning and stays on the selected file: `arete record RUN_ID plan-2.jsonl.gz -f`
 follows only the second attempt and never switches to another attempt.
+
+The miner reads two sources: Claude Code session files on this machine, and the records of arete's own runs, since the last mine that ended `pr` or `noop` (or since `--hours` ago).
+It reads only runs with a signal, worst first: `failed` (a failed run, call or step), `retry` (a step run more than once, or a repair), `budget` (the run parked on a limit) and `long` (active time of half the run limit or more).
+Miner, eval, experiment and draft runs are left out.
+A run's records go into the prompt as quoted data, one prefixed line each, to a call with Read, Glob and Grep only and a JSON schema as its only output, so text inside a record cannot reach a tool that acts.
+Evidence cites `run <id> <record>:<lines>`, the raw line numbers `arete record RUN STEP --raw` prints.
+A proposal for arete or a public repo that names another repository, ticket, run, host or the login name is skipped.
 
 ## Run lines
 
@@ -589,7 +596,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `research_plan` (the planner of a staged research run), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you), `document` (the concise writer of PR text, tickets and messages). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop` and `session`, which use sonnet, and `research`, `research_plan` and `chat`, which use opus. `arete status` lists each role's model. |
 | `[steps]`, `[kinds]`, `[tiers]`, `[factory]` | Each pipeline step's model, runner, effort, timeout, tries, tools, MCP servers, instructions and session. See [Steps](#steps). `[factory] adws` is the folder the adw scripts come from, default `adws/` in this checkout; see [The adw scripts](#the-adw-scripts). |
 | `[mcp.<name>]` | An MCP server a step can name in its `mcp` list: `command` with optional `args`, or `url` for an HTTP server. Servers are defined here only, not in a layer. |
-| `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly transcript digest. |
+| `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly digest of transcripts and recorded runs; recorded runs take up to half of `max_digest_chars`. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
@@ -609,7 +616,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 |------------|---------|---------|
 | `pipeline` | `false` | Poll this repo's tickets and run the build pipeline. |
 | `mine` | `true` | The miner may open harness PRs here. |
-| `public` | `false` | PR bodies cite run ids, never transcript text. |
+| `public` | `false` | PR bodies cite run ids, never transcript text. Arete's own repo (`arete_repo`) is treated the same way. |
 | `tracker` | `"github"` | `github` for issues in the repo, `jira` for tickets in Jira, `local` for [local tasks](#local-tasks) only; such a repo may have no `github`. PRs are on GitHub either way. |
 | `jira_project` | `[jira] project` | Jira project for this repo. |
 | `jira_label` | `repo-<github repo name>` | Route label that sends a Jira ticket to this repo. |
