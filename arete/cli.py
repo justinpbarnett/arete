@@ -287,6 +287,52 @@ def cmd_heartbeat(args) -> int:
     return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
 
 
+def cmd_oncall(args) -> int:
+    from . import oncall, state
+
+    cfg = config.load()
+    if args.action == "scan":
+        summary = oncall.scan(cfg)
+        if summary is None:
+            print(f"on-call is off; set [oncall] enabled = true in {paths.CONFIG_FILE}")
+        elif "skipped" in summary:
+            print(summary["skipped"])
+        else:
+            print(json.dumps(summary) if args.json else f"on-call: {oncall.said(summary)}")
+        return 0
+    if args.action == "show":
+        found = state.incident(int(args.id)) if args.id.isdigit() else None
+        if not found:
+            print(f"no incident {args.id}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(found))
+            return 0
+        print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
+              f"{found['first_seen']} to {found['last_seen']}")
+        print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
+        for note in found["notes"]:
+            print(f"{note['ts']}  {note['note']}")
+        return 0
+    rows = state.incidents()
+    if args.json:
+        for row in rows:
+            print(json.dumps(row))
+        return 0
+    for r in rows:
+        print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
+              f"x{r['count']:<4} {r['signature']}")
+    now = oncall.status(cfg)
+    if not now["enabled"]:
+        print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
+    else:
+        last = "no scan yet"
+        if now["last_scan"]:
+            last = f"last scan {when(now['last_scan'])}" + ("" if now["ok"] else f" failed: {now['detail']}")
+        print(f"on-call is on; {last}; {now['expected']} expected events counted")
+    return 0
+
+
 def cmd_hook(args) -> int:
     from . import hook
 
@@ -326,6 +372,11 @@ def cmd_ask(args) -> int:
 
 
 def cmd_jev(args) -> int:
+    if args.action != "report":
+        from . import calibrate
+
+        return calibrate.main(args)
+
     import json
 
     from . import verdicts
@@ -529,6 +580,25 @@ def cmd_eval(args) -> int:
     prompts_dir = paths.expand(args.prompts).resolve() if args.prompts else None
     prompts = evals.Prompts(prompts_dir, paths.short_path(prompts_dir)) if prompts_dir else None
     return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run, prompts=prompts)
+
+
+def cmd_experiment(args) -> int:
+    import tomllib
+
+    from . import experiment
+
+    wrong = (args.dry_run and args.action == "summary") or (args.out and args.action == "summary") \
+        or (args.json and args.action == "run")
+    if wrong:
+        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json]", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "summary":
+            return experiment.show(paths.expand(args.path), args.json)
+        return experiment.run(paths.expand(args.path), args.out, args.dry_run)
+    except (experiment.Refused, tomllib.TOMLDecodeError, OSError) as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 def cmd_triage(args) -> int:
@@ -1094,6 +1164,38 @@ def cmd_prices(args) -> int:
     return 0
 
 
+BENCHMARK_NEVER = "It never pulls weights, provisions a device or schedules load."
+
+
+def cmd_benchmark(args) -> int:
+    from pathlib import Path
+
+    from . import benchmark, devices, util
+
+    if args.action == "fixture":
+        if not 1 <= args.seconds <= 3600:
+            print("arete benchmark: --seconds must be from 1 to 3600", file=sys.stderr)
+            return 2
+        try:
+            return benchmark.serve_fixture(args.port, args.seconds)
+        except OSError as e:
+            print(f"arete benchmark: cannot serve the fixture on port {args.port}: {util.first_line(str(e), 200)}",
+                  file=sys.stderr)
+            return 1
+    try:
+        found = benchmark.run(benchmark.read_manifest(paths.expand(args.manifest)))
+        if args.out:
+            util.write_json(Path(args.out), found)
+    except (benchmark.Refused, ValueError, TypeError, OSError, devices.DeviceError) as e:
+        print(f"arete benchmark: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(found))
+    else:
+        print_lines(benchmark.report_lines(found))
+    return 0
+
+
 def cmd_writers(args) -> int:
     from pathlib import Path
 
@@ -1329,6 +1431,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_heartbeat)
 
+    p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
+    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan"))
+    p.add_argument("id", nargs="?", default="", help="with show: the incident number")
+    p.add_argument("--json", action="store_true", help="one JSON line per incident")
+    p.set_defaults(fn=cmd_oncall)
+
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
 
@@ -1358,8 +1466,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_ask)
 
-    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts")
-    p.add_argument("action", choices=("report",))
+    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts; "
+                                   "compare decision models offline")
+    p.add_argument("action", choices=("report", "compare", "sample"))
+    p.add_argument("target", nargs="?", default="", help="compare: the spec file; sample: a new empty folder")
+    p.add_argument("--out", metavar="DIR", help="compare: where to write proposal.json and predictions.jsonl "
+                                                "(default: out next to the spec)")
     p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_jev)
@@ -1463,6 +1575,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rater", default="", metavar="NAME", help="rate: the rater, instead of the file's rater")
     p.add_argument("--json", action="store_true", help="report: one JSON line")
     p.set_defaults(fn=cmd_writers)
+
+    p = sub.add_parser("benchmark", help="measure already configured local model endpoints under 8K and 32K context "
+                                         "and concurrency; " + BENCHMARK_NEVER,
+                       description="Benchmark already configured local model endpoints once, on request. "
+                                   + BENCHMARK_NEVER)
+    bsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
+    b = bsub.add_parser("run", help="run the manifest's candidates once and print the comparable report")
+    b.add_argument("manifest", metavar="MANIFEST", help="a TOML manifest of candidates")
+    b.add_argument("--json", action="store_true", help="print the report as one JSON line")
+    b.add_argument("--out", metavar="FILE", help="also write the report JSON to FILE")
+    b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
+    b.add_argument("--port", type=int, required=True)
+    b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
+    p.set_defaults(fn=cmd_benchmark)
 
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))
@@ -1602,6 +1728,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=3, help="with mine: the most merged PRs to mine in one go")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, or summarize its results")
+    p.add_argument("action", choices=("run", "summary"))
+    p.add_argument("path", metavar="MANIFEST | FILE", help="run: the manifest; summary: the results file")
+    p.add_argument("--dry-run", action="store_true", help="with run: validate and print the plan; writes and calls nothing")
+    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for the manifest")
+    p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
+    p.set_defaults(fn=cmd_experiment)
 
     p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
                                          "`sample FOLDER`, `run SUITE`, `report FILE`")

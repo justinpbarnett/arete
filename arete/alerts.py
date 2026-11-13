@@ -12,7 +12,7 @@ NOTIFY_SCRIPT = ("-e", "on run argv", "-e", "display notification (item 1 of arg
 def notify(title: str, message: str) -> None:
     msg, title = message[:200], title[:100]
     if sys.platform == "darwin":
-        util.sh(["osascript", *NOTIFY_SCRIPT, "--", msg, title], timeout=10)
+        util.sh(["osascript", *NOTIFY_SCRIPT, "--", msg, title], timeout=10, keeps=("launch",))
     else:
         util.sh(["notify-send", "--", title, msg], timeout=10)
 
