@@ -699,12 +699,24 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     hook = ()
     kw.pop("verification_attempt", None)
     if trip.scratch:
+        original = kw.get("mcp_config", "")
+        if which == "codex" and not target.remote:
+            try:
+                kw["mcp_config"] = verification_scratch.browser_config(trip.scratch, original, kw.get("add_dirs", ()))
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                kw["budget_error"] = f"browser confinement unavailable: {error}"
         try:
             hook = verification_scratch.activate(trip.scratch, which, bool(target.remote), kw.get("add_dirs", ()),
                                                  kw.get("mcp_config", ""))
         except (OSError, ValueError, KeyError, TypeError):
             hook = ()
-        if not hook:
+        if (not hook and which == "codex" and not target.remote and verification_scratch.has_servers(original)
+                and not kw.get("budget_error")
+                and (kw.get("mcp_config", "") != original
+                     or verification_scratch.plain_config(trip.scratch, original) is None)):
+            kw["budget_error"] = "browser confinement unavailable: the trusted browser could not be activated"
+        if not hook and "mcp_config" in kw:
+            kw["mcp_config"] = original
             say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
             kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
         kw["verification_attempt"] = trip.scratch

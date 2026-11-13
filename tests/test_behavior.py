@@ -572,5 +572,66 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertTrue(Path(a.root).exists())
 
 
+class EvidenceLinkTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.evidence = self.root / "evidence"
+        self.evidence.mkdir()
+        (self.evidence / "ok.png").write_bytes(b"png")
+        outside = self.root / "outside.txt"
+        outside.write_text("secret")
+        (self.evidence / "leak.png").symlink_to(outside)
+        self.verified = verify.Verified("pass", "s", [
+            {"what": "a", "how": "b", "saw": "c", "passed": True, "screenshot": name}
+            for name in ("ok.png", "leak.png")])
+
+    def test_screenshots_skip_links(self):
+        self.assertEqual(self.verified.screenshots(self.evidence), [self.evidence / "ok.png"])
+
+    def test_linked_evidence_folders_and_ancestors_are_not_followed(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "ok.png").write_bytes(b"outside")
+        (self.root / "linked").symlink_to(elsewhere)
+        (self.root / "real" / "run").mkdir(parents=True)
+        (self.root / "real" / "run" / "evidence").symlink_to(elsewhere)
+        (self.root / "ancestor").symlink_to(self.root / "real")
+        for folder in (self.root / "linked", self.root / "ancestor" / "run" / "evidence"):
+            with self.subTest(str(folder)):
+                self.assertEqual(self.verified.screenshots(folder), [])
+                self.assertIsNone(verify.evidence_bytes(folder, "ok.png"))
+                with mock.patch.object(verify.subprocess, "run", side_effect=AssertionError("hashed")):
+                    self.assertEqual(verify.push_evidence(self.root, "o/r", "run", [folder / "ok.png"]), {})
+        self.verified.saved = str(self.root / "ancestor" / "run" / "verify.md")
+        self.assertEqual([r["evidence"] for r in self.verified.requirements()], [self.verified.saved] * 2)
+
+    def test_evidence_of_skips_links(self):
+        self.verified.saved = str(self.root / "verify.md")
+        evidence = [r["evidence"] for r in self.verified.requirements()]
+        self.assertEqual(evidence, [str(self.evidence / "ok.png"), str(self.root / "verify.md")])
+
+    def test_push_evidence_hashes_opened_bytes_and_never_a_link(self):
+        done = SimpleNamespace(returncode=0, stdout=b"abc\n", stderr=b"")
+        with mock.patch.object(verify.subprocess, "run", return_value=done) as run, \
+                mock.patch.object(verify, "git", return_value=""), \
+                mock.patch.object(verify.util, "git_as_owner", return_value="c0ffee"):
+            urls = verify.push_evidence(self.root, "o/r", "run", [self.evidence / "leak.png", self.evidence / "ok.png"])
+        self.assertEqual(list(urls), ["ok.png"])
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["input"], b"png")
+        self.assertIn("--stdin", run.call_args.args[0])
+        with mock.patch.object(verify.subprocess, "run", side_effect=AssertionError("no hashing")):
+            self.assertEqual(verify.push_evidence(self.root, "o/r", "run", [self.evidence / "leak.png"]), {})
+
+    def test_the_claude_browser_config_keeps_chromes_own_sandbox(self):
+        config_text = verify.mcp_config(self.evidence)
+        self.assertNotIn("--no-sandbox", config_text)
+        self.assertIn("npx", config_text)
+        self.assertNotIn("browser_evaluate", verify.PLAYWRIGHT_TOOLS)
+        self.assertNotIn("browser_run_code_unsafe", verify.PLAYWRIGHT_TOOLS)
+
+
 if __name__ == "__main__":
     unittest.main()

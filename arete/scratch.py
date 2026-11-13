@@ -3,19 +3,24 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import pwd
 import secrets
 import shlex
+import signal
 import stat
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import paths
 
@@ -41,6 +46,19 @@ RUN_BASELINES: dict[str, dict[int, int] | None] = {}
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
 GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
               "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
+BROWSER_EXEC = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                "from arete import scratch; scratch.browser_start(sys.argv[1:])")
+BROWSER_MACH = ("com.apple.system.opendirectoryd.libinfo", "com.apple.system.opendirectoryd.membership",
+                "com.apple.system.notification_center", "com.apple.system.logger", "com.apple.logd",
+                "com.apple.cfprefsd.daemon", "com.apple.cfprefsd.agent", "com.apple.bsd.dirhelper",
+                "com.apple.fonts", "com.apple.FontObjectsServer", "com.apple.coreservices.launchservicesd",
+                "com.apple.lsd.mapdb", "com.apple.windowserver.active", "com.apple.CARenderServer",
+                "com.apple.MTLCompilerService")
+BROWSER_MACH_PATTERN = r"^(com\.google\.Chrome|org\.chromium\.Chromium)[A-Za-z.]*\.MachPortRendezvousServer\.[0-9]+$"
+BROWSER_HIDDEN = ("Library/Application Support/Google/Chrome", "Library/Keychains", ".claude.json", ".config/gh",
+                  ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc", ".bash_profile", ".bash_login", ".profile",
+                  ".config/fish")
+BROWSER_GRACE_SECONDS = 3
 
 
 def identity(st: os.stat_result) -> list[int]:
@@ -261,7 +279,7 @@ def producing(a: Attempt | None):
         PRODUCING.reset(token)
 
 
-def process_ids(workspace: str = "") -> dict[int, int]:
+def process_ids(*workspaces: str) -> dict[int, int]:
     if not paths.ON_MAC:
         raise ConfinementUnavailable("producer lifetime inspection unavailable")
     lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -285,8 +303,8 @@ def process_ids(workspace: str = "") -> dict[int, int]:
                 continue
             if info[2] in found:
                 continue
-            outside = workspace and (box.sandbox_check(pid, None, 0) == 0 or box.sandbox_check(
-                pid, b"file-write-create", 1, ctypes.c_char_p(os.fsencode(workspace))) == 1)
+            outside = workspaces and (box.sandbox_check(pid, None, 0) == 0 or all(box.sandbox_check(
+                pid, b"file-write-create", 1, ctypes.c_char_p(os.fsencode(w))) == 1 for w in workspaces))
             if (lib.proc_pidinfo(pid, 13, 0, parent, ctypes.sizeof(parent)) != ctypes.sizeof(parent)
                     or lib.proc_pidinfo(pid, 17, 0, after, ctypes.sizeof(after)) != ctypes.sizeof(after)
                     or after[2] != info[2]):
@@ -351,17 +369,221 @@ def protected_command(command, cwd=None, keeps=()):
                                 keeps=tuple(keeps)) + words
 
 
+def home_dir() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def hidden_folders(with_state: bool = True) -> tuple[Path, ...]:
+    from . import guard
+
+    home = home_dir()
+    state = home / ".local/share/arete"
+    return tuple(p for p in (AUTHORITY.parent, state, home / "Library/Application Support/arete",
+                             *(home / n for n in (*guard.SECRET_DIRS, ".claude", ".codex", ".pi")))
+                 if with_state or p != state)
+
+
 def service_command(a: Attempt, command: str) -> list[str]:
-    from . import guard, pi
+    from . import pi
 
     if (not pi.can_confine(False) or Path(a.workspace) == paths.WORKTREES_DIR.resolve()
             or not Path(a.workspace).is_relative_to(paths.WORKTREES_DIR.resolve())):
         raise ConfinementUnavailable("service confinement cannot isolate trusted scratch in this workspace")
-    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    hidden = (AUTHORITY.parent, home / ".local/share/arete", home / "Library/Application Support/arete",
-              *(home / n for n in (*guard.SECRET_DIRS, ".claude", ".codex", ".pi")))
-    return pi.write_confinement(Path(a.workspace), [], hidden=hidden, agent_roots=False,
+    return pi.write_confinement(Path(a.workspace), [], hidden=hidden_folders(), agent_roots=False,
                                 peers=paths.WORKTREES_DIR, secrets_denied=True, unix_confined=True) + ["/bin/sh", "-c", command]
+
+
+def browser_path(run_dir: str) -> Path:
+    return Path(run_dir) / "browser"
+
+
+def evidence_path(run_dir: str) -> Path:
+    return Path(run_dir) / "evidence"
+
+
+def browser_folder(a: Attempt) -> Path:
+    folder = browser_path(a.run_dir)
+    with paths.directory_fd(folder, create=True) as fd:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise ConfinementUnavailable("the browser folder is not private")
+        for leaf in ("home", "tmp"):
+            with paths.directory_fd(Path(leaf), fd, create=True):
+                pass
+    return folder
+
+
+def browser_profile(a: Attempt, port: int, folder: Path) -> list[str]:
+    from . import browser, pi
+
+    state_default = home_dir() / ".local/share/arete"
+    hidden = (*hidden_folders(paths.STATE_DIR.resolve() != state_default.resolve()),
+              *(home_dir() / n for n in BROWSER_HIDDEN))
+    evidence = evidence_path(a.run_dir)
+    return pi.write_confinement(folder, [evidence], hidden=hidden, agent_roots=False, peers=paths.WORKTREES_DIR,
+                                secrets_denied=True, temp_writes=False,
+                                state=(paths.STATE_DIR, (evidence, folder, browser.server_folder())),
+                                mach=(BROWSER_MACH, BROWSER_MACH_PATTERN), tcp_port=port)
+
+
+def browser_record(a: Attempt) -> dict:
+    with registry() as (fd, key):
+        data = load(fd, key, a.selector)
+    if data["attempt"] != asdict(a):
+        raise PermissionError("verification attempt authority revoked")
+    return data.get("browser") or {}
+
+
+def update_browser(a: Attempt, **fields) -> None:
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load(fd, key, a.selector)
+        if data["attempt"] != asdict(a) or data["state"] not in ("prepared", "active"):
+            raise PermissionError("verification attempt authority revoked")
+        data["browser"] = {**(data.get("browser") or {}), **fields}
+        store(fd, key, data)
+
+
+def app_port(a: Attempt, url: str) -> None:
+    parts = urlsplit(url)
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        port = 0
+    try:
+        loopback = ipaddress.ip_address(parts.hostname or "").is_loopback
+    except ValueError:
+        loopback = False
+    update_browser(a, port=port, loopback=loopback)
+
+
+def browser_digest(argv: list[str]) -> str:
+    return hashlib.sha256(encoded(list(argv))).hexdigest()
+
+
+def browser_command(a: Attempt, words: list[str]) -> list[str]:
+    from . import browser, pi
+
+    workspace, worktrees = Path(a.workspace), paths.WORKTREES_DIR.resolve()
+    if (not pi.can_confine(False) or sandboxed() or workspace == worktrees
+            or not workspace.is_relative_to(worktrees)):
+        raise ConfinementUnavailable("browser confinement cannot be applied in this process or workspace")
+    port = browser_record(a).get("port")
+    if not isinstance(port, int) or not 0 < port < 65536:
+        raise ConfinementUnavailable("no app port is recorded for browser confinement")
+    node, cli = browser.checked()
+    folder = browser_folder(a)
+    return [str(Path(sys.executable).resolve()), "-I", "-c", BROWSER_EXEC, a.selector,
+            *browser_profile(a, port, folder), "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", f"HOME={folder}/home",
+            f"CFFIXED_USER_HOME={folder}/home", f"TMPDIR={folder}/tmp", node, cli, *words, "--no-sandbox"]
+
+
+def browser_table(a: Attempt, argv: list[str]) -> dict:
+    return {"command": argv[0], "args": argv[1:], "cwd": str(browser_path(a.run_dir))}
+
+
+def browser_server(a: Attempt) -> dict:
+    words = browser_record(a).get("words")
+    if not isinstance(words, list) or not all(isinstance(w, str) for w in words):
+        raise ValueError("no browser server was built for this attempt")
+    return browser_table(a, browser_command(a, words))
+
+
+def plain_config(a: Attempt, mcp_config: str) -> list[str] | None:
+    from . import verify
+
+    try:
+        servers = json.loads(mcp_config or "{}").get("mcpServers")
+        words = servers["playwright"]["args"][2:] if servers else None
+        output = Path(words[words.index("--output-dir") + 1]) if words else None
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+        return None
+    if (not servers or output is None or output.resolve() != evidence_path(a.run_dir).resolve()
+            or mcp_config != verify.mcp_config(output)):
+        return None
+    return words
+
+
+def has_servers(mcp_config: str) -> bool:
+    try:
+        return bool(json.loads(mcp_config or "{}").get("mcpServers"))
+    except (ValueError, AttributeError):
+        return True
+
+
+def browser_config(a: Attempt, mcp_config: str, add_dirs) -> str:
+    from . import browser
+
+    words = plain_config(a, mcp_config)
+    if words is None:
+        return mcp_config
+    try:
+        loopback = browser_record(a).get("loopback")
+    except (OSError, ValueError, KeyError, TypeError):
+        return mcp_config
+    if loopback is not True or not isolation(a, "codex", False, add_dirs, ""):
+        return mcp_config
+    browser.resolved()
+    argv = browser_command(a, words)
+    update_browser(a, words=words, argv=browser_digest(argv[5:]))
+    return json.dumps({"mcpServers": {"playwright": browser_table(a, argv)}})
+
+
+def browser_start(argv: list[str]) -> None:
+    selector, rest = argv[0], argv[1:]
+    if sandboxed() or not rest or rest[0] != "/usr/bin/sandbox-exec":
+        raise SystemExit("browser server refused: it must start outside any sandbox with the engine's profile")
+    try:
+        os.setsid()
+    except PermissionError:
+        os.setpgid(0, 0)
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load(fd, key, selector)
+        recorded = (data.get("browser") or {}).get("argv")
+        if data["state"] != "active" or not isinstance(recorded, str) or not hmac.compare_digest(
+                recorded, browser_digest(rest)):
+            raise SystemExit("browser server refused: the command is not the one the engine built")
+        data["browser"]["groups"] = [*data["browser"].get("groups", []), os.getpid()]
+        data["producers"][f"browser-{os.getpid()}"] = os.getpid()
+        store(fd, key, data)
+    os.execv(rest[0], rest)
+
+
+def stop_browser(data: dict) -> None:
+    groups = {g for g in (data.get("browser") or {}).get("groups", []) if isinstance(g, int) and g > 1}
+    if not groups:
+        return
+    folder = ctypes.c_char_p(os.fsencode(browser_path(data["attempt"]["run_dir"])))
+    box = ctypes.CDLL(None)
+    box.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+
+    def writers() -> list[int]:
+        try:
+            rows = subprocess.run(["/bin/ps", "-U", str(os.getuid()), "-o", "pid=,pgid="], check=False,
+                                  capture_output=True, text=True, timeout=30).stdout.split("\n")
+        except (OSError, subprocess.SubprocessError):
+            return []
+        found = []
+        for row in rows:
+            pid, _, group = row.strip().partition(" ")
+            if (pid.isdigit() and group.strip().isdigit() and int(group) in groups and int(pid) != os.getpid()
+                    and box.sandbox_check(int(pid), None, 0) == 1
+                    and box.sandbox_check(int(pid), b"file-write-create", 1, folder) == 0):
+                found.append(int(pid))
+        return found
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not (pids := writers()):
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        deadline = time.monotonic() + BROWSER_GRACE_SECONDS
+        while time.monotonic() < deadline and writers():
+            time.sleep(0.1)
 
 
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
@@ -423,7 +645,9 @@ def producers_done(data: dict) -> bool:
             except PermissionError:
                 return False
             return False
-    current, unrelated = process_ids(data["attempt"]["workspace"]), {-1, *data["before"]}
+    attempt = data["attempt"]
+    current = process_ids(attempt["workspace"], str(browser_path(attempt["run_dir"])), str(evidence_path(attempt["run_dir"])))
+    unrelated = {-1, *data["before"]}
     while descendants := {child for child, parent in current.items() if parent in unrelated} - unrelated:
         unrelated.update(descendants)
     return not current.keys() - unrelated
@@ -436,11 +660,28 @@ def workspace_busy(a: Attempt) -> bool:
                for d in records())
 
 
+def servers_allowed(a: Attempt, mcp_config: str) -> bool:
+    try:
+        servers = json.loads(mcp_config or "{}").get("mcpServers")
+        return not servers or servers == {"playwright": browser_server(a)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def activated(a: Attempt) -> bool:
+    try:
+        with registry() as (fd, key):
+            data = load(fd, key, a.selector)
+        return data["attempt"] == asdict(a) and data["state"] == "active"
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def isolation(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str = "") -> bool:
     broad = (Path("/tmp").resolve(), Path("/private/tmp"), Path(os.getenv("TMPDIR", "/tmp")).resolve())
     writable = [Path(a.workspace), *(Path(d).resolve() for d in add_dirs or ())]
     return (which == "codex" and not remote and paths.ON_MAC
-            and not json.loads(mcp_config or "{}").get("mcpServers")
+            and servers_allowed(a, mcp_config)
             and Path(a.workspace).is_relative_to(paths.WORKTREES_DIR.resolve())
             and Path(a.workspace) != paths.WORKTREES_DIR.resolve()
             and not any(Path(a.workspace).is_relative_to(p) or AUTHORITY.is_relative_to(p) for p in broad)
@@ -811,6 +1052,7 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
                 return "", [], [a.root] if os.path.lexists(a.root) else []
             data["state"] = "pending"
             store(fd, key, data)
+            stop_browser(data)
             if not producers_done(data):
                 data["state"] = "retained"
                 data["diagnostic"] = "waiting for registered verification producers to exit; authority revoked"
@@ -880,6 +1122,7 @@ def retain(a: Attempt) -> None:
         data["state"] = "retained"
         data["diagnostic"] = "producer shutdown unconfirmed; authority revoked and worktree retained"
         store(fd, key, data)
+        stop_browser(data)
 
 
 def recover_pending() -> list[str]:
