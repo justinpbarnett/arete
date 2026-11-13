@@ -184,6 +184,10 @@ class FakeTableTests(unittest.TestCase):
         self.assertEqual(record["state"], "retained")
         self.assertEqual([(h["pid"], h["name"], h["reason"]) for h in record["diagnostic"]["holders"]],
                          [(901, "fakeagentd", scratch.SUBMITTED)])
+        self.alter_record(lambda data: data["labels"]["gui"].append("label901"))
+        self.assertEqual(scratch.end(self.attempt, self.run_dir)[2], [])
+        self.assertEqual(scratch.records()[0]["state"], "done")
+        self.assertIn(5001, self.table)
 
     def test_record_without_label_baseline_holds_sealed_job_as_unclassified(self):
         self.alter_record(lambda data: data.pop("labels"))
@@ -193,6 +197,11 @@ class FakeTableTests(unittest.TestCase):
                 if missing == "unread":
                     self.alter_record(lambda data: data.update(labels=None))
                 self.assertEqual([(h["pid"], h["name"], h["reason"]) for h in self.held().values()],
+                                 [(900, "fakeagentd", scratch.UNCLASSIFIED_HOLDER)])
+                self.assertEqual(scratch.end(self.attempt, self.run_dir)[2], [self.attempt.root])
+                record = scratch.records()[0]
+                self.assertEqual(record["state"], "retained")
+                self.assertEqual([(h["pid"], h["name"], h["reason"]) for h in record["diagnostic"]["holders"]],
                                  [(900, "fakeagentd", scratch.UNCLASSIFIED_HOLDER)])
         self.table.clear()
         self.start(proc(900, 5000, executable="/bin/sh"), service_path="(submitted by x)", program="/bin/sh")
@@ -398,20 +407,27 @@ class LiveTests(unittest.TestCase):
             producer = scratch.spawn(confined([sys.executable, "-c", "pass"]), actor_confined=True, cwd=self.ws)
         producer.wait(timeout=20)
         candidates = []
-        for name in ("voicebankingd", "siriknowledged", "featureaccessagent", "contentlinkingd"):
+        for name in ("voicebankingd", "siriknowledged", "featureaccessagent", "contentlinkingd", "secinitd"):
             candidates.extend(label for label in labels["gui"]
                               if label.startswith("com.apple.") and name in label.lower())
-        notes, accepted = [], None
-        for label in candidates[:4]:
+        notes, accepted, kicks = [], None, 0
+        for label in dict.fromkeys(candidates):
+            if kicks >= 4:
+                break
             target = f"gui/{UID}/{label}"
             printed = self.launchctl("print", target)
             if printed.returncode:
                 notes.append(f"{label}: launchctl print {target} exited {printed.returncode}")
                 continue
-            if "pid" in launchd.fields(printed.stdout):
+            fields = launchd.fields(printed.stdout)
+            if "pid" in fields:
                 notes.append(f"{label}: already running, so in the baseline")
                 continue
+            if not launchd.sealed(fields.get("path", "")):
+                notes.append(f"{label}: job is not defined on the sealed volume")
+                continue
             words = ("kickstart", target)
+            kicks += 1
             started = self.launchctl(*words)
             if started.returncode:
                 notes.append(f"{label}: launchctl {' '.join(words)} exited {started.returncode}")
@@ -419,8 +435,7 @@ class LiveTests(unittest.TestCase):
 
             failures = []
             pid = self.wait_for(lambda: self.polled_pid(target, failures))
-            found = scratch.processes(str(self.ws)).values()
-            process = next((p for p in found if p.pid == pid and p.parent == 0), None) if pid else None
+            process = self.wait_for(lambda: self.launchd_child(pid), 5) if pid else None
             if process is None:
                 notes.append(f"{label}: {failures[0]}" if failures else
                              f"{label}: no pid in the workspace process list" if pid else
@@ -434,6 +449,20 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(scratch.end(a, self.run_dir)[2], [], self.record(a)["diagnostic"])
         self.assertEqual(self.record(a)["state"], "done")
         self.assertEqual(scratch.identity_of(pid), identity, f"{label} exited before the check finished; run the test again")
+
+    def launchd_child(self, pid):
+        return next((p for p in scratch.processes(str(self.ws)).values() if p.pid == pid and p.parent == 0), None)
+
+    def job_pid(self, label, failures):
+        notes = []
+        for kind in ("gui", "user"):
+            one = []
+            if pid := self.polled_pid(f"{kind}/{UID}/{label}", one):
+                failures.clear()
+                return pid
+            notes.extend(one)
+        failures[:] = notes
+        return None
 
     def wait_for(self, check, seconds=10):
         deadline = time.time() + seconds
@@ -501,10 +530,10 @@ class LiveTests(unittest.TestCase):
             self.skip_for(("submit", "-l", label, "--", *command), submit)
 
         failures = []
-        pid = self.wait_for(lambda: self.polled_pid(f"gui/{UID}/{label}", failures))
+        pid = self.wait_for(lambda: self.job_pid(label, failures))
         if not pid:
-            self.skipTest(failures[0] if failures else
-                          f"launchctl print gui/{UID}/{label} never reported a pid")
+            self.skipTest("; ".join(failures) if failures else
+                          f"launchctl print gui/{UID}/{label} and user/{UID}/{label} never reported a pid")
         self.assertEqual(self.wait_for(lambda: self.held(a).get(pid, {}).get("reason")), scratch.SUBMITTED)
         listing = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True)
         name = os.path.basename(listing.stdout.strip())
