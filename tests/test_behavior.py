@@ -830,5 +830,96 @@ class PushedPrDraftTests(unittest.TestCase):
         self.assertEqual(self.names("pr", "merge"), [])
 
 
+class ChatContextTests(unittest.TestCase):
+    SCRIPT = r'''
+import json, sys, time
+from pathlib import Path
+from arete import chat, config, paths, record, state
+
+root = Path(sys.argv[1])
+answers = root / "replay"
+
+
+def put(name, body):
+    (answers / f"{name}.json").write_text(json.dumps(body))
+
+
+def reply(text):
+    return {"text": "", "structured": {"reply": text, "issue_title": "", "issue_body": ""}}
+
+
+def take(chat_id, text):
+    chat.send(chat_id, text)
+    deadline = time.monotonic() + 60
+    while chat.view(chat_id)["busy"]:
+        assert time.monotonic() < deadline, "the chat never finished"
+        time.sleep(0.05)
+    return chat.view(chat_id)
+
+
+def header(name):
+    return next(record.lines(paths.record_dir("chat") / f"{name}{record.RECORD_SUFFIX}"), {})
+
+
+state.ensure_schema()
+first, second = chat.new("")["id"], chat.new("")["id"]
+put("chat-1", {**reply("The poll ran at noon."),
+               "tool_calls": [{"name": "Bash", "input": {"command": "arete status"}, "result": "poll: last ran 12:00"}]})
+put("chat-12", reply("Noted PLUM."))
+put("chat-13", reply("Third answer."))
+put("chat-14", reply("Fourth answer."))
+put("chat-1-summary", {"text": "the owner asked when the poll ran."})
+put("chat-1-summary2", {"text": "SUMMARYMARK the owner asked when the poll ran, then for more."})
+put("chat-2", reply("Short answer."))
+put("chat-22", reply("Second answer."))
+put("chat-23", reply("Third answer."))
+one = take(first, "When did APRICOT poll run?")
+take(first, "Thanks")
+take(first, "Tell me more. " * 30)
+three = take(first, "And now?")
+take(second, "short")
+take(second, "long " * 120)
+failed = take(second, "and then?")
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "senders": [m["sender"] for m in one["messages"]],
+    "first": header("chat-1")["prompt"],
+    "second": header("chat-1-2"),
+    "third": header("chat-1-4")["prompt"],
+    "summary": three["summary"],
+    "summary_header": header("chat-1-summary"),    "failed_summary": failed["summary"],
+    "failed_last": failed["messages"][-1]["text"],
+    "failed_prompt": header("chat-2-3")["prompt"]}))
+'''
+
+    def test_each_turn_is_built_from_saved_messages_and_summarized_past_the_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text(
+                f'[replay]\nall = true\ndir = "{root / "replay"}"\n\n[chat]\ncontext_tokens = 100\n\n[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), TMPDIR=str(root))
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+            result = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
+                                    cwd=root, env=env, text=True, capture_output=True, timeout=180)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            output = next(line.removeprefix("BEHAVIOR_RESULT=") for line in result.stdout.splitlines()
+                          if line.startswith("BEHAVIOR_RESULT="))
+        found = json.loads(output)
+        self.assertEqual(found["senders"], ["you", "tool", "arete"])
+        self.assertEqual(found["first"], "When did APRICOT poll run?")
+        self.assertIsNone(found["second"].get("resume"))
+        for part in ("When did APRICOT poll run?", "Tool: Bash: arete status → poll: last ran 12:00", "The poll ran at noon."):
+            self.assertIn(part, found["second"]["prompt"])
+        self.assertTrue(found["summary"].startswith("SUMMARYMARK"))
+        self.assertIn("SUMMARYMARK", found["third"])
+        self.assertEqual(found["summary_header"]["model"], "haiku")
+        self.assertEqual(found["failed_summary"], "")
+        self.assertEqual(found["failed_last"], "Third answer.")
+        self.assertIn("left out because their summary could not be written", found["failed_prompt"])
+
+
 if __name__ == "__main__":
     unittest.main()

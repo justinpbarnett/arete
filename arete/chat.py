@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import threading
 
-from . import board, config, gh, paths, pipeline, runner, state, util
-from .agent import Result, Session
+from . import board, config, gh, paths, pipeline, record, routing, runner, state, util
+from .agent import Result
 
 CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
 OLD_CHAT_FILE = paths.STATE_DIR / "chat.json"
@@ -11,6 +12,15 @@ MOVED_CHAT_FILE = paths.STATE_DIR / "chat.json.moved"
 BUDGET_USD = 2
 TIMEOUT_SECONDS = 900
 TITLE_CHARS = 120
+SENDER_LABELS = {"you": "You", "arete": "Arete", "tool": "Tool"}
+SUMMARY_BUDGET_USD = 0.25
+SUMMARY_TIMEOUT_SECONDS = 120
+MIN_CUT_CHARS = 6
+MAX_TOOL_NOTES = 30
+NOTE_CHARS = 400
+NOTE_RESULT_CHARS = 200
+NOTE_INPUT_KEYS = ("command", "file_path", "path", "pattern")
+HIDDEN_TOOLS = ("StructuredOutput",)
 RESTARTED = "The dashboard restarted before this answer came back. Send the message again."
 REPLY_SCHEMA = {
     "type": "object",
@@ -68,9 +78,9 @@ def view(chat_id: int) -> dict:
     except config.UnknownRepo:
         repo = None
     return {**summary(row), "folder": folder(row["project"]), "draft": draft_of(row, cfg),
-            "metered": runner.metered(cfg.model("chat"), row["runner"], cfg=cfg, repo=repo,
+            "metered": runner.metered(cfg.model("chat"), cfg=cfg, repo=repo,
                                      tools=[*runner.READ_TOOLS, "Bash"]) if repo else None,
-            "messages": state.chat_messages(chat_id)}
+            "summary": row["summary"], "messages": state.chat_messages(chat_id)}
 
 
 def draft_of(row: dict, cfg: config.Config) -> dict | None:
@@ -116,28 +126,166 @@ def title_of(text: str, limit: int = TITLE_CHARS) -> str:
 
 def send(chat_id: int, text: str) -> dict:
     chat_row(chat_id)
-    if not state.chat_claim(chat_id, text, title_of(text)):
+    message_id = state.chat_claim(chat_id, text, title_of(text))
+    if not message_id:
         raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
     row = chat_row(chat_id)
-    session = Session(row["session"], row["session_spent"], row["runner"])
-    threading.Thread(target=answer, args=(chat_id, text, session, row["project"]), daemon=True).start()
+    threading.Thread(target=answer, args=(chat_id, text, message_id, row["project"]), daemon=True).start()
     return view(chat_id)
 
 
-def answer(chat_id: int, text: str, session: Session, project: str) -> None:
-    reply, cost, paid, draft = "", 0.0, 0.0, None
+def answer(chat_id: int, text: str, message_id: int, project: str) -> None:
+    reply, cost, paid, draft, notes = "", 0.0, 0.0, None, []
     try:
-        result = ask(chat_id, text, session, project)
-        session, cost, paid = result.session, result.cost_usd, result.paid_usd
+        cfg = config.load()
+        prompt, summary_cost, summary_paid = context_for(chat_id, text, message_id, cfg)
+        cost, paid = summary_cost, summary_paid
+        result = ask(chat_id, prompt, project, cfg)
+        cost, paid = cost + result.cost_usd, paid + result.paid_usd
+        notes = tool_notes(result)
         if result.ok:
             reply, draft = reply_and_draft(result)
         else:
             reply = f"The agent stopped: {result.error or result.text}"
     except Exception as e:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
-    state.chat_say(chat_id, "arete", reply, cost, paid_usd=paid,
-                   busy=0, session=session.id, session_spent=session.spent_usd,
-                   runner=session.runner, **({"draft_title": draft["title"], "draft_body": draft["body"]} if draft else {}))
+    state.chat_say(chat_id, "arete", reply, cost, paid_usd=paid, busy=0, before=[("tool", n) for n in notes],
+                   **({"draft_title": draft["title"], "draft_body": draft["body"]} if draft else {}))
+
+
+def render(message: dict) -> str:
+    return f"{SENDER_LABELS.get(message['sender'], 'Arete')}: {message['text']}"
+
+
+def render_all(messages: list[dict]) -> str:
+    return "\n\n".join(render(m) for m in messages)
+
+
+def size_of(*parts: str) -> int:
+    return routing.request_tokens("\n\n".join(p for p in parts if p), "", None)
+
+
+def newest_within(messages: list[dict], limit: int) -> list[dict]:
+    kept: list[dict] = []
+    for message in reversed(messages):
+        if size_of(render_all([message, *kept])) > limit:
+            break
+        kept.insert(0, message)
+    return kept
+
+
+def longest_fit(most: int, fits, least: int = 0) -> int:
+    low, high = least, most
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def cut_to(message: dict, limit: int) -> dict:
+    if size_of(render(message)) <= limit:
+        return message
+    text = message["text"]
+    keep = longest_fit(len(text), lambda n: size_of(render({**message, "text": util.both_ends(text, n)})) <= limit,
+                       MIN_CUT_CHARS)
+    return {**message, "text": util.both_ends(text, keep)}
+
+
+def capped(summary: str, limit: int) -> str:
+    return summary[:longest_fit(len(summary), lambda n: size_of(summary[:n]) <= limit)].rstrip()
+
+
+def batches_of(messages: list[dict], limit: int) -> list[list[dict]]:
+    batches: list[list[dict]] = [[]]
+    for message in messages:
+        cut = cut_to(message, limit)
+        if batches[-1] and size_of(render_all([*batches[-1], cut])) > limit:
+            batches.append([])
+        batches[-1].append(cut)
+    return batches
+
+
+def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config) -> tuple[str, float, float]:
+    cost = paid = 0.0
+    for batch in batches_of(old, cfg.chat.context_tokens):
+        res = runner.run(
+            pipeline.prompt("chat_summary", summary=summary or "(none yet)", messages=render_all(batch)),
+            paths.STATE_DIR, model=cfg.chat.summary_model, tools=[], persist=False,
+            timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=SUMMARY_BUDGET_USD, wait_out_limits=False,
+            trace=("chat", f"chat {chat_id} summary"), cfg=cfg)
+        cost, paid = cost + res.cost_usd, paid + res.paid_usd
+        summary = res.text.strip() if res.ok else ""
+        if not summary:
+            return "", cost, paid
+    return capped(summary, cfg.chat.context_tokens // 4), cost, paid
+
+
+def sections_of(summary: str, shown: list[dict], left_out: int, row: dict, text: str) -> str:
+    draft = f"## The issue draft showing now\n\nTitle: {row['draft_title']}\n\n{row['draft_body']}" if row["draft_title"] else ""
+    if not (summary or shown or left_out or draft):
+        return text
+    earlier = render_all(shown)
+    if left_out:
+        earlier += f"\n\n({left_out} older messages are left out because their summary could not be written.)"
+    return "\n\n".join(s for s in (
+        f"## Summary of the older messages\n\n{summary}" if summary else "",
+        f"## This chat so far\n\n{earlier.strip()}" if earlier.strip() else "",
+        draft, f"## The owner's new message\n\n{text}") if s)
+
+
+def context_for(chat_id: int, text: str, message_id: int, cfg: config.Config) -> tuple[str, float, float]:
+    row = chat_row(chat_id)
+    budget = cfg.chat.context_tokens
+    summary = row["summary"] or ""
+    fresh = [m for m in state.chat_messages(chat_id) if row["summarized_to"] < m["id"] < message_id]
+    if size_of(summary, render_all(fresh)) <= budget:
+        return sections_of(summary, fresh, 0, row, text), 0.0, 0.0
+    recent = newest_within(fresh, budget // 2)
+    old = fresh[:len(fresh) - len(recent)]
+    written, cost, paid = summarize(chat_id, summary, old, cfg) if old else ("", 0.0, 0.0)
+    if written:
+        state.chat_summarize(chat_id, written, old[-1]["id"])
+        return sections_of(written, recent, 0, row, text), cost, paid
+    shown = newest_within(fresh, budget - size_of(summary))
+    return sections_of(summary, shown, len(fresh) - len(shown), row, text), cost, paid
+
+
+def tool_notes(result: Result) -> list[str]:
+    if not result.record:
+        return []
+    calls: dict[str, dict] = {}
+    results: dict[str, dict] = {}
+    try:
+        for event in record.events(paths.record_dir("chat") / result.record):
+            if event.get("kind") == "tool_call" and event.get("name") not in HIDDEN_TOOLS:
+                calls[event.get("id", "")] = event
+            elif event.get("kind") == "tool_result":
+                results[event.get("id", "")] = event
+    except OSError:
+        return []
+    notes = [note_of(call, results.get(at)) for at, call in calls.items()]
+    if len(notes) > MAX_TOOL_NOTES:
+        notes = [*notes[:MAX_TOOL_NOTES], f"{len(notes) - MAX_TOOL_NOTES} more tool calls not kept"]
+    return notes
+
+
+def note_of(call: dict, outcome: dict | None) -> str:
+    note = f"{call.get('name', '')}: {util.one_line(input_text(call.get('input')))}"
+    if outcome:
+        shown = util.one_line(str(outcome.get("text") or ""), NOTE_RESULT_CHARS)
+        note += f" → failed: {shown}" if outcome.get("error") else f" → {shown}"
+    return note[:NOTE_CHARS]
+
+
+def input_text(value) -> str:
+    if isinstance(value, dict):
+        key = next((k for k in NOTE_INPUT_KEYS if isinstance(value.get(k), str)), "")
+        if key:
+            return value[key]
+    return json.dumps(value, separators=(",", ":"), default=str)
 
 
 def reply_and_draft(result: Result) -> tuple[str, dict | None]:
@@ -215,8 +363,7 @@ def project_section(repo: config.Repo) -> str:
                            checks=pipeline.check_list(layer), expertise=expertise or "(none yet)")
 
 
-def ask(chat_id: int, text: str, session: Session, project: str) -> Result:
-    cfg = config.load()
+def ask(chat_id: int, prompt: str, project: str, cfg: config.Config) -> Result:
     model = cfg.model("chat")
     util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends()})
     arete = arete_repo(cfg)
@@ -224,8 +371,9 @@ def ask(chat_id: int, text: str, session: Session, project: str) -> Result:
     github = arete.github
     reads_issues = [f"Bash(gh issue list --repo {github}*)", f"Bash(gh issue view * --repo {github}*)"] if github else []
     return runner.run(
-        text, work.path,
+        prompt, work.path,
         trace=("chat", f"chat {chat_id}"),
+        persist=False,
         cfg=cfg,
         repo=work,
         model=model,
@@ -233,7 +381,6 @@ def ask(chat_id: int, text: str, session: Session, project: str) -> Result:
         allowed_tools=[*runner.READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",
                        "Bash(git show*)", *reads_issues],
         json_schema=REPLY_SCHEMA,
-        resume=session,
         system=pipeline.prompt("chat", code=arete.path, workdir=work.path, config=paths.CONFIG_FILE,
                                state=paths.STATE_DIR, context=CONTEXT_FILE, logs=paths.LOG_DIR,
                                github=github or "(no GitHub repo set)",
