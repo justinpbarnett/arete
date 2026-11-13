@@ -286,7 +286,8 @@ class AgentRun:
             size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
             found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer)
             servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers", {})
-            effective = replace(s, mcp=tuple(dict.fromkeys((*s.mcp, *servers))))
+            bare, denied = runner.reach(kw)
+            effective = replace(s, tools=bare, denied=denied, mcp=tuple(servers))
             picked = routing.select(found, effective, request_tokens=size)
             kw["route"] = routing.described_selection(picked, effective, size)
             if picked.error:

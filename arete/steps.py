@@ -38,16 +38,13 @@ class Settings:
     fallback: bool = True
     instructions_explicit: bool = False
     requires: routing.Requirements = field(default_factory=routing.Requirements)
+    denied: tuple[str, ...] = ()
 
     def effort_on(self, which: str) -> str:
         return routing.nearest_effort(which, self.effort)
 
     def instructions_on(self, which: str) -> tuple[str, ...]:
         return self.instructions if self.instructions_explicit else default_instructions(which)
-
-    @property
-    def denied(self) -> tuple[str, ...]:
-        return ()
 
     @property
     def call(self) -> dict:

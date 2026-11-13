@@ -290,7 +290,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                        accounts.Auth(), {"launch": 1, **({"selection": route} if route else {})}, try_no)
     if not target.remote:
         repo = repo or cfg.repo_for_work_dir(cwd)
-    trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw), resume,
+    size = routing_size(prompt, settings, kw)
+    trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size), resume,
                 remaining_budget, kw.get("max_budget_usd"))
     from . import routing
 
@@ -309,6 +310,11 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             return with_spent(exhausted(trip, skipped, limited, which, name, wake), limited)
         chosen_route = picked.candidate
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
+        final_size = routing_size(text, settings, kw)
+        if (trip.request.requires.declared and final_size > trip.request.size
+                and (why := outgrown(trip, chosen_route, final_size))):
+            trip.barred[routing.route_key(chosen_route)] = why
+            continue
         if resume_only and not session.id:
             return with_spent(Result(ok=False, error=f"the kept session cannot continue on {chosen_route.runner} "
                                                       f"{picked.name}", runner=chosen_route.runner, model=picked.name,
@@ -322,7 +328,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
                  "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
                  "position": chosen_route.position, "requested": chosen_route.requested,
-                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env")), "skipped": skipped, "launch": launches}
+                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env")), "skipped": skipped, "launch": launches,
+                 **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         on_launch(route)
         started = util.iso()
         res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
@@ -366,6 +373,7 @@ class Trip:
     pinned: dict = field(default_factory=dict)
     floors: dict = field(default_factory=dict)
     launched: bool = False
+    barred: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -393,8 +401,16 @@ def reach(kw: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return bare, denied
 
 
+def routing_size(prompt: str, settings, kw: dict) -> int:
+    from . import routing
+
+    if not (settings and settings.requires.declared):
+        return 0
+    return routing.request_tokens(prompt, kw.get("system", ""), kw.get("json_schema"))
+
+
 def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: str, settings, fallback: bool,
-                kw: dict):
+                kw: dict, size: int = 0):
     from . import routing, steps
 
     bare, denied = reach(kw)
@@ -406,7 +422,8 @@ def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: 
     given = kw.get("instructions")
     explicit = (tuple(settings.instructions) if settings.instructions_explicit else None) if settings else (
         None if given is None else tuple(given))
-    if settings and settings.chain and (routing.identity(which, name) == routing.identity(
+    requires = settings.requires if settings else routing.Requirements()
+    if settings and settings.chain and (requires.declared or routing.identity(which, name) == routing.identity(
             settings.chain[0].runner, settings.chain[0].model)):
         chain, allowed = settings.chain, settings.fallback
     else:
@@ -415,7 +432,23 @@ def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: 
         except (ValueError, OSError):
             layer = None
         chain, allowed = steps.chain_for(cfg, layer, which, name, effort, explicit)
-    return routing.Request(chain, allowed and fallback, bare, tuple(servers), effort, explicit, denied)
+    return routing.Request(chain, allowed and fallback, bare, tuple(servers), effort, explicit, denied, requires, size)
+
+
+def outgrown(trip: Trip, chosen, size: int) -> str:
+    from . import routing
+
+    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=layer_of(trip.repo))
+    key = routing.route_key(chosen)
+    again = discovery.routes(replace(trip.request, size=size), request_tokens=size)
+    return next((c.detail for c in again if routing.route_key(c) == key and c.state == "ineligible"), "")
+
+
+def layer_of(repo: config.Repo | None):
+    try:
+        return config.load_layer(repo.layer_dir) if repo else None
+    except (ValueError, OSError):
+        return None
 
 
 def passed_over(found, why: str, detail: str, until: str = "") -> dict:
@@ -426,8 +459,8 @@ def passed_over(found, why: str, detail: str, until: str = "") -> dict:
 def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
     from . import routing
 
-    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target)
-    found = discovery.routes(trip.request)
+    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=layer_of(trip.repo))
+    found = discovery.routes(trip.request, request_tokens=trip.request.size)
     wanted = trip.resume
     if wanted.id and not trip.launched:
         found.sort(key=lambda c: not (c.runner == wanted.runner and (not wanted.credential
@@ -435,6 +468,9 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
     skipped: list[dict] = []
     for candidate in found:
         key = routing.route_key(candidate)
+        if key in trip.barred:
+            skipped.append(passed_over(candidate, "ineligible", trip.barred[key]))
+            continue
         remaining = None
         if candidate.billing == "paid" and candidate.state in ("ready", "held"):
             remaining = trip.budget() if trip.budget else trip.max_budget
@@ -606,7 +642,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
-    if route:
+    if route.get("selection"):
         header["route"] = route
     found = secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg)
     selected = kw.get("selected")

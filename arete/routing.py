@@ -99,6 +99,8 @@ class Request:
     effort: str
     instructions: tuple[str, ...] | None = None
     denied: tuple[str, ...] = ()
+    requires: Requirements = Requirements()
+    size: int = 0
 
     def effort_on(self, which: str) -> str:
         return nearest_effort(which, self.effort)
@@ -647,6 +649,8 @@ def select(found: Discovery, settings, remaining: float | None = None, request_t
     candidates = found.routes(settings, remaining, request_tokens)
     chosen = next((n for n, c in enumerate(candidates)
                    if c.state == "ready" and not (c.requested and c.runner == settings.runner)), None)
+    if chosen is None and any(c.state == "held" for c in candidates):
+        return Selection(None, False, f"requested {settings.model} {why}; waiting on held routes", tuple(candidates))
     if chosen is None:
         tried = "; ".join(f"{c.model} ({c.runner}, {c.credential}): {c.state}: {c.detail}" for c in candidates)
         return Selection(None, False, "", tuple(candidates),
