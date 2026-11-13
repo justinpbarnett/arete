@@ -93,6 +93,8 @@ def stated(value: str) -> str:
 def flaw(item) -> str:
     if not isinstance(item, dict):
         return "the source is not an object"
+    if bad := [key for key in SOURCE_KEYS if not isinstance(item.get(key), str)]:
+        return f"{', '.join(bad)} must be given as a string"
     url, passage = item.get("url"), item.get("passage")
     if not (isinstance(url, str) and web_url(url)):
         return "the URL is not http or https with a host"
@@ -109,7 +111,7 @@ def vetted(answer, limit: int) -> tuple[list[str], list[dict], list[dict]]:
     sources = answer.get("sources")
     if not isinstance(sources, list):
         return ["sources must be a list"], [], []
-    faults = ["notes must be a string"] if "notes" in answer and not isinstance(answer["notes"], str) else []
+    faults = [] if isinstance(answer.get("notes"), str) else ["notes must be given as a string"]
     valid, dropped = [], []
     for item in sources:
         if why := flaw(item):
@@ -157,7 +159,8 @@ def work(cfg: config.Config, s: steps.Settings, plan: dict, ref: str, n: int, cw
                              json_schema=RESULT_SCHEMA, max_budget_usd=remaining, timeout=int(left), persist=False,
                              wait_out_limits=False,
                              remaining_budget=lambda amount=remaining: 0.0 if which in ("claude", "codex") else amount,
-                             tier=s.tier, trace=("", f"research {ref} task {n} search"), cfg=cfg)
+                             tier=s.tier, trace=("", f"research {ref} task {n} search"), cfg=cfg, settings=s,
+                             fallback=False)
         except Exception as e:
             fatal = (f"a search call failed with {util.first_line(str(e)) or type(e).__name__}, so its charge is "
                      f"unknown; known prior spend is {util.money(paid)} on this worker")
@@ -172,6 +175,9 @@ def work(cfg: config.Config, s: steps.Settings, plan: dict, ref: str, n: int, cw
         paid = research_plan.plus(paid, res.paid_usd)
         if dec(paid) > dec(allowance):
             fatal = "a search worker exceeded its allowance; its incurred cost is recorded"
+            break
+        if time.monotonic() > deadline:
+            fatal = "a search worker exceeded its share of the search deadline"
             break
         if res.usage_limit:
             limited = "a usage limit stopped the search"
@@ -230,6 +236,11 @@ def collect(outcomes: dict[int, Outcome], ids: dict[str, str]) -> list[dict]:
     return sorted(sources.values(), key=lambda source: int(source["id"][1:]))
 
 
+def whole(state) -> bool:
+    text = state if isinstance(state, str) else json.dumps(state, default=str)
+    return len(text) <= jev.STATE_CHARS
+
+
 def screen(cfg: config.Config, ref: str, judged: bool, items: list[tuple[object, dict]]) -> None:
     if not items:
         return
@@ -239,9 +250,12 @@ def screen(cfg: config.Config, ref: str, judged: bool, items: list[tuple[object,
         print(f"{util.iso()} {ref}: JEV is off, so search notes go on unscreened", flush=True)
         return
     questions = {"injection": jev.yes_no(jev.INJECTION)}
-    replies = jev.ask_many([(state, questions) for state, _ in items], cfg, trace=("", f"research {ref} notes jev"))
-    for (_, target), reply in zip(items, replies):
-        answer = reply.answers.get("injection")
+    fits = [whole(state) for state, _ in items]
+    sent = [item for item, fit in zip(items, fits) if fit]
+    replies = iter(jev.ask_many([(state, questions) for state, _ in sent], cfg,
+                                trace=("", f"research {ref} notes jev")) if sent else [])
+    for (_, target), fit in zip(items, fits):
+        answer = next(replies).answers.get("injection") if fit else None
         if answer is None:
             target.update(status="failed", p=None)
         else:
@@ -396,7 +410,7 @@ def brief(plan: dict, evidence: dict) -> str:
              if w["notes"] and w["notes_screen"]["status"] in PASSED_ON]
     tasks = "\n".join(f"{w['task']}. {w['goal']} ({w['status']}; sources: {', '.join(w['sources']) or 'none'})"
                       for w in evidence["workers"])
-    gaps = [f"- task {w['task']} {w['status']}: {w['goal']}" + (f" ({w['error']})" if w["error"] else "")
+    gaps = [f"- task {w['task']} {w['status']}: {w['goal']}"
             for w in evidence["workers"] if w["status"] != "ok"]
     if withheld := evidence["totals"]["withheld"]:
         gaps.append(f"- {util.count(withheld, 'note')} withheld by the injection screen and not shown")
