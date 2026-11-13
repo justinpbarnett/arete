@@ -406,7 +406,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     tries INTEGER DEFAULT 0,
     retry_at TEXT DEFAULT '',
     decided_count INTEGER DEFAULT 0,
-    shapes TEXT DEFAULT ''
+    shapes TEXT DEFAULT '',
+    policies TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -458,7 +459,7 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("decision", "TEXT DEFAULT ''"), ("confidence", "REAL DEFAULT 0"), ("reason", "TEXT DEFAULT ''"),
                   ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
                   ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
-                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"))]]
+                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"))]]
 
 
 @contextmanager
@@ -770,7 +771,7 @@ def prune(days: float = 14) -> None:
 
 
 def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signature: str, count: int,
-                   evidence: str) -> tuple[int, bool]:
+                   evidence: str, policies: str) -> tuple[int, bool]:
     now = util.iso()
     row = c.execute("SELECT id, count FROM incidents WHERE state = 'open' AND (fingerprint = ? OR id IN "
                     "(SELECT incident FROM incident_aliases WHERE fingerprint = ?)) ORDER BY fingerprint = ? DESC "
@@ -782,8 +783,9 @@ def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signa
         opened, incident_id = False, row["id"]
     else:
         incident_id = c.execute("INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, "
-                                "last_seen, count, evidence) VALUES (?,?,?,?,?,?,?,?,?)",
-                                (fingerprint, kind, source, repo, signature, now, now, count, evidence)).lastrowid
+                                "last_seen, count, evidence, policies) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                (fingerprint, kind, source, repo, signature, now, now, count, evidence,
+                                 policies)).lastrowid
         note, opened = f"opened: {kind}, {count} from {source}", True
     c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, now, note))
     return incident_id, opened
@@ -836,11 +838,13 @@ def incidents_to_decide() -> list[dict]:
             "AND decision IN ('', 'ignore') ORDER BY id")]
 
 
-def known_fingerprints() -> dict[str, str]:
+def known_fingerprints() -> dict[str, dict]:
     with db() as c:
-        held = {r[0]: r[1] for r in c.execute("SELECT a.fingerprint, i.source FROM incident_aliases a JOIN incidents i "
-                                              "ON i.id = a.incident WHERE i.state = 'open'")}
-        held.update((r[0], r[1]) for r in c.execute("SELECT fingerprint, source FROM incidents WHERE state = 'open'"))
+        held = {r[0]: {"source": r[1], "policies": r[2]} for r in c.execute(
+            "SELECT a.fingerprint, i.source, i.policies FROM incident_aliases a JOIN incidents i "
+            "ON i.id = a.incident WHERE i.state = 'open'")}
+        held.update((r[0], {"source": r[1], "policies": r[2]}) for r in c.execute(
+            "SELECT fingerprint, source, policies FROM incidents WHERE state = 'open'"))
         return held
 
 

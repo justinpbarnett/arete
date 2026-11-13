@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fnmatch
 import glob
 import hashlib
 import json
@@ -55,6 +54,7 @@ URL_ONLY_END = re.compile(r"\] done: failed https?://\S+$")
 TRACEBACK = "Traceback (most recent call last):"
 CHAINED = re.compile(r"During handling of the above exception|The above exception was the direct cause")
 REPAIR_STEPS = ("check_repair", "review_repair", "ci_repair")
+NO_TEXT = frozenset({("", "")})
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,7 @@ class Event:
     repo: str
     window: list[str]
     count: int = 1
+    rule: frozenset[tuple[str, str]] = frozenset()
 
 
 def digest(name: str, end: int) -> str | None:
@@ -353,30 +354,40 @@ class Policies:
         for entry, files in self.files:
             for name in files:
                 self.entries.setdefault(self.named.setdefault(name, identity(name) or name), []).append(entry)
-        self.every = frozenset(entry_policy(cfg, s) for s in cfg.oncall.sources)
+        self.every = frozenset({entry_policy(cfg), *(entry_policy(cfg, s) for s in cfg.oncall.sources)})
 
-    def matching(self, source: str) -> tuple[list[config.OncallSource], bool]:
-        key = self.named.get(source) or identity(source)
-        if key is not None:
-            return self.entries.get(key, []), True
-        spelled = [s for s in self.cfg.oncall.sources if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))]
-        if not spelled and not os.path.isabs(source):
-            return [], True
-        could = self.every if spelled else self.every | {entry_policy(self.cfg)}
-        return spelled, len(could) == 1
-
-    def text(self, source: str) -> tuple[str, str]:
-        return entry_policy(self.cfg, next(iter(self.matching(source)[0]), None))
+    def of_file(self, name: str) -> frozenset[tuple[str, str]]:
+        key = self.named.get(name) or identity(name)
+        if key is None:
+            return self.every if len(self.every) == 1 else frozenset()
+        return frozenset({entry_policy(self.cfg, s) for s in self.entries.get(key, [])} or {entry_policy(self.cfg)})
 
     def of(self, source: str) -> frozenset[tuple[str, str]]:
-        found, sure = self.matching(source)
-        if not sure:
-            return frozenset()
-        return frozenset({entry_policy(self.cfg, s) for s in found} or {entry_policy(self.cfg)})
+        if os.path.isabs(source) or source in self.named or identity(source):
+            return self.of_file(source)
+        return frozenset({entry_policy(self.cfg)})
+
+    def opened(self, row: dict) -> frozenset[tuple[str, str]]:
+        return NO_TEXT if row.get("policies") is None else unpacked(row["policies"])
+
+    def standing(self, row: dict) -> frozenset[tuple[str, str]] | None:
+        rule = self.opened(row)
+        return rule if self.of(row["source"]) == rule else None
+
+    def text(self, row: dict) -> tuple[str, str]:
+        return min(self.opened(row), default=entry_policy(self.cfg))
+
+
+def packed(rule: frozenset[tuple[str, str]]) -> str:
+    return json.dumps(sorted(rule))
+
+
+def unpacked(text: str) -> frozenset[tuple[str, str]]:
+    return frozenset((str(vision), str(scope)) for vision, scope in json.loads(text))
 
 
 def bounded(scope: str, rule: frozenset[tuple[str, str]]) -> str:
-    return f"{scope}\n{json.dumps(sorted(rule))}"
+    return f"{scope}\n{packed(rule)}"
 
 
 def fingerprint_of(kind: str, scope: str, signature: str) -> str:
@@ -384,7 +395,7 @@ def fingerprint_of(kind: str, scope: str, signature: str) -> str:
 
 
 def questions(policies: Policies, incident: dict) -> dict[str, dict]:
-    vision, scope = policies.text(incident["source"])
+    vision, scope = policies.text(incident)
     asking = {"injection": jev.yes_no(jev.INJECTION), "actionable": jev.yes_no(ACTIONABLE)}
     if vision:
         asking["vision"] = jev.yes_no(VISION.format(text=vision))
@@ -448,11 +459,14 @@ def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, policies: Polici
         if not a.sure(line):
             return UNSURE, a.confidence, f"{name} is uncertain ({a.note()})", answers, 0
     least = min(a.confidence for a in got.values())
-    rule = policies.of(row["source"])
+    rule = policies.opened(row)
     if not rule:
         why = "its file is gone, so which [[oncall.source]] vision and scope apply cannot be told; the owner decides"
         return UNSURE, least, why, answers, 0
-    for name, text in zip(("vision", "scope"), policies.text(row["source"]), strict=True):
+    if not rule <= policies.every:
+        why = "the vision or scope its file was under when read is no longer in the config, so the owner decides"
+        return UNSURE, least, why, answers, 0
+    for name, text in zip(("vision", "scope"), policies.text(row), strict=True):
         if not text:
             return UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0
     if len(rule) > 1:
@@ -544,16 +558,16 @@ def decision_line(row: dict) -> str:
     return f"{row['decision']} {row['confidence']:.2f}{mark}: {row['reason']}"
 
 
-def known_twins(cfg: config.Config, policies: Policies, rows: list[tuple], known: dict[str, str],
+def known_twins(cfg: config.Config, policies: Policies, rows: list[tuple], known: dict[str, dict],
                 budget: int = MAX_ASKS) -> tuple[list, dict, int]:
     open_rows = [r for r in state.open_incidents() if not r["injection"]]
     line, injection_line = thresholds(cfg)
     fresh, candidates = [], []
     homes = {r["id"]: origin_repo(r["source"], r["repo"]) for r in open_rows}
-    rules = {r["id"]: policies.of(r["source"]) for r in open_rows}
+    rules = {r["id"]: policies.standing(r) for r in open_rows}
     for row in rows:
         home = origin_repo(row[2], row[3])
-        rule = policies.of(row[2])
+        rule = unpacked(row[7])
         same = [r for r in open_rows if homes[r["id"]] == home and rules[r["id"]] == rule][:TWINS_OFFERED]
         if (row[0] not in known and rule and same and not refused(cfg, home)
                 and not owner_run({"class": row[1], "source": row[2], "evidence": row[6]})):
@@ -596,16 +610,17 @@ class Watch:
         self.cursors: list[tuple[str, str, bool, str]] = []
 
     def add(self, kind: str, scope: str, text: str, source: str, repo: str, window: list[str],
-            count: int = 1) -> None:
+            count: int = 1, rule: frozenset[tuple[str, str]] | None = None) -> None:
         key = (kind, scope, sources.signature(text))
         if key in self.found:
             self.found[key].count += count
         else:
-            self.found[key] = Event(kind, scope, text, source, repo, window, count)
+            read = self.policies.of(source) if rule is None else rule
+            self.found[key] = Event(kind, scope, text, source, repo, window, count, read)
 
     def consider(self, name: str, rows: list[str], origin: Origin) -> None:
         self.lines += len(rows)
-        rule = self.policies.of(name)
+        rule = self.policies.of_file(name)
         policy_scope = origin.scope if rule == origin.home else bounded(origin.scope, rule)
         i = 0
         while i < len(rows):
@@ -633,7 +648,7 @@ class Watch:
                 repo = (state.run_get(str(row["run"])) or {}).get("repo") or ""
                 if repo:
                     scope = f"{policy_scope}:{repo}"
-            self.add(classify(text, row), scope, text, name, repo, window)
+            self.add(classify(text, row), scope, text, name, repo, window, rule=rule)
 
     def follow(self, group: str, watched: list[str], origin: Origin) -> None:
         stored, marks = cursor_value(PREFIX + group)
@@ -710,12 +725,12 @@ class Watch:
             if e.kind == ORCHESTRATION:
                 signature = signature.removeprefix("<time> ")
             evidence = outbound.redact(record.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
-            scope, rule = e.scope, self.policies.of(e.source)
+            scope = e.scope
             fingerprint = fingerprint_of(e.kind, scope, signature)
-            while fingerprint in held and self.policies.of(held[fingerprint]) != rule:
-                scope = bounded(scope, rule)
+            while fingerprint in held and self.policies.standing(held[fingerprint]) != e.rule:
+                scope = bounded(scope, e.rule)
                 fingerprint = fingerprint_of(e.kind, scope, signature)
-            rows.append((fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence))
+            rows.append((fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence, packed(e.rule)))
         matched, marks, self.asks = known_twins(self.cfg, self.policies, rows, held)
         opened = sum(state.commit_scan(rows, self.cursors, matched, marks))
         return opened, len(events) - opened, len(self.found) - len(events)

@@ -984,8 +984,10 @@ class Decisions(Scratch):
         self.baseline()
         columns = ("fingerprint, class, source, repo, signature, first_seen, last_seen, count, evidence, "
                    "decision, confidence, reason, decided_count")
-        self.sql(f"INSERT INTO incidents ({columns}) VALUES ('old', 'unexpected', 'app.log', '', 'old undecided', "
-                 "'2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 1, 'OLD EVIDENCE worker died', '', 0.0, '', 0)")
+        policy = json.dumps([["A payments service that must stay up", "Bug fixes in the payment worker only"]])
+        self.sql(f"INSERT INTO incidents ({columns}, policies) VALUES ('old', 'unexpected', 'app.log', '', "
+                 "'old undecided', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 1, 'OLD EVIDENCE worker died', "
+                 "'', 0.0, '', 0, ?)", policy)
         self.sql("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) "
                  f"INSERT INTO incidents ({columns}) SELECT 'n' || i, 'unexpected', 'app.log', '', 'newer ' || i, "
                  "?, ?, 1, 'e', 'wake', 0.9, 'r', 1 FROM n", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z")
@@ -1282,7 +1284,7 @@ class Decisions(Scratch):
         self.assertEqual(decisions, {"unsure": 2})
         self.assertEqual(len(reasons), 2)
         for reason in reasons:
-            self.assertIn("gone", reason)
+            self.assertIn("more than one", reason)
 
     def test_a_file_reached_through_a_symlink_and_gone_before_its_decision_is_unsure(self):
         app = self.two_logs()
@@ -1315,6 +1317,70 @@ class Decisions(Scratch):
         self.scanned()
         self.assertEqual(self.sql("SELECT source, count FROM incidents ORDER BY id"),
                          [(str(gone), 1), (str(worker), 1)])
+
+    def undecided_then_changed(self, to, change, expected):
+        self.scanned()
+        self.append("2026-11-13T10:06:30Z INFO failing context",
+                    self.failure_line("payments ledger write failed: KeyError"), to=to)
+        self.assertEqual(self.scanned({"failing context": {"error": "HTTP 503"}})["decisions"],
+                         {"undecided": expected})
+        self.calls()
+        change()
+        self.sql("UPDATE incidents SET retry_at = ''")
+        return self.scanned()["decisions"]
+
+    def test_a_gone_arete_log_is_decided_under_oncall_though_an_entry_glob_spells_its_path(self):
+        base = Path(self.tmp.name)
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{base}/*.log"\nscope = "Only the mailer module"\n')
+        self.append("2026-11-13T10:00:00Z INFO started")
+        self.assertEqual(self.undecided_then_changed(self.log, self.log.unlink, 1), {"wake": 1})
+        (batch,) = self.calls()
+        self.assertIn("payment worker", batch[0]["instructions"]["scope"])
+
+    def test_a_file_reached_through_a_hard_link_and_rotated_stays_under_both_policies(self):
+        app = self.two_logs()
+        alias = Path(self.tmp.name) / "alias"
+        alias.mkdir()
+        mailer = app / "mailer.log"
+        os.link(mailer, alias / "mailer.log")
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{alias / "mailer.log"}"\nscope = "Only the mailer module"\n')
+
+        def rotated():
+            mailer.rename(app / "mailer.log.1")
+            mailer.write_text("2026-11-13T10:08:00Z INFO reopened\n")
+        self.assertEqual(self.undecided_then_changed(mailer, rotated, 2), {"unsure": 2})
+        for (reason,) in self.sql("SELECT reason FROM incidents"):
+            self.assertIn("more than one", reason)
+
+    def test_a_symlink_repointed_after_its_lines_were_read_stays_under_both_policies(self):
+        app = self.two_logs()
+        other = Path(self.tmp.name) / "other.log"
+        other.write_text("2026-11-13T10:00:00Z INFO started\n")
+        link = Path(self.tmp.name) / "current.log"
+        link.symlink_to(app / "mailer.log")
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{link}"\nscope = "Only the mailer module"\n')
+
+        def repointed():
+            link.unlink()
+            link.symlink_to(other)
+        self.assertEqual(self.undecided_then_changed(app / "mailer.log", repointed, 2), {"unsure": 2})
+
+    def test_an_incident_opened_before_vision_and_scope_existed_is_unsure(self):
+        self.baseline()
+        self.sql("INSERT INTO incidents (fingerprint, class, source, first_seen, last_seen, evidence) VALUES "
+                 "('old', 'unexpected', ?, '2026-11-13T10:00:00Z', '2026-11-13T10:00:00Z', 'worker died')",
+                 str(self.log))
+        self.assertEqual(self.scanned()["decisions"], {"unsure": 1})
+        self.assertIn("no longer in the config", self.only()["reason"])
+
+    def test_an_incident_whose_scope_left_the_config_before_its_decision_is_unsure(self):
+        self.append("2026-11-13T10:00:00Z INFO started")
+        narrowed = DECIDING.replace("Bug fixes in the payment worker only", "Only the ledger")
+        decisions = self.undecided_then_changed(self.log, lambda: self.write_config(narrowed), 1)
+        self.assertEqual(decisions, {"unsure": 1})
+        self.assertIn("no longer in the config", self.only()["reason"])
 
 
 if __name__ == "__main__":

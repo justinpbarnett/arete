@@ -82,8 +82,10 @@ When on, serve scans on its tick, on the poll pool, so a slow scan never blocks 
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
 `repo` and `check` are recorded for a later repair part and start nothing now.
 When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is still asked, and a result that would be `wake` is stored as `unsure` for the owner.
-An entry matches a file when its glob finds that file by any path, so a symlink or another letter case names the same file.
-When the file is gone by the time its incident is decided, the entries that match it cannot be told, so a result that would be `wake` is stored as `unsure`, unless every entry that could match it has the same text.
+An entry matches a file when its glob finds that file by any path, so a symlink, a hard link or another letter case names the same file.
+An incident keeps the set of `vision` and `scope` its file was under when its lines were read and is decided under that set, so a file deleted, rotated or reached through a repointed link before the decision changes nothing.
+Lines read from the rotated copy of a file that is gone have no file to match, so a result that would be `wake` is stored as `unsure`, unless the config holds only one set.
+A result that would be `wake` is also stored as `unsure` when the set an incident was read under is no longer in the config, as for an incident opened before `vision` and `scope` existed.
 
 **Sources.** Arete's own files are watched without being listed: the `*.log` files in the log folder, each live run's `run.jsonl`, `heartbeat.json` and serve's beat file.
 Other application or service logs are watched only when listed as `[[oncall.source]]`.
@@ -109,10 +111,10 @@ Each event then gets a class without a model:
 
 Expected events are counted and open no incident.
 
-**Incidents.** The `incidents` table holds the fingerprint, class, source, state, first and last occurrence, count and evidence.
+**Incidents.** The `incidents` table holds the fingerprint, class, source, state, first and last occurrence, count, evidence and the set of `vision` and `scope` its lines were read under.
 A repeat of an open incident's fingerprint, minutes or hours later, updates it instead of opening another.
 A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
-The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines from files under the same set as its own file, and by no other file once its own file is gone and that set cannot be told.
+The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines read under the set it was opened under, and only while its own file is still under that set, or, once that file is gone, while the config holds no other set.
 The append-only `incident_notes` table records what happened and when.
 Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
 
@@ -130,7 +132,7 @@ The evidence is redacted before it is stored and is sent fenced as data. It is n
 | `wake` | Every question was answered with confidence: actionable, fits the vision, in scope. It may later wake a repair. |
 | `ignore` | A confident "no" to `actionable`, `vision` or `scope`. |
 | `ignore` with the injection mark | The evidence reads as instructions to an agent. It is never asked again and can never wake a model. |
-| `unsure` | An answer was under the confidence line, no vision or scope is set, more than one source entry with different text applies to the file, or the file is gone and more than one could. It never wakes a model; the owner decides. |
+| `unsure` | An answer was under the confidence line, no vision or scope is set, more than one source entry with different text applied to the file when its lines were read, the lines came from a gone file's rotated copy while the config holds more than one set, or the set has left the config since. It never wakes a model; the owner decides. |
 | undecided | JEV is off, has no key, is not allowed for the incident's repo or the call failed. The reason is stored and nothing wakes. |
 
 Each decision is stored on the incident with every answer's value and confidence and a one-line reason, and added to its notes.
