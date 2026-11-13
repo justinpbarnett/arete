@@ -15,9 +15,10 @@ MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop
 STEP_ALIASES = {"implement": "build"}
 STEP_NAMES = (*MODEL_ROLES, *STEP_ALIASES)
 STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
-             "session")
-STEP_COUNTS = ("timeout_minutes", "tries")
-STEP_LISTS = ("tools", "mcp", "instructions")
+             "session", "modalities", "min_context", "structured_output", "data_handling", "floor")
+STEP_COUNTS = ("timeout_minutes", "tries", "min_context")
+STEP_LISTS = ("tools", "mcp", "instructions", "modalities", "data_handling")
+CAPABILITY_KEYS = ("modalities", "context", "structured_output", "data_handling")
 INSTRUCTIONS = ("user", "repo")
 SESSIONS = ("resume", "fresh")
 MCP_KEYS = ("command", "args", "url")
@@ -165,6 +166,8 @@ class Config:
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     tier_map: str = ""
     routing_fallback: bool = True
+    capabilities: dict[str, dict] = field(default_factory=dict)
+    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
     payment_modes: tuple[str, ...] = PAYMENT_MODES
     adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
@@ -235,7 +238,10 @@ def step_table(table, where: str) -> dict:
         raise ValueError(f"[{where}]: instructions {', '.join(map(repr, bad))} is not one of {', '.join(INSTRUCTIONS)}")
     if "session" in table and table["session"] not in SESSIONS:
         raise ValueError(f"[{where}]: session {table['session']!r} is not one of {', '.join(SESSIONS)}")
-    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else v if k in STEP_COUNTS else str(v) for k, v in table.items()}
+    if "structured_output" in table and type(table["structured_output"]) is not bool:
+        raise ValueError(f"[{where}]: structured_output must be true or false, not {table['structured_output']!r}")
+    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else v if k in STEP_COUNTS or type(v) is bool else str(v)
+            for k, v in table.items()}
 
 
 def mcp_tables(data) -> dict[str, dict]:
@@ -308,21 +314,54 @@ def tier_maps(data, where: str) -> dict[str, dict[str, tuple[dict[str, str], ...
     return maps
 
 
-def routing_table(data) -> tuple[bool, tuple[str, ...] | None]:
+@dataclass(frozen=True)
+class Routing:
+    fallback: bool = True
+    capabilities: dict[str, dict] = field(default_factory=dict)
+    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    payment_modes: tuple[str, ...] | None = None
+
+
+def capability_table(key: str, table) -> dict:
+    where = f"[routing.capabilities.{key}]"
+    table = table_of(table, f"routing.capabilities.{key}")
+    if bad := sorted(set(table) - set(CAPABILITY_KEYS)):
+        raise ValueError(f"{where}: unknown key {', '.join(bad)}; use {', '.join(CAPABILITY_KEYS)}")
+    found = table.get("modalities", [])
+    if not (isinstance(found, list) and all(isinstance(v, str) and v for v in found)):
+        raise ValueError(f"{where}: modalities must be a list of names, not {found!r}")
+    if "context" in table and (type(table["context"]) is not int or table["context"] < 1):
+        raise ValueError(f"{where}: context must be a whole number of at least 1, not {table['context']!r}")
+    if "structured_output" in table and type(table["structured_output"]) is not bool:
+        raise ValueError(f"{where}: structured_output must be true or false, not {table['structured_output']!r}")
+    if "data_handling" in table and not (isinstance(table["data_handling"], str) and table["data_handling"]):
+        raise ValueError(f"{where}: data_handling must be one label, not {table['data_handling']!r}")
+    return {**table, **({"modalities": tuple(dict.fromkeys(found))} if "modalities" in table else {})}
+
+
+def routing_table(data) -> Routing:
     table = table_of(data, "routing")
-    if bad := sorted(set(table) - {"fallback", "payment_modes"}):
-        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, payment_modes")
+    if bad := sorted(set(table) - {"fallback", "payment_modes", "capabilities", "floors"}):
+        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, payment_modes, capabilities, floors")
     value = table.get("fallback", True)
     if type(value) is not bool:
         raise ValueError(f"[routing] fallback must be true or false, not {value!r}")
+    capabilities = {str(key): capability_table(str(key), entry)
+                    for key, entry in table_of(table.get("capabilities", {}), "routing.capabilities").items()}
+    floors = {}
+    for name, models in table_of(table.get("floors", {}), "routing.floors").items():
+        if not (isinstance(models, list) and models and all(isinstance(m, str) and m for m in models)):
+            raise ValueError(f"[routing.floors] {name}: must be a nonempty list of model names, not {models!r}")
+        floors[str(name)] = tuple(dict.fromkeys(models))
     modes = table.get("payment_modes")
-    if modes is None:
-        return value, None
-    if (not isinstance(modes, list) or not modes or not all(isinstance(m, str) and m in PAYMENT_MODES for m in modes)
-            or len(set(modes)) != len(modes)):
-        raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
-                         f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
-    return value, tuple(modes)
+    if modes is not None:
+        if (not isinstance(modes, list) or not modes
+                or not all(isinstance(m, str) and m in PAYMENT_MODES for m in modes)
+                or len(set(modes)) != len(modes)):
+            raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
+                             f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
+        modes = tuple(modes)
+    return Routing(value, capabilities, floors, modes)
 
 
 def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[str, ...]:
@@ -415,8 +454,9 @@ def load(path: Path | None = None) -> Config:
     cfg.pricing = {str(m): tuple(price_rate(r[k], f"[pricing.models.{m}] {k}") if k in r else None
                                 for k in ("input", "output"))
                    for m, r in (pricing.get("models") or {}).items()}
-    cfg.routing_fallback, modes = routing_table(data.get("routing", {}))
-    cfg.payment_modes = modes or PAYMENT_MODES
+    found = routing_table(data.get("routing", {}))
+    cfg.routing_fallback, cfg.capabilities, cfg.floors = found.fallback, found.capabilities, found.floors
+    cfg.payment_modes = found.payment_modes or PAYMENT_MODES
     j = data.get("jira", {})
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
@@ -572,6 +612,8 @@ class RepoLayer:
     research_dir: str = ""
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     routing_fallback: bool = True
+    capabilities: dict[str, dict] = field(default_factory=dict)
+    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
     payment_modes: tuple[str, ...] | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
@@ -632,7 +674,9 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")
     layer.tiers = tier_maps(section(data, "tiers"), "tiers")
-    layer.routing_fallback, layer.payment_modes = routing_table(section(data, "routing"))
+    found = routing_table(section(data, "routing"))
+    layer.routing_fallback, layer.capabilities, layer.floors = found.fallback, found.capabilities, found.floors
+    layer.payment_modes = found.payment_modes
     layer.steps = step_tables(section(data, "steps"), "steps")
     layer.kinds = kind_tables(section(data, "kinds"), "kinds")
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
