@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import os
@@ -12,7 +13,7 @@ import unittest
 from unittest import mock
 
 import arete
-from arete import config, pipeline, verify
+from arete import config, devices, gh, pipeline, sessions, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -570,6 +571,205 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
         self.assertEqual(self.record(a)["state"], "pending")
         self.assertTrue(Path(a.root).exists())
+
+
+class RemoteSessionTests(unittest.TestCase):
+    SESSION = r'''
+import contextlib, json, os, subprocess, sys, urllib.request
+from pathlib import Path
+from arete import config, devices, gh, record, sessions, state, util
+root = Path(sys.argv[1])
+VALUE = "fake-clone-value-0001"
+def git(*args, cwd):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+hub, seed, here, home = root / "hub.git", root / "seed", root / "controller", root / "device"
+home.mkdir()
+subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(hub)], check=True)
+git("clone", "-q", str(hub), str(seed), cwd=root)
+(seed / "a.txt").write_text("one\n")
+git("add", "-A", cwd=seed)
+git("commit", "-q", "-m", "first", cwd=seed)
+git("push", "-q", "origin", "HEAD:main", cwd=seed)
+git("clone", "-q", str(hub), str(here), cwd=root)
+(root / "app-key").write_text("not a key\n")
+calls, pushes, asked = [], [], []
+scenario = sys.argv[2]
+class Reply:
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def read(self):
+        return json.dumps({"token": VALUE, "permissions": {"contents": "read"}, "repository_selection": "selected",
+                           "repositories": [{"full_name": "octo/widgets"}]}).encode()
+urllib.request.urlopen = lambda request, timeout=None: asked.append(json.loads(request.data)) or Reply()
+gh.key_signature = lambda app, text: b"signature"
+gh.default_branch = lambda repo: "main"
+real_sh = util.sh
+def sh(cmd, *a, **k):
+    if not (isinstance(cmd, list) and cmd[:1] == ["ssh"]):
+        if "push" in cmd:
+            pushes.append(cmd)
+        return real_sh(cmd, *a, **k)
+    calls.append(cmd[-1])
+    if scenario == "bundle-fails" and "git bundle create" in cmd[-1]:
+        return subprocess.CompletedProcess(cmd, 1, "", "fatal: the device went away")
+    script = cmd[-1].replace("https://github.com/octo/widgets.git", hub.as_uri())
+    script = script.replace("GIT_ALLOW_PROTOCOL=https", "GIT_ALLOW_PROTOCOL=https:file")
+    env = {"PATH": os.environ["PATH"], "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"}
+    return subprocess.run(["sh", "-c", script], cwd=home, env=env, input=k.get("input") or "", capture_output=True, text=True)
+util.sh = sh
+box = devices.Device("box", "ssh", host="dev@box.test", dir=str(home / "work"))
+devices.get = lambda name: box
+cfg = config.Config(repos=[config.Repo("widgets", here, github="octo/widgets")], session_idle_hours=0,
+                    github_app=config.GithubApp("12345", "67890", root / "app-key"))
+config.load = lambda path=None: cfg
+def take_turn(spec, cfg, device, prompt, turn, resume):
+    (Path(spec.cwd) / "notes.txt").write_text("from the device\n")
+    return resume
+sessions.take_turn = take_turn
+repo = sessions.repo_named("widgets", box, cfg)
+spec = sessions.Spec("ses-remote", "hello", device="box", repo="widgets")
+sessions.workspace(spec, box, repo)
+sessions.save_spec(spec)
+record.start("session", run_id=spec.id, lock=sessions.session_lock(spec.id), pid=None, device="box")
+status = sessions.execute(spec.id)
+tip = git("rev-parse", "session/ses-remote", cwd=Path(spec.cwd))
+on_hub = subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/heads/session/ses-remote"], cwd=hub, capture_output=True, text=True)
+saved = sessions.load_spec(spec.id)
+print(json.dumps({"status": status, "hub": on_hub.stdout.strip(), "tip": tip, "asked": asked,
+                  "tree": git("ls-tree", "-r", "--name-only", tip, cwd=Path(spec.cwd)).split(), "calls": calls,
+                  "pushes": pushes, "pushed": saved.pushed, "unreturned": saved.unreturned,
+                  "summary": state.run_get(spec.id)["summary"],
+                  "leaks": [str(f) for d in ("state", "logs") for f in (root / d).rglob("*")
+                            if f.is_file() and VALUE.encode() in f.read_bytes()]}))
+'''
+
+    def test_app_jwt_verifies_with_the_public_key(self):
+        from arete import gh
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key, pub = root / "key.pem", root / "pub.pem"
+            subprocess.run(["openssl", "genrsa", "-out", str(key), "2048"], check=True, capture_output=True)
+            subprocess.run(["openssl", "rsa", "-in", str(key), "-pubout", "-out", str(pub)], check=True, capture_output=True)
+            token = gh.app_jwt(config.GithubApp("12345", "67890", key))
+            head, claims, signature = token.split(".")
+            (root / "signed").write_text(f"{head}.{claims}")
+            (root / "sig").write_bytes(base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4)))
+            checked = subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(pub), "-signature", str(root / "sig"),
+                                      str(root / "signed")], capture_output=True, text=True)
+            self.assertIn("Verified OK", checked.stdout)
+
+    def session(self, scenario):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            run = subprocess.run([sys.executable, "-c", self.SESSION, str(root), scenario], cwd=SOURCE, env=env,
+                                 capture_output=True, text=True, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+            return json.loads(run.stdout.strip().splitlines()[-1])
+
+    def test_work_returns_through_the_controller_and_the_device_never_pushes(self):
+        out = self.session("normal")
+        self.assertEqual(out["status"], "done")
+        self.assertEqual(out["hub"], out["tip"])
+        self.assertEqual(out["pushed"], out["tip"])
+        self.assertEqual(out["tree"], ["a.txt", "notes.txt"])
+        self.assertEqual(out["asked"], [{"repositories": ["widgets"], "permissions": {"contents": "read"}}])
+        self.assertEqual(len(out["pushes"]), 1)
+        self.assertFalse([c for c in out["calls"] if " push" in c])
+        self.assertEqual(out["leaks"], [])
+
+    def test_a_failed_bring_back_fails_the_session_and_keeps_the_device(self):
+        out = self.session("bundle-fails")
+        self.assertEqual(out["status"], "failed")
+        self.assertEqual((out["hub"], out["pushes"]), ("", []))
+        self.assertIn("device went away", out["unreturned"])
+        self.assertIn("did not come back", out["summary"])
+        kept, log, forgotten = SimpleNamespace(device=SimpleNamespace(keep=False), name="vm", delete_command=lambda: "rm"), [], []
+        with mock.patch.object(devices.state, "forget_vm", forgotten.append), \
+                mock.patch.object(devices, "delete_or_say_why", side_effect=AssertionError("deleted")):
+            with devices.kept_or_deleted(kept, log.append, lambda: "the work is not back"):
+                pass
+        self.assertEqual((forgotten, len(log)), (["vm"], 1))
+        with mock.patch.object(devices, "delete_or_say_why") as deleted:
+            with devices.kept_or_deleted(kept, log.append):
+                pass
+        deleted.assert_called_once()
+
+    def test_any_interrupted_return_marks_the_work_unreturned(self):
+        spec = sessions.Spec("ses-y", "p", repo="widgets", github="octo/widgets", branch="session/ses-y")
+        cfg = SimpleNamespace(repo=lambda name: SimpleNamespace(path=Path("/nowhere")))
+        for failure in (OSError("disk full"), KeyError("odd")):
+            with self.subTest(failure=repr(failure)), mock.patch.object(sessions, "save_spec"), \
+                    mock.patch.object(sessions, "log_line"), mock.patch.object(sessions, "bring_back", side_effect=failure):
+                spec.unreturned = ""
+                try:
+                    sessions.return_work(spec, cfg, None, "m", last=True)
+                except KeyError:
+                    pass
+                self.assertTrue(spec.unreturned)
+                self.assertTrue(sessions.unreturned_reason(spec))
+
+    def test_the_end_note_compares_the_push_with_the_latest_fetch(self):
+        spec = sessions.Spec("ses-x", "p", repo="widgets", github="octo/widgets", branch="session/ses-x",
+                             cloned="c" * 40, fetched="b" * 40, pushed="a" * 40)
+        self.assertIn("not pushed", sessions.work_note(spec))
+        self.assertIn("aaaaaaaaaa was pushed earlier", sessions.work_note(spec))
+        spec.held = ".github/workflows/ci.yml"
+        self.assertIn("denied paths .github/workflows/ci.yml", sessions.work_note(spec))
+        spec.pushed = spec.fetched
+        self.assertIn("is pushed as bbbbbbbbbb", sessions.work_note(spec))
+        spec.unreturned = "bundle failed"
+        self.assertIn("did not come back", sessions.work_note(spec))
+
+    def test_a_device_error_is_redacted_before_it_is_cut_short(self):
+        value = "fake-clone-value-0001"
+        device = devices.Device("box", "ssh", host="dev@box.test")
+        said = subprocess.CompletedProcess([], 1, "", "fatal: " + "x" * 280 + value)
+        with mock.patch.object(devices.util, "sh", return_value=said):
+            with self.assertRaises(devices.DeviceError) as caught:
+                devices.run_script(device, "true", "cloning", value)
+        self.assertNotIn("fake-c", str(caught.exception))
+        self.assertIn("***", str(caught.exception))
+
+    def test_the_mint_refuses_anything_but_read_on_this_one_repository(self):
+        value = "fake-clone-value-0001"
+        good = {"token": value, "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected", "repositories": [{"full_name": "Octo/Widgets"}]}
+        app = config.GithubApp("12345", "67890", Path("/nowhere"))
+        replies = {"write": {**good, "permissions": {"contents": "write"}},
+                   "extra": {**good, "permissions": {"contents": "read", "pull_requests": "write"}},
+                   "none": {"token": value}, "all": {**good, "repository_selection": "all", "repositories": []},
+                   "other": {**good, "repositories": [{"full_name": "octo/other"}]}, "no token": {**good, "token": ""}}
+        for name, reply in replies.items():
+            with self.subTest(name), mock.patch.object(gh, "token_reply", return_value=reply):
+                with self.assertRaises(gh.GhError) as caught:
+                    gh.clone_token(app, "octo/widgets")
+                self.assertNotIn(value, str(caught.exception))
+        with mock.patch.object(gh, "token_reply", return_value=good):
+            self.assertEqual(gh.clone_token(app, "octo/widgets"), value)
+
+    def test_the_credential_helper_answers_github_over_https_only(self):
+        value = "fake-clone-value-0001"
+        with tempfile.TemporaryDirectory() as home:
+            def fill(protocol, host):
+                env = {"PATH": os.environ["PATH"], "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                       "GIT_TERMINAL_PROMPT": "0", "ARETE_GIT_TOKEN": value}
+                return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + devices.TOKEN_HELPER,
+                                       "credential", "fill"], cwd=home, env=env, capture_output=True, text=True,
+                                      input=f"protocol={protocol}\nhost={host}\n\n")
+            self.assertIn(f"password={value}", fill("https", "github.com").stdout.splitlines())
+            for protocol, host in (("https", "example.com"), ("http", "github.com"), ("https", "github.com.example.com")):
+                other = fill(protocol, host)
+                self.assertNotEqual(other.returncode, 0)
+                self.assertNotIn(value, other.stdout + other.stderr)
 
 
 if __name__ == "__main__":

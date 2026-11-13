@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import base64
 import functools
 import itertools
 import json
+import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from . import outbound, paths, util
+from . import config, outbound, paths, util
 
 ARETE_MARK = "<!-- arete -->"
+GITHUB_API = "https://api.github.com"
+CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
 
 
@@ -312,6 +318,89 @@ def default_branch(repo: str) -> str:
         return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
     except (GhError, KeyError, TypeError):
         return "main"
+
+
+def base64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def key_signature(app: config.GithubApp, signing_input: bytes) -> bytes:
+    failed = f"openssl could not sign with [github_app] private_key {paths.short_path(app.private_key)}"
+    if paths.ISOLATED and paths.confined(app.private_key) is None:
+        raise GhError("isolated arete uses no key of this machine; put the [github_app] private_key in the scratch folder")
+    try:
+        res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(app.private_key)], input=signing_input,
+                             capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise GhError(f"{failed}: {e}") from None
+    if res.returncode != 0:
+        raise GhError(f"{failed}: {util.first_line(res.stderr.decode(errors='replace')) or f'exit {res.returncode}'}")
+    return res.stdout
+
+
+def app_jwt(app: config.GithubApp) -> str:
+    now = int(time.time())
+    signed = ".".join(base64url(json.dumps(part, separators=(",", ":")).encode()) for part in (
+        {"alg": "RS256", "typ": "JWT"}, {"iat": now - 60, "exp": now + 540, "iss": app.app_id}))
+    return f"{signed}.{base64url(key_signature(app, signed.encode()))}"
+
+
+def clone_token(app: config.GithubApp, repo: str) -> str:
+    where = f"for {repo} from [github_app] installation {app.installation_id}"
+    try:
+        reply = token_reply(app, repo, retry=True)
+    except urllib.error.HTTPError as e:
+        raise GhError(f"GitHub gave no token {where}: HTTP {e.code}: {http_message(e)}") from None
+    except OSError as e:
+        raise GhError(f"GitHub gave no token {where}: {getattr(e, 'reason', None) or e}") from None
+    if not (token := reply.get("token")):
+        raise GhError(f"GitHub gave no token {where}: its reply held none")
+    if problem := token_overreach(reply, repo):
+        raise GhError(f"GitHub gave a token {where} that is not read only on that one repository, so arete "
+                      f"discarded it: {problem}")
+    return token
+
+
+def token_overreach(reply: dict, repo: str) -> str:
+    permissions = reply.get("permissions")
+    if not isinstance(permissions, dict) or not permissions:
+        return "its reply named no permissions"
+    if wider := sorted(name for name, level in permissions.items() if level != "read"):
+        return f"it grants more than read on {', '.join(wider)}"
+    if reply.get("repository_selection") == "all":
+        return "it reaches every repository of the installation"
+    listed = reply.get("repositories")
+    if listed is not None and (not isinstance(listed, list) or
+                               [str(r.get("full_name", "")).lower() for r in listed if isinstance(r, dict)] != [repo.lower()]):
+        return "it reaches repositories other than this one"
+    return ""
+
+
+def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
+    body = {"repositories": [repo.rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
+    request = urllib.request.Request(
+        f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
+        method="POST", headers={"Authorization": f"Bearer {app_jwt(app)}", "Accept": "application/vnd.github+json",
+                                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as res:
+            reply = json.loads(res.read())
+    except urllib.error.HTTPError:
+        raise
+    except OSError:
+        if not (retry and util.wait_for_network()):
+            raise
+        return token_reply(app, repo, retry=False)
+    except ValueError:
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+def http_message(e: urllib.error.HTTPError) -> str:
+    try:
+        return str(json.loads(e.read()).get("message") or e.reason)
+    except (ValueError, OSError, AttributeError):
+        return str(e.reason)
 
 
 def repo_exists(repo: str) -> bool:

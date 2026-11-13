@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import paths, record, state, util
+from .diffguard import NEVER_STAGED
 
 DEVICES_FILE = paths.CONFIG_DIR / "devices.toml"
 CACHE_FILE = paths.STATE_DIR / "devices.json"
@@ -36,6 +37,15 @@ END_WITH_SESSION = ("( (kill -0 $PPID && while kill -0 $PPID && kill -0 $$; do s
                     " </dev/null >/dev/null 2>&1 & ); exec \"$@\"")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HOME_DIR = re.compile(r"~([a-z_][a-z0-9_.-]*)?")
+TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
+                'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
+                'test "$p" = https && test "$h" = github.com || return 0; '
+                'echo username=x-access-token; echo "password=$ARETE_GIT_TOKEN"; }; f')
+GIT_NO_HOOKS = "git -c core.hooksPath=/dev/null"
+GIT_WITH_TOKEN = ('ARETE_GIT_TOKEN="$arete_token" GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= '
+                  + shlex.join(["git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=",
+                                "-c", "credential.helper=" + TOKEN_HELPER]))
+CLONE_SECONDS = 900
 VM_NAME_CHARS = 60
 VM_PREFIX = "arete-"
 EXE_LOBBY = "exe.dev"
@@ -353,6 +363,53 @@ class BootingClone:
         return parsed
 
 
+def run_script(device: Device | str, script: str, what: str, token: str = "", timeout: float = 300) -> str:
+    d = resolve(device)
+    if not d.remote:
+        raise DeviceError(f"{what} runs only on a remote device, not on {d.name}")
+    if token:
+        script = f"IFS= read -r arete_token && {script}"
+    res = util.sh([*ssh_argv(d), script], input=f"{token}\n" if token else "", timeout=timeout)
+    if res.returncode != 0:
+        output = res.stderr or res.stdout
+        said = util.git_error(output.replace(token, "***") if token else output) or f"exit {res.returncode}"
+        raise DeviceError(f"{d.name}: {what} failed: {said}")
+    return res.stdout
+
+
+def github_url(github: str) -> str:
+    return f"https://github.com/{github}.git"
+
+
+def clone(device: Device | str, github: str, base: str, branch: str, folder: str, token: str) -> str:
+    q, where = shlex.quote, remote_dir(folder)
+    steps = [f"{GIT_WITH_TOKEN} clone -q --no-checkout --template= --branch {q(base)} {q(github_url(github))} {where}",
+             "unset arete_token", f"cd {where}",
+             f"GIT_LFS_SKIP_SMUDGE=1 {GIT_NO_HOOKS} checkout -q -f -b {q(branch)}",
+             "{ git config user.email >/dev/null || { git config user.name arete && git config user.email arete@localhost; }; }",
+             "git rev-parse HEAD"]
+    return util.last_line(run_script(device, " && ".join(steps), f"cloning {github}", token, CLONE_SECONDS))
+
+
+def commit_all(device: Device | str, folder: str, message: str, deny: list[str]) -> tuple[str, list[str]]:
+    excluded = shlex.join([*NEVER_STAGED, *(f":(exclude,glob){p}" for p in deny)])
+    listed = shlex.join(f":(glob){p}" for p in deny)
+    steps = [f"cd {remote_dir(folder)}", "git reset -q", f"git add -A -- . {excluded}",
+             f"{{ git diff --cached --quiet || {GIT_NO_HOOKS} commit -q -m {shlex.quote(message)}; }}"]
+    if deny:
+        steps.append(f"git status --porcelain --untracked-files=all -- {listed}")
+    steps.append("git rev-parse HEAD")
+    *left_out, head = run_script(device, " && ".join(steps), "committing the session's work").splitlines() or [""]
+    return head.strip(), [line[3:] for line in left_out if line.strip()]
+
+
+def bundle(device: Device | str, folder: str, branch: str, since: str) -> str:
+    q = shlex.quote
+    script = (f"cd {remote_dir(folder)} && f=$(mktemp) && {{ git bundle create -q \"$f\" {q(f'refs/heads/{branch}')} "
+              f"--not {q(since)}; s=$?; if [ $s -eq 0 ]; then base64 < \"$f\"; s=$?; fi; rm -f \"$f\"; exit $s; }}")
+    return run_script(device, script, f"bundling {branch}", timeout=CLONE_SECONDS)
+
+
 def clone_address(boot: BootingClone) -> str:
     while not boot.late:
         res = boot.guest("cmd", "network-get-interfaces", 30)
@@ -417,14 +474,14 @@ def wait_for_ssh(vm: Device) -> None:
 
 
 @contextmanager
-def lease(device: Device | str, run_id: str, log=lambda text: None):
+def lease(device: Device | str, run_id: str, log=lambda text: None, hold=lambda: ""):
     d = resolve(device)
     if d.kind == "proxmox":
-        with proxmox_clone(d, run_id, log) as clone:
+        with proxmox_clone(d, run_id, log, hold) as clone:
             record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=clone.host)
             yield clone
     elif d.kind == "exe":
-        with fresh_sandbox(d, run_id, log) as vm:
+        with fresh_sandbox(d, run_id, log, hold) as vm:
             record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=vm.host)
             yield vm
     else:
@@ -488,13 +545,13 @@ class Sandbox:
 
 
 @contextmanager
-def proxmox_clone(d: Device, run_id: str, log):
+def proxmox_clone(d: Device, run_id: str, log, hold=lambda: ""):
     clone = Clone(d, vm_name(run_id), int(pve(d, "pvesh get /cluster/nextid").strip()))
     log(f"cloning template {d.template} to {clone} on {d.name}")
     with creating(clone, run_id, log), record.timed(run_id, "clone", device=d.name, vmid=clone.vmid,
                                                     template=d.template):
         pve(d, f"qm clone {d.template} {clone.vmid} --name {clone.name} --full 0")
-    with kept_or_deleted(clone, log):
+    with kept_or_deleted(clone, log, hold):
         with record.timed(run_id, "boot", device=d.name, vmid=clone.vmid) as booted:
             pve(d, f"qm start {clone.vmid}")
             boot = BootingClone(d, clone.vmid)
@@ -507,7 +564,7 @@ def proxmox_clone(d: Device, run_id: str, log):
 
 
 @contextmanager
-def fresh_sandbox(d: Device, run_id: str, log):
+def fresh_sandbox(d: Device, run_id: str, log, hold=lambda: ""):
     sandbox = Sandbox(d, vm_name(run_id))
     started = time.monotonic()
     with record.timed(run_id, "create", device=sandbox.device.name, sandbox=sandbox.name):
@@ -519,7 +576,7 @@ def fresh_sandbox(d: Device, run_id: str, log):
         delete_or_say_why(sandbox, log)
         raise
     log(f"{sandbox} is up at {vm.host} in {time.monotonic() - started:.1f} s")
-    with kept_or_deleted(sandbox, log):
+    with kept_or_deleted(sandbox, log, hold):
         yield vm
 
 
@@ -540,7 +597,7 @@ def creating(vm: Clone | Sandbox, run_id: str | None, log):
 
 
 @contextmanager
-def kept_or_deleted(vm: Clone | Sandbox, log):
+def kept_or_deleted(vm: Clone | Sandbox, log, hold=lambda: ""):
     if vm.device.keep:
         state.forget_vm(vm.name)
     try:
@@ -548,6 +605,9 @@ def kept_or_deleted(vm: Clone | Sandbox, log):
     finally:
         if vm.device.keep:
             log(f"keeping {vm} up until {vm.delete_command()} deletes it")
+        elif reason := hold():
+            state.forget_vm(vm.name)
+            log(f"keeping {vm} up because {reason}; {vm.delete_command()} deletes it")
         else:
             delete_or_say_why(vm, log)
 

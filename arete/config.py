@@ -96,6 +96,16 @@ class JiraConfig:
 
 
 @dataclass
+class GithubApp:
+    app_id: str = ""
+    installation_id: str = ""
+    private_key: Path | None = None
+
+    def missing(self) -> list[str]:
+        return [name for name in ("app_id", "installation_id", "private_key") if not getattr(self, name)]
+
+
+@dataclass
 class JevConfig:
     enabled: bool = True
     model: str = "jev-latest"
@@ -178,6 +188,7 @@ class Config:
     probes: list[Probe] = field(default_factory=list)
     jira: JiraConfig = field(default_factory=JiraConfig)
     jev: JevConfig = field(default_factory=JevConfig)
+    github_app: GithubApp = field(default_factory=GithubApp)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     environment: Environment = field(default_factory=Environment)
     miner_lookback_hours: float = 24
@@ -639,6 +650,14 @@ def load(path: Path | None = None) -> Config:
     if bad := sorted(set(cfg.jev.screen_lines) - set(JevConfig().screen_lines)):
         raise ValueError(f"[jev.screen_lines]: unknown question {', '.join(bad)}; use "
                          f"{', '.join(JevConfig().screen_lines)}")
+    app = section(data, "github_app")
+    cfg.github_app = GithubApp(
+        app_id=str(app.get("app_id", "")).strip(),
+        installation_id=str(app.get("installation_id", "")).strip(),
+        private_key=paths.expand(app["private_key"]) if app.get("private_key") else None,
+    )
+    if cfg.github_app.installation_id and not cfg.github_app.installation_id.isdigit():
+        raise ValueError("[github_app] installation_id must be digits only")
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")
         if tracker not in TRACKERS:
