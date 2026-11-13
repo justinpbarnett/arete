@@ -19,6 +19,7 @@ RESULTS = ("pass", "fail", "ask", "stop")
 LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode", "atom")
 COUNTS = ("tokens_in", "tokens_out", "turns", "cache_read", "cache_write")
 MAX_ERROR_CHARS = 500
+OPENING = "prepare"
 
 
 @dataclass(frozen=True)
@@ -130,12 +131,30 @@ def chain(run_id: str) -> list[list[dict]]:
     return found
 
 
+def unopened(read: list[dict]) -> bool:
+    return any(line.get("step") == OPENING and line.get("result") != "pass" for line in ends(read))
+
+
+def reopening(chained: list[list[dict]]) -> bool:
+    for read in chained:
+        if opened := [line for line in ends(read) if line.get("step") == OPENING]:
+            return opened[-1].get("result") != "pass"
+    return False
+
+
 def history(chained: list[list[dict]]) -> list[dict]:
     done: list[dict] = []
     for read in reversed(chained):
-        skipped = next((line["skipped"] for line in read
-                        if line.get("event") == "route" and type(line.get("skipped")) is int), None)
-        done = (done if skipped is None else done[:skipped]) + ends(read)
+        if unopened(read):
+            continue
+        own = ends(read)
+        route = next((line for line in reversed(read)
+                      if line.get("event") == "route" and type(line.get("skipped")) is int), None)
+        if route is None:
+            done = done + own
+            continue
+        redone = route["redone"] if type(route.get("redone")) is int else 0
+        done = own[:redone] + done[redone:redone + route["skipped"]] + own[redone:]
     return done
 
 
@@ -204,6 +223,9 @@ class Flow:
                             for line in self.earlier if line.get("tree")}
         self.prints: dict[str, str] = {}
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
+        self.redone = 0
+        self.reopens = (bool(continues) and not only and again != OPENING and reopening(chained)
+                        and bool(self.earlier) and self.earlier[0].get("step") == OPENING)
         if self.matching:
             lines.write(run_id, "route", continues=continues, only=only, again=again)
 
@@ -213,6 +235,12 @@ class Flow:
         if self.done:
             raise OnlyDone(f"only {self.only} runs in this flow")
         if self.matching:
+            if self.reopens and name == OPENING:
+                self.reopens = False
+                self.note_route()
+                outcome = self.run(name, args, kw)
+                self.redone = 1
+                return outcome
             if self.takes(name) and (found := self.stored(name, kw)):
                 self.skipped += 1
                 return found
@@ -227,10 +255,10 @@ class Flow:
             self.done = self.done or name == self.only
 
     def takes(self, name: str) -> bool:
-        return name != self.only and (name != self.again or self.skipped < self.again_at)
+        return name != self.only and (name != self.again or self.at < self.again_at)
 
     def stored(self, name: str, kw: dict) -> Outcome | None:
-        line = self.earlier[self.skipped] if self.skipped < len(self.earlier) else {}
+        line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
         if self.only and line.get("tree") and not os.path.isdir(line["tree"]):
@@ -248,7 +276,8 @@ class Flow:
     def takable(self, line: dict) -> bool:
         if line.get("result") == "pass":
             return True
-        return line.get("result") == "fail" and not line.get("error") and self.skipped + 1 < len(self.earlier)
+        return (line.get("result") == "fail" and not line.get("error") and line.get("step") != OPENING
+                and self.at + 1 < len(self.earlier))
 
     def print_of(self, folder: Path | str) -> str:
         key = os.path.abspath(folder)
@@ -256,10 +285,17 @@ class Flow:
             self.prints[key] = fingerprint(key)
         return self.prints[key]
 
-    def route(self) -> None:
-        after = str(self.earlier[self.skipped - 1].get("step") or "") if self.skipped else ""
+    @property
+    def at(self) -> int:
+        return self.redone + self.skipped
+
+    def note_route(self) -> None:
+        after = str(self.earlier[self.at - 1].get("step") or "") if self.skipped else ""
         lines.write(self.run_id, "route", continues=self.continues, after=after, skipped=self.skipped,
-                    only=self.only, again=self.again)
+                    redone=self.redone, only=self.only, again=self.again)
+
+    def route(self) -> None:
+        self.note_route()
         self.matching = False
 
     def run(self, name: str, args: tuple, kw: dict) -> Outcome:
