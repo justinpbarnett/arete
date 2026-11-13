@@ -542,6 +542,27 @@ def cmd_audit(args) -> int:
     return auditor.run(dry_run=args.dry_run)
 
 
+def cmd_verifiers(args) -> int:
+    import tomllib
+
+    from . import verifiers
+
+    if args.dry_run and args.action != "run" or args.json and args.action != "report":
+        print("usage: arete verifiers sample FOLDER | run SUITE [--dry-run] | report FILE [--json]", file=sys.stderr)
+        return 2
+    target = paths.expand(args.target)
+    try:
+        if args.action == "sample":
+            print_lines(verifiers.sample(target))
+            return 0
+        if args.action == "run":
+            return verifiers.run(target, dry=args.dry_run)
+        return verifiers.report(target, as_json=args.json)
+    except (verifiers.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
 def cmd_eval(args) -> int:
     from . import eval_mine, evals
 
@@ -1715,6 +1736,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for the manifest")
     p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
     p.set_defaults(fn=cmd_experiment)
+
+    p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
+                                         "`sample FOLDER`, `run SUITE`, `report FILE`")
+    p.add_argument("action", choices=["sample", "run", "report"])
+    p.add_argument("target", metavar="FOLDER | SUITE | FILE")
+    p.add_argument("--dry-run", action="store_true", help="with run: list arms, tasks and trials; no calls, no writes")
+    p.add_argument("--json", action="store_true", help="with report: the summary as one JSON line")
+    p.set_defaults(fn=cmd_verifiers)
 
     p = sub.add_parser("triage", help="loop 5: the triage board of your open tickets without the agent label")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")
