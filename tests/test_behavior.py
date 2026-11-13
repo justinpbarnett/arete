@@ -115,7 +115,9 @@ accounts.read = forbidden
 gh.gh = forbidden
 if importlib.util.find_spec("arete.scratch"):
     from arete import scratch
-    scratch.AUTHORITY = root / "authority-parent/verification-authority"
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
 lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
     "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=1\n")
