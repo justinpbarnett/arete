@@ -39,7 +39,7 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HOME_DIR = re.compile(r"~([a-z_][a-z0-9_.-]*)?")
 TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
                 'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
-                'test "$p" = https && test "$h" = github.com || return 0; '
+                'test "$p" = https && test "$h" = github.com && test -n "$ARETE_GIT_TOKEN" || return 0; '
                 'echo username=x-access-token; echo "password=$ARETE_GIT_TOKEN"; }; f')
 GIT_NO_HOOKS = "git -c core.hooksPath=/dev/null"
 GIT_WITH_TOKEN = ('ARETE_GIT_TOKEN="$arete_token" GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= '

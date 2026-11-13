@@ -294,12 +294,23 @@ def fetch_back(spec: Spec, repo: config.Repo, device: devices.Device, head: str)
     spec.fetched = head
 
 
+def denied_work(spec: Spec, repo: config.Repo) -> list[str]:
+    found = {path: path for path in diffguard.between(repo.path, spec.cloned, spec.fetched, deny=spec.deny).denied}
+    empty = util.git(["hash-object", "-t", "tree", os.devnull], repo.path).strip()
+    listed = util.git(["rev-list", "--reverse", "--parents", f"{spec.cloned}..{spec.fetched}"], repo.path)
+    for line in listed.splitlines():
+        commit, *parents = line.split()
+        for parent in parents or [empty]:
+            for path in diffguard.between(repo.path, parent, commit, deny=spec.deny).denied:
+                found.setdefault(path, f"{path} in {commit[:10]}")
+    return list(found.values())
+
+
 def push_fetched(spec: Spec, repo: config.Repo) -> None:
-    denied = diffguard.between(repo.path, spec.cloned, spec.fetched, deny=spec.deny).denied
-    if denied:
+    if denied := denied_work(spec, repo):
         held = ", ".join(denied)
         if held != spec.held:
-            log_line(spec, "error", f"not pushing {spec.branch}: the work touches denied paths {held}")
+            log_line(spec, "error", f"not pushing {spec.branch}: its commits touch denied paths {held}")
         spec.held = held
         return
     util.git(["push", "-q", "origin", f"{spec.fetched}:refs/heads/{spec.branch}"], repo.path, timeout=600)
@@ -405,7 +416,7 @@ def work_note(spec: Spec) -> str:
         return f"; the session made no changes to {spec.github}"
     if spec.held:
         return (f"; the work is fetched into the local {spec.repo} on {spec.branch} but not pushed: "
-                f"it touches denied paths {spec.held}{earlier}")
+                f"its commits touch denied paths {spec.held}{earlier}")
     return f"; the work is fetched into the local {spec.repo} on {spec.branch} but not pushed; see the log{earlier}"
 
 
