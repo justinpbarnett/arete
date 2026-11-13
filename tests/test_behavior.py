@@ -103,10 +103,10 @@ class OfflineWorkflowTests(unittest.TestCase):
                        TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
-import importlib.util, json, runpy, sys, urllib.request
+import importlib.util, json, os, runpy, sys, urllib.request
 from pathlib import Path
 from unittest import mock
-from arete import accounts, config, factory, gh, paths, pipeline, record, replay, runner, state
+from arete import accounts, config, factory, gh, paths, pipeline, record, replay, runlimits, runner, state
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
@@ -120,7 +120,8 @@ if importlib.util.find_spec("arete.scratch"):
         scratch.AUTHORITY = root / "authority-parent/verification-authority"
 lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
-    "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=1\n")
+    "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
+    ("2" if scenario == "edited-after-held-pr" else "1") + "\n")
 if scenario == "failed-check":
     with (root / "sample/layer/config.toml").open("a") as out:
         out.write('\n[steps.check_repair]\ntries=1\n')
@@ -128,26 +129,93 @@ if scenario == "failed-check":
     layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "exit 7"))
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
-elif scenario == "review-rejected":
+elif scenario in ("review-rejected", "edited-after-held-pr"):
     file = root / "sample/replay/review.json"
     data = json.loads(file.read_text())
+    if scenario == "edited-after-held-pr":
+        (root / "sample/replay/review2.json").write_text(file.read_text())
+        (root / "sample/replay/verify2.json").write_text((root / "sample/replay/verify.json").read_text())
+        (root / "sample/replay/review_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
     data["structured"] = {"verdict":"request_changes", "summary":"A real behavior is still wrong.",
                            "problems":[{"file":"notes.txt", "problem":"fixture blocker", "severity":"major"}]}
     file.write_text(json.dumps(data))
 cfg = config.load()
 task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+if scenario == "edited-after-held-pr":
+    from arete import lines
+    old = record.start("pipeline", repo="replay-sample", issue=task)
+    lines.write(old, "step_end", step="prepare", result="pass",
+                data={"ticket": {"title": "Add kumquat", "body": "Add kumquat to the fixture notes"}})
+    for n in (1, 2, 3):
+        lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
+    record.settle(old, "pr")
+    with state.db() as connection:
+        connection.execute("UPDATE tasks SET body = ? WHERE id = ?",
+                           ("Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", task))
 feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
-try:
-    factory.main(feature, ["replay-sample", task, "--force"])
-except SystemExit:
-    pass
-row = state.ticket_runs("replay-sample", task, whole=True)[0]
+def forced():
+    try:
+        factory.main(feature, ["replay-sample", task, "--force"])
+    except SystemExit:
+        pass
+    return state.ticket_runs("replay-sample", task, whole=True)[0]
+if scenario.startswith("held-scratch"):
+    layer, answer = root / "sample/layer/config.toml", root / "sample/replay/verify.json"
+    plain, passing = layer.read_text(), answer.read_text()
+    prefix = paths.SCRATCH_PREFIX + "0123456789abcdef"
+    holding = f"mkdir -p {prefix} && echo '*' > {prefix}/.gitignore && " + replay.SAMPLE_CHECK
+    commit = "git -c user.name=fixture -c user.email=fixture@localhost -c commit.gpgsign=false commit -q --allow-empty -m local"
+    layer.write_text(plain.replace(json.dumps(replay.SAMPLE_CHECK), json.dumps(holding)) +
+                     "\n[setup]\ncommands = [" + json.dumps(commit) + "]\n")
+    answer.write_text(json.dumps(json.loads(passing) | {"seconds": 30}))
+    with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_verify_minutes=.05)):
+        parked = forced()
+    layer.write_text(plain)
+    answer.write_text(passing)
+    ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+    saved = pipeline.made_record(ws).read_text()
+    made = json.loads(saved)
+    result = {"parked": parked["summary"], "recorded": [k for k in made if not k.startswith("\0")],
+              "head_recorded": made.get(pipeline.head_key(pipeline.Checkout("", "", ws, ws, "main"))) == pipeline.git(["rev-parse", "HEAD"], ws).strip(),
+              "unpushed": pipeline.git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], ws).strip(),
+              "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")]}
+    with state.db() as c:
+        c.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Add kumquat on a last line of its own", task))
+    refused = forced()
+    result["while_held"] = refused["summary"]
+    result["record_kept"] = pipeline.made_record(ws).read_text() == saved
+    for fd in list(scratch.LEASES.values()):
+        os.close(fd)
+    scratch.LEASES.clear()
+    with mock.patch.object(scratch, "holders", return_value=[]):
+        pipeline.retry_scratch()
+    (root / "finalized").mkdir()
+    for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
+        p.rename(root / "finalized" / p.name)
+    if scenario == "held-scratch-edited":
+        with (ws / "notes.txt").open("a") as out:
+            out.write("edited by hand\n")
+    row = forced()
+    events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+    result |= {"status": row["status"], "summary": row["summary"],
+               "prepared": [e.get("result") for e in events if e.get("event") == "step_end" and e.get("step") == "prepare"],
+               "origin": pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git"),
+               "edited": (ws / "notes.txt").exists() and "edited by hand" in (ws / "notes.txt").read_text()}
+    branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
+    result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git") if len(branches) == 1 else ""
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
+row = forced()
 events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
                 if e.get("event") == "step_end" and e.get("step") == "verify"]
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
           "verified":[v["verdict"] for v in verification if v],
           "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git")}
+if scenario == "edited-after-held-pr":
+    result["old"] = old
+    result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+    result["budget"] = json.loads((paths.RUNS_DIR / row["id"] / "budget.json").read_text())
 if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
@@ -156,7 +224,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
 '''
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
             result = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario],
-                                    cwd=root, env=env, text=True, capture_output=True, timeout=45)
+                                    cwd=root, env=env, text=True, capture_output=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in result.stdout.splitlines()
                            if line.startswith("BEHAVIOR_RESULT=")), None)
@@ -168,6 +236,29 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
+
+    def test_run_parked_with_scratch_held_records_its_work_without_scratch(self):
+        result = self.workflow("held-scratch")
+        self.assertIn("parked", result["parked"])
+        self.assertIn("notes.txt", result["recorded"])
+        self.assertFalse([n for n in result["recorded"] if ".arete-scratch-" in n])
+        self.assertTrue(result["held"])
+        self.assertTrue(result["head_recorded"])
+        self.assertEqual(result["unpushed"], "1")
+        self.assertIn("unresolved or unknown scratch resources", result["while_held"])
+        self.assertTrue(result["record_kept"])
+        self.assertEqual(result["prepared"], ["pass"])
+        self.assertEqual(result["status"], "done")
+        self.assertNotIn("no record of", result["summary"])
+        self.assertIn("kumquat", result["published"])
+
+    def test_file_edited_after_parked_run_still_stops_forced_run(self):
+        result = self.workflow("held-scratch-edited")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["prepared"], ["fail"])
+        self.assertIn("no record of leaving there (notes.txt)", result["summary"])
+        self.assertTrue(result["edited"])
+        self.assertEqual(result["origin"].strip(), "refs/heads/main")
 
     def test_behavioral_check_failure_stops_before_verification_or_publication(self):
         result = self.workflow("failed-check")
@@ -186,6 +277,42 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["status"], "failed")
         self.assertIn("review", result["summary"])
         self.assertIn("requested changes", result["summary"])
+
+    def test_forced_run_after_a_specification_edit_repairs_instead_of_parking(self):
+        result = self.workflow("edited-after-held-pr")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("review_fix", result["steps"])
+        self.assertIn("left out 3 earlier repair cycles", result["log"])
+        self.assertEqual(result["budget"]["left_out"], [result["old"]])
+        self.assertEqual(result["budget"]["parents"], [])
+
+
+class FailedPrepareHistoryTests(unittest.TestCase):
+    @staticmethod
+    def end(step, result="pass", **extra):
+        return {"event": "step_end", "step": step, "result": result, **extra}
+
+    def test_failed_prepare_run_adds_nothing(self):
+        a = [self.end("prepare"), self.end("plan"), self.end("verify", "fail")]
+        b = [{"event": "route", "skipped": 0}, self.end("prepare", "fail"), self.end("respond")]
+        history = arete.factory.history([b, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "verify"])
+        self.assertTrue(arete.factory.reopening([b, a]))
+        self.assertFalse(arete.factory.reopening([a]))
+
+    def test_redone_join_puts_own_prepare_first(self):
+        a = [self.end("prepare", n=1), self.end("plan"), self.end("implement")]
+        c = [{"event": "route", "skipped": 2, "redone": 1}, self.end("prepare", n=2), self.end("verify")]
+        history = arete.factory.history([c, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "implement", "verify"])
+        self.assertEqual(history[0]["n"], 2)
+
+    def test_failed_prepare_is_not_takable_but_other_fails_are(self):
+        flow = object.__new__(arete.factory.Flow)
+        flow.earlier, flow.redone, flow.skipped = [self.end("prepare", "fail"), self.end("verify", "fail"), {}], 0, 0
+        self.assertFalse(flow.takable(flow.earlier[0]))
+        flow.skipped = 1
+        self.assertTrue(flow.takable(flow.earlier[1]))
 
 
 @unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
@@ -291,6 +418,158 @@ class WriterRegressionTests(unittest.TestCase):
                 self.assertEqual(len(sent), 1)
                 self.assertNotIn(candidate, sent[0])
                 self.assertIn("Enabled offline checks.", sent[0])
+
+
+@unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
+                     "needs macOS confinement")
+class VerificationOutputTests(unittest.TestCase):
+    def setUp(self):
+        import ctypes
+        import struct
+        self.ctypes, self.struct = ctypes, struct
+        from arete import scratch
+        self.scratch = scratch
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        if scratch.filesystem(os.open(self.root, os.O_RDONLY)) != "apfs":
+            self.skipTest("needs APFS")
+        (self.root / "home").mkdir()
+        for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
+                      mock.patch.object(scratch, "holders", return_value=[])):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.ws = self.root / "worktrees/ticket"
+        (self.ws / "owner-dir").mkdir(parents=True)
+        (self.ws / "owner.txt").write_text("owner data\n")
+        (self.ws / "owner-dir/kept.txt").write_text("kept\n")
+        self.made = []
+        self.addCleanup(self.release)
+
+    def release(self):
+        for a in self.made:
+            fd = self.scratch.LEASES.pop(a.selector, None)
+            if fd is not None:
+                os.close(fd)
+            self.scratch.RUN_BASELINES.pop(a.run_id, None)
+
+    def attempt(self):
+        run_id = f"run-{len(self.made)}"
+        run_dir = self.root / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        self.scratch.RUN_BASELINES[run_id] = {}
+        a = self.scratch.make(run_id, "verify", self.ws, run_dir)
+        self.made.append(a)
+        return a
+
+    def record(self, a):
+        return next(r for r in self.scratch.records() if r["attempt"]["selector"] == a.selector)
+
+    def write(self, a, name, text="{}"):
+        target = Path(a.root) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def test_created_entries_are_archived_and_workspace_is_free(self):
+        a = self.attempt()
+        for name in ("config/predictions.jsonl", "fixture-a/nested/case.json", "out/scenario-1/result.json"):
+            self.write(a, name)
+        os.symlink(self.ws / "owner.txt", Path(a.root) / "fixture-a/link-to-file")
+        os.symlink(self.ws / "owner-dir", Path(a.root) / "fixture-a/link-to-dir")
+        self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [])
+        data = self.record(a)
+        self.assertEqual((data["state"], data["diagnostic"]), ("done", ""))
+        tree = self.scratch.AUTHORITY / a.selector / data["final_tree"]
+        for name in ("config/predictions.jsonl", "fixture-a/nested/case.json", "out/scenario-1/result.json"):
+            self.assertTrue((tree / name).exists())
+        self.assertTrue((tree / "fixture-a/link-to-file").is_symlink())
+        self.assertTrue((tree / "fixture-a/link-to-dir").is_symlink())
+        self.assertEqual((self.ws / "owner.txt").read_text(), "owner data\n")
+        self.assertEqual((self.ws / "owner-dir/kept.txt").read_text(), "kept\n")
+        self.assertFalse(self.scratch.pending(self.ws))
+        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        self.attempt()
+
+    def retained(self, a, name):
+        self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
+        data = self.record(a)
+        self.assertEqual(data["state"], "pending")
+        return data["diagnostic"]
+
+    def test_owner_file_moved_to_root_is_retained(self):
+        a = self.attempt()
+        os.rename(self.ws / "owner.txt", Path(a.root) / "owner.txt")
+        diagnostic = self.retained(a, "owner.txt")
+        self.assertEqual(diagnostic["unknown_entries"], ["owner.txt"])
+        self.assertEqual(diagnostic["reasons"]["owner.txt"], self.scratch.EXISTED)
+        self.assertEqual((Path(a.root) / "owner.txt").read_text(), "owner data\n")
+        self.assertTrue(pipeline.scratch_left(self.ws, []))
+        with self.assertRaises(OSError) as raised:
+            self.attempt()
+        self.assertEqual(raised.exception.errno, 16)
+
+    def test_owner_file_in_created_folder_is_named(self):
+        a = self.attempt()
+        self.write(a, "fixture-a/nested/case.json")
+        os.rename(self.ws / "owner.txt", Path(a.root) / "fixture-a/nested/owner.txt")
+        self.assertEqual(self.retained(a, "")["unknown_entries"], ["fixture-a/nested/owner.txt"])
+
+    def test_hard_link_is_retained(self):
+        a = self.attempt()
+        os.link(self.ws / "owner.txt", Path(a.root) / "config/linked.txt")
+        diagnostic = self.retained(a, "")
+        self.assertEqual(diagnostic["reasons"], {"config/linked.txt": self.scratch.LINKED})
+
+    def test_forged_birth_time_is_retained(self):
+        a = self.attempt()
+        target = Path(a.root) / "fixture-a/owner.txt"
+        target.parent.mkdir()
+        os.rename(self.ws / "owner.txt", target)
+        later = int(time.time()) + 3600
+        libc = self.ctypes.CDLL(None, use_errno=True)
+        libc.setattrlist.argtypes = (self.ctypes.c_char_p, self.ctypes.c_char_p, self.ctypes.c_char_p,
+                                     self.ctypes.c_size_t, self.ctypes.c_uint)
+        attrs = self.struct.pack("HHIIIII", 5, 0, 0x200, 0, 0, 0, 0)
+        self.assertEqual(libc.setattrlist(os.fsencode(target), attrs, self.struct.pack("ll", later, 0), 16, 0), 0)
+        self.assertEqual(int(os.lstat(target).st_birthtime), later)
+        self.assertEqual(self.retained(a, "")["unknown_entries"], ["fixture-a/owner.txt"])
+
+    def test_record_from_before_the_change_finalizes_on_poll(self):
+        a = self.attempt()
+        self.write(a, "config/predictions.jsonl")
+        self.write(a, "fixture-a/case.json")
+        with self.scratch.registry() as (fd, key):
+            data = self.scratch.load(fd, key, a.selector)
+            data["state"] = "pending"
+            data["diagnostic"] = {"retained_root": a.root, "unknown_entries": ["config/predictions.jsonl", "fixture-a"]}
+            self.scratch.store(fd, key, data)
+        os.close(self.scratch.LEASES.pop(a.selector))
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pipeline.retry_scratch()
+        self.assertIn(a.root, out.getvalue())
+        data = self.record(a)
+        self.assertEqual(data["state"], "done")
+        self.assertTrue((self.scratch.AUTHORITY / a.selector / data["final_tree"] / "fixture-a/case.json").exists())
+
+    def test_unclassifiable_filesystem_is_retained(self):
+        a = self.attempt()
+        self.write(a, "config/new.json")
+        with mock.patch.object(self.scratch, "filesystem", return_value="hfs"):
+            diagnostic = self.retained(a, "")
+        self.assertTrue(diagnostic["reasons"]["config/new.json"].startswith(self.scratch.UNCLASSIFIED))
+        st = SimpleNamespace(st_dev=2, st_ino=9, st_nlink=1, st_mode=0o100600)
+        self.assertEqual(self.scratch.refusal(st, 1, 5), self.scratch.ELSEWHERE)
+
+    def test_layout_is_still_protected(self):
+        self.assertEqual(self.scratch.end(self.attempt(), Path(self.made[0].run_dir))[2], [])
+        a = self.attempt()
+        os.unlink(Path(a.root) / "out/output.txt")
+        self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
+        self.assertEqual(self.record(a)["state"], "pending")
+        self.assertTrue(Path(a.root).exists())
 
 
 if __name__ == "__main__":

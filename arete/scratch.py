@@ -17,13 +17,20 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import paths
+from . import launchd, paths
 
 PREFIX = paths.SCRATCH_PREFIX
 ENV_NAME = paths.SCRATCH_ENV
 FOLDERS = ("fixtures", "config", "state", "out")
 SLOTS = ("config/config.toml", "state/arete.db", "fixtures/config.toml", "fixtures/fixture.db", "out/output.txt")
 MAX_LISTED = 500
+MAX_HOLDERS = 50
+MAX_DIAGNOSTIC = 16000
+EXISTED = "existed before the attempt"
+LINKED = "has more than one link"
+ELSEWHERE = "on another device"
+UNCLASSIFIED = "cannot be classified"
+MISSING = "registered entry missing"
 MAX_SAVED_BYTES = 16 * 1024 * 1024
 HOOK = {"root": "", "id": "", "saves": ""}
 try:
@@ -32,7 +39,14 @@ except KeyError:
     AUTHORITY = paths.NOWHERE
 LEASES: dict[str, int] = {}
 RUN_BASELINES: dict[str, dict[int, int] | None] = {}
+RUN_LABELS: dict[str, dict | None] = {}
+MAX_RECORD_BYTES = 1024 * 1024
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
+IN_GROUP = "in a producer group"
+ORPHAN = "orphan of a producer"
+SUBMITTED = "submitted launchd job"
+UNCLASSIFIED_HOLDER = "unclassified"
+WAITING = "waiting for registered verification producers to exit; authority revoked"
 GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
               "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
 
@@ -116,7 +130,7 @@ def load(fd: int, key: bytes, selector: str) -> dict:
     with os.fdopen(source, "rb") as inp:
         st = os.fstat(source)
         checked(st, identity(st))
-        envelope = json.loads(inp.read(65537))
+        envelope = json.loads(inp.read(MAX_RECORD_BYTES + 1))
     data = envelope["data"]
     if not hmac.compare_digest(envelope["signature"], hmac.digest(key, encoded(data), "sha256").hex()):
         raise ValueError("unauthenticated scratch record")
@@ -169,15 +183,19 @@ def overlap(a: Path, b: Path) -> bool:
 def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
     ws, rd = workspace.resolve(), run_dir.resolve()
     before = RUN_BASELINES[run_id] if run_id in RUN_BASELINES else process_ids()
+    labels = RUN_LABELS.get(run_id) if run_id in RUN_BASELINES else service_labels()
     if before is None:
         raise ConfinementUnavailable("no producer baseline before repository execution")
     if rd.name != run_id or not step or Path(step).name != step:
         raise ValueError("scratch requires a pinned run and step")
     with registry(True) as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
-        if any(d["state"] != "done"
-               and overlap(Path(d["attempt"]["workspace"]), ws) for d in records()):
-            raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt")
+        unresolved = [d for d in records() if d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), ws)]
+        if unresolved:
+            held = named_holders([h for d in unresolved if isinstance(d.get("diagnostic"), dict)
+                                  for h in d["diagnostic"].get("holders", [])])
+            raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt"
+                          + (f" held by {held}" if held else ""))
         selector, token = secrets.token_hex(32), secrets.token_hex(8)
         root = ws / f"{PREFIX}{token}"
         directories, files = {}, {}
@@ -186,7 +204,7 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
             run_identity = identity(os.fstat(run_fd))
         data = {"version": 2, "engine": secrets.token_hex(16), "attempt": asdict(a), "run": run_identity,
                 "evidence": [], "state": "initializing", "diagnostic": "",
-                "archives": [], "producers": {}, "before": sorted(before),
+                "archives": [], "producers": {}, "before": sorted(before), "labels": labels,
                 "source_mutations": False, "cleanup_version": 3}
         lease = None
         try:
@@ -255,16 +273,46 @@ def producing(a: Attempt | None):
         PRODUCING.reset(token)
 
 
+@dataclass(frozen=True)
+class Process:
+    pid: int
+    identity: int
+    parent: int
+    group: int
+    executable: str
+
+
 def process_ids(workspace: str = "") -> dict[int, int]:
+    return {p.identity: p.parent for p in processes(workspace).values()}
+
+
+def identity_of(pid: int) -> int | None:
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    lib.proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+    info = (ctypes.c_uint64 * 7)()
+    if lib.proc_pidinfo(pid, 17, 0, info, ctypes.sizeof(info)) != ctypes.sizeof(info):
+        return None
+    return info[2]
+
+
+def executable_of(lib, pid: int, short) -> str:
+    buffer = ctypes.create_string_buffer(4096)
+    if lib.proc_pidpath(pid, buffer, ctypes.sizeof(buffer)) > 0:
+        return os.fsdecode(buffer.value)
+    return os.fsdecode(bytes(short)[16:32].split(b"\0", 1)[0])
+
+
+def processes(workspace: str = "") -> dict[int, Process]:
     if not paths.ON_MAC:
         raise ConfinementUnavailable("producer lifetime inspection unavailable")
     lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     lib.proc_listpids.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_int)
     lib.proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+    lib.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
     box = ctypes.CDLL(None)
     box.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
     for _ in range(50):
-        found: dict[int, int] = {}
+        found: dict[int, Process] = {}
         pids = (ctypes.c_int * (max(lib.proc_listpids(4, os.getuid(), None, 0), 0) // 4 + 1024))()
         size = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids))
         settled = 0 < size < ctypes.sizeof(pids)
@@ -286,7 +334,9 @@ def process_ids(workspace: str = "") -> dict[int, int]:
                     or after[2] != info[2]):
                 settled = False
                 continue
-            found[info[2]] = -1 if outside else info[3] if parent[1] != 1 else 0
+            key = -1 if outside else info[3] if parent[1] != 1 else 0
+            found[info[2]] = Process(pid, info[2], key, parent[2],
+                                     executable_of(lib, pid, parent) if workspace else "")
         if settled:
             return found
     raise OSError(errno.EBUSY, "producer changed during enumeration")
@@ -305,14 +355,34 @@ def producer_group(a: Attempt, producer: str, group: int | None) -> None:
         store(fd, key, data)
 
 
-def protected_command(command, cwd=None):
+def sandboxed() -> bool:
+    lib = ctypes.CDLL(None)
+    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    return lib.sandbox_check(os.getpid(), None, 0) == 1
+
+
+def dashboard_ports() -> frozenset[int]:
+    from . import config, util
+
+    found = {config.DASHBOARD_PORT}
+    try:
+        found.add(int(config.load().dashboard_port))
+    except (OSError, ValueError, TypeError):
+        pass
+    record = util.read_json(paths.SERVER_FILE, None)
+    if isinstance(record, dict) and isinstance(record.get("port"), int):
+        found.add(record["port"])
+    return frozenset(found)
+
+
+def protected_command(command, cwd=None, keeps=()):
     from . import pi
 
     if not pi.can_confine(False):
         return command
-    lib = ctypes.CDLL(None)
-    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
-    if lib.sandbox_check(os.getpid(), None, 0) == 1:
+    if sandboxed():
+        lib = ctypes.CDLL(None)
+        lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
         try:
             os.lstat(AUTHORITY)
         except OSError:
@@ -321,7 +391,8 @@ def protected_command(command, cwd=None):
                for op in (b"file-read-data", b"file-write-data")):
             return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
-    return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False) + words
+    return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False,
+                                keeps=tuple(keeps)) + words
 
 
 def service_command(a: Attempt, command: str) -> list[str]:
@@ -334,7 +405,7 @@ def service_command(a: Attempt, command: str) -> list[str]:
     hidden = (AUTHORITY.parent, home / ".local/share/arete", home / "Library/Application Support/arete",
               *(home / n for n in (*guard.SECRET_DIRS, ".claude", ".codex", ".pi")))
     return pi.write_confinement(Path(a.workspace), [], hidden=hidden, agent_roots=False,
-                                peers=paths.WORKTREES_DIR, secrets_denied=True) + ["/bin/sh", "-c", command]
+                                peers=paths.WORKTREES_DIR, secrets_denied=True, unix_confined=True) + ["/bin/sh", "-c", command]
 
 
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
@@ -378,35 +449,120 @@ def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
     return proc
 
 
-def producers_done(data: dict) -> bool:
-    if "producers" not in data or "before" not in data:
-        return False
+def service_labels() -> dict[str, list[str]] | None:
+    return launchd.labels(os.getuid())
+
+
+def service_reason(p: Process, current: dict[int, Process], unrelated: set[int], table: launchd.Table,
+                   labels: dict | None) -> str:
+    try:
+        job = table.job(p.pid, launchd.bundled(p.executable))
+    except launchd.Unreadable:
+        return UNCLASSIFIED_HOLDER
+    if job is None:
+        return ORPHAN
+    if not launchd.sealed(job.path):
+        return SUBMITTED
+    if not job.domain.startswith("pid/"):
+        if not isinstance(labels, dict):
+            return UNCLASSIFIED_HOLDER
+        if job.label not in labels.get(job.domain.split("/")[0], ()):
+            return SUBMITTED
+    if (identity_of(p.pid) != p.identity or not launchd.sealed(p.executable)
+            or not launchd.runs(job.path, p.executable)):
+        return UNCLASSIFIED_HOLDER
+    if job.domain.startswith("pid/"):
+        owner = current.get(int(job.domain[4:]))
+        if owner is None or owner.identity not in unrelated or identity_of(owner.pid) != owner.identity:
+            return UNCLASSIFIED_HOLDER
+    return ""
+
+
+def holder(p: Process, reason: str) -> dict:
+    return {"pid": p.pid, "name": os.path.basename(p.executable) or "unknown", "reason": reason}
+
+
+def live_groups(data: dict) -> list[int] | None:
+    live = []
     for group in data["producers"].values():
         if isinstance(group, dict) and group.get("gated") is True:
             group = group["group"]
             if group is None:
                 continue
         if group is None:
-            return False
+            return None
         if group:
             try:
                 os.killpg(group, 0)
             except ProcessLookupError:
                 continue
             except PermissionError:
-                return False
-            return False
-    current, unrelated = process_ids(data["attempt"]["workspace"]), {-1, *data["before"]}
-    while descendants := {child for child, parent in current.items() if parent in unrelated} - unrelated:
-        unrelated.update(descendants)
-    return not current.keys() - unrelated
+                pass
+            live.append(group)
+    return live
 
 
-def workspace_busy(a: Attempt) -> bool:
-    return any(d["attempt"]["selector"] != a.selector and d["state"] not in ("done", "preserved")
-               and overlap(Path(d["attempt"]["workspace"]), Path(a.workspace))
-               and (d["state"] in ("initializing", "prepared", "active") or not producers_done(d))
-               for d in records())
+def holders(data: dict) -> list[dict]:
+    unknown_holder = {"pid": 0, "name": "unknown", "reason": UNCLASSIFIED_HOLDER}
+    if "producers" not in data or "before" not in data:
+        return [unknown_holder]
+    groups = live_groups(data)
+    if groups is None:
+        return [unknown_holder]
+    current = processes(data["attempt"]["workspace"])
+    by_pid = {p.pid: p for p in current.values()}
+    why = {p.identity: IN_GROUP for p in current.values() if p.group in groups}
+    held = [{"pid": g, "name": "unknown", "reason": IN_GROUP} for g in groups
+            if not any(p.group == g for p in current.values())]
+    unrelated, table = {-1, *data["before"]}, launchd.Table(os.getuid())
+    while True:
+        while descendants := {i for i, p in current.items() if p.parent in unrelated} - unrelated:
+            unrelated.update(descendants)
+        exempt = {i for i, p in current.items() if p.parent == 0 and i not in unrelated and i not in why
+                  and not service_reason(p, by_pid, unrelated, table, data.get("labels"))}
+        if not exempt:
+            break
+        unrelated.update(exempt)
+    rest = [i for i in current if i not in unrelated and i not in why]
+    for i in rest:
+        if current[i].parent == 0:
+            why[i] = service_reason(current[i], by_pid, unrelated, table, data.get("labels")) or UNCLASSIFIED_HOLDER
+    rest = [i for i in rest if i not in why]
+    while rest:
+        placed = [i for i in rest if current[i].parent in why or current[i].parent not in current]
+        for i in placed:
+            why[i] = why.get(current[i].parent, UNCLASSIFIED_HOLDER)
+        if not placed:
+            placed = rest
+            for i in rest:
+                why[i] = UNCLASSIFIED_HOLDER
+        rest = [i for i in rest if i not in placed]
+    held.extend(holder(current[i], reason) for i, reason in why.items())
+    return sorted(held, key=lambda h: h["pid"])
+
+
+def holding(a: Attempt) -> list[dict]:
+    for data in records():
+        if data["attempt"]["selector"] == a.selector:
+            diagnostic = data.get("diagnostic")
+            return diagnostic.get("holders", []) if isinstance(diagnostic, dict) else []
+    return []
+
+
+def named_holders(held: list[dict]) -> str:
+    return ", ".join(f"pid {h['pid']} {h['name']} ({h['reason']})" for h in held)
+
+
+def blocking_holders(a: Attempt) -> list[dict] | None:
+    found, blocked = [], False
+    for d in records():
+        if (d["attempt"]["selector"] != a.selector and d["state"] not in ("done", "preserved")
+                and overlap(Path(d["attempt"]["workspace"]), Path(a.workspace))):
+            held = holders(d) if d["state"] not in ("initializing", "prepared", "active") else []
+            if held or d["state"] in ("initializing", "prepared", "active"):
+                blocked = True
+                found.extend(held)
+    return found if blocked else None
 
 
 def isolation(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str = "") -> bool:
@@ -571,11 +727,71 @@ def context(command: str, cwd: str) -> str:
         return ""
 
 
-def unknown_fd(a: Attempt, root: int) -> list[str]:
+def filesystem(fd: int) -> str:
+    if not paths.ON_MAC:
+        return ""
+    lib = ctypes.CDLL(None, use_errno=True)
+    call = getattr(lib, "fstatfs$INODE64", None) or lib.fstatfs
+    call.argtypes = (ctypes.c_int, ctypes.c_char_p)
+    buffer = ctypes.create_string_buffer(2168)
+    if call(fd, buffer):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return buffer.raw[72:88].split(b"\0")[0].decode("ascii", "replace")
+
+
+def creation_floor(a: Attempt, root_fd: int) -> int | None:
+    try:
+        if filesystem(root_fd) != "apfs":
+            return None
+    except OSError:
+        return None
+    if set(a.directories) - {"", *FOLDERS} or set(a.files) - {".gitignore", *SLOTS}:
+        return None
+    recorded = [a.directories[n] for n in ("", *FOLDERS) if n in a.directories]
+    recorded += [a.files[n] for n in (".gitignore", *SLOTS) if n in a.files]
+    if not recorded or any(device != a.directories[""][0] for device, _ in recorded):
+        return None
+    inodes = [inode for _, inode in recorded]
+    if inodes != sorted(set(inodes)):
+        return None
+    return inodes[-1]
+
+
+def refusal(st: os.stat_result, device: int, least: int | None) -> str:
+    if st.st_dev != device:
+        return ELSEWHERE
+    if least is None:
+        return UNCLASSIFIED
+    if not stat.S_ISDIR(st.st_mode) and st.st_nlink != 1:
+        return LINKED
+    if st.st_ino <= least:
+        return EXISTED
+    return ""
+
+
+def examined(folder: int, prefix: str, names, device: int, least: int | None, failed: dict, waiting: list) -> None:
+    for name in names:
+        try:
+            st = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        except OSError as error:
+            failed[prefix + name] = f"{UNCLASSIFIED}: {type(error).__name__}"
+            continue
+        reason = refusal(st, device, least)
+        if reason:
+            failed[prefix + name] = reason
+        elif stat.S_ISDIR(st.st_mode):
+            waiting.append((prefix + name, identity(st)))
+
+
+def unknown_fd(a: Attempt, root: int) -> dict[str, str]:
     checked(os.fstat(root), a.directories[""], True)
+    device, least = a.directories[""][0], creation_floor(a, root)
     names = set(os.listdir(root))
     expected = {n for n in a.directories if n} | {n for n in a.files if "/" not in n}
-    found = list(names - expected) + ["missing:" + n for n in expected - names]
+    failed = {"missing:" + n: MISSING for n in expected - names}
+    waiting: list[tuple[str, list[int]]] = []
+    examined(root, "", names - expected, device, least, failed, waiting)
     for name in names & expected:
         if name in a.files:
             checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.files[name])
@@ -584,15 +800,35 @@ def unknown_fd(a: Attempt, root: int) -> list[str]:
                 checked(os.fstat(folder), a.directories[name], True)
                 children = set(os.listdir(folder))
                 wanted = {n.partition("/")[2] for n in a.files if n.startswith(name + "/")}
-                found += [name + "/" + n for n in children - wanted]
-                found += ["missing:" + name + "/" + n for n in wanted - children]
+                failed.update({"missing:" + name + "/" + n: MISSING for n in wanted - children})
+                examined(folder, name + "/", children - wanted, device, least, failed, waiting)
                 for child in children & wanted:
                     checked(os.stat(child, dir_fd=folder, follow_symlinks=False), a.files[name + "/" + child])
             checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.directories[name], True)
-    return sorted(found)
+    while waiting:
+        path, expected_identity = waiting.pop()
+        try:
+            with paths.directory_fd(Path(path), root) as folder:
+                if identity(os.fstat(folder)) != expected_identity:
+                    raise OSError(errno.ESTALE, "resource replaced")
+                examined(folder, path + "/", os.listdir(folder), device, least, failed, waiting)
+        except OSError as error:
+            failed[path] = f"{UNCLASSIFIED}: {type(error).__name__}"
+    return failed
 
 
-def unknown(a: Attempt) -> list[str]:
+def named(failed: dict[str, str]) -> dict:
+    kept: list[str] = []
+    size = 0
+    for name in sorted(failed):
+        size += 2 * len(json.dumps(name)) + len(failed[name])
+        if len(kept) >= MAX_LISTED or size > MAX_DIAGNOSTIC:
+            break
+        kept.append(name)
+    return {"unknown_entries": kept, "reasons": {n: failed[n] for n in kept}, "omitted": len(failed) - len(kept)}
+
+
+def unknown(a: Attempt) -> dict[str, str]:
     with root_fd(a) as root:
         return unknown_fd(a, root)
 
@@ -704,13 +940,18 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
                 return "", [], [a.root] if os.path.lexists(a.root) else []
             data["state"] = "pending"
             store(fd, key, data)
-            if not producers_done(data):
+            if held := holders(data):
                 data["state"] = "retained"
-                data["diagnostic"] = "waiting for registered verification producers to exit; authority revoked"
+                data["diagnostic"] = {"message": WAITING, "holders": held[:MAX_HOLDERS]}
+                if len(held) > MAX_HOLDERS:
+                    data["diagnostic"]["more"] = len(held) - MAX_HOLDERS
                 store(fd, key, data)
                 return "", [], kept
-            if workspace_busy(a):
-                data["diagnostic"] = "another verification attempt still holds this workspace"
+            if (blocked := blocking_holders(a)) is not None:
+                data["diagnostic"] = {"message": "another verification attempt still holds this workspace",
+                                      "holders": blocked[:MAX_HOLDERS]}
+                if len(blocked) > MAX_HOLDERS:
+                    data["diagnostic"]["more"] = len(blocked) - MAX_HOLDERS
                 store(fd, key, data)
                 return "", [], kept
             if data.get("capture"):
@@ -732,9 +973,9 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
                 data = load(fd, key, a.selector)
                 data["snapshot"] = archived
                 store(fd, key, data)
-            unknown_entries = unknown(a)
-            if unknown_entries:
-                data["diagnostic"] = {"retained_root": a.root, "unknown_entries": unknown_entries[:MAX_LISTED]}
+            failed = unknown(a)
+            if failed:
+                data["diagnostic"] = {"retained_root": a.root, **named(failed)}
                 store(fd, key, data)
                 return archived, saved, kept
             kept = cleanup(a, data, fd, key)
@@ -771,7 +1012,12 @@ def retain(a: Attempt) -> None:
         if data["attempt"] != asdict(a):
             return
         data["state"] = "retained"
-        data["diagnostic"] = "producer shutdown unconfirmed; authority revoked and worktree retained"
+        try:
+            held = holders(data)[:MAX_HOLDERS]
+        except OSError:
+            held = []
+        data["diagnostic"] = {"message": "producer shutdown unconfirmed; authority revoked and worktree retained",
+                              "holders": held}
         store(fd, key, data)
 
 
@@ -814,9 +1060,11 @@ def note(a: Attempt | None) -> str:
     return ("## Disposable fixtures\n\nHarness paths (data): " + json.dumps({"root": a.root, "slots": SLOTS}) +
             "\n\nUse these empty engine-created slots for fake configuration, SQLite state and output; rewrite them "
             "in place. Set ARETE_CONFIG_DIR and ARETE_STATE_DIR to this root's config and state folders. "
-            "Arbitrary entries and imported files have no ownership claim and keep the worktree retained. "
+            "Files and folders that you or the service create here are verification output: Arete archives them "
+            "with the scratch root, and they gain no ownership claim with the guard. Entries moved or hard-linked "
+            "in from elsewhere keep the worktree retained. "
             "Arete snapshots owned bytes, then archives the validated scratch root in protected evidence. "
-            "Unknown or replaced entries keep the worktree retained; failed preservation is retried by polling. "
+            "Imported, hard-linked or replaced entries keep the worktree retained; failed preservation is retried by polling. "
             "Scratch fixtures do not change the delivered implementation. Never copy real credentials or live state. "
             "Use fake transports before product calls. Unsupported confinement supplies no enhanced authority. "
             "The guard supplies authenticated snapshots as context; guards and JEV remain authoritative. "

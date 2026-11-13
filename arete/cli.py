@@ -287,6 +287,52 @@ def cmd_heartbeat(args) -> int:
     return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
 
 
+def cmd_oncall(args) -> int:
+    from . import oncall, state
+
+    cfg = config.load()
+    if args.action == "scan":
+        summary = oncall.scan(cfg)
+        if summary is None:
+            print(f"on-call is off; set [oncall] enabled = true in {paths.CONFIG_FILE}")
+        elif "skipped" in summary:
+            print(summary["skipped"])
+        else:
+            print(json.dumps(summary) if args.json else f"on-call: {oncall.said(summary)}")
+        return 0
+    if args.action == "show":
+        found = state.incident(int(args.id)) if args.id.isdigit() else None
+        if not found:
+            print(f"no incident {args.id}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(found))
+            return 0
+        print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
+              f"{found['first_seen']} to {found['last_seen']}")
+        print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
+        for note in found["notes"]:
+            print(f"{note['ts']}  {note['note']}")
+        return 0
+    rows = state.incidents()
+    if args.json:
+        for row in rows:
+            print(json.dumps(row))
+        return 0
+    for r in rows:
+        print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
+              f"x{r['count']:<4} {r['signature']}")
+    now = oncall.status(cfg)
+    if not now["enabled"]:
+        print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
+    else:
+        last = "no scan yet"
+        if now["last_scan"]:
+            last = f"last scan {when(now['last_scan'])}" + ("" if now["ok"] else f" failed: {now['detail']}")
+        print(f"on-call is on; {last}; {now['expected']} expected events counted")
+    return 0
+
+
 def cmd_hook(args) -> int:
     from . import hook
 
@@ -313,6 +359,12 @@ def cmd_codex_guard(args) -> int:
     return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
 
 
+def cmd_mcp_ask(args) -> int:
+    from . import asks
+
+    return asks.check(sys.stdin, sys.stdout) if args.check else asks.serve(sys.stdin, sys.stdout)
+
+
 def cmd_background(args) -> int:
     from . import background
 
@@ -326,6 +378,11 @@ def cmd_ask(args) -> int:
 
 
 def cmd_jev(args) -> int:
+    if args.action != "report":
+        from . import calibrate
+
+        return calibrate.main(args)
+
     import json
 
     from . import verdicts
@@ -491,6 +548,27 @@ def cmd_audit(args) -> int:
     return auditor.run(dry_run=args.dry_run)
 
 
+def cmd_verifiers(args) -> int:
+    import tomllib
+
+    from . import verifiers
+
+    if args.dry_run and args.action != "run" or args.json and args.action != "report":
+        print("usage: arete verifiers sample FOLDER | run SUITE [--dry-run] | report FILE [--json]", file=sys.stderr)
+        return 2
+    target = paths.expand(args.target)
+    try:
+        if args.action == "sample":
+            print_lines(verifiers.sample(target))
+            return 0
+        if args.action == "run":
+            return verifiers.run(target, dry=args.dry_run)
+        return verifiers.report(target, as_json=args.json)
+    except (verifiers.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
 def cmd_eval(args) -> int:
     from . import eval_mine, evals
 
@@ -508,6 +586,25 @@ def cmd_eval(args) -> int:
     prompts_dir = paths.expand(args.prompts).resolve() if args.prompts else None
     prompts = evals.Prompts(prompts_dir, paths.short_path(prompts_dir)) if prompts_dir else None
     return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run, prompts=prompts)
+
+
+def cmd_experiment(args) -> int:
+    import tomllib
+
+    from . import experiment
+
+    wrong = (args.dry_run and args.action == "summary") or (args.out and args.action == "summary") \
+        or (args.json and args.action == "run")
+    if wrong:
+        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json]", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "summary":
+            return experiment.show(paths.expand(args.path), args.json)
+        return experiment.run(paths.expand(args.path), args.out, args.dry_run)
+    except (experiment.Refused, tomllib.TOMLDecodeError, OSError) as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 def cmd_triage(args) -> int:
@@ -1082,6 +1179,73 @@ def cmd_prices(args) -> int:
     return 0
 
 
+BENCHMARK_NEVER = "It never pulls weights, provisions a device or schedules load."
+
+
+def cmd_benchmark(args) -> int:
+    from pathlib import Path
+
+    from . import benchmark, devices, util
+
+    if args.action == "fixture":
+        if not 1 <= args.seconds <= 3600:
+            print("arete benchmark: --seconds must be from 1 to 3600", file=sys.stderr)
+            return 2
+        try:
+            return benchmark.serve_fixture(args.port, args.seconds)
+        except OSError as e:
+            print(f"arete benchmark: cannot serve the fixture on port {args.port}: {util.first_line(str(e), 200)}",
+                  file=sys.stderr)
+            return 1
+    try:
+        found = benchmark.run(benchmark.read_manifest(paths.expand(args.manifest)))
+        if args.out:
+            util.write_json(Path(args.out), found)
+    except (benchmark.Refused, ValueError, TypeError, OSError, devices.DeviceError) as e:
+        print(f"arete benchmark: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(found))
+    else:
+        print_lines(benchmark.report_lines(found))
+    return 0
+
+
+def cmd_writers(args) -> int:
+    from pathlib import Path
+
+    from . import util, writers
+
+    words = args.words
+    counts = {"sample": 1, "run": 1, "export": 1, "rate": 2, "report": 1}
+    if len(words) != counts[args.action]:
+        print("usage: arete writers sample FOLDER | run REPO [--dry-run] | export RUN [--out FILE] | "
+              "rate RUN FILE [--rater NAME] | report RUN [--json]", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print_lines(writers.sample(Path(words[0])))
+        elif args.action == "run":
+            return writers.run(words[0], args.dry_run)
+        elif args.action == "export":
+            found = writers.export(words[0])
+            if args.out:
+                util.write_json(Path(args.out), found)
+                print(json.dumps({"run": words[0], "out": args.out,
+                                  "texts": sum(len(c["texts"]) for c in found["cases"])}))
+            else:
+                print(json.dumps(found, indent=2))
+        elif args.action == "rate":
+            print(json.dumps(writers.rate(words[0], words[1], args.rater)))
+        else:
+            found = writers.report(words[0])
+            print(json.dumps(found) if args.json else "\n".join(writers.report_lines(found)))
+    except (writers.Refused, ValueError, TypeError, OSError, config.UnknownRepo) as e:
+        print(f"arete writers: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
     from . import lines, state
 
@@ -1164,6 +1328,27 @@ def cmd_replay(args) -> int:
         return 1
     print_lines(lines)
     return 0
+
+
+def cmd_retrieval(args) -> int:
+    import tomllib
+
+    from . import retrieval
+
+    words = list(args.words)
+    if (args.action, len(words)) not in (("sample", 1), ("run", 2)):
+        print("usage: arete retrieval run REPO SUITE [--split S] [--dry-run] [--json] [--out FILE] | sample FOLDER",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print_lines(retrieval.sample(paths.expand(words[0])))
+            return 0
+        return retrieval.run(words[0], words[1], split=args.split, dry_run=args.dry_run, as_json=args.json,
+                             out=args.out)
+    except (retrieval.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError, config.UnknownRepo) as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 def print_lines(lines: Iterable[str], *, flush: bool = False) -> None:
@@ -1261,6 +1446,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_heartbeat)
 
+    p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
+    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan"))
+    p.add_argument("id", nargs="?", default="", help="with show: the incident number")
+    p.add_argument("--json", action="store_true", help="one JSON line per incident")
+    p.set_defaults(fn=cmd_oncall)
+
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
 
@@ -1274,6 +1465,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--judge", action="store_true")
     scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
+
+    p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "
+                                       "validates one call read from stdin")
+    p.add_argument("--check", action="store_true")
+    p.set_defaults(fn=cmd_mcp_ask)
 
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "
@@ -1290,8 +1486,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_ask)
 
-    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts")
-    p.add_argument("action", choices=("report",))
+    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts; "
+                                   "compare decision models offline")
+    p.add_argument("action", choices=("report", "compare", "sample"))
+    p.add_argument("target", nargs="?", default="", help="compare: the spec file; sample: a new empty folder")
+    p.add_argument("--out", metavar="DIR", help="compare: where to write proposal.json and predictions.jsonl "
+                                                "(default: out next to the spec)")
     p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_jev)
@@ -1386,6 +1586,30 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("words", nargs="*", help="diff [FILE], import FILE, or recompute RUN_ID STEP")
     p.set_defaults(fn=cmd_prices)
 
+    p = sub.add_parser("writers", help="compare owner-configured writer routes with blinded team ratings and "
+                                       "factual checks; proposals only")
+    p.add_argument("action", choices=("sample", "run", "export", "rate", "report"))
+    p.add_argument("words", nargs="*", help="sample FOLDER, run REPO, export RUN, rate RUN FILE or report RUN")
+    p.add_argument("--dry-run", action="store_true", help="run: list the candidates and cases without a call")
+    p.add_argument("--out", metavar="FILE", help="export: write the rating view to FILE")
+    p.add_argument("--rater", default="", metavar="NAME", help="rate: the rater, instead of the file's rater")
+    p.add_argument("--json", action="store_true", help="report: one JSON line")
+    p.set_defaults(fn=cmd_writers)
+
+    p = sub.add_parser("benchmark", help="measure already configured local model endpoints under 8K and 32K context "
+                                         "and concurrency; " + BENCHMARK_NEVER,
+                       description="Benchmark already configured local model endpoints once, on request. "
+                                   + BENCHMARK_NEVER)
+    bsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
+    b = bsub.add_parser("run", help="run the manifest's candidates once and print the comparable report")
+    b.add_argument("manifest", metavar="MANIFEST", help="a TOML manifest of candidates")
+    b.add_argument("--json", action="store_true", help="print the report as one JSON line")
+    b.add_argument("--out", metavar="FILE", help="also write the report JSON to FILE")
+    b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
+    b.add_argument("--port", type=int, required=True)
+    b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
+    p.set_defaults(fn=cmd_benchmark)
+
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))
     p.add_argument("run_id")
@@ -1433,6 +1657,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("folder")
     p.add_argument("--adw", action="store_true", help="turn on [factory] path = \"adw\" in the sample layer")
     p.set_defaults(fn=cmd_replay)
+
+    p = sub.add_parser("retrieval", help="offline experiment: compare exact, hybrid, embedding and rerank retrieval on "
+                                         "a layer's labeled queries; `retrieval sample FOLDER` writes a fixture")
+    p.add_argument("action", choices=("run", "sample"))
+    p.add_argument("words", nargs="+", help="run: REPO SUITE; sample: FOLDER")
+    p.add_argument("--split", default="", help="keep only the queries of this split (train, validation, holdout)")
+    p.add_argument("--dry-run", action="store_true", help="check the suite and corpus, call no adapter or model")
+    p.add_argument("--json", action="store_true", help="print the results as one JSON line")
+    p.add_argument("--out", default="", help="also write the results JSON to this file")
+    p.set_defaults(fn=cmd_retrieval)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")
@@ -1514,6 +1748,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=3, help="with mine: the most merged PRs to mine in one go")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, or summarize its results")
+    p.add_argument("action", choices=("run", "summary"))
+    p.add_argument("path", metavar="MANIFEST | FILE", help="run: the manifest; summary: the results file")
+    p.add_argument("--dry-run", action="store_true", help="with run: validate and print the plan; writes and calls nothing")
+    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for the manifest")
+    p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
+    p.set_defaults(fn=cmd_experiment)
+
+    p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
+                                         "`sample FOLDER`, `run SUITE`, `report FILE`")
+    p.add_argument("action", choices=["sample", "run", "report"])
+    p.add_argument("target", metavar="FOLDER | SUITE | FILE")
+    p.add_argument("--dry-run", action="store_true", help="with run: list arms, tasks and trials; no calls, no writes")
+    p.add_argument("--json", action="store_true", help="with report: the summary as one JSON line")
+    p.set_defaults(fn=cmd_verifiers)
 
     p = sub.add_parser("triage", help="loop 5: the triage board of your open tickets without the agent label")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")

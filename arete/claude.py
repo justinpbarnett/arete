@@ -15,6 +15,7 @@ from pathlib import Path
 from . import accounts, background, config, devices, environment, paths, scratch, util
 from .agent import (
     NO_SESSION,
+    Cut,
     Result,
     Session,
     UsageLimit,
@@ -266,8 +267,19 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
                           text=True, errors="replace", env=env, actor_confined=actor_confined)
     out: list[str] = []
     err: list[str] = []
+    cuts: list[Cut] = []
+
+    def watched(line: str) -> None:
+        if cuts:
+            return
+        try:
+            on_line(line)
+        except Cut as cut:
+            cuts.append(cut)
+            util.kill_tree(child.pid)
+
     helpers = [threading.Thread(target=feed, args=(child.stdin, prompt), daemon=True),
-               threading.Thread(target=collect, args=(child.stdout, out, on_line), daemon=True),
+               threading.Thread(target=collect, args=(child.stdout, out, watched), daemon=True),
                threading.Thread(target=collect, args=(child.stderr, err, lambda line: None), daemon=True)]
     for helper in helpers:
         helper.start()
@@ -283,6 +295,8 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
             verify.stop(child)
         for helper in helpers:
             helper.join(DRAIN_SECONDS)
+    if cuts:
+        raise cuts[0]
     return subprocess.CompletedProcess(cmd, child.returncode, "".join(out), "".join(err))
 
 

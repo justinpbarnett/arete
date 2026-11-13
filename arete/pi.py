@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
 
-from . import accounts, claude, config, devices, environment, paths, scratch, state, util
+from . import accounts, asks, claude, config, devices, environment, paths, scratch, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -41,6 +41,7 @@ LOGIN_DIR = paths.STATE_DIR / "pi-login"
 KEY_DIR = paths.STATE_DIR / "pi-key"
 KEYS_FILE = paths.PI_KEYS_FILE
 GUARD_FILE = paths.PACKAGE_DIR / "pi_guard.mjs"
+ASK_FILE = paths.PACKAGE_DIR / "pi_ask.mjs"
 GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls"})
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
@@ -554,7 +555,7 @@ def guard_env(auth_paths: list[Path] | None = None, secret_paths: tuple[Path, ..
     files.extend(path for source in secret_paths for path in (source, source.resolve()))
     return {"ARETE_PI_GUARD_PATHS": json.dumps({"roots": list(map(str, roots)), "files": list(map(str, files)),
                                               "write_roots": [str(paths.PACKAGE_DIR)],
-                                              "write_files": [str(GUARD_FILE)]})}
+                                              "write_files": [str(GUARD_FILE), str(ASK_FILE)]})}
 
 
 def can_confine(remote: bool) -> bool:
@@ -563,7 +564,8 @@ def can_confine(remote: bool) -> bool:
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
                       *, hidden: tuple[Path, ...] = (), restrict_writes: bool = True,
-                      agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False) -> list[str]:
+                      agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False,
+                      keeps: tuple[str, ...] = (), unix_confined: bool = False) -> list[str]:
     hidden = tuple(dict.fromkeys((*hidden, scratch.AUTHORITY)))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
@@ -578,7 +580,7 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
         params += ["-D", f"AUTH={auth_path.resolve()}", "-D", f"LOCK={auth_path.resolve()}.lock"]
     for i, path in enumerate(hidden):
         params += ["-D", f"H{i}={path.resolve()}"]
-        profile += f'(deny file-read* file-write* (subpath (param "H{i}")))'
+        profile += f'(deny file-read* file-write* file-link (subpath (param "H{i}")))'
     if peers:
         params += ["-D", f"PEERS={peers.resolve()}", "-D", f"WORK={cwd.resolve()}"]
         profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
@@ -601,7 +603,42 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     for i, path in enumerate(sorted(ancestors)):
         params += ["-D", f"A{i}={path}"]
         profile += f'(deny file-write* (literal (param "A{i}")))'
+    if "launch" not in keeps:
+        profile += '(deny lsopen)(deny appleevent-send)(deny job-creation)'
+    if unix_confined:
+        params += ["-D", f"UNIX={cwd.resolve()}"]
+        profile += ('(deny network-outbound (subpath "/"))(allow network-outbound (subpath (param "UNIX")) '
+                    '(subpath "/private/tmp") (subpath "/private/var/folders"))')
+    folders, sockets = command_sockets(keeps)
+    for i, folder in enumerate(folders):
+        params += ["-D", f"SF{i}={folder}"]
+        profile += f'(deny network-outbound (subpath (param "SF{i}")))'
+    for i, sock in enumerate(sockets):
+        params += ["-D", f"SL{i}={sock}"]
+        profile += f'(deny network-outbound (literal (param "SL{i}")))'
+    for port in sorted(scratch.dashboard_ports()):
+        profile += f'(deny network-outbound (remote tcp "*:{int(port)}"))'
     return ["/usr/bin/sandbox-exec", *params, "-p", profile]
+
+
+def command_sockets(keeps: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
+    uid = os.getuid()
+    folders = [f"/private/tmp/tmux-{uid}"]
+    if tmpdir := os.environ.get("TMUX_TMPDIR"):
+        folders.append(str(Path(tmpdir).resolve() / f"tmux-{uid}"))
+    folders += [str(paths.HOME / p) for p in (".docker/run", ".colima", ".orbstack/run", ".rd",
+                                              "Library/Containers/com.docker.docker/Data")]
+    sockets = []
+    if tmux := os.environ.get("TMUX", "").split(",")[0]:
+        sockets.append(tmux)
+    sockets += ["/private/var/run/docker.sock", str(Path("/var/run/docker.sock").resolve())]
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith("unix://"):
+        sockets.append(host.removeprefix("unix://"))
+    agent = os.environ.get("SSH_AUTH_SOCK", "")
+    if agent and "ssh-agent" not in keeps and os.path.isabs(agent):
+        sockets += [agent, str(Path(agent).resolve())]
+    return list(dict.fromkeys(folders)), list(dict.fromkeys(sockets))
 
 
 def sessions_dir(remote: devices.Device | None) -> str:
@@ -610,7 +647,7 @@ def sessions_dir(remote: devices.Device | None) -> str:
 
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
             persist: bool = True, add_dirs: list[Path] | None = None,
-            remote: devices.Device | None = None) -> list[str]:
+            remote: devices.Device | None = None, ask_owner: bool = False) -> list[str]:
     if refusal := remote_refusal(remote):
         raise ValueError(refusal)
     remote = None
@@ -618,6 +655,9 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp"]
     if not remote:
         cmd += ["--extension", str(GUARD_FILE)]
+        if ask_owner:
+            cmd += ["--extension", str(ASK_FILE)]
+    names = [*names, asks.TOOL] if ask_owner and not remote else names
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
     if model:
         cmd += ["--model", model]
@@ -830,6 +870,7 @@ def _run(
     auth: accounts.Auth | None = None,
     selected: Route | None = None,
     extra_env: dict[str, str] | None = None,
+    ask_owner: bool = False,
 ) -> Result:
     if refusal := remote_refusal(remote):
         return Result(ok=False, error=refusal, session=resume, runner="pi", model=model)
@@ -853,7 +894,7 @@ def _run(
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     launch_model = selected.model.partition("/")[2] if selected else model
     cmd = command(names, model=launch_model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
-                  remote=remote)
+                  remote=remote, ask_owner=ask_owner)
     if selected and selected.provider:
         cmd += ["--provider", selected.provider]
     if json_schema:
@@ -875,7 +916,8 @@ def _run(
     else:
         folder = selected.view
         env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
-               **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files)}
+               **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files),
+               **({"ARETE_ASK_TOOL": json.dumps(asks.pi_tool())} if ask_owner else {})}
     try:
         with refresh_channel(selected, env) as descriptors:
             if error := plan_token_error(env.items()):

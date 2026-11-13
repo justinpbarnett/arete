@@ -48,7 +48,7 @@ def metadata(run_id: str, name: str) -> dict:
 
 
 def family(run_id: str) -> list[str]:
-    found, todo = [], [run_id] if run_id else []
+    found, todo, dropped = [], [run_id] if run_id else [], set()
     while todo:
         rid = todo.pop()
         if rid in found:
@@ -61,6 +61,11 @@ def family(run_id: str) -> list[str]:
             if saved.get("version") != 1 or not isinstance(saved.get("parents"), list) or any(
                     not isinstance(parent, str) or not parent for parent in saved["parents"]):
                 raise ValueError(f"run {rid} has invalid budget lineage")
+            if "left_out" in saved:
+                if not isinstance(saved["left_out"], list) or any(
+                        not isinstance(left, str) or not left for left in saved["left_out"]):
+                    raise ValueError(f"run {rid} has invalid budget lineage")
+                dropped.update(saved["left_out"])
             todo.extend(saved.get("parents", []))
             continue
         for item in lines.read(rid):
@@ -68,11 +73,26 @@ def family(run_id: str) -> list[str]:
                 todo.append(str(item["source"]))
             if item.get("event") == "route" and item.get("continues"):
                 todo.append(str(item["continues"]))
-    return found
+    return [rid for rid in found if rid not in dropped]
+
+
+def digest(title, body) -> str:
+    return hashlib.sha256(json.dumps([title, body], ensure_ascii=True).encode()).hexdigest()
 
 
 def specification(ticket) -> str:
-    return hashlib.sha256(json.dumps([ticket.title, ticket.body], ensure_ascii=True).encode()).hexdigest()
+    return digest(ticket.title, ticket.body)
+
+
+def recorded_specification(run_id: str) -> str:
+    saved = metadata(run_id, "budget.json").get("specification")
+    if isinstance(saved, str) and saved:
+        return saved
+    for item in reversed(lines.read(run_id)):
+        data = item.get("data")
+        if item.get("step") == "prepare" and isinstance(data, dict) and isinstance(data.get("ticket"), dict):
+            return digest(data["ticket"].get("title", ""), data["ticket"].get("body", ""))
+    return ""
 
 
 def heads(repo, branch: str) -> dict[str, str]:
@@ -81,7 +101,8 @@ def heads(repo, branch: str) -> dict[str, str]:
     found = {}
     parts = [(p.dir, repo.path / p.dir) for p in repo.parts] or [("", repo.path)]
     for name, src in parts:
-        result = util.sh(["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=src, timeout=10)
+        result = util.sh(["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=src, timeout=10,
+                         keeps=("ssh-agent",))
         if result.returncode:
             raise ValueError("could not confirm the parked branch head; work remains parked")
         row = result.stdout.split()
@@ -162,14 +183,24 @@ def verification_seconds(run_id: str, row: dict) -> float:
 
 
 class Budget:
-    def __init__(self, run, policy: Policy, previous: str, ticket=None) -> None:
+    def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False) -> None:
         self.run, self.policy = run, policy
-        self.parents = family(previous)
-        rows = [state.run_get(rid) for rid in self.parents]
-        if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid)) for row in rows):
+        chain = family(previous)
+        rows = {rid: state.run_get(rid) for rid in chain}
+        if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
+               for row in rows.values()):
             raise ValueError("the repair budget chain names a different or missing ticket run")
-        self.prior_seconds = sum(elapsed(row) for row in rows)
-        self.verify_seconds = sum(verification_seconds(row["id"], row) for row in rows)
+        current = specification(ticket) if ticket else None
+        left = [rid for rid in chain
+                if forced and current and (found := recorded_specification(rid)) and found != current]
+        left_repairs = sum(repair_count(rid) for rid in left)
+        left_seconds = sum(elapsed(rows[rid]) for rid in left)
+        left_verify = sum(verification_seconds(rid, rows[rid]) for rid in left)
+        self.left_out = left
+        self.parents = [rid for rid in chain if rid not in left]
+        kept = [rows[rid] for rid in self.parents]
+        self.prior_seconds = sum(elapsed(row) for row in kept)
+        self.verify_seconds = sum(verification_seconds(row["id"], row) for row in kept)
         self.prior_repairs = sum(repair_count(rid) for rid in self.parents)
         self.repair_calls = 0
         self.current_verification_seconds = 0.0
@@ -177,26 +208,17 @@ class Budget:
         self.started = time.monotonic() - elapsed(state.run_get(run.id))
         self.deadline = self.started + policy.max_run_minutes * 60 - self.prior_seconds
         self.verify_deadline = None
-        self.specification = specification(ticket) if ticket else None
-        if not self.specification:
-            for rid in self.parents:
-                if prior := metadata(rid, "budget.json").get("specification"):
-                    self.specification = prior
-                    break
-                for item in reversed(lines.read(rid)):
-                    data = item.get("data") or {}
-                    if item.get("step") == "prepare" and isinstance(data.get("ticket"), dict):
-                        value = data["ticket"]
-                        self.specification = hashlib.sha256(json.dumps(
-                            [value.get("title", ""), value.get("body", "")], ensure_ascii=True).encode()).hexdigest()
-                        break
-                if self.specification:
-                    break
+        self.specification = current or next(
+            (found for rid in self.parents if (found := recorded_specification(rid))), None)
         self.persist()
+        if left:
+            run.log(f"budget: left out {util.count(left_repairs, 'earlier repair cycle')}, "
+                    f"{left_seconds / 60:.1f} run minutes and {left_verify / 60:.1f} verification minutes of "
+                    f"{util.count(len(left), 'earlier run')} because the ticket specification changed since they ran")
 
     def persist(self) -> None:
         util.write_json(artifact(self.run.id, "budget.json"), {
-            "version": 1, "parents": self.parents, "policy": asdict(self.policy),
+            "version": 1, "parents": self.parents, "left_out": self.left_out, "policy": asdict(self.policy),
             "specification": self.specification, "repair_calls": self.repair_calls,
             "verification_seconds": self.current_verification_seconds,
             "verification_active_since": self.verification_active_since})

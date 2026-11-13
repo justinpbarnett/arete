@@ -23,7 +23,7 @@ from . import lines as run_lines
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
 STOPPED = "stopped by request"
-ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva"}
+ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva", "experiment": "exp"}
 FAILS_WHEN_DEAD = ("miner", "eval")
 TICKET_KINDS = ("pipeline",)
 RECORD_SUFFIX = ".jsonl.gz"
@@ -672,8 +672,28 @@ def read_pi(e: dict) -> list[dict]:
     return out
 
 
+def mcp_call(item: dict) -> dict:
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            pass
+    return {"kind": "tool_call", "id": item.get("id", ""), "name": f"mcp__{item.get('server', '')}__{item.get('tool', '')}",
+            "input": arguments}
+
+
+def mcp_result(item: dict, name: str) -> dict:
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    failure = item.get("error")
+    text = block_text(result.get("content")) or (str(failure.get("message") if isinstance(failure, dict) else failure or ""))
+    return {"kind": "tool_result", "id": item.get("id", ""), "name": name, "text": text,
+            "error": bool(failure) or item.get("status") == "failed"}
+
+
 def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
     before: dict = {}
+    started: set[str] = set()
 
     def read(e: dict) -> list[dict]:
         nonlocal before
@@ -689,8 +709,14 @@ def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
                      "cost_usd": None}]
         if e.get("type") == "item.started" and kind == "command_execution":
             return [{"kind": "tool_call", "id": at, "name": "Bash", "input": {"command": item.get("command", "")}}]
+        if e.get("type") == "item.started" and kind == "mcp_tool_call":
+            started.add(at)
+            return [mcp_call(item)]
         if e.get("type") != "item.completed":
             return []
+        if kind == "mcp_tool_call":
+            call = mcp_call(item)
+            return [*([] if at in started else [call]), mcp_result(item, call["name"])]
         if kind in ("agent_message", "reasoning"):
             role = "assistant" if kind == "agent_message" else "thinking"
             return [{"kind": "message", "role": role, "text": item.get("text", "")}]
@@ -704,9 +730,19 @@ def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
     return read
 
 
+def read_replay(e: dict) -> list[dict]:
+    if e.get("type") == "tool_call":
+        return [{"kind": "tool_call", "id": e.get("id", ""), "name": e.get("name", ""), "input": e.get("input")}]
+    if e.get("type") == "tool_result":
+        return [{"kind": "tool_result", "id": e.get("id", ""), "name": e.get("name", ""), "text": e.get("text", ""),
+                 "error": bool(e.get("error"))}]
+    return []
+
+
 READERS: dict[str, Callable[[dict], Callable[[dict], list[dict]]]] = {"claude": claude_reader,
                                                                       "pi": lambda header: read_pi,
-                                                                      "codex": codex_reader}
+                                                                      "codex": codex_reader,
+                                                                      "replay": lambda header: read_replay}
 
 
 def named_model(raw: str) -> str:
