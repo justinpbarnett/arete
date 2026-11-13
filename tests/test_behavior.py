@@ -187,7 +187,7 @@ if scenario.startswith("held-scratch"):
     for fd in list(scratch.LEASES.values()):
         os.close(fd)
     scratch.LEASES.clear()
-    with mock.patch.object(scratch, "producers_done", return_value=True):
+    with mock.patch.object(scratch, "holders", return_value=[]):
         pipeline.retry_scratch()
     (root / "finalized").mkdir()
     for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
@@ -285,6 +285,34 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("left out 3 earlier repair cycles", result["log"])
         self.assertEqual(result["budget"]["left_out"], [result["old"]])
         self.assertEqual(result["budget"]["parents"], [])
+
+
+class FailedPrepareHistoryTests(unittest.TestCase):
+    @staticmethod
+    def end(step, result="pass", **extra):
+        return {"event": "step_end", "step": step, "result": result, **extra}
+
+    def test_failed_prepare_run_adds_nothing(self):
+        a = [self.end("prepare"), self.end("plan"), self.end("verify", "fail")]
+        b = [{"event": "route", "skipped": 0}, self.end("prepare", "fail"), self.end("respond")]
+        history = arete.factory.history([b, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "verify"])
+        self.assertTrue(arete.factory.reopening([b, a]))
+        self.assertFalse(arete.factory.reopening([a]))
+
+    def test_redone_join_puts_own_prepare_first(self):
+        a = [self.end("prepare", n=1), self.end("plan"), self.end("implement")]
+        c = [{"event": "route", "skipped": 2, "redone": 1}, self.end("prepare", n=2), self.end("verify")]
+        history = arete.factory.history([c, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "implement", "verify"])
+        self.assertEqual(history[0]["n"], 2)
+
+    def test_failed_prepare_is_not_takable_but_other_fails_are(self):
+        flow = object.__new__(arete.factory.Flow)
+        flow.earlier, flow.redone, flow.skipped = [self.end("prepare", "fail"), self.end("verify", "fail"), {}], 0, 0
+        self.assertFalse(flow.takable(flow.earlier[0]))
+        flow.skipped = 1
+        self.assertTrue(flow.takable(flow.earlier[1]))
 
 
 @unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
@@ -408,7 +436,7 @@ class VerificationOutputTests(unittest.TestCase):
             self.skipTest("needs APFS")
         (self.root / "home").mkdir()
         for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
-                      mock.patch.object(scratch, "producers_done", return_value=True)):
+                      mock.patch.object(scratch, "holders", return_value=[])):
             patch.start()
             self.addCleanup(patch.stop)
         self.ws = self.root / "worktrees/ticket"
@@ -542,6 +570,264 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
         self.assertEqual(self.record(a)["state"], "pending")
         self.assertTrue(Path(a.root).exists())
+
+
+class PushedPrDraftTests(unittest.TestCase):
+    URL = "https://github.com/fixture/repo/pull/7"
+
+    def setUp(self):
+        from arete import gh, jev
+        self.gh, self.jev = gh, jev
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+
+        def sh(*args):
+            return subprocess.run([*git, *args], cwd=self.root, check=True, capture_output=True, text=True).stdout.strip()
+
+        sh("init", "-b", "main")
+        (self.root / "a.txt").write_text("a\n")
+        sh("add", ".")
+        sh("commit", "-m", "base")
+        sh("update-ref", "refs/remotes/origin/main", "HEAD")
+        sh("checkout", "-b", "work")
+        (self.root / "a.txt").write_text("b\n")
+        sh("commit", "-am", "change")
+        self.head = sh("rev-parse", "HEAD")
+        self.calls, self.logs, self.said = [], [], []
+        self.draft, self.remote_head, self.score, self.fail = True, self.head, 0.1, False
+        self.body, self.listed = "", True
+        self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=self.root), repairs="", feedback=[],
+                                   log=self.logs.append)
+        self.layer = SimpleNamespace(trust_level="automerge")
+        self.cfg = config.Config()
+        self.c = pipeline.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
+        for target, name, fake in [(gh, "gh", self.fake_gh), (jev, "ready", lambda *a, **k: True),
+                                   (jev, "ask", self.fake_ask)]:
+            patcher = mock.patch.object(target, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_gh(self, args, input=None, **kw):
+        self.calls.append((list(args), input))
+        if args[:2] == ["pr", "list"]:
+            return json.dumps([{"url": self.URL}] if self.listed else [])
+        if args[:2] == ["pr", "create"]:
+            self.draft = "--draft" in args
+            return self.URL
+        if args[:2] == ["pr", "edit"]:
+            self.body = input
+        if args[:2] == ["pr", "ready"]:
+            self.draft = "--undo" in args
+        if args[:2] == ["pr", "view"] and "isDraft,headRefOid" in args:
+            if self.fail:
+                raise self.gh.GhError("gh pr view: boom")
+            return json.dumps({"isDraft": self.draft, "headRefOid": self.remote_head})
+        if args[:2] == ["pr", "view"] and "body" in args:
+            return json.dumps({"body": self.body})
+        if args[:2] == ["pr", "view"]:
+            return json.dumps({"mergeStateStatus": "DRAFT" if self.draft else "CLEAN", "mergeable": "MERGEABLE"})
+        if args[0] == "api":
+            return json.dumps({"allow_auto_merge": False})
+        return ""
+
+    def fake_ask(self, *a, **k):
+        answers = {n: self.jev.Answer(self.score, 1.0) for n in self.jev.RISK}
+        answers["irreversible"] = self.jev.Answer(False, 1.0, {"yes": 0.0})
+        return self.jev.Reply(answers=answers)
+
+    def names(self, *prefix):
+        return [a for a, _ in self.calls if a[:len(prefix)] == list(prefix)]
+
+    def reads(self):
+        return [a for a, _ in self.calls if "isDraft,headRefOid" in a]
+
+    def found_run(self, held=False, feedback=False, pushed=False, moved=False, preset=False, legacy=False):
+        from arete import flows, tracker
+        root = Path(tempfile.mkdtemp(dir=self.root))
+        origin, wt = root / "origin.git", root / "wt"
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+
+        def sh(cwd, *args):
+            return subprocess.run([*git, *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+        sh(root, "init", "-q", "--bare", "-b", "main", str(origin))
+        sh(root, "clone", "-q", str(origin), str(wt))
+        (wt / "a.txt").write_text("a\n")
+        sh(wt, "add", ".")
+        sh(wt, "commit", "-qm", "base")
+        sh(wt, "push", "-q", "origin", "main")
+        sh(wt, "checkout", "-qb", "work")
+        (wt / "a.txt").write_text("b\n")
+        sh(wt, "commit", "-qam", "change by the earlier run")
+        sh(wt, "push", "-q", "-u", "origin", "work")
+        c = pipeline.Checkout("", "fixture/repo", wt, wt, "main", pr=self.URL if preset else "",
+                              lease=sh(wt, "rev-parse", "HEAD"), resumes=True)
+        self.remote_head = "f" * 40 if moved else c.lease
+        self.calls.clear()
+        self.logs.clear()
+        self.said.clear()
+        tk = SimpleNamespace(pr_link=lambda t, whole=True: "link", pr_title=lambda s, t: s, pr_labels=[])
+        self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=wt,
+                                                            parts=[config.Part("", "fixture/repo")]),
+                                   repairs="", feedback=["comment"] if feedback else [], feedback_prs=[],
+                                   log=self.logs.append, tracker=tk, enter=lambda s: None, say=self.said.append)
+        layer = config.RepoLayer(dir=Path())
+        layer.trust_level = "automerge"
+        verified = verify.Verified("blocked" if held else "pass", blocked_by="needs a login")
+        job = flows.Job(config.Config(), self.run, root / "ws", ticket=tracker.Ticket("123", "#123", "Title"),
+                        branch="work", checkouts=[c], layer=layer, verified=verified, review={"verdict": "approve"})
+        staged = pipeline.Staged(counts={"a.txt": 1}, changed=[c])
+        job.built = SimpleNamespace(restage=lambda from_base=False: staged if from_base or pushed else pipeline.Staged(),
+                                    from_base=False, committed_lines=0, staged=pipeline.Staged(),
+                                    push=lambda branch, message: None)
+        with mock.patch.multiple(pipeline, evidence_images=lambda *a, **k: {}, report_body=lambda *a, **k: "report",
+                                 synced_pr_body=lambda run, url, body, t, left: body,
+                                 answer_feedback=lambda *a, **k: None):
+            out = flows.pr(SimpleNamespace(ctx=job), str(wt))
+            stored = {k: v for k, v in out.data.items() if k not in ("found", "drafted", "ci_stopped")}
+            job.published(stored if legacy else out.data, stored=False)
+            flows.publish(SimpleNamespace(ctx=job))
+        return out.data
+
+    def test_found_draft_pr_not_held_is_marked_ready_then_merged(self):
+        data = self.found_run()
+        self.assertEqual((data["found"], data["opened"]), (["fixture/repo"], ["fixture/repo"]))
+        self.assertEqual(self.names("pr", "create"), [])
+        self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]])
+        self.assertEqual(len(self.names("pr", "merge")), 1)
+        self.assertFalse(self.draft)
+        self.assertIn(f"pr: marked {self.URL} ready for review", self.logs)
+
+    def test_found_ready_pr_held_is_made_a_draft(self):
+        for pushed in (False, True):
+            with self.subTest(pushed=pushed):
+                self.draft = False
+                data = self.found_run(held=True, pushed=pushed)
+                self.assertEqual((data["committed"], data["drafted"]), (pushed, ["fixture/repo"]))
+                self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL, "--undo"]])
+                self.assertEqual(self.names("pr", "merge"), [])
+                self.assertTrue(self.draft)
+                self.assertTrue(self.said[-1].endswith("The PRs are drafts: the check in use was blocked. needs a login"))
+
+    def test_found_pr_in_a_revise_run_is_left_alone(self):
+        for draft, held in ((True, False), (False, True), (False, False)):
+            with self.subTest(draft=draft, held=held):
+                self.draft = draft
+                data = self.found_run(held=held, feedback=True)
+                self.assertEqual(data["drafted"], [])
+                self.assertEqual((self.reads(), self.names("pr", "ready"), self.names("pr", "merge")), ([], [], []))
+                self.assertEqual(self.draft, draft)
+
+    def test_found_pr_with_moved_head_is_left_alone(self):
+        for draft, held in ((True, False), (False, True)):
+            with self.subTest(draft=draft, held=held):
+                self.draft = draft
+                self.found_run(held=held, moved=True)
+                self.assertEqual((self.names("pr", "ready"), self.names("pr", "merge")), ([], []))
+                self.assertEqual(self.draft, draft)
+                self.assertTrue(any(line.startswith(f"pr: left {self.URL} as it is: its head is ffffffffffff")
+                                    for line in self.logs))
+
+    def test_found_pr_an_earlier_ci_watch_stopped_is_left_alone_and_keeps_its_ci_section(self):
+        self.body = "intro\n<!-- arete:ci -->\n## CI\n\nArete stopped: CI failed.\n<!-- /arete:ci -->\n"
+        data = self.found_run()
+        self.assertEqual(data["ci_stopped"], ["fixture/repo"])
+        self.assertEqual((self.reads(), self.names("pr", "ready"), self.names("pr", "merge")), ([], [], []))
+        self.assertTrue(self.draft)
+        self.assertTrue(self.body.startswith("link\n\nreport"))
+        self.assertTrue(pipeline.ci.stopped(self.body))
+
+    def test_pr_opened_fresh_by_this_try_behaves_as_before(self):
+        self.listed = False
+        data = self.found_run()
+        self.assertEqual((data["found"], data["opened"]), ([], ["fixture/repo"]))
+        self.assertEqual(len(self.names("pr", "create")), 1)
+        self.assertEqual((self.reads(), self.names("pr", "ready")), ([], []))
+        self.assertEqual(len(self.names("pr", "merge")), 1)
+
+    def test_pr_outcome_stored_before_found_was_kept_reads_as_none_found(self):
+        from arete import flows
+        job = flows.Job(config.Config(), self.run, self.root / "ws", checkouts=[self.c])
+        job.built = SimpleNamespace(committed_lines=0)
+        job.published({"prs": {}, "opened": ["fixture/repo"], "pushed": [], "changed": ["fixture/repo"],
+                       "draft_why": "", "report_body": "", "summary": "", "committed_lines": 0}, stored=False)
+        self.assertEqual(job.found, [])
+
+    def test_pr_outcome_stored_before_ci_stopped_was_kept_leaves_a_standing_pr_alone(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self.draft = True
+                self.found_run(preset=True, legacy=legacy)
+                self.assertEqual(len(self.names("pr", "ready")), 0 if legacy else 1)
+                self.assertEqual(len(self.names("pr", "merge")), 0 if legacy else 1)
+                self.assertEqual(self.draft, legacy)
+
+    def test_pushed_draft_is_marked_ready_then_merged(self):
+        ready = pipeline.ready_pushed(self.run, [self.c], [], "")
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
+        self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]])
+        self.assertEqual(len(self.names("pr", "merge")), 1)
+        self.assertIn(f"pr: marked {self.URL} ready for review", self.logs)
+
+    def test_pushed_draft_over_risk_line_stays_for_a_person(self):
+        self.score = 0.9
+        ready = pipeline.ready_pushed(self.run, [self.c], [], "")
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
+        self.assertEqual(len(self.names("pr", "ready")), 1)
+        self.assertEqual(self.names("pr", "merge"), [])
+        comments = [i for a, i in self.calls if a[:2] == ["pr", "comment"]]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("Automerge stays off for this PR", comments[0])
+
+    def test_pushed_ready_pr_is_made_a_draft_when_held(self):
+        self.draft = False
+        why, verified = "the check in use was blocked", verify.Verified("blocked", "", [])
+        drafted = pipeline.hold_pushed(self.run, [self.c], [], why)
+        self.assertEqual(drafted, [self.c])
+        self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL, "--undo"]])
+        self.assertIn(f"{why}.", pipeline.published_note(why, verified, [], drafted))
+        self.calls.clear()
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], why), [])
+        self.assertEqual(self.calls, [])
+
+    def test_opened_pr_behaves_as_before(self):
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", [self.c], "about")
+        self.assertEqual([a for a in self.calls if "isDraft,headRefOid" in a[0]], [])
+        self.assertEqual(self.names("pr", "ready"), [])
+        verified = verify.Verified("blocked", "", [])
+        self.assertEqual(pipeline.published_note("why", verified, [self.c], []), pipeline.draft_note("why", verified))
+        self.assertEqual(pipeline.published_note("", verified, [self.c], []), "")
+
+    def test_ci_stopped_repair_and_changed_head_are_left_alone(self):
+        for why in ("", "held"):
+            self.assertEqual(pipeline.hold_pushed(self.run, [self.c], [self.c], why), [])
+            self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [self.c], why), [])
+        self.assertEqual(self.calls, [])
+        self.run.repairs = "old"
+        self.assertEqual(pipeline.hold_pushed(self.run, [self.c], [], "held"), [])
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], ""), [])
+        self.assertEqual(self.calls, [])
+        self.run.repairs = ""
+        self.remote_head = "f" * 40
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], ""), [])
+        self.draft = False
+        self.assertEqual(pipeline.hold_pushed(self.run, [self.c], [], "held"), [])
+        self.assertEqual(self.names("pr", "ready"), [])
+        self.assertTrue(any(f"left {self.URL} as it is" in line for line in self.logs))
+
+    def test_unreadable_state_is_left_alone(self):
+        self.fail = True
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], ""), [])
+        self.assertIn(f"pr: left {self.URL} as it is: arete could not read its state: gh pr view: boom", self.logs)
+
+    def test_trust_level_pr_marks_ready_without_merging(self):
+        self.layer.trust_level = "pr"
+        ready = pipeline.ready_pushed(self.run, [self.c], [], "")
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
+        self.assertEqual(len(self.names("pr", "ready")), 1)
+        self.assertEqual(self.names("pr", "merge"), [])
 
 
 if __name__ == "__main__":

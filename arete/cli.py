@@ -363,6 +363,12 @@ def cmd_codex_guard(args) -> int:
     return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
 
 
+def cmd_mcp_ask(args) -> int:
+    from . import asks
+
+    return asks.check(sys.stdin, sys.stdout) if args.check else asks.serve(sys.stdin, sys.stdout)
+
+
 def cmd_background(args) -> int:
     from . import background
 
@@ -376,6 +382,11 @@ def cmd_ask(args) -> int:
 
 
 def cmd_jev(args) -> int:
+    if args.action != "report":
+        from . import calibrate
+
+        return calibrate.main(args)
+
     import json
 
     from . import verdicts
@@ -539,6 +550,27 @@ def cmd_audit(args) -> int:
     from . import auditor
 
     return auditor.run(dry_run=args.dry_run)
+
+
+def cmd_verifiers(args) -> int:
+    import tomllib
+
+    from . import verifiers
+
+    if args.dry_run and args.action != "run" or args.json and args.action != "report":
+        print("usage: arete verifiers sample FOLDER | run SUITE [--dry-run] | report FILE [--json]", file=sys.stderr)
+        return 2
+    target = paths.expand(args.target)
+    try:
+        if args.action == "sample":
+            print_lines(verifiers.sample(target))
+            return 0
+        if args.action == "run":
+            return verifiers.run(target, dry=args.dry_run)
+        return verifiers.report(target, as_json=args.json)
+    except (verifiers.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 def cmd_eval(args) -> int:
@@ -1142,6 +1174,38 @@ def cmd_prices(args) -> int:
     return 0
 
 
+BENCHMARK_NEVER = "It never pulls weights, provisions a device or schedules load."
+
+
+def cmd_benchmark(args) -> int:
+    from pathlib import Path
+
+    from . import benchmark, devices, util
+
+    if args.action == "fixture":
+        if not 1 <= args.seconds <= 3600:
+            print("arete benchmark: --seconds must be from 1 to 3600", file=sys.stderr)
+            return 2
+        try:
+            return benchmark.serve_fixture(args.port, args.seconds)
+        except OSError as e:
+            print(f"arete benchmark: cannot serve the fixture on port {args.port}: {util.first_line(str(e), 200)}",
+                  file=sys.stderr)
+            return 1
+    try:
+        found = benchmark.run(benchmark.read_manifest(paths.expand(args.manifest)))
+        if args.out:
+            util.write_json(Path(args.out), found)
+    except (benchmark.Refused, ValueError, TypeError, OSError, devices.DeviceError) as e:
+        print(f"arete benchmark: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(found))
+    else:
+        print_lines(benchmark.report_lines(found))
+    return 0
+
+
 def cmd_writers(args) -> int:
     from pathlib import Path
 
@@ -1397,6 +1461,11 @@ def main(argv: list[str] | None = None) -> int:
     scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
 
+    p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "
+                                       "validates one call read from stdin")
+    p.add_argument("--check", action="store_true")
+    p.set_defaults(fn=cmd_mcp_ask)
+
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "
                                           "(reads a payload on stdin)")
@@ -1412,8 +1481,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_ask)
 
-    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts")
-    p.add_argument("action", choices=("report",))
+    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts; "
+                                   "compare decision models offline")
+    p.add_argument("action", choices=("report", "compare", "sample"))
+    p.add_argument("target", nargs="?", default="", help="compare: the spec file; sample: a new empty folder")
+    p.add_argument("--out", metavar="DIR", help="compare: where to write proposal.json and predictions.jsonl "
+                                                "(default: out next to the spec)")
     p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_jev)
@@ -1517,6 +1590,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rater", default="", metavar="NAME", help="rate: the rater, instead of the file's rater")
     p.add_argument("--json", action="store_true", help="report: one JSON line")
     p.set_defaults(fn=cmd_writers)
+
+    p = sub.add_parser("benchmark", help="measure already configured local model endpoints under 8K and 32K context "
+                                         "and concurrency; " + BENCHMARK_NEVER,
+                       description="Benchmark already configured local model endpoints once, on request. "
+                                   + BENCHMARK_NEVER)
+    bsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
+    b = bsub.add_parser("run", help="run the manifest's candidates once and print the comparable report")
+    b.add_argument("manifest", metavar="MANIFEST", help="a TOML manifest of candidates")
+    b.add_argument("--json", action="store_true", help="print the report as one JSON line")
+    b.add_argument("--out", metavar="FILE", help="also write the report JSON to FILE")
+    b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
+    b.add_argument("--port", type=int, required=True)
+    b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
+    p.set_defaults(fn=cmd_benchmark)
 
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))
@@ -1664,6 +1751,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for the manifest")
     p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
     p.set_defaults(fn=cmd_experiment)
+
+    p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
+                                         "`sample FOLDER`, `run SUITE`, `report FILE`")
+    p.add_argument("action", choices=["sample", "run", "report"])
+    p.add_argument("target", metavar="FOLDER | SUITE | FILE")
+    p.add_argument("--dry-run", action="store_true", help="with run: list arms, tasks and trials; no calls, no writes")
+    p.add_argument("--json", action="store_true", help="with report: the summary as one JSON line")
+    p.set_defaults(fn=cmd_verifiers)
 
     p = sub.add_parser("triage", help="loop 5: the triage board of your open tickets without the agent label")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")

@@ -17,7 +17,8 @@ INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "bui
 STEP_ROLES = (*MODEL_ROLES, *INHERITS)
 STEP_NAMES = (*STEP_ROLES, *STEP_ALIASES)
 STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
-             "session", "modalities", "min_context", "structured_output", "data_handling", "floor", "budget_usd")
+             "session", "modalities", "min_context", "structured_output", "data_handling", "floor", "budget_usd",
+             "directory_cleanup")
 STEP_COUNTS = ("timeout_minutes", "tries", "min_context")
 STEP_AMOUNTS = ("budget_usd",)
 STEP_LISTS = ("tools", "mcp", "instructions", "modalities", "data_handling")
@@ -35,6 +36,7 @@ WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
+ASK_KEYS = ("max_per_run", "settle")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -123,6 +125,12 @@ class ReplayConfig:
 
 
 @dataclass
+class AskConfig:
+    max_per_run: int = 3
+    settle: bool = True
+
+
+@dataclass
 class Environment:
     passes: tuple[str, ...] = ()
     providers: dict[str, tuple[str, ...]] = field(default_factory=dict)
@@ -201,6 +209,7 @@ class Config:
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
     research_planner: bool = False
+    ask: AskConfig = field(default_factory=AskConfig)
     document: dict = field(default_factory=dict)
     oncall: OncallConfig = field(default_factory=OncallConfig)
 
@@ -272,6 +281,8 @@ def step_table(table, where: str) -> dict:
         raise ValueError(f"[{where}]: session {table['session']!r} is not one of {', '.join(SESSIONS)}")
     if "structured_output" in table and type(table["structured_output"]) is not bool:
         raise ValueError(f"[{where}]: structured_output must be true or false, not {table['structured_output']!r}")
+    if "directory_cleanup" in table and type(table["directory_cleanup"]) is not bool:
+        raise ValueError(f"[{where}]: directory_cleanup must be true or false, not {table['directory_cleanup']!r}")
     return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else float(v) if k in STEP_AMOUNTS
             else v if k in STEP_COUNTS or type(v) is bool else str(v)
             for k, v in table.items()}
@@ -417,6 +428,18 @@ def replay_table(data) -> ReplayConfig:
     if bad := sorted(set(table) - set(REPLAY_KEYS)):
         raise ValueError(f"[replay]: unknown key {', '.join(bad)}; use {', '.join(REPLAY_KEYS)}")
     return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
+
+
+def ask_table(data) -> AskConfig:
+    table = table_of(data, "ask")
+    if bad := sorted(set(table) - set(ASK_KEYS)):
+        raise ValueError(f"[ask]: unknown key {', '.join(bad)}; use {', '.join(ASK_KEYS)}")
+    limit, settle = table.get("max_per_run", 3), table.get("settle", True)
+    if type(limit) is not int or limit < 0:
+        raise ValueError(f"[ask] max_per_run must be a whole number of at least 0, not {limit!r}")
+    if type(settle) is not bool:
+        raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
+    return AskConfig(max_per_run=limit, settle=settle)
 
 
 def research_table(data) -> bool:
@@ -681,6 +704,7 @@ def load(path: Path | None = None) -> Config:
     cfg.replay = replay_table(data.get("replay") or {})
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.research_planner = research_table(data.get("research") or {})
+    cfg.ask = ask_table(data.get("ask") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)
     from . import steps
