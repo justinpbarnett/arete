@@ -20,7 +20,7 @@ adw-wait id:
 adw-logs id step="":
     uv run arete lines {{quote(id)}} --step={{quote(step)}}
 
-# Answer a run's question; prints the run the answer starts
+# Answer a parked run's text question; prints the run that continues it
 adw-answer id text:
     uv run arete answer {{quote(id)}} -- "$2"
 

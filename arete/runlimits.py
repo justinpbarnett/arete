@@ -290,7 +290,7 @@ class Budget:
         self.persist()
         lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
 
-    def park(self, reason: str) -> dict:
+    def park(self, reason: str, kept: dict | None = None) -> dict:
         row = state.run_get(self.run.id) or {}
         branch = str(row.get("branch") or next((r.get("branch") for rid in self.parents
                      if (r := state.run_get(rid)) and r.get("branch")), ""))
@@ -302,7 +302,7 @@ class Budget:
                      if (r := state.run_get(rid)) and r.get("pr_url")), ""))
         util.write_json(artifact(self.run.id, "parked.json"), {
             "reason": reason, "policy": asdict(self.policy), "specification": self.specification,
-            "heads": published, "branch": branch, "pr_url": pr_url,
+            "heads": published, "branch": branch, "pr_url": pr_url, "kept": kept or {},
             "workspace": str(self.run.workspace[0]) if self.run.workspace else "", "retry": RETRY})
         lines.write(self.run.id, "parked", reason=reason, retry=RETRY)
         return {"branch": branch, "pr_url": pr_url}

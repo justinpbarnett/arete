@@ -23,10 +23,12 @@ from string import Template
 from typing import TextIO
 
 from . import (
+    alerts,
     asks,
     ci,
     config,
     control,
+    devices,
     diffguard,
     document,
     environment,
@@ -404,6 +406,7 @@ class Run(AgentRun):
     repairs: str = ""
     workspace: tuple[Path, list[Checkout]] | None = None
     asks_made: int = 0
+    answers_due: list[dict] = field(default_factory=list)
 
     @property
     def ref(self) -> str:
@@ -420,13 +423,35 @@ class Run(AgentRun):
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
+        due, plain = self.due_for(step), text
+        if due:
+            text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
+        if due and kw["resume"].id and not res.ok and asks.session_gone(res.error):
+            self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
+            res = super().agent(step, f"{plain}\n\n{asks.fresh_note(due)}", cwd, role, ask_owner=True,
+                                **{**kw, "resume": NO_SESSION})
+        if due and res.ok:
+            state.asks_taken([a["id"] for a in due], self.id)
+            self.answers_due = [a for a in self.answers_due if a not in due]
         while res.record and (sent := asks.found(record.events(paths.record_dir(self.id) / res.record))):
             kept = res.session if kw.get("persist", True) else NO_SESSION
             self.owner_ask(step, sent, kept)
             res = super().agent(step, asks.settled_message(sent), cwd, role, ask_owner=True,
                                 **{**kw, "resume": kept, "resume_only": True})
         return res
+
+    def due_for(self, call: str) -> list[dict]:
+        seam = factory.inside(self.id).step
+        here = [a for a in self.answers_due if a["step"] == seam]
+        return [a for a in here if a["call"] == call] or here
+
+    def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
+        session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
+        fresh = f"{text}\n\n{asks.fresh_note(due)}"
+        if session.id and kw.get("persist", True):
+            return asks.answers_message(due), {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
+        return fresh, {**kw, "resume": NO_SESSION}
 
     def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
         ask_ids = [f"{self.id}-a{self.asks_made + n}" for n in range(1, len(sent) + 1)]
@@ -533,6 +558,8 @@ class Checkout:
     resolved: list[str] = field(default_factory=list)
     merge: str = ""
     resolved_lines: int = 0
+    onto: str = ""
+    kept: str = ""
 
     @property
     def prefix(self) -> str:
@@ -540,6 +567,14 @@ class Checkout:
 
     @property
     def starting_point(self) -> str:
+        if not self.onto:
+            return self.start_note
+        diff = f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.onto[:12]} HEAD"
+        return (f"{self.start_note}; the worktree also holds edits that an earlier run of this ticket left unpushed, "
+                f"committed locally since `{self.onto[:12]}` (`{diff}` shows them), and they are part of this change")
+
+    @property
+    def start_note(self) -> str:
         if not self.resumes:
             return f"fresh from `{self.base}`"
         start = (f"continuing the open PR {self.pr}" if self.pr
@@ -726,10 +761,15 @@ def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
             and not any(h.is_relative_to(ws / n) for h in held)]
 
 
+def onto_key(c: Checkout) -> str:
+    return f"\0onto {c.prefix}"
+
+
 def note_made(ws: Path, checkouts: list[Checkout]) -> None:
     try:
         names = outside_scratch(ws, leftovers(ws, checkouts), scratch_left(ws, checkouts)) if ws.is_dir() else []
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
+        heads |= {onto_key(c): c.onto for c in checkouts if c.onto and (c.wt / ".git").exists()}
         if names or heads:
             salt = os.urandom(16).hex()
             made = {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
@@ -787,12 +827,103 @@ def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: l
         raise RunFailed("workspace removal withheld to preserve scratch resources")
 
 
+def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> None:
+    head = git(["rev-parse", "HEAD"], c.wt).strip()
+    drop_untracked_bytecode(c.wt)
+    diffguard.add(c.wt)
+    deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
+    if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
+                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny)]:
+        git(["reset", "-q", "--", *denied], c.wt)
+    if git(["diff", "--cached", "--name-only"], c.wt).strip():
+        message = f"wip: edits of arete run {run_id}, kept when it ended before pushing\n\nArete-Run: {run_id}"
+        util.git_as_owner(["commit", "-q", "-m", message], c.wt)
+        c.onto = c.onto or head
+
+
+def keep_edits(run: Run) -> None:
+    if run.dry_run or not run.workspace:
+        return
+    for c in run.workspace[1]:
+        if not (c.wt / ".git").exists():
+            continue
+        try:
+            commit_kept(run.id, c, run.layer)
+        except (RuntimeError, OSError) as e:
+            run.log(f"could not commit the edits in {c.github}, so they stay uncommitted in {c.wt}: {e}")
+            try:
+                c.onto = c.onto or git(["rev-parse", "HEAD"], c.wt).strip()
+            except (RuntimeError, OSError):
+                pass
+
+
+def kept_heads(run: Run) -> dict:
+    if not run.workspace:
+        return {}
+    try:
+        return {c.prefix or ".": {"head": git(["rev-parse", "HEAD"], c.wt).strip(), "onto": c.onto}
+                for c in run.workspace[1] if c.onto and (c.wt / ".git").exists()}
+    except (RuntimeError, OSError):
+        return {}
+
+
+def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str]:
+    made = made_before(ws)
+    kept = {}
+    for c in checkouts:
+        onto = str(made.get(onto_key(c)) or "")
+        if not onto or not (c.wt / ".git").exists():
+            continue
+        try:
+            head = git(["rev-parse", "HEAD"], c.wt).strip()
+            on = git(["symbolic-ref", "-q", "--short", "HEAD"], c.wt, check=False).strip()
+        except (RuntimeError, OSError) as e:
+            raise RunFailed(f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it "
+                            f"is: {e}") from e
+        recorded = str(made.get(head_key(c)) or "")
+        if head != recorded:
+            what = f"is at `{head[:12]}`, not at `{recorded[:12]}` where arete kept the last run's edits"
+        elif on != branch:
+            what = f"has `{on or 'a detached HEAD'}` checked out, not `{branch}`"
+        else:
+            kept[str(c.wt)] = onto
+            continue
+        raise RunFailed(f"the existing worktree {c.wt} of {c.github} {what}, so arete did not continue from it or "
+                        f"make it again; put it back with `git -C {c.wt} checkout -B {branch} {recorded}`, or remove "
+                        f"the worktree and the local branch `{branch}` to start from origin, then run again")
+    return kept
+
+
+def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
+                    branch: str) -> dict[str, str]:
+    if scratch_left(ws, checkouts):
+        raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
+    kept = kept_onto(ws, checkouts, branch)
+    if not kept:
+        clear_workspace(ws, checkouts, source, copies)
+        return {}
+    if why := kept_work(ws, checkouts, source, copies):
+        raise RunFailed(why)
+    return kept
+
+
+def start_of(c: Checkout, branch: str) -> str:
+    return f"origin/{branch}" if c.resumes else c.origin_base
+
+
+def continue_from(c: Checkout, branch: str, onto: str) -> None:
+    c.onto = onto
+    behind = [start_of(c, branch), *([c.origin_base] if c.resumes else [])]
+    if any(git(["rev-list", "--count", f"HEAD..{ref}"], c.wt).strip() != "0" for ref in behind):
+        c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
+
+
 def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
                    copies: list[str]) -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
     checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
                  for p in repo.parts]
-    clear_workspace(ws, checkouts, repo.path, copies)
+    kept = kept_or_cleared(ws, checkouts, repo.path, copies, branch)
     for c in checkouts:
         with record.timed(run_id, "clone", repo=c.github, base=c.base, branch=branch, path=str(c.wt)) as clone:
             fetch(c.src, c.base)
@@ -801,7 +932,14 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
             c.resumes = bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
             if c.resumes:
                 fetch(c.src, branch)
-            add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
+            if str(c.wt) in kept:
+                continue_from(c, branch, kept[str(c.wt)])
+                clone["continued"] = True
+            else:
+                if kept and (c.wt / ".git").exists():
+                    with util.repo_lock(c.src):
+                        git(["worktree", "remove", "--force", str(c.wt)], c.src)
+                add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
             clone["resumed"] = c.resumes
     return ws, checkouts
 
@@ -858,7 +996,7 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
     out = Staged()
     for c in checkouts:
         drop_untracked_bytecode(c.wt)
-        against = git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() if from_base else "HEAD"
+        against = git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() if from_base else (c.onto or "HEAD")
         diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
         merged = pending_merge(c)
         if merged and not from_base:
@@ -1176,6 +1314,9 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if newest and newest[0]["status"] == "interrupted" and repaired_by(newest[0]["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
+    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
+        path = str(factory.first(lines.read(asked["id"]), "task").get("path") or "") or name
+        return script_command(cfg, path, repo_name, str(tid), *flags, "--continue", asked["id"])
     return script_command(cfg, name, repo_name, str(tid), *flags)
 
 
@@ -1283,13 +1424,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return 1
         with util.lock(SLOTS_LOCK, wait=True):
             slot = RunSlot(repo.name, str(tid), cfg.max_parallel)
+            only = script.only if script else ""
+            due = state.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
-                if slots_free_to_start(cfg.max_parallel) <= 0:
+                if slots_free_to_start(cfg.max_parallel) > 0:
+                    slot.hold()
+                elif not due:
                     print(f"{name} was not started: {no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
-                slot.hold()
-            only = script.only if script else ""
             earlier = [] if only else state.ticket_runs(repo.name, tid, limit=1, whole=True)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier[0]["id"] if restarting else ""))
@@ -1319,6 +1462,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
         pr_url, passed = "", None
         try:
+            if due and not slot.held and not dry_run and not flow.refusal:
+                slot.take(run.log, run.waiting, "answer")
             parent = (script.repairs or script.continues if script else "") or (
                 earlier[0]["id"] if earlier and earlier[0]["status"] not in ("done", "merged", "rejected") else "")
             if budget_history and budget_history[0]["status"] not in ("done", "merged", "rejected"):
@@ -1336,8 +1481,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 status, summary, passed = flows.alone(flow)
         except runlimits.Parked as e:
             reason = str(e)
-            status, summary = "failed", f"parked: {reason}; branch and evidence retained, workspace left in place. {runlimits.RETRY}"
-            kept = run.budget.park(reason)
+            keep_edits(run)
+            held = kept_heads(run)
+            status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
+                                         f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
+            kept = run.budget.park(reason, held)
             record.note(run.id, **kept)
             pr_url = kept["pr_url"]
             run.log(summary)
@@ -1360,6 +1508,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             if run.workspace:
+                keep_edits(run)
                 note_made(*run.workspace)
             slot.free()
         if restarting and status in ("skipped", "noop") and not run.feedback:
@@ -1369,7 +1518,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if run.feedback and not dry_run and not run.alone:
             state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         if status == "failed":
-            if flow and flow.matching:
+            if flow and flow.matching and flow.stepped:
                 flow.route()
             if not lines.ended_in_error(run_id, reply="respond" if flow else ""):
                 lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
@@ -1464,12 +1613,23 @@ def run_minutes(row: dict) -> float:
 
 
 def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str,
-         asked: list[dict] | None = None) -> tuple[str, str, str]:
+         asked: list[dict] | None = None, session: dict | None = None) -> tuple[str, str, str]:
     for ask in asked or [{}]:
         lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
+    if asked and session is not None and not run.dry_run:
+        for ask in asked:
+            state.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
+                          ask.get("why", ""), ask.get("tried", ""), ask["questions"], session)
+        run.say(outbound.screen(comment))
+        run.enter("needs-info")
+        devices.release(run.id, run.log)
+        alerts.ask_notice(run.where, summary)
+        run.log("needs-info: kept the work folder and the step's session for the answer")
+        return "needs-info", summary[:300], ""
     run.say(comment)
     run.enter("needs-info")
-    remove_workspace(ws, checkouts)
+    if not any(c.onto for c in checkouts):
+        remove_workspace(ws, checkouts)
     return "needs-info", summary[:300], ""
 
 
@@ -1562,8 +1722,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
-        note_fresh_bases(checkouts)
-        merge_moved_bases(run, [c for c in checkouts if c.resumes], main_layer, t)
+        settle_starts(run, checkouts, main_layer, t, branch)
     except RunFailed as e:
         return _fail(run, e.why, detail=e.detail)
     layer = resolve_layer(cfg, run, ws)
@@ -1935,10 +2094,12 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
     for c in changed:
         if not git(["diff", "--cached", "--name-only"], c.wt).strip():
             continue
+        before = git(["rev-parse", "HEAD"], c.wt).strip()
         try:
             util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         except RuntimeError as e:
             raise RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
+        c.onto = c.onto or before
     moved = [c.github for c in checkouts if remote_head(c.src, branch) != c.lease]
     if moved:
         raise RunFailed(f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
@@ -1952,6 +2113,7 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
             raise RunFailed(f"the push to {c.github} failed after arete pushed {done}",
                             f"{e}\n\nA retry builds on whatever reached the branch.") from e
         c.lease = git(["rev-parse", "HEAD"], c.wt).strip()
+        c.onto = ""
         pushed.append(c)
 
 
@@ -2153,7 +2315,60 @@ def resolution_diff(c: Checkout) -> diffguard.Diff:
 def note_fresh_bases(checkouts: list[Checkout]) -> None:
     for c in checkouts:
         if not c.resumes:
-            c.base_commit = git(["rev-parse", "HEAD"], c.wt).strip()
+            c.base_commit = git(["rev-parse", c.origin_base if c.onto else "HEAD"], c.wt).strip()
+
+
+def settle_starts(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
+                  branch: str) -> None:
+    moved = [c for c in checkouts if c.kept]
+    try:
+        for c in moved:
+            drop_untracked_bytecode(c.wt)
+            if uncommitted(c.wt):
+                commit_kept(run.id, c, layer)
+                c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
+                if left := uncommitted(c.wt):
+                    raise RunFailed(f"{c.github} holds edits to protected paths that arete does not keep "
+                                    f"({', '.join(left[:5])}), so it merged nothing into them and left them as they are")
+    except RuntimeError as e:
+        raise RunFailed(f"the commit of the kept edits failed, so arete merged nothing into them: {e}") from e
+    try:
+        for c in moved:
+            git(["reset", "-q", "--hard", start_of(c, branch)], c.wt)
+        note_fresh_bases(checkouts)
+        merge_moved_bases(run, [c for c in checkouts if c.resumes], layer, ticket)
+        for c in moved:
+            merge_kept(run, c, layer, ticket, start_of(c, branch))
+    except BaseException:
+        for c in moved:
+            if c.kept:
+                abort_merge(c.wt)
+                git(["reset", "-q", "--hard", c.kept], c.wt, check=False)
+        raise
+
+
+def merge_kept(run: AgentRun, c: Checkout, layer: config.RepoLayer, ticket: tracker.Ticket, start: str) -> None:
+    arrived = git(["rev-parse", "HEAD"], c.wt).strip()
+    git(["reset", "-q", "--hard", c.kept], c.wt)
+    if git(["rev-list", "--count", f"HEAD..{arrived}"], c.wt).strip() != "0":
+        with record.timed(run.id, "kept_merge", repo=c.github, kept=c.kept, onto=arrived):
+            try:
+                merge_as_run(run.id, c, arrived, start)
+            except RuntimeError as e:
+                conflicts = unmerged_paths(c.wt)
+                if not conflicts:
+                    raise RunFailed(f"git could not merge `{start}` into the edits the last run kept in {c.github}: "
+                                    f"{e}") from e
+                resolve_conflicts(run, c, conflicts, layer, ticket, incoming=(start, arrived))
+        c.onto = arrived
+        run.log(f"merged `{start}` into the edits the last run kept in {c.github}")
+    c.kept = ""
+
+
+def merge_as_run(run_id: str, c: Checkout, commit: str, named: str) -> None:
+    with util.repo_lock(c.src):
+        util.git_as_owner(["merge", "-q", "--no-edit", "-m", f"Merge {named} at {commit[:12]}",
+                           "-m", f"Arete-Run: {run_id}", commit], c.wt)
 
 
 def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
@@ -2171,8 +2386,7 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
                           head=head) as rec:
             try:
                 try:
-                    with util.repo_lock(c.src):
-                        util.git_as_owner(["merge", "-q", "--no-edit", c.base_commit], c.wt)
+                    merge_as_run(run.id, c, c.base_commit, c.origin_base)
                 except RuntimeError as e:
                     conflicts = unmerged_paths(c.wt)
                     if not conflicts:
@@ -2196,10 +2410,11 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
 
 
 def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: config.RepoLayer,
-                      ticket: tracker.Ticket) -> None:
+                      ticket: tracker.Ticket, incoming: tuple[str, str] | None = None) -> None:
     deny = diffguard.denied_paths(layer)
+    named, commit = incoming or (c.origin_base, c.base_commit)
     if protected := [p for p in conflicts if util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny)]:
-        raise RunFailed(f"merging `{c.origin_base}` conflicts in protected paths in {c.github} "
+        raise RunFailed(f"merging `{named}` conflicts in protected paths in {c.github} "
                         f"({', '.join(protected)}), which a person must merge")
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
@@ -2207,8 +2422,8 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
         untracked_before = untracked_files(c.wt)
         ignored_before = ignored_state(c.wt)
         previous = run.sessions.get("build")
-        text = prompt("resolve", repo=run.repo.name, github=c.github, base=c.origin_base,
-                      base_commit=c.base_commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
+        text = prompt("resolve", repo=run.repo.name, github=c.github, base=named,
+                      base_commit=commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
                       ref=ticket.ref, title=ticket.title, body=ticket.body,
                       conflicts="\n".join(f"- `{p}`" for p in conflicts),
                       branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
@@ -3134,7 +3349,7 @@ class RunSlot:
         self.held = util.hold_lock(state.run_lock("slot", self.repo, self.tid))
 
     def take(self, log: Callable[[str], None],
-             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext()) -> None:
+             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), what: str = "ci") -> None:
         if self.held:
             return
         waiting = False
@@ -3144,13 +3359,13 @@ class RunSlot:
                     self.max_parallel = live_max_parallel(self.max_parallel)
                     if len(runs_in_slots()) < self.max_parallel:
                         self.hold()
-                        log("ci: took a run slot back" + (" after waiting for one" if waiting else ""))
+                        log(f"{what}: took a run slot back" + (" after waiting for one" if waiting else ""))
                         return
                     if not waiting:
                         waiting = True
                         stack.enter_context(util.hold_lock(state.run_lock("slot-wait", self.repo, self.tid)))
                         stack.enter_context(waits("slot"))
-                        log(f"ci: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
+                        log(f"{what}: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
                 time.sleep(SLOT_POLL_SECONDS)
 
     def free(self) -> None:
@@ -3276,6 +3491,30 @@ def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
     return ""
 
 
+def answered_run(repo_name: str, tid: str) -> dict | None:
+    newest = state.ticket_runs(repo_name, tid, limit=1, whole=True)
+    if (newest and newest[0]["status"] == "needs-info" and state.asks_due([newest[0]["id"]])
+            and not state.asks_of(newest[0]["id"], "open")):
+        return newest[0]
+    return None
+
+
+def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool) -> str:
+    newest = state.ticket_runs(repo.name, str(tid), limit=1, whole=True)
+    if not newest or newest[0]["status"] != "needs-info":
+        return ""
+    waiting = state.asks_of(newest[0]["id"], "open")
+    if not waiting:
+        return ""
+    if any(asks.has_secret(a["questions"]) for a in waiting):
+        return "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
+    text = tk.reply_since(tid, waiting[0]["asked"])
+    if text and not dry_run:
+        for a in waiting:
+            state.ask_close(a["id"], "answered", asks.text_answers(a, text))
+    return ""
+
+
 def poll(dry_run: bool = False) -> int:
     paths.ensure_dirs()
     cfg = config.load()
@@ -3343,7 +3582,9 @@ def poll(dry_run: bool = False) -> int:
                     progressed = True
                     source = tracker.for_ticket(cfg, repo, tid)
                     name = tracker.ticket_name(repo.name, source.ref(tid))
-                    if waiting := held_back(cfg, repo.name, going, slots):
+                    reply = tracker_reply(repo, source, str(tid), dry_run)
+                    answering = not reply and answered_run(repo.name, str(tid)) is not None
+                    if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
                         exhausted.add(repo.name)
                         if not dry_run:
                             state.pass_over(repo.name, str(tid))
@@ -3351,7 +3592,8 @@ def poll(dry_run: bool = False) -> int:
                         continue
                     blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
                     ticket = source.get(tid)
-                    blocked = blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, discovery, layer)
+                    blocked = (blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, discovery, layer)
+                               or reply)
                     if blocked:
                         skips.note(name, ticket, blocked, repo.name)
                         print(f"{util.iso()} {name}: {blocked}")

@@ -39,8 +39,10 @@ WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
-ASK_KEYS = ("max_per_run", "settle")
+ASK_KEYS = ("max_per_run", "settle", "expire_days")
+MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb")
+CHAT_KEYS = ("context_tokens", "summary_model")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -142,12 +144,19 @@ class ReplayConfig:
 class AskConfig:
     max_per_run: int = 3
     settle: bool = True
+    expire_days: float = 7
 
 
 @dataclass(frozen=True)
 class Retention:
     days: float = 30
     max_gb: float = 20
+
+
+@dataclass(frozen=True)
+class ChatConfig:
+    context_tokens: int = 40_000
+    summary_model: str = "haiku"
 
 
 @dataclass
@@ -230,6 +239,7 @@ class Config:
     research_search_share: float = 0.6
     ask: AskConfig = field(default_factory=AskConfig)
     retention: Retention = field(default_factory=Retention)
+    chat: ChatConfig = field(default_factory=ChatConfig)
     document: dict = field(default_factory=dict)
     oncall: OncallConfig = field(default_factory=OncallConfig)
 
@@ -459,7 +469,10 @@ def ask_table(data) -> AskConfig:
         raise ValueError(f"[ask] max_per_run must be a whole number of at least 0, not {limit!r}")
     if type(settle) is not bool:
         raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
-    return AskConfig(max_per_run=limit, settle=settle)
+    days = table.get("expire_days", 7)
+    if type(days) not in (int, float) or not math.isfinite(days) or not 0 < days <= MAX_ASK_EXPIRE_DAYS:
+        raise ValueError(f"[ask] expire_days must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS}, not {days!r}")
+    return AskConfig(max_per_run=limit, settle=settle, expire_days=days)
 
 
 def retention_table(data) -> Retention:
@@ -473,6 +486,19 @@ def retention_table(data) -> Retention:
             raise ValueError(f"[retention] {key} must be a number above 0, not {value!r}")
         found[key] = value
     return Retention(**found)
+
+
+def chat_table(data) -> ChatConfig:
+    table = table_of(data, "chat")
+    if bad := sorted(set(table) - set(CHAT_KEYS)):
+        raise ValueError(f"[chat]: unknown key {', '.join(bad)}; use {', '.join(CHAT_KEYS)}")
+    tokens = table.get("context_tokens", ChatConfig.context_tokens)
+    if type(tokens) is not int or tokens < 100:
+        raise ValueError(f"[chat] context_tokens must be a whole number of at least 100, not {tokens!r}")
+    model = table.get("summary_model", ChatConfig.summary_model)
+    if type(model) is not str or not model.strip():
+        raise ValueError(f"[chat] summary_model must be a model name, not {model!r}")
+    return ChatConfig(context_tokens=tokens, summary_model=model.strip())
 
 
 def research_table(data) -> dict:
@@ -759,6 +785,7 @@ def load(path: Path | None = None) -> Config:
     cfg.research_search_share = research["search_share"]
     cfg.ask = ask_table(data.get("ask") or {})
     cfg.retention = retention_table(data.get("retention") or {})
+    cfg.chat = chat_table(data.get("chat") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)
     from . import steps
