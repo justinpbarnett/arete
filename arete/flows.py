@@ -105,8 +105,13 @@ def restore(job: Job, line: dict) -> str:
     if why:
         return why
     ws = Path(line["tree"])
+    layer = pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
     try:
-        pipeline.remove_workspace(ws, made)
+        pipeline.clear_workspace(ws, made, job.run.repo.path, layer.copy)
+    except pipeline.RunFailed as e:
+        return e.why
+    job.run.workspace = ws, made
+    try:
         for c in made:
             if c.lease:
                 pipeline.fetch(c.src, branch)
@@ -115,7 +120,7 @@ def restore(job: Job, line: dict) -> str:
     except RuntimeError as e:
         return f"arete could not make it again from origin/{branch}: {e}"
     job.run.log(f"made {ws} again from origin/{branch}")
-    return pipeline.furnish(job.cfg, job.run, pipeline.checked_layer(job.cfg, Path(line["data"]["layer"])), ws)
+    return pipeline.furnish(job.cfg, job.run, layer, ws)
 
 
 def facts(name: str, data: dict) -> dict:
@@ -286,6 +291,10 @@ class Job:
         self.check_commands, self.check_rules = pipeline.check_script(run.dir, self.layer, self.ws)
         run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
+        if stored and not run.workspace:
+            if why := pipeline.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
+                raise pipeline.RunFailed(why)
+            run.workspace = self.ws, self.checkouts
         if stored:
             opened(run, self.ticket)
             if not run.alone:
@@ -365,6 +374,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                                                 main_layer.copy)[1]
         else:
             checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
+        run.workspace = job.ws, checkouts
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind

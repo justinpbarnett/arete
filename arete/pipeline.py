@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -7,6 +8,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -160,9 +162,6 @@ RESOLVE_SCHEMA = {
     "properties": {"resolved": {"type": "boolean"}, "summary": {"type": "string"}},
     "required": ["resolved", "summary"],
 }
-DISPOSABLE_DIRS = {"__pycache__", "node_modules", ".venv", "venv", ".pytest_cache", ".ruff_cache", ".mypy_cache",
-                   ".tox", ".next", ".turbo", ".cache", "dist", "build", "target", "coverage"}
-DISPOSABLE_FILES = {".DS_Store"}
 CONFLICT_MARKER = re.compile(r"^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)( |$)", re.MULTILINE)
 CI_FIX_SCHEMA = {
     "type": "object",
@@ -354,6 +353,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     repairs: str = ""
+    workspace: tuple[Path, list[Checkout]] | None = None
 
     @property
     def ref(self) -> str:
@@ -488,6 +488,7 @@ def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
         with util.repo_lock(c.src):
             git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
     shutil.rmtree(ws, ignore_errors=True)
+    made_record(ws).unlink(missing_ok=True)
     for c in checkouts:
         with util.repo_lock(c.src):
             git(["worktree", "prune"], c.src, check=False)
@@ -498,13 +499,36 @@ def made_copy(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
             and (ws / rel).read_bytes() == (source / rel).read_bytes())
 
 
-def disposable(rel: str) -> bool:
-    parts = rel.rstrip("/").split("/")
-    return parts[-1] in DISPOSABLE_FILES or any(p in DISPOSABLE_DIRS or p.endswith(".egg-info") for p in parts)
+def made_record(ws: Path) -> Path:
+    return paths.STATE_DIR / "workspaces" / f"{ws.name}.json"
 
 
-def owned(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
-    return not disposable(rel) and not made_copy(ws, source, copies, rel)
+def fingerprint(p: Path, salt: str) -> str:
+    if not p.exists() and not p.is_symlink():
+        return "missing"
+    walked = os.walk(p) if p.is_dir() and not p.is_symlink() else [(str(p.parent), [], [p.name])]
+    h = hashlib.sha256(salt.encode())
+    for root, dirs, files in walked:
+        dirs.sort()
+        for name in sorted(dirs + files):
+            q = Path(root, name)
+            st = q.lstat()
+            h.update(f"{q.relative_to(p.parent).as_posix()}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+            if stat.S_ISLNK(st.st_mode):
+                h.update(os.readlink(q).encode())
+            elif stat.S_ISREG(st.st_mode):
+                with open(q, "rb") as f:
+                    while chunk := f.read(1 << 20):
+                        h.update(chunk)
+    return h.hexdigest()
+
+
+def made_before(ws: Path) -> dict:
+    try:
+        made = json.loads(made_record(ws).read_text())
+    except (OSError, ValueError):
+        return {}
+    return made if isinstance(made, dict) else {}
 
 
 def ignored_files(wt: Path) -> list[str]:
@@ -512,35 +536,75 @@ def ignored_files(wt: Path) -> list[str]:
                                              "--untracked-files=normal"], wt) if r.startswith("!! ")]
 
 
-def unexamined(ws: Path, examined: set[Path], source: Path, copies: list[str]) -> list[str]:
+def unexamined(ws: Path, examined: set[Path]) -> list[str]:
     if ws in examined or not ws.is_dir():
         return []
     found = []
     for root, dirs, files in os.walk(ws):
-        dirs[:] = [d for d in dirs if Path(root, d) not in examined and d not in DISPOSABLE_DIRS]
-        names = (Path(root, f).relative_to(ws).as_posix() for f in files)
-        found += [rel for rel in names if owned(ws, source, copies, rel)]
+        dirs[:] = [d for d in dirs if Path(root, d) not in examined]
+        found += [Path(root, f).relative_to(ws).as_posix() for f in files]
     return sorted(found)
 
 
+def leftovers(ws: Path, checkouts: list[Checkout]) -> list[str]:
+    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
+    found = [c.prefix + n for c in checkouts if c.wt in examined for n in uncommitted(c.wt) + ignored_files(c.wt)]
+    return found + unexamined(ws, examined)
+
+
+def head_key(c: Checkout) -> str:
+    return f"\0head {c.prefix}"
+
+
+SALT_KEY = "\0salt"
+
+
+def note_made(ws: Path, checkouts: list[Checkout]) -> None:
+    try:
+        names = leftovers(ws, checkouts) if ws.is_dir() else []
+        heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
+        if names or heads:
+            salt = os.urandom(16).hex()
+            made = {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
+            made_record(ws).parent.mkdir(parents=True, exist_ok=True)
+            made_record(ws).write_text(json.dumps(made))
+            return
+    except (OSError, RuntimeError):
+        pass
+    made_record(ws).unlink(missing_ok=True)
+
+
 def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> str:
+    made = made_before(ws)
+    salt = str(made.get(SALT_KEY) or "")
+
+    def unknown(names: list[str]) -> list[str]:
+        return [n for n in names if not made_copy(ws, source, copies, n)
+                and not (salt and made.get(n) == fingerprint(ws / n, salt))]
+
     examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
     for c in checkouts:
         if c.wt not in examined:
             continue
         try:
-            edits = [n for n in uncommitted(c.wt) if not made_copy(ws, source, copies, c.prefix + n)]
-            ignored = [n for n in ignored_files(c.wt) if owned(ws, source, copies, c.prefix + n)]
+            edits = unknown([c.prefix + n for n in uncommitted(c.wt)])
+            ignored = unknown([c.prefix + n for n in ignored_files(c.wt)])
             ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip()
-        except RuntimeError as e:
+            if made.get(head_key(c)) == git(["rev-parse", "HEAD"], c.wt).strip():
+                ahead = "0"
+        except (RuntimeError, OSError) as e:
             return f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it is: {e}"
         if edits or ignored or ahead != "0":
-            what = (f"uncommitted edits ({', '.join(edits[:5])})" if edits
-                    else f"git-ignored files that are not build output ({', '.join(ignored[:5])})" if ignored
-                    else f"{util.count(int(ahead), 'commit')} that are not on origin")
+            what = (f"uncommitted edits that arete has no record of leaving there ({', '.join(edits[:5])})" if edits
+                    else (f"git-ignored files that arete has no record of leaving there ({', '.join(ignored[:5])})"
+                          if ignored else f"{util.count(int(ahead), 'commit')} that are not on origin"))
             return (f"the existing worktree {c.wt} of {c.github} holds {what}, so arete did not make it again and "
                     "left them as they are; move or remove them, then run again")
-    if others := unexamined(ws, examined, source, copies):
+    try:
+        others = unknown(unexamined(ws, examined))
+    except OSError as e:
+        return f"arete could not read the existing workspace {ws}, so it left it as it is: {e}"
+    if others:
         return (f"the existing workspace {ws} holds files outside this repo's worktrees ({', '.join(others[:5])}), "
                 "so arete did not make it again and left them as they are; move or remove them, then run again")
     return ""
@@ -1069,6 +1133,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            if run.workspace:
+                note_made(*run.workspace)
             slot.free()
         if restarting and status in ("skipped", "noop") and not run.feedback:
             run.enter("failed")
@@ -1263,6 +1329,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
 
     try:
         ws, checkouts = make_workspace(run.id, repo, main_layer.base_branch, branch, t.id, main_layer.copy)
+        run.workspace = ws, checkouts
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
@@ -1759,8 +1826,7 @@ def unmerged_paths(wt: Path) -> list[str]:
 
 
 def uncommitted(wt: Path) -> list[str]:
-    drop_untracked_bytecode(wt)
-    return [r[3:] for r in util.git_records(["status", "--porcelain", "--untracked-files=all"], wt)]
+    return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", "--untracked-files=all"], wt)]
 
 
 def marked(wt: Path, names: list[str]) -> list[str]:
@@ -1857,7 +1923,9 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
         if answer.get("resolved") is not True:
             raise RunFailed(f"the resolver could not keep both the branch's work and the base's in {c.github}: "
                             f"{answer.get('summary') or 'no reason given'}", res.text)
-        drop_untracked_bytecode(c.wt)
+        for name in untracked_files(c.wt) - untracked_before:
+            if Path(name).parent.name == "__pycache__" and Path(name).suffix == ".pyc":
+                remove_untracked(c.wt, name)
         touched = set(util.git_records(["diff", "--name-only"], c.wt)) | (untracked_files(c.wt) - untracked_before)
         if outside := sorted(touched - set(conflicts)):
             raise RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
