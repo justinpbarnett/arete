@@ -346,7 +346,7 @@ def result(**fields):
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
             done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), str(SOURCE),
                                    "true" if jev_on else "false"],
-                                  cwd=root, env=env, text=True, capture_output=True, timeout=120)
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
             output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
                            if line.startswith("BEHAVIOR_RESULT=")), None)
@@ -402,7 +402,7 @@ result(**out)
         shapes = {}
         for runner, data in found.items():
             self.assertTrue(data["items"][0].startswith("summary: "), data)
-            self.assertTrue(any(re.match(r"call build \(%s m1\): failed after 3 s$" % runner, i)
+            self.assertTrue(any(re.match(rf"call build \({runner} m1\): failed after 3 s$", i)
                                 for i in data["items"]), data)
             self.assertTrue(any(re.match(r"\[build\.jsonl\.gz:\d+\] TOOL ERROR \w+\(.+\): boom$", i)
                                 for i in data["items"]), data)
