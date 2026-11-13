@@ -724,7 +724,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         if budget_error:
             res = Result(ok=False, error=budget_error, session=resume, runner=which, model=name)
         elif which == REPLAY:
-            res = replay.run(cwd, trace, cfg, rec.line, resume)
+            res = replay.run(cwd, trace, cfg, rec.line, resume, kw.get("timeout"))
         elif which == "codex":
             res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line, hidden=found, auth=auth, **kw)
         else:

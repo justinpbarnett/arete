@@ -324,7 +324,7 @@ Set `jev = false` on a repo whose code or tickets must not leave the machine.
 
 ## Runs, sleep and the network
 
-Poll does not wait for a run. It starts each run as its own detached `arete run` process and returns in about a second, so a long run never holds up the next poll. `max_parallel` sets how many runs go at once on the machine, manual runs included. A run frees its slot while it waits on its PR's CI, and takes one back before a CI fix step. A run that waits to take its slot back goes ahead of new runs: while it waits, no new run starts, even on a free slot. It reads `max_parallel` again every 30 seconds, so a raised limit lets it go at once. `arete status` lists it as waiting for a run slot, and a run in its CI wait as waiting on CI without a run slot. Poll takes tickets round robin across repos and starts at most one run per repo each time. A repo with `max_parallel_per_repo` runs going, counting runs in their CI wait and manual runs, gets no new one from poll; `arete run` by hand is held only by `max_parallel`.
+Poll does not wait for a run. It starts each run as its own detached `arete run` process and returns in about a second, so a long run never holds up the next poll. `max_parallel` sets how many runs go at once on the machine, manual runs included; an `arete experiment` trial holds a slot too, and starts only on a free one with no run waiting to take a slot back and no ready ticket passed over. A run frees its slot while it waits on its PR's CI, and takes one back before a CI fix step. A run that waits to take its slot back goes ahead of new runs: while it waits, no new run starts, even on a free slot. It reads `max_parallel` again every 30 seconds, so a raised limit lets it go at once. `arete status` lists it as waiting for a run slot, and a run in its CI wait as waiting on CI without a run slot. Poll takes tickets round robin across repos and starts at most one run per repo each time. A repo with `max_parallel_per_repo` runs going, counting runs in their CI wait and manual runs, gets no new one from poll; `arete run` by hand is held only by `max_parallel`.
 
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
@@ -483,7 +483,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/` (sqlite, events, run logs, loop digests, `serve.json`, `server.json`, `price-snapshot.json`)
+- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, loop digests, `serve.json`, `server.json`, `price-snapshot.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -986,6 +986,66 @@ The grader is the pipeline's verifier, started on the layer's `[verify]`. It res
 `arete eval mine [REPO]` writes these tasks from merged arete PRs, newest first, 3 at a time (`--limit N`). A read only writer step reads the ticket, the PR body with its evidence, and the diff, and writes the ask and the steps without naming the fix; it skips a change with no behavior a user meets. Arete keeps a task only when the grader passes it on the merge commit and fails it on the commit before, so the task tells a working change from a missing one. Each outcome is recorded, so a PR is mined once; a crash records nothing, and the next mine tries again. A kept task is committed in a layer outside the repo, or opened as a PR on `arete/evals-<name>` for a layer in `.agents/`. `--dry-run` lists what it would mine and skip, with no model call. Only repos whose layer has `[verify]` are mined.
 
 `arete eval REPO --prompts DIR` runs the plan, build and fix steps with the prompts in `DIR`. The grader keeps the installed prompt, so the judge never moves with what it judges.
+
+## Experiments
+
+One eval run per arm cannot select a model. `arete experiment run MANIFEST` pairs two or more arms on the same eval tasks, repeats each pair, and `arete experiment summary FILE` says whether the difference is real. It runs the eval runner once per trial, never writes `config.toml` or a layer, and selects no live setting: the owner reads the summary and edits the config. Keep candidate lists, rankings, tariffs and real task samples in private configuration, not in the manifest you share.
+
+```toml
+name = "build-effort"            # letters, digits, _ and -; names the results file
+repo = "replay-sample"           # a single repo with eval tasks in its layer
+atom = "build"                   # plan, build or check_repair; verify and eval_grade stay fixed
+repeats = 3                      # whole number, 1 or more
+cache_policy = "provider-default"  # optional label, recorded on every trial
+
+[arms.current]                   # two or more; keys: tier, runner, provider, model, effort
+model = "scratch-a"
+effort = "medium"
+[arms.stronger]
+model = "scratch-b"
+effort = "high"
+
+[tasks.word]                     # an eval task of the repo's layer
+base = "4f1c2ab"                 # 7 to 40 hex digits of a commit; the eval task's own base when left out
+split = "validation"             # train, validation or holdout
+
+[accept]                         # the rule, written before any trial runs
+baseline = "current"
+split = "validation"             # the only split that decides; validation by default
+min_pairs = 6                    # never under 6
+min_difference = 0.0             # 0 to 1
+confidence = 0.95                # above 0.5, under 1
+
+[limits]                         # all four required, finite, above 0
+spend_usd = 5
+minutes = 60
+calls = 200
+tokens = 2000000
+```
+
+An unknown key is refused. Each arm resolves through the step settings for `atom`, so a bad effort or model is refused by name. A task needs a `check` or `verify`, and its base must resolve to a commit. `--dry-run` validates the manifest and prints the results file, each arm's resolved runner, model, effort, tier and timeout, the fixed grader, each task with its full base, split, grader and hidden file count, the trial count and how many the file holds already, the acceptance rule and the limits. It writes no file and no row and makes no call. A manifest that changes the design (arms, tasks, atom, repeats, acceptance rule, prompts, harness, tools or grader) gets a new digest, and an existing file refuses it: pass `--out` for a new file. The limits are not part of the design, so they can be raised to resume.
+
+A trial is one task, arm and repeat. It is its own `runs` row of kind `experiment`, with a fresh worktree and fresh sessions, and the arm's settings reach the targeted atom. The other builder steps are frozen: they keep their configured settings for every arm, and the repair step does not inherit the arm from build. A step with no model configured runs on the baseline arm's route (never its effort), the same for every arm. The design digest covers the effective settings of the arms, the frozen steps and the grader, including its tools and instructions. Graders, hidden files and prompts are the same for every arm. Within a repeat the arms are rotated per task, so none always goes first. A trial takes a run slot the way a pipeline run does, so `arete status` counts it and `arete run` is refused while it holds the last one. It starts only when a slot is free, no run waits to take a slot back, and the poller has passed no ready ticket over; otherwise it waits and says why, and queued production work is never delayed by it. The wait counts toward `minutes`. One experiment runs per repo at a time.
+
+The results file is `experiments/<name>.jsonl` under the state folder, or the `--out` path: one JSON object per line, appended and synced, with unparsable lines skipped on read. Each line has an `event`:
+
+| event | fields |
+|---|---|
+| `manifest` | `digest`, `design` (arms with their resolved runner, model, provider, tier and effort, tasks with split, full base and an evidence hash, the grader, the acceptance rule, prompt, context and tool fingerprints). First line only |
+| `session` | `at`, `limits`, `pid`; one per invocation |
+| `start` | `task`, `arm`, `repeat`, `attempt`, `run`, `at` |
+| `trial` | `task`, `split`, `base`, `arm`, `repeat`, `attempt`, `run`, `status`, `accepted`, `failures`, `repairs`, `route` (runner, model, provider, tier, credential, billing, auth_mode, position, requested), `effort`, `requested_effort`, `fingerprints`, `endpoint`, `cache_policy`, `calls`, `tokens_in`, `tokens_out`, `cache_read`, `cache_write`, `cost_usd`, `charged_usd`, `reference_usd`, `reference_unknown_calls`, `api_seconds`, `wall_seconds`, `wait_seconds` |
+| `wait` | `task`, `arm`, `repeat`, `attempt`, `seconds`, `at`; time spent waiting for a run slot, written as it passes so a stop or crash keeps it |
+| `alive` | `run`, `seconds`; written every 10 seconds while a trial runs, so an interrupted trial's `wall_seconds` is its last one |
+| `stop` | `why`, `at` |
+
+`status` is `done` (the trial ran to its end, accepted or not), `capped` (a limit or an unroutable call stopped it) or `interrupted` (the process died or was stopped). Only `done` trials are paired. `charged_usd` is what the account paid, zero on replay and local routes; `reference_usd` prices the tokens at the imported route price. A missing price leaves `reference_usd` null, and the call counts in `reference_unknown_calls`: it is never read as zero.
+
+The limits count every `trial` line in the file plus the trial running, across invocations: `spend_usd` against charged cost, `calls`, `tokens` (in plus out) and `minutes` (wall plus wait). A limit is checked before each trial and before each agent call; a call, a repo check, setup and the held out check get only the time left, and a call only the dollars left. Spend, calls and tokens come from the stored step rows, read before every route launch, so a retry on another route cannot start past a limit, and every launch counts. The time limit is one deadline: the network wait, a retry after it, each repo check and a replay answer all stop at it. A trial that ends past a limit is `capped`, never `done`. Slot wait counts too, including a wait that ended in a stop. A reached limit writes a `stop` line, prints the reason and exits 3. A usage limit is never waited out.
+
+Running the same command again resumes: a `done` trial is not repeated, and an earlier `start` with no `trial` line (a killed process) is settled as interrupted and run again as the next attempt. A `capped` trial runs again as well. With `[replay] dir` set, a trial reads its answers from the first folder holding a `.json` answer of `<dir>/<arm>/<task>/<repeat>`, `<dir>/<arm>/<task>`, `<dir>/<arm>` and `<dir>`, so two arms can be replayed over several repeats, with a failed trial, without a paid call.
+
+The summary reads only the file, so `summary FILE` reproduces the text a run prints at its end byte for byte; `--json` prints the same numbers as one line. Per arm it shows accepted of done trials with a Wilson interval, repairs, calls, tokens, cache, api, wall and wait seconds, and charged and reference cost over every attempt, failed and interrupted ones included, in total and per accepted task. Zero accepted prints "no accepted task" and an unknown reference "unknown". Per split and candidate it shows the pairs where both arms are done, the candidate-only and baseline-only accepts, the difference with its interval (the paired difference plus or minus a normal margin and one pair) and the exact sign test. Only `accept.split` gives a verdict. There is no winner when the pairs are under `max(6, min_pairs)`, when the interval reaches `min_difference` or below and `-min_difference` or above, or when the sign test p exceeds `1 - confidence`. Otherwise a candidate wins when the interval's lower bound is above `min_difference`, and the baseline holds when the upper bound is below `-min_difference`. Several winning candidates are each listed and none is named the winner. Other splits are shown as not deciding.
 
 ## Prompt changes
 

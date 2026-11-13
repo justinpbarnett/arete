@@ -52,7 +52,7 @@ def failed(error: str) -> Result:
 
 
 def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Callable[[str], None],
-        resume: Session = NO_SESSION) -> Result:
+        resume: Session = NO_SESSION, timeout: float | None = None) -> Result:
     if not (where := folder(cfg)):
         return failed(f"replay: no answer folder; set [replay] dir in {paths.short_path(paths.CONFIG_FILE)} or {ENV}")
     name = answer_name(*trace)
@@ -84,6 +84,9 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
         return failed(f"replay: {answer_file} has a bad value: {e}")
     if not res.ok and not res.error:
         res.error = f"replay: {answer_file} says ok is false"
+    if timeout and seconds > timeout:
+        time.sleep(max(0.0, timeout))
+        return failed(f"replay: {answer_file} takes {seconds:g} seconds and the timeout is {timeout:g}")
     time.sleep(seconds)
     if patched and (applied := util.sh(["git", "apply", str(patch_file)], cwd=cwd)).returncode != 0:
         return failed(f"replay: {patch_file} does not apply: {util.first_line(applied.stderr or applied.stdout)}")

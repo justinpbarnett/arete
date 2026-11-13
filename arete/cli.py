@@ -502,6 +502,25 @@ def cmd_eval(args) -> int:
     return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run, prompts=prompts)
 
 
+def cmd_experiment(args) -> int:
+    import tomllib
+
+    from . import experiment
+
+    wrong = (args.dry_run and args.action == "summary") or (args.out and args.action == "summary") \
+        or (args.json and args.action == "run")
+    if wrong:
+        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json]", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "summary":
+            return experiment.show(paths.expand(args.path), args.json)
+        return experiment.run(paths.expand(args.path), args.out, args.dry_run)
+    except (experiment.Refused, tomllib.TOMLDecodeError, OSError) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
 def cmd_triage(args) -> int:
     from . import triage
 
@@ -1456,6 +1475,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=3, help="with mine: the most merged PRs to mine in one go")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, or summarize its results")
+    p.add_argument("action", choices=("run", "summary"))
+    p.add_argument("path", metavar="MANIFEST | FILE", help="run: the manifest; summary: the results file")
+    p.add_argument("--dry-run", action="store_true", help="with run: validate and print the plan; writes and calls nothing")
+    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for the manifest")
+    p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
+    p.set_defaults(fn=cmd_experiment)
 
     p = sub.add_parser("triage", help="loop 5: the triage board of your open tickets without the agent label")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")

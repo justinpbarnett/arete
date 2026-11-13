@@ -22,7 +22,7 @@ REFRESH_SCOPE = "credential-refresh-v1:"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,            -- pipeline | miner | eval | draft | loop | session
+    kind TEXT NOT NULL,            -- pipeline | miner | eval | experiment | draft | loop | session
     repo TEXT,
     issue INTEGER,
     status TEXT NOT NULL,          -- running | pr | needs-info | skipped | noop | dry-run | failed | interrupted
@@ -511,7 +511,7 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
 
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
-            "eval": f"eval-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
+            "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
 
 
 def loop_lock(name: str) -> str:
@@ -1047,6 +1047,11 @@ def carry_holds(previous: str, latest: str, connect=db) -> None:
 def pass_over(repo: str, issue: str) -> None:
     with db() as c:
         c.execute("INSERT OR IGNORE INTO passed_over (repo, issue, since) VALUES (?,?,?)", (repo, str(issue), util.iso()))
+
+
+def tickets_passed_over() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM passed_over ORDER BY since")]
 
 
 def take_passed_over(repo: str, issue: str) -> str:
