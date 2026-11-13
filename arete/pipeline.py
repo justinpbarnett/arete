@@ -1919,7 +1919,10 @@ def own_draft_state(run: AgentRun, c: Checkout) -> bool | None:
     except gh.GhError as e:
         run.log(f"pr: left {c.pr} as it is: arete could not read its state: {util.first_line(str(e), 300)}")
         return None
-    if not head or not c.lease or head != c.lease:
+    if not head or not c.lease:
+        run.log(f"pr: left {c.pr} as it is: arete could not compare its head with this run's push")
+        return None
+    if head != c.lease:
         run.log(f"pr: left {c.pr} as it is: its head is {head[:12]}, not the {c.lease[:12]} this run pushed, "
                 "so someone changed it after the run started")
         return None
@@ -1928,7 +1931,7 @@ def own_draft_state(run: AgentRun, c: Checkout) -> bool | None:
 
 def hold_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout],
                 draft_why: str) -> list[Checkout]:
-    if not draft_why or run.repairs:
+    if not draft_why or run.repairs or run.feedback:
         return []
     held = []
     for c in pushed:
@@ -1944,7 +1947,7 @@ def hold_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout
 
 def ready_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout],
                  draft_why: str) -> list[Checkout]:
-    if draft_why or run.repairs:
+    if draft_why or run.repairs or run.feedback:
         return []
     ready = []
     for c in pushed:
