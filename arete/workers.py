@@ -314,7 +314,7 @@ def run(manifest: Path, out: str = "", dry: bool = False) -> int:
         print("\n".join(dry_lines(bench, path)))
         return 0
     hands_off = frozenset(arm for arm, b in bench.exp.design["workers"]["arms"].items() if b["escalation"])
-    return experiment.exclusive(bench.exp, lambda: implbench.drive(
+    return experiment.exclusive(bench.exp.repo.name, lambda: implbench.drive(
         bench, path, hands_off=hands_off, shown=lambda p: render(report(p))))
 
 
