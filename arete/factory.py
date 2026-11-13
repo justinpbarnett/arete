@@ -187,13 +187,14 @@ def checked(name: str, value) -> Outcome:
 class Flow:
     def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None,
                  labels: Callable[[str, dict], dict] | None = None, again: str = "",
-                 restore: Callable[[dict], str] | None = None) -> None:
+                 restore: Callable[[dict], str] | None = None, refusal: str = "") -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         if again and again not in STEPS:
             raise KeyError(f"from {again}: no step by that name")
         chained = chain(continues)
         self.run_id, self.continues, self.only, self.ctx, self.again = run_id, continues, only, ctx, again
+        self.refusal = refusal
         self.labels = labels or (lambda name, kw: {})
         self.restore = restore or (lambda line: "a step can run alone only on a run whose folder is kept")
         self.earlier = history(chained)
@@ -212,6 +213,8 @@ class Flow:
             raise KeyError(f"no step {name}")
         if self.done:
             raise OnlyDone(f"only {self.only} runs in this flow")
+        if self.refusal:
+            raise Refused(self.refusal)
         if self.matching:
             if self.takes(name) and (found := self.stored(name, kw)):
                 self.skipped += 1
@@ -233,10 +236,12 @@ class Flow:
         line = self.earlier[self.skipped] if self.skipped < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
-        if self.only and line.get("tree") and not os.path.isdir(line["tree"]):
+        if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
             why = self.restore(line)
             if why or not os.path.isdir(line["tree"]):
                 why = why or "its work folder is still missing after restoring from origin"
+                if not self.only:
+                    return None
                 raise Refused(f"only {self.only}: run {self.continues} removed its work folder {line['tree']} when it "
                               f"ended, and {why}")
         if not self.only and line.get("tree"):
