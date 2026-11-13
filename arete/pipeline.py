@@ -2308,6 +2308,10 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:
     run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
     step = b.next_step(step_name)
+    if refusal := verify.port_refusal(v):
+        run.log(f"{step}: {refusal}")
+        return verify.Verified("blocked", "Verification cannot use a port the live dashboard serves.",
+                               blocked_by=refusal, finished=False)
     if ready := verify.preflight(v, b.ws, b.cfg, run.repo):
         run.save(f"{step}-preflight.json", json.dumps(asdict(ready), indent=2))
         run.log(f"{step}: preflight {ready.verdict}")
