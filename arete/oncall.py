@@ -113,6 +113,10 @@ def still_holds(name: str, size: int, older: list, inode: int, same: int) -> boo
             and digest(name, older[1]) == digest(name + ".1", older[1]))
 
 
+def untouched(info: os.stat_result, older: list) -> bool:
+    return info.st_mtime_ns < older[2] or (info.st_mtime_ns == older[2] and info.st_size == older[1])
+
+
 def parts(mark: list, now: list | None) -> tuple[list | None, list | None]:
     return (mark[3] if len(mark) > 3 else None), (mark[4] if len(mark) > 4 else now)
 
@@ -148,11 +152,12 @@ def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list
         pending, seen = parts(mark, now)
         if sources.log_start(mark[:2], size, inode) != offset or digest(name, offset) != mark[2]:
             pending, offset = ([offset, mark[2]] if offset > 0 else pending), 0
-        elif offset == 0 and not pending and now and now != seen:
-            if still_holds(name, size, now, inode, mark[1]):
+        elif now and now != seen and not pending and now[1] > offset and digest(name + ".1", offset) == mark[2]:
+            copied = still_holds(name, size, now, inode, mark[1])
+            if copied and untouched(info, now):
                 noted = seen
             else:
-                pending = [0, ""]
+                pending, offset = [offset, mark[2]], 0
     end = min(size, offset + MAX_READ)
     if (got := sources.read_lines(name, offset, end)) is None:
         return [], mark

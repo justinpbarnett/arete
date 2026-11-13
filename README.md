@@ -80,6 +80,8 @@ Other application or service logs are watched only when listed as `[[oncall.sour
 **Cursors.** Each file has a durable cursor (`oncall:` in the `cursors` table) holding its offset, inode and a hash of the bytes before the offset, and what it last saw of the rotated `.1` file, so a rotation is found when nothing had been read yet and a drained `.1` is not read twice.
 A first sight of a file reads nothing old; a file that appears later is read from its start.
 Rotation, including the copy-then-truncate of `arete install`'s log rotation, truncation and a restart neither replay old lines nor lose new ones.
+A new `.1` that the current file still begins with is a copy waiting for its truncate only while the current file has not been written since the copy; otherwise the lines beyond the cursor are read from the `.1` and the current file is read from its start, so a new file that starts with the same bytes as the rotated one loses nothing.
+Two cases cannot be told apart from the files alone: when a scan lands between a copy and its truncate and a line was appended in that gap, the copied lines not yet read are counted twice; and a truncated file that regrows with exactly the bytes already read is not read again.
 A scan reads at most 1,000,000 bytes per file; the rest waits for the next scan.
 An incident keeps the five lines either side of the first match, at most 4,000 characters.
 

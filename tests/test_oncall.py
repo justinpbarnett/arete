@@ -228,6 +228,78 @@ class Rotation(Scratch):
     def test_rename_at_offset_zero_with_new_lines(self):
         self.check(True, True)
 
+    def counts(self):
+        return sorted(i["count"] for i in self.incidents())
+
+    def test_copy_truncate_then_the_same_line_again_counts_every_occurrence(self):
+        plain = "ERROR database unavailable"
+        self.log.write_text("")
+        self.scan()
+        self.append(plain)
+        self.rotate(False)
+        self.append(plain, "ERROR cache unavailable")
+        self.assertIn("2 opened", self.scan())
+        self.assertEqual(self.counts(), [1, 2])
+        self.assertIn("0 lines, 0 events", self.scan())
+        self.assertEqual(self.counts(), [1, 2])
+
+    def test_copy_truncate_with_a_repeated_opening_line_counts_every_occurrence(self):
+        plain = "ERROR database unavailable"
+        self.log.write_text("INFO started\n")
+        self.scan()
+        self.append(plain)
+        self.rotate(False)
+        self.append("INFO started", plain, "ERROR cache unavailable")
+        self.scan()
+        self.assertEqual(self.counts(), [1, 2])
+        self.scan()
+        self.assertEqual(self.counts(), [1, 2])
+
+    def test_copy_truncate_then_the_already_read_error_again_counts_it(self):
+        first, second, third = "ERROR alpha unavailable", "ERROR beta unavailable", "ERROR gamma unavailable"
+        self.log.write_text("")
+        self.scan()
+        self.append(first)
+        self.scan()
+        self.append(second)
+        self.rotate(False)
+        self.append(first, second, third)
+        older = self.log.with_name("app.log.1")
+        later = older.stat().st_mtime_ns + 10**9
+        os.utime(self.log, ns=(later, later))
+        self.scan()
+        self.assertEqual(self.counts(), [1, 2, 2])
+        self.scan()
+        self.assertEqual(self.counts(), [1, 2, 2])
+
+    def test_a_truncated_file_regrown_to_match_its_copy_is_read_again(self):
+        plain = "ERROR database unavailable"
+        self.log.write_text("")
+        self.scan()
+        self.append(plain)
+        self.rotate(False)
+        self.append(plain)
+        older = self.log.with_name("app.log.1")
+        later = older.stat().st_mtime_ns + 10**9
+        os.utime(self.log, ns=(later, later))
+        self.scan()
+        self.assertEqual(self.counts(), [2])
+        self.scan()
+        self.assertEqual(self.counts(), [2])
+
+    def test_a_copy_never_truncated_replays_nothing(self):
+        self.baseline()
+        self.append(self.error(1))
+        self.scan()
+        older = self.log.with_name("app.log.1")
+        older.write_bytes(self.log.read_bytes())
+        self.append(self.error(2, "10:06:00"))
+        self.scan()
+        self.assertEqual(self.counts(), [2])
+        self.append(self.error(3, "10:07:00"))
+        self.scan()
+        self.assertEqual(self.counts(), [3])
+
     def test_rename_with_a_scan_during_the_gap(self):
         self.log.write_text("")
         self.scan()
