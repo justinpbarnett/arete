@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import accounts, claude, config, environment, guard, paths, util
+from . import scratch as verification_scratch
 from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
 from .pi import SCHEMA_RULE
 
@@ -160,14 +161,17 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
 def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | str],
             allowed_tools: list[str] | None = None) -> list[str]:
     name = WRITE_PROFILE if writing else READ_PROFILE
-    granted = {path: "write" for d in add_dirs for path in both(d)} if writing else {}
+    granted = {path: "write" if writing else "read" for path in both(cwd)}
+    if writing:
+        granted |= {path: "write" for d in add_dirs for path in both(d)}
     metadata = {path: "read" for root in [cwd, *add_dirs] for path in both(root / ".git")}
     result = util.sh(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], cwd=cwd,
                      timeout=10, env=agent_env(), inherit=False)
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
     table = {"extends": PROFILE_BASE[name], "filesystem": {**granted, **metadata,
-             **kept_out([cwd, *add_dirs], hidden), **executables(allowed_tools, hidden)},
+             **kept_out([cwd, *add_dirs], [*hidden, verification_scratch.AUTHORITY]),
+             **executables(allowed_tools, [*hidden, verification_scratch.AUTHORITY])},
              "network": {"enabled": False}}
     return [*setting("default_permissions", name), "-c", f"permissions.{name}={toml_value(table)}"]
 
@@ -188,9 +192,9 @@ def owner_hooks_off() -> dict[str, dict]:
     return off
 
 
-def guard_hook(judge: bool) -> list[str]:
+def guard_hook(judge: bool, scratch: tuple[str, ...] = ()) -> list[str]:
     entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); from arete.cli import main; raise SystemExit(main())"
-    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else [])])
+    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else []), *scratch])
     entry = [{"matcher": "*", "hooks": [{"type": "command", "command": hook, "timeout": guard.HOOK_TIMEOUT_SECONDS}]}]
     off = owner_hooks_off()
     return [*setting("hooks.PreToolUse", entry), *(setting("hooks.state", off) if off else [])]
@@ -204,6 +208,9 @@ def mcp_settings(mcp_config: str, allowed_tools: list[str] | None = None) -> lis
             continue
         table = ({"url": server["url"]} if server.get("url") else
                  {"command": server.get("command", ""), "args": list(server.get("args") or [])})
+        if "command" in table:
+            confined = verification_scratch.protected_command([table["command"], *table["args"]])
+            table["command"], table["args"] = confined[0], confined[1:]
         prefix = f"mcp__{name}"
         rules = set(allowed_tools or [])
         whole = prefix in rules or f"{prefix}__*" in rules
@@ -257,6 +264,7 @@ def command(
     passing: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     hidden: list[Path | str] = (),
+    scratch: tuple[str, ...] = (),
 ) -> list[str]:
     try:
         if any((home() / name).exists() for name in ("AGENTS.override.md", "AGENTS.md")):
@@ -288,13 +296,13 @@ def command(
         system = "\n\n".join(filter(None, [system, repo_instructions(cwd)]))
     if system:
         cmd += setting("developer_instructions", system)
-    cmd += guard_hook(judge)
+    cmd += guard_hook(judge, scratch)
     cmd += mcp_settings(mcp_config, allowed_tools)
     return [*cmd, "-"]
 
 
 def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
-    if remote:
+    if remote or paths.ISOLATED:
         return accounts.Auth()
     env = agent_env(passing, extra)
     folder = Path(env.get("CODEX_HOME") or Path(env.get("HOME", str(paths.HOME))) / ".codex")
@@ -342,6 +350,7 @@ def _run(
     hidden: list[Path | str] = (),
     on_line: Callable[[str], None] = lambda line: None,
     auth: accounts.Auth | None = None,
+    scratch: tuple[str, ...] = (),
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth()
     resume = resume if resume.runner == "codex" else NO_SESSION
@@ -368,7 +377,7 @@ def _run(
     try:
         cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                       system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, instructions=instructions,
-                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden)
+                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch)
     except ValueError as e:
         return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
     if json_schema:
@@ -386,7 +395,13 @@ def _run(
         on_line(line)
 
     try:
-        proc = claude.run_streaming(cmd, str(cwd), prompt, env, timeout, streamed)
+        attempt = verification_scratch.PRODUCING.get()
+        protected = {Path(p).resolve() for p in hidden}
+        confined = (attempt is None or not scratch or (not json.loads(mcp_config or "{}").get("mcpServers")
+                         and verification_scratch.AUTHORITY.resolve() in protected
+                         and paths.WORKTREES_DIR.resolve() in protected
+                         and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
+        proc = claude.run_streaming(cmd, str(cwd), prompt, env, timeout, streamed, actor_confined=confined)
     except subprocess.TimeoutExpired:
         return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
                       provider=provider)
@@ -513,6 +528,8 @@ def reset_time(text: str) -> datetime | None:
 
 
 def login(env: dict | None = None) -> tuple[bool, str, str]:
+    if paths.ISOLATED:
+        return False, paths.ISOLATED_LOGINS, ""
     res = util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env(), inherit=False)
     said = f"{res.stdout}\n{res.stderr}"
     if "ChatGPT" in said and res.returncode == 0:

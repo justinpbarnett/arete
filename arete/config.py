@@ -538,9 +538,10 @@ def document_for(cfg: Config, repo: Repo | None = None, layer: RepoLayer | None 
 
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
-    if not path.exists():
+    try:
+        data = tomllib.loads(paths.read_confined(path).decode())
+    except FileNotFoundError:
         return Config()
-    data = tomllib.loads(path.read_text())
     cfg = Config(
         alert_repo=data.get("alert_repo", ""),
         global_repo=data.get("global_repo", "ai"),
@@ -706,6 +707,8 @@ class Verify:
     allow_bash: list[str] = field(default_factory=list)
     notes: str = ""
     publish_evidence: bool = True
+    preflight: dict[str, str] = field(default_factory=dict)
+    preflight_seconds: float = 30
 
     @property
     def bash(self) -> list[str]:
@@ -728,6 +731,10 @@ class RepoLayer:
     subject: str = "{kind}: {title}"
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
+    max_repair_cycles: int = 2
+    max_run_minutes: int = 60
+    max_verify_minutes: int = 20
+    parallel_checks: bool = False
     verify: Verify | None = None
     research_dir: str = ""
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
@@ -784,6 +791,14 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.deny = list(lim.get("deny", []))
     layer.max_attempts = int(lim.get("max_attempts", layer.max_attempts))
     layer.timeout_minutes = int(lim.get("timeout_minutes", layer.timeout_minutes))
+    for name in ("max_repair_cycles", "max_run_minutes", "max_verify_minutes"):
+        value = lim.get(name, getattr(layer, name))
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"[limits] {name} must be a positive integer")
+        setattr(layer, name, value)
+    layer.parallel_checks = lim.get("parallel_checks", False)
+    if type(layer.parallel_checks) is not bool:
+        raise ValueError("[limits] parallel_checks must be true or false")
     agent = section(data, "agent")
     layer.allow_bash = list(DEFAULT_ALLOW_BASH) + list(agent.get("allow_bash", []))
     trust = section(data, "trust")
@@ -811,8 +826,16 @@ def load_layer(layer_dir: Path) -> RepoLayer:
         publish_evidence = v.get("publish_evidence", True)
         if type(publish_evidence) is not bool:
             raise ValueError("[verify] publish_evidence must be true or false")
+        preflight = table_of(v.get("preflight", {}), "verify.preflight")
+        if any(not isinstance(name, str) or not name.strip() or not isinstance(command, str) or not command.strip()
+               for name, command in preflight.items()):
+            raise ValueError("[verify.preflight] must map names to nonempty command strings")
+        seconds = v.get("preflight_seconds", Verify.preflight_seconds)
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= 300:
+            raise ValueError("[verify] preflight_seconds must be greater than 0 and at most 300")
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
-                              allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip())
+                              allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),
+                              preflight=dict(preflight), preflight_seconds=float(seconds))
         outbound.keep_verify_private(layer.verify.url)
     return layer
