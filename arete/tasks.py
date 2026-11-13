@@ -19,6 +19,7 @@ from . import (
     pipeline,
     record,
     repairs,
+    runlimits,
     state,
     tracker,
     util,
@@ -119,6 +120,10 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
             return answer(tid, repo.name, run["id"], "running", "already running")
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
+        why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
+                                     runlimits.Policy.of(config.load_layer(repo.layer_dir)), force)
+        if why:
+            raise control.Refused(why)
         if new := spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force)):
             return answer(tid, repo.name, new, "running", "started")
         if why := held(cfg, repo):
@@ -150,6 +155,10 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
         raise control.Busy(f"run {run['id']} of {tracker.ticket_name(repo.name, tracker.ref_for(tid))}")
     if why := held(cfg, repo):
         raise pipeline.NoFreeSlot(why + after)
+    why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
+                                 runlimits.Policy.of(config.load_layer(repo.layer_dir)), True)
+    if why:
+        raise control.Refused(why)
 
 
 def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str]) -> dict:
