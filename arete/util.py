@@ -41,11 +41,12 @@ def sh(
     env: dict | None = None,
     input: str | None = None,
     inherit: bool = True,
+    keeps: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     full_env = {**(os.environ if inherit else {}), **(env or {})}
     from . import scratch
 
-    command = scratch.protected_command(cmd, cwd)
+    command = scratch.protected_command(cmd, cwd, keeps)
     try:
         res = subprocess.run(
             command,
@@ -127,10 +128,14 @@ def sh_with_network(cmd: list[str] | str, **kw) -> subprocess.CompletedProcess:
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None,
         env: dict | None = None) -> str:
-    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env)
+    keeps = ("ssh-agent",) if git_command(args).partition(" ")[0] in NETWORK_GIT else ()
+    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps)
     if check and res.returncode != 0:
         raise RuntimeError(f"git {git_command(args)}: {git_error(res.stderr or res.stdout)}")
     return res.stdout
+
+
+NETWORK_GIT = frozenset({"fetch", "push", "pull", "clone", "ls-remote"})
 
 
 def git_command(args: list[str]) -> str:

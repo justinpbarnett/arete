@@ -81,7 +81,8 @@ def heads(repo, branch: str) -> dict[str, str]:
     found = {}
     parts = [(p.dir, repo.path / p.dir) for p in repo.parts] or [("", repo.path)]
     for name, src in parts:
-        result = util.sh(["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=src, timeout=10)
+        result = util.sh(["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=src, timeout=10,
+                         keeps=("ssh-agent",))
         if result.returncode:
             raise ValueError("could not confirm the parked branch head; work remains parked")
         row = result.stdout.split()
