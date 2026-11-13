@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -437,6 +438,9 @@ def service_command(a: Attempt, command: str) -> list[str]:
                                 peers=paths.WORKTREES_DIR, secrets_denied=True, unix_confined=True) + ["/bin/sh", "-c", command]
 
 
+DATA_VOLUME = Path("/System/Volumes/Data")
+
+
 def browser_path(run_dir: str) -> Path:
     return Path(run_dir) / "browser"
 
@@ -503,11 +507,53 @@ def traversed(path: Path) -> tuple[set[Path], Path]:
     return seen, current
 
 
+def canonical(path: Path) -> Path:
+    try:
+        current, missing = Path.cwd().joinpath(path).resolve(), []
+    except (OSError, RuntimeError) as e:
+        raise ConfinementUnavailable(f"{path} cannot be resolved") from e
+    while True:
+        try:
+            fd = os.open(current, getattr(os, "O_SEARCH", os.O_RDONLY) | os.O_DIRECTORY)
+        except (FileNotFoundError, NotADirectoryError):
+            if current.parent == current:
+                raise ConfinementUnavailable(f"{path} cannot be located") from None
+            missing.append(current.name)
+            current = current.parent
+            continue
+        except OSError as e:
+            raise ConfinementUnavailable(f"{path} cannot be checked: {e.strerror}") from e
+        try:
+            getpath = getattr(fcntl, "F_GETPATH", None)
+            name = fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0] if getpath else os.fsencode(current)
+        except OSError as e:
+            raise ConfinementUnavailable(f"{path} cannot be checked: {e.strerror}") from e
+        finally:
+            os.close(fd)
+        return Path(os.fsdecode(name), *reversed(missing))
+
+
+def folded(path: Path) -> Path:
+    return Path(unicodedata.normalize("NFD", unicodedata.normalize("NFD", str(path)).casefold()))
+
+
+def spellings(path: Path) -> set[Path]:
+    real = canonical(path)
+    names = {Path(path), real}
+    if real.is_relative_to(DATA_VOLUME):
+        names.add(Path("/") / real.relative_to(DATA_VOLUME))
+    return {folded(n) for n in names}
+
+
 def exposure(path: Path, grants) -> Path | None:
     seen, final = traversed(path)
-    for root in (Path(g).resolve() for g in grants):
-        if root.is_relative_to(final) or any(d.is_relative_to(root) for d in seen):
-            return root
+    ends = spellings(final)
+    folders = set().union(ends, *(spellings(d) for d in seen), *(set(e.parents) for e in ends))
+    for grant in grants:
+        roots = spellings(Path(grant).resolve()) | spellings(Path(grant))
+        if any(r.is_relative_to(e) for r in roots for e in ends) or any(
+                d.is_relative_to(r) for d in folders for r in roots):
+            return Path(grant).resolve()
     return None
 
 
@@ -867,9 +913,15 @@ def isolation(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str
             and servers_allowed(a, mcp_config)
             and Path(a.workspace).is_relative_to(paths.WORKTREES_DIR.resolve())
             and Path(a.workspace) != paths.WORKTREES_DIR.resolve()
-            and not any(Path(a.workspace).is_relative_to(p) or AUTHORITY.is_relative_to(p) for p in broad)
-            and not any(AUTHORITY.is_relative_to(p) or p.is_relative_to(AUTHORITY) for p in writable)
-            and all(p == Path(a.workspace) or p == Path(a.run_dir) / "evidence" for p in writable))
+            and all(p == Path(a.workspace) or p == Path(a.run_dir) / "evidence" for p in writable)
+            and apart(Path(a.workspace), broad) and apart(AUTHORITY, (*broad, *writable)))
+
+
+def apart(path: Path, grants) -> bool:
+    try:
+        return exposure(path, grants) is None
+    except ConfinementUnavailable:
+        return False
 
 
 def activate(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str = "") -> tuple[str, ...]:

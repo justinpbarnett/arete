@@ -336,6 +336,17 @@ class BrowserServerTests(unittest.TestCase):
              "pinned browser server", "browser"),
             ("a temp grant inside the browser folder",
              lambda: mock.patch.dict(os.environ, {"TMPDIR": str(folder / "tmp")}), "browser folder", "agent"),
+            ("state under /private/TMP", lambda: mock.patch.object(
+                paths, "STATE_DIR", Path(str(shared).replace("/private/tmp", "/private/TMP")) / "state"),
+             "pinned browser server", "agent"),
+            ("state under /PRIVATE/tmp", lambda: mock.patch.object(
+                paths, "STATE_DIR", Path(str(shared).replace("/private/tmp", "/PRIVATE/tmp")) / "state"),
+             "pinned browser server", "agent"),
+            ("state under the data volume firmlink", lambda: mock.patch.object(
+                paths, "STATE_DIR", Path("/System/Volumes/Data" + str(shared)) / "state"),
+             "pinned browser server", "agent"),
+            ("a temp grant spelled in other case over the state",
+             lambda: mock.patch.dict(os.environ, {"TMPDIR": str(self.root / "STATE")}), "browser folder", "agent"),
         )
         for name, layout, tree, actor in cases:
             self.reactivate()
@@ -359,6 +370,23 @@ class BrowserServerTests(unittest.TestCase):
         self.reactivate()
         self.assertTrue(scratch.isolation(self.a, "codex", False, [self.evidence], config_text))
         self.assertIn("mcp_servers.playwright", " ".join(self.settings(config_text)))
+
+    def test_a_workspace_or_authority_under_another_spelling_of_a_temp_grant_is_not_isolated(self):
+        self.assertTrue(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
+        shared = Path(tempfile.mkdtemp(dir="/private/tmp"))
+        self.addCleanup(shutil.rmtree, shared, True)
+        layouts = (
+            ("workspace under a case variant TMPDIR", {"TMPDIR": str(self.root).upper()}),
+            ("workspace under a firmlink TMPDIR", {"TMPDIR": "/System/Volumes/Data" + str(self.root)}),
+            ("authority under a case variant TMPDIR", {"TMPDIR": str(self.root / "AUTHORITY")}),
+        )
+        for name, env in layouts:
+            with self.subTest(name), mock.patch.dict(os.environ, env):
+                self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
+        for spelling in ("/private/TMP", "/System/Volumes/Data/private/tmp"):
+            authority = Path(str(shared).replace("/private/tmp", spelling)) / "verification-authority"
+            with self.subTest(spelling), mock.patch.object(scratch, "AUTHORITY", authority):
+                self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
 
     def reactivate(self):
         with scratch.registry() as (fd, key):
