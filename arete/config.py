@@ -681,6 +681,10 @@ class RepoLayer:
     subject: str = "{kind}: {title}"
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
+    max_repair_cycles: int = 2
+    max_run_minutes: int = 60
+    max_verify_minutes: int = 20
+    parallel_checks: bool = False
     verify: Verify | None = None
     research_dir: str = ""
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
@@ -737,6 +741,14 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.deny = list(lim.get("deny", []))
     layer.max_attempts = int(lim.get("max_attempts", layer.max_attempts))
     layer.timeout_minutes = int(lim.get("timeout_minutes", layer.timeout_minutes))
+    for name in ("max_repair_cycles", "max_run_minutes", "max_verify_minutes"):
+        value = lim.get(name, getattr(layer, name))
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"[limits] {name} must be a positive integer")
+        setattr(layer, name, value)
+    layer.parallel_checks = lim.get("parallel_checks", False)
+    if type(layer.parallel_checks) is not bool:
+        raise ValueError("[limits] parallel_checks must be true or false")
     agent = section(data, "agent")
     layer.allow_bash = list(DEFAULT_ALLOW_BASH) + list(agent.get("allow_bash", []))
     trust = section(data, "trust")
