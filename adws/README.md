@@ -6,7 +6,7 @@ This is the guide for an agent that starts and follows arete's runs: a session l
 
 A **task** is one piece of work in a repo from the config. It is a local task with an id like `t-1a2b`, made from a prompt, or a tracker item: a GitHub issue number or a Jira key.
 
-A **run** is one process that takes a task through the steps of the [adw flow](../README.md#the-adw-flow): `prepare`, `plan`, `implement`, `checks`, `verify`, `review`, `learn`, `pr`, `ci`, `publish` and `respond`. A run has an id of its own, and every recipe after the first one takes that id.
+A **run** is one process that takes a task through the steps of the [adw flow](../README.md#the-adw-flow): `prepare`, `plan`, `implement`, `checks`, `verify`, `review`, `learn`, `document` (when `[document]` is on), `pr`, `ci`, `publish` and `respond`. A run has an id of its own, and every recipe after the first one takes that id.
 
 A task has many runs. An answer, a resume and a step each start a **new** run with a **new** id. Always wait on the id the last recipe printed, never on the old one.
 
@@ -59,12 +59,13 @@ When the server restarts on new code, `just adw-wait` connects again by itself a
 | `just adw-logs <id> [step]` | all of the run's lines, or one step's lines |
 | `just adw-answer <id> "<text>"` | answers a question and starts the next run |
 | `just adw-resume <id> [step]` | continues at the first unfinished step, or from a named one |
+| `just adw-repair <id>` | repairs the open held PR of a run from its saved review findings, with no new plan; prints the repair run |
 | `just adw-step <id> <step> [key=value ...]` | runs one step alone, with overrides such as `model=opus` or `effort=high` |
 | `just adw-stop <id>` | stops a run |
 | `just adw-costs [days]` | cost and time by step, kind and model, then the wait minutes |
 | `just adw-steps [repo]` | the step sheet with each step's resolved settings |
 
-`adw`, `adw-ticket`, `adw-answer`, `adw-resume` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the new run's id in `run`, or `queued` with an empty `run`, and `why` says which.
+`adw`, `adw-ticket`, `adw-answer`, `adw-resume`, `adw-repair` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the new run's id in `run`, or `queued` with an empty `run`, and `why` says which.
 
 ## One whole session
 
@@ -118,7 +119,7 @@ just adw-wait RUN2
 |---|---|
 | `task` | the run started; names the ticket, kind, repo, title and script |
 | `answer` | this run carries the answer to an earlier run's question: `asked_in`, `question`, `text` |
-| `step_start` | a step began; names its model, runner and effort when it calls an agent, and in `env` the names of the variables that agent starts with, never their values |
+| `step_start` | a step began; names its model, runner, credential, effort and `skipped` routes when it calls an agent, once per launch if a limit moves the call to another route, and in `env` the names of the variables that agent starts with, never their values |
 | `heartbeat` | the step is still working; every 30 seconds |
 | `step_end` | a step ended: `result` is `pass`, `fail`, `ask` or `stop`, with `error`, `cost_usd` and `seconds` |
 | `route` | the run continues an earlier one and took its finished steps; it comes twice, once when the run starts and once with `after` and `skipped` when it runs its first step |
@@ -133,13 +134,14 @@ just adw-wait RUN2
 | status | next |
 |---|---|
 | `done`, `pr` | it shipped: `done` pushed a branch, `pr` opened or updated a pull request; tell the person |
+| `pr` with `review.unresolved` true | the PR is a held draft whose last review still requested changes; `held` says why. Tell the person, or `just adw-repair <id>` to feed those findings back once more |
 | `needs-info` | the run asked a question; see below |
 | `failed` | read `summary` and the `error` line, and `just adw-logs <id>` for the step that failed; then `just adw-resume <id>`, which runs the failed step again, or tell the person |
 | `stopped`, `interrupted` | `just adw-resume <id>` goes on from where it stopped |
 | `noop` | there was nothing to change |
 | `skipped` | the run did not start its work; `summary` says why, such as a wait that still holds |
 | `step` | a run of one step alone (`just adw-step`); look at that step's `step_end` |
-| `dry-run` | a dry run ended after `learn` |
+| `dry-run` | a dry run ended after `learn`, or after `document` when it is on |
 
 ## On a question
 

@@ -202,7 +202,7 @@ def plan(cfg: config.Config, budget: Budget, text: str, cwd, add_dirs: list, ref
                           model=s.model, runner=s.runner, effort=s.call["effort"],
                           tools=list(s.tools), allowed_tools=list(s.tools), instructions=list(s.instructions),
                           json_schema=PLAN_SCHEMA, add_dirs=add_dirs, tier=s.tier, trace=("", f"research {ref} plan"),
-                          cfg=cfg)
+                          cfg=cfg, settings=s)
         if budget.error:
             return Planned(None, budget.error + "; no search ran", n)
         faults = problems(res.structured, family) if res.ok else [

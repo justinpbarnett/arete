@@ -16,7 +16,7 @@ from . import config, lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
-LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode")
+LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode", "atom")
 COUNTS = ("tokens_in", "tokens_out", "turns", "cache_read", "cache_write")
 MAX_ERROR_CHARS = 500
 
@@ -64,6 +64,7 @@ class Calls:
     run_id: str
     step: str
     made: list[dict] = field(default_factory=list)
+    n: int = 0
 
     def add(self, error: str = "", **usage) -> None:
         self.made.append({**usage, "error": error})
@@ -165,7 +166,8 @@ def outcome_of(line: dict) -> Outcome:
                    feedback=str(line.get("feedback") or ""),
                    data=data if isinstance(data, dict) else {},
                    session=Session(str(session.get("id") or ""), float(amount(session, "spent_usd")),
-                                   str(session.get("runner") or "")))
+                                   str(session.get("runner") or ""), str(session.get("credential") or ""),
+                                   str(session.get("account") or ""), str(session.get("generation") or "")))
 
 
 def checked(name: str, value) -> Outcome:
@@ -184,7 +186,7 @@ def checked(name: str, value) -> Outcome:
 
 class Flow:
     def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None,
-                 labels: Callable[[str], dict] | None = None, again: str = "",
+                 labels: Callable[[str, dict], dict] | None = None, again: str = "",
                  restore: Callable[[dict], str] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
@@ -192,7 +194,7 @@ class Flow:
             raise KeyError(f"from {again}: no step by that name")
         chained = chain(continues)
         self.run_id, self.continues, self.only, self.ctx, self.again = run_id, continues, only, ctx, again
-        self.labels = labels or (lambda name: {})
+        self.labels = labels or (lambda name, kw: {})
         self.restore = restore or (lambda line: "a step can run alone only on a run whose folder is kept")
         self.earlier = history(chained)
         self.again_at = max((i for i, line in enumerate(self.earlier) if again and line.get("step") == again),
@@ -262,9 +264,9 @@ class Flow:
 
     def run(self, name: str, args: tuple, kw: dict) -> Outcome:
         n = self.tries[name] = self.tries.get(name, 0) + 1
-        calls, started = Calls(self.run_id, name), time.monotonic()
+        calls, started = Calls(self.run_id, name, n=n), time.monotonic()
         try:
-            labels = self.labels(name)
+            labels = self.labels(name, kw)
         except Exception as e:
             lines.write(self.run_id, "step_start", step=name, **{"try": n})
             self.failed(name, n, e, calls, started, kw)
@@ -334,7 +336,9 @@ def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
             raise ValueError(f"--set {item}: {name} is not a step that calls an agent; use {', '.join(role_of)}")
         table.setdefault(role_of[name], {})[key] = (
             int(value) if key in config.STEP_COUNTS and value.isdigit()
-            else [v for v in value.split(",") if v] if key in config.STEP_LISTS else value)
+            else float(value) if key in config.STEP_AMOUNTS and value.replace(".", "", 1).isdigit()
+            else [v for v in value.split(",") if v] if key in config.STEP_LISTS
+            else value == "true" if key == "structured_output" and value in ("true", "false") else value)
     return config.step_tables(table, "--set")
 
 
@@ -352,14 +356,17 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
                    help="run this step alone, the steps before it from the stored outcomes")
     p.add_argument("--from", dest="again", default="", choices=sorted(STEPS),
                    help="with --continue, run this step again and every step after it")
+    p.add_argument("--repair", dest="repairs", default="", metavar="RUN",
+                   help="continue the open PR of this held run from its saved internal review")
     p.add_argument("--set", dest="sets", action="append", default=[], metavar="STEP.KEY=VALUE",
                    help="override one setting of one step; repeat for more")
     args = p.parse_args(argv)
     try:
-        table = overrides(args.sets, flows.ROLE_OF)
+        table = overrides(args.sets, flows.SETTABLE)
     except (ValueError, TypeError) as e:
         p.error(str(e))
-    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again)
+    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
+                             args.repairs)
     try:
         code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
     except config.UnknownRepo as e:

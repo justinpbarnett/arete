@@ -6,7 +6,24 @@ import time
 from collections import Counter
 from collections.abc import Callable
 
-from . import chat, config, control, factory, flows, gh, jira, lines, paths, pipeline, record, state, tracker, util
+from . import (
+    chat,
+    config,
+    control,
+    factory,
+    flows,
+    gh,
+    jira,
+    lines,
+    paths,
+    pipeline,
+    record,
+    repairs,
+    runlimits,
+    state,
+    tracker,
+    util,
+)
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -103,6 +120,10 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
             return answer(tid, repo.name, run["id"], "running", "already running")
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
+        why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
+                                     runlimits.Policy.of(config.load_layer(repo.layer_dir)), force)
+        if why:
+            raise control.Refused(why)
         if new := spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force)):
             return answer(tid, repo.name, new, "running", "started")
         if why := held(cfg, repo):
@@ -134,6 +155,10 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
         raise control.Busy(f"run {run['id']} of {tracker.ticket_name(repo.name, tracker.ref_for(tid))}")
     if why := held(cfg, repo):
         raise pipeline.NoFreeSlot(why + after)
+    why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
+                                 runlimits.Policy.of(config.load_layer(repo.layer_dir)), True)
+    if why:
+        raise control.Refused(why)
 
 
 def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str]) -> dict:
@@ -241,6 +266,26 @@ def resume(run_id: str, step: str = "") -> dict:
                          if line.get("result") != "pass"), "")
         return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--continue", run_id,
                                                  *(["--from", step] if step else [])))
+
+
+def repair(run_id: str) -> dict:
+    with util.lock(STEER_LOCK, wait=True):
+        cfg, repo, row = run_of(run_id)
+        tid = str(row["issue"])
+        if (later := state.later_run(row["repo"], row["issue"], run_id)) and pipeline.repaired_by(later["id"]) == run_id:
+            return answer(tid, repo.name, later["id"], later["status"],
+                          f"run {later['id']} already repairs run {run_id}")
+        if row["status"] == "running":
+            raise control.Refused(f"run {run_id} is running; stop it first")
+        no_later_run(row)
+        try:
+            found = repairs.source(row)
+            repairs.open_heads(repo, found)
+        except repairs.Refused as e:
+            raise control.Refused(str(e)) from None
+        if refusal := pipeline.script_refusal(cfg, repo, tid, pipeline.Script("repair", None, repairs=run_id)):
+            raise control.Refused(refusal)
+        return launch(cfg, repo, tid, command_of(cfg, "repair", repo.name, tid, "--force", "--repair", run_id))
 
 
 def run_step(run_id: str, step: str, sets) -> dict:

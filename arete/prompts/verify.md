@@ -36,6 +36,8 @@ $surface
 
 $notes
 
+$scratch
+
 ## Rules
 
 - Check every behavior the issue asks for, each edge and error case it names, and one thing near the change that
@@ -46,10 +48,10 @@ $notes
 - Arete's guard stops a command it reads as showing a credential or as harm git cannot undo. When a command needs a
   key or token you were not given, give it a value that starts `arete-placeholder`, such as
   `API_KEY=arete-placeholder-1 <command>`, so it carries no credential. A request to localhost, 127.0.0.1 or [::1]
-  reaches the product you started, not an outside service, so the guard counts it as reversible.
+  reaches the product you started, not an outside service, so the guard counts it as reversible. Fixture writes belong in the scratch folder below.
 - A step you could not do is not a failed check. Leave it out of `checks`. When the step is essential to know
   whether the change works, return `blocked` and name the step and what stopped you in `blocked_by`.
-- Do not edit files and do not fix what you find. Arete gives your findings to the builder.
+- Do not edit the repo's files and do not fix what you find; fixtures in the scratch folder are not edits to the change. Arete gives your findings to the builder.
 - Never run git commands that write. Arete deletes the `__pycache__` your commands leave, so do not report it.
 - A problem that is also on the base branch is not a failure of this change. Note it in `saw` and do not fail it.
 

@@ -24,6 +24,9 @@ class Session:
     id: str = ""
     spent_usd: float = 0.0
     runner: str = ""
+    credential: str = ""
+    account: str = ""
+    generation: str = ""
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,13 @@ class Result:
     auth_modes: tuple[str, ...] = ()
     calls: list[Result] = field(default_factory=list, repr=False)
     call_seconds: float = 0.0
+    credential: str = ""
+    effort: str = ""
+    requested_effort: str = ""
+    skipped: list[dict] = field(default_factory=list)
+    record: str = ""
+    quote: dict | None = None
+    reference_usd: float | None = None
 
     @property
     def modes(self) -> tuple[str, ...]:

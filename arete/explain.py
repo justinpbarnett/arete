@@ -32,7 +32,8 @@ def plain_summary(approval: dict, cfg: config.Config) -> str:
                            briefing=delivery.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
     res = runner.run(text, paths.STATE_DIR, model=cfg.model("explain"), tools=[],
                      json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS, wait_out_limits=False,
-                     trace=("", f"plain summary #{approval['id']}"), cfg=cfg)
+                     trace=("", f"plain summary #{approval['id']}"), cfg=cfg,
+                     repo=delivery.repo_for(approval, cfg))
     said = str(res.structured.get("summary") or "").strip() if res.ok and isinstance(res.structured, dict) else ""
     if not said:
         raise NoSummary(res.error or "the answer held no summary")

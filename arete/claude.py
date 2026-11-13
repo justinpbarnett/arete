@@ -12,7 +12,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from . import accounts, background, config, devices, environment, paths, util
+from . import accounts, background, config, devices, environment, paths, scratch, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -117,6 +117,8 @@ def command(
 
 
 def auth_status(env: dict | None = None) -> dict:
+    if paths.ISOLATED:
+        return {}
     try:
         res = util.sh([binary(), "auth", "status"], timeout=10, env=env if env is not None else agent_env(),
                       inherit=False)
@@ -128,6 +130,8 @@ def auth_status(env: dict | None = None) -> dict:
 def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
     if remote:
         return accounts.Auth("subscription", "claude")
+    if paths.ISOLATED:
+        return accounts.Auth()
     env = agent_env(passing, extra)
     folder = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME", str(paths.HOME))) / ".claude")
     if token := env.get("CLAUDE_CODE_OAUTH_TOKEN"):
@@ -181,7 +185,7 @@ def _run(
                   instructions=instructions)
     if remote:
         env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, **AGENT_SETS, **(extra_env or {})}
-        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, dict(AGENT_SETS))
+        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, {**AGENT_SETS, **(extra_env or {})})
     else:
         env = agent_env(passing, extra_env)
     try:
@@ -257,9 +261,9 @@ def failure_reason(data: dict) -> str:
 
 
 def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str], timeout: float,
-                  on_line: Callable[[str], None]) -> subprocess.CompletedProcess:
-    child = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, errors="replace", env=env)
+                  on_line: Callable[[str], None], *, actor_confined: bool = False) -> subprocess.CompletedProcess:
+    child = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, errors="replace", env=env, actor_confined=actor_confined)
     out: list[str] = []
     err: list[str] = []
     helpers = [threading.Thread(target=feed, args=(child.stdin, prompt), daemon=True),
@@ -273,6 +277,10 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
         stop(child)
         raise
     finally:
+        if scratch.PRODUCING.get() is not None:
+            from . import verify
+
+            verify.stop(child)
         for helper in helpers:
             helper.join(DRAIN_SECONDS)
     return subprocess.CompletedProcess(cmd, child.returncode, "".join(out), "".join(err))

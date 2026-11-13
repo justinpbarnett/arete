@@ -1,5 +1,6 @@
 from arete import factory
-from arete.flows import BUILD, REVIEW_FIX, end_dry_run, ended, finish, step
+from arete.pipeline import round_name
+from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, documents, end_dry_run, ended, finish, step
 
 
 def feature(flow):
@@ -12,7 +13,7 @@ def built(flow, first):
     for name, kw in [("prepare", {"tree": ws}), *first]:
         if not (outcome := step(flow, name, **kw)).passed:
             return ended(flow, outcome)
-    tries = job.run.settings(BUILD).tries
+    tries = job.run.settings(CHECK_REPAIR).tries
     attempt, outcome = 1, step(flow, "checks", tree=ws, attempt=1, tries=tries)
     while not outcome.passed and attempt < tries:
         attempt += 1
@@ -23,13 +24,19 @@ def built(flow, first):
         step(flow, "learn", tree=ws, apply=False)
         return finish(flow, "failed", why=f"checks still failing after {attempt} attempts")
     step(flow, "verify", tree=ws)
-    if not (outcome := step(flow, "review")).passed:
-        step(flow, "implement", tree=ws, round=REVIEW_FIX, feedback=outcome.feedback)
-        if not (outcome := step(flow, "checks", tree=ws, after="the review fixes")).passed:
-            return finish(flow, "failed", why="the checks failed after the review fixes", detail=outcome.feedback)
-        step(flow, "verify", tree=ws)
-        step(flow, "review", second=True)
+    reviews = max(1, job.run.settings("review").tries)
+    n, outcome = 1, step(flow, "review", attempt=1, tries=reviews)
+    while not outcome.passed and n < reviews:
+        if outcome.feedback:
+            step(flow, "implement", tree=ws, round=round_name(REVIEW_FIX, n), feedback=outcome.feedback)
+            if not (checked := step(flow, "checks", tree=ws, after="the review fixes")).passed:
+                return finish(flow, "failed", why="the checks failed after the review fixes", detail=checked.feedback)
+            step(flow, "verify", tree=ws)
+        n += 1
+        outcome = step(flow, "review", attempt=n, tries=reviews)
     step(flow, "learn", tree=ws, apply=True)
+    if documents(job):
+        step(flow, "document", tree=ws)
     if job.run.dry_run:
         return end_dry_run(flow)
     for name, kw in [("pr", {"tree": ws}), *([("ci", {"tree": ws})] if job.run.repo.parts else []), ("publish", {})]:

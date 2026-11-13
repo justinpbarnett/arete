@@ -294,14 +294,22 @@ def cmd_hook(args) -> int:
 
 
 def cmd_guard(args) -> int:
-    from . import guard
+    from . import guard, scratch
 
+    scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     return guard.main()
 
 
-def cmd_codex_guard(args) -> int:
-    from . import codex, runner
+def scratch_hook(p) -> None:
+    p.add_argument("--scratch", default="", help="the verification attempt's scratch folder, set by arete")
+    p.add_argument("--scratch-id", default="", help="selector for protected harness authority; never proves ownership")
+    p.add_argument("--scratch-saves", default="", help="must match the authenticated evidence destination")
 
+
+def cmd_codex_guard(args) -> int:
+    from . import codex, runner, scratch
+
+    scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
 
 
@@ -895,6 +903,13 @@ def cmd_costs(args) -> int:
             steps = "step " if row["steps"] == 1 else "steps"
             print(f"  {row['name']:<36} ${row['cost_usd']:>8.2f}  {row['steps']:>5} {steps}  "
                   f"{row['tokens_in']:>10,} in  {row['tokens_out']:>9,} out")
+    print("by route:")
+    for row in c["by_route"][:12]:
+        spend = (f"subscription reported ${row['subscription_usd']:.2f}" if row["billing"] == "subscription"
+                 else f"{row['billing']} ${row['cost_usd']:.2f}" if row["billing"] in ("local", "replay")
+                 else f"paid ${row['paid_usd']:.2f}")
+        print(f"  {row['name']:<52} {spend:<32} {row['calls']:>5} calls  {row['tokens_in']:>10,} in  "
+              f"{row['cache_read']:>10,} cache rd  {row['cache_write']:>9,} cache wr  {row['tokens_out']:>9,} out")
     return 0
 
 
@@ -906,19 +921,27 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
     except control.Refused as e:
         return refused(e)
     c = found[-1][1]
-    waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"]}
+    waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"], "paid_usd": c["paid_usd"],
+             "subscription_usd": c["subscription_usd"]}
     if as_json:
         print_lines([*(json.dumps(g) for _, each in found for g in each["groups"]), json.dumps(waits)])
         return 0
     for by, each in found:
         print(f"Every step by {by} in the last {each['days']:g} days. Cost is what each call reported; "
               "subscription calls count here too. Paid totals exclude them. `in` counts the input no cache served.")
-        rows = [(by, "runs", "calls", "cost", "in", "cache rd", "cache wr", "out", "min", "api min")]
-        rows += [(g["name"], str(g["runs"]), str(g["calls"]), f"${g['cost_usd']:.2f}",
+        routed = by == "route"
+        rows = [(by, *(("billing",) if routed else ()), "runs", "calls", *(("paid", "subscription") if routed else ("cost",)),
+                 "in", "cache rd", "cache wr", "out", "min", "api min")]
+        rows += [(g["name"], *((g["billing"],) if routed else ()), str(g["runs"]), str(g["calls"]),
+                  *((f"${g['paid_usd']:.2f}", f"${g['subscription_usd']:.2f}") if routed else (f"${g['cost_usd']:.2f}",)),
                   f"{g['tokens_in'] - g['cache_read'] - g['cache_write']:,}", f"{g['cache_read']:,}",
                   f"{g['cache_write']:,}", f"{g['tokens_out']:,}", f"{g['minutes']:.1f}", f"{g['api_minutes']:.1f}")
                  for g in each["groups"]]
         print_table(rows, 200)
+        if routed:
+            local = sum(g["calls"] for g in each["groups"] if g["billing"] == "local")
+            print(f"paid ${each['paid_usd']:.2f}  subscription reported ${each['subscription_usd']:.2f}  "
+                  f"local calls {local}")
     print("waits (minutes): " + "  ".join(f"{cause} {m:.1f}" for cause, m in c["wait_minutes"].items()))
     return 0
 
@@ -934,11 +957,11 @@ def cmd_steps(args) -> int:
         where = f"{paths.short_path(layer_dir / 'config.toml')}: " if layer_dir else ""
         layer = config.load_layer(layer_dir) if layer_dir else None
         steps.check(cfg, layer)
-        sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.MODEL_ROLES]
+        sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.STEP_ROLES]
     except (ValueError, TypeError) as e:
         print(f"{where}{e}", file=sys.stderr)
         return 1
-    found = None if cfg.replay.all else routing.Discovery(cfg, repo)
+    found = None if cfg.replay.all else routing.Discovery(cfg, repo, layer=layer)
     for s in sheet:
         notes = list(s.notes)
         if s.step in steps.SEARCHES and (why := research_search.unavailable(s)):
@@ -953,8 +976,42 @@ def cmd_steps(args) -> int:
                 notes.append("pi anthropic: paid api_key route (Anthropic Console key)")
         remaining = routing.loop_budget_left(cfg) if s.step in ("loop", "classify") else None
         routes = routing.described(found.routes(s, remaining)) if found else []
-        print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes}))
+        selection = (routing.described_selection(routing.select(found, s, remaining), s, 0)
+                     if found and s.requires.declared else None)
+        print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes, "selection": selection,
+                          "payment_modes": list(config.allowed_payment_modes(cfg, layer))}))
     return 0
+
+
+def cmd_document(args) -> int:
+    from pathlib import Path
+
+    from . import document, outbound
+
+    try:
+        raw = sys.stdin.read() if args.brief == "-" else Path(args.brief).read_text()
+        data = json.loads(raw)
+        if args.draft and isinstance(data, dict):
+            data["draft"] = Path(args.draft).read_text()
+        brief = document.brief_from(data)
+        cfg = config.load()
+        repo = cfg.repo(args.repo) if args.repo else None
+        layer = config.load_layer(repo.layer_dir) if repo else None
+        written = document.write(brief, cfg, repo=repo, layer=layer)
+    except (ValueError, TypeError, OSError, config.UnknownRepo) as e:
+        print(f"arete document: {e}", file=sys.stderr)
+        return 2
+    if args.text:
+        sys.stdout.write(written.text if written.text.endswith("\n") else written.text + "\n")
+    else:
+        shown = {"kind": brief.kind, "source": written.source, "title": written.title, "text": written.text,
+                 "words": written.words, "target": written.target,
+                 "over_target": bool(written.target and written.words > written.target[1]), "kept": written.kept,
+                 "faults": list(written.faults), "tries": written.tries}
+        if brief.kind != "doc":
+            shown["screened"] = outbound.screen(written.text)
+        print(json.dumps(shown))
+    return 0 if written.source == "writer" else 1
 
 
 def cmd_record(args) -> int:
@@ -990,6 +1047,39 @@ def cmd_record(args) -> int:
     names = ", ".join(f.name for f in record.record_files(args.run_id)) or "none"
     print(f"no step {args.step} in run {args.run_id}; its records: {names}", file=sys.stderr)
     return 1
+
+
+def cmd_prices(args) -> int:
+    from . import prices, util
+
+    words = args.words
+    if (args.action, len(words)) not in (("diff", 0), ("diff", 1), ("import", 1), ("recompute", 2)):
+        print("usage: arete prices diff [FILE] | import FILE | recompute RUN_ID STEP", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "recompute":
+            print_lines([json.dumps(prices.recompute(*words), ensure_ascii=False)])
+            return 0
+        old = prices.load()
+        if words:
+            new = prices.read_file(words[0])
+        elif old is None:
+            print("no price snapshot imported", file=sys.stderr)
+            return 1
+        else:
+            new = old
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    found = prices.diff(old if words else None, new, util.now())
+    importing = args.action == "import"
+    print_lines([*(json.dumps(f, ensure_ascii=False) for f in found),
+                 json.dumps({"source": new["source"], "observed": new["observed"], "version": new["version"],
+                             "routes": len(new["routes"]), "against": old["version"] if words and old else None,
+                             "findings": dict(Counter(f["finding"] for f in found)), "imported": importing})])
+    if importing:
+        prices.store(new)
+    return 0
 
 
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
@@ -1035,6 +1125,12 @@ def cmd_resume(args) -> int:
     from . import client
 
     return client.say("POST", client.run_path(args.run_id, "resume"), {"step": args.step} if args.step else {})
+
+
+def cmd_repair(args) -> int:
+    from . import client
+
+    return client.say("POST", client.run_path(args.run_id, "repair"), {})
 
 
 def cmd_step(args) -> int:
@@ -1170,11 +1266,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: keeps them out of secret files and, with JEV, "
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
+    scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
     p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
                                            "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
+    scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
 
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
@@ -1253,9 +1351,10 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_webhook)
 
     p = steering(sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop; with --by, "
-                                              "every step by step, task kind or model, and the wait minutes by cause"))
+                                              "every step by step, task kind, model or route, and the wait minutes by cause"))
     p.add_argument("--days", type=float, default=None)
-    p.add_argument("--by", nargs="+", choices=("step", "kind", "model"), help="one grouping or several, in order")
+    p.add_argument("--by", nargs="+", choices=("step", "kind", "model", "route"),
+                   help="one grouping or several, in order; route is runner/provider/model/billing")
     p.add_argument("--json", action="store_true", help="one JSON line per group, then one with the wait minutes")
     p.set_defaults(fn=cmd_costs)
 
@@ -1265,6 +1364,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kind", default="", choices=config.KINDS, help="resolve for this kind of ticket")
     p.set_defaults(fn=cmd_steps)
 
+    p = sub.add_parser("document", help="write a short message, ticket, PR text or doc edit from a JSON brief of "
+                                        "verified facts; prints one JSON line")
+    p.add_argument("brief", metavar="BRIEF", help="a JSON file, or - for standard input")
+    p.add_argument("--repo", default="", help="use this repo's layer, its [document] settings and voice files")
+    p.add_argument("--draft", default="", metavar="FILE", help="an existing text to keep, edited as little as possible")
+    p.add_argument("--text", action="store_true", help="print the text alone")
+    p.set_defaults(fn=cmd_document)
+
     p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
                                       "events")
     p.add_argument("run_id")
@@ -1272,6 +1379,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")
     p.set_defaults(fn=cmd_record)
+
+    p = sub.add_parser("prices", help="import, diff or recompute from an owner-supplied price and lifecycle "
+                                      "snapshot")
+    p.add_argument("action", choices=("import", "diff", "recompute"))
+    p.add_argument("words", nargs="*", help="diff [FILE], import FILE, or recompute RUN_ID STEP")
+    p.set_defaults(fn=cmd_prices)
 
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))
@@ -1298,6 +1411,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_id")
     p.add_argument("--step", default="", help="run this step and every step after it again")
     p.set_defaults(fn=cmd_resume)
+
+    p = steering(sub.add_parser("repair", help="repair the open held PR of a run from its saved internal review, "
+                                               "through the server"))
+    p.add_argument("run_id")
+    p.set_defaults(fn=cmd_repair)
 
     p = steering(sub.add_parser("step", help="run one step of a run that ended alone, through the server"))
     p.add_argument("run_id")

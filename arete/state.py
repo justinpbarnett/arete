@@ -12,7 +12,7 @@ from .agent import KEY_PROVIDERS, SUBSCRIPTION_RUNNERS
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
-PAID_STEP = (f"(CASE steps.auth_mode WHEN 'subscription' THEN 0 WHEN 'api_key' THEN 1 ELSE "
+PAID_STEP = (f"(CASE steps.auth_mode WHEN 'subscription' THEN 0 WHEN 'local' THEN 0 WHEN 'api_key' THEN 1 ELSE "
              f"NOT (COALESCE(steps.runner, '') IN ({', '.join(repr(r) for r in sorted(SUBSCRIPTION_RUNNERS))}) AND "
              f"NOT (steps.runner = 'codex' AND COALESCE(steps.provider, '') IN "
              f"({', '.join(repr(p) for p in sorted(KEY_PROVIDERS))}))) END)")
@@ -417,13 +417,13 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
 @contextmanager
 def db():
     paths.ensure_dirs()
-    conn = sqlite3.connect(paths.DB_FILE, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    for table, column, sql in MIGRATIONS:
-        if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
-            conn.execute(sql)
+    conn = paths.connect_db(paths.DB_FILE)
     try:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        for table, column, sql in MIGRATIONS:
+            if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                conn.execute(sql)
         yield conn
         conn.commit()
     finally:
@@ -437,7 +437,7 @@ def ensure_schema() -> None:
 
 @contextmanager
 def reader():
-    conn = sqlite3.connect(f"{paths.DB_FILE.absolute().as_uri()}?mode=ro", uri=True, timeout=30)
+    conn = paths.connect_db(paths.DB_FILE, readonly=True)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -474,13 +474,21 @@ def run_facets(connect=db) -> dict[str, list[str]]:
                 for column in ("kind", "repo", "loop")}
 
 
-def paid_by_run(run_ids: list[str], connect=db) -> dict[str, float]:
+def paid_by_run(run_ids: list[str], connect=db, local_providers=None) -> dict[str, float]:
     if not run_ids:
         return {}
+    if local_providers is None:
+        from . import config
+
+        local_providers = config.load().local_providers
+    paid: dict[str, float] = {}
     with connect() as c:
-        rows = c.execute(f"SELECT run_id, SUM(cost_usd) FROM steps WHERE run_id IN ({','.join('?' * len(run_ids))}) "
-                         f"AND {PAID_STEP} GROUP BY run_id", run_ids)
-        return {r[0]: round(float(r[1] or 0), 6) for r in rows}
+        rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "
+                         f"WHERE run_id IN ({','.join('?' * len(run_ids))}) AND {PAID_STEP}", run_ids)
+        for r in rows:
+            if not unbilled_step(dict(r), local_providers):
+                paid[r[0]] = paid.get(r[0], 0.0) + float(r["cost_usd"] or 0)
+    return {k: round(v, 6) for k, v in paid.items()}
 
 
 def runs_since(since: str, connect=db) -> list[dict]:
@@ -523,7 +531,7 @@ def steps(run_id: str, connect=db) -> list[dict]:
 
 def step_tries(run_id: str, step: str) -> int:
     with db() as c:
-        return c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
+        return c.execute("SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
 
 
 def steps_since(since: str, connect=db, paid_only: bool = False) -> list[dict]:
@@ -892,15 +900,26 @@ def chat_import(chat: dict, messages: list[tuple]) -> int:
         return chat_id
 
 
-def loop_spent_since(since: str, loop: str | None = None) -> float:
-    q = ("SELECT COALESCE(SUM(steps.cost_usd), 0) FROM steps JOIN runs r ON r.id = steps.run_id "
-         f"WHERE steps.ts >= ? AND r.kind = 'loop' AND {PAID_STEP}")
+def local_step(step: dict, local_providers) -> bool:
+    mode, model = step.get("auth_mode") or "", step.get("model") or ""
+    provider = step.get("provider") or (model.partition("/")[0] if "/" in model else "")
+    return mode == "local" or (step.get("runner") == "pi" and mode != "subscription" and provider in local_providers)
+
+
+def unbilled_step(step: dict, local_providers) -> bool:
+    return step.get("runner") == "replay" or local_step(step, local_providers)
+
+
+def loop_spent_since(since: str, loop: str | None = None, local_providers=()) -> float:
+    q = ("SELECT steps.cost_usd, steps.runner, steps.provider, steps.model, steps.auth_mode FROM steps "
+         f"JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop' AND {PAID_STEP}")
     args: list = [since]
     if loop:
         q += " AND r.loop = ?"
         args.append(loop)
     with db() as c:
-        return float(c.execute(q, args).fetchone()[0])
+        return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args)
+                   if not unbilled_step(dict(r), local_providers))
 
 
 def hold(scope: str, until: str, why: str, connect=db) -> None:

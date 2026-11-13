@@ -137,6 +137,11 @@ def emit_of(approval: dict) -> Emit:
     return EMITS[approval["emit"]["type"]]
 
 
+def repo_for(approval: dict, cfg: config.Config) -> config.Repo | None:
+    name = repo_of(approval)
+    return next((r for r in cfg.repos if r.name == name), None)
+
+
 def repo_of(approval: dict) -> str:
     return emit_of(approval).target_repo(approval["emit"]["item"]) or approval["run_repo"]
 

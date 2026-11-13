@@ -43,11 +43,14 @@ def sh(
     inherit: bool = True,
 ) -> subprocess.CompletedProcess:
     full_env = {**(os.environ if inherit else {}), **(env or {})}
+    from . import scratch
+
+    command = scratch.protected_command(cmd, cwd)
     try:
         res = subprocess.run(
-            cmd,
+            command,
             cwd=str(cwd) if cwd else None,
-            shell=isinstance(cmd, str),
+            shell=isinstance(command, str),
             capture_output=True,
             text=True,
             errors="replace",
@@ -345,9 +348,11 @@ def lock_is_held(name: str) -> bool:
 
 def read_env_file(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
-    if not path.exists():
+    try:
+        text = paths.read_confined(path).decode()
+    except FileNotFoundError:
         return out
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
