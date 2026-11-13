@@ -887,6 +887,48 @@ A rate applies when its period holds the clock's time. A `min_input_tokens` rate
 
 Findings: `stale` (observed over 30 days ago, or no rate in effect), `retired` (with the replacement), `changed` (an applicable component moved by 1% or more or became known or unknown, a currency, unit, kind, provider, model or lifecycle field differs, or an alias moved), `added` and `dropped` (routes or aliases). All rate schedules are compared separately, including material component changes, additions, removals, order, conditions and effective periods, even for unconditional, expired or future rates. This comparison does not make an unproven rate applicable.
 
+### Benchmark local routes
+
+A model that fits in VRAM may still fail a real task. `arete benchmark run MANIFEST` measures endpoints already configured in Pi's `models.json` under 8K and 32K prompts and configurable concurrency. It never pulls weights, provisions a device or schedules load. Nothing runs unless the owner types the command, and the run is finite.
+
+Each cell sends three probes per worker (plain text, structured JSON, a forced tool call) with synthetic prompts that carry a unique nonce, so a prefix cache cannot flatter first-token latency. The report holds, per candidate, the manifest metadata, observed memory, first-token and completion medians, tokens per second, context failures, structured-output and tool reliability, and quality as accepted over sent requests. Outcomes are `ok`, `rejected` (well-formed, wrong word), `malformed`, `context_overflow` (including silent truncation), `out_of_memory`, `timeout` and `error`.
+
+```toml
+contexts = [8192, 32768]      # 1 to 4 sizes, default shown
+concurrency = [1, 2]          # 1 to 4 levels of 1..16, default shown
+max_tokens = 64               # 1..1024
+timeout_seconds = 120         # per request, 1..600
+max_seconds = 900             # whole run, 1..7200; later cells are not_run
+
+[escalation]                  # optional; both rates in USD per million tokens
+input_usd_per_mtok = 1.0
+output_usd_per_mtok = 2.0
+
+[candidates.example]          # 1 to 12 candidates
+route = "fixture/ok"          # provider/model from models.json, or fixture/<scenario>
+quantization = "placeholder"
+runtime = "placeholder"
+runtime_version = "placeholder"
+hardware = "placeholder"
+memory_gb = 24
+window = 32768                # context the runtime is configured with; larger cells are unsupported
+# device = "name"             # optional devices.toml name (local or ssh only)
+```
+
+Real candidate lists and escalation rates belong in a private file such as `~/.config/arete/benchmark.toml` or a private layer, not in the repo.
+
+Before any request, the endpoint must answer `GET /models` and list the model, and a named device must pass its probe. Otherwise the candidate is `unavailable`, sends nothing and is not scored, so an offline host never lowers quality. Observed memory comes only from an Ollama-style `/api/ps`; anything missing prints `unknown`. Zero API spend is reported beside wall time and the escalation cost: what the rejected or failed requests would cost at the `[escalation]` rates. Unsupported, not run and unavailable cells add nothing.
+
+`arete benchmark fixture --port N --seconds S` serves loopback fixtures at `http://127.0.0.1:N/<scenario>/v1` for `S` seconds (1 to 3600): `ok`, `oom` (out of memory above an estimated 16000 prompt tokens), `overflow` (context error above 8192) and `malformed` (broken JSON and tool arguments). Routes `fixture/<scenario>` run the same scenarios in process, plus `fixture/offline`.
+
+The finite opt-in command for a ready endpoint:
+
+```
+arete benchmark run ~/.config/arete/benchmark.toml --out ~/benchmarks/local.json
+```
+
+It is bounded by `max_seconds` and `timeout_seconds`, and by at most 12 candidates x 4 contexts x 4 levels.
+
 ## Replay
 
 The `replay` runner answers each agent call from a file and calls no model, so a check of the pipeline's own flow runs in seconds and costs nothing. A step picks it like any runner: `runner = "replay"` in a step table or a tier, or a `replay:<name>` model. `[replay] all = true` in `~/.config/arete/config.toml` sends every agent call to it, whatever the step sheet says, and `arete steps` shows `replay` for every step.
