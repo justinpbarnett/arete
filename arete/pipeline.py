@@ -1035,6 +1035,10 @@ def report_review(review: dict) -> dict:
                          for p in review_problems(review.get("problems"))]}
 
 
+def note_review(run: Run, review: dict, verified: verify.Verified) -> None:
+    run.facts.update(requirements=verified.requirements(), review=report_review(review))
+
+
 def assumptions_of(plan: dict) -> list[str]:
     listed = plan.get("assumptions")
     return [a.strip() for a in listed if isinstance(a, str) and a.strip()] if isinstance(listed, list) else []
@@ -1263,6 +1267,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     verified = verify_in_use(b, goal, build_summary)
     reviews, n = max(1, run.settings("review").tries), 1
     review = _review(b, plan_to_review, verified)
+    note_review(run, review, verified)
     while review.get("verdict") == "request_changes" and n < reviews:
         if problems := review_findings(review):
             run.story.append(f"Review requested changes:\n{problems}")
@@ -1271,8 +1276,10 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             verified = verify_in_use(b, goal, build_summary)
         n += 1
         review = _review(b, plan_to_review, verified, round_name("review", n))
+        note_review(run, review, verified)
     draft_why = draft_reason(review, verified, n)
-    run.facts.update(requirements=verified.requirements(), review=report_review(review), held=draft_why)
+    note_review(run, review, verified)
+    run.facts["held"] = draft_why
     _learn(run, ws, layer.expertise_file, t.title, expertise, apply=True)
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
