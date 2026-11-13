@@ -375,8 +375,8 @@ def arm_row(arm: str, trials: list[dict], design: dict) -> dict:
     launched = [a for a in attempts if a.get("launched")]
     handoffs = {r: n for r in HANDOFFS if (n := sum(t.get("handoff") == r for t in mine))}
     unknown = any(t.get("unpriced_attempts") or not accounted_for(t) for t in mine)
-    worker, escalation = tariff_of(launched, WORKER), tariff_of(launched, ESCALATION)
-    total = None if unknown or None in (worker, escalation) else round(worker + escalation, 6)
+    worker, escalation = (None, None) if unknown else (tariff_of(launched, WORKER), tariff_of(launched, ESCALATION))
+    total = None if None in (worker, escalation) else round(worker + escalation, 6)
     return {"arm": arm, "trials": len(mine), "done": row["done"], "accepted": row["accepted"], "rate": row["rate"],
             "interval": row["interval"], "first_pass": sum(bool(t.get("first_pass")) for t in finished),
             "worker_attempts": sum(a.get("phase") == WORKER for a in attempts),

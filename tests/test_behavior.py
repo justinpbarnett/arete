@@ -1057,6 +1057,19 @@ print("BEHAVIOR_RESULT=" + json.dumps({"run": ran, "trials": trials, "report": w
         self.assertIsNone(workers.arm_row("a", [lost], design)["tariff_usd"])
         self.assertEqual(workers.arm_row("a", [{**lost, "attempts": []}], design)["tariff_usd"], 0)
 
+    def test_an_arm_with_an_unaccounted_trial_prices_no_phase(self):
+        from arete import workers
+
+        design = {"accept": {"confidence": 0.95}, "workers": {"kinds": {"t": "patch"}}}
+        lost = {"event": "trial", "task": "t", "arm": "a", "repeat": 1, "status": "interrupted",
+                "charged_usd": 0.0, "reference_usd": 0.0, "unpriced_attempts": 2}
+        priced = {**lost, "repeat": 2, "unpriced_attempts": 0, "reference_usd": 0.08,
+                  "attempts": [{"phase": workers.WORKER, "launched": True, "tariff_usd": 0.08}]}
+        row = workers.arm_row("a", [priced, lost], design)
+        self.assertEqual((row["tariff_worker_usd"], row["tariff_escalation_usd"], row["tariff_usd"]), (None, None, None))
+        row = workers.arm_row("a", [priced], design)
+        self.assertEqual((row["tariff_worker_usd"], row["tariff_usd"]), (0.08, 0.08))
+
 
 class MinerRecordedRunTests(unittest.TestCase):
     PRELUDE = r'''
