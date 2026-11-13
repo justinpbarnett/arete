@@ -582,7 +582,8 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     if peers:
         params += ["-D", f"PEERS={peers.resolve()}", "-D", f"WORK={cwd.resolve()}"]
         profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
-                    '(require-not (subpath (param "WORK")))))')
+                    '(require-not (literal (param "PEERS"))) (require-not (subpath (param "WORK")))))'
+                    '(deny file-read-data file-write* (literal (param "PEERS")))')
     if secrets_denied:
         from . import guard
 
