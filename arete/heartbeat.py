@@ -115,7 +115,7 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
         except (ValueError, TypeError, OSError):
             continue
         for kind in ("", *config.KINDS):
-            for role in config.MODEL_ROLES:
+            for role in config.STEP_ROLES:
                 try:
                     step = steps.resolve(cfg, layer, role, kind)
                     if step.runner == "pi":
@@ -170,7 +170,7 @@ def uses_codex(cfg: config.Config) -> bool:
             continue
     for layer in layers:
         for kind in ("", *config.KINDS):
-            for role in config.MODEL_ROLES:
+            for role in config.STEP_ROLES:
                 try:
                     if steps.resolve(cfg, layer, role, kind).runner == "codex":
                         return True

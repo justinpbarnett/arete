@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
 
-from . import accounts, claude, config, devices, environment, paths, state, util
+from . import accounts, claude, config, devices, environment, paths, scratch, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -102,6 +102,8 @@ SAFE_HEADERS = {"accept": r"application/json|text/event-stream", "content-type":
 
 
 def owner_dir() -> Path:
+    if paths.ISOLATED:
+        return (paths.SCRATCH_STATE and paths.confined(paths.STATE_DIR / "pi-agent")) or paths.NOWHERE / "pi-agent"
     return paths.expand(os.environ.get("PI_CODING_AGENT_DIR") or PI_HOME / "agent").absolute()
 
 
@@ -209,8 +211,7 @@ def managed_material(credential: ManagedCredential, provider: str) -> list:
     values = []
     for path in files:
         try:
-            with path.open("rb") as source:
-                data = source.read(accounts.MAX_LOGIN_METADATA)
+            data = paths.read_confined(path, accounts.MAX_LOGIN_METADATA)
             if credential.kind == "profile":
                 parser = configparser.RawConfigParser()
                 parser.read_string(data.decode())
@@ -305,7 +306,7 @@ def sanitized(value):
 
 def model_configuration(folder: Path | None = None) -> dict:
     try:
-        text = ((folder or owner_dir()) / "models.json").read_text(encoding="utf-8-sig")
+        text = paths.read_confined((folder or owner_dir()) / "models.json").decode("utf-8-sig")
         strings = r'"(?:\\.|[^"\\])*"'
         text = re.sub(strings + r'|//[^\n]*', lambda m: m[0] if m[0].startswith('"') else "", text)
         text = re.sub(strings + r'|,(\s*[}\]])', lambda m: m[1] or m[0], text)
@@ -322,6 +323,8 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
         providers = cfg.environment.providers if providers is None else providers
         local_providers = cfg.local_providers
     owner = Path(owner_auth).absolute() if owner_auth is not None else owner_dir() / "auth.json"
+    if paths.ISOLATED:
+        owner, source = paths.confined(owner) or paths.NOWHERE / "auth.json", {}
     settings = accounts.read(owner.parent / "settings.json")
     models = model_configuration(owner.parent)
     provider, sep, name = model.partition("/")
@@ -507,7 +510,10 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
 
 
 def default_provider() -> str:
-    settings = util.read_json(owner_dir() / "settings.json", {})
+    try:
+        settings = json.loads(paths.read_confined(owner_dir() / "settings.json"))
+    except (OSError, ValueError):
+        settings = {}
     provider = settings.get("defaultProvider") if isinstance(settings, dict) else ""
     return provider if isinstance(provider, str) else ""
 
@@ -552,20 +558,50 @@ def guard_env(auth_paths: list[Path] | None = None, secret_paths: tuple[Path, ..
 
 
 def can_confine(remote: bool) -> bool:
-    return not remote and sys.platform == "darwin" and bool(shutil.which("sandbox-exec"))
+    return not remote and sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK)
 
 
-def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None) -> list[str]:
-    roots = [cwd, *add_dirs, AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR]
+def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
+                      *, hidden: tuple[Path, ...] = (), restrict_writes: bool = True,
+                      agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False) -> list[str]:
+    hidden = tuple(dict.fromkeys((*hidden, scratch.AUTHORITY)))
+    roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
     allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
-    profile = f'(version 1)(allow default)(deny file-write* (subpath "/"))(allow file-write* {allow})'
+    profile = '(version 1)(allow default)'
+    if restrict_writes:
+        profile += f'(deny file-write* (subpath "/"))(allow file-write* {allow})'
     if auth_path is not None:
         profile += '(allow file-write* (literal (param "AUTH")) (literal (param "LOCK")))'
     params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={Path(root).resolve()}")]
     if auth_path is not None:
         params += ["-D", f"AUTH={auth_path.resolve()}", "-D", f"LOCK={auth_path.resolve()}.lock"]
-    return ["sandbox-exec", *params, "-p", profile]
+    for i, path in enumerate(hidden):
+        params += ["-D", f"H{i}={path.resolve()}"]
+        profile += f'(deny file-read* file-write* (subpath (param "H{i}")))'
+    if peers:
+        params += ["-D", f"PEERS={peers.resolve()}", "-D", f"WORK={cwd.resolve()}"]
+        profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
+                    '(require-not (literal (param "PEERS"))) (require-not (subpath (param "WORK")))))'
+                    '(deny file-read-data file-write* (literal (param "PEERS")))')
+    if secrets_denied:
+        from . import guard
+
+        def pattern(names, descendants=False):
+            return "(^|/)(" + "|".join(re.escape(n).replace(r"\*", "[^/]*") for n in names) + (
+                ")($|/)" if descendants else ")$")
+
+        params += ["-D", "NAMES=" + pattern(guard.SECRET_NAMES), "-D", "SAFE=" + pattern(guard.SAFE_NAMES),
+                   "-D", "DIRS=" + pattern(guard.SECRET_DIRS, True)]
+        profile += ('(deny file-read* file-write* (require-all (regex (param "NAMES")) '
+                    '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
+    params += ["-D", f"ENGINE={paths.PACKAGE_DIR.resolve()}", "-D", f"RUNTIME={Path(sys.prefix).resolve()}"]
+    profile += '(deny file-write* (subpath (param "ENGINE")) (subpath (param "RUNTIME")))'
+    ancestors = {p for root in (*hidden, paths.PACKAGE_DIR, Path(sys.prefix)) for p in Path(root).resolve().parents}
+    for i, path in enumerate(sorted(ancestors)):
+        params += ["-D", f"A{i}={path}"]
+        profile += f'(deny file-write* (literal (param "A{i}")))'
+    return ["/usr/bin/sandbox-exec", *params, "-p", profile]
 
 
 def sessions_dir(remote: devices.Device | None) -> str:
@@ -924,8 +960,9 @@ def mcp_servers(mcp_config: str) -> dict:
 def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budget_usd: float | None,
            cost_of: Callable[[str], float],
            on_line: Callable[[str], None], *, pass_fds: tuple[int, ...] = ()) -> tuple[subprocess.CompletedProcess, str]:
-    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, errors="replace", env=env, pass_fds=pass_fds)
+    proc = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, errors="replace", env=env, pass_fds=pass_fds,
+                         actor_confined=bool(cmd and cmd[0] == "/usr/bin/sandbox-exec"))
     stderr: list[str] = []
     reader = threading.Thread(target=lambda: stderr.append(proc.stderr.read()), daemon=True)
     reader.start()
@@ -949,6 +986,10 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        if scratch.PRODUCING.get() is not None:
+            from . import verify
+
+            verify.stop(proc)
     reader.join(5)
     done = subprocess.CompletedProcess(cmd, proc.returncode, "".join(lines), "".join(stderr))
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")
