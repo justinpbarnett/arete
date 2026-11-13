@@ -284,7 +284,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if refusal:
         return refused(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind,
                        chosen_by, try_no, refusal)
-    if which == REPLAY:
+    if which == REPLAY and (cfg.replay.all or not (settings and settings.requires.declared)):
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
         return attempt(which, name, prompt, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
@@ -310,7 +310,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                     wait_until(trip, wake)
                 continue
             done = exhausted(trip, skipped, limited, which, name, wake)
-            if trip.request.requires.declared and not wake:
+            if trip.request.requires.declared:
                 given = {"launch": launches + 1, "skipped": skipped, "requested_effort": trip.request.effort,
                          "selection": launched_selection(trip, prior, skipped, measured, error=done.error)}
                 res = refused(which, name, prompt, cwd, done.session, cfg, trace, record_id, target, kw, tier, kind,
