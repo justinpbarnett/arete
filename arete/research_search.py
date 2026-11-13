@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from . import config, jev, paths, research_plan, runner, steps, tracker, util
+from . import claude, config, jev, paths, research_plan, runner, steps, tracker, util
 from .pipeline import prompt
 
 FOLDER = paths.STATE_DIR / "research"
@@ -29,7 +29,9 @@ PASSAGE_CHARS = 1500
 PASSED_ON = ("passed", "unscreened")
 WITHHELD = ("flagged", "failed")
 CAP_REACHED = "the search cap was reached"
-NO_REPORT = ", so no report was written"
+ROUTING_SECONDS = 20
+GRACE_SECONDS = ROUTING_SECONDS + claude.STOP_GRACE_SECONDS + claude.DRAIN_SECONDS
+NO_REPORT =", so no report was written"
 USAGE_KEYS = ("cost_usd", "tokens_in", "tokens_out", "turns")
 
 
@@ -148,7 +150,7 @@ def work(cfg: config.Config, s: steps.Settings, plan: dict, ref: str, n: int, cw
     paid, faults, feedback, kept, fatal, limited = 0.0, [], "", [], "", ""
     answer = None
     for _ in range(s.tries):
-        remaining, left = float(dec(allowance) - dec(paid)), deadline - time.monotonic()
+        remaining, left = float(dec(allowance) - dec(paid)), deadline - time.monotonic() - GRACE_SECONDS
         if remaining <= runner.BUDGET_FLOOR_USD or left < research_plan.MIN_CALL_SECONDS:
             faults = faults or ["the worker's share of the search cap was used up"]
             break
@@ -263,7 +265,7 @@ def screen(cfg: config.Config, ref: str, judged: bool, items: list[tuple[object,
 
 
 def screening(cfg: config.Config, ref: str, judged: bool, workers: list[dict], sources: list[dict]) -> None:
-    items = [({"title": f["title"], "question": f["question"], "passage": f["passage"],
+    items = [({"url": s["url"], "title": f["title"], "question": f["question"], "passage": f["passage"],
                "uncertainty": f["uncertainty"]}, f["screen"]) for s in sources for f in s["findings"]]
     items += [(w["notes"], w["notes_screen"]) for w in workers if w["notes"]]
     screen(cfg, ref, judged, items)
@@ -318,7 +320,7 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
     share = cfg.research_search_share
     cap_usd = min(share * left_usd, left_usd - budget.reserve_usd)
     cap_seconds = min(share * left_seconds, left_seconds - budget.reserve_seconds)
-    room = not budget.short(cap_usd, cap_seconds)
+    room = not budget.short(cap_usd, cap_seconds - GRACE_SECONDS)
     tasks, size = plan["tasks"], cfg.research_search_workers
     cap = dec(cap_usd) if room else Decimal(0)
     stage_deadline = time.monotonic() + cap_seconds if room else 0.0
@@ -338,7 +340,7 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
             while pending and not stop and len(running) < size:
                 allowance = (cap - spent - committed) / min(size - len(running), len(pending))
                 seconds = min(s.timeout_minutes * 60, stage_deadline - time.monotonic())
-                if allowance <= floor or seconds < research_plan.MIN_CALL_SECONDS:
+                if allowance <= floor or seconds < research_plan.MIN_CALL_SECONDS + GRACE_SECONDS:
                     status, stop = "capped", CAP_REACHED
                     break
                 n = pending.pop(0)
