@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import posixpath
 import signal
@@ -35,6 +36,21 @@ INBOX_POLL_SECONDS = 2
 SESSION_LOG = "sessions.log"
 SEEN_MODEL_DAYS = 30
 RECENT_CHARS = 8000
+CHECK_RESULTS = ("pass", "fail", "skipped")
+REPORT_SCHEMA = {
+    "type": "object", "additionalProperties": False, "required": ["summary", "checks", "open_questions"],
+    "properties": {
+        "summary": {"type": "string"},
+        "checks": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False, "required": ["name", "result", "detail"],
+            "properties": {"name": {"type": "string"}, "result": {"type": "string", "enum": list(CHECK_RESULTS)},
+                           "detail": {"type": "string"}}}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+    },
+}
+REPORT_PROMPT = ("The task is over. Change no file and run nothing new. Report: a summary of what was done and what is "
+                 "left undone; each check you ran with its result (pass, fail or skipped) and one line of detail, or an "
+                 "empty list when you ran none; and the open questions for whoever gave the task, or an empty list for none.")
 SWITCHES_TASK = ("Does the new message start a different task from the recent work, so that the details of the recent "
                  "work no longer matter for it?")
 
@@ -61,6 +77,11 @@ class Spec:
     held: str = ""
     unreturned: str = ""
     deny: list[str] = field(default_factory=list)
+    task: bool = False
+    draft_pr: bool = False
+    pr: str = ""
+    turn_error: str = ""
+    publish_error: str = ""
 
 
 class SessionStopped(Exception):
@@ -142,16 +163,36 @@ def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> N
     spec.source = str(repo.path)
     spec.branch = f"session/{spec.id}"
     wt = paths.WORKTREES_DIR / f"session-{spec.id}"
+    if spec.task:
+        spec.deny = diffguard.denied_paths(config.load_layer(repo.layer_dir))
+        spec.cloned = published_baseline(repo)
     with record.timed(spec.id, "worktree", repo=repo.name, branch=spec.branch, path=str(wt)):
         util.git(["worktree", "add", "-q", "-b", spec.branch, str(wt), "HEAD"], repo.path)
     spec.cwd = str(wt)
+    if spec.task:
+        spec.fetched = util.git(["rev-parse", "HEAD"], wt).strip()
+
+
+def published_baseline(repo: config.Repo) -> str:
+    base = config.load_layer(repo.layer_dir).base_branch or util.git(
+        ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo.path, check=False).strip().removeprefix(
+        "origin/") or "main"
+    found = util.sh(["git", "merge-base", "HEAD", f"refs/remotes/origin/{base}"], cwd=repo.path)
+    if found.returncode != 0 or not found.stdout.strip():
+        raise control.Refused(f"a task session needs origin/{base} in {repo.name} to tell which commits are already "
+                              "published; fetch it first")
+    return found.stdout.strip()
 
 
 def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str = "", tools: list[str] | None = None,
-           repo: str = "", budget_usd: float | None = None) -> dict:
+           repo: str = "", budget_usd: float | None = None, task: bool = False, draft_pr: bool = False) -> dict:
     prompt = prompt.strip()
     if not prompt:
         raise control.Refused("a session needs a first message")
+    if draft_pr and not task:
+        raise control.Refused("only a task session opens a draft PR; add --task")
+    if draft_pr and not repo.strip():
+        raise control.Refused("a draft PR needs a repo")
     tools = list(SESSION_TOOLS if tools is None else tools)
     if problems := runner.agent_problems(run_with, tools):
         raise control.Refused("; ".join(problems))
@@ -163,6 +204,8 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
         raise control.Refused("pick a model, or set [models] session in the config")
     target = device_named(device)
     work_repo = repo_named(repo, target, cfg)
+    if draft_pr and work_repo and not work_repo.github:
+        raise control.Refused(f"repo {work_repo.name} has no github setting, so arete cannot open a PR for it")
     which, name = runner.route(model, run_with)
     off = runner.withheld(model, run_with, tools, target)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
@@ -171,7 +214,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     if (refusal := "" if cfg.replay.all else routing.fit_refusal(asked, target, routing.modes_for(cfg, work_repo))):
         raise control.Refused(refusal)
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
-                budget_usd, created=util.iso())
+                budget_usd, created=util.iso(), task=task, draft_pr=draft_pr)
     workspace(spec, target, work_repo)
     save_spec(spec)
     record.start("session", run_id=spec.id, lock=session_lock(spec.id), pid=None, repo=spec.repo or None,
@@ -181,11 +224,12 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     clone = f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
     state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
                                      f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
-                                                                for reason, withheld in off.items()))
+                                                                for reason, withheld in off.items())
+                   + ("; a task: it ends with a report" if task else ""))
     proc = control.detach(["session", "exec", spec.id], SESSION_LOG)
     record.note(spec.id, pid=proc.pid)
     return {"id": spec.id, "cwd": spec.cwd, "branch": spec.branch, "model": name, "runner": which,
-            "device": spec.device, "tools": tools}
+            "device": spec.device, "tools": tools, "task": task}
 
 
 def send(session_id: str, text: str) -> dict:
@@ -221,20 +265,25 @@ def session_lock(session_id: str) -> str:
     return f"session-{session_id}"
 
 
+def turn_arguments(spec: Spec, cfg: config.Config, device: devices.Device) -> dict:
+    def remaining_budget():
+        return spec.budget_usd - record.metered_spent(spec.id) if spec.budget_usd else None
+
+    return {"model": spec.model, "runner": spec.runner, "cfg": cfg, "device": device, "tools": spec.tools,
+            "allowed_tools": spec.tools, "disallowed_tools": runner.NO_GIT_WRITES, "remaining_budget": remaining_budget,
+            "timeout": TURN_TIMEOUT_SECONDS, "say": lambda text: log_line(spec, "wait", text),
+            "repo": session_repo(spec, cfg)}
+
+
 def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, turn: int,
               resume: Session) -> Session:
     log = SESSIONS_DIR / spec.id / "session.log"
     recent = util.tail(log.read_text(errors="replace"), RECENT_CHARS) if log.exists() else ""
     log_line(spec, "you", prompt)
-
-    def remaining_budget():
-        return spec.budget_usd - record.metered_spent(spec.id) if spec.budget_usd else None
-
     resume = compacted(spec, cfg, device, prompt, recent, turn, resume)
-    res = runner.run(prompt, spec.cwd, model=spec.model, runner=spec.runner, trace=(spec.id, f"turn {turn}"),
-                     resume=resume, cfg=cfg, device=device, tools=spec.tools, allowed_tools=spec.tools,
-                     disallowed_tools=runner.NO_GIT_WRITES, remaining_budget=remaining_budget, timeout=TURN_TIMEOUT_SECONDS,
-                     say=lambda text: log_line(spec, "wait", text), repo=session_repo(spec, cfg))
+    res = runner.run(prompt, spec.cwd, trace=(spec.id, f"turn {turn}"), resume=resume,
+                     **turn_arguments(spec, cfg, device))
+    spec.turn_error = "" if res.ok else util.one_line(res.error, 400)
     record.note(spec.id, model=res.model, runner=res.runner)
     note = runner.cost_note(res)
     log_line(spec, "reply" if res.ok else "error", (res.text.strip() or "(no text)") + f"\n{note}" if res.ok
@@ -351,6 +400,135 @@ def unreturned_reason(spec: Spec) -> str:
     return f"the work of {spec.branch} is not fetched back from {spec.cwd}" if spec.unreturned else ""
 
 
+def commit_local(spec: Spec, message: str) -> None:
+    wt = Path(spec.cwd)
+    util.git(["reset", "-q"], wt)
+    util.git(["add", "-A", "--", ".", *diffguard.NEVER_STAGED, *(f":(exclude,glob){p}" for p in spec.deny)], wt)
+    if util.git(["diff", "--cached", "--name-only"], wt).strip():
+        util.git_as_owner(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", message], wt)
+    if spec.deny:
+        left_out = util.git(["status", "--porcelain", "--untracked-files=all", "--", *(f":(glob){p}" for p in spec.deny)], wt)
+        for line in left_out.splitlines():
+            log_line(spec, "device", f"left {line[3:]} out of the commit: a denied path")
+    spec.fetched = util.git(["rev-parse", "HEAD"], wt).strip()
+
+
+def publish_local(spec: Spec, repo: config.Repo) -> None:
+    try:
+        spec.publish_error = attempted(spec, "committing", False, lambda: commit_local(spec, f"arete session {spec.id}"))
+        if not spec.publish_error and spec.fetched not in (spec.pushed, spec.cloned):
+            spec.publish_error = attempted(spec, "pushing", False, lambda: push_fetched(spec, repo))
+    finally:
+        save_spec(spec)
+
+
+def publication_problems(spec: Spec) -> list[str]:
+    problems = []
+    if spec.unreturned:
+        problems.append(unreturned_reason(spec))
+    if spec.publish_error:
+        problems.append(f"the work of {spec.branch} was not published: {spec.publish_error}")
+    if spec.held:
+        problems.append(f"{spec.branch} is not pushed: its commits touch denied paths {spec.held}")
+    elif spec.branch and not spec.publish_error and spec.fetched not in (spec.pushed, spec.cloned):
+        problems.append(f"committed on {spec.branch} but not pushed; see the session log")
+    return problems
+
+
+def report_prompt(spec: Spec) -> str:
+    fact = "; ".join(publication_problems(spec)) or (
+        f"{spec.branch} is pushed" if spec.pushed else "there is no pushed branch")
+    return (f"{REPORT_PROMPT}\n\nArete's own record of the branch: {fact}.")
+
+
+def ask_report(spec: Spec, cfg: config.Config, device: devices.Device, turn: int,
+               resume: Session) -> tuple[dict | None, str]:
+    prompt = report_prompt(spec)
+    log_line(spec, "you", prompt)
+    res = runner.run(prompt, spec.cwd, trace=(spec.id, "report"), resume=resume, json_schema=REPORT_SCHEMA,
+                     **turn_arguments(spec, cfg, device))
+    note = runner.cost_note(res)
+    if res.ok and isinstance(res.structured, dict):
+        log_line(spec, "reply", f"{(res.text.strip() or 'a report')}\n{note}")
+        return res.structured, ""
+    error = util.one_line(res.error, 400) if not res.ok else "the answer was not a JSON object"
+    log_line(spec, "error", f"{error} {note}")
+    return None, error
+
+
+def shaped(answer: dict) -> dict:
+    def text(value, n: int) -> str:
+        return value[:n] if isinstance(value, str) else ("" if value is None else str(value)[:n])
+
+    def listed(value) -> list:
+        return value if isinstance(value, list) else []
+
+    checks = []
+    for item in listed(answer.get("checks"))[:50]:
+        if not isinstance(item, dict):
+            continue
+        result = text(item.get("result"), 20)
+        checks.append({"name": text(item.get("name"), 200), "result": result if result in CHECK_RESULTS else "skipped",
+                       "detail": text(item.get("detail"), 1000)})
+    return {"summary": text(answer.get("summary"), 4000), "checks": checks,
+            "open_questions": [text(q, 1000) for q in listed(answer.get("open_questions"))[:20]]}
+
+
+def draft_body(spec: Spec, report: dict) -> str:
+    checks = "\n".join(f"- {c['name']}: {c['result']}" + (f" ({c['detail']})" if c["detail"] else "")
+                       for c in report["checks"]) or "none"
+    questions = "\n".join(f"- {q}" for q in report["open_questions"]) or "none"
+    return (f"{report['summary']}\n\n## Checks\n{checks}\n\n## Open questions\n{questions}\n\n"
+            f"Opened by arete task session {spec.id}.")
+
+
+def open_draft_pr(spec: Spec, cfg: config.Config, report: dict) -> str:
+    if not spec.pushed or spec.pushed == spec.cloned:
+        return "no draft PR: nothing is pushed"
+    try:
+        repo = cfg.repo(spec.repo)
+        github = repo.github
+        base = spec.base or config.load_layer(repo.layer_dir).base_branch or gh.default_branch(github)
+        url = gh.open_pr_url(github, spec.branch) or gh.pr_create(
+            github, spec.branch, base, util.first_line(spec.prompt, 72), draft_body(spec, report), draft=True,
+            cwd=repo.path)
+    except (gh.GhError, RuntimeError, OSError) as e:
+        return f"the draft PR was not opened: {util.one_line(str(e), 300)}"
+    spec.pr = url
+    save_spec(spec)
+    record.note(spec.id, pr_url=url)
+    log_line(spec, "pr", f"draft PR {url}")
+    return ""
+
+
+def publish_then_ask_report(spec: Spec, cfg: config.Config, device: devices.Device, turn: int,
+                            resume: Session) -> tuple[dict | None, str]:
+    if spec.source and (repo := session_repo(spec, cfg)):
+        publish_local(spec, repo)
+    elif spec.github and spec.cloned:
+        return_work(spec, cfg, device, f"arete session {spec.id}, last changes", last=True)
+    return ask_report(spec, cfg, device, turn, resume)
+
+
+def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: str) -> tuple[str, str]:
+    report = shaped(answer or {})
+    pr_problem = ""
+    if spec.draft_pr:
+        pr_problem = open_draft_pr(spec, cfg, report) if answer is not None else "no draft PR: the report turn failed"
+    row = state.run_get(spec.id) or {}
+    problems = [p for p in (f"the last turn failed: {spec.turn_error}" if spec.turn_error else "",
+                            f"the report turn gave no report: {error}" if error else "",
+                            *publication_problems(spec), pr_problem) if p]
+    report |= {"branch": spec.branch, "commit": spec.pushed, "pr_url": spec.pr,
+               "cost_usd": round(row.get("cost_usd") or 0, 4), "paid_usd": record.metered_spent(spec.id),
+               "problems": problems}
+    state.save_report(spec.id, report)
+    log_line(spec, "report", json.dumps(report))
+    if error:
+        return "failed", f"the report turn gave no report: {error}"
+    return "done", "reported: " + util.first_line(report["summary"], 200)
+
+
 def execute(session_id: str) -> str:
     spec = load_spec(session_id)
     cfg = config.load()
@@ -367,7 +545,7 @@ def execute(session_id: str) -> str:
                                lambda: unreturned_reason(spec)) as device:
                 if spec.github:
                     clone_repo(spec, cfg, device)
-                resume, turn, prompt = NO_SESSION, 0, spec.prompt
+                resume, turn, prompt, asked = NO_SESSION, 0, spec.prompt, None
                 idle_since = time.monotonic()
                 try:
                     while True:
@@ -380,6 +558,9 @@ def execute(session_id: str) -> str:
                         prompt = "\n\n".join(state.take_messages(session_id))
                         if prompt:
                             continue
+                        if spec.task:
+                            asked = publish_then_ask_report(spec, cfg, device, turn + 1, resume)
+                            break
                         if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
                             summary = f"closed after {cfg.session_idle_hours:g}h with no message"
                             break
@@ -387,6 +568,8 @@ def execute(session_id: str) -> str:
                 finally:
                     if spec.github and spec.cloned:
                         return_work(spec, cfg, device, f"arete session {spec.id}, last changes", last=True)
+                if asked:
+                    status, summary = conclude_task(spec, cfg, *asked)
                 if spec.unreturned:
                     status, summary = "failed", "the session's work did not come back from the device"
                 if summary:
@@ -420,9 +603,19 @@ def work_note(spec: Spec) -> str:
     return f"; the work is fetched into the local {spec.repo} on {spec.branch} but not pushed; see the log{earlier}"
 
 
+def local_push_note(spec: Spec) -> str:
+    if problems := publication_problems(spec):
+        return f"; {spec.branch} is not pushed: {'; '.join(problems)}"
+    if spec.pushed:
+        return f"; {spec.pushed[:10]} is pushed on {spec.branch}"
+    return "; the branch is unchanged"
+
+
 def close(spec: Spec, status: str, summary: str) -> None:
     kept = work_note(spec) if spec.github else (
         f"; the worktree stays at {paths.short_path(spec.cwd)} on {spec.branch}" if spec.branch else "")
+    if spec.task and spec.source:
+        kept += local_push_note(spec)
     paid = record.metered_spent(spec.id)
     end_line = f"{status}: {summary}{kept} ({util.paid_note(paid)})"
     if record.settle(spec.id, status, end_line=end_line, summary=f"{summary}{kept}"[:500]):
@@ -439,7 +632,7 @@ def views(limit: int = 30, connect=state.db) -> list[dict]:
                                           "cost_usd", "summary", "branch")}
                    | {"paid": paid.get(r["id"], 0), "prompt": util.first_line(spec.get("prompt", ""), 200),
                       "tools": spec.get("tools", []), "cwd": paths.short_path(spec.get("cwd", "")),
-                      "repo": spec.get("repo", "")})
+                      "repo": spec.get("repo", ""), "task": spec.get("task", False)})
     return out
 
 
