@@ -275,8 +275,9 @@ class Flow:
         try:
             outcome = self.call(name, calls, args, kw)
         except asks.Asked as e:
-            self.end(name, n, Outcome("ask", feedback=asks.summary(e.ask), data={"ask_id": e.ask_id, "call": e.call},
-                                      session=e.session), "", calls, started, kw)
+            outcome = Outcome("ask", feedback=asks.summary(e.sent), data={"ask_ids": e.ask_ids, "call": e.call},
+                              session=e.session)
+            self.end(name, n, outcome, "", calls, started, kw)
             raise
         except Exception as e:
             self.failed(name, n, e, calls, started, kw)

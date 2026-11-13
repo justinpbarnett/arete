@@ -205,32 +205,31 @@ def is_ask(name) -> bool:
     return isinstance(name, str) and (name == TOOL or name.endswith(f"__{TOOL}"))
 
 
-def found(events) -> dict | None:
+def found(events) -> list[dict]:
     calls, failed = [], set()
     for event in events:
         if event.get("kind") == "tool_call" and is_ask(event.get("name")):
             calls.append(event)
         elif event.get("kind") == "tool_result" and event.get("error"):
             failed.add(event.get("id"))
-    last = None
+    sent = []
     for call in calls:
-        if call.get("id") in failed:
-            continue
         ask, problems = validate(call.get("input"))
-        if not problems:
-            last = ask
-    return last
+        if call.get("id") not in failed and not problems and ask not in sent:
+            sent.append(ask)
+    return sent
 
 
 class Asked(Exception):
-    def __init__(self, ask: dict, ask_id: str, step: str, call: str, session, limit: int | None = None) -> None:
-        super().__init__(summary(ask))
-        self.ask, self.ask_id, self.step, self.call, self.session, self.limit = ask, ask_id, step, call, session, limit
+    def __init__(self, sent: list[dict], ask_ids: list[str], step: str, call: str, session,
+                 limit: int | None = None) -> None:
+        super().__init__(summary(sent))
+        self.sent, self.ask_ids, self.step, self.call = sent, ask_ids, step, call
+        self.session, self.limit = session, limit
 
 
-def summary(ask: dict) -> str:
-    questions = [q["question"] for q in ask["questions"]]
-    return (questions[0] if len(questions) == 1 else " | ".join(questions))[:300]
+def summary(sent: list[dict]) -> str:
+    return " | ".join(q["question"] for ask in sent for q in ask["questions"])[:300]
 
 
 def question_text(i: int, q: dict) -> str:
@@ -250,14 +249,18 @@ def question_text(i: int, q: dict) -> str:
     return head
 
 
-def comment(ask: dict, info_label: str, limit: int | None = None) -> str:
+def comment(sent: list[dict], info_label: str, limit: int | None = None) -> str:
     opening = (f"This run reached its limit of {limit} asks (`[ask] max_per_run`), so it stops here. "
                if limit is not None else "")
-    questions = "\n\n".join(question_text(i, q) for i, q in enumerate(ask["questions"], 1))
-    tried = f"\n\nTried: {outbound.plain(ask['tried'], 1000)}" if ask.get("tried") else ""
-    return (f"{opening}Before I can finish this I need {'an answer' if len(ask['questions']) == 1 else 'answers'}:"
-            f"\n\n{questions}\n\nWhy: {outbound.plain(ask['why'], 1000)}{tried}\n\n"
-            f"Reply here, then remove the `{info_label}` label and I will pick it up.")
+    blocks, count = [], 0
+    for ask in sent:
+        questions = "\n\n".join(question_text(count + i, q) for i, q in enumerate(ask["questions"], 1))
+        tried = f"\n\nTried: {outbound.plain(ask['tried'], 1000)}" if ask.get("tried") else ""
+        blocks.append(f"{questions}\n\nWhy: {outbound.plain(ask['why'], 1000)}{tried}")
+        count += len(ask["questions"])
+    need = "an answer" if count == 1 else "answers"
+    return (f"{opening}Before I can finish this I need {need}:\n\n" + "\n\n".join(blocks) +
+            f"\n\nReply here, then remove the `{info_label}` label and I will pick it up.")
 
 
 def settles(ask: dict) -> bool:
@@ -269,8 +272,8 @@ def choices(ask: dict) -> list[str]:
             for q in ask["questions"]]
 
 
-def settled_message(ask: dict) -> str:
-    taken = "\n".join(f"- {q['header']}: {q['options'][0]['label']}" for q in ask["questions"])
+def settled_message(sent: list[dict]) -> str:
+    taken = "\n".join(f"- {q['header']}: {q['options'][0]['label']}" for ask in sent for q in ask["questions"])
     return (f"The owner was not asked. Arete took the recommended option of each question:\n{taken}\n\n"
             "Carry on with these and finish the step.")
 

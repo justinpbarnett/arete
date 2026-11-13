@@ -410,33 +410,39 @@ class Run(AgentRun):
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
-        while res.record and (ask := asks.found(record.events(paths.record_dir(self.id) / res.record))):
+        while res.record and (sent := asks.found(record.events(paths.record_dir(self.id) / res.record))):
             kept = res.session if kw.get("persist", True) else NO_SESSION
-            self.owner_ask(step, ask, kept)
-            res = super().agent(step, asks.settled_message(ask), cwd, role, ask_owner=True,
+            self.owner_ask(step, sent, kept)
+            res = super().agent(step, asks.settled_message(sent), cwd, role, ask_owner=True,
                                 **{**kw, "resume": kept, "resume_only": True})
         return res
 
-    def owner_ask(self, step: str, ask: dict, session: Session) -> None:
-        self.asks_made += 1
-        ask_id, limit = f"{self.id}-a{self.asks_made}", self.config.ask.max_per_run
-        seam = factory.inside(self.id).step
+    def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
+        ask_ids = [f"{self.id}-a{self.asks_made + n}" for n in range(1, len(sent) + 1)]
+        self.asks_made += len(sent)
+        limit, seam = self.config.ask.max_per_run, factory.inside(self.id).step
         if self.asks_made > limit:
-            raise asks.Asked(ask, ask_id, seam, step, session, limit=limit)
-        if (self.config.ask.settle and asks.settles(ask) and session.id and jev.ready(self.config, [self.repo])
-                and self.settled_by_jev(step, ask)):
+            raise asks.Asked(sent, ask_ids, seam, step, session, limit=limit)
+        if (self.config.ask.settle and all(asks.settles(ask) for ask in sent) and session.id
+                and jev.ready(self.config, [self.repo]) and self.settled_by_jev(step, sent, ask_ids)):
             return
-        raise asks.Asked(ask, ask_id, seam, step, session)
+        raise asks.Asked(sent, ask_ids, seam, step, session)
 
-    def settled_by_jev(self, step: str, ask: dict) -> bool:
-        state_text = f"Step: {step}\nThe ask, with every question, option and description:\n{json.dumps(ask, indent=1)}"
-        reply = jev.ask(state_text, {"settle": jev.yes_no(asks.SETTLE)}, self.config, trace=(self.id, f"{step} ask jev"))
-        answer = reply.answers.get("settle")
-        if not answer or answer.yes < asks.SETTLE_AT:
-            return False
-        self.log(f"{step}: took the recommended options without asking the owner ({answer.note()})")
-        lines.write(self.id, "ask_settled", ask_id=f"{self.id}-a{self.asks_made}", step=factory.inside(self.id).step,
-                    call=step, choices=asks.choices(ask), p=round(answer.yes, 3))
+    def settled_by_jev(self, step: str, sent: list[dict], ask_ids: list[str]) -> bool:
+        answers = []
+        for ask in sent:
+            state_text = (f"Step: {step}\nThe ask, with every question, option and description:\n"
+                          f"{json.dumps(ask, indent=1)}")
+            reply = jev.ask(state_text, {"settle": jev.yes_no(asks.SETTLE)}, self.config,
+                            trace=(self.id, f"{step} ask jev"))
+            answer = reply.answers.get("settle")
+            if not answer or answer.yes < asks.SETTLE_AT:
+                return False
+            answers.append(answer)
+        for ask_id, ask, answer in zip(ask_ids, sent, answers, strict=True):
+            self.log(f"{step}: took the recommended options without asking the owner ({answer.note()})")
+            lines.write(self.id, "ask_settled", ask_id=ask_id, step=factory.inside(self.id).step, call=step,
+                        choices=asks.choices(ask), p=round(answer.yes, 3))
         return True
 
     @property
@@ -1425,8 +1431,9 @@ def run_minutes(row: dict) -> float:
 
 
 def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str,
-         ask: dict | None = None) -> tuple[str, str, str]:
-    lines.write(run.id, "question", question=comment, summary=summary[:300], **(ask or {}))
+         asked: list[dict] | None = None) -> tuple[str, str, str]:
+    for ask in asked or [{}]:
+        lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
     run.say(comment)
     run.enter("needs-info")
     remove_workspace(ws, checkouts)

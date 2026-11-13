@@ -124,8 +124,8 @@ just adw-wait RUN2
 | `step_end` | a step ended: `result` is `pass`, `fail`, `ask` or `stop`, with `error`, `cost_usd` and `seconds` |
 | `route` | the run continues an earlier one and took its finished steps; it comes twice, once when the run starts and once with `after` and `skipped` when it runs its first step |
 | `wait` | the run waited on a usage limit, CI, a run slot or a person, with `minutes` |
-| `question` | the run asks the person: `summary` is the question in short, `question` the whole comment; an ask from an agent step also has `ask_id`, `step` and `questions` |
-| `ask_settled` | an agent step's ask of choice questions was settled without the person: `ask_id`, `step`, `choices` and `p`; the choices show in the report's `assumptions` |
+| `question` | the run asks the person: `summary` is the question in short, `question` the whole comment; an ask from an agent step also has `ask_id`, `step` and `questions`, and a turn with several asks writes one line per ask with the same `summary` and `question` |
+| `ask_settled` | an agent step's ask of choice questions was settled without the person (one line per ask of the turn): `ask_id`, `step`, `choices` and `p`; the choices show in the report's `assumptions` |
 | `error` | something failed: `step` and `message` |
 | `step` | a row of `just adw-status <id>`, not a run line: one step's `state`, `try`, `seconds`, `cost_usd`, `model`, `runner` and `error` |
 | `report` | the last line: `status`, `prs`, `summary`, `requirements`, `assumptions`, `left_for_a_person`, `review`, `question`, `steps`, `minutes`, `cost_usd` |

@@ -443,7 +443,7 @@ def plan(flow: factory.Flow) -> Outcome:
     estimate = int(found.get("estimated_lines") or 0)
     if found.get("ambiguous") and found.get("question"):
         run.log("plan: ambiguous, asking the author")
-        raise run.owner_ask("plan", asks.text_ask(str(found["question"])), res.session)
+        raise run.owner_ask("plan", [asks.text_ask(str(found["question"]))], res.session)
     if estimate > limit:
         split = [s for s in found.get("split") or [] if isinstance(s, dict) and s.get("title")]
         run.log(f"plan: about {estimate} lines, over the {limit} line limit; proposing a {len(split)} part split")
@@ -782,14 +782,14 @@ def publish(flow: factory.Flow) -> Outcome:
 @factory.step("respond")
 def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", detail: str = "", comment: str = "",
             summary: str = "", status: str = "", replies: list[dict] | None = None, prs: bool = False,
-            ask: dict | None = None) -> Outcome:
+            asked: list[dict] | None = None) -> Outcome:
     job: Job = flow.ctx
     run, pr_url = job.run, ""
     if ending == "failed":
         status, summary, _ = pipeline._fail(run, why, said, detail)
         pr_url = pipeline.record_prs(run, job.branch, job.with_prs) if prs else ""
     elif ending == "ask":
-        status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary, ask)
+        status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary, asked)
     elif ending == "nothing":
         status, summary, pr_url = pipeline.nothing_to_build(run, job.ticket, job.ws, job.checkouts, job.branch,
                                                             summary, job.left_for_a_person)
@@ -852,9 +852,10 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
         return finish(flow, "failed", why=e.why, detail=e.detail)
     except asks.Asked as e:
         reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
-        return finish(flow, "ask", summary=reached + asks.summary(e.ask),
-                      comment=asks.comment(e.ask, flow.ctx.run.tracker.label_name("needs-info"), e.limit),
-                      ask={"ask_id": e.ask_id, "step": e.step, "call": e.call, "questions": e.ask["questions"]})
+        return finish(flow, "ask", summary=reached + asks.summary(e.sent),
+                      comment=asks.comment(e.sent, flow.ctx.run.tracker.label_name("needs-info"), e.limit),
+                      asked=[{"ask_id": ask_id, "step": e.step, "call": e.call, "questions": ask["questions"]}
+                             for ask_id, ask in zip(e.ask_ids, e.sent, strict=True)])
 
 
 def alone(flow: factory.Flow) -> tuple[str, str, bool]:
