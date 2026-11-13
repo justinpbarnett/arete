@@ -17,8 +17,11 @@ CHECK_SAW_CHARS = 300
 TICKET_BODY_CHARS = 4000
 VOICE_LINE_CHARS = 400
 CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
-WARNING_LINE = re.compile(r"^\W*(?:warnings?|caution|danger|important|prerequisites?|requires?|before you start|"
-                          r"expected (?:output|result))\b", re.IGNORECASE)
+WARNING_LINE = re.compile(r"^[\W_]*(?:warnings?|caution|danger|important|prerequisites?|requires?|before you start|"
+                          r"expected (?:output|result))(?![^\W_])", re.IGNORECASE)
+LABEL_MARKUP = re.compile(r"(?:[\s*_~`]|</?\w+>)+$")
+WARNING_LABEL = re.compile(r"[\W_]*(?:warnings?|caution|danger|important|prerequisites?|requires?|"
+                           r"before you start|expected (?:output|result))[\W_]*", re.IGNORECASE)
 HEADING = re.compile(r"^ {0,3}(#{1,6})\s")
 FENCE = re.compile(r"^\s*(?:`{3,}|~{3,})")
 UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
@@ -134,6 +137,10 @@ def block_end(lines: list[str], start: int) -> int:
     return end
 
 
+def is_label(line: str) -> bool:
+    return LABEL_MARKUP.sub("", line).endswith(":")
+
+
 def section_end(lines: list[str], start: int) -> int:
     if level := heading_level(lines, start):
         end = start + 1
@@ -141,7 +148,7 @@ def section_end(lines: list[str], start: int) -> int:
             end += 1
         return end
     end = block_end(lines, start)
-    if not lines[end - 1].rstrip().endswith(":"):
+    if not is_label(lines[end - 1]) and not (end - start == 1 and WARNING_LABEL.fullmatch(lines[start])):
         return end
     while end < len(lines) and not lines[end].strip():
         end += 1
@@ -214,16 +221,20 @@ def clipped(line: str) -> str:
     return line[:space].rstrip() if space > 0 else line[:VOICE_LINE_CHARS]
 
 
-def prefix_in(value: str, text: str) -> bool:
-    return re.search(r"(?<![\w@-])" + re.escape(flat(value)), flat(text)) is not None
+def wording(text: str) -> str:
+    return " ".join(re.findall(r"[^\W_]+", text.lower()))
+
+
+def phrase_in(value: str, text: str, *, whole_word_end: bool = True) -> bool:
+    words = wording(value)
+    return bool(words) and f" {words}{' ' if whole_word_end else ''}" in f" {wording(text)} "
 
 
 def repeats_voice(samples: list[str], whole: str, known: str) -> bool:
-    if any(piece.strip() and supplied_in(piece, whole) and not supplied_in(piece, known)
-           for piece in voice_pieces(samples)):
+    if any(phrase_in(piece, whole) and not phrase_in(piece, known) for piece in voice_pieces(samples)):
         return True
-    return any(len(line) > VOICE_LINE_CHARS and prefix_in(clipped(line), whole)
-               and not prefix_in(clipped(line), known) for line in samples)
+    return any(len(line) > VOICE_LINE_CHARS and phrase_in(clipped(line), whole, whole_word_end=False)
+               and not phrase_in(clipped(line), known, whole_word_end=False) for line in samples)
 
 
 def plain_code_in(span: str, text: str) -> bool:
