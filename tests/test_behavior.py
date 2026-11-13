@@ -349,15 +349,25 @@ if scenario.startswith("asked"):
     calls = [asking, placing] if scenario == "asked-twice" else [asking]
     (answers / "build.json").write_text(json.dumps({"text": "Asked.", "ok": True,
                                                     "tool_calls": [{"name": "ask_owner", "input": a} for a in calls]}))
-    (answers / "build.patch").unlink()
+    edited = scenario == "asked-edited"
+    if not edited:
+        (answers / "build.patch").unlink()
     parked = forced()
     ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
     waiting = state.asks_of(parked["id"], "open")
     first = [json.loads(line) for line in (paths.RUNS_DIR / parked["id"] / "run.jsonl").read_text().splitlines()]
-    result = {"parked": parked["status"], "worktree": ws.is_dir(), "open": len(waiting), "notices": len(notices)}
+    result = {"parked": parked["status"], "worktree": ws.is_dir(), "open": len(waiting), "notices": len(notices),
+              "parked_id": parked["id"], "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.is_dir() else "",
+              "dirty": pipeline.git(["status", "--short"], ws).strip() if ws.is_dir() else ""}
+    if scenario == "asked-moved":
+        src = root / "sample/repo"
+        pipeline.git(["checkout", "-q", "main"], src)
+        (src / "moved.txt").write_text("moved\n")
+        pipeline.git(["add", "moved.txt"], src)
+        pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "move main"], src)
+        pipeline.git(["push", "-q", "origin", "HEAD:main"], src)
     if scenario == "asked-twice":
         from arete import control, tasks
-        result["parked_id"] = parked["id"]
         tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "Spelled with a K, as in kumquat-7."}]})
         for name, call in (("resent", lambda: tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "again"}]})),
                            ("resumed", lambda: tasks.resume(parked["id"]))):
@@ -372,7 +382,10 @@ if scenario.startswith("asked"):
                                         if gone else passing)
     if gone:
         (answers / "build2.json").write_text(passing)
-    (answers / "build.patch").write_text(patch)
+    if edited:
+        (answers / "build.patch").unlink()
+    else:
+        (answers / "build.patch").write_text(patch)
     continuing = ["replay-sample", task, "--force", "--continue", parked["id"]]
     if scenario.endswith("-waiting"):
         import signal, subprocess
@@ -449,7 +462,13 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
                "skipped": next((e["skipped"] for e in events if e.get("event") == "route" and "skipped" in e), None),
                "same_session": session(first) == session(events),
                "answered": "Spelled with a K, as in kumquat-7." in prompts,
-               "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])]}
+               "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])],
+               "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
+               "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text()}
+    origin = root / "sample/origin.git"
+    branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines()
+                if b != "refs/heads/main"]
+    result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], origin) if len(branches) == 1 else ""
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
 row = forced()
@@ -508,6 +527,29 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertTrue(result["same_session"])
         self.assertTrue(result["answered"])
         self.assertEqual(result["taken"], [True])
+
+    def test_answer_after_main_moved_resumes_the_asking_step_without_preparing_again(self):
+        result = self.workflow("asked-moved")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["renewed"], [])
+        self.assertNotIn("prepares again", result["log"])
+        self.assertEqual(result["skipped"], 2)
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True])
+        self.assertIn("kumquat", result["published"])
+
+    def test_edits_made_before_an_ask_are_kept_while_it_waits_and_published_after_the_answer(self):
+        result = self.workflow("asked-edited")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertIn(f"Arete-Run: {result['parked_id']}", result["kept"])
+        self.assertEqual(result["dirty"], "")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["skipped"], 2)
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertIn("kumquat", result["published"])
 
     def test_answer_sent_again_while_another_ask_waits_names_that_ask_not_a_resume(self):
         result = self.workflow("asked-twice")
