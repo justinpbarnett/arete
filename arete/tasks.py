@@ -5,8 +5,11 @@ import subprocess
 import time
 from collections import Counter
 from collections.abc import Callable
+from datetime import timedelta
+from pathlib import Path
 
 from . import (
+    asks,
     chat,
     config,
     control,
@@ -150,10 +153,10 @@ def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
                            f"of {paths.short_path(paths.LOG_DIR / pipeline.RUNS_LOG)} says why")
 
 
-def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = "") -> None:
+def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = "", ahead: bool = False) -> None:
     if run := live_run(repo.name, tid):
         raise control.Busy(f"run {run['id']} of {tracker.ticket_name(repo.name, tracker.ref_for(tid))}")
-    if why := held(cfg, repo):
+    if not ahead and (why := held(cfg, repo)):
         raise pipeline.NoFreeSlot(why + after)
     why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
                                  runlimits.Policy.of(config.load_layer(repo.layer_dir)), True)
@@ -161,9 +164,9 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
         raise control.Refused(why)
 
 
-def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str]) -> dict:
+def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], ahead: bool = False) -> dict:
     with util.lock(START_LOCK, wait=True):
-        free_to_start(cfg, repo, tid)
+        free_to_start(cfg, repo, tid, ahead=ahead)
         if new := spawned(repo.name, tid, lambda: control.launch(command, pipeline.RUNS_LOG)):
             return answer(tid, repo.name, new, "running", "started")
     raise did_not_show(repo, tid)
@@ -216,6 +219,8 @@ def reply(run_id: str, text: str) -> dict:
             raise control.Refused(f"run {run_id} is {row['status']}, so it has no question to answer")
         no_later_run(row)
         tid = str(row["issue"])
+        if waiting := state.asks_of(run_id, "open"):
+            return reply_to_asks(cfg, repo, row, waiting, text)
         free_to_start(cfg, repo, tid, "; the answer was not stored")
         kept = store_answer(cfg, repo, tid, text)
         (folder := paths.RUNS_DIR / run_id).mkdir(parents=True, exist_ok=True)
@@ -237,6 +242,124 @@ def store_answer(cfg: config.Config, repo: config.Repo, tid: str, text: str) -> 
     return ""
 
 
+def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: list[dict], text: str) -> dict:
+    if any(asks.has_secret(a["questions"]) for a in waiting):
+        raise control.Refused(f"run {row['id']} asks a secret question, which a text reply cannot answer; answer it "
+                              f"on the dashboard or with `arete answer {row['id']} --json`")
+    tid = str(row["issue"])
+    free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
+    command = continuing(cfg, repo, row)
+    kept = store_answer(cfg, repo, tid, text)
+    for a in waiting:
+        state.ask_close(a["id"], "answered", asks.text_answers(a, text))
+    started = continue_asked(cfg, repo, row, command)
+    return {**started, "why": f"{started['why']}; {kept}"} if kept else started
+
+
+def asks_view() -> dict:
+    keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions")
+    return {"asks": [{k: a[k] for k in keys} for a in state.open_asks(connect=state.reader)]}
+
+
+def answer_ask(ask_id: str, body) -> dict:
+    with util.lock(STEER_LOCK, wait=True):
+        ask = state.ask_get(ask_id)
+        if not ask:
+            raise control.NotFound(f"no ask {ask_id}")
+        if ask["status"] != "open":
+            held = (f"; its answers are stored, and `arete resume {ask['run']}` continues the run if it did not start"
+                    if ask["status"] == "answered" and not ask["taken_by"] else "")
+            raise control.Refused(f"ask {ask_id} is {ask['status']}, so it takes no answer{held}")
+        cfg, repo, row = run_of(ask["run"])
+        if row["status"] != "needs-info":
+            raise control.Refused(f"run {row['id']} is {row['status']}, so ask {ask_id} takes no answer")
+        no_later_run(row)
+        tid = str(row["issue"])
+        if run := live_run(repo.name, tid):
+            raise control.Busy(f"run {run['id']} of {tracker.ticket_name(repo.name, tracker.ref_for(tid))}")
+        if isinstance(body, dict) and "stop" in body:
+            if body != {"stop": True}:
+                raise control.Refused('To stop the run, send {"stop": true} alone')
+            return let_go(cfg, repo, row, "stopped")
+        try:
+            answers = asks.answers_for(ask, body)
+        except (ValueError, TypeError) as e:
+            raise control.Refused(str(e)) from None
+        free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
+        command = continuing(cfg, repo, row)
+        state.ask_close(ask_id, "answered", answers)
+        if more := state.asks_of(row["id"], "open"):
+            return answer(tid, repo.name, "", "waiting",
+                          f"{util.count(len(more), 'more ask')} of run {row['id']} wait for an answer")
+        return continue_asked(cfg, repo, row, command)
+
+
+def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:
+    tid = str(row["issue"])
+    path = script_path(row) or ("revise" if pipeline.pending_feedback(repo.name, tid) else "feature")
+    return command_of(cfg, path, repo.name, tid, "--force", "--continue", row["id"])
+
+
+def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: list[str] | None = None) -> dict:
+    return launch(cfg, repo, str(row["issue"]), command or continuing(cfg, repo, row), ahead=True)
+
+
+def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> bool:
+    try:
+        checkouts = [pipeline.Checkout(**{**c, "src": Path(c["src"]), "wt": Path(c["wt"])})
+                     for c in flows.prepared_data(run_id).get("checkouts") or []]
+    except (TypeError, KeyError):
+        return False
+    return pipeline.remove_workspace(paths.WORKTREES_DIR / f"{repo.name}-{tid}", checkouts)
+
+
+def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
+    tid, run_id = str(row["issue"]), row["id"]
+    name = tracker.ticket_name(repo.name, tracker.ref_for(tid))
+    with util.lock(state.run_lock("pipeline", repo.name, tid)) as got:
+        if not got:
+            raise control.Busy(f"a run of {name}")
+        state.asks_retire(run_id, status)
+        latest = not state.later_run(repo.name, tid, run_id)
+        removed = latest and kept_folder_removed(repo, tid, run_id)
+        folder = "its work folder is removed" if removed else "its work folder was left in place"
+        run = pipeline.Run(run_id, repo, paths.RUNS_DIR / run_id, tracker=tracker.for_ticket(cfg, repo, tid), tid=tid)
+        run.dir.mkdir(parents=True, exist_ok=True)
+        if status == "stopped":
+            record.note(run_id, status="stopped", summary=record.STOPPED)
+            run.give_up("was stopped by its owner instead of an answer")
+            pipeline.write_report(state.run_get(run_id) or row)
+            return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped; {folder}")
+        if latest:
+            run.say(f"No answer came in {cfg.ask.expire_days:g} days, so I let go of the kept work{'' if removed else ' as far as I could'}. "
+                    f"Reply here and remove the `{run.tracker.label_name('needs-info')}` label to start again.")
+        return answer(tid, repo.name, run_id, "needs-info", f"run {run_id} expired; {folder}")
+
+
+def expire_asks(cfg: config.Config) -> list[str]:
+    cutoff = util.iso(util.now() - timedelta(days=cfg.ask.expire_days))
+    notes = []
+    for run_id in dict.fromkeys(a["run"] for a in state.asks_asked_before(cutoff)):
+        with util.lock(STEER_LOCK, wait=True):
+            if not state.asks_of(run_id, "open"):
+                continue
+            try:
+                _, repo, row = run_of(run_id)
+            except (control.NotFound, control.Refused):
+                row = None
+            if row is None or row["status"] != "needs-info" or state.later_run(row["repo"], row["issue"], run_id):
+                state.asks_retire(run_id, "expired")
+                notes.append(f"asks of run {run_id} expired; the run is not the ticket's latest")
+                continue
+            if live_run(repo.name, str(row["issue"])):
+                continue
+            try:
+                notes.append(let_go(cfg, repo, row, "expired")["why"])
+            except control.Busy:
+                continue
+    return notes
+
+
 def resume(run_id: str, step: str = "") -> dict:
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = run_of(run_id)
@@ -247,6 +370,9 @@ def resume(run_id: str, step: str = "") -> dict:
             row = state.run_get(run_id) or row
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; stop it first")
+        if row["status"] == "needs-info" and (held := pipeline.answered_run(row["repo"], str(row["issue"]))) \
+                and held["id"] == run_id:
+            return continue_asked(cfg, repo, row)
         if row.get("only_step"):
             raise control.Refused(f"run {run_id} ran {row['only_step']} alone; resume the run it continued")
         if row["status"] not in RESUMABLE:

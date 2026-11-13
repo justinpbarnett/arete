@@ -69,11 +69,13 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.tid}"
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
+    if continues and not only:
+        run.answers_due = state.asks_due(sorted(chain_runs(continues)))
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
     refusal = guard(job, continues) if continues else ""
     if refusal:
         job.note_task()
-    elif continues and not only and not job.pending and (moved := base_moved(continues)):
+    elif continues and not only and not run.answers_due and not job.pending and (moved := base_moved(continues)):
         run.log(f"{moved} since run {continues} prepared, so this run prepares again and redoes every step after it")
         again = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
@@ -339,6 +341,9 @@ class Job:
 
     def take(self, name: str, outcome: Outcome, stored: bool) -> None:
         data, run = outcome.data, self.run
+        if name == "prepare" and not stored:
+            for ask in run.answers_due:
+                ask["session"] = {}
         if outcome.passed or name == "review":
             run.facts.update(facts(name, data))
         if "story" in data:
@@ -478,7 +483,11 @@ class Job:
 def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
     lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=run.repo.name, title=t.title,
                 **({"path": run.path} if run.path else {}))
-    if run.answering:
+    if run.answers_due:
+        for ask in run.answers_due:
+            lines.write(run.id, "answer", asked_in=ask["run"], ask_id=ask["id"], step=ask["step"],
+                        answers=ask["answers"])
+    elif run.answering:
         lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
                     text=pipeline.answer_text(run.answering["id"]))
 
@@ -957,14 +966,14 @@ def publish(flow: factory.Flow) -> Outcome:
 @factory.step("respond")
 def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", detail: str = "", comment: str = "",
             summary: str = "", status: str = "", replies: list[dict] | None = None, prs: bool = False,
-            asked: list[dict] | None = None) -> Outcome:
+            asked: list[dict] | None = None, session: dict | None = None) -> Outcome:
     job: Job = flow.ctx
     run, pr_url = job.run, ""
     if ending == "failed":
         status, summary, _ = pipeline._fail(run, why, said, detail)
         pr_url = pipeline.record_prs(run, job.branch, job.with_prs) if prs else ""
     elif ending == "ask":
-        status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary, asked)
+        status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary, asked, session)
     elif ending == "nothing":
         status, summary, pr_url = pipeline.nothing_to_build(run, job.ticket, job.ws, job.checkouts, job.branch,
                                                             summary, job.left_for_a_person)
@@ -1027,10 +1036,14 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
         return finish(flow, "failed", why=e.why, detail=e.detail)
     except asks.Asked as e:
         reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
+        parks = e.limit is None
         return finish(flow, "ask", summary=reached + asks.summary(e.sent),
-                      comment=asks.comment(e.sent, flow.ctx.run.tracker.label_name("needs-info"), e.limit),
-                      asked=[{"ask_id": ask_id, "step": e.step, "call": e.call, "questions": ask["questions"]}
-                             for ask_id, ask in zip(e.ask_ids, e.sent, strict=True)])
+                      comment=asks.comment(e.sent, flow.ctx.run.tracker.label_name("needs-info"), e.limit,
+                                           run_id=flow.run_id if parks else ""),
+                      asked=[{"ask_id": ask_id, "step": e.step, "call": e.call, "why": ask["why"],
+                              "tried": ask.get("tried", ""), "questions": ask["questions"]}
+                             for ask_id, ask in zip(e.ask_ids, e.sent, strict=True)],
+                      session=asdict(e.session) if parks else None)
 
 
 def alone(flow: factory.Flow) -> tuple[str, str, bool]:

@@ -403,6 +403,24 @@ CREATE TABLE IF NOT EXISTS incident_notes (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS incident_notes_incident ON incident_notes (incident, id);
+CREATE TABLE IF NOT EXISTS asks (
+    id TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    ticket TEXT NOT NULL,
+    step TEXT NOT NULL,
+    call TEXT DEFAULT '',
+    why TEXT DEFAULT '',
+    tried TEXT DEFAULT '',
+    questions TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',    -- open | answered | stopped | expired
+    asked TEXT NOT NULL,
+    answered TEXT,
+    session TEXT DEFAULT '{}',
+    answers TEXT DEFAULT '[]',
+    taken_by TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS asks_run ON asks (run);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
@@ -1619,3 +1637,71 @@ def tasks_replied(repo: str) -> list[dict]:
         return [dict(r) for r in c.execute(
             "SELECT * FROM tasks WHERE repo = ? AND state = 'needs-info' AND (SELECT author FROM task_comments c "
             "WHERE c.task = tasks.id ORDER BY c.rowid DESC LIMIT 1) = 'owner' ORDER BY created, rowid", (repo,))]
+
+
+def ask_row(r) -> dict:
+    return {**dict(r), "questions": json.loads(r["questions"]), "session": json.loads(r["session"] or "{}"),
+            "answers": json.loads(r["answers"] or "[]")}
+
+
+def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str, why: str, tried: str,
+            questions: list[dict], session: dict) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
+                  "session) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
+                   json.dumps(session)))
+
+
+def ask_get(ask_id: str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM asks WHERE id = ?", (ask_id,)).fetchone()
+        return ask_row(r) if r else None
+
+
+def asks_of(run: str, status: str = "", connect=db) -> list[dict]:
+    with connect() as c:
+        return [ask_row(r) for r in c.execute(
+            "SELECT * FROM asks WHERE run = ?" + (" AND status = ?" if status else "") + " ORDER BY asked, rowid",
+            (run, status) if status else (run,))]
+
+
+def open_asks(connect=db) -> list[dict]:
+    with connect() as c:
+        return [ask_row(r) for r in c.execute(
+            "SELECT * FROM asks WHERE status = 'open' AND NOT EXISTS (SELECT 1 FROM runs a, runs later WHERE "
+            "a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue AND "
+            "COALESCE(later.only_step, '') = '' AND later.rowid > a.rowid) ORDER BY asked, rowid")]
+
+
+def asks_due(run_ids) -> list[dict]:
+    ids = list(run_ids)
+    if not ids:
+        return []
+    with db() as c:
+        return [ask_row(r) for r in c.execute(
+            f"SELECT * FROM asks WHERE status = 'answered' AND taken_by = '' AND run IN ({','.join('?' * len(ids))}) "
+            "ORDER BY asked, rowid", ids)]
+
+
+def ask_close(ask_id: str, status: str, answers: list[dict] | None = None) -> bool:
+    with db() as c:
+        return c.execute("UPDATE asks SET status = ?, answered = ?, answers = ? WHERE id = ? AND status = 'open'",
+                         (status, util.iso(), json.dumps(answers or []), ask_id)).rowcount > 0
+
+
+def asks_retire(run_id: str, status: str) -> None:
+    with db() as c:
+        c.execute("UPDATE asks SET status = ?, answered = COALESCE(answered, ?) WHERE run = ? AND "
+                  "(status = 'open' OR (status = 'answered' AND taken_by = ''))", (status, util.iso(), run_id))
+
+
+def asks_taken(ids: list[str], run_id: str) -> None:
+    with db() as c:
+        c.executemany("UPDATE asks SET taken_by = ? WHERE id = ?", [(run_id, i) for i in ids])
+
+
+def asks_asked_before(iso: str) -> list[dict]:
+    with db() as c:
+        return [ask_row(r) for r in c.execute("SELECT * FROM asks WHERE status = 'open' AND asked < ? "
+                                              "ORDER BY asked, rowid", (iso,))]

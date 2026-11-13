@@ -36,7 +36,7 @@ WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
-ASK_KEYS = ("max_per_run", "settle")
+ASK_KEYS = ("max_per_run", "settle", "expire_days")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -128,6 +128,7 @@ class ReplayConfig:
 class AskConfig:
     max_per_run: int = 3
     settle: bool = True
+    expire_days: float = 7
 
 
 @dataclass
@@ -433,7 +434,10 @@ def ask_table(data) -> AskConfig:
         raise ValueError(f"[ask] max_per_run must be a whole number of at least 0, not {limit!r}")
     if type(settle) is not bool:
         raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
-    return AskConfig(max_per_run=limit, settle=settle)
+    days = table.get("expire_days", 7)
+    if type(days) not in (int, float) or days <= 0:
+        raise ValueError(f"[ask] expire_days must be a number above 0, not {days!r}")
+    return AskConfig(max_per_run=limit, settle=settle, expire_days=days)
 
 
 def research_table(data) -> bool:

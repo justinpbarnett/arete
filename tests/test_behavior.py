@@ -205,9 +205,49 @@ if scenario.startswith("held-scratch"):
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git") if len(branches) == 1 else ""
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
+if scenario.startswith("asked"):
+    from arete import alerts, asks
+    notices = []
+    alerts.notify = lambda title, message: notices.append(title)
+    answers = root / "sample/replay"
+    passing, patch = (answers / "build.json").read_text(), (answers / "build.patch").read_text()
+    asking = {"questions": [{"header": "Spelling", "question": "How is it spelled?", "kind": "text"}],
+              "why": "The task leaves it open.", "tried": "Read the task."}
+    (answers / "build.json").write_text(json.dumps({"text": "Asked.", "ok": True,
+                                                    "tool_calls": [{"name": "ask_owner", "input": asking}]}))
+    (answers / "build.patch").unlink()
+    parked = forced()
+    ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+    waiting = state.asks_of(parked["id"], "open")
+    first = [json.loads(line) for line in (paths.RUNS_DIR / parked["id"] / "run.jsonl").read_text().splitlines()]
+    result = {"parked": parked["status"], "worktree": ws.is_dir(), "open": len(waiting), "notices": len(notices)}
+    for ask in waiting:
+        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
+    gone = scenario == "asked-gone"
+    (answers / "build.json").write_text(json.dumps({"ok": False, "error": "No conversation found with session ID x"})
+                                        if gone else passing)
+    if gone:
+        (answers / "build2.json").write_text(passing)
+    (answers / "build.patch").write_text(patch)
+    try:
+        factory.main(feature, ["replay-sample", task, "--force", "--continue", parked["id"]])
+    except SystemExit:
+        pass
+    row = state.ticket_runs("replay-sample", task, whole=True)[0]
+    events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+    session = lambda read: next(e["session"]["id"] for e in read if e.get("event") == "step_end" and e.get("step") == "implement" and e.get("session"))
+    header = json.loads(next(record.raw_lines([f for f in record.record_files(row["id"]) if "build" in f.name][-1])))
+    prompts = str(header.get("prompt"))
+    result |= {"status": row["status"], "id": row["id"], "again": row["id"] != parked["id"],
+               "skipped": next(e["skipped"] for e in events if e.get("event") == "route" and "skipped" in e),
+               "same_session": session(first) == session(events),
+               "answered": "Spelled with a K, as in kumquat-7." in prompts,
+               "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])]}
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
 row = forced()
 events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
-verification = [e.get("data", {}).get("verified") for e in events
+verification =[e.get("data", {}).get("verified") for e in events
                 if e.get("event") == "step_end" and e.get("step") == "verify"]
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
           "verified":[v["verdict"] for v in verification if v],
@@ -236,6 +276,24 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
+
+    def test_run_that_asks_parks_with_its_folder_and_resumes_its_session(self):
+        result = self.workflow("asked")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertTrue(result["worktree"])
+        self.assertEqual((result["open"], result["notices"]), (1, 1))
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["skipped"], 2)
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True])
+
+    def test_run_whose_kept_session_is_gone_restarts_the_step_with_the_ask_and_answers(self):
+        result = self.workflow("asked-gone")
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["answered"])
+        self.assertFalse(result["same_session"])
+        self.assertEqual(result["taken"], [True])
 
     def test_run_parked_with_scratch_held_records_its_work_without_scratch(self):
         result = self.workflow("held-scratch")

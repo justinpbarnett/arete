@@ -30,6 +30,7 @@ from . import (
     runner,
     sources,
     state,
+    tasks,
     util,
 )
 from .loops import Loop
@@ -154,6 +155,11 @@ class Server:
         if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
             self.sweep = self.pool.submit(self.sweep_vms)
             self.swept = time.monotonic()
+        try:
+            for note in tasks.expire_asks(self.cfg):
+                self.say(note)
+        except Exception as e:
+            self.say(f"expiring asks: {type(e).__name__}: {e}")
         self.ticks += 1
         self.beat(every_loop, live)
 

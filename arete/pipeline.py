@@ -23,10 +23,12 @@ from string import Template
 from typing import TextIO
 
 from . import (
+    alerts,
     asks,
     ci,
     config,
     control,
+    devices,
     diffguard,
     document,
     environment,
@@ -404,6 +406,7 @@ class Run(AgentRun):
     repairs: str = ""
     workspace: tuple[Path, list[Checkout]] | None = None
     asks_made: int = 0
+    answers_due: list[dict] = field(default_factory=list)
 
     @property
     def ref(self) -> str:
@@ -420,13 +423,35 @@ class Run(AgentRun):
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
+        due, plain = self.due_for(step), text
+        if due:
+            text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
+        if due and kw["resume"].id and not res.ok and asks.session_gone(res.error):
+            self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
+            res = super().agent(step, f"{plain}\n\n{asks.fresh_note(due)}", cwd, role, ask_owner=True,
+                                **{**kw, "resume": NO_SESSION})
+        if due and res.ok:
+            state.asks_taken([a["id"] for a in due], self.id)
+            self.answers_due = [a for a in self.answers_due if a not in due]
         while res.record and (sent := asks.found(record.events(paths.record_dir(self.id) / res.record))):
             kept = res.session if kw.get("persist", True) else NO_SESSION
             self.owner_ask(step, sent, kept)
             res = super().agent(step, asks.settled_message(sent), cwd, role, ask_owner=True,
                                 **{**kw, "resume": kept, "resume_only": True})
         return res
+
+    def due_for(self, call: str) -> list[dict]:
+        seam = factory.inside(self.id).step
+        here = [a for a in self.answers_due if a["step"] == seam]
+        return [a for a in here if a["call"] == call] or here
+
+    def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
+        session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
+        fresh = f"{text}\n\n{asks.fresh_note(due)}"
+        if session.id and kw.get("persist", True):
+            return asks.answers_message(due), {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
+        return fresh, {**kw, "resume": NO_SESSION}
 
     def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
         ask_ids = [f"{self.id}-a{self.asks_made + n}" for n in range(1, len(sent) + 1)]
@@ -1161,6 +1186,9 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if newest and newest[0]["status"] == "interrupted" and repaired_by(newest[0]["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
+    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
+        path = str(factory.first(lines.read(asked["id"]), "task").get("path") or "") or name
+        return script_command(cfg, path, repo_name, str(tid), *flags, "--continue", asked["id"])
     return script_command(cfg, name, repo_name, str(tid), *flags)
 
 
@@ -1268,13 +1296,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return 1
         with util.lock(SLOTS_LOCK, wait=True):
             slot = RunSlot(repo.name, str(tid), cfg.max_parallel)
+            only = script.only if script else ""
+            due = state.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
-                if slots_free_to_start(cfg.max_parallel) <= 0:
+                if slots_free_to_start(cfg.max_parallel) > 0:
+                    slot.hold()
+                elif not due:
                     print(f"{name} was not started: {no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
-                slot.hold()
-            only = script.only if script else ""
             earlier = [] if only else state.ticket_runs(repo.name, tid, limit=1, whole=True)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier[0]["id"] if restarting else ""))
@@ -1293,6 +1323,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.log(f"repairing the review findings of run {mending}")
         opening_waits(run_id, run.answering,
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
+        if due and not slot.held and not dry_run:
+            slot.take(run.log, run.waiting, "answer")
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
         flow = (flows.start(cfg, run, earlier[0] if restarting else {}, slot, script.continues, script.only,
@@ -1449,9 +1481,19 @@ def run_minutes(row: dict) -> float:
 
 
 def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str,
-         asked: list[dict] | None = None) -> tuple[str, str, str]:
+         asked: list[dict] | None = None, session: dict | None = None) -> tuple[str, str, str]:
     for ask in asked or [{}]:
         lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
+    if asked and session is not None and not run.dry_run:
+        for ask in asked:
+            state.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
+                          ask.get("why", ""), ask.get("tried", ""), ask["questions"], session)
+        run.say(outbound.screen(comment))
+        run.enter("needs-info")
+        devices.release(run.id, run.log)
+        alerts.ask_notice(run.where, summary)
+        run.log("needs-info: kept the work folder and the step's session for the answer")
+        return "needs-info", summary[:300], ""
     run.say(comment)
     run.enter("needs-info")
     remove_workspace(ws, checkouts)
@@ -3059,7 +3101,7 @@ class RunSlot:
         self.held = util.hold_lock(state.run_lock("slot", self.repo, self.tid))
 
     def take(self, log: Callable[[str], None],
-             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext()) -> None:
+             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), what: str = "ci") -> None:
         if self.held:
             return
         waiting = False
@@ -3069,13 +3111,13 @@ class RunSlot:
                     self.max_parallel = live_max_parallel(self.max_parallel)
                     if len(runs_in_slots()) < self.max_parallel:
                         self.hold()
-                        log("ci: took a run slot back" + (" after waiting for one" if waiting else ""))
+                        log(f"{what}: took a run slot back" + (" after waiting for one" if waiting else ""))
                         return
                     if not waiting:
                         waiting = True
                         stack.enter_context(util.hold_lock(state.run_lock("slot-wait", self.repo, self.tid)))
                         stack.enter_context(waits("slot"))
-                        log(f"ci: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
+                        log(f"{what}: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
                 time.sleep(SLOT_POLL_SECONDS)
 
     def free(self) -> None:
@@ -3201,6 +3243,30 @@ def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
     return ""
 
 
+def answered_run(repo_name: str, tid: str) -> dict | None:
+    newest = state.ticket_runs(repo_name, tid, limit=1, whole=True)
+    if (newest and newest[0]["status"] == "needs-info" and state.asks_due([newest[0]["id"]])
+            and not state.asks_of(newest[0]["id"], "open")):
+        return newest[0]
+    return None
+
+
+def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool) -> str:
+    newest = state.ticket_runs(repo.name, str(tid), limit=1, whole=True)
+    if not newest or newest[0]["status"] != "needs-info":
+        return ""
+    waiting = state.asks_of(newest[0]["id"], "open")
+    if not waiting:
+        return ""
+    if any(asks.has_secret(a["questions"]) for a in waiting):
+        return "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
+    text = tk.reply_since(tid, waiting[0]["asked"])
+    if text and not dry_run:
+        for a in waiting:
+            state.ask_close(a["id"], "answered", asks.text_answers(a, text))
+    return ""
+
+
 def poll(dry_run: bool = False) -> int:
     paths.ensure_dirs()
     cfg = config.load()
@@ -3268,7 +3334,9 @@ def poll(dry_run: bool = False) -> int:
                     progressed = True
                     source = tracker.for_ticket(cfg, repo, tid)
                     name = tracker.ticket_name(repo.name, source.ref(tid))
-                    if waiting := held_back(cfg, repo.name, going, slots):
+                    reply = tracker_reply(repo, source, str(tid), dry_run)
+                    answering = not reply and answered_run(repo.name, str(tid)) is not None
+                    if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
                         exhausted.add(repo.name)
                         if not dry_run:
                             state.pass_over(repo.name, str(tid))
@@ -3276,7 +3344,8 @@ def poll(dry_run: bool = False) -> int:
                         continue
                     blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
                     ticket = source.get(tid)
-                    blocked = blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, discovery, layer)
+                    blocked = (blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, discovery, layer)
+                               or reply)
                     if blocked:
                         skips.note(name, ticket, blocked, repo.name)
                         print(f"{util.iso()} {name}: {blocked}")

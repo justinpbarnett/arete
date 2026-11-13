@@ -1273,7 +1273,7 @@ def cmd_wait(args) -> int:
 def cmd_answer(args) -> int:
     from . import client
 
-    return client.say("POST", client.run_path(args.run_id, "answer"), {"text": " ".join(args.text)})
+    return client.answer(args.run_id, " ".join(args.text), args.json, args.ask)
 
 
 def cmd_resume(args) -> int:
@@ -1615,10 +1615,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_id")
     p.set_defaults(fn=cmd_wait)
 
-    p = steering(sub.add_parser("answer", help="answer the question of a run that ended needs-info, through the "
-                                               "server, which starts the next run"))
+    p = steering(sub.add_parser("answer", help="answer the ask of a run that parked needs-info, through the server, "
+                                               "which continues the run: per question on a terminal, or with --json "
+                                               "BODY such as {\"recommended\": true}; TEXT answers the run's text "
+                                               "question the older way"))
     p.add_argument("run_id")
-    p.add_argument("text", nargs="+")
+    p.add_argument("text", nargs="*")
+    p.add_argument("--json", default="", metavar="BODY", help="the body of POST /api/asks/ID/answer")
+    p.add_argument("--ask", default="", metavar="ID", help="the ask to answer when the run holds several")
     p.set_defaults(fn=cmd_answer)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
