@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -324,12 +325,14 @@ CREATE TABLE IF NOT EXISTS chats (
     session_spent REAL DEFAULT 0,
     runner TEXT DEFAULT '',
     draft_title TEXT DEFAULT '',
-    draft_body TEXT DEFAULT ''
+    draft_body TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    summarized_to INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
-    sender TEXT NOT NULL,          -- you | arete
+    sender TEXT NOT NULL,          -- you | arete | tool
     text TEXT,
     cost REAL DEFAULT 0,
     paid_usd REAL,
@@ -421,6 +424,8 @@ CREATE TABLE IF NOT EXISTS incident_aliases (
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+              ("chats", "summary", "ALTER TABLE chats ADD COLUMN summary TEXT DEFAULT ''"),
+              ("chats", "summarized_to", "ALTER TABLE chats ADD COLUMN summarized_to INTEGER DEFAULT 0"),
               ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
               ("triage", "code", "ALTER TABLE triage ADD COLUMN code INTEGER"),
@@ -1000,30 +1005,39 @@ def chats() -> list[dict]:
 
 def chat_messages(chat_id: int) -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT sender, text, cost, paid_usd, ts FROM chat_messages WHERE chat_id = ? "
+        return [dict(r) for r in c.execute("SELECT id, sender, text, cost, paid_usd, ts FROM chat_messages WHERE chat_id = ? "
                                            "ORDER BY id", (chat_id,))]
 
 
-def chat_claim(chat_id: int, text: str, title: str) -> bool:
+def chat_claim(chat_id: int, text: str, title: str) -> int:
     ts = util.iso()
     with db() as c:
         claimed = c.execute("UPDATE chats SET busy = 1, updated = ?, title = CASE WHEN title = '' THEN ? ELSE title END "
                             "WHERE id = ? AND busy = 0", (ts, title, chat_id)).rowcount
         if claimed:
-            c.execute("INSERT INTO chat_messages (chat_id, sender, text, ts) VALUES (?,?,?,?)", (chat_id, "you", text, ts))
-        return bool(claimed)
+            return c.execute("INSERT INTO chat_messages (chat_id, sender, text, ts) VALUES (?,?,?,?)",
+                             (chat_id, "you", text, ts)).lastrowid
+        return 0
 
 
 def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_usd: float | None = None,
-             reported_cost: float | None = None, **fields) -> None:
+             reported_cost: float | None = None, before: Sequence[tuple[str, str]] = (), **fields) -> None:
     ts = util.iso()
     reported_cost = cost if reported_cost is None else reported_cost
     paid_usd = 0.0 if reported_cost == 0 and paid_usd is None else paid_usd
     with db() as c:
+        for kind, note in before:
+            c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
+                      (chat_id, kind, note, 0, 0, ts))
         c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
                   (chat_id, sender, text, reported_cost, paid_usd, ts))
         c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",
                   (*fields.values(), ts, reported_cost, chat_id))
+
+
+def chat_summarize(chat_id: int, summary: str, upto: int) -> None:
+    with db() as c:
+        c.execute("UPDATE chats SET summary = ?, summarized_to = ? WHERE id = ?", (summary, upto, chat_id))
 
 
 def chat_drop_draft(chat_id: int, title: str, body: str) -> None:
