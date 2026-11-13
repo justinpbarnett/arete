@@ -39,6 +39,9 @@ class Settings:
     instructions_explicit: bool = False
     requires: routing.Requirements = field(default_factory=routing.Requirements)
     denied: tuple[str, ...] = ()
+    inherits: str = ""
+    budget_usd: float | None = None
+    explicit_route: bool = False
 
     def effort_on(self, which: str) -> str:
         return routing.nearest_effort(which, self.effort)
@@ -49,7 +52,8 @@ class Settings:
     @property
     def call(self) -> dict:
         return {"model": self.model, "runner": self.runner, "effort": self.effort_on(self.runner),
-                "timeout": self.timeout_minutes * 60}
+                "timeout": self.timeout_minutes * 60,
+                **({"max_budget_usd": self.budget_usd} if self.budget_usd else {})}
 
     def agent_kw(self, cfg: config.Config, rules=(), own_mcp: str = "") -> dict:
         return {"allowed_tools": [*self.tools, *rules, *(f"mcp__{n}" for n in self.mcp)],
@@ -120,14 +124,27 @@ def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple
     return next(iter(maps.items()), ("", {}))
 
 
-def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, overrides: dict) -> dict:
-    settings = {"timeout_minutes": layer.timeout_minutes, "tries": layer.max_attempts, **DEFAULTS,
-                **BUILT_IN.get(role, {})}
+def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, overrides: dict,
+           inherited: dict | None = None) -> dict:
+    base = config.INHERITS.get(role, "")
+    if base:
+        settings, own_route = {**merged(cfg, layer, base, kind, inherited or {}), **BUILT_IN.get(role, {})}, False
+    else:
+        settings, own_route = {"timeout_minutes": layer.timeout_minutes, "tries": layer.max_attempts, **DEFAULTS,
+                               **BUILT_IN.get(role, {})}, True
+    explicit_runner = False
     for level in (cfg.steps.get(role), cfg.kinds.get(kind, {}).get(role), layer.steps.get(role),
                   layer.kinds.get(kind, {}).get(role), overrides):
+        explicit_runner = explicit_runner or bool(level and "runner" in level)
         if level and "model" in level:
             settings = {k: v for k, v in settings.items() if k not in MODEL_SOURCE}
+            own_route = True
+        elif level and "tier" in level and not own_route:
+            settings = {k: v for k, v in settings.items() if k not in (*MODEL_SOURCE, "model")}
+            own_route = True
         settings.update(level or {})
+    if base:
+        settings["explicit_route"] = own_route or explicit_runner
     return settings
 
 
@@ -162,13 +179,14 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
 
 
 def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind: str = "",
-            overrides: dict | None = None) -> Settings:
+            overrides: dict | None = None, inherited: dict | None = None) -> Settings:
     role = config.STEP_ALIASES.get(step, step)
-    if role not in config.MODEL_ROLES:
+    if role not in config.STEP_ROLES:
         raise ValueError(f"unknown step '{step}'; use {', '.join(config.STEP_NAMES)}")
     where = f"step {role}" + (f" for {kind} tickets" if kind else "")
     layer = layer or config.RepoLayer(dir=Path())
-    found = merged(cfg, layer, role, kind, config.step_table(overrides or {}, f"{where}: overrides"))
+    found = merged(cfg, layer, role, kind, config.step_table(overrides or {}, f"{where}: overrides"),
+                   config.step_table(inherited or {}, f"{where}: overrides"))
     tier = ""
     entries: tuple[dict[str, str], ...] = ()
     if found.get("model"):
@@ -182,7 +200,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
         entries = tiers[tier]
         source = entries[0]
     else:
-        source = {**found, "model": cfg.model(role)}
+        source = {**found, "model": cfg.model(config.INHERITS.get(role, role))}
     hint = source.get("runner", "")
     if hint and hint not in runner.RUNNERS:
         raise ValueError(f"{where}: runner '{hint}' is not one of {', '.join(runner.RUNNERS)}")
@@ -222,7 +240,9 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
                     mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,
                     chain=chain, fallback=fallback,
-                    instructions_explicit=explicit is not None, requires=requires)
+                    instructions_explicit=explicit is not None, requires=requires,
+                    inherits=config.INHERITS.get(role, ""), budget_usd=found.get("budget_usd"),
+                    explicit_route=found.get("explicit_route", False))
 
 
 def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_tiers: bool = False) -> None:
@@ -231,7 +251,7 @@ def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_ti
     if not deferred:
         tier_map(cfg, layer)
     for kind in ("", *config.KINDS):
-        for role in config.MODEL_ROLES:
+        for role in config.STEP_ROLES:
             if deferred:
                 found = merged(cfg, layer, role, kind, {})
                 if found.get("tier") and not found.get("model"):

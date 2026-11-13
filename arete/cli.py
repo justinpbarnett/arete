@@ -942,7 +942,7 @@ def cmd_steps(args) -> int:
         where = f"{paths.short_path(layer_dir / 'config.toml')}: " if layer_dir else ""
         layer = config.load_layer(layer_dir) if layer_dir else None
         steps.check(cfg, layer)
-        sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.MODEL_ROLES]
+        sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.STEP_ROLES]
     except (ValueError, TypeError) as e:
         print(f"{where}{e}", file=sys.stderr)
         return 1
