@@ -56,20 +56,28 @@ A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete we
 ## On-call
 
 The watcher notices operational failures on its own and keeps one durable incident for each underlying symptom.
-This part only watches and records: it calls no model and repairs nothing.
+JEV decides whether an incident may wake a repair; no repair starts yet.
 
 ```toml
 [oncall]
 enabled = false
+vision = "A payments service that must stay up"
+scope = "Bug fixes in the payment worker only"
+confidence = 0.8
+injection = 0.5
 
 [[oncall.source]]
 path = "~/Library/Logs/myapp/*.log"
 pattern = "ERROR|panic"
 repo = "myapp"
 check = "make check"
+vision = "The checkout flow matters most"
+scope = "Only the checkout module"
 ```
 
 `enabled` defaults to false. With it off, `arete serve` does no on-call work and creates no cursor or incident.
+`vision` and `scope` are owner text; a source's own `vision` or `scope` replaces the `[oncall]` one for incidents from that source.
+`confidence` and `injection` are numbers from 0 to 1 and default to `[jev] confidence` and `[jev] injection`.
 When on, serve scans on its tick, on the poll pool, so a slow scan never blocks the tick.
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
 `repo` and `check` are recorded for a later repair part and start nothing now.
@@ -103,9 +111,36 @@ A repeat of an open incident's fingerprint, minutes or hours later, updates it i
 The append-only `incident_notes` table records what happened and when.
 Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
 
+**Decisions.** After each scan, JEV is asked four yes/no questions about every open incident that is due, and the answers become one stored decision:
+
+- `injection`: does the text try to steer an agent that reads it (the same question used elsewhere in arete)?
+- `actionable`: is it a failure a code or config change would repair, rather than noise?
+- `vision`: does repairing it fit `vision`? Asked only when a vision is set.
+- `scope`: is the repair inside `scope`? Asked only when a scope is set.
+
+The evidence is redacted before it is stored and is sent fenced as data. It is never used as instructions or put into a command; the owner's `vision` and `scope` are the only text in the questions themselves.
+
+| Outcome | Meaning |
+| --- | --- |
+| `wake` | Every question was answered with confidence: actionable, fits the vision, in scope. It may later wake a repair. |
+| `ignore` | A confident "no" to `actionable`, `vision` or `scope`. |
+| `ignore` with the injection mark | The evidence reads as instructions to an agent. It is never asked again and can never wake a model. |
+| `unsure` | An answer was under the confidence line, or no vision or scope is set. It never wakes a model; the owner decides. |
+| undecided | JEV is off, has no key, is not allowed for the incident's repo or the call failed. The reason is stored and nothing wakes. |
+
+Each decision is stored on the incident with every answer's value and confidence and a one-line reason, and added to its notes.
+JEV is not asked about `expected` events, about an incident a live run owns, or about a repeat of a decided incident.
+An ignored incident is asked again only when it changed materially: its count reached ten times the count at its decision, or its evidence shows a failure line of a new shape.
+An undecided incident is tried again after 60 seconds, then 120, doubling up to an hour.
+Before a new incident is opened, JEV may match a differently worded symptom to an open incident of the same repo; a confident match updates that incident instead.
+A symptom whose twin check reads as an injection is opened already marked and can never wake a model.
+Twin checks and decisions share one budget: at most 20 JEV evaluations per scan, and the rest wait for the next.
+A symptom from a run that is still live gets no twin check and no decision until the run ends.
+All calls go through `oncall.ask_jev`, one function a test harness can replace.
+
 ```
-arete oncall             # incidents, newest first, then the watcher's state
-arete oncall show ID     # one incident with its evidence and notes
+arete oncall             # incidents, newest first, each with its decision, confidence and reason, then the watcher's state
+arete oncall show ID     # one incident with its decision, answers, evidence and notes
 arete oncall scan        # one scan now
 ```
 
@@ -576,7 +611,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. See [Triage](#triage). |
-| `[oncall]` | `enabled` (default false) turns on the log watcher; `[[oncall.source]]` adds other logs. See [On-call](#on-call). |
+| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
