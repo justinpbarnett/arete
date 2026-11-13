@@ -69,11 +69,15 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     job = Job(cfg, run, ws, slot=slot)
+    renew = ""
     if continues and not only and (moved := base_moved(continues)):
-        run.log(f"{moved} since run {continues} prepared, so this run prepares again and redoes every step after it")
-        again = "prepare"
+        run.log(f"{moved} since run {continues} prepared, so this run prepares again, keeps the plan and the build "
+                "when the worktree still holds that run's edits, and runs every later step again")
+        renew = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
-                        restore=lambda line: restore(job, line))
+                        restore=lambda line: restore(job, line), renew=renew,
+                        keeps=lambda name, kw: any(c.onto for c in job.checkouts) and (
+                            name in ("plan", "revise", "repair") or name == "implement" and kw.get("round") == BUILD))
 
 
 def prepared_data(continues: str) -> dict:
@@ -298,7 +302,7 @@ class Job:
         self.b.committed_lines = data["committed_lines"]
         if stored:
             for c in self.picked(self.changed):
-                c.lease = util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
 
     def prepared(self, data: dict, stored: bool) -> None:
         run = self.run
@@ -315,9 +319,15 @@ class Job:
         run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored and not run.workspace:
+            kept = pipeline.kept_onto(self.ws, self.checkouts, self.branch)
             if why := pipeline.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
                 raise pipeline.RunFailed(why)
-            run.workspace = self.ws, self.checkouts
+            for c in self.checkouts:
+                c.onto = kept.get(str(c.wt), "")
+        elif stored:
+            for c in self.checkouts:
+                c.onto = ""
+        run.workspace = self.ws, self.checkouts
         if stored:
             opened(run, self.ticket)
             if not run.alone:
@@ -341,7 +351,7 @@ def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies:
     checkouts = [pipeline.Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
                                    base or util.origin_default_branch(repo.path / p.dir))
                  for p in repo.parts or [config.Part("", repo.name)]]
-    pipeline.clear_workspace(ws, checkouts, repo.path, copies)
+    kept = pipeline.kept_or_cleared(ws, checkouts, repo.path, copies, branch)
     for c in checkouts:
         with record.timed(run.id, "clone", repo=c.github, base=c.base, branch=branch, path=str(c.wt)) as clone:
             pipeline.fetch(c.src, c.base)
@@ -349,7 +359,14 @@ def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies:
             c.resumes = bool(c.lease)
             if c.resumes:
                 pipeline.fetch(c.src, branch)
-            pipeline.add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
+            if str(c.wt) in kept:
+                pipeline.continue_from(c, branch, kept[str(c.wt)])
+                clone["continued"] = True
+            else:
+                if kept and (c.wt / ".git").exists():
+                    with util.repo_lock(c.src):
+                        util.git(["worktree", "remove", "--force", str(c.wt)], c.src)
+                pipeline.add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
             clone["resumed"] = c.resumes
     return checkouts
 
@@ -401,8 +418,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
-        pipeline.note_fresh_bases(checkouts)
-        pipeline.merge_moved_bases(run, [c for c in checkouts if c.resumes], main_layer, t)
+        pipeline.settle_starts(run, checkouts, main_layer, t, branch)
     except pipeline.RunFailed as e:
         return end_as("fail", "failed", why=e.why, detail=e.detail)
     for c in checkouts:

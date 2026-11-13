@@ -187,7 +187,8 @@ def checked(name: str, value) -> Outcome:
 class Flow:
     def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None,
                  labels: Callable[[str, dict], dict] | None = None, again: str = "",
-                 restore: Callable[[dict], str] | None = None) -> None:
+                 restore: Callable[[dict], str] | None = None, renew: str = "",
+                 keeps: Callable[[str, dict], bool] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         if again and again not in STEPS:
@@ -203,15 +204,21 @@ class Flow:
         self.last_prints = {str(line["tree"]): str(line.get("fingerprint") or "")
                             for line in self.earlier if line.get("tree")}
         self.prints: dict[str, str] = {}
+        self.renew, self.keeps = renew, keeps or (lambda name, kw: False)
+        self.carrying, self.carry = False, 0
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
         if self.matching:
-            lines.write(run_id, "route", continues=continues, only=only, again=again)
+            lines.write(run_id, "route", continues=continues, only=only, again=again, renew=renew)
 
     def step(self, name: str, *args, **kw) -> Outcome:
         if name not in STEPS:
             raise KeyError(f"no step {name}")
         if self.done:
             raise OnlyDone(f"only {self.only} runs in this flow")
+        if self.matching and name == self.renew:
+            return self.renewed(name, args, kw)
+        if not self.matching and self.carrying and (found := self.carried(name, kw)) is not None:
+            return found
         if self.matching:
             if self.takes(name) and (found := self.stored(name, kw)):
                 self.skipped += 1
@@ -225,6 +232,37 @@ class Flow:
             return self.run(name, args, kw)
         finally:
             self.done = self.done or name == self.only
+
+    def renewed(self, name: str, args: tuple, kw: dict) -> Outcome:
+        line = self.earlier[self.skipped] if self.skipped < len(self.earlier) else {}
+        tree = str(line.get("tree") or "")
+        now, then = self.print_of(kw.get("tree") or tree) if tree else "", self.last_prints.get(tree, "")
+        intact = (line.get("step") == name and line.get("result") == "pass" and bool(tree)
+                  and (bool(then) and now == then or not then and not now and self.holds_worktrees(line)))
+        self.route()
+        outcome = self.run(name, args, kw)
+        self.prints.clear()
+        self.carrying, self.carry = intact and outcome.passed, self.skipped + 1
+        return outcome
+
+    def holds_worktrees(self, line: dict) -> bool:
+        data = line.get("data") if isinstance(line.get("data"), dict) else {}
+        listed = data.get("checkouts")
+        return isinstance(listed, list) and bool(listed) and all(
+            isinstance(c, dict) and os.path.exists(os.path.join(str(c.get("wt") or ""), ".git")) for c in listed)
+
+    def carried(self, name: str, kw: dict) -> Outcome | None:
+        line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
+        if (line.get("step") == name and line.get("result") == "pass" and self.keeps(name, kw)
+                and (not self.again or self.carry < self.again_at)):
+            n = self.tries[name] = self.tries.get(name, 0) + 1
+            outcome = outcome_of(line)
+            self.end(name, n, outcome, "", Calls(self.run_id, name, n=n), time.monotonic(), kw,
+                     carried=self.continues)
+            self.carry += 1
+            return outcome
+        self.carrying = False
+        return None
 
     def takes(self, name: str) -> bool:
         return name != self.only and (name != self.again or self.skipped < self.again_at)
@@ -297,7 +335,8 @@ class Flow:
             _open.reset(token)
         return checked(name, value)
 
-    def end(self, name: str, n: int, outcome: Outcome, error: str, calls: Calls, started: float, kw: dict) -> None:
+    def end(self, name: str, n: int, outcome: Outcome, error: str, calls: Calls, started: float, kw: dict,
+            **extra) -> None:
         seconds, tree = round(time.monotonic() - started, 1), {}
         if kw.get("tree"):
             where = os.path.abspath(kw["tree"])
@@ -305,7 +344,7 @@ class Flow:
         lines.write(self.run_id, "step_end", step=name, **{"try": n}, result=outcome.result, ok=outcome.passed,
                     next=outcome.next, feedback=outcome.feedback, data=outcome.data,
                     session=asdict(outcome.session), **envelope(calls.made), seconds=seconds,
-                    error=error[:MAX_ERROR_CHARS], **tree)
+                    error=error[:MAX_ERROR_CHARS], **tree, **extra)
 
     def respond(self, status: str, **fields) -> dict:
         if self.matching:
@@ -316,7 +355,7 @@ class Flow:
 def tally(run_id: str) -> dict[str, dict]:
     found: dict[str, list] = {}
     for line in lines.read(run_id):
-        if line.get("event") == "step_end":
+        if line.get("event") == "step_end" and not line.get("carried"):
             counts = found.setdefault(str(line.get("step") or ""), [0, 0.0, 0.0])
             counts[0] += 1
             counts[1] += amount(line, "seconds")

@@ -15,7 +15,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arete import claude, config, lines, paths, pipeline, record, runlimits, state, tracker, util
+from arete import claude, config, diffguard, factory, gh, lines, paths, pipeline, record, runlimits, state, tracker, util
 
 
 class Isolated(unittest.TestCase):
@@ -648,6 +648,174 @@ class CheckConcurrencyTests(Isolated):
     def test_explicit_isolated_checks_overlap(self):
         first, second = self.checks(True)
         self.assertLess(max(first[0], second[0]), min(first[1], second[1]))
+
+
+class KeptEditsTests(Isolated):
+    BRANCH = "arete/t1-fixture"
+    URL = "https://github.com/o/fixture/pull/1"
+
+    def setUp(self):
+        super().setUp()
+        self.origin = self.root / "origin.git"
+        util.git(["init", "-q", "--bare", "-b", "main", str(self.origin)], self.root)
+        util.git(["init", "-q", "-b", "main"], self.repo.path)
+        self.commit(self.repo.path, "shared.txt", "one\n", "first")
+        util.git(["remote", "add", "origin", str(self.origin)], self.repo.path)
+        util.git(["push", "-q", "origin", "main:main", f"main:refs/heads/{self.BRANCH}"], self.repo.path)
+        self.repo.parts = [config.Part("", "o/fixture")]
+        self.patches.enter_context(patch.object(gh, "open_pr_url", return_value=self.URL))
+        self.patches.enter_context(patch.object(gh, "closed_pr_heads", return_value=[]))
+        self.layer, self.ticket_data = config.RepoLayer(dir=Path()), tracker.Ticket("", "", "")
+
+    def commit(self, where, name, text, message):
+        (where / name).write_text(text)
+        util.git(["add", name], where)
+        util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message], where)
+
+    def head(self, where):
+        return util.git(["rev-parse", "HEAD"], where).strip()
+
+    def start(self, run):
+        made = pipeline.make_workspace(run.id, self.repo, "main", self.BRANCH, "t1", [])
+        run.workspace = made
+        return made
+
+    def parked_edit(self, name="edit.txt", text="edit\n"):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        (checkouts[0].wt / name).write_text(text)
+        pipeline.keep_edits(run)
+        pipeline.note_made(ws, checkouts)
+        return ws, checkouts[0]
+
+    def push_from_elsewhere(self, name, text):
+        src = self.repo.path
+        util.git(["fetch", "-q", "origin"], src)
+        util.git(["checkout", "-q", "--detach", f"origin/{self.BRANCH}"], src)
+        self.commit(src, name, text, "moved")
+        util.git(["push", "-q", "origin", f"HEAD:refs/heads/{self.BRANCH}"], src)
+        util.git(["checkout", "-q", "main"], src)
+
+    def test_next_run_continues_on_the_kept_edits_over_the_pr_head(self):
+        ws, first = self.parked_edit()
+        kept, pr_head = self.head(first.wt), util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(self.head(checkouts[0].wt), kept)
+        self.assertEqual(checkouts[0].onto, pr_head)
+        self.assertIn("left unpushed", checkouts[0].starting_point)
+        self.assertEqual(pipeline.stage(checkouts, []).files, ["edit.txt"])
+
+    def test_reset_worktree_is_refused_naming_both_commits(self):
+        ws, first = self.parked_edit()
+        kept = self.head(first.wt)
+        util.git(["reset", "-q", "--hard", "HEAD~1"], first.wt)
+        with self.assertRaises(pipeline.RunFailed) as refused:
+            self.start(self.made_run())
+        self.assertIn(kept[:12], refused.exception.why)
+        self.assertIn(self.head(first.wt)[:12], refused.exception.why)
+        self.assertTrue((first.wt / ".git").exists())
+
+    def test_moved_branch_is_merged_into_the_kept_edits(self):
+        ws, first = self.parked_edit()
+        kept = self.head(first.wt)
+        self.push_from_elsewhere("moved.txt", "moved\n")
+        new_head = util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        wt = checkouts[0].wt
+        self.assertEqual(util.git(["rev-list", "--parents", "-n1", "HEAD"], wt).split()[1:], [kept, new_head])
+        self.assertEqual(checkouts[0].onto, new_head)
+        self.assertTrue((wt / "edit.txt").exists() and (wt / "moved.txt").exists())
+
+    def test_denied_paths_stay_out_of_the_kept_commit(self):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        wt = checkouts[0].wt
+        (wt / "edit.txt").write_text("edit\n")
+        (wt / ".env").write_text("SECRET=1\n")
+        pipeline.keep_edits(run)
+        self.assertEqual(util.git(["show", "--name-only", "--format=", "HEAD"], wt).split(), ["edit.txt"])
+        self.assertTrue((wt / ".env").exists())
+        self.assertEqual(pipeline.stage(checkouts, diffguard.denied_paths(self.layer)).denied, [".env"])
+        pipeline.note_made(ws, checkouts)
+        self.push_from_elsewhere("moved.txt", "moved\n")
+        again = self.made_run()
+        _, second = self.start(again)
+        with self.assertRaises(pipeline.RunFailed) as refused:
+            pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
+        self.assertIn(".env", refused.exception.why)
+        self.assertTrue((wt / ".env").exists())
+
+    def test_commit_left_unpushed_by_a_failed_publication_is_kept_for_the_retry(self):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        wt, pr_head = checkouts[0].wt, self.head(checkouts[0].wt)
+        (wt / "edit.txt").write_text("edit\n")
+        staged = pipeline.stage(checkouts, [])
+        with patch.object(pipeline, "remote_head", return_value="someone-else"):
+            with self.assertRaises(pipeline.RunFailed):
+                pipeline.commit_and_push(checkouts, staged.changed, self.BRANCH, "work")
+        committed = self.head(wt)
+        self.assertNotEqual(committed, pr_head)
+        pipeline.keep_edits(run)
+        pipeline.note_made(ws, checkouts)
+        again = self.made_run()
+        _, second = self.start(again)
+        pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(self.head(second[0].wt), committed)
+        self.assertEqual(second[0].onto, pr_head)
+        self.assertEqual(pipeline.stage(second, []).files, ["edit.txt"])
+
+    def test_failed_retention_commit_does_not_lose_the_edits_on_retry(self):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        wt, head = checkouts[0].wt, self.head(checkouts[0].wt)
+        (wt / "edit.txt").write_text("edit\n")
+        with patch.object(pipeline, "commit_kept", side_effect=RuntimeError("hook failed")):
+            pipeline.keep_edits(run)
+        pipeline.note_made(ws, checkouts)
+        again = self.made_run()
+        _, second = self.start(again)
+        pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual((second[0].wt / "edit.txt").read_text(), "edit\n")
+        self.assertEqual(second[0].onto, head)
+        self.assertEqual(pipeline.stage(second, []).files, ["edit.txt"])
+
+    def test_renewed_flow_carries_stored_steps_when_the_workspace_holds_several_worktrees(self):
+        container = self.root / "container"
+        for part in ("a", "b"):
+            (container / part).mkdir(parents=True)
+            util.git(["init", "-q", "-b", "main"], container / part)
+        earlier = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
+        listed = [{"wt": str(container / part)} for part in ("a", "b")]
+        lines.write(earlier, "step_end", step="prepare", result="pass", tree=str(container), fingerprint="",
+                    data={"checkouts": listed})
+        lines.write(earlier, "step_end", step="plan", result="pass", data={"plan": "p"})
+        made = []
+        fakes = {"prepare": lambda flow, tree: factory.Outcome("pass"),
+                 "plan": lambda flow: made.append("plan") or factory.Outcome("pass")}
+        with patch.dict(factory.STEPS, fakes):
+            flow = factory.Flow("later", continues=earlier, renew="prepare", keeps=lambda name, kw: name == "plan")
+            flow.step("prepare", tree=str(container))
+            carried = flow.step("plan")
+        self.assertTrue(carried.passed)
+        self.assertEqual(made, [])
+        self.assertTrue(any(line.get("carried") == earlier for line in lines.read("later")))
+
+    def test_conflicting_move_with_a_failed_resolver_leaves_the_kept_commit(self):
+        ws, first = self.parked_edit("shared.txt", "mine\n")
+        kept = self.head(first.wt)
+        self.push_from_elsewhere("shared.txt", "theirs\n")
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        with patch.object(pipeline, "resolve_conflicts", side_effect=pipeline.RunFailed("resolver failed")):
+            with self.assertRaises(pipeline.RunFailed):
+                pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(self.head(checkouts[0].wt), kept)
+        self.assertEqual(util.git(["status", "--short"], checkouts[0].wt).strip(), "")
 
 
 if __name__ == "__main__":
