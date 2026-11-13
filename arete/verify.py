@@ -65,6 +65,30 @@ def with_free_ports(v: config.Verify) -> config.Verify:
     return replace(v, start=filled(v.start), url=filled(v.url), notes=filled(v.notes))
 
 
+def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo | None = None) -> Verified | None:
+    if not v.preflight:
+        return None
+    deadline, checks = time.monotonic() + v.preflight_seconds, []
+    for name, command in v.preflight.items():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            checks.append({"what": name, "how": command, "saw": "preflight time budget exhausted", "passed": False})
+            break
+        try:
+            result = environment.sh(command, cfg, repo, cwd=cwd, timeout=remaining)
+            passed = result.returncode == 0
+            saw = f"exit {result.returncode}: " + util.tail(result.stdout + result.stderr, MAX_SAW_CHARS)
+        except OSError as error:
+            passed, saw = False, f"{type(error).__name__}: {error}"
+        checks.append({"what": name, "how": command, "saw": saw, "passed": passed})
+        if not passed:
+            break
+    failed = next((check for check in checks if not check["passed"]), None)
+    return Verified("blocked" if failed else "pass", "Verification prerequisites are unavailable." if failed else
+                    "Configured verification prerequisites passed.", checks,
+                    blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
+
+
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
             repo: config.Repo | None = None):
