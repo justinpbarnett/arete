@@ -13,11 +13,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
-from . import config, environment, paths, util
+from . import config, environment, paths, scratch, util
 from .util import git
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
 PORT_FIELD = re.compile(r"\{(port\d*)\}")
+SCRATCH_FIELD = "{scratch}"
 STOP_GRACE_SECONDS = 10
 EVIDENCE_BRANCH = "arete/evidence"
 MAX_SCREENSHOTS = 8
@@ -65,6 +66,10 @@ def with_free_ports(v: config.Verify) -> config.Verify:
     return replace(v, start=filled(v.start), url=filled(v.url), notes=filled(v.notes))
 
 
+def with_scratch(v: config.Verify, root: str) -> config.Verify:
+    return replace(v, start=v.start.replace(SCRATCH_FIELD, root), notes=v.notes.replace(SCRATCH_FIELD, root))
+
+
 def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo | None = None) -> Verified | None:
     if not v.preflight:
         return None
@@ -91,20 +96,39 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
 
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
-            repo: config.Repo | None = None):
+            repo: config.Repo | None = None, sets: dict[str, str] | None = None, lifetime: dict | None = None,
+            attempt: scratch.Attempt | None = None):
+    if lifetime is not None:
+        lifetime["stopped"] = True
     if not v.start:
         yield ""
         return
     url = v.url.rstrip("/")
-    with open(log, "w") as out:
-        proc = subprocess.Popen(v.start, shell=True, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, env=environment.commands(cfg or config.load(), repo),
-                                **util.own_group_args())
+    command = scratch.service_command(attempt, v.start) if attempt else v.start
+    env = environment.commands(cfg or config.load(), repo, sets)
+    if attempt:
+        env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k)}
+        env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
+                    "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
+                    "ARETE_WORKTREES_DIR": attempt.root + "/state/worktrees"})
+    with open(log, "w") as out, scratch.producing(attempt):
+        proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, env=env,
+                             actor_confined=bool(attempt), **util.own_group_args())
+    if lifetime is not None:
+        lifetime["stopped"] = False
     try:
         wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
         yield url
     finally:
         stop(proc)
+        if lifetime is not None:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                lifetime["stopped"] = True
+            except PermissionError:
+                pass
 
 
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:

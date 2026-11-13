@@ -20,6 +20,8 @@ $surface
 
 $notes
 
+$scratch
+
 ## Rules
 
 - Do every step, in order, and compare what you see with the result the step expects.
@@ -30,7 +32,7 @@ $notes
   that the step needs is a failed step, not a blocked one.
 - Return `blocked` only for a cause outside the product's code: the app did not answer, a login or a service you do
   not have, a command you may not run. Name the step and the cause in `blocked_by`.
-- Do not edit files and do not fix what you find.
+- Do not edit the repo's files and do not fix what you find; fixtures in the scratch folder are not edits to the change.
 - Never run git commands that write.
 
 ## What to return

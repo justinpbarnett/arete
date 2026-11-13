@@ -55,8 +55,14 @@ class KeptFailure(Refused):
     pass
 
 
+def command(args: list[str]) -> list[str]:
+    entrypoint = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                  "from arete.cli import main; raise SystemExit(main())")
+    return [sys.executable, "-I", "-c", entrypoint, *args]
+
+
 def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
-    return launch([sys.executable, "-m", "arete.cli", *args], log_name, keep)
+    return launch(command(args), log_name, keep)
 
 
 def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:

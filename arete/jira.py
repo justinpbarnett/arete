@@ -11,7 +11,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from . import outbound, util
+from . import outbound, paths, util
 
 ENV_KEYS = ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
 TIMEOUT = 30
@@ -27,6 +27,8 @@ class JiraError(RuntimeError):
 
 
 def credentials(env_file: Path | None) -> tuple[str, str, str]:
+    if paths.ISOLATED:
+        raise JiraError(paths.ISOLATED_LOGINS)
     from_file = util.read_env_file(env_file) if env_file else {}
     vals = [os.environ.get(k) or from_file.get(k, "") for k in ENV_KEYS]
     missing = [k for k, v in zip(ENV_KEYS, vals) if not v]
