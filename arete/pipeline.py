@@ -1057,7 +1057,12 @@ def flow_function(cfg: config.Config, name: str) -> Callable:
 
 
 def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
-    return scratch.protected_command([sys.executable, str(script_file(cfg, name)), *args])
+    script = script_file(cfg, name).resolve()
+    if script.parent == paths.ADWS_DIR.resolve():
+        entrypoint = (f"import sys, runpy; sys.path[:0] = {[str(paths.PACKAGE_DIR.parent), str(script.parent)]!r}; "
+                      f"runpy.run_path({str(script)!r}, run_name='__main__')")
+        return [sys.executable, "-I", "-c", entrypoint, *args]
+    return scratch.protected_command([sys.executable, str(script), *args])
 
 
 def answer_text(asked_id: str) -> str:

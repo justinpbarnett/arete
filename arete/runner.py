@@ -643,8 +643,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         if not hook:
             say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
             kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
-        else:
-            kw["verification_attempt"] = trip.scratch
+        kw["verification_attempt"] = trip.scratch
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:

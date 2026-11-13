@@ -191,13 +191,15 @@ def exits_by(proc: subprocess.Popen, deadline: float) -> bool:
 def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, device: devices.Device,
                 stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
     local = not device.remote
-    if argv and argv[0] == "arete" and local:
+    trusted = bool(argv and argv[0] == "arete" and local)
+    if trusted:
         argv = control.command(argv[1:])
     full = devices.wrap(device, argv, cwd, env)
     deadline = time.monotonic() + timeout
     from . import scratch
 
     proc = scratch.spawn(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             actor_confined=trusted,
                             stderr=subprocess.STDOUT, text=True, errors="replace", env={**os.environ, **env} if local else None,
                             **util.own_group_args())
     threading.Thread(target=feed_stdin, args=(proc, stdin), daemon=True).start()

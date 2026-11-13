@@ -72,7 +72,7 @@ def encoded(value) -> bytes:
 def registry(create: bool = False):
     from . import pi
 
-    if not pi.can_confine(False):
+    if not pi.can_confine(False) or os.getuid() == 0:
         raise ConfinementUnavailable("local producers cannot protect the scratch authority store")
     if create:
         with paths.directory_fd(AUTHORITY.parent) as parent:
@@ -133,7 +133,7 @@ def store(fd: int, key: bytes, data: dict) -> None:
     os.rename(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
 
 
-def records() -> list[dict]:
+def records(strict: bool = False) -> list[dict]:
     found = []
     try:
         with registry() as (fd, key):
@@ -142,15 +142,22 @@ def records() -> list[dict]:
                     try:
                         found.append(load(fd, key, name[:-5]))
                     except (OSError, ValueError, KeyError, TypeError):
+                        if strict:
+                            raise
                         continue
     except OSError:
+        if strict:
+            raise
         pass
     return found
 
 
 def pending(workspace: Path) -> bool:
-    return any(d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), workspace.absolute())
-               for d in records())
+    try:
+        return any(d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), workspace.absolute())
+                   for d in records(True))
+    except (OSError, ValueError, KeyError, TypeError):
+        return os.path.lexists(AUTHORITY)
 
 
 def overlap(a: Path, b: Path) -> bool:
@@ -242,13 +249,40 @@ def producing(a: Attempt | None):
         PRODUCING.reset(token)
 
 
+def process_ids() -> set[int]:
+    if not paths.ON_MAC:
+        raise ConfinementUnavailable("producer lifetime inspection unavailable")
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    lib.proc_listpids.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_int)
+    lib.proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+    size = lib.proc_listpids(4, os.getuid(), None, 0)
+    if size <= 0:
+        raise OSError(errno.EBUSY, "producer enumeration unavailable")
+    pids = (ctypes.c_int * (size // 4 + 1024))()
+    size = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids))
+    if size <= 0 or size >= ctypes.sizeof(pids):
+        raise OSError(errno.EBUSY, "producer enumeration incomplete")
+    found = set()
+    for pid in pids[:size // 4]:
+        if not pid or pid == os.getpid():
+            continue
+        info = (ctypes.c_uint64 * 7)()
+        if lib.proc_pidinfo(pid, 17, 0, info, ctypes.sizeof(info)) != ctypes.sizeof(info):
+            raise OSError(errno.EBUSY, "producer changed during enumeration")
+        found.add(info[2])
+    return found
+
+
 def producer_group(a: Attempt, producer: str, group: int | None) -> None:
     with registry() as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
         data = load(fd, key, a.selector)
         if data["attempt"] != asdict(a) or data["state"] not in ("prepared", "active"):
             raise PermissionError("verification producer authority revoked")
-        data["producers"][producer] = {"gated": True, "group": group}
+        if producer not in data["producers"]:
+            data["producers"][producer] = {"gated": True, "before": sorted(process_ids())}
+        entry = data["producers"][producer]
+        entry["group"] = group
         store(fd, key, data)
 
 
@@ -256,6 +290,11 @@ def protected_command(command, cwd=None):
     from . import pi
 
     if not pi.can_confine(False):
+        return command
+    lib = ctypes.CDLL(None)
+    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+    if all(lib.sandbox_check(os.getpid(), op, 1, os.fsencode(AUTHORITY)) == 1
+           for op in (b"file-read-data", b"file-write-data")):
         return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
     return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False) + words
@@ -277,19 +316,24 @@ def service_command(a: Attempt, command: str) -> list[str]:
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
     a = PRODUCING.get()
     if a is None:
+        if actor_confined:
+            return subprocess.Popen(*args, **kwargs)
         command, *rest = args
         if kwargs.pop("shell", False):
             command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
         args = (protected_command(command, kwargs.get("cwd")), *rest)
         return subprocess.Popen(*args, **kwargs)
-    if not actor_confined:
-        raise ConfinementUnavailable("trusted verification cannot launch an actor outside verified confinement")
     producer = secrets.token_hex(16)
     producer_group(a, producer, None)
     kwargs.pop("process_group", None)
     command, *rest = args
     if kwargs.pop("shell", False):
         command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
+    if not actor_confined:
+        with registry() as (fd, key):
+            if load(fd, key, a.selector)["state"] == "active":
+                raise ConfinementUnavailable("active authority requires verified actor confinement")
+        command = protected_command(command, kwargs.get("cwd"))
     read_gate, release_gate = os.pipe()
     try:
         proc = subprocess.Popen([str(Path(sys.executable).resolve()), "-I", "-c", GATED_EXEC,
@@ -317,8 +361,16 @@ def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
 def producers_done(data: dict) -> bool:
     if "producers" not in data:
         return False
+    current = None
     for group in data["producers"].values():
         if isinstance(group, dict) and group.get("gated") is True:
+            if group["group"]:
+                if "before" not in group:
+                    return False
+                if current is None:
+                    current = process_ids()
+                if current - set(group["before"]):
+                    return False
             group = group["group"]
             if group is None:
                 continue
@@ -473,6 +525,8 @@ def save(a: Attempt, names: list[str], final: bool = False) -> str:
                                    0o600, dir_fd=output)
                 with os.fdopen(manifest, "wb") as target:
                     target.write(encoded({"attempt": a.selector, "files": names}))
+            checked(os.stat(dest, dir_fd=evidence, follow_symlinks=False), destination_identity, True)
+            checked(os.stat(a.selector, dir_fd=fd, follow_symlinks=False), data["evidence"], True)
             data["archives"].append(dest)
             store(fd, key, data)
             return str(AUTHORITY / a.selector / dest)
@@ -551,6 +605,14 @@ def captured(a: Attempt, fd: int) -> None:
     checked(os.stat("tree", dir_fd=fd, follow_symlinks=False), a.directories[""], True)
 
 
+def seal(a: Attempt, root: int, mode: int) -> None:
+    checked(os.fstat(root), a.directories[""], True)
+    for name, expected in a.directories.items():
+        with paths.directory_fd(Path(name), root) as directory:
+            checked(os.fstat(directory), expected, True)
+            os.fchmod(directory, mode)
+
+
 def cleanup(a: Attempt, data: dict, fd: int, key: bytes) -> list[str]:
     with paths.directory_fd(Path(a.workspace)) as workspace:
         if data.get("cleanup_version") is None and not data.get("capture"):
@@ -588,12 +650,19 @@ def cleanup(a: Attempt, data: dict, fd: int, key: bytes) -> list[str]:
                 try:
                     if transaction.get("restore"):
                         raise OSError(errno.ESTALE, "restoration must finish before cleanup")
+                    with paths.directory_fd(Path("tree"), archive) as tree:
+                        seal(a, tree, 0o500)
                     captured(a, archive)
                     with paths.directory_fd(Path(a.workspace)) as current:
                         checked(os.fstat(current), data["workspace_identity"], True)
                 except OSError:
                     transaction["restore"] = True
                     store(fd, key, data)
+                    try:
+                        with paths.directory_fd(Path("tree"), archive) as tree:
+                            seal(a, tree, 0o700)
+                    except OSError:
+                        pass
                     restore_entry("tree", archive, Path(a.root).name, workspace)
                     data.pop("capture")
                     data["diagnostic"] = "concurrent replacement restored to its original location"
@@ -637,6 +706,10 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
                 kept = cleanup(a, data, fd, key)
                 return data.get("snapshot", ""), [], kept
             if not os.path.lexists(a.root):
+                if a.directories or a.files:
+                    data["diagnostic"] = "registered scratch root missing; original workspace retained"
+                    store(fd, key, data)
+                    return "", [], kept
                 data["state"] = "done"
                 data["diagnostic"] = "scratch absent; no source resources mutated"
                 store(fd, key, data)
@@ -739,5 +812,5 @@ def note(a: Attempt | None) -> str:
             "Unknown or replaced entries keep the worktree retained; failed preservation is retried by polling. "
             "Scratch fixtures do not change the delivered implementation. Never copy real credentials or live state. "
             "Use fake transports before product calls. Unsupported confinement supplies no enhanced authority. "
-            "Installed guard integration is pending; guards and JEV remain authoritative. "
+            "The guard supplies authenticated snapshots as context; guards and JEV remain authoritative. "
             "Report unavailable fixtures or services as blocked, with the command and reason.")

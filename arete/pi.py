@@ -564,6 +564,7 @@ def can_confine(remote: bool) -> bool:
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
                       *, hidden: tuple[Path, ...] = (), restrict_writes: bool = True,
                       agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False) -> list[str]:
+    hidden = tuple(dict.fromkeys((*hidden, scratch.AUTHORITY)))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
     allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
@@ -959,7 +960,8 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
            cost_of: Callable[[str], float],
            on_line: Callable[[str], None], *, pass_fds: tuple[int, ...] = ()) -> tuple[subprocess.CompletedProcess, str]:
     proc = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, errors="replace", env=env, pass_fds=pass_fds)
+                         text=True, errors="replace", env=env, pass_fds=pass_fds,
+                         actor_confined=bool(cmd and cmd[0] == "/usr/bin/sandbox-exec"))
     stderr: list[str] = []
     reader = threading.Thread(target=lambda: stderr.append(proc.stderr.read()), daemon=True)
     reader.start()

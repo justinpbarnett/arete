@@ -170,7 +170,8 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
     table = {"extends": PROFILE_BASE[name], "filesystem": {**granted, **metadata,
-             **kept_out([cwd, *add_dirs], hidden), **executables(allowed_tools, hidden)},
+             **kept_out([cwd, *add_dirs], [*hidden, verification_scratch.AUTHORITY]),
+             **executables(allowed_tools, [*hidden, verification_scratch.AUTHORITY])},
              "network": {"enabled": False}}
     return [*setting("default_permissions", name), "-c", f"permissions.{name}={toml_value(table)}"]
 
@@ -207,6 +208,9 @@ def mcp_settings(mcp_config: str, allowed_tools: list[str] | None = None) -> lis
             continue
         table = ({"url": server["url"]} if server.get("url") else
                  {"command": server.get("command", ""), "args": list(server.get("args") or [])})
+        if "command" in table:
+            confined = verification_scratch.protected_command([table["command"], *table["args"]])
+            table["command"], table["args"] = confined[0], confined[1:]
         prefix = f"mcp__{name}"
         rules = set(allowed_tools or [])
         whole = prefix in rules or f"{prefix}__*" in rules
@@ -393,10 +397,10 @@ def _run(
     try:
         attempt = verification_scratch.PRODUCING.get()
         protected = {Path(p).resolve() for p in hidden}
-        confined = (not json.loads(mcp_config or "{}").get("mcpServers")
-                    and (attempt is None or (verification_scratch.AUTHORITY.resolve() in protected
+        confined = (attempt is None or not scratch or (not json.loads(mcp_config or "{}").get("mcpServers")
+                         and verification_scratch.AUTHORITY.resolve() in protected
                          and paths.WORKTREES_DIR.resolve() in protected
-                         and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config))))
+                         and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
         proc = claude.run_streaming(cmd, str(cwd), prompt, env, timeout, streamed, actor_confined=confined)
     except subprocess.TimeoutExpired:
         return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
