@@ -641,11 +641,15 @@ def head_key(c: Checkout) -> str:
 SALT_KEY = "\0salt"
 
 
+def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
+    return [n for n in names
+            if not any(part.startswith(paths.SCRATCH_PREFIX) for part in Path(n).parts)
+            and not any(h.is_relative_to(ws / n) for h in held)]
+
+
 def note_made(ws: Path, checkouts: list[Checkout]) -> None:
-    if scratch_left(ws, checkouts):
-        return
     try:
-        names = leftovers(ws, checkouts) if ws.is_dir() else []
+        names = outside_scratch(ws, leftovers(ws, checkouts), scratch_left(ws, checkouts)) if ws.is_dir() else []
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         if names or heads:
             salt = os.urandom(16).hex()
