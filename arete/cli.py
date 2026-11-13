@@ -372,6 +372,11 @@ def cmd_ask(args) -> int:
 
 
 def cmd_jev(args) -> int:
+    if args.action != "report":
+        from . import calibrate
+
+        return calibrate.main(args)
+
     import json
 
     from . import verdicts
@@ -1408,8 +1413,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_ask)
 
-    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts")
-    p.add_argument("action", choices=("report",))
+    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts; "
+                                   "compare decision models offline")
+    p.add_argument("action", choices=("report", "compare", "sample"))
+    p.add_argument("target", nargs="?", default="", help="compare: the spec file; sample: a new empty folder")
+    p.add_argument("--out", metavar="DIR", help="compare: where to write proposal.json and predictions.jsonl "
+                                                "(default: out next to the spec)")
     p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_jev)
