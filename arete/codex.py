@@ -161,7 +161,7 @@ def run_cleanup_probe(version: str) -> Cleanup:
         for name in (".env", "nested/deep/.env"):
             (workspace / name).parent.mkdir(parents=True, exist_ok=True)
             (workspace / name).write_text("PLACEHOLDER=not-a-secret\n")
-        cmd = [binary(), "sandbox", SANDBOX_PLATFORMS[sys.platform], *profile(workspace, [], True, []), "--",
+        cmd = [binary(), "sandbox", *profile(workspace, [], True, []), "--",
                sys.executable, "-I", "-c", CLEANUP_PROBE]
         try:
             proc = launch(cmd, workspace, "", {**agent_env(), "TMPDIR": str(workspace)}, CLEANUP_TIMEOUT_SECONDS,
