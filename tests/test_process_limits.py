@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -52,6 +53,93 @@ class Isolated(unittest.TestCase):
 
 
 class BudgetTests(Isolated):
+    def delayed_start(self, concurrent, drive):
+        before_lock, finished = threading.Event(), threading.Event()
+        original_lock, failures = util.lock, []
+        ticket_lock = state.run_lock("pipeline", self.repo.name, self.ticket)
+        def worker():
+            try:
+                if not before_lock.wait(5):
+                    raise AssertionError("launcher never reached its ticket lock")
+                with original_lock(ticket_lock) as got:
+                    if not got:
+                        raise AssertionError("concurrent attempt could not acquire its ticket lock")
+                    concurrent()
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                finished.set()
+        @contextlib.contextmanager
+        def delayed_lock(name, *args, **kw):
+            if name == ticket_lock:
+                before_lock.set()
+                if not finished.wait(5):
+                    raise AssertionError("concurrent attempt never finished")
+            with original_lock(name, *args, **kw) as got:
+                yield got
+        thread = threading.Thread(target=worker)
+        thread.start()
+        called = []
+        try:
+            with patch.object(config, "load", return_value=self.cfg), \
+                    patch.object(pipeline, "run_refusal", return_value=(True, "")), \
+                    patch.object(util, "lock", side_effect=delayed_lock), \
+                    patch.object(pipeline.runner, "run", side_effect=lambda *a, **k: called.append(True)):
+                code = pipeline.run_issue(self.repo.name, self.ticket, force=True,
+                                          script=pipeline.Script("feature", drive))
+        finally:
+            before_lock.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(called, [])
+        return code
+
+    def test_delayed_launcher_counts_attempt_completed_before_ticket_lock(self):
+        first = self.made_run()
+        first.budget.charge("review_fix1", "review_repair")
+        record.settle(first.id, "failed")
+        def concurrent():
+            second = self.made_run(first.id)
+            second.budget.charge("review_fix2", "review_repair")
+            record.settle(second.id, "failed")
+        def drive(flow):
+            flow.ctx.run.agent("repair", "one repair too many", self.repo.path, role="review_repair")
+        self.assertEqual(self.delayed_start(concurrent, drive), 1)
+        latest = state.ticket_runs(self.repo.name, self.ticket)[0]
+        self.assertIn("repair cycles", latest["summary"])
+        self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
+
+    def test_delayed_launcher_does_not_reuse_another_epoch_reset(self):
+        first = self.made_run()
+        first.budget.park("first epoch exhausted")
+        record.settle(first.id, "failed")
+        with state.db() as connection:
+            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("A narrower specification", self.ticket))
+        def concurrent():
+            second = self.made_run()
+            second.budget.charge("review_fix1", "review_repair")
+            second.budget.charge("review_fix2", "review_repair")
+            second.budget.park("second epoch exhausted")
+            record.settle(second.id, "failed")
+        def drive(flow):
+            flow.ctx.run.agent("repair", "stale reset must not run", self.repo.path, role="review_repair")
+        self.assertEqual(self.delayed_start(concurrent, drive), 2)
+        self.assertEqual(len(state.ticket_runs(self.repo.name, self.ticket)), 2)
+
+    def test_interrupted_atomic_publish_keeps_previous_authoritative_files(self):
+        run = self.made_run()
+        run.budget.park("original park")
+        for name, action in (("budget.json", run.budget.persist),
+                             ("parked.json", lambda: run.budget.park("replacement park"))):
+            path = run.dir / name
+            before = path.read_bytes()
+            with patch.object(util.os, "replace", side_effect=runlimits.Parked("interrupted before replace")):
+                with self.assertRaises(runlimits.Parked):
+                    action()
+            self.assertEqual(path.read_bytes(), before)
+            self.assertIsInstance(json.loads(path.read_text()), dict)
+
     def test_limits_validate_positive_integers_and_explicit_parallel_opt_in(self):
         (self.root / "config.toml").write_text("[limits]\nmax_repair_cycles=4\nmax_run_minutes=90\n"
                                              "max_verify_minutes=25\nparallel_checks=true\n")
@@ -100,6 +188,43 @@ class BudgetTests(Isolated):
                               env={k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("budget remained exhausted", done.stdout)
+
+    def test_repair_usage_is_durable_even_when_audit_event_cannot_be_written(self):
+        first = self.made_run()
+        with patch.object(lines, "write", return_value={}):
+            first.budget.charge("review_fix1", "review_repair")
+            first.budget.charge("verify_fix1", "build")
+        record.settle(first.id, "failed")
+        second = self.made_run(first.id)
+        with self.assertRaisesRegex(runlimits.Parked, "repair cycles"):
+            second.budget.charge("repair", "review_repair")
+
+    def test_abrupt_process_exit_retains_active_verification_checkpoint_without_audit(self):
+        overrides = {name: str(getattr(paths, name)) for name in (
+            "STATE_DIR", "RUNS_DIR", "DB_FILE", "LOCKS_DIR", "CONFIG_DIR", "CONFIG_FILE", "LOG_DIR",
+            "EVENTS_FILE", "WORKTREES_DIR")}
+        before = util.iso(util.now() - timedelta(minutes=21))
+        code = (f"import os,sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
+                "from pathlib import Path;from arete import config,paths,pipeline,record,runlimits,tracker,util,lines;"
+                f"overrides={overrides!r};"
+                "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
+                f"util.now=lambda:util.parse_iso({before!r});"
+                f"repo=config.Repo(name='fixture',path=Path({str(self.repo.path)!r}),tracker='local');"
+                f"tid={self.ticket!r};rid=record.start('pipeline',repo=repo.name,issue=tid);"
+                "folder=paths.RUNS_DIR/rid;folder.mkdir();local=tracker.LocalTracker(repo);"
+                "run=pipeline.Run(rid,repo,folder,tracker=local,tid=tid);"
+                "budget=runlimits.Budget(run,runlimits.Policy(),'',local.get(tid));"
+                "lines.write=lambda *a,**k:{};"
+                "\nwith budget.watching(),budget.verifying():os._exit(0)")
+        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
+                              env={k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        previous = state.ticket_runs(self.repo.name, self.ticket)[0]
+        record.settle(previous["id"], "interrupted")
+        next_run = self.made_run(previous["id"])
+        with self.assertRaisesRegex(runlimits.Parked, "verification"):
+            with next_run.budget.watching(), next_run.budget.verifying():
+                self.fail("abrupt exit reset verification usage")
 
     def test_legacy_nested_announcements_count_one_cycle(self):
         rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
@@ -181,6 +306,15 @@ class BudgetTests(Isolated):
         with self.assertRaises(ValueError):
             runlimits.family(run.id)
 
+    def test_corrupt_verification_usage_does_not_reset_spent_time(self):
+        run = self.made_run()
+        path = run.dir / "budget.json"
+        original = json.loads(path.read_text())
+        for invalid in (-1, float("nan"), "unknown"):
+            util.write_json(path, {**original, "verification_seconds": invalid})
+            with self.assertRaises(ValueError):
+                runlimits.verification_seconds(run.id, state.run_get(run.id))
+
     def test_individual_step_reruns_cannot_reset_the_ticket_budget(self):
         first = self.made_run()
         first.budget.charge("review_fix1", "review_repair")
@@ -240,6 +374,64 @@ class BudgetTests(Isolated):
 
 
 class QueueTests(Isolated):
+    def interrupted_repair(self):
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath="adw"\n[verify]\nnotes="offline"\n')
+        source = self.made_run()
+        record.settle(source.id, "pr")
+        current = self.made_run(source.id)
+        lines.write(current.id, "repair", source=source.id)
+        record.settle(current.id, "interrupted")
+        return current
+
+    def test_interrupted_repair_ignores_held_planner_and_uses_repair_atom(self):
+        self.interrupted_repair()
+        seen, started = [], []
+        def routes(setting, *args, **kw):
+            seen.append(setting.step)
+            return [SimpleNamespace(state="held" if setting.step in ("plan", "build") else "ready",
+                                    detail="fixture quota hold", until="")]
+        with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)):
+            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
+        self.assertEqual(started, [self.ticket])
+        self.assertEqual(seen, ["review_repair", "verify", "review"])
+
+    def test_interrupted_repair_waits_for_its_actual_held_repair_route(self):
+        self.interrupted_repair()
+        seen, started = [], []
+        def routes(setting, *args, **kw):
+            seen.append(setting.step)
+            return [SimpleNamespace(state="held" if setting.step == "review_repair" else "ready",
+                                    detail="repair quota hold", until="")]
+        with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)):
+            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
+        self.assertEqual(started, [])
+        self.assertEqual(seen, ["review_repair"])
+
+    def test_revision_ignores_held_planner(self):
+        seen, started = [], []
+        def routes(setting, *args, **kw):
+            seen.append(setting.step)
+            return [SimpleNamespace(state="held" if setting.step == "plan" else "ready",
+                                    detail="planner quota hold", until="")]
+        with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)), \
+                patch.object(pipeline, "pending_feedback", return_value=[{"id": 1}]):
+            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
+        self.assertEqual(started, [self.ticket])
+        self.assertEqual(seen, ["build", "review"])
+
+    def test_interrupted_ticket_rechecks_dependencies_before_starting(self):
+        interrupted = self.made_run()
+        record.settle(interrupted.id, "interrupted")
+        prerequisite = state.task_add(self.repo.name, "Prerequisite", "Prerequisite", "feat")
+        with state.db() as connection:
+            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", (f"Waits on {prerequisite}", self.ticket))
+        self.cfg.replay = config.ReplayConfig(all=True)
+        started = []
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
+        self.assertNotIn(self.ticket, started)
+        self.assertIn(prerequisite, started)
+
     def poll_with(self, cfg, spawn):
         with patch.object(config, "load", return_value=cfg), patch.object(pipeline, "runnable", return_value=True), \
                 patch.object(pipeline, "spawn_run", side_effect=spawn), \

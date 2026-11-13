@@ -1112,22 +1112,22 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
         print(refusal)
         return 2
-    layer = config.load_layer(repo.layer_dir)
-    budget_history = state.ticket_runs(repo.name, tid, limit=1)
-    try:
-        blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
-    except (ValueError, OSError) as e:
-        print(f"could not validate the process budget: {e}")
-        return 2
-    if blocked and not dry_run:
-        print(blocked)
-        return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
     lock = state.run_lock("pipeline", repo.name, tid)
     with util.lock(lock) as got:
         if not got:
             print(f"{name} is already running")
             return 0
+        try:
+            layer = config.load_layer(repo.layer_dir)
+            budget_history = state.ticket_runs(repo.name, tid, limit=1)
+            blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
+        except (ValueError, OSError) as e:
+            print(f"could not validate the process budget: {e}")
+            return 2
+        if blocked and not dry_run:
+            print(blocked)
+            return 2
         if script and script.repairs and (later := state.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
             return 1
@@ -2957,7 +2957,14 @@ def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
                   discovery: routing.Discovery, layer: config.RepoLayer) -> str:
     if cfg.replay.all:
         return ""
-    for role in ("plan", "build", "review", *(("verify",) if layer.verify else ())):
+    first = ("plan", "build")
+    newest = state.ticket_runs(repo.name, ticket.id, limit=1, whole=True)
+    if (layer.factory_path == "adw" and newest and newest[0]["status"] == "interrupted"
+            and repaired_by(newest[0]["id"])):
+        first = ("review_repair",)
+    elif pending_feedback(repo.name, ticket.id):
+        first = ("build",)
+    for role in (*first, *(("verify",) if layer.verify else ()), "review"):
         setting = steps.resolve(cfg, layer, role, ticket.kind)
         if setting.runner == runner.REPLAY:
             continue
@@ -3041,7 +3048,7 @@ def poll(dry_run: bool = False) -> int:
                         continue
                     blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
                     ticket = source.get(tid)
-                    blocked = blocked or route_blocker(cfg, repo, ticket, discovery, layer)
+                    blocked = blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, discovery, layer)
                     if blocked:
                         skips.note(name, ticket, blocked, repo.name)
                         print(f"{util.iso()} {name}: {blocked}")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import signal
 import time
 from contextlib import contextmanager
@@ -113,7 +114,13 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool) -> tuple[
 
 def repair_count(run_id: str) -> int:
     read = lines.read(run_id)
-    if metadata(run_id, "budget.json"):
+    saved = metadata(run_id, "budget.json")
+    if "repair_calls" in saved:
+        count = saved["repair_calls"]
+        if type(count) is not int or count < 0:
+            raise ValueError(f"run {run_id} has invalid repair usage")
+        return count
+    if saved:
         return sum(item.get("event") == "budget_repair" for item in read)
     found = set()
     for item in read:
@@ -131,7 +138,16 @@ def elapsed(row: dict) -> float:
 
 def verification_seconds(run_id: str, row: dict) -> float:
     read = lines.read(run_id)
-    if metadata(run_id, "budget.json"):
+    saved = metadata(run_id, "budget.json")
+    active, spent = saved.get("verification_active_since"), saved.get("verification_seconds", 0)
+    if type(spent) not in (int, float) or not math.isfinite(spent) or spent < 0:
+        raise ValueError(f"run {run_id} has invalid verification usage")
+    if active is not None and (not isinstance(active, str) or not active):
+        raise ValueError(f"run {run_id} has invalid active verification checkpoint")
+    if active or spent:
+        return max(0, float(spent)) + (max(0, (util.parse_iso(row.get("finished") or util.iso()) -
+                                             util.parse_iso(active)).total_seconds()) if active else 0)
+    if saved:
         active, spent = None, 0.0
         for item in read:
             if item.get("event") == "budget_verify_start":
@@ -155,6 +171,9 @@ class Budget:
         self.prior_seconds = sum(elapsed(row) for row in rows)
         self.verify_seconds = sum(verification_seconds(row["id"], row) for row in rows)
         self.prior_repairs = sum(repair_count(rid) for rid in self.parents)
+        self.repair_calls = 0
+        self.current_verification_seconds = 0.0
+        self.verification_active_since = None
         self.started = time.monotonic() - elapsed(state.run_get(run.id))
         self.deadline = self.started + policy.max_run_minutes * 60 - self.prior_seconds
         self.verify_deadline = None
@@ -176,8 +195,11 @@ class Budget:
         self.persist()
 
     def persist(self) -> None:
-        self.run.save("budget.json", {"version": 1, "parents": self.parents, "policy": asdict(self.policy),
-                                      "specification": self.specification})
+        util.write_json(artifact(self.run.id, "budget.json"), {
+            "version": 1, "parents": self.parents, "policy": asdict(self.policy),
+            "specification": self.specification, "repair_calls": self.repair_calls,
+            "verification_seconds": self.current_verification_seconds,
+            "verification_active_since": self.verification_active_since})
 
     def capture(self, ticket) -> None:
         self.specification = specification(ticket)
@@ -215,6 +237,8 @@ class Budget:
             raise Parked(f"verification reached its cumulative {self.policy.max_verify_minutes:g} minute budget")
         started = time.monotonic()
         self.verify_deadline = started + remaining
+        self.verification_active_since = util.iso()
+        self.persist()
         lines.write(self.run.id, "budget_verify_start")
         self.arm()
         try:
@@ -222,6 +246,9 @@ class Budget:
         finally:
             spent = time.monotonic() - started
             self.verify_seconds += spent
+            self.current_verification_seconds += spent
+            self.verification_active_since = None
+            self.persist()
             lines.write(self.run.id, "budget_verify_end", seconds=spent)
             self.verify_deadline = None
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -234,9 +261,11 @@ class Budget:
             raise Parked(self.reason())
         if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
             return
-        count = self.prior_repairs + repair_count(self.run.id)
+        count = self.prior_repairs + self.repair_calls
         if count >= self.policy.max_repair_cycles:
             raise Parked(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
+        self.repair_calls += 1
+        self.persist()
         lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
 
     def park(self, reason: str) -> dict:
@@ -249,11 +278,10 @@ class Budget:
             published = None
         pr_url = str(row.get("pr_url") or next((r.get("pr_url") for rid in self.parents
                      if (r := state.run_get(rid)) and r.get("pr_url")), ""))
-        self.run.save("parked.json", {"reason": reason, "policy": asdict(self.policy),
-                                       "specification": self.specification, "heads": published, "branch": branch,
-                                       "pr_url": pr_url,
-                                       "workspace": str(self.run.workspace[0]) if self.run.workspace else "",
-                                       "retry": RETRY})
+        util.write_json(artifact(self.run.id, "parked.json"), {
+            "reason": reason, "policy": asdict(self.policy), "specification": self.specification,
+            "heads": published, "branch": branch, "pr_url": pr_url,
+            "workspace": str(self.run.workspace[0]) if self.run.workspace else "", "retry": RETRY})
         lines.write(self.run.id, "parked", reason=reason, retry=RETRY)
         return {"branch": branch, "pr_url": pr_url}
 
