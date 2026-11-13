@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import asdict
 import functools
 import http.server
@@ -31,6 +32,7 @@ LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/Laun
               "/Support/lsregister")
 CONNECT = "import socket, sys; socket.create_connection(('127.0.0.1', int(sys.argv[1])), 3).close(); open(sys.argv[2], 'w').close()"
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+GRANTS = pi.WRITABLE_ALWAYS
 
 
 def attempt_for(ws: Path) -> scratch.Attempt:
@@ -173,6 +175,7 @@ class BrowserServerTests(unittest.TestCase):
                       mock.patch.object(scratch, "sandboxed", return_value=False),
                       mock.patch.object(pi, "can_confine", return_value=True),
                       mock.patch.dict(os.environ, {"TMPDIR": "/private/var/empty"}),
+                      mock.patch.object(pi, "WRITABLE_ALWAYS", ("/private/tmp", "/dev")),
                       mock.patch.object(browser.shutil, "which", return_value=str(self.node))):
             patch.start()
             self.addCleanup(patch.stop)
@@ -301,14 +304,78 @@ class BrowserServerTests(unittest.TestCase):
         scratch.update_browser(self.a, loopback=False)
         self.assertEqual(scratch.browser_config(self.a, self.config, [self.evidence]), self.config)
 
-    def launch(self, mcp_config):
+    def launch(self, mcp_config, said=None):
         picked = SimpleNamespace(candidate=SimpleNamespace(runner="codex", effort="", instructions=()))
         trip = SimpleNamespace(cfg=SimpleNamespace(jev=SimpleNamespace(guard=False)), repo=None, scratch=self.a,
                                target=SimpleNamespace(remote=None), tokens=None)
         base = {"mcp_config": mcp_config, "add_dirs": [self.evidence]}
         with mock.patch.dict(scratch.LEASES, {self.a.selector: 0}), \
                 mock.patch.object(runner.environment, "passed", return_value=[]):
-            return runner.launch_kwargs(base, picked, trip, ("r", "s"), False, lambda _: None)
+            return runner.launch_kwargs(base, picked, trip, ("r", "s"), False, [].append if said is None else said.append)
+
+    def test_a_browser_tree_an_actor_can_write_or_replace_is_refused_before_any_download(self):
+        self.prepare()
+        config_text, _ = self.exact()
+        shared = Path(tempfile.mkdtemp(dir="/private/tmp"))
+        self.addCleanup(shutil.rmtree, shared, True)
+        (self.root / "linked").symlink_to(shared)
+        folder = self.run_dir / "browser"
+        cases = (
+            ("the service temp grant holds the run folder", lambda: mock.patch.object(pi, "WRITABLE_ALWAYS", GRANTS),
+             "browser folder", "service"),
+            ("state under /private/tmp", lambda: mock.patch.object(paths, "STATE_DIR", shared / "state"),
+             "pinned browser server", "agent"),
+            ("state behind a link into /private/tmp", lambda: mock.patch.object(
+                paths, "STATE_DIR", self.root / "linked" / "x" / ".." / "state"), "pinned browser server", "agent"),
+            ("state inside the workspace", lambda: mock.patch.object(paths, "STATE_DIR", self.ws / "state"),
+             "pinned browser server", "agent"),
+            ("state inside the evidence", lambda: mock.patch.object(paths, "STATE_DIR", self.evidence / "state"),
+             "pinned browser server", "agent"),
+            ("state inside the browser folder", lambda: mock.patch.object(paths, "STATE_DIR", folder / "state"),
+             "pinned browser server", "browser"),
+            ("a temp grant inside the browser folder",
+             lambda: mock.patch.dict(os.environ, {"TMPDIR": str(folder / "tmp")}), "browser folder", "agent"),
+        )
+        for name, layout, tree, actor in cases:
+            self.reactivate()
+            with self.subTest(name), layout(), mock.patch.object(
+                    browser, "resolved", side_effect=AssertionError("downloaded into an exposed tree")):
+                with self.assertRaisesRegex(scratch.ConfinementUnavailable, f"the {tree} .* the {actor} write grant"):
+                    scratch.browser_config(self.a, self.config, [self.evidence])
+                with self.assertRaises(scratch.ConfinementUnavailable):
+                    scratch.browser_server(self.a)
+                self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], config_text))
+                with self.assertRaises(ValueError):
+                    self.settings(config_text)
+                said = []
+                refused = self.launch(self.config, said)
+                self.assertIn(f"browser confinement unavailable: the {tree}", refused["budget_error"])
+                self.assertEqual(refused["mcp_config"], self.config)
+                self.assertIn(scratch.note(None), refused["system"])
+                self.assertTrue(any("trusted scratch authority unavailable" in line for line in said))
+        with self.linked_run(), self.assertRaisesRegex(scratch.ConfinementUnavailable, "the browser folder .* agent"):
+            scratch.browser_server(self.a)
+        self.reactivate()
+        self.assertTrue(scratch.isolation(self.a, "codex", False, [self.evidence], config_text))
+        self.assertIn("mcp_servers.playwright", " ".join(self.settings(config_text)))
+
+    def reactivate(self):
+        with scratch.registry() as (fd, key):
+            data = scratch.load(fd, key, self.a.selector)
+            data["state"] = "active"
+            scratch.store(fd, key, data)
+
+    @contextlib.contextmanager
+    def linked_run(self):
+        moved = Path(tempfile.mkdtemp(dir="/private/tmp")) / "r"
+        self.run_dir.rename(moved)
+        self.run_dir.symlink_to(moved)
+        try:
+            yield
+        finally:
+            self.run_dir.unlink()
+            moved.rename(self.run_dir)
+            shutil.rmtree(moved.parent)
 
     def test_launch_fails_instead_of_falling_back_when_the_browser_cannot_be_activated(self):
         self.install()
@@ -393,8 +460,7 @@ class BrowserServerTests(unittest.TestCase):
 
     def test_a_tampered_tarball_tree_or_pin_is_refused(self):
         folder = self.install()
-        node, cli = browser.checked()
-        self.assertEqual(node, str(self.node))
+        self.assertEqual(browser.checked()[0], str(self.node))
         tarball = next((folder / "tarballs").iterdir())
         installed = folder / "node_modules" / "dep" / "index.js"
         pin = scratch.AUTHORITY / browser.PIN
@@ -674,7 +740,7 @@ class EscapeTests(unittest.TestCase):
             marker = folder / name
             marker.unlink(missing_ok=True)
             subprocess.run(run(["/bin/sh", "-c", f"/usr/bin/nc -z 127.0.0.1 {port} && : > {marker}"]), cwd=self.ws,
-                           capture_output=True, timeout=30)
+                           capture_output=True, timeout=30, check=False)
             self.assertEqual(marker.exists(), reached, name)
 
     def test_browser_profile_writes_only_its_folder_and_the_evidence(self):
@@ -683,7 +749,8 @@ class EscapeTests(unittest.TestCase):
                                 (self.ws / "w", False), (self.marks / "w", False),
                                 (Path(attempt.run_dir) / "w", False)):
             target.unlink(missing_ok=True)
-            subprocess.run(run(["/bin/sh", "-c", f": > {target}"]), cwd=self.ws, capture_output=True, timeout=30)
+            subprocess.run(run(["/bin/sh", "-c", f": > {target}"]), cwd=self.ws, capture_output=True, timeout=30,
+                           check=False)
             self.assertEqual(target.exists(), allowed, str(target))
 
     def test_browser_profile_hides_the_state_folder_but_for_its_own_evidence(self):
@@ -691,10 +758,10 @@ class EscapeTests(unittest.TestCase):
         (self.root / "state" / "other.txt").write_text("state-secret")
         (Path(attempt.run_dir) / "evidence" / "shot").write_text("shot")
         inside = subprocess.run(run(["/bin/cat", str(self.root / "state" / "other.txt")]), cwd=self.ws,
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, check=False)
         self.assertNotIn("state-secret", inside.stdout)
         seen = subprocess.run(run(["/bin/cat", str(Path(attempt.run_dir) / "evidence" / "shot")]), cwd=self.ws,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
         self.assertEqual(seen.stdout, "shot", seen.stderr)
 
     def test_git_in_a_linked_worktree_works_inside(self):
@@ -818,9 +885,11 @@ class BrowserRunTests(unittest.TestCase):
         threading.Thread(target=self.app.serve_forever, daemon=True).start()
         self.addCleanup(self.app.server_close)
         self.addCleanup(self.app.shutdown)
-        patch = mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees")
-        patch.start()
-        self.addCleanup(patch.stop)
+        for patch in (mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees"),
+                      mock.patch.object(pi, "WRITABLE_ALWAYS", ("/private/tmp", "/dev")),
+                      mock.patch.dict(os.environ, {"TMPDIR": "/private/var/empty"})):
+            patch.start()
+            self.addCleanup(patch.stop)
         selector = os.urandom(32).hex()
         self.a = scratch.Attempt(selector, "t", "r", "verify", str(self.ws), str(self.ws / ".arete-scratch-0123456789abcdef"),
                                  str(self.run_dir), {}, {})

@@ -724,8 +724,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
                 and (kw.get("mcp_config", "") != original
                      or verification_scratch.plain_config(trip.scratch, original) is None)):
             kw["budget_error"] = "browser confinement unavailable: the trusted browser could not be activated"
-        if not hook and "mcp_config" in kw:
-            kw["mcp_config"] = original
+        if not hook:
+            if "mcp_config" in kw:
+                kw["mcp_config"] = original
             say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
             kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
         kw["verification_attempt"] = trip.scratch

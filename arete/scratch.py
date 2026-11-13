@@ -470,6 +470,58 @@ def browser_profile(a: Attempt, port: int, folder: Path) -> list[str]:
                                 mach=(BROWSER_MACH, BROWSER_MACH_PATTERN), tcp_port=port)
 
 
+def temp_grants() -> tuple[Path, ...]:
+    return (Path("/tmp").resolve(), Path("/private/tmp"), Path(os.getenv("TMPDIR", "/tmp")).resolve())
+
+
+def actor_grants(a: Attempt) -> dict[str, tuple[Path, ...]]:
+    from . import pi
+
+    evidence = evidence_path(a.run_dir)
+    return {"agent": (Path(a.workspace), evidence, *temp_grants()),
+            "service": (Path(a.workspace), *map(Path, pi.WRITABLE_ALWAYS)),
+            "browser": (browser_path(a.run_dir), evidence, *map(Path, pi.WRITABLE_DEVICES))}
+
+
+def traversed(path: Path) -> tuple[set[Path], Path]:
+    pending = list(reversed(Path.cwd().joinpath(path).parts[1:]))
+    current, seen, links = Path("/"), {Path("/")}, 0
+    while pending:
+        part = pending.pop()
+        if part == "..":
+            current = current.parent
+        elif (current / part).is_symlink():
+            links += 1
+            if links > 32:
+                raise ConfinementUnavailable(f"{path} passes through too many symbolic links")
+            target = Path(os.readlink(current / part))
+            current = Path("/") if target.is_absolute() else current
+            pending.extend(reversed(target.parts[1:] if target.is_absolute() else target.parts))
+        elif part != ".":
+            current = current / part
+        seen.add(current)
+    return seen, current
+
+
+def exposure(path: Path, grants) -> Path | None:
+    seen, final = traversed(path)
+    for root in (Path(g).resolve() for g in grants):
+        if root.is_relative_to(final) or any(d.is_relative_to(root) for d in seen):
+            return root
+    return None
+
+
+def browser_exposure(a: Attempt) -> None:
+    from . import browser
+
+    grants = actor_grants(a)
+    for name, tree, actors in (("browser folder", browser_path(a.run_dir), ("agent", "service")),
+                               ("pinned browser server", browser.server_folder(), ("agent", "service", "browser"))):
+        for actor in actors:
+            if (root := exposure(tree, grants[actor])) is not None:
+                raise ConfinementUnavailable(f"the {name} {tree} can be changed through the {actor} write grant {root}")
+
+
 def browser_record(a: Attempt) -> dict:
     with registry() as (fd, key):
         data = load(fd, key, a.selector)
@@ -515,6 +567,7 @@ def browser_command(a: Attempt, words: list[str]) -> list[str]:
     port = browser_record(a).get("port")
     if not isinstance(port, int) or not 0 < port < 65536:
         raise ConfinementUnavailable("no app port is recorded for browser confinement")
+    browser_exposure(a)
     node, cli = browser.checked()
     folder = browser_folder(a)
     return [str(Path(sys.executable).resolve()), "-I", "-c", BROWSER_EXEC, a.selector,
@@ -567,6 +620,7 @@ def browser_config(a: Attempt, mcp_config: str, add_dirs) -> str:
         return mcp_config
     if loopback is not True or not isolation(a, "codex", False, add_dirs, ""):
         return mcp_config
+    browser_exposure(a)
     browser.resolved()
     argv = browser_command(a, words)
     update_browser(a, words=words, argv=browser_digest(argv[5:]))
@@ -806,7 +860,7 @@ def activated(a: Attempt) -> bool:
 
 
 def isolation(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str = "") -> bool:
-    broad = (Path("/tmp").resolve(), Path("/private/tmp"), Path(os.getenv("TMPDIR", "/tmp")).resolve())
+    broad = temp_grants()
     writable = [Path(a.workspace), *(Path(d).resolve() for d in add_dirs or ())]
     return (which == "codex" and not remote and paths.ON_MAC
             and servers_allowed(a, mcp_config)
