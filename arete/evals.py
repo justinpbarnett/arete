@@ -368,16 +368,21 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         session, attempts, summary = res.session, 1, res.text
         max_attempts = run.settings("check_repair").tries if run.trial else layer.max_attempts
         ok, report = run_checks(layer, wt, [wt], run, run.time_for(timeout))
-        while not ok and attempts < max_attempts:
-            attempts += 1
-            fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
-                         checks=runs_checks)
-            res = run.agent(f"fix{attempts}", fix, wt, **step_call(cfg, run, "check_repair", runner.BUILD_TOOLS, rules),
-                            disallowed_tools=runner.NO_GIT_WRITES, resume=session, timeout=timeout,
-                            fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
-                                which, wt, task, plan, summary, fix))
-            session, summary = res.session, res.text
-            ok, report = run_checks(layer, wt, [wt], run, run.time_for(timeout))
+        try:
+            while not ok and attempts < max_attempts:
+                attempts += 1
+                fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
+                             checks=runs_checks)
+                res = run.agent(f"fix{attempts}", fix, wt,
+                                **step_call(cfg, run, "check_repair", runner.BUILD_TOOLS, rules),
+                                disallowed_tools=runner.NO_GIT_WRITES, resume=session, timeout=timeout,
+                                fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
+                                    which, wt, task, plan, summary, fix))
+                session, summary = res.session, res.text
+                ok, report = run_checks(layer, wt, [wt], run, run.time_for(timeout))
+        except RunFailed:
+            result["repairs"] = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
+            raise
         result["repairs"] = attempts - 1
         git(["add", "-A"], wt)
         (run_dir / "diff.patch").write_text(git(["diff", "--cached", "HEAD"], wt))

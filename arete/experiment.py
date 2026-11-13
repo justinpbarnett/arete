@@ -385,12 +385,12 @@ def totals_of(found: list[dict]) -> Totals:
     return used
 
 
-def reached(limits: dict, used: Totals, over: bool = False) -> str:
-    for key, value in (("spend_usd", used.spend), ("calls", used.calls), ("tokens", used.tokens),
-                       ("minutes", used.seconds / 60)):
-        if value > limits[key] if over else value >= limits[key]:
-            return f"the {LIMIT_LABELS[key]} limit ({key} = {limits[key]:g}) is {'exceeded' if over else 'reached'}"
-    return ""
+def reached(limits: dict, used: Totals, launching: bool = True) -> str:
+    calls = used.calls + 1 if launching else used.calls
+    over = {"spend_usd": used.spend >= limits["spend_usd"], "calls": calls > limits["calls"],
+            "tokens": used.tokens >= limits["tokens"], "minutes": used.seconds / 60 >= limits["minutes"]}
+    return next((f"the {LIMIT_LABELS[key]} limit ({key} = {limits[key]:g}) is reached"
+                 for key in ("spend_usd", "calls", "tokens", "minutes") if over[key]), "")
 
 
 def framed(path: Path) -> tuple[dict, dict | None]:
@@ -535,9 +535,10 @@ class TrialRun(evals.EvalRun):
         kw.update(timeout=self.call_timeout, wait_out_limits=False, remaining_budget=self.dollars_left,
                   remaining_tokens=self.tokens_left)
         res = super().agent(step, text, cwd, role, **kw)
-        if not res.ok and not self.stopped_by:
-            self.stopped_by = (res.error if res.error.startswith(runner.NO_ROUTE)
-                               else reached(self.limits, self.used()))
+        if not res.ok and res.error.startswith(runner.NO_ROUTE):
+            self.stopped_by = self.stopped_by or res.error
+        elif why := reached(self.limits, self.used(), launching=False):
+            self.stop(self.stopped_by or why)
         return res
 
 
@@ -641,7 +642,7 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                 append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started))
                 raise
             failures = result["failures"] or ([result["why"]] if result["why"] else [])
-            stopped_by = trial.stopped_by or reached(exp.limits, trial.used(), over=True)
+            stopped_by = trial.stopped_by or reached(exp.limits, trial.used(), launching=False)
             record.settle(run_id, "stopped" if stopped_by else "done",
                           summary=stopped_by if stopped_by else "accepted" if result["passed"]
                           else f"not accepted: {util.first_line(result['why'], 200)}")
