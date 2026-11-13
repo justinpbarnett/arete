@@ -271,6 +271,7 @@ class Job:
     draft_why: str = ""
     summary: str = ""
     opened: list[str] = field(default_factory=list)
+    found: list[str] = field(default_factory=list)
     pushed: list[str] = field(default_factory=list)
     drafted: list[str] = field(default_factory=list)
     ci_stopped: list[str] = field(default_factory=list)
@@ -382,6 +383,7 @@ class Job:
             c.pr = data["prs"].get(c.github, c.pr)
         self.opened, self.pushed, self.changed = data["opened"], data["pushed"], data["changed"]
         self.drafted, self.ci_stopped = data.get("drafted", []), data.get("ci_stopped", [])
+        self.found = data.get("found", [])
         self.draft_why, self.report_body, self.summary = data["draft_why"], data["report_body"], data["summary"]
         self.b.committed_lines = data["committed_lines"]
         self.committed = bool(data.get("committed", True))
@@ -810,12 +812,13 @@ def publishing(run: pipeline.Run, branch: str, push: Callable[[], None]) -> None
 def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     b, run, t, tk = job.b, job.run, job.ticket, job.run.tracker
-    opened: list[pipeline.Checkout] = []
+    found: list[pipeline.Checkout] = []
     for c in job.checkouts if run.repo.parts else []:
-        if not c.pr and (found := gh.open_pr_url(c.github, job.branch)):
-            c.pr = found
-            opened.append(c)
+        if not c.pr and (url := gh.open_pr_url(c.github, job.branch)):
+            c.pr = url
+            found.append(c)
             run.log(f"found open {c.pr}, opened by an earlier try of this step")
+    opened = list(found)
     for c in job.with_prs if run.repairs else []:
         view = gh.pr_view(c.pr)
         if view.get("state") != "OPEN":
@@ -869,9 +872,11 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
                                        held=draft_why, written=job.document)
     link = tk.pr_link(t, whole=not left)
     opened = [c for c in opened if c in staged.changed]
+    found = [c for c in found if c in opened]
+    stops = {c.github: pipeline.ci.stopped_section(gh.pr_body(c.pr)) for c in found}
     for c in staged.changed:
         if c in opened:
-            gh.pr_edit_body(c.pr, f"{link}\n\n{report_body}")
+            gh.pr_edit_body(c.pr, with_stop(f"{link}\n\n{report_body}", stops.get(c.github, "")))
         elif not c.pr:
             c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), f"{link}\n\n{report_body}",
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
@@ -882,12 +887,12 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
     standing = [c for c in staged.changed if c not in opened]
     pushed = standing if committed else []
     with_prs = job.with_prs
-    ci_stopped: list[pipeline.Checkout] = []
+    ci_stopped = [c for c in found if stops[c.github]]
     for c in with_prs:
         others = pipeline.sibling_section(t.ref, c, with_prs)
         if c in opened:
             if others:
-                gh.pr_edit_body(c.pr, f"{link}\n\n{report_body}{others}")
+                gh.pr_edit_body(c.pr, with_stop(f"{link}\n\n{report_body}{others}", stops.get(c.github, "")))
             continue
         body = gh.pr_body(c.pr)
         if c in standing and pipeline.ci.stopped(body):
@@ -901,13 +906,18 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
         elif not committed and c in staged.changed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Verified and reviewed {t.ref} again; nothing new was pushed.\n\n{report_body}")
-    drafted = pipeline.hold_pushed(run, standing, ci_stopped, draft_why)
+    drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why)
     return Outcome("pass", data={
         "summary": outcome, "prs": {c.github: c.pr for c in with_prs}, "opened": [c.github for c in opened],
+        "found": [c.github for c in found],
         "pushed": [c.github for c in pushed], "drafted": [c.github for c in drafted],
         "ci_stopped": [c.github for c in ci_stopped], "changed": [c.github for c in staged.changed], "draft_why": draft_why,
         "report_body": report_body, "committed_lines": b.committed_lines,
         "heads": {c.github: c.lease for c in staged.changed}, "committed": committed})
+
+
+def with_stop(text: str, stop: str) -> str:
+    return pipeline.ci.with_section(text, stop) if stop else text
 
 
 @factory.step("ci")
@@ -943,6 +953,7 @@ def publish(flow: factory.Flow) -> Outcome:
                 else f"verified and reviewed {job.branch} again with nothing new to push")
         return end_as("pass", "done", summary=f"{what}: {job.summary}")
     opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
+    fresh = [c for c in opened if c.github not in job.found]
     run.enter("pr")
     pr_lines = "\n".join(f"- {'Opened' if c in opened else 'Pushed to' if c in pushed else 'Unchanged'} "
                          f"[{c.pr_name}]({c.pr})" for c in with_prs)
@@ -955,10 +966,10 @@ def publish(flow: factory.Flow) -> Outcome:
                    or "\n\nThe review now approves it. The PR is still a draft until a person marks it ready."))
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {job.ci_result}."
-                + pipeline.published_note(job.draft_why, job.verified, opened, job.picked(job.drafted)))
-    standing = [c for c in job.picked(job.changed) if c not in opened]
+                + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
+    standing = [c for c in job.picked(job.changed) if c not in fresh]
     ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
-    pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, opened + ready,
+    pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, fresh + ready,
                        f"{job.ticket.title}\n\n{job.build_summary.strip()[:3000]}")
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
 
