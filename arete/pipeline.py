@@ -2372,7 +2372,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                         f"{archived}")
             if kept:
                 fixture_blocker = "Verification scratch resources remain unresolved; the workspace is retained."
-                run.log(f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree")
+                run.log(retained_line(step, attempt))
         finally:
             restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
@@ -2874,6 +2874,12 @@ class SkipLog:
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
+
+
+def retained_line(step: str, attempt: scratch.Attempt) -> str:
+    line = f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree"
+    held = scratch.named(scratch.holding(attempt))
+    return f"{line}; held by {held}" if held else line
 
 
 def retry_scratch() -> None:
