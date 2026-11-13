@@ -359,6 +359,12 @@ def cmd_codex_guard(args) -> int:
     return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
 
 
+def cmd_mcp_ask(args) -> int:
+    from . import asks
+
+    return asks.check(sys.stdin, sys.stdout) if args.check else asks.serve(sys.stdin, sys.stdout)
+
+
 def cmd_background(args) -> int:
     from . import background
 
@@ -540,6 +546,27 @@ def cmd_audit(args) -> int:
     from . import auditor
 
     return auditor.run(dry_run=args.dry_run)
+
+
+def cmd_verifiers(args) -> int:
+    import tomllib
+
+    from . import verifiers
+
+    if args.dry_run and args.action != "run" or args.json and args.action != "report":
+        print("usage: arete verifiers sample FOLDER | run SUITE [--dry-run] | report FILE [--json]", file=sys.stderr)
+        return 2
+    target = paths.expand(args.target)
+    try:
+        if args.action == "sample":
+            print_lines(verifiers.sample(target))
+            return 0
+        if args.action == "run":
+            return verifiers.run(target, dry=args.dry_run)
+        return verifiers.report(target, as_json=args.json)
+    except (verifiers.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 def cmd_eval(args) -> int:
@@ -1467,6 +1494,11 @@ def main(argv: list[str] | None = None) -> int:
     scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
 
+    p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "
+                                       "validates one call read from stdin")
+    p.add_argument("--check", action="store_true")
+    p.set_defaults(fn=cmd_mcp_ask)
+
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "
                                           "(reads a payload on stdin)")
@@ -1763,6 +1795,14 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--port", type=int, required=True)
     b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
     p.set_defaults(fn=cmd_benchmark)
+
+    p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
+                                         "`sample FOLDER`, `run SUITE`, `report FILE`")
+    p.add_argument("action", choices=["sample", "run", "report"])
+    p.add_argument("target", metavar="FOLDER | SUITE | FILE")
+    p.add_argument("--dry-run", action="store_true", help="with run: list arms, tasks and trials; no calls, no writes")
+    p.add_argument("--json", action="store_true", help="with report: the summary as one JSON line")
+    p.set_defaults(fn=cmd_verifiers)
 
     p = sub.add_parser("triage", help="loop 5: the triage board of your open tickets without the agent label")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")

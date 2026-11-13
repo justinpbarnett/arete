@@ -187,7 +187,7 @@ if scenario.startswith("held-scratch"):
     for fd in list(scratch.LEASES.values()):
         os.close(fd)
     scratch.LEASES.clear()
-    with mock.patch.object(scratch, "producers_done", return_value=True):
+    with mock.patch.object(scratch, "holders", return_value=[]):
         pipeline.retry_scratch()
     (root / "finalized").mkdir()
     for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
@@ -285,6 +285,34 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("left out 3 earlier repair cycles", result["log"])
         self.assertEqual(result["budget"]["left_out"], [result["old"]])
         self.assertEqual(result["budget"]["parents"], [])
+
+
+class FailedPrepareHistoryTests(unittest.TestCase):
+    @staticmethod
+    def end(step, result="pass", **extra):
+        return {"event": "step_end", "step": step, "result": result, **extra}
+
+    def test_failed_prepare_run_adds_nothing(self):
+        a = [self.end("prepare"), self.end("plan"), self.end("verify", "fail")]
+        b = [{"event": "route", "skipped": 0}, self.end("prepare", "fail"), self.end("respond")]
+        history = arete.factory.history([b, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "verify"])
+        self.assertTrue(arete.factory.reopening([b, a]))
+        self.assertFalse(arete.factory.reopening([a]))
+
+    def test_redone_join_puts_own_prepare_first(self):
+        a = [self.end("prepare", n=1), self.end("plan"), self.end("implement")]
+        c = [{"event": "route", "skipped": 2, "redone": 1}, self.end("prepare", n=2), self.end("verify")]
+        history = arete.factory.history([c, a])
+        self.assertEqual([line["step"] for line in history], ["prepare", "plan", "implement", "verify"])
+        self.assertEqual(history[0]["n"], 2)
+
+    def test_failed_prepare_is_not_takable_but_other_fails_are(self):
+        flow = object.__new__(arete.factory.Flow)
+        flow.earlier, flow.redone, flow.skipped = [self.end("prepare", "fail"), self.end("verify", "fail"), {}], 0, 0
+        self.assertFalse(flow.takable(flow.earlier[0]))
+        flow.skipped = 1
+        self.assertTrue(flow.takable(flow.earlier[1]))
 
 
 @unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
@@ -408,7 +436,7 @@ class VerificationOutputTests(unittest.TestCase):
             self.skipTest("needs APFS")
         (self.root / "home").mkdir()
         for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
-                      mock.patch.object(scratch, "producers_done", return_value=True)):
+                      mock.patch.object(scratch, "holders", return_value=[])):
             patch.start()
             self.addCleanup(patch.stop)
         self.ws = self.root / "worktrees/ticket"

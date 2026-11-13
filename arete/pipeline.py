@@ -23,6 +23,7 @@ from string import Template
 from typing import TextIO
 
 from . import (
+    asks,
     ci,
     config,
     control,
@@ -197,6 +198,7 @@ REJECTED_PR_LISTEN = timedelta(days=7)
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
     text = (prompts_dir / f"{name}.md").read_text()
+    values.setdefault("owner", asks.NOBODY)
     return Template(text).safe_substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
 
 
@@ -249,6 +251,10 @@ class AgentRun:
     @property
     def ref(self) -> str:
         return ""
+
+    @property
+    def owner_note(self) -> str:
+        return asks.NOBODY
 
     @property
     def where(self) -> str:
@@ -397,10 +403,58 @@ class Run(AgentRun):
     facts: dict = field(default_factory=dict)
     repairs: str = ""
     workspace: tuple[Path, list[Checkout]] | None = None
+    asks_made: int = 0
 
     @property
     def ref(self) -> str:
         return self.tracker.ref(self.tid)
+
+    @property
+    def asks_owner(self) -> bool:
+        return factory.inside(self.id) is not None
+
+    @property
+    def owner_note(self) -> str:
+        return asks.GUIDE if self.asks_owner else asks.NOBODY
+
+    def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
+        if not self.asks_owner:
+            return super().agent(step, text, cwd, role, **kw)
+        res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
+        while res.record and (sent := asks.found(record.events(paths.record_dir(self.id) / res.record))):
+            kept = res.session if kw.get("persist", True) else NO_SESSION
+            self.owner_ask(step, sent, kept)
+            res = super().agent(step, asks.settled_message(sent), cwd, role, ask_owner=True,
+                                **{**kw, "resume": kept, "resume_only": True})
+        return res
+
+    def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
+        ask_ids = [f"{self.id}-a{self.asks_made + n}" for n in range(1, len(sent) + 1)]
+        self.asks_made += len(sent)
+        limit, seam = self.config.ask.max_per_run, factory.inside(self.id).step
+        if self.asks_made > limit:
+            raise asks.Asked(sent, ask_ids, seam, step, session, limit=limit)
+        if (self.config.ask.settle and all(asks.settles(ask) for ask in sent) and session.id
+                and jev.ready(self.config, [self.repo]) and self.settled_by_jev(step, sent, ask_ids)):
+            return
+        raise asks.Asked(sent, ask_ids, seam, step, session)
+
+    def settled_by_jev(self, step: str, sent: list[dict], ask_ids: list[str]) -> bool:
+        answers = []
+        for ask in sent:
+            state_text = (f"Step: {step}\nThe ask, with every question, option and description:\n"
+                          f"{json.dumps(ask, indent=1)}")
+            reply = jev.ask(state_text, {"settle": jev.yes_no(asks.SETTLE)}, self.config,
+                            trace=(self.id, f"{step} ask jev"))
+            answer = reply.answers.get("settle")
+            if not answer or answer.yes < asks.SETTLE_AT:
+                return False
+            answers.append(answer)
+        for ask_id, ask, answer in zip(ask_ids, sent, answers, strict=True):
+            self.log(f"{step}: took the recommended options without asking the owner ({answer.note()})")
+            lines.write(self.id, "ask_settled", ask_id=ask_id, step=factory.inside(self.id).step, call=step,
+                        choices=asks.choices(ask), p=round(answer.yes, 3))
+        return True
 
     @property
     def where(self) -> str:
@@ -673,7 +727,7 @@ def note_made(ws: Path, checkouts: list[Checkout]) -> None:
     made_record(ws).unlink(missing_ok=True)
 
 
-def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> str:
+def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True) -> str:
     made = made_before(ws)
     salt = str(made.get(SALT_KEY) or "")
 
@@ -688,7 +742,7 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
         try:
             edits = unknown([c.prefix + n for n in uncommitted(c.wt)])
             ignored = unknown([c.prefix + n for n in ignored_files(c.wt)])
-            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip()
+            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip() if commits else "0"
             if made.get(head_key(c)) == git(["rev-parse", "HEAD"], c.wt).strip():
                 ahead = "0"
         except (RuntimeError, OSError) as e:
@@ -1173,6 +1227,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         producer_baseline = scratch.process_ids()
     except OSError:
         producer_baseline = None
+    service_labels = scratch.service_labels()
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
@@ -1227,6 +1282,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
             scratch.RUN_BASELINES[run_id] = producer_baseline
+            scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
@@ -1258,7 +1314,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             current = tk.get(tid) if fresh else None
             run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh)
             with run.budget.watching():
-                run.budget.capture(current or tk.get(tid))
+                if not (flow and flow.refusal):
+                    run.budget.capture(current or tk.get(tid))
                 status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
@@ -1338,7 +1395,8 @@ def report_fields(row: dict, facts: dict) -> dict:
     asked = next((line for line in reversed(read) if line.get("event") == "question"), {})
     return {"task": str(row.get("issue") or ""), "status": row.get("status") or "",
             "prs": (row.get("pr_url") or "").split(), "summary": row.get("summary") or "",
-            "requirements": facts.get("requirements") or [], "assumptions": facts.get("assumptions") or [],
+            "requirements": facts.get("requirements") or [],
+            "assumptions": [*(facts.get("assumptions") or []), *asks.assumed(factory.chain(row["id"]))],
             "left_for_a_person": facts.get("left_for_a_person") or "", "held": facts.get("held") or "",
             "review": facts.get("review") or report_review({}), "question": str(asked.get("summary") or ""),
             "steps": factory.tally(row["id"]), "minutes": run_minutes(row),
@@ -1390,8 +1448,10 @@ def run_minutes(row: dict) -> float:
     return round((util.parse_iso(row["finished"]) - util.parse_iso(row["started"])).total_seconds() / 60, 1)
 
 
-def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str) -> tuple[str, str, str]:
-    lines.write(run.id, "question", question=comment, summary=summary[:300])
+def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str,
+         asked: list[dict] | None = None) -> tuple[str, str, str]:
+    for ask in asked or [{}]:
+        lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
     run.say(comment)
     run.enter("needs-info")
     remove_workspace(ws, checkouts)
@@ -1716,6 +1776,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
         f"## Summary\n\n{written or summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
         + left_block(left)
+        + assumed_block(run)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
         + "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems)
@@ -1808,6 +1869,13 @@ def left_section(run: Run, text: str) -> str:
         f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
 
 
+def assumed_block(run: Run) -> str:
+    taken = asks.assumed(factory.chain(run.id))
+    if not taken:
+        return ""
+    return "## Assumed\n\nArete took these recommended options without asking:\n" + "".join(f"- {c}\n" for c in taken) + "\n"
+
+
 def left_block(left: str) -> str:
     return f"{LEFT_START}\n{LEFT_HEADING}\n\n{left}\n\n{LEFT_END}\n\n" if left else ""
 
@@ -1879,6 +1947,8 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
         for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
             publish_ci(run, pushed, ci.section(rounds, max_rounds))
+    except asks.Asked:
+        raise
     except Exception as e:
         failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
         drafted = [c for c in with_prs if set_draft(run, c, True)]
@@ -2068,7 +2138,8 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
                       conflicts="\n".join(f"- `{p}`" for p in conflicts),
                       branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
                       base_log=git(["log", "--oneline", "-n30", "HEAD..MERGE_HEAD"], c.wt),
-                      commands=code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback)
+                      commands=code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
+                      owner=run.owner_note)
         try:
             res = run.agent(round_name("resolve", n), text, c.wt, role="build",
                             allowed_tools=bash_rules(layer.builder_bash), disallowed_tools=runner.NO_GIT_WRITES,
@@ -2368,13 +2439,17 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
                                          scratch=scratch.note(attempt),
-                                         commands=code_list(bash), checks=check_list(b.layer), **values),
+                                         commands=code_list(bash), checks=check_list(b.layer),
+                                         owner=run.owner_note, **values),
                             b.ws, role=role,
                             allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=verify.mcp_config(evidence) if url else "",
                             scratch=attempt)
             agent_finished = True
+    except asks.Asked:
+        agent_finished = True
+        raise
     except scratch.ConfinementUnavailable as e:
         return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
                                blocked_by=util.first_line(str(e), 300))
@@ -2395,7 +2470,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                         f"{archived}")
             if kept:
                 fixture_blocker = "Verification scratch resources remain unresolved; the workspace is retained."
-                run.log(f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree")
+                run.log(retained_line(step, attempt))
         finally:
             restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
@@ -2897,6 +2972,12 @@ class SkipLog:
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
+
+
+def retained_line(step: str, attempt: scratch.Attempt) -> str:
+    line = f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree"
+    held = scratch.named_holders(scratch.holding(attempt))
+    return f"{line}; held by {held}" if held else line
 
 
 def retry_scratch() -> None:
