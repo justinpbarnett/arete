@@ -281,14 +281,16 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     try_no = try_no or (state.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
     prior = route
     chosen_by = {"launch": 1, "selection": prior} if prior else None
+    atom = settings.step if settings else ""
     if refusal:
         return refused(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind,
-                       chosen_by, try_no, refusal)
+                       chosen_by, try_no, refusal, atom)
     if which == REPLAY and (cfg.replay.all or not (settings and settings.requires.declared)):
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
         return attempt(which, name, prompt, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
-                       accounts.Auth(), {"launch": 1, **({"selection": route} if route else {})}, try_no)
+                       accounts.Auth(), {"launch": 1, **({"selection": route} if route else {})}, try_no,
+                       atom)
     if not target.remote:
         repo = repo or cfg.repo_for_work_dir(cwd)
     size = routing_size(prompt, settings, kw)
@@ -314,7 +316,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                 given = {"launch": launches + 1, "skipped": skipped, "requested_effort": trip.request.effort,
                          "selection": launched_selection(trip, prior, skipped, measured, error=done.error)}
                 res = refused(which, name, prompt, cwd, done.session, cfg, trace, record_id, target, kw, tier, kind,
-                              given, try_no, done.error)
+                              given, try_no, done.error, atom)
                 res.skipped, res.usage_limit = done.skipped, done.usage_limit
                 return with_spent(res, limited)
             return with_spent(done, limited)
@@ -345,7 +347,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         on_launch(route)
         started = util.iso()
         res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
-                      tier, kind, picked.auth, route, try_no)
+                      tier, kind, picked.auth, route, try_no, atom)
         res.credential, res.effort, res.requested_effort, res.skipped = (
             chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
         if res.session.id:
@@ -479,10 +481,10 @@ def launched_selection(trip: Trip, prior: dict | None, skipped: list[dict], size
 
 def refused(which: str, name: str, prompt: str, cwd: Path | str, session: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str, kind: str,
-            route: dict | None, try_no: int, error: str) -> Result:
+            route: dict | None, try_no: int, error: str, atom: str = "") -> Result:
     return attempt(which, name, prompt, cwd, session, cfg, trace, record_id, target,
                    {**kw, **({"remote": target} if target.remote else {}), "budget_error": error},
-                   tier, kind, accounts.Auth(), route, try_no)
+                   tier, kind, accounts.Auth(), route, try_no, atom)
 
 
 def layer_of(repo: config.Repo | None):
@@ -667,7 +669,8 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
-            kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0) -> Result:
+            kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
+            atom: str = "") -> Result:
     auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
     route = route or {}
     header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
@@ -683,6 +686,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
+    if atom:
+        header["atom"] = atom
     if route.get("selection"):
         header["route"] = route
     found = secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg)

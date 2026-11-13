@@ -1,6 +1,6 @@
 from arete import factory
 from arete.pipeline import round_name
-from arete.flows import BUILD, REVIEW_FIX, end_dry_run, ended, finish, step
+from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, end_dry_run, ended, finish, step
 
 
 def feature(flow):
@@ -13,7 +13,7 @@ def built(flow, first):
     for name, kw in [("prepare", {"tree": ws}), *first]:
         if not (outcome := step(flow, name, **kw)).passed:
             return ended(flow, outcome)
-    tries = job.run.settings(BUILD).tries
+    tries = job.run.settings(CHECK_REPAIR).tries
     attempt, outcome = 1, step(flow, "checks", tree=ws, attempt=1, tries=tries)
     while not outcome.passed and attempt < tries:
         attempt += 1
