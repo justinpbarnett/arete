@@ -22,7 +22,7 @@ A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work
 | Loop | Kind | When | What it does |
 |------|------|------|--------------|
 | `heartbeat` | command | hourly, and when serve starts | Checks serve's beat, the loops, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
-| `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
+| `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, plus arete's own recorded runs that failed, needed a retry, hit a budget or ran long, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
 | `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
 | `poll` | command | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. `arete run REPO TICKET` runs one ticket by hand. |
 | `eval` | command | weekly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `arete eval mine` writes new tasks from merged arete PRs. |
@@ -384,7 +384,7 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
 - Triage: JEV asks whether a ticket asks for a change to a repo and what kind of ticket it is. A ticket it gives a chance of a code change at or under `triage_skip` settles with no model call, as research when JEV is sure it is research and as work for a person otherwise; one under even odds settles the same way when JEV is sure of research or person. Before arete sends a ticket to the pipeline or the research agent, JEV screens its text for instructions to an agent, and a ticket it flags waits for you.
 - Research: when a researched ticket changes, JEV reads what changed in its text against the report's summary and asks whether the change asks something different or adds a fact, decision, limit, deadline or resource the report should use. Under a chance of `research_rerun`, the report stands with no agent call. Before a ticket's first report, JEV reads it against the reports already done for its parent, its siblings and its children, and picks the one that already delivers what it asks, or none. At a chance of `research_answered` or more that one does, the ticket links that report instead of a new run. See [Triage](#triage).
 - PR feedback: JEV asks of each new comment you leave on an arete PR whether it asks for a change or a question the author should answer, logs the chance, and stores it with the comment. A comment under `feedback_skip` starts no revision; at the default of 0, none is skipped.
-- Miner: the digest leaves out the transcripts JEV is sure hold nothing to learn from, so it has room for the ones that do.
+- Miner: the digest leaves out the transcripts JEV is sure hold nothing to learn from, so it has room for the ones that do. The gate also leaves out recorded runs JEV is sure hold nothing to learn from; a run from a `jev = false` repo is never sent.
 - Sessions: when a session's context passes `compact_tokens` and JEV is sure the new message starts a different task, the session compacts before it takes the turn.
 - Guard: each local claude agent that can read files, write files or run commands runs `arete guard` as a PreToolUse hook. With no JEV call, it keeps the agent out of secret files (`.env`, keys, `~/.ssh`, cloud credentials), whether the agent reads or writes one or names one in a command. With JEV it also stops a command that would do harm git cannot undo (throw away uncommitted work, delete outside the working folder, force push, publish, drop data, send a message) and a command that would show or send a credential. A plain push or a new pull request goes through. The verify prompt tells the verifier to give a key it was not given a value that starts `arete-placeholder`, and that a request to localhost, 127.0.0.1 or [::1] reaches the product it started, so neither reads as a credential or an outside send. When anything goes wrong, it lets the call through. `[jev] guard = false` turns it off. A codex agent runs `arete codex-guard` as its PreToolUse hook instead, with the same judge; the secret file and git write rules there always run, and `guard = false` turns off only its judge (see [Codex](#codex)).
 - `arete ask QUESTION [PATHS] [--choice A B] [--score LOW HIGH] [-r] [--only ANSWER] [--json]` asks JEV about piped text, or about each file, sixteen at a time. Agents that can run commands get it, with a short note on when it pays: sort files before reading them, sort a test failure before digging in, check a diff against its task. An agent may ask only about files inside its working folder, and never about secret files.
@@ -452,6 +452,13 @@ it drains available complete lines and stops when the run's status, run report o
 A missing run row alone does not mean the run ended. A run that ends without creating the requested step reports a missing-step error.
 Following starts at the beginning and stays on the selected file: `arete record RUN_ID plan-2.jsonl.gz -f`
 follows only the second attempt and never switches to another attempt.
+
+The miner reads two sources: Claude Code session files on this machine, and the records of arete's own runs, since the last mine that ended `pr` or `noop` (or since `--hours` ago).
+It reads only runs with a signal, worst first: `failed` (a failed run, call or step), `retry` (a step run more than once, or a repair), `budget` (the run parked on a limit) and `long` (active time of half the run limit or more).
+Miner, eval, experiment and draft runs are left out.
+A run's records go into the prompt as quoted data, one prefixed line each, to a call with Read, Glob and Grep only and a JSON schema as its only output, so text inside a record cannot reach a tool that acts.
+Evidence cites `run <id> <record>:<lines>`, the raw line numbers `arete record RUN STEP --raw` prints.
+A proposal for arete or a public repo that names another repository, ticket, run, host or the login name is skipped.
 
 ### Retention
 
@@ -598,7 +605,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `research_plan` (the planner of a staged research run), `research_search` (the search workers of a staged run), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you), `document` (the concise writer of PR text, tickets and messages). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop`, `session` and `research_search`, which use sonnet, and `research`, `research_plan` and `chat`, which use opus. `arete status` lists each role's model. |
 | `[steps]`, `[kinds]`, `[tiers]`, `[factory]` | Each pipeline step's model, runner, effort, timeout, tries, tools, MCP servers, instructions and session. See [Steps](#steps). `[factory] adws` is the folder the adw scripts come from, default `adws/` in this checkout; see [The adw scripts](#the-adw-scripts). |
 | `[mcp.<name>]` | An MCP server a step can name in its `mcp` list: `command` with optional `args`, or `url` for an HTTP server. Servers are defined here only, not in a layer. |
-| `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly transcript digest. |
+| `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly digest of transcripts and recorded runs; recorded runs take up to half of `max_digest_chars`. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
@@ -620,7 +627,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 |------------|---------|---------|
 | `pipeline` | `false` | Poll this repo's tickets and run the build pipeline. |
 | `mine` | `true` | The miner may open harness PRs here. |
-| `public` | `false` | PR bodies cite run ids, never transcript text. |
+| `public` | `false` | PR bodies cite run ids, never transcript text. Arete's own repo (`arete_repo`) is treated the same way. |
 | `tracker` | `"github"` | `github` for issues in the repo, `jira` for tickets in Jira, `local` for [local tasks](#local-tasks) only; such a repo may have no `github`. PRs are on GitHub either way. |
 | `jira_project` | `[jira] project` | Jira project for this repo. |
 | `jira_label` | `repo-<github repo name>` | Route label that sends a Jira ticket to this repo. |
@@ -1218,7 +1225,7 @@ atom = "build"                   # plan, build or check_repair; verify and eval_
 repeats = 3                      # whole number, 1 or more
 cache_policy = "provider-default"  # optional label, recorded on every trial
 
-[arms.current]                   # two or more; keys: tier, runner, provider, model, effort
+[arms.current]                   # two or more; keys: tier, runner, provider, model, effort, tools, mcp, instructions, prompts, context
 model = "scratch-a"
 effort = "medium"
 [arms.stronger]
@@ -1270,6 +1277,57 @@ Pi launches a second call to restate an answer that lacks its structured output,
 Running the same command again resumes: a `done` trial is not repeated, and an earlier `start` with no `trial` line (a killed process) is settled as interrupted and run again as the next attempt. A `capped` trial runs again as well. With `[replay] dir` set, a trial reads its answers from the first folder holding a `.json` answer of `<dir>/<arm>/<task>/<repeat>`, `<dir>/<arm>/<task>`, `<dir>/<arm>` and `<dir>`, so two arms can be replayed over several repeats, with a failed trial, without a paid call.
 
 The summary reads only the file, so `summary FILE` reproduces the text a run prints at its end byte for byte; `--json` prints the same numbers as one line. Per arm it shows accepted of done trials with a Wilson interval, repairs, calls, tokens, cache, api, wall and wait seconds, and charged and reference cost over every attempt, failed and interrupted ones included, in total and per accepted task. Zero accepted prints "no accepted task" and an unknown reference "unknown". Per split and candidate it shows the pairs where both arms are done, the candidate-only and baseline-only accepts, the difference with its interval (the paired difference plus or minus a normal margin and one pair) and the exact sign test. Only `accept.split` gives a verdict. There is no winner when the pairs are under `max(6, min_pairs)`, when the interval reaches `min_difference` or below and `-min_difference` or above, or when the sign test p exceeds `1 - confidence`. Otherwise a candidate wins when the interval's lower bound is above `min_difference`, and the baseline holds when the upper bound is below `-min_difference`. Several winning candidates are each listed and none is named the winner. Other splits are shown as not deciding.
+
+`tools`, `mcp` and `instructions` are step settings. `prompts` names a folder holding `plan.md`, `build.md` and `fix.md` for the arm's builder prompts, and `context` a commit whose harness files (instructions, skills, settings) the arm's checkout takes. An arm with either gets its own prompt or context fingerprint in the design; an arm with neither keeps the digest it always had.
+
+### Promoting a winner
+
+Nothing here runs until you run the command: no loop, schedule, server hook or dashboard route starts a search, and merging this feature starts nothing.
+
+`arete experiment optimize PLAN` improves one atom's settings one variable per round, on top of the paired trials above. The plan is private configuration, like a manifest:
+
+```toml
+name = "build-search"
+repo = "replay-sample"
+atom = "build"
+repeats = 6
+
+[[rounds]]
+vary = "model"                   # model | effort | prompt | context | tools
+[rounds.candidates.stronger]     # names are unique across rounds and never `baseline`
+model = "scratch-b"              # only keys of the round's variable: model takes tier, runner, provider, model, effort
+
+[[rounds]]
+vary = "effort"
+[rounds.candidates.cheap]
+effort = "low"
+
+[tasks.word-train]               # each of train, validation and holdout needs at least one task
+base = "4f1c2ab"
+split = "train"
+
+[accept]                         # min_pairs, min_difference, confidence, as in a manifest
+[floor]                          # the declared quality floor
+accept_rate = 0.8                # a candidate must be accepted at least this often
+max_drop = 0.2                   # and may not trail the champion by this much
+min_saving = 0.1                 # economics must be lower by this share; optional, above 0 and under 1
+[limits]                         # all five required; they cover the whole search
+spend_usd = 5
+minutes = 60
+calls = 2000
+tokens = 5000000
+rounds = 2
+```
+
+The first round varies `model` or `effort`, and no such round follows a `prompt`, `context` or `tools` round. The baseline is the live configuration. Each round runs the champion and every candidate on the train tasks; a candidate is proposed when it fixes at least as many train tasks as it breaks and has pairs, and its failing train trials are recorded. The champion and the proposals then run on the validation tasks, where each is decided in this order: `no promotion: insufficient evidence` (a tiny sample), `no promotion: missing costs` (charged or reference cost unknown for either arm), `no promotion: quality regression`, `no promotion: under the quality floor` (accepted rate below `accept_rate`), `promote on quality` (a clear win), then for an overlap `no promotion: noisy tie` (the interval reaches `-max_drop`, or the candidate is not cheaper) or `promote on economics`. Cheaper means charged cost, reference cost, repairs and wall seconds per accepted task are each no worse than the champion's and charged plus reference cost per accepted task is lower by `min_saving`. The best promotable candidate (highest validation rate, then lowest cost per accepted task, then plan order) becomes the champion. A noisy tie is never a win. After the rounds, a champion that is not the baseline is run against the baseline on the holdout tasks once; the holdout never proposes or selects, and a second run does not score it again. It is confirmed only with enough pairs, known costs, a rate at or above `accept_rate` and a paired difference no worse than `-max_drop`.
+
+`spend_usd`, `minutes`, `calls` and `tokens` count every trial of every phase in the folder, and `rounds` caps the rounds; a reached limit stops the search with exit 3, with no holdout and no end line, and running it again resumes. Every trial takes a run slot like any experiment trial, so queued production work keeps priority and the wait counts toward `minutes`. `--dry-run` prints the plan digest, the baseline, each round's candidates with their resolved runner, model and effort, the tasks per split, the floor, the limits and the most trials the search can run, and writes and calls nothing. A changed plan or baseline refuses an existing folder; pass `--out` for a new one. A search with an `end` line is final: running it again, even with a higher `rounds` limit, prints its result and runs nothing, and once the holdout is scored no further round runs. A `context` arm takes the commit's harness files, but every step's settings, the fixed grader included, keep resolving against the live layer, so the design records what runs. Search trials differ from plain experiment trials in one way: the repair step (`check_repair`) follows the arm the way it follows `build` in production, so the evidence covers what apply writes; its settings hash is recorded per arm. `review_repair` and `ci_repair` follow `build` too but no trial runs them, and the dry run lists them as not measured. Before each phase the fixed steps, grader, harness, prompts, tasks and live baseline are checked against the search's start, and a change refuses the phase (and a rerun of the folder); pass `--out` for a new one. The prompt, context and tools fingerprints of the arm a round selected are stored in its `round` line; every later phase (train and validation of the next round, holdout, a resume) and the validation after a train check that arm again before any trial and refuse when its prompts, context or `[mcp]` server definitions changed, so the holdout scores the exact candidate validation selected.
+
+The trail is a folder, `experiments/<name>/` under the state folder or `--out`: `trail.jsonl` (events `search` with the digest, design and a baseline snapshot of the config path, its hash, the raw `[steps.<atom>]` table and the resolved settings; then `round`, `holdout`, `stop`, `end`, `apply`, `rollback`), the phase results `r<n>-train.jsonl`, `r<n>-validation.jsonl` and `holdout.jsonl` (ordinary results files, readable with `experiment summary`), and `config-before-apply.toml` (mode 0600) once an apply ran.
+
+`arete experiment promote FOLDER` is a dry run: it prints the decision, its basis and the exact diff of `config.toml`, the roles that follow the atom by inheritance and whether apply is refused: a winner that needs `prompts` or `context` is never applied in part, since the step settings alone were not what the search confirmed. `--apply` writes only the winner's step keys into the private `config.toml` table `[steps.<atom>]` through a checked, atomic replace; it refuses a search that is not promotable or has not finished, or settings for the atom that changed since the search began, and says so when the winner is already applied. The new file must load, give the atom the winner's settings and leave every other role resolving as before; the file is read back afterwards. On any failure it records `apply` as failed and leaves `config.toml` unchanged (or restores the saved bytes). `--rollback` restores the saved bytes, or, when `config.toml` changed since, puts back only the applied keys. Limits: apply targets only the private `config.toml`, never a layer; a layer `[steps]` entry that sets the same key fails the read-back; `[kinds.*.steps]` entries still win for their tickets.
+
+`arete experiment sample FOLDER` writes a replay fixture and prints a `config.toml` for a scratch config folder: three eval tasks, answers for a baseline, a stronger model, a cheaper one that regresses on validation and a twin of the stronger one, a price file for `arete prices import`, and `plan.toml`. Running it shows a winner promoted, a cheaper quality regression, a noisy tie, and apply and rollback of one `model` line.
 
 ## Implementation benchmark
 

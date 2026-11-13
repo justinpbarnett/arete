@@ -333,7 +333,7 @@ def run(manifest: Path, out: str = "", dry: bool = False) -> int:
     if dry:
         print("\n".join(dry_lines(bench, path)))
         return 0
-    return experiment.exclusive(bench.exp, lambda: drive(bench, path))
+    return experiment.exclusive(bench.exp.repo.name, lambda: drive(bench, path))
 
 
 def count_of(trials: list[dict], key: str, value: str) -> int:
