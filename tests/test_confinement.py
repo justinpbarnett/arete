@@ -256,6 +256,7 @@ class BrowserServerTests(unittest.TestCase):
         folder = self.run_dir / "browser"
         self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
         self.assertIn(f"HOME={folder}/home", argv)
+        self.assertIn(f"MAC_CHROMIUM_TMPDIR={folder}/tmp", argv)
         self.assertEqual(argv[:4][1:3], ["-I", "-c"])
         self.assertIn("browser_start", argv[3])
         self.assertEqual(argv[argv.index(str(self.node)) + 1].rpartition("/")[2], "cli.js")
@@ -915,11 +916,16 @@ class BrowserRunTests(unittest.TestCase):
         return proc
 
     def reap(self, proc):
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            proc.kill()
-        proc.wait(10)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                proc.send_signal(sig)
+            try:
+                proc.wait(10)
+                return
+            except subprocess.TimeoutExpired:
+                pass
 
     def rpc(self, proc, ident, method, params, wait=90):
         message = {"jsonrpc": "2.0", "method": method, "params": params, **({"id": ident} if ident else {})}

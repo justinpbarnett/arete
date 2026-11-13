@@ -572,7 +572,8 @@ def browser_command(a: Attempt, words: list[str]) -> list[str]:
     folder = browser_folder(a)
     return [str(Path(sys.executable).resolve()), "-I", "-c", BROWSER_EXEC, a.selector,
             *browser_profile(a, port, folder), "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", f"HOME={folder}/home",
-            f"CFFIXED_USER_HOME={folder}/home", f"TMPDIR={folder}/tmp", node, cli, *words, "--no-sandbox"]
+            f"CFFIXED_USER_HOME={folder}/home", f"TMPDIR={folder}/tmp", f"MAC_CHROMIUM_TMPDIR={folder}/tmp", node, cli,
+            *words, "--no-sandbox"]
 
 
 def browser_table(a: Attempt, argv: list[str]) -> dict:
