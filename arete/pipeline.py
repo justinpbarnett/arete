@@ -1237,10 +1237,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 earlier[0]["id"] if earlier and earlier[0]["status"] not in ("done", "merged", "rejected") else "")
             if budget_history and budget_history[0]["status"] not in ("done", "merged", "rejected"):
                 parent = budget_history[0]["id"]
-            run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), "" if reset_budget else parent)
+            previous = "" if reset_budget else parent
+            fresh = bool(previous) and force and not restarting and not run.repairs and not run.alone and not (
+                flow and flow.continues)
+            current = tk.get(tid) if fresh else None
+            run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh)
             with run.budget.watching():
                 if not (flow and flow.refusal):
-                    run.budget.capture(tk.get(tid))
+                    run.budget.capture(current or tk.get(tid))
                 status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
