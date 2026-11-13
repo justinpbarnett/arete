@@ -87,9 +87,11 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
 def pending_refusal(job: Job) -> str:
     source = job.continues if job.only else job.run.id
     step = " --step pr" if factory.started(job.continues, "pr") else ""
-    return (f"{', '.join(job.pending)} holds commits of this run's chain that are not on origin, and preparing again "
-            "would drop them, so arete ran no model, reset nothing and left the commits on the branch and in the "
-            f"worktree; `arete resume {source}{step}` publishes them")
+    harm = ("a prepare run alone would change them outside that chain, which then could not publish them"
+            if job.only else "preparing again would drop them")
+    return (f"{', '.join(job.pending)} holds commits of this run's chain that are not on origin, and {harm}, so arete "
+            "ran no model, reset nothing and left the commits on the branch and in the worktree; "
+            f"`arete resume {source}{step}` publishes them")
 
 
 def kept_pending(job: Job, continues: str) -> bool:
@@ -409,7 +411,7 @@ class Job:
                 c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
 
     def hold(self, name: str) -> str:
-        if name != "prepare" or kept_pending(self, self.continues):
+        if name != "prepare" or not self.pending or not self.only and kept_pending(self, self.continues):
             return ""
         self.note_task()
         return pending_refusal(self)

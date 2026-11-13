@@ -198,16 +198,24 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
             last = mid = forced("--continue", failed["id"])
             layer.write_text(plain)
             mid["log"] = (paths.RUNS_DIR / mid["id"] / "run.log").read_text()
-        if scenario != "failed-resume-moved":
+        if "only-prepare" in scenario:
+            try:
+                factory.main(feature, ["replay-sample", task, "--continue", failed["id"], "--only", "prepare"])
+            except SystemExit:
+                pass
+            mid = state.ticket_runs("replay-sample", task)[0]
+            mid["unmoved"] = pipeline.git(["rev-parse", "HEAD"], ws).strip() == before
+        resuming = scenario in ("failed-resume-moved", "failed-resume-only-prepare-moved")
+        if not resuming:
             (replays / "build.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
-        again = ["--from", "prepare"] if "again-prepare" in scenario else ["--from", "checks"] if scenario == "failed-resume-moved" else []
+        again = ["--from", "prepare"] if "again-prepare" in scenario else ["--from", "checks"] if resuming else []
         row = forced("--continue", last["id"], *again)
         log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
         published = "refs/heads/" + branch in og("for-each-ref", "--format=%(refname)", "refs/heads")
         result = {"failed": failed["summary"], "status": row["status"], "summary": row["summary"], "log": log,
                   "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
                   "steps": [s["step"] for s in state.steps(row["id"])], "failed_id": failed["id"],
-                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log")},
+                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved")},
                   "unmoved": ws.exists() and pipeline.git(["rev-parse", "HEAD"], ws).strip() == before,
                   "moved": og("show", f"{branch}:moved.txt") if "moved" in scenario and published else "",
                   "published": og("show", f"{branch}:notes.txt") if published else "",
@@ -439,6 +447,22 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["moved"], "moved.txt")
         self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
         self.assertIn(f"Arete-Run: {result['mid']['id']}", result["trailers"])
+
+    def test_prepare_run_alone_leaves_kept_edits_for_the_resume_after_main_moved(self):
+        result = self.workflow("failed-resume-only-prepare-moved")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["mid"]["only_step"], "prepare")
+        self.assertEqual(result["mid"]["status"], "failed")
+        self.assertIn("a prepare run alone would change them outside that chain", result["mid"]["summary"])
+        self.assertIn(f"`arete resume {result['failed_id']}` publishes them", result["mid"]["summary"])
+        self.assertTrue(result["mid"]["unmoved"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("merged `origin/main` into the edits the last run kept", result["log"])
+        self.assertTrue(result["kept_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertEqual(result["moved"], "moved.txt")
+        self.assertIn(result["main"], result["head_parents"])
+        self.assertNotIn(f"Arete-Run: {result['mid']['id']}", result["trailers"])
 
     def assert_prepared_again_on_the_kept_edits(self, result):
         self.assertIn("checks still failing", result["failed"])
