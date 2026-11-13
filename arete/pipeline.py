@@ -580,11 +580,20 @@ def add_worktree(c: Checkout, branch: str, start: str) -> None:
         git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
 
 
+def scratch_named(names: set[str] | None, name: str) -> bool:
+    return name.startswith(paths.SCRATCH_PREFIX) and (names is None or name in names)
+
+
 def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
-    found = []
+    found, unproven = [], []
+    names = scratch.root_names()
     for d in {ws, *(c.wt for c in checkouts)}:
         if scratch.pending(d):
             found.append(d)
+
+        def unreadable(e: OSError, d: Path = d, found: list[Path] = found) -> None:
+            found.append(Path(e.filename) if e.filename else d)
+
         try:
             try:
                 d.lstat()
@@ -593,12 +602,16 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
             if d.is_symlink():
                 found.append(d)
                 continue
-            for root, dirs, files in os.walk(d, onerror=lambda e, found=found, d=d: found.append(d)):
-                found += [Path(root, n) for n in dirs + files if n.startswith(paths.SCRATCH_PREFIX)]
-                dirs[:] = [n for n in dirs if n != ".git" and not n.startswith(paths.SCRATCH_PREFIX)]
+            for root, dirs, files in os.walk(d, onerror=unreadable):
+                held = [n for n in dirs + files if scratch_named(names, n)]
+                found += [Path(root, n) for n in held]
+                unproven += [Path(root, n) for n in dirs + files
+                             if n.startswith(paths.SCRATCH_PREFIX) and n not in held]
+                dirs[:] = [n for n in dirs if n != ".git" and n not in held]
         except OSError:
             found.append(d)
-    return found
+    late = scratch.root_names()
+    return found + [p for p in unproven if scratch_named(late, p.name)]
 
 
 def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
@@ -707,8 +720,9 @@ SALT_KEY = "\0salt"
 
 
 def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
+    roots = scratch.root_names()
     return [n for n in names
-            if not any(part.startswith(paths.SCRATCH_PREFIX) for part in Path(n).parts)
+            if not any(scratch_named(roots, part) for part in Path(n).parts)
             and not any(h.is_relative_to(ws / n) for h in held)]
 
 
@@ -764,8 +778,9 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
 
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
-    if scratch_left(ws, checkouts):
-        raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
+    if left := scratch_left(ws, checkouts):
+        held = ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
+        raise RunFailed(f"unresolved or unknown scratch resources keep the existing workspace retained ({held})")
     if why := kept_work(ws, checkouts, source, copies):
         raise RunFailed(why)
     if not remove_workspace(ws, checkouts):
