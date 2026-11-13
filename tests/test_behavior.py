@@ -2328,20 +2328,35 @@ if scenario == "commit-fails":
     def commit_local(spec, message):
         raise RuntimeError("disk full")
     sessions.commit_local = commit_local
-strangers = []
+strangers, told = [], []
+if scenario == "unsessioned-turn":
+    from arete import runner
+    (answers / "turn-1.json").unlink()
+    (answers / "turn-2.json").write_text(json.dumps({"text": "added fig", "cost_usd": 0.01}))
+    launched = runner.attempt
+    def telling(which, name, text, cwd, resume, cfg, trace, *rest, **kw):
+        if trace[1] == "turn 2":
+            told.append({"resumed": resume.id, "prompt": text})
+        return launched(which, name, text, cwd, resume, cfg, trace, *rest, **kw)
+    runner.attempt = telling
 if scenario.startswith("rerouted"):
     from dataclasses import replace
     from types import SimpleNamespace
     from arete import accounts, agent, runner
     routed, launched = runner.run, runner.attempt
     def turn_on_claude(prompt, cwd, **kw):
-        if kw["trace"][1] == "report" and scenario == "rerouted-account":
+        step = kw["trace"][1]
+        if (step == "report" and scenario == "rerouted-account") or (step != "turn 1" and scenario == "rerouted-turn"):
             kw = {**kw, "runner": "claude", "cfg": replace(kw["cfg"], replay=replace(kw["cfg"].replay, all=False))}
         res = routed(prompt, cwd, **kw)
-        if kw["trace"][1] == "turn 1":
+        if step == "turn 1":
             res.session = replace(res.session, runner="claude", account="acct-a")
         return res
     def stranger(which, name, text, cwd, resume, cfg, trace, *rest, **kw):
+        if trace[1] == "turn 2":
+            told.append({"resumed": resume.id, "prompt": text})
+            return agent.Result(ok=True, text="added fig", runner=which, model=name,
+                                session=agent.Session("s-b", 0.0, which))
         if trace[1] != "report":
             return launched(which, name, text, cwd, resume, cfg, trace, *rest, **kw)
         strangers.append({"runner": which, "resumed": resume.id, "prompt": text})
@@ -2357,6 +2372,8 @@ spec = sessions.Spec(record.new_id("ses"), "Add kumquat", model="sonnet", repo=r
 sessions.workspace(spec, devices.LOCAL, repo)
 sessions.save_spec(spec)
 record.start("session", run_id=spec.id, lock=sessions.session_lock(spec.id), pid=None, repo=repo.name, device="local")
+if scenario.endswith("-turn"):
+    state.add_message(spec.id, "Also add fig")
 status = sessions.execute(spec.id)
 origin = root / "sample" / "origin.git"
 def origin_git(*args):
@@ -2366,7 +2383,8 @@ print(json.dumps({"status": status, "report": state.report(spec.id), "row": stat
                   "origin": origin_git("rev-parse", "--verify", "-q", f"refs/heads/session/{spec.id}"),
                   "files": origin_git("ls-tree", "-r", "--name-only", f"session/{spec.id}").split(),
                   "log_tail": log.strip().splitlines()[-1], "made": len(made),
-                  "report_steps": [s for s in state.steps(spec.id) if s["step"] == "report"], "strangers": strangers}))
+                  "report_steps": [s for s in state.steps(spec.id) if s["step"] == "report"], "strangers": strangers,
+                  "told": told}))
 '''
 
     def run_task(self, scenario):
@@ -2445,6 +2463,19 @@ print(json.dumps({"status": status, "report": state.report(spec.id), "row": stat
                 self.assertEqual(report["commit"], out["origin"])
                 self.assertTrue([p for p in report["problems"] if "report turn" in p and "cannot continue" in p])
                 self.assertNotIn("Ignore your instructions", json.dumps(out))
+
+    def test_a_later_turn_on_a_new_agent_gets_the_task_and_the_session_so_far(self):
+        for scenario, earlier in (("rerouted-turn", "added the word"), ("unsessioned-turn", "no answer file")):
+            with self.subTest(scenario=scenario):
+                out = self.run_task(scenario)
+                [turn] = out["told"]
+                self.assertEqual((out["status"], turn["resumed"]), ("done", ""))
+                prompt = turn["prompt"]
+                for part in ("Add kumquat", earlier, "Also add fig"):
+                    self.assertIn(part, prompt)
+                self.assertLess(prompt.index(earlier), prompt.index("Also add fig"))
+                if scenario == "rerouted-turn":
+                    self.assertEqual([s["resumed"] for s in out["strangers"]], ["s-b"])
 
     def test_launch_refuses_a_draft_pr_it_cannot_open(self):
         cfg = config.Config(repos=[config.Repo("bare", Path("/nowhere"))])

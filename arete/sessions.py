@@ -281,14 +281,23 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     recent = util.tail(log.read_text(errors="replace"), RECENT_CHARS) if log.exists() else ""
     log_line(spec, "you", prompt)
     resume = compacted(spec, cfg, device, prompt, recent, turn, resume)
-    res = runner.run(prompt, spec.cwd, trace=(spec.id, f"turn {turn}"), resume=resume,
-                     **turn_arguments(spec, cfg, device))
+    whole = handover(spec, prompt, recent) if turn > 1 else prompt
+    res = runner.run(prompt if resume.id else whole, spec.cwd, trace=(spec.id, f"turn {turn}"), resume=resume,
+                     fresh_prompt=lambda which: whole, **turn_arguments(spec, cfg, device))
     spec.turn_error = "" if res.ok else util.one_line(res.error, 400)
     record.note(spec.id, model=res.model, runner=res.runner)
     note = runner.cost_note(res)
     log_line(spec, "reply" if res.ok else "error", (res.text.strip() or "(no text)") + f"\n{note}" if res.ok
              else f"{res.error.strip()} {note}")
     return res.session if res.session.id else resume
+
+
+def handover(spec: Spec, prompt: str, recent: str) -> str:
+    return (f"An earlier agent worked on this session, and its conversation is not in your context. Its work is in "
+            f"{spec.cwd}; inspect the current state there before you change anything.\n\n"
+            f"## The session's first message\n\n{spec.prompt}\n\n"
+            f"## The end of the session log, oldest line first\n\n{recent.strip() or '(empty)'}\n\n"
+            f"## The new message\n\n{prompt}")
 
 
 def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, recent: str, turn: int,
