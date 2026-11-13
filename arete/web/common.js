@@ -259,10 +259,10 @@ function count(n, one, many) {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-async function call(path, body) {
+async function call(path, body, signal) {
   const changes = body !== undefined;
   const options = changes ? { method: "POST", headers: { "Content-Type": "application/json", "X-Arete": "1" }, body: JSON.stringify(body) }
-    : { cache: "no-store" };
+    : { cache: "no-store", signal };
   if (changes) changesInFlight++;
   try {
     const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });

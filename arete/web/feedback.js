@@ -9,7 +9,12 @@ let feedbackReturn = null;
 let feedbackTimer = 0;
 let feedbackDirty = false;
 let feedbackSaving = false;
-let feedbackReading = 0;
+const FEEDBACK_READ_MS = 8000;
+const FEEDBACK_ON_DEVICE = "The draft is kept on this device, and it saves again when the server answers.";
+let feedbackRead = false;
+let feedbackDiscarding = false;
+let feedbackSaveWaits = null;
+let feedbackBase = { ...FEEDBACK_EMPTY };
 let feedbackLine = Promise.resolve();
 
 function inFeedbackTurn(work) {
@@ -32,7 +37,10 @@ function feedbackFields() {
 function putFeedback(fields) {
   const kind = fields.kind || "idea";
   for (const radio of document.querySelectorAll("input[name=feedback-kind]")) radio.checked = radio.value === kind;
-  for (const name of FEEDBACK_TEXTS) feedbackBox(name).value = fields[name] ?? "";
+  for (const name of FEEDBACK_TEXTS) {
+    const value = fields[name] ?? "";
+    if (feedbackBox(name).value !== value) feedbackBox(name).value = value;
+  }
   feedbackBox("bug").hidden = kind !== "bug";
 }
 
@@ -77,17 +85,82 @@ function onFeedbackInput() {
   keepFeedbackHere(true);
   feedbackBox("bug").hidden = feedbackFields().kind !== "bug";
   clearTimeout(feedbackTimer);
-  feedbackTimer = setTimeout(saveFeedback, FEEDBACK_SAVE_MS);
+  feedbackTimer = 0;
+  saveFeedbackLater(FEEDBACK_SAVE_MS);
+}
+
+function saveFeedbackLater(ms) {
+  if (!feedbackTimer) feedbackTimer = setTimeout(saveFeedback, ms);
+}
+
+function feedbackAnswer() {
+  const stop = new AbortController();
+  let timer = 0;
+  const late = new Promise((_, refuse) => {
+    timer = setTimeout(() => {
+      stop.abort();
+      refuse(new NoAnswer("arete did not answer in time."));
+    }, FEEDBACK_READ_MS);
+  });
+  return Promise.race([call("/api/capture", undefined, stop.signal), late]).finally(() => clearTimeout(timer));
+}
+
+function mergedFeedbackText(typed, base, held) {
+  if (typed === base) return held;
+  if (held === base || !held || typed === held) return typed;
+  return typed ? `${held}\n\n${typed}` : held;
+}
+
+function mergeFeedback(draft) {
+  const held = Object.fromEntries(Object.keys(FEEDBACK_EMPTY).map((name) => [name, draft?.[name] || FEEDBACK_EMPTY[name]]));
+  const typed = feedbackFields();
+  const merged = { kind: typed.kind === feedbackBase.kind ? held.kind : typed.kind };
+  for (const name of FEEDBACK_TEXTS) merged[name] = mergedFeedbackText(typed[name], feedbackBase[name], held[name]);
+  putFeedback(merged);
+  feedbackBase = held;
+  feedbackRead = true;
+  feedbackDirty = JSON.stringify(merged) !== JSON.stringify(held);
+  keepFeedbackHere(feedbackDirty);
+  drawFeedbackContext(draft);
+}
+
+async function readFeedbackDraft() {
+  try {
+    const answered = await feedbackAnswer();
+    for (const name of FEEDBACK_TEXTS) {
+      feedbackBox(name).maxLength = answered.limits[name];
+      const line = feedbackBox(`${name}-limit`);
+      line.textContent = `${name === "text" ? "Required" : "Optional"} · up to ${answered.limits[name].toLocaleString("en-US")} characters`;
+    }
+    if (feedbackDiscarding) return;
+    mergeFeedback(answered.draft);
+    feedbackBox("result").hidden = true;
+  } catch (e) {
+    sayFeedback("caution", `${failedFeedback(e)} ${feedbackDirty ? FEEDBACK_ON_DEVICE : "This shows the copy kept on this device."}`);
+  }
+}
+
+function readFeedback() {
+  return inFeedbackTurn(async () => {
+    await readFeedbackDraft();
+    if (feedbackDirty) saveFeedbackLater(feedbackRead ? FEEDBACK_SAVE_MS : FEEDBACK_RETRY_MS);
+  });
 }
 
 async function sendFeedbackFields() {
-  if (!feedbackDirty) return;
+  if (!feedbackDirty || feedbackDiscarding) return;
+  if (!feedbackRead) {
+    await readFeedbackDraft();
+    if (!feedbackRead) return saveFeedbackLater(FEEDBACK_RETRY_MS);
+    if (!feedbackDirty) return;
+  }
   const sent = feedbackFields();
   let saved = false;
   feedbackSaving = true;
   try {
     const answered = await call("/api/capture", sent);
     saved = true;
+    feedbackBase = sent;
     if (JSON.stringify(feedbackFields()) === JSON.stringify(sent)) {
       feedbackDirty = false;
       keepFeedbackHere(false);
@@ -95,47 +168,21 @@ async function sendFeedbackFields() {
     drawFeedbackContext(answered.draft);
     sayFeedback("ok", `Draft saved at ${clock(new Date())}. It is kept, and nothing is filed.`);
   } catch (e) {
-    sayFeedback("caution", `${failedFeedback(e)} The draft is kept on this device, and it saves again when the server answers.`);
+    sayFeedback("caution", `${failedFeedback(e)} ${FEEDBACK_ON_DEVICE}`);
   } finally {
     feedbackSaving = false;
-    if (feedbackDirty && !feedbackTimer) feedbackTimer = setTimeout(saveFeedback, saved ? FEEDBACK_SAVE_MS : FEEDBACK_RETRY_MS);
+    if (feedbackDirty) saveFeedbackLater(saved ? FEEDBACK_SAVE_MS : FEEDBACK_RETRY_MS);
   }
 }
 
 function saveFeedback() {
   clearTimeout(feedbackTimer);
   feedbackTimer = 0;
-  return inFeedbackTurn(sendFeedbackFields);
-}
-
-function lockFeedback(locked) {
-  feedbackReading += locked ? 1 : -1;
-  const reading = feedbackReading > 0;
-  for (const name of FEEDBACK_TEXTS) feedbackBox(name).readOnly = reading;
-  for (const radio of document.querySelectorAll("input[name=feedback-kind]")) radio.disabled = reading;
-}
-
-function readFeedback() {
-  const lock = !feedbackDirty;
-  if (lock) lockFeedback(true);
-  return inFeedbackTurn(async () => {
-    try {
-      const answered = await call("/api/capture");
-      for (const name of FEEDBACK_TEXTS) {
-        feedbackBox(name).maxLength = answered.limits[name];
-        const line = feedbackBox(`${name}-limit`);
-        line.textContent = `${name === "text" ? "Required" : "Optional"} · up to ${answered.limits[name].toLocaleString("en-US")} characters`;
-      }
-      if (feedbackDirty) return;
-      putFeedback(answered.draft ?? FEEDBACK_EMPTY);
-      keepFeedbackHere(false);
-      drawFeedbackContext(answered.draft);
-    } catch {
-      // the copy kept on this device stays showing
-    } finally {
-      if (lock) lockFeedback(false);
-    }
+  feedbackSaveWaits ||= inFeedbackTurn(() => {
+    feedbackSaveWaits = null;
+    return sendFeedbackFields();
   });
+  return feedbackSaveWaits;
 }
 
 function drawFeedbackContext(draft) {
@@ -175,26 +222,39 @@ async function dropFeedbackContext() {
 }
 
 async function discardFeedback() {
+  if (feedbackDiscarding) return;
+  feedbackDiscarding = true;
   clearTimeout(feedbackTimer);
   feedbackTimer = 0;
-  const before = JSON.stringify(feedbackFields());
+  const clicked = feedbackFields();
   await inFeedbackTurn(async () => {
+    let failed = null;
     try {
       await call("/api/capture/discard", {});
     } catch (e) {
-      sayFeedback("caution", `The draft was not discarded: ${failedFeedback(e)} It is still kept.`);
-      if (feedbackDirty) feedbackTimer = setTimeout(saveFeedback, FEEDBACK_RETRY_MS);
+      failed = e;
+    }
+    feedbackDiscarding = false;
+    if (failed) {
+      sayFeedback("caution", `The draft was not discarded: ${failedFeedback(failed)} It is still kept.`);
+      if (feedbackDirty) saveFeedbackLater(FEEDBACK_RETRY_MS);
       return;
     }
+    const typed = feedbackFields();
+    const since = Object.fromEntries(Object.keys(FEEDBACK_EMPTY).map((name) => [name, typed[name] === clicked[name] ? FEEDBACK_EMPTY[name] : typed[name]]));
+    putFeedback(since);
+    feedbackBase = { ...FEEDBACK_EMPTY };
+    feedbackRead = true;
     drawFeedbackContext(null);
-    if (JSON.stringify(feedbackFields()) !== before) {
-      sayFeedback("ok", "Discarded the draft. What you typed since is kept as a new draft.");
+    feedbackDirty = JSON.stringify(since) !== JSON.stringify(FEEDBACK_EMPTY);
+    if (!feedbackDirty) {
+      forgetFeedbackHere();
+      sayFeedback("ok", "Discarded the draft.");
       return;
     }
-    putFeedback(FEEDBACK_EMPTY);
-    feedbackDirty = false;
-    forgetFeedbackHere();
-    sayFeedback("ok", "Discarded the draft.");
+    keepFeedbackHere(true);
+    saveFeedbackLater(FEEDBACK_SAVE_MS);
+    sayFeedback("ok", "Discarded the draft. What you typed since is kept on this device and saves as a new draft.");
   });
 }
 
@@ -227,8 +287,10 @@ function wireFeedback() {
   if (kept) putFeedback(kept);
   if (kept?.unsaved) {
     feedbackDirty = true;
+    feedbackRead = true;
     saveFeedback();
   } else {
+    feedbackBase = feedbackFields();
     readFeedback();
   }
 }
