@@ -292,12 +292,31 @@ def current(snapshot: dict, name: str, now: datetime) -> dict:
     return applied(snapshot, "", (name,), now)
 
 
+def schedule_changes(before: dict, after: dict) -> list[str]:
+    old = dict(enumerate(before["rates"], 1))
+    new = dict(enumerate(after["rates"], 1))
+    found = []
+    for n in sorted(old.keys() | new.keys()):
+        left, right = old.get(n), new.get(n)
+        label = "conditional rate" if (left or {}).get("when") or (right or {}).get("when") else "rate"
+        if left is None or right is None:
+            found.append(f"{label} {n} {json.dumps(left, sort_keys=True)} -> "
+                         f"{json.dumps(right, sort_keys=True)}")
+            continue
+        for key in (*COMPONENTS, "when", "from", "until"):
+            a, b = left.get(key), right.get(key)
+            if moved(a, b) if key in COMPONENTS else a != b:
+                found.append(f"{label} {n} {key} {a} -> {b}")
+    return found
+
+
 def changes(name: str, old: dict, new: dict, now: datetime) -> list[str]:
     before, after = current(old, name, now), current(new, name, now)
     found = [f"{key} {before[key]} -> {after[key]}" for key in COMPONENTS if moved(before[key], after[key])]
     for key in ("currency", "unit", "kind", "provider", "model", "retired", "replacement"):
         if before[key] != after[key]:
             found.append(f"{key} {before[key]} -> {after[key]}")
+    found += schedule_changes(index(old)[name], index(new)[name])
     return found
 
 
@@ -316,6 +335,14 @@ def diff(old: dict | None, new: dict, now: datetime) -> list[dict]:
             found.append({"route": name, "finding": "changed",
                           "detail": f"alias {name} moved from {old_names[name]['route']} "
                                     f"to {new_names[name]['route']}"})
+    for name in sorted(new_names.keys() - old_names.keys()):
+        if name != new_names[name]["route"]:
+            found.append({"route": name, "finding": "added",
+                          "detail": f"alias {name} added to {new_names[name]['route']}"})
+    for name in sorted(old_names.keys() - new_names.keys()):
+        if name != old_names[name]["route"]:
+            found.append({"route": name, "finding": "dropped",
+                          "detail": f"alias {name} removed from {old_names[name]['route']}"})
     found += [{"route": name, "finding": "added", "detail": "new route"} for name in sorted(after - before)]
     found += [{"route": name, "finding": "dropped", "detail": "no longer listed"} for name in sorted(before - after)]
     return found

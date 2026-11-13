@@ -877,7 +877,7 @@ Names match a route exactly, with no fuzzy vendor or id matching, so a native an
 
 A rate applies when its period holds the clock's time. A `min_input_tokens` rate applies when the request's input is known to reach it: the size estimate in previews, the call's input tokens in a record when it took one turn. The last applicable rate wins whole, and the `unproven` list in the quote names in-effect conditional rates left out. A route whose entry has no applicable rate has an unknown quote and sorts last.
 
-Findings: `stale` (observed over 30 days ago, or no rate in effect), `retired` (with the replacement), `changed` (an applicable component moved by 1% or more or became known or unknown, a currency, unit, kind, provider, model or lifecycle field differs, or an alias moved), `added` and `dropped`.
+Findings: `stale` (observed over 30 days ago, or no rate in effect), `retired` (with the replacement), `changed` (an applicable component moved by 1% or more or became known or unknown, a currency, unit, kind, provider, model or lifecycle field differs, or an alias moved), `added` and `dropped` (routes or aliases). All rate schedules are compared separately, including material component changes, additions, removals, order, conditions and effective periods, even for unconditional, expired or future rates. This comparison does not make an unproven rate applicable.
 
 ## Replay
 
