@@ -11,7 +11,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from . import util
+from . import outbound, util
 
 ENV_KEYS = ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
 TIMEOUT = 30
@@ -154,7 +154,7 @@ class Client:
         return self._paged(f"/rest/api/2/issue/{_path_segment(key)}/comment", key="comments", orderBy="created")
 
     def comment(self, key: str, markdown: str) -> None:
-        self.request("POST", f"/rest/api/3/issue/{_path_segment(key)}/comment", body={"body": adf(markdown)})
+        self.request("POST", f"/rest/api/3/issue/{_path_segment(key)}/comment", body={"body": adf(outbound.screen(markdown))})
 
     def edit_labels(self, key: str, add: list[str] = (), remove: list[str] = ()) -> None:
         ops = [{"add": a} for a in add] + [{"remove": r} for r in remove]

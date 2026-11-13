@@ -1,6 +1,6 @@
 from arete import factory
 from arete.pipeline import round_name
-from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, end_dry_run, ended, finish, step
+from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, documents, end_dry_run, ended, finish, step
 
 
 def feature(flow):
@@ -35,6 +35,8 @@ def built(flow, first):
         n += 1
         outcome = step(flow, "review", attempt=n, tries=reviews)
     step(flow, "learn", tree=ws, apply=True)
+    if documents(job):
+        step(flow, "document", tree=ws)
     if job.run.dry_run:
         return end_dry_run(flow)
     for name, kw in [("pr", {"tree": ws}), *([("ci", {"tree": ws})] if job.run.repo.parts else []), ("publish", {})]:

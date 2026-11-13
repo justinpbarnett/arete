@@ -12,11 +12,12 @@ CODEX_INSTRUCTIONS = ("repo",)
 DEFAULTS = {"tools": tuple(runner.READ_TOOLS), "mcp": (), "session": "fresh"}
 BUILT_IN = {"build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
             "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
-            "research_plan": {"timeout_minutes": 10, "tries": 2}}
+            "research_plan": {"timeout_minutes": 10, "tries": 2},
+            "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
-KEEPS_NO_SESSION = ("learn", "uat", "research_plan")
-READ_ONLY = ("research_plan",)
+KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "document")
+READ_ONLY = ("research_plan", "document")
 
 
 @dataclass(frozen=True)
