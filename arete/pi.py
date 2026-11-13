@@ -140,6 +140,8 @@ class Route:
     managed: ManagedCredential | None = field(default=None, repr=False)
     using_login: bool = False
     sensitive_files: tuple[Path, ...] = field(default=(), repr=False)
+    local: bool = False
+    key_supported: bool = False
 
     @property
     def key_available(self) -> bool:
@@ -381,7 +383,7 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     error = token_error
     if not error and not provider:
         error = f"pi needs provider/model or defaultProvider in {owner.parent / 'settings.json'} before choosing credentials"
-    elif not error and provider == "anthropic" and not key:
+    elif not error and provider == "anthropic" and (mode in ("login", "subscription") or not key):
         error = ANTHROPIC_KEY_REQUIRED
     elif not error and provider != "anthropic" and (
             (mode in ("login", "subscription") and not login) or (not chosen_login and not (has_key or local))):
@@ -439,7 +441,8 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
                  login_held=login_held,
                  owner=owner, key=key, key_name=key_name, models=clean_models, settings=clean_settings, env=env,
                  hidden=tuple(v for v in hidden if len(v) >= 8), managed=managed if not chosen_login else None,
-                 using_login=chosen_login, sensitive_files=tuple(sorted(files)))
+                 using_login=chosen_login, sensitive_files=tuple(sorted(files)), local=local,
+                 key_supported=supported and provider != "openai-codex")
 
 
 def private_dir(path: Path) -> None:
