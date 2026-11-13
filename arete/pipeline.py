@@ -16,7 +16,7 @@ import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from string import Template
@@ -36,6 +36,7 @@ from . import (
     outbound,
     paths,
     record,
+    routing,
     runner,
     state,
     steps,
@@ -281,12 +282,27 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(s.step, NO_SESSION) if s.session == "resume" else NO_SESSION, **kw}
         cfg = kw.get("cfg") or self.config
+        if s and s.requires.declared and not cfg.replay.all:
+            size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
+            found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer)
+            servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers", {})
+            bare, denied = runner.reach(kw)
+            effective = replace(s, tools=bare, denied=denied, mcp=tuple(servers))
+            picked = routing.select(found, effective, request_tokens=size)
+            kw["route"] = routing.described_selection(picked, effective, size)
+            if picked.error:
+                kw["refusal"] = picked.error
+            elif alternative := picked.route:
+                kw.update(model=alternative.model, runner=alternative.runner, effort=alternative.effort,
+                          instructions=list(alternative.instructions), mode=alternative.mode)
+                self.log(f"{step}: {picked.reason}")
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
         which, model = runner.chosen(kw.get("model", ""), run_with, cfg)
         effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost
         tier, kind = kw.setdefault("tier", s.tier if s else ""), kw.setdefault("kind", self.kind)
         kw.setdefault("waits", self.waiting)
         kw.setdefault("repo", self.repo)
+        kw.setdefault("layer", self.layer)
         seam = factory.inside(self.id)
         lined = self.writes_lines and seam is None
         if s:

@@ -946,7 +946,7 @@ def cmd_steps(args) -> int:
     except (ValueError, TypeError) as e:
         print(f"{where}{e}", file=sys.stderr)
         return 1
-    found = None if cfg.replay.all else routing.Discovery(cfg, repo)
+    found = None if cfg.replay.all else routing.Discovery(cfg, repo, layer=layer)
     for s in sheet:
         notes = list(s.notes)
         if s.runner == "pi" and not cfg.replay.all:
@@ -959,7 +959,9 @@ def cmd_steps(args) -> int:
                 notes.append("pi anthropic: paid api_key route (Anthropic Console key)")
         remaining = routing.loop_budget_left(cfg) if s.step in ("loop", "classify") else None
         routes = routing.described(found.routes(s, remaining)) if found else []
-        print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes,
+        selection = (routing.described_selection(routing.select(found, s, remaining), s, 0)
+                     if found and s.requires.declared else None)
+        print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes, "selection": selection,
                           "payment_modes": list(config.allowed_payment_modes(cfg, layer))}))
     return 0
 
