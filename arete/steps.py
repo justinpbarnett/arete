@@ -13,11 +13,13 @@ DEFAULTS = {"tools": tuple(runner.READ_TOOLS), "mcp": (), "session": "fresh"}
 BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
             "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
             "research_plan": {"timeout_minutes": 10, "tries": 2},
+            "research_search": {"timeout_minutes": 10, "tries": 2, "tools": runner.WEB_TOOLS},
             "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
-KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "document")
-READ_ONLY = ("research_plan", "document")
+KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "research_search", "document")
+READ_ONLY = ("research_plan", "research_search", "document")
+SEARCHES = ("research_search",)
 
 
 @dataclass(frozen=True)
@@ -151,17 +153,18 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
 
 def check_reach(where: str, cfg: config.Config, role: str, which: str, found: dict, instructions: tuple) -> None:
     tools, mcp = found["tools"], found["mcp"]
+    web = runner.WEB_TOOLS if role in SEARCHES else ()
     if role in READ_ONLY:
-        if acting := [t for t in tools if t not in runner.READ_ONLY_TOOLS]:
+        if acting := [t for t in tools if t not in runner.READ_ONLY_TOOLS and t not in web]:
             raise ValueError(f"{where}: tools {', '.join(acting)} would let {role} change files; it is read only, "
                              "so use Read, Glob, Grep and LS")
         if mcp:
             raise ValueError(f"{where}: mcp {', '.join(mcp)} cannot load on {role}, which is read only and takes "
                              "no servers")
-    if bad := [t for t in tools if t not in STEP_TOOLS]:
+    if bad := [t for t in tools if t not in STEP_TOOLS and t not in web]:
         raise ValueError(f"{where}: tools {', '.join(bad)} is not a built in tool a step takes; use "
                          f"{', '.join(STEP_TOOLS)}, since shell rules come from the layer and servers from mcp")
-    if which in ("pi", "codex") and (missing := [t for t in runner.READ_TOOLS if t not in tools]):
+    if which in ("pi", "codex") and role not in SEARCHES and (missing := [t for t in runner.READ_TOOLS if t not in tools]):
         raise ValueError(f"{where}: tools {', '.join(tools) or '[]'} leaves out {', '.join(missing)}, which {which} always "
                          "grants; list them")
     if which == "pi" and mcp:
