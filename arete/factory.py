@@ -354,6 +354,8 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
                    help="run this step alone, the steps before it from the stored outcomes")
     p.add_argument("--from", dest="again", default="", choices=sorted(STEPS),
                    help="with --continue, run this step again and every step after it")
+    p.add_argument("--repair", dest="repairs", default="", metavar="RUN",
+                   help="continue the open PR of this held run from its saved internal review")
     p.add_argument("--set", dest="sets", action="append", default=[], metavar="STEP.KEY=VALUE",
                    help="override one setting of one step; repeat for more")
     args = p.parse_args(argv)
@@ -361,7 +363,8 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
         table = overrides(args.sets, flows.ROLE_OF)
     except (ValueError, TypeError) as e:
         p.error(str(e))
-    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again)
+    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
+                             args.repairs)
     try:
         code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
     except config.UnknownRepo as e:

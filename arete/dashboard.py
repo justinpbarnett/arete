@@ -336,6 +336,8 @@ class Handler(BaseHTTPRequestHandler):
                     return tasks.reply(run_id, str(self.body().get("text") or ""))
                 if action == "resume":
                     return tasks.resume(run_id, str(self.body().get("step") or ""))
+                if action == "repair":
+                    return tasks.repair(run_id)
                 if action.startswith("steps/"):
                     return tasks.run_step(run_id, action[len("steps/"):], self.body().get("set") or {})
             if path.startswith(APPROVAL_PATH):

@@ -59,12 +59,13 @@ When the server restarts on new code, `just adw-wait` connects again by itself a
 | `just adw-logs <id> [step]` | all of the run's lines, or one step's lines |
 | `just adw-answer <id> "<text>"` | answers a question and starts the next run |
 | `just adw-resume <id> [step]` | continues at the first unfinished step, or from a named one |
+| `just adw-repair <id>` | repairs the open held PR of a run from its saved review findings, with no new plan; prints the repair run |
 | `just adw-step <id> <step> [key=value ...]` | runs one step alone, with overrides such as `model=opus` or `effort=high` |
 | `just adw-stop <id>` | stops a run |
 | `just adw-costs [days]` | cost and time by step, kind and model, then the wait minutes |
 | `just adw-steps [repo]` | the step sheet with each step's resolved settings |
 
-`adw`, `adw-ticket`, `adw-answer`, `adw-resume` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the new run's id in `run`, or `queued` with an empty `run`, and `why` says which.
+`adw`, `adw-ticket`, `adw-answer`, `adw-resume`, `adw-repair` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the new run's id in `run`, or `queued` with an empty `run`, and `why` says which.
 
 ## One whole session
 
@@ -133,6 +134,7 @@ just adw-wait RUN2
 | status | next |
 |---|---|
 | `done`, `pr` | it shipped: `done` pushed a branch, `pr` opened or updated a pull request; tell the person |
+| `pr` with `review.unresolved` true | the PR is a held draft whose last review still requested changes; `held` says why. Tell the person, or `just adw-repair <id>` to feed those findings back once more |
 | `needs-info` | the run asked a question; see below |
 | `failed` | read `summary` and the `error` line, and `just adw-logs <id>` for the step that failed; then `just adw-resume <id>`, which runs the failed step again, or tell the person |
 | `stopped`, `interrupted` | `just adw-resume <id>` goes on from where it stopped |

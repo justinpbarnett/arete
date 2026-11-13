@@ -386,6 +386,7 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 | event | fields |
 |---|---|
 | `task` | `ticket`, `kind`, `repo`, `title`, and `path` (the name of the script in `adws/` that ran it, such as `feature`) for a run from a [script](#the-adw-scripts); when the run starts |
+| `repair` | `source` (the run whose saved review this run repairs); in the new run that `POST /api/runs/RUN_ID/repair` starts. The `report` line gains `review.unresolved` (the last review still requests changes) and `held` (why the PR stays a draft, or empty) |
 | `answer` | `asked_in` (the run that asked), `question`, `text` (the answer given through `POST /api/runs/RUN_ID/answer`, or empty); in the new run that the author's reply starts |
 | `step_start` | `step`, `runner`, `model`, `provider`, `auth_mode`, `credential`, `billing`, `effort`, `requested_effort`, `tier` (the route's tier, or empty), `position`, `requested`, `kind` (the task's kind), `launch` (1 for the first provider call of an agent call, higher after a fallback), `skipped` (the routes passed over, each with `runner`, `model`, `credential`, `state`, `detail`, `until`), `env` (the sorted names of the variables the agent starts with, never their values; see [An agent's environment](#an-agents-environment)); before each agent call. An agent call that falls back writes one `step_start` per launch. A [seam](#the-seam) step writes `step` and `try` for its own line, and a seam step that calls an agent (`plan`, `implement`, `revise`, `verify`, `review`, `learn`) adds a line per launch with `step`, `try`, `call` (the agent call's name) and the route fields above; extra launches never change `try` |
 | `heartbeat` | `step`, `seconds` so far; every 30 seconds while a step works (`lines.HEARTBEAT_SECONDS`) |
@@ -427,10 +428,11 @@ A run with open review feedback takes the revise flow (`adws/revise.py`); any ot
 | `prepare` | Reads the ticket, holds a closed or blocked one, saves its images, picks the branch, makes the worktree, loads the layer, copies files and runs the setup commands. A revise run whose PR closed ends quietly. |
 | `plan` | Feature flow. Plans; asks the author when the plan is ambiguous or over `max_diff_lines`. |
 | `revise` | Revise flow, in place of `plan` and `implement`. Changes the code for the review comments and drafts a reply to each. With nothing staged it answers the comments with no code change, posts `No code changes for your review.` and pushes nothing. |
-| `implement` | The build, then a fix round after each failed check (`fix2` and up), the review fix, and inside `ci` the CI fix (`ci_fix` and up) with the red output. |
+| `repair` | Repair flow, in place of `plan` and `implement`. Reads the saved internal review of the run named by `--repair`, checks that the PR head holds a commit of that run, and changes the code for the findings. It fails with nothing staged, so the findings stay unresolved. |
+| `implement` | The build, then a fix round after each failed check (`fix2` and up), the review fixes (`review_fix`, `review_fix2`), and inside `ci` the CI fix (`ci_fix` and up) with the red output. |
 | `checks` | Runs the layer's checks. A fail goes back to `implement` until the build step's `tries` run out; then learn runs without applying and the run fails. |
 | `verify` | Checks the change in use, with its own rounds as in a classic run. |
-| `review` | Reviews. `request_changes` goes back to `implement` once, then `checks`, `verify` and `review` again. |
+| `review` | Reviews. `request_changes` goes back to `implement`, then `checks`, `verify` and `review` again, until the review step's `tries` reviews are used (`review`, `review2`, ...). The last review that still requests changes ends `fail`, and the run still publishes a held draft whose report keeps `review.unresolved` and `held`. |
 | `learn` | Rewrites `expertise.md` as a classic run does. |
 | `pr` | Commits the staged change with `git.subject` and the ticket ref and pushes it. With a `github` name it opens each PR, or pushes to the open one, with the classic body, sibling section, labels and draft rule; its outcome holds the PR links. Without one it notes the branch on the run. |
 | `ci` | With a `github` name, watches CI in rounds. A red check this change caused runs `implement` with the red output, then the push and the watch again. |
@@ -449,17 +451,20 @@ The order of an adw run's steps lives in short scripts in `adws/` at the top of 
 |---|---|
 | `adws/feature.py` | The feature flow: `prepare`, `plan`, `implement`, the `checks` and fix loop, `verify`, `review` and the review fix, `learn`, then `pr`, `ci` and `publish`. |
 | `adws/revise.py` | The revise flow: the same order with `revise` in place of `plan` and `implement`. |
+| `adws/repair.py` | The repair flow: the same order with `repair` in place of `plan` and `implement`, on the branch of an open held PR. |
 | `adws/step.py` | Runs one step of an earlier run alone. |
 
 ```
 python adws/feature.py <repo> <ticket> [--force] [--dry-run] [--continue RUN] [--from STEP] [--only STEP] [--set step.key=value ...]
 python adws/revise.py  <repo> <ticket> [same options]
+python adws/repair.py  <repo> <ticket> --repair RUN [--force] [--set step.key=value ...]
 python adws/step.py    <run id> <step> [key=value ...]
 ```
 
 Run them with the Python that has arete installed (`uv run python adws/feature.py ...` from the checkout).
 
 - `--continue RUN` takes the passing steps of that earlier run of the same ticket (see `continues` in [The seam](#the-seam)). A run id of another repo or ticket is refused before any run starts.
+- `--repair RUN` starts a new run on the open PR branch of that earlier run of the ticket, from the findings of its saved internal review (see [API](#api)). It does not go with `--continue`, `--from`, `--only` or `--dry-run`, and is refused when a later run of the ticket exists.
 - `--from STEP` with `--continue` takes the stored outcomes up to the last call of that step, then runs it and every step after it again. It needs `--continue` and does not go with `--only`.
 - `--only STEP` runs that step alone and takes the steps before it from the stored outcomes; with no `--continue` there are none, so it refuses, naming the first step it could not take. The run ends with the status `step`, exits 0 only when the step passed, and leaves the ticket and the tracker as they were. Its `runs` row holds the step in `only_step`, so the ticket's history looks past it: the poller still restarts an interrupted run, a second interruption still fails the ticket, and a run after a question still answers it. A step run that dies or is stopped is settled `interrupted` or `stopped` with no comment, no ticket move and no restart.
 - `--set step.key=value` overrides one setting of one step for this run, with the keys and values of `[steps]` (see [Steps](#steps)); repeat it for more. The step names are the seam's (`plan`, `implement`, `revise`, `verify`, `review`, `learn`); `implement` and `revise` both set the build step. A value `[steps]` would not take is refused before any run starts.
@@ -710,7 +715,7 @@ A step is named by its `[models]` role. `implement` is a second name for `build`
 | `provider` | For pi, the provider put before a model name that does not start with it. |
 | `effort` | claude's `--effort` (`low`, `medium`, `high`, `xhigh`, `max`), pi's `--thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), or codex's `model_reasoning_effort` (`low`, `medium`, `high`, `xhigh`, `max`, `ultra`). Left out, the runner's own default. |
 | `timeout_minutes` | The step's time limit. Default `limits.timeout_minutes`; learn 15, uat 10, research_plan 10. The checks keep `limits.timeout_minutes`. |
-| `tries` | For build, the fix attempts after failed checks and the CI fix rounds; for verify, the rounds of verify in use; for uat, the tries at the test steps. Default `limits.max_attempts`; uat 3; for research_plan, the plans asked for before the run fails, default 2. The other steps run once. |
+| `tries` | For build, the fix attempts after failed checks and the CI fix rounds; for review, the most reviews in one run (a failed review costs a try, and a final `request_changes` keeps the PR a held draft with its findings unresolved); for verify, the rounds of verify in use; for uat, the tries at the test steps. Default `limits.max_attempts`; uat 3; for research_plan, the plans asked for before the run fails, default 2. The other steps run once. |
 | `tools` | The built in tools the step may use, from `Read`, `Glob`, `Grep`, `LS`, `Edit`, `MultiEdit`, `Write` and `TodoWrite`. Default `Read`, `Glob`, `Grep`, `Edit`, `Write` and `TodoWrite` for build, `Read`, `Glob` and `Grep` for the rest. The layer's shell rules still apply on top. pi always grants `Read`, `Glob` and `Grep`, so a pi step lists them. |
 | `mcp` | Names of `[mcp.<name>]` servers from `~/.config/arete/config.toml`; claude and codex load those and no others. Default `[]`. verify also gets its own browser server when the layer serves an app, and that server wins over one of the same name. pi takes no servers. codex refuses servers with `env` values. |
 | `instructions` | Which standing instruction files load: `user` and `repo`. Default both on claude (`~/.claude/CLAUDE.md`, the repo's `CLAUDE.md` and `CLAUDE.local.md`), `[]` on pi, and `["repo"]` on codex (repo `AGENTS.md` or `AGENTS.override.md`, supplied as developer instructions with automatic project document loading disabled). codex refuses `user`; if the login has global instruction files that the CLI cannot exclude, the call is withheld automatically. On claude, a value short of both becomes `--setting-sources`, which also leaves out that source's `settings.json`. pi runs with `--no-context-files` and takes only `[]`. |
@@ -997,10 +1002,11 @@ It answers `{"task", "repo", "run", "state", "why"}`. `state` is `running` with 
 
 `GET /api/runs/RUN_ID/events` returns the run's [lines](#run-lines) as `application/x-ndjson`. `?from=SEQ` starts after that `seq`, and `?follow=1` keeps the response open and sends each new line until the `report` line, or until the run has stopped or its process has died and no line comes.
 
-These routes steer a ticket's run. The first three answer `{"task", "repo", "run", "state", "why"}` as `POST /api/tasks` does, with the run they started:
+These routes steer a ticket's run. The first four answer `{"task", "repo", "run", "state", "why"}` as `POST /api/tasks` does, with the run they started:
 
 - `POST /api/runs/RUN_ID/answer` with `{"text": "..."}` answers the question of a run that ended `needs-info`. It stores the answer on the ticket, as the owner's reply on a local task, a comment on a GitHub issue, which then loses its `needs-info` label, or a comment on a Jira ticket, and keeps it in the run's folder as `answer.md`. Then it starts the ticket's next run, whose `answer` line carries the `text`. A run of the ticket going on, or no free slot, refuses with 409 before the answer is stored. A label GitHub would not remove is named in `why`, and the run starts anyway.
 - `POST /api/runs/RUN_ID/resume` resumes a run that ended `interrupted`, `stopped` or `failed`, with the script in `adws/` it ran and `--continue`, so with no step it takes every step the old run finished, failures it moved past included, and goes on from where it stopped. A run that ended `failed` runs the step whose failure ended it again, with every step after it. `{"step": "verify"}` runs that step and every step after it again instead. A run still marked running whose process is gone is settled first, as the poll would. A run of the classic path, a run of one step alone, and a step the run never started are refused.
+- `POST /api/runs/RUN_ID/repair` repairs a held PR from the saved internal review of the run that left it. It starts a new run with `adws/repair.py` on the run's own PR branch and plan, with no plan step, a work folder made again from the PR's head when it was removed, and the configured build, verify and review settings; the run's `repair` line names the source and its first step's data the review evidence, and the findings are never posted as a GitHub comment or stored as owner feedback. It refuses a run that is not the ticket's latest, a run whose last review approved or saved no findings, a closed or merged PR, a PR branch holding no commit of that run (rewritten), and a run still going. A new commit on the branch on top of the run's is kept, and checks, verify and review run again on it. A second request while a repair of that run exists answers that run, so a retry after an uncertain launch starts nothing. The repair run follows the normal slot, lock and stop rules; one that fails or is stopped continues with `resume`. An approved repair leaves the PR a draft for a person to mark ready, and the merge rules are unchanged.
 - `POST /api/runs/RUN_ID/steps/STEP` runs one step of a run that has ended alone, as `adws/step.py` does, and `{"set": {"model": "opus"}}` overrides that step's settings. It refuses a run that did not come from a script, a step the run never started, settings for a step that calls no agent or that `[steps]` would not take, and a run whose work folder is gone when its branch is not on origin; a gone folder whose branch is on origin is made again from it.
 - `POST /api/runs/RUN_ID/stop` stops a running run as before, and the run ends with a `stopped` report.
 
@@ -1026,6 +1032,7 @@ Each of these commands makes one call to the server and prints JSON and nothing 
 | `arete lines RUN_ID [--step STEP] [--follow]` | `GET /api/runs/RUN_ID/events` |
 | `arete answer RUN_ID "TEXT"` | `POST /api/runs/RUN_ID/answer` |
 | `arete resume RUN_ID [--step STEP]` | `POST /api/runs/RUN_ID/resume` |
+| `arete repair RUN_ID` | `POST /api/runs/RUN_ID/repair` |
 | `arete step RUN_ID STEP [key=value ...]` | `POST /api/runs/RUN_ID/steps/STEP` |
 | `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
