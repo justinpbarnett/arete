@@ -673,7 +673,7 @@ def note_made(ws: Path, checkouts: list[Checkout]) -> None:
     made_record(ws).unlink(missing_ok=True)
 
 
-def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> str:
+def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True) -> str:
     made = made_before(ws)
     salt = str(made.get(SALT_KEY) or "")
 
@@ -688,7 +688,7 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
         try:
             edits = unknown([c.prefix + n for n in uncommitted(c.wt)])
             ignored = unknown([c.prefix + n for n in ignored_files(c.wt)])
-            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip()
+            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip() if commits else "0"
             if made.get(head_key(c)) == git(["rev-parse", "HEAD"], c.wt).strip():
                 ahead = "0"
         except (RuntimeError, OSError) as e:
@@ -1258,7 +1258,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             current = tk.get(tid) if fresh else None
             run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh)
             with run.budget.watching():
-                run.budget.capture(current or tk.get(tid))
+                if not (flow and flow.refusal):
+                    run.budget.capture(current or tk.get(tid))
                 status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
