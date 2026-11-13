@@ -131,7 +131,8 @@ def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]
     waiting = Counter(item["loop"] for item in state.pending(connect))
     spent: dict[str, float] = defaultdict(float)
     for s in state.steps_since(day_ago(), connect, paid_only=True):
-        spent[s.get("loop") or ""] += s["cost_usd"] or 0
+        if billing_of(s, cfg) not in ("local", "replay"):
+            spent[s.get("loop") or ""] += s["cost_usd"] or 0
     out = []
     for loop in every_loop:
         last = next(iter(state.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=connect)), None)
@@ -227,6 +228,8 @@ def costs(days: float | None = None, connect=state.db, cfg: config.Config | None
 
 def billing_of(step: dict, cfg: config.Config) -> str:
     which, mode = step.get("runner") or "", step.get("auth_mode") or ""
+    if which == "replay":
+        return "replay"
     if state.local_step(step, cfg.local_providers):
         return "local"
     return "subscription" if subscription(which, step.get("provider") or "", mode) else "api_key"
@@ -257,7 +260,7 @@ def step_costs(by: str, days: float | None = None, connect=state.db, cfg: config
                                           if by == "route" else {}),
                                        **dict.fromkeys(TOKEN_FIELDS, 0), "minutes": 0.0, "api_minutes": 0.0})
         local = route["billing"] == "local"
-        cost = 0 if local else s["cost_usd"] or 0
+        cost = 0 if local or route["billing"] == "replay" else s["cost_usd"] or 0
         side = "subscription_usd" if route["billing"] == "subscription" else "paid_usd"
         row["runs"].add(s["run_id"])
         row["calls"] += 1

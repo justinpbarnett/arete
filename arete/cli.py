@@ -890,8 +890,9 @@ def cmd_costs(args) -> int:
                   f"{row['tokens_in']:>10,} in  {row['tokens_out']:>9,} out")
     print("by route:")
     for row in c["by_route"][:12]:
-        spend = (f"paid ${row['paid_usd']:.2f}" if row["billing"] != "subscription"
-                 else f"subscription reported ${row['subscription_usd']:.2f}")
+        spend = (f"subscription reported ${row['subscription_usd']:.2f}" if row["billing"] == "subscription"
+                 else f"{row['billing']} ${row['cost_usd']:.2f}" if row["billing"] in ("local", "replay")
+                 else f"paid ${row['paid_usd']:.2f}")
         print(f"  {row['name']:<52} {spend:<32} {row['calls']:>5} calls  {row['tokens_in']:>10,} in  "
               f"{row['cache_read']:>10,} cache rd  {row['cache_write']:>9,} cache wr  {row['tokens_out']:>9,} out")
     return 0
