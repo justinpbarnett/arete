@@ -1923,5 +1923,196 @@ class PushedPrDraftTests(unittest.TestCase):
         self.assertEqual(self.names("pr", "merge"), [])
 
 
+class ChatContextTests(unittest.TestCase):
+    PRELUDE = r'''
+import json, sys, time
+from pathlib import Path
+from arete import chat, config, paths, record, state
+
+root = Path(sys.argv[1])
+answers = root / "replay"
+
+
+def put(name, body):
+    (answers / f"{name}.json").write_text(json.dumps(body))
+
+
+def reply(text):
+    return {"text": "", "structured": {"reply": text, "issue_title": "", "issue_body": ""}}
+
+
+def take(chat_id, text):
+    chat.send(chat_id, text)
+    deadline = time.monotonic() + 60
+    while chat.view(chat_id)["busy"]:
+        assert time.monotonic() < deadline, "the chat never finished"
+        time.sleep(0.05)
+    return chat.view(chat_id)
+
+
+def header(name):
+    return next(record.lines(paths.record_dir("chat") / f"{name}{record.RECORD_SUFFIX}"), {})
+
+
+def answer_of(n):
+    return "chat-1" if n == 1 else f"chat-1{n}"
+
+
+def record_of(n):
+    return "chat-1" if n == 1 else f"chat-1-{n}"
+
+
+def summary_answer_of(k):
+    return "chat-1-summary" if k == 1 else f"chat-1-summary{k}"
+
+
+def summary_records():
+    return sorted(p.name for p in paths.record_dir("chat").glob(f"chat-1-summary*{record.RECORD_SUFFIX}"))
+
+
+def summary_header(k):
+    return header("chat-1-summary" if k == 1 else f"chat-1-summary-{k}")
+
+
+def result(**fields):
+    print("BEHAVIOR_RESULT=" + json.dumps(fields))
+
+
+state.ensure_schema()
+assert chat.new("")["id"] == 1
+'''
+
+    def scratch(self, body):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay", "home", "tmp"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text(
+                f'[replay]\nall = true\ndir = "{root / "replay"}"\n\n[chat]\ncontext_tokens = 100\n\n[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=180, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            return json.loads(output)
+
+    FRUITS = r'''
+fruits = ["APRICOT" + " word" * 18, "PLUM" + " word" * 18, "PEAR" + " word" * 18, "And now?"]
+'''
+
+    def test_each_turn_is_a_fresh_call_built_from_the_saved_messages(self):
+        found = self.scratch(r'''
+put("chat-1", {**reply("The poll ran at noon."),
+               "tool_calls": [{"name": "Bash", "input": {"command": "arete status"}, "result": "poll: last ran 12:00"}]})
+put("chat-12", reply("Noted."))
+one = take(1, "When did APRICOT poll run?")
+take(1, "Thanks")
+result(senders=[m["sender"] for m in one["messages"]], first=header("chat-1")["prompt"], second=header("chat-1-2"))
+''')
+        self.assertEqual(found["senders"], ["you", "tool", "arete"])
+        self.assertEqual(found["first"], "When did APRICOT poll run?")
+        self.assertIsNone(found["second"].get("resume"))
+        for part in ("When did APRICOT poll run?", "Tool: Bash: arete status → poll: last ran 12:00", "The poll ran at noon."):
+            self.assertIn(part, found["second"]["prompt"])
+
+    def test_saved_history_over_the_budget_is_summarized_and_the_newest_messages_stay(self):
+        found = self.scratch(self.FRUITS + r'''
+for n in range(1, 5):
+    put(answer_of(n), reply(f"Reply {n}."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK the owner asked about two fruits."})
+counts = []
+for n, text in enumerate(fruits, 1):
+    last = take(1, text)
+    counts.append(len(summary_records()))
+result(counts=counts, summary=last["summary"], prompt=header(record_of(4))["prompt"], model=summary_header(1).get("model"),
+       summary_prompt=summary_header(1).get("prompt", ""))
+''')
+        self.assertEqual(found["counts"], [0, 0, 0, 1])
+        self.assertEqual(found["model"], "haiku")
+        self.assertTrue(found["summary"].startswith("SUMMARYMARK"))
+        prompt = found["prompt"]
+        self.assertIn("SUMMARYMARK", prompt)
+        self.assertIn("You: PEAR" + " word" * 18, prompt)
+        self.assertIn("Arete: Reply 3.", prompt)
+        self.assertNotIn("APRICOT", prompt)
+        self.assertNotIn("PLUM", prompt)
+        self.assertTrue(prompt.endswith("And now?"))
+
+    def test_a_long_new_message_alone_writes_no_summary(self):
+        found = self.scratch(r'''
+put("chat-1", reply("Reply 1."))
+put("chat-12", reply("Reply 2."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK wrongly written."})
+long = "long " * 120
+take(1, "When did APRICOT poll run?")
+last = take(1, long)
+result(records=summary_records(), summary=last["summary"], prompt=header(record_of(2))["prompt"], long=long)
+''')
+        self.assertEqual(found["records"], [])
+        self.assertEqual(found["summary"], "")
+        self.assertIn("You: When did APRICOT poll run?", found["prompt"])
+        self.assertIn("Arete: Reply 1.", found["prompt"])
+        self.assertTrue(found["prompt"].endswith(found["long"]))
+        self.assertNotIn("left out", found["prompt"])
+
+    def test_a_long_message_in_another_script_is_batched_within_the_budget(self):
+        found = self.scratch(r'''
+put("chat-1", reply("Reply 1."))
+put("chat-12", reply("Reply 2."))
+for k in range(1, 7):
+    put(summary_answer_of(k), {"text": "摘" * 200})
+take(1, "汉" * 200)
+last = take(1, "And now?")
+records = summary_records()
+result(counts=[summary_header(k)["prompt"].count("汉") for k in range(1, len(records) + 1)],
+       sizes=[chat.size_of(chat.render({"sender": "you", "text": "汉" * summary_header(k)["prompt"].count("汉")}))
+              for k in range(1, len(records) + 1)],
+       summary_size=chat.size_of(last["summary"]), summarized_to=state.chat_get(1)["summarized_to"],
+       chinese_id=state.chat_messages(1)[0]["id"])
+''')
+        self.assertGreaterEqual(len(found["counts"]), 2)
+        self.assertEqual(sum(found["counts"]), 200)
+        self.assertTrue(all(size <= 100 for size in found["sizes"]), found["sizes"])
+        self.assertLessEqual(found["summary_size"], 25)
+        self.assertEqual(found["summarized_to"], found["chinese_id"])
+
+    def test_a_failed_summary_keeps_the_saved_summary_and_messages_within_the_budget(self):
+        found = self.scratch(self.FRUITS + r'''
+turns = [*fruits, "FIG" + " word" * 18, "Still there?"]
+for n in range(1, 7):
+    put(answer_of(n), reply(f"Reply {n}."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK the owner asked about two fruits."})
+put(summary_answer_of(2), {"ok": False, "error": "the summary model is down"})
+counts = []
+for n, text in enumerate(turns, 1):
+    if n == 6:
+        saved = chat.view(1)["messages"]
+        before = chat.view(1)["summary"]
+    last = take(1, text)
+    counts.append(len(summary_records()))
+prompt = header(record_of(6))["prompt"]
+kept = [m for m in saved if chat.render(m) in prompt]
+result(counts=counts, before=before, summary=last["summary"], prompt=prompt, last=last["messages"][-1]["text"],
+       size=chat.size_of(last["summary"], chat.render_all(kept)), kept=len(kept))
+''')
+        self.assertEqual(found["counts"], [0, 0, 0, 1, 1, 2])
+        self.assertTrue(found["before"].startswith("SUMMARYMARK"))
+        self.assertEqual(found["summary"], found["before"])
+        prompt = found["prompt"]
+        self.assertIn(found["summary"], prompt)
+        self.assertIn("left out because their summary could not be written", prompt)
+        self.assertIn("You: FIG" + " word" * 18, prompt)
+        self.assertIn("Arete: Reply 5.", prompt)
+        self.assertNotIn("PEAR", prompt)
+        self.assertGreater(found["kept"], 0)
+        self.assertLessEqual(found["size"], 100)
+        self.assertEqual(found["last"], "Reply 6.")
+
+
 if __name__ == "__main__":
     unittest.main()
