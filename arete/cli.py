@@ -632,19 +632,21 @@ def implementation_manifest(path) -> bool:
 def cmd_implementations(args) -> int:
     import tomllib
 
-    from . import experiment, implbench
+    from . import experiment, implbench, workers
 
     if args.action == "run" and args.json:
-        print("usage: arete benchmark run MANIFEST [--dry-run] [--out FILE] | report FILE [--json] | sample FOLDER",
-              file=sys.stderr)
+        print("usage: arete benchmark run MANIFEST [--dry-run] [--out FILE] | report FILE [--json] | "
+              "sample FOLDER [--workers]", file=sys.stderr)
         return 2
     try:
         if args.action == "sample":
-            print("\n".join(implbench.sample(paths.expand(args.folder))))
+            print("\n".join((workers.sample if args.workers else implbench.sample)(paths.expand(args.folder))))
             return 0
         if args.action == "report":
-            return implbench.show(paths.expand(args.file), args.json)
-        return implbench.run(paths.expand(args.manifest), args.out or "", args.dry_run)
+            file = paths.expand(args.file)
+            return (workers.show if workers.holds(file) else implbench.show)(file, args.json)
+        manifest = paths.expand(args.manifest)
+        return (workers.run if workers.declared(manifest) else implbench.run)(manifest, args.out or "", args.dry_run)
     except (experiment.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -1824,6 +1826,7 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--json", action="store_true", help="print one JSON line")
     b = bsub.add_parser("sample", help="write a replay fixture for the implementation benchmark into a new folder")
     b.add_argument("folder", metavar="FOLDER", help="a new, empty folder")
+    b.add_argument("--workers", action="store_true", help="write the bounded-worker fixture instead")
     b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
     b.add_argument("--port", type=int, required=True)
     b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")

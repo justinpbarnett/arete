@@ -9,6 +9,7 @@ import signal
 import threading
 import time
 import tomllib
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -68,6 +69,7 @@ class Experiment:
     reviews: bool = False
     checks_required: bool = False
     skip: frozenset = frozenset()
+    make_run: Callable | None = None
 
 
 @dataclass
@@ -504,6 +506,9 @@ class TrialRun(evals.EvalRun):
     call_timeout: float = 0.0
     stopped_by: str = ""
 
+    def outcomes(self) -> dict:
+        return {}
+
     def used(self) -> Totals:
         rows = state.steps(self.id)
         paid = state.paid_by_run([self.id], local_providers=self.config.local_providers).get(self.id, 0.0)
@@ -655,10 +660,11 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                      "run": run_id, "at": util.iso()}
             append(path, begun)
             started = time.monotonic()
-            trial = TrialRun(id=run_id, repo=exp.repo, dir=paths.RUNS_DIR / run_id, cfg=exp.cfg, task=task,
-                             trial=f"{arm}-{repeat}", step_overrides=trial_overrides(exp, arm), limits=exp.limits,
-                             reviews=exp.reviews, checks_required=exp.checks_required,
-                             before=replace(used, seconds=used.seconds + waited))
+            given = {"id": run_id, "repo": exp.repo, "dir": paths.RUNS_DIR / run_id, "cfg": exp.cfg, "task": task,
+                     "trial": f"{arm}-{repeat}", "step_overrides": trial_overrides(exp, arm), "limits": exp.limits,
+                     "reviews": exp.reviews, "checks_required": exp.checks_required,
+                     "before": replace(used, seconds=used.seconds + waited)}
+            trial = exp.make_run(exp, arm, given) if exp.make_run else TrialRun(**given)
             trial.dir.mkdir(parents=True, exist_ok=True)
             try:
                 with alive(path, run_id, started), replay_folder(exp, task, arm, repeat):
@@ -666,7 +672,8 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                                             evals.Prompts(), run=trial)
             except (KeyboardInterrupt, pipeline.Stopped):
                 record.settle(run_id, "stopped", summary=record.STOPPED)
-                append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started))
+                append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started,
+                                        outcomes=trial.outcomes()))
                 raise
             failures = result["failures"] or ([result["why"]] if result["why"] else [])
             stopped_by = trial.stopped_by or reached(exp.limits, trial.used(), launching=False)
@@ -676,7 +683,8 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
             append(path, trial_line(exp, path, begun, "capped" if stopped_by else "done", time.monotonic() - started,
                                     result["passed"] and not stopped_by, failures, result["repairs"],
                                     {"checks": result["checks"], "verify": result["verify"],
-                                     "hidden_check": result["hidden"], "blocking_findings": result["blocking"]}))
+                                     "hidden_check": result["hidden"], "blocking_findings": result["blocking"],
+                                     **trial.outcomes()}))
             return stopped_by
     finally:
         held.close()
