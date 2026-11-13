@@ -235,14 +235,26 @@ if scenario.startswith("asked"):
     passing, patch = (answers / "build.json").read_text(), (answers / "build.patch").read_text()
     asking = {"questions": [{"header": "Spelling", "question": "How is it spelled?", "kind": "text"}],
               "why": "The task leaves it open.", "tried": "Read the task."}
+    placing = {**asking, "questions": [{"header": "Place", "question": "Where does it go?", "kind": "text"}]}
+    calls = [asking, placing] if scenario == "asked-twice" else [asking]
     (answers / "build.json").write_text(json.dumps({"text": "Asked.", "ok": True,
-                                                    "tool_calls": [{"name": "ask_owner", "input": asking}]}))
+                                                    "tool_calls": [{"name": "ask_owner", "input": a} for a in calls]}))
     (answers / "build.patch").unlink()
     parked = forced()
     ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
     waiting = state.asks_of(parked["id"], "open")
     first = [json.loads(line) for line in (paths.RUNS_DIR / parked["id"] / "run.jsonl").read_text().splitlines()]
     result = {"parked": parked["status"], "worktree": ws.is_dir(), "open": len(waiting), "notices": len(notices)}
+    if scenario == "asked-twice":
+        from arete import control, tasks
+        result["parked_id"] = parked["id"]
+        tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "Spelled with a K, as in kumquat-7."}]})
+        for name, call in (("resent", lambda: tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "again"}]})),
+                           ("resumed", lambda: tasks.resume(parked["id"]))):
+            try:
+                result[name] = call()
+            except control.Refused as e:
+                result[name] = str(e)
     for ask in waiting:
         state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
     gone = scenario == "asked-gone"
@@ -262,6 +274,10 @@ if scenario.startswith("asked"):
             def stop_while_waiting(run, text):
                 said(run, text)
                 if "waiting for a free run slot" in text:
+                    try:
+                        tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "again"}]})
+                    except control.Refused as e:
+                        result["while_starting"] = str(e)
                     record.ask_stop(run.id)
                     os.kill(os.getpid(), signal.SIGTERM)
             with full(), mock.patch.object(pipeline.Run, "log", stop_while_waiting):
@@ -375,11 +391,24 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertTrue(result["waited_continues"])
         self.assertEqual(result["untaken"], [""])
         self.assertTrue(result["refusal_names_it"])
+        self.assertIn("which is starting with them", result["while_starting"])
+        self.assertNotIn("arete resume", result["while_starting"])
         self.assertTrue(result["resumes_it"])
         self.assertEqual((result["status"], result["skipped"]), ("done", 2))
         self.assertTrue(result["same_session"])
         self.assertTrue(result["answered"])
         self.assertEqual(result["taken"], [True])
+
+    def test_answer_sent_again_while_another_ask_waits_names_that_ask_not_a_resume(self):
+        result = self.workflow("asked-twice")
+        self.assertEqual((result["parked"], result["open"]), ("needs-info", 2))
+        self.assertIn(f"stored for run {result['parked_id']}, which goes on with them when its 1 other ask is answered",
+                      result["resent"])
+        self.assertNotIn("arete resume", result["resent"])
+        self.assertIn("ended needs-info", result["resumed"])
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True, True])
 
     def test_answered_run_killed_while_waiting_for_a_slot_restarts_with_the_answers(self):
         result = self.workflow("asked-killed-waiting")

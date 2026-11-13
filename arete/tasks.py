@@ -268,10 +268,7 @@ def answer_ask(ask_id: str, body) -> dict:
         if not ask:
             raise control.NotFound(f"no ask {ask_id}")
         if ask["status"] != "open":
-            holder = answers_holder(ask) if ask["status"] == "answered" and not ask["taken_by"] else ""
-            held = (f"; its answers are stored for run {holder}, and `arete resume {holder}` continues it with them "
-                    "if it is not running" if holder else "")
-            raise control.Refused(f"ask {ask_id} is {ask['status']}, so it takes no answer{held}")
+            raise control.Refused(f"ask {ask_id} is {ask['status']}, so it takes no answer{answers_held(ask)}")
         cfg, repo, row = run_of(ask["run"])
         if row["status"] != "needs-info":
             raise control.Refused(f"run {row['id']} is {row['status']}, so ask {ask_id} takes no answer")
@@ -296,11 +293,38 @@ def answer_ask(ask_id: str, body) -> dict:
         return continue_asked(cfg, repo, row, command)
 
 
-def answers_holder(ask: dict) -> str:
+def answers_holder(ask: dict) -> dict | None:
     newest = state.ticket_runs(ask["repo"], ask["ticket"], limit=1, whole=True)
     if newest and ask["run"] in {newest[0]["id"], *flows.chain_runs(newest[0]["id"])}:
-        return newest[0]["id"]
-    return ""
+        return newest[0]
+    return None
+
+
+def answers_held(ask: dict) -> str:
+    if ask["status"] != "answered" or ask["taken_by"] or not (holder := answers_holder(ask)):
+        return ""
+    run_id = holder["id"]
+    held = f"; its answers are stored for run {run_id}"
+    if still_running(holder):
+        return f"{held}, which is starting with them"
+    if more := len(state.asks_of(run_id, "open")):
+        waiting = f"{util.count(more, 'other ask')} {'is' if more == 1 else 'are'}"
+        return f"{held}, which goes on with them when its {waiting} answered"
+    if holder["status"] in (*RESUMABLE, "running") or parked_with_answers(holder):
+        return f"{held}, and `arete resume {run_id}` continues it with them"
+    return held
+
+
+def still_running(row: dict) -> bool:
+    if row["status"] != "running":
+        return False
+    with record.dead(row) as gone:
+        return not gone
+
+
+def parked_with_answers(row: dict) -> bool:
+    held = pipeline.answered_run(row["repo"], str(row["issue"]))
+    return bool(held) and held["id"] == row["id"]
 
 
 def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:
@@ -379,8 +403,7 @@ def resume(run_id: str, step: str = "") -> dict:
             row = state.run_get(run_id) or row
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; stop it first")
-        if row["status"] == "needs-info" and (held := pipeline.answered_run(row["repo"], str(row["issue"]))) \
-                and held["id"] == run_id:
+        if parked_with_answers(row):
             return continue_asked(cfg, repo, row)
         if row.get("only_step"):
             raise control.Refused(f"run {run_id} ran {row['only_step']} alone; resume the run it continued")
