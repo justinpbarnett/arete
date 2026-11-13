@@ -50,8 +50,52 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     job = Job(cfg, run, ws, slot=slot)
+    if continues and not only and (moved := base_moved(continues)):
+        run.log(f"{moved} since run {continues} prepared, so this run prepares again and redoes every step after it")
+        job.kept = unsaved_work(continues)
+        again = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
                         restore=lambda line: restore(job, line))
+
+
+def prepared_data(continues: str) -> dict:
+    prepared = [line for line in factory.history(factory.chain(continues))
+                if line.get("step") == "prepare" and line.get("result") == "pass"]
+    data = prepared[-1].get("data") if prepared else None
+    return data if isinstance(data, dict) else {}
+
+
+def unsaved_work(continues: str) -> str:
+    data = prepared_data(continues)
+    for c in data.get("checkouts") or []:
+        wt = Path(c.get("wt") or "")
+        if not (wt / ".git").exists():
+            continue
+        try:
+            edits = pipeline.uncommitted(wt)
+            kept = util.git(["rev-parse", "-q", "--verify", f"origin/{data.get('branch')}"], wt, check=False).strip()
+            ahead = util.git(["rev-list", "--first-parent", "--no-merges", "--count",
+                              f"{kept or c.get('base_commit') or 'HEAD'}..HEAD"], wt, check=False).strip()
+        except RuntimeError:
+            continue
+        if edits or ahead not in ("", "0"):
+            what = f"uncommitted edits ({', '.join(edits[:5])})" if edits else "commits that are not on origin"
+            return (f"{c.get('github')} holds {what} in {wt}, so arete did not prepare it again for the moved base "
+                    "and left them as they are")
+    return ""
+
+
+def base_moved(continues: str) -> str:
+    for c in prepared_data(continues).get("checkouts") or []:
+        if not isinstance(c, dict) or not c.get("base_commit"):
+            continue
+        try:
+            now = pipeline.remote_head(Path(c["src"]), c["base"])
+        except RuntimeError:
+            continue
+        if now and now != c["base_commit"]:
+            return f"`origin/{c['base']}` moved from {c['base_commit'][:12]} to {now[:12]} in {c['github']}"
+    return ""
 
 
 def remade(line: dict) -> tuple[str, list[pipeline.Checkout], str]:
@@ -120,6 +164,7 @@ class Job:
     cfg: config.Config
     run: pipeline.Run
     ws: Path
+    kept: str = ""
     ticket: tracker.Ticket = field(default_factory=lambda: tracker.Ticket("", "", ""))
     branch: str = ""
     checkouts: list[pipeline.Checkout] = field(default_factory=list)
@@ -336,14 +381,20 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         tk.prepare()
     if not run.alone:
         run.enter("running")
+    if job.kept:
+        return end_as("fail", "failed", why=job.kept)
     if repo.parts and not run.dry_run:
         checkouts = pipeline.make_workspace(run.id, repo, main_layer.base_branch, branch, run.tid)[1]
     else:
         checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws)
     for c in checkouts:
         run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
-    for c in pipeline.merge_moved_bases(run, [c for c in checkouts if c.resumes]):
-        c.merged_base = True
+    run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
+    pipeline.note_fresh_bases(checkouts)
+    try:
+        pipeline.merge_moved_bases(run, [c for c in checkouts if c.resumes], main_layer, t)
+    except pipeline.RunFailed as e:
+        return end_as("fail", "failed", why=e.why, detail=e.detail)
     for c in checkouts:
         c.revision = util.git(["rev-parse", "HEAD"], c.wt).strip()
     layer = pipeline.resolve_layer(cfg, run, job.ws)

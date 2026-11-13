@@ -155,6 +155,12 @@ REVISE_SCHEMA = {
     },
     "required": ["summary", "replies"],
 }
+RESOLVE_SCHEMA = {
+    "type": "object",
+    "properties": {"resolved": {"type": "boolean"}, "summary": {"type": "string"}},
+    "required": ["resolved", "summary"],
+}
+CONFLICT_MARKER = re.compile(r"^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)( |$)", re.MULTILINE)
 CI_FIX_SCHEMA = {
     "type": "object",
     "properties": {
@@ -423,6 +429,10 @@ class Checkout:
     resumes: bool = False
     merged_base: bool = False
     revision: str = ""
+    base_commit: str = ""
+    resolved: list[str] = field(default_factory=list)
+    merge: str = ""
+    resolved_lines: int = 0
 
     @property
     def prefix(self) -> str:
@@ -434,8 +444,12 @@ class Checkout:
             return f"fresh from `{self.base}`"
         start = (f"continuing the open PR {self.pr}" if self.pr
                  else "continuing commits already pushed to the branch, with no PR yet")
-        return start + (f", with `{self.origin_base}` merged in since the base moved after the last push"
-                        if self.merged_base else "")
+        if not self.merged_base:
+            return start
+        at = f" at `{self.base_commit[:12]}`" if self.base_commit else ""
+        fixed = (f"; arete resolved its merge conflicts in {', '.join(f'`{p}`' for p in self.resolved)}"
+                 if self.resolved else "")
+        return start + f", with `{self.origin_base}`{at} merged in since the base moved after the last push" + fixed
 
     @property
     def pr_name(self) -> str:
@@ -547,6 +561,9 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
         out += diff
         out.changed.append(c)
         out.patch += checkout_patch(c, diff.locks, "--cached", against)
+        if c.resolved and not from_base:
+            out.patch += git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
+                              c.base_commit, "HEAD", "--", *c.resolved], c.wt)
     return out
 
 
@@ -739,7 +756,7 @@ class Build(TicketWork):
         staged = self.restage()
         if not staged.files:
             raise RunFailed(f"{after} undid every change")
-        earlier = 0 if self.from_base else self.committed_lines
+        earlier = 0 if self.from_base else self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
         why = staged.refusal(self.layer.max_diff_lines, earlier=earlier)
         if staged.denied:
             raise RunFailed(f"{after} {why}")
@@ -1169,8 +1186,12 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     ws, checkouts = make_workspace(run.id, repo, main_layer.base_branch, branch, t.id)
     for c in checkouts:
         run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
-    for c in merge_moved_bases(run, [c for c in checkouts if c.resumes]):
-        c.merged_base = True
+    run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
+    note_fresh_bases(checkouts)
+    try:
+        merge_moved_bases(run, [c for c in checkouts if c.resumes], main_layer, t)
+    except RunFailed as e:
+        return _fail(run, e.why, detail=e.detail)
     layer = resolve_layer(cfg, run, ws)
     run.cfg, run.layer, run.kind = cfg, layer, t.kind
     if why := furnish(cfg, run, layer, ws):
@@ -1653,22 +1674,125 @@ def ci_target(c: Checkout) -> ci.Target:
     return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.base)
 
 
-def merge_moved_bases(run: Run, checkouts: list[Checkout], log_prefix: str = "") -> list[Checkout]:
+def unmerged_paths(wt: Path) -> list[str]:
+    return util.git_records(["diff", "--name-only", "--diff-filter=U"], wt)
+
+
+def uncommitted(wt: Path) -> list[str]:
+    drop_untracked_bytecode(wt)
+    return [r[3:] for r in util.git_records(["status", "--porcelain", "--untracked-files=all"], wt)]
+
+
+def marked(wt: Path, names: list[str]) -> list[str]:
+    return [n for n in names if (wt / n).is_file()
+            and CONFLICT_MARKER.search((wt / n).read_text(errors="replace"))]
+
+
+def abort_merge(wt: Path) -> None:
+    if git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], wt, check=False).strip():
+        git(["merge", "--abort"], wt, check=False)
+
+
+def resolution_diff(c: Checkout) -> diffguard.Diff:
+    if not c.resolved:
+        return diffguard.Diff()
+    return diffguard.between(c.wt, c.base_commit, "HEAD", "--", *c.resolved, prefix=c.prefix)
+
+
+def note_fresh_bases(checkouts: list[Checkout]) -> None:
+    for c in checkouts:
+        if not c.resumes:
+            c.base_commit = git(["rev-parse", "HEAD"], c.wt).strip()
+
+
+def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
+                      log_prefix: str = "") -> list[Checkout]:
     merged = []
     for c in checkouts:
-        try:
-            if git(["rev-list", "--count", f"HEAD..{c.origin_base}"], c.wt).strip() == "0":
-                continue
-            util.git_as_owner(["merge", "-q", "--no-edit", c.origin_base], c.wt)
-        except RuntimeError as e:
-            git(["merge", "--abort"], c.wt, check=False)
-            run.log(f"{log_prefix}could not merge `{c.origin_base}` into the branch in {c.github}, so this run works "
-                    f"on the branch as it is: {e}")
+        c.base_commit = git(["rev-parse", c.origin_base], c.wt).strip()
+        if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
             continue
-        run.log(f"{log_prefix}merged `{c.origin_base}` into the branch in {c.github}, since the base moved after "
-                "the last push")
+        if edits := uncommitted(c.wt):
+            raise RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
+                            "them and left them as they are")
+        head = git(["rev-parse", "HEAD"], c.wt).strip()
+        with record.timed(run.id, "base_merge", repo=c.github, base=c.base, base_commit=c.base_commit,
+                          head=head) as rec:
+            try:
+                try:
+                    with util.repo_lock(c.src):
+                        util.git_as_owner(["merge", "-q", "--no-edit", c.base_commit], c.wt)
+                except RuntimeError as e:
+                    conflicts = unmerged_paths(c.wt)
+                    if not conflicts:
+                        raise RunFailed(f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}")
+                    rec["conflicts"] = conflicts
+                    resolve_conflicts(run, c, conflicts, layer, ticket)
+                else:
+                    conflicts = []
+                rec["outcome"] = "resolved" if conflicts else "clean"
+                rec["merge"] = c.merge = git(["rev-parse", "HEAD"], c.wt).strip()
+            except BaseException:
+                abort_merge(c.wt)
+                raise
+        c.merged_base, c.resolved = True, conflicts
+        c.resolved_lines = resolution_diff(c).lines
+        run.log(f"{log_prefix}merged `{c.origin_base}` into the branch in {c.github}, "
+                + (f"and resolved conflicts in {', '.join(conflicts)}" if conflicts
+                   else "since the base moved after the last push"))
         merged.append(c)
     return merged
+
+
+def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: config.RepoLayer,
+                      ticket: tracker.Ticket) -> None:
+    deny = diffguard.denied_paths(layer)
+    if protected := [p for p in conflicts if util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny)]:
+        raise RunFailed(f"merging `{c.origin_base}` conflicts in protected paths in {c.github} "
+                        f"({', '.join(protected)}), which a person must merge")
+    tries = max(1, run.settings("build").tries)
+    feedback = "this is the first attempt"
+    for n in range(1, tries + 1):
+        untracked_before = untracked_files(c.wt)
+        previous = run.sessions.get("build")
+        text = prompt("resolve", repo=run.repo.name, github=c.github, base=c.origin_base,
+                      base_commit=c.base_commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
+                      ref=ticket.ref, title=ticket.title, body=ticket.body,
+                      conflicts="\n".join(f"- `{p}`" for p in conflicts),
+                      branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
+                      base_log=git(["log", "--oneline", "-n30", "HEAD..MERGE_HEAD"], c.wt),
+                      commands=code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback)
+        try:
+            res = run.agent(round_name("resolve", n), text, c.wt, role="build",
+                            allowed_tools=bash_rules(layer.builder_bash), disallowed_tools=runner.NO_GIT_WRITES,
+                            json_schema=RESOLVE_SCHEMA, resume=NO_SESSION)
+        finally:
+            if previous is None:
+                run.sessions.pop("build", None)
+            else:
+                run.sessions["build"] = previous
+        if not res.ok:
+            raise RunFailed(f"the conflict resolution step failed: {res.error}", res.text)
+        answer = res.structured if isinstance(res.structured, dict) else {}
+        if answer.get("resolved") is not True:
+            raise RunFailed(f"the resolver could not keep both the branch's work and the base's in {c.github}: "
+                            f"{answer.get('summary') or 'no reason given'}", res.text)
+        drop_untracked_bytecode(c.wt)
+        touched = set(util.git_records(["diff", "--name-only"], c.wt)) | (untracked_files(c.wt) - untracked_before)
+        if outside := sorted(touched - set(conflicts)):
+            raise RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
+        if left := marked(c.wt, conflicts):
+            feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
+            if n == tries:
+                raise RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
+                                f"in {c.github}")
+            continue
+        git(["add", "-A", "--", *conflicts], c.wt)
+        if unmerged_paths(c.wt):
+            raise RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
+        with util.repo_lock(c.src):
+            util.git_as_owner(["commit", "-q", "--no-edit"], c.wt)
+        return
 
 
 def merge_moved_bases_for_ci_fix(b: Build, watched: list[Checkout]) -> str:
@@ -1681,11 +1805,13 @@ def merge_moved_bases_for_ci_fix(b: Build, watched: list[Checkout]) -> str:
                       f"is: {e}")
             continue
         fetched.append(c)
-    merged = merge_moved_bases(b.run, fetched, "ci: ")
+    merged = merge_moved_bases(b.run, fetched, b.layer, b.ticket, "ci: ")
     if not merged:
         return ""
     names = ", ".join(f"`{c.origin_base}` into `{c.prefix or './'}`" for c in merged)
-    return (f"Before this step arete merged {names}, since the base moved after the last push. CI tested the PR "
+    fixed = "".join(f" Arete resolved merge conflicts in {', '.join(f'`{p}`' for p in c.resolved)} of "
+                    f"`{c.prefix or './'}`." for c in merged if c.resolved)
+    return (f"Before this step arete merged {names}, since the base moved after the last push.{fixed} CI tested the PR "
             "merged with that base, so the worktree now holds what CI ran, and files the base added are yours to "
             "edit like any other.")
 
@@ -1693,7 +1819,12 @@ def merge_moved_bases_for_ci_fix(b: Build, watched: list[Checkout]) -> str:
 def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: list[Checkout],
              fix: CiFix | None = None) -> str:
     run = b.run
-    merged_base = merge_moved_bases_for_ci_fix(b, watched)
+    try:
+        merged_base = merge_moved_bases_for_ci_fix(b, watched)
+    except RunFailed as e:
+        for r in reds:
+            r.reason = "Arete could not merge the moved base before judging this check."
+        raise RunFailed(e.why, ci.red_list(reds))
     logs = run.dir / "ci"
     logs.mkdir(exist_ok=True)
     if logs not in run.add_dirs:
