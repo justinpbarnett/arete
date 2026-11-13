@@ -1072,6 +1072,76 @@ The grader is the pipeline's verifier, started on the layer's `[verify]`. It res
 
 `arete eval REPO --prompts DIR` runs the plan, build and fix steps with the prompts in `DIR`. The grader keeps the installed prompt, so the judge never moves with what it judges.
 
+## Verifier suites
+
+A verifier has to catch a regression as well as accept a working UI. `arete verifiers` runs candidate verifiers (arms) over known-good states, seeded regressions and real historical failures, each with numbered requirements and an expected label, then reports how often each arm got them wrong. It uses the pipeline's own verifier call and `[verify]` browser setup, and changes no prompt.
+
+```toml
+name = "counter"                 # letters, digits, _ and -
+repo = "toy"                     # optional: a configured repo, for its layer, environment and [verify]
+repeats = 2                      # trials per task and arm, default 1
+max_false_pass_rate = 0.0        # required, 0 to 1: the most false passes you accept
+
+[limits]                         # required, all above 0
+minutes = 15                     # whole suite
+spend_usd = 1.0                  # whole suite
+timeout_minutes = 5              # one trial
+
+[verify]                         # start, url, ready, ready_seconds, notes, allow_bash, preflight_seconds, [verify.preflight]
+start = "python3 -m http.server {port} --bind 127.0.0.1"
+url = "http://127.0.0.1:{port}"
+
+[arms.careful]                   # tier, runner, provider, model, effort
+model = "replay:scratch-a"
+
+[tasks.reset-missing]
+kind = "seeded_regression"       # known_good (expect pass), seeded_regression or historical_failure (expect fail)
+expect = "fail"
+title = "Counter page"
+prompt = "The page is a counter with Add one and Reset."
+requirements = ["The page shows Count: 0", "Add one makes it 1", "Reset sets it back to 0"]
+fails = [3]                      # requirements that must fail; none for a pass
+state = "ui/missing"             # a folder of plain files beside the manifest, or base = "4f1c2ab" (a commit of repo)
+source = "https://github.com/acme/toy/pull/110"   # optional, recorded only
+```
+
+Unknown keys are refused. A `.git` folder or file at any depth in a state folder is refused when the suite loads: a state is plain files committed once in a new repository with no earlier history. `[verify]` is optional when `repo` is set and its layer has one; `publish_evidence` is read from that layer and is false otherwise.
+
+**What a candidate sees.** The task title, the task prompt and the numbered requirements, in the pipeline's grader prompt. It never sees the task or arm name, the kind, the expected label, the failing requirement numbers, the source, a builder's summary or a diff, and none of them is written into its workspace. Every trial is a fresh observer: a new session, a fresh copy of the state (committed in a new git repo, or a checkout of `base` with the layer's `setup` run), its own app on a free port, and its own isolated browser and evidence folder. Trials number from 1 in the order task, repeat, arm; trial `n` is the step `verify-n`, so a replay answer is `verify-n.json`.
+
+**Preflight.** Per arm, before any trial, arete checks that the arm can run here: `[verify.preflight]` commands (once, for every arm), whether its route can load the Playwright MCP server (Pi cannot, it runs with `--no-mcp`), and, for arms that really call a model, `npx` for the browser. An arm that cannot run is `unavailable` with the reason. It runs no trial and gets no quality numbers, so a missing browser never counts as a failed verdict. A trial whose verdict is `blocked`, whose call failed, whose app did not start or whose setup failed is `blocked`, never a false pass or false failure.
+
+**Retained trials.** When a trial's scratch attempt is still unresolved (a producer is alive, the agent call raised or cleanup could not finish), arete keeps the trial worktree and `runs/<run>/trial-n/<run>/` in place. The trial is recorded as blocked whatever the verdict, with both paths in `retained`, and `evidence` points inside the kept folder. The remaining trials run, and `arete poll` finalizes the attempt. After poll prints `preserved and finalized verification scratch`, the two folders are no longer needed and the owner removes them.
+
+**The report**, per arm:
+
+- `judged`, `blocked`, `not run`: trials that gave a pass or fail, trials that could not, and planned trials never started (a limit stopped the suite).
+- `false passes X of Y`: of the judged trials that expect fail, how many got `pass`. The false-pass rate is X/Y.
+- `false failures X of Y`: of the judged known-good trials, how many got `fail`.
+- `coverage X of Y requirements`: in judged trials, requirements named by at least one check. A check names requirement `k` when it starts `Step k` or `Requirement k`. `labels right` counts requirements whose seen result (`fail` if a naming check failed, else `pass`) equals the expected one.
+- `accepted`: judged trials whose verdict equals the label. `cost per accepted verification` is all the arm's cost, blocked trials included, over `accepted`.
+- seconds, cost and paid dollars, summed over the arm's trials.
+
+The recommendation is the first arm that is available, has judged every expect-fail task at least once and has a false-pass rate at or below `max_false_pass_rate`, ordered by false-pass rate, false-failure rate, cost per accepted verification, mean seconds and name. With no such arm there is no recommendation. Arms that also qualify are listed.
+
+`arete verifiers run SUITE` appends one JSON line at a time to `runs/<run>/results.jsonl`: `suite`, a `preflight` per arm, a `trial` per trial and a `stop` when the minutes or the spend limit ends it (exit 3). It prints the path and the report; `arete verifiers report FILE` prints the same report from the file, and `--json` prints it as one JSON line. Evidence for each trial is kept under `runs/<run>/<task>/<arm>/<repeat>/` (`evidence/`, `verify-n.json`, `verify-n.md`, the server log and `run.log`), never pushed, whatever the layer's `publish_evidence` says. `run --dry-run` lists the arms with their availability, the tasks, the requirement labels and the numbered trials, without a call or a write.
+
+**Try it without a model.** `arete verifiers sample FOLDER` writes a tiny counter UI with one known-good state and two seeded regressions (no Reset button, Add one adds 2), `suite.toml`, `unavailable.toml` (a failing preflight probe) and 18 replay answers. Use a scratch `ARETE_CONFIG_DIR` and `ARETE_STATE_DIR`, then:
+
+```
+ARETE_REPLAY_DIR=FOLDER/replay arete verifiers run FOLDER/suite.toml
+```
+
+The scripted arms show a verifier that is right every time, one that passes a regression, one with a blocked trial and a failed call, and one that is unavailable.
+
+**Against a real browser.** Copy the suite to private config with real arms and run it, bounded by its `[limits]`:
+
+```
+arete verifiers run ~/.config/arete/verifiers/counter.toml
+```
+
+Each arm sets `model` (or `tier`), such as `[arms.candidate] model = "claude-sonnet-5-5"`. The run needs node (`npx` starts the Playwright MCP server) and Chrome. An arm without them is `unavailable`, not rated. Calls are real and paid, and the run stops when `minutes` or `spend_usd` is reached. Candidate lists, rankings, route tariffs and real task samples belong in private config or a layer, not in this repo.
+
 ## Prompt changes
 
 Arete's own step prompts, `arete/prompts/*.md`, are harness too. When the miner sees the same problem in how arete's steps do their job across repos, it proposes a change to the plan, build, fix, verify, review or other step prompts in the `arete_repo`. The grader, the eval writer, the miner and apply prompts stay human edited. Apply refuses a change that adds or drops a `$placeholder`, or adds or deletes a prompt file.
