@@ -1232,7 +1232,7 @@ atom = "build"                   # plan, build or check_repair; verify and eval_
 repeats = 3                      # whole number, 1 or more
 cache_policy = "provider-default"  # optional label, recorded on every trial
 
-[arms.current]                   # two or more; keys: tier, runner, provider, model, effort
+[arms.current]                   # two or more; keys: tier, runner, provider, model, effort, tools, mcp, instructions, prompts, context
 model = "scratch-a"
 effort = "medium"
 [arms.stronger]
@@ -1284,6 +1284,57 @@ Pi launches a second call to restate an answer that lacks its structured output,
 Running the same command again resumes: a `done` trial is not repeated, and an earlier `start` with no `trial` line (a killed process) is settled as interrupted and run again as the next attempt. A `capped` trial runs again as well. With `[replay] dir` set, a trial reads its answers from the first folder holding a `.json` answer of `<dir>/<arm>/<task>/<repeat>`, `<dir>/<arm>/<task>`, `<dir>/<arm>` and `<dir>`, so two arms can be replayed over several repeats, with a failed trial, without a paid call.
 
 The summary reads only the file, so `summary FILE` reproduces the text a run prints at its end byte for byte; `--json` prints the same numbers as one line. Per arm it shows accepted of done trials with a Wilson interval, repairs, calls, tokens, cache, api, wall and wait seconds, and charged and reference cost over every attempt, failed and interrupted ones included, in total and per accepted task. Zero accepted prints "no accepted task" and an unknown reference "unknown". Per split and candidate it shows the pairs where both arms are done, the candidate-only and baseline-only accepts, the difference with its interval (the paired difference plus or minus a normal margin and one pair) and the exact sign test. Only `accept.split` gives a verdict. There is no winner when the pairs are under `max(6, min_pairs)`, when the interval reaches `min_difference` or below and `-min_difference` or above, or when the sign test p exceeds `1 - confidence`. Otherwise a candidate wins when the interval's lower bound is above `min_difference`, and the baseline holds when the upper bound is below `-min_difference`. Several winning candidates are each listed and none is named the winner. Other splits are shown as not deciding.
+
+`tools`, `mcp` and `instructions` are step settings. `prompts` names a folder holding `plan.md`, `build.md` and `fix.md` for the arm's builder prompts, and `context` a commit whose harness files (instructions, skills, settings) the arm's checkout takes. An arm with either gets its own prompt or context fingerprint in the design; an arm with neither keeps the digest it always had.
+
+### Promoting a winner
+
+Nothing here runs until you run the command: no loop, schedule, server hook or dashboard route starts a search, and merging this feature starts nothing.
+
+`arete experiment optimize PLAN` improves one atom's settings one variable per round, on top of the paired trials above. The plan is private configuration, like a manifest:
+
+```toml
+name = "build-search"
+repo = "replay-sample"
+atom = "build"
+repeats = 6
+
+[[rounds]]
+vary = "model"                   # model | effort | prompt | context | tools
+[rounds.candidates.stronger]     # names are unique across rounds and never `baseline`
+model = "scratch-b"              # only keys of the round's variable: model takes tier, runner, provider, model, effort
+
+[[rounds]]
+vary = "effort"
+[rounds.candidates.cheap]
+effort = "low"
+
+[tasks.word-train]               # each of train, validation and holdout needs at least one task
+base = "4f1c2ab"
+split = "train"
+
+[accept]                         # min_pairs, min_difference, confidence, as in a manifest
+[floor]                          # the declared quality floor
+accept_rate = 0.8                # a candidate must be accepted at least this often
+max_drop = 0.2                   # and may not trail the champion by this much
+min_saving = 0.1                 # economics must be lower by this share; optional, above 0 and under 1
+[limits]                         # all five required; they cover the whole search
+spend_usd = 5
+minutes = 60
+calls = 2000
+tokens = 5000000
+rounds = 2
+```
+
+The first round varies `model` or `effort`, and no such round follows a `prompt`, `context` or `tools` round. The baseline is the live configuration. Each round runs the champion and every candidate on the train tasks; a candidate is proposed when it fixes at least as many train tasks as it breaks and has pairs, and its failing train trials are recorded. The champion and the proposals then run on the validation tasks, where each is decided in this order: `no promotion: insufficient evidence` (a tiny sample), `no promotion: missing costs` (charged or reference cost unknown for either arm), `no promotion: quality regression`, `no promotion: under the quality floor` (accepted rate below `accept_rate`), `promote on quality` (a clear win), then for an overlap `no promotion: noisy tie` (the interval reaches `-max_drop`, or the candidate is not cheaper) or `promote on economics`. Cheaper means charged cost, reference cost, repairs and wall seconds per accepted task are each no worse than the champion's and charged plus reference cost per accepted task is lower by `min_saving`. The best promotable candidate (highest validation rate, then lowest cost per accepted task, then plan order) becomes the champion. A noisy tie is never a win. After the rounds, a champion that is not the baseline is run against the baseline on the holdout tasks once; the holdout never proposes or selects, and a second run does not score it again. It is confirmed only with enough pairs, known costs, a rate at or above `accept_rate` and a paired difference no worse than `-max_drop`.
+
+`spend_usd`, `minutes`, `calls` and `tokens` count every trial of every phase in the folder, and `rounds` caps the rounds; a reached limit stops the search with exit 3, with no holdout and no end line, and running it again resumes. Every trial takes a run slot like any experiment trial, so queued production work keeps priority and the wait counts toward `minutes`. `--dry-run` prints the plan digest, the baseline, each round's candidates with their resolved runner, model and effort, the tasks per split, the floor, the limits and the most trials the search can run, and writes and calls nothing. A changed plan or baseline refuses an existing folder; pass `--out` for a new one. A search with an `end` line is final: running it again, even with a higher `rounds` limit, prints its result and runs nothing, and once the holdout is scored no further round runs. A `context` arm takes the commit's harness files, but every step's settings, the fixed grader included, keep resolving against the live layer, so the design records what runs. Search trials differ from plain experiment trials in one way: the repair step (`check_repair`) follows the arm the way it follows `build` in production, so the evidence covers what apply writes; its settings hash is recorded per arm. `review_repair` and `ci_repair` follow `build` too but no trial runs them, and the dry run lists them as not measured. Before each phase the fixed steps, grader, harness, prompts, tasks and live baseline are checked against the search's start, and a change refuses the phase (and a rerun of the folder); pass `--out` for a new one. The prompt, context and tools fingerprints of the arm a round selected are stored in its `round` line; every later phase (train and validation of the next round, holdout, a resume) and the validation after a train check that arm again before any trial and refuse when its prompts, context or `[mcp]` server definitions changed, so the holdout scores the exact candidate validation selected.
+
+The trail is a folder, `experiments/<name>/` under the state folder or `--out`: `trail.jsonl` (events `search` with the digest, design and a baseline snapshot of the config path, its hash, the raw `[steps.<atom>]` table and the resolved settings; then `round`, `holdout`, `stop`, `end`, `apply`, `rollback`), the phase results `r<n>-train.jsonl`, `r<n>-validation.jsonl` and `holdout.jsonl` (ordinary results files, readable with `experiment summary`), and `config-before-apply.toml` (mode 0600) once an apply ran.
+
+`arete experiment promote FOLDER` is a dry run: it prints the decision, its basis and the exact diff of `config.toml`, the roles that follow the atom by inheritance and whether apply is refused: a winner that needs `prompts` or `context` is never applied in part, since the step settings alone were not what the search confirmed. `--apply` writes only the winner's step keys into the private `config.toml` table `[steps.<atom>]` through a checked, atomic replace; it refuses a search that is not promotable or has not finished, or settings for the atom that changed since the search began, and says so when the winner is already applied. The new file must load, give the atom the winner's settings and leave every other role resolving as before; the file is read back afterwards. On any failure it records `apply` as failed and leaves `config.toml` unchanged (or restores the saved bytes). `--rollback` restores the saved bytes, or, when `config.toml` changed since, puts back only the applied keys. Limits: apply targets only the private `config.toml`, never a layer; a layer `[steps]` entry that sets the same key fails the read-back; `[kinds.*.steps]` entries still win for their tickets.
+
+`arete experiment sample FOLDER` writes a replay fixture and prints a `config.toml` for a scratch config folder: three eval tasks, answers for a baseline, a stronger model, a cheaper one that regresses on validation and a twin of the stronger one, a price file for `arete prices import`, and `plan.toml`. Running it shows a winner promoted, a cheaper quality regression, a noisy tie, and apply and rollback of one `model` line.
 
 ## Implementation benchmark
 

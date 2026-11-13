@@ -603,16 +603,26 @@ def cmd_eval(args) -> int:
 def cmd_experiment(args) -> int:
     import tomllib
 
-    from . import experiment
+    from . import experiment, optimize
 
-    wrong = (args.dry_run and args.action == "summary") or (args.out and args.action == "summary") \
-        or (args.json and args.action == "run")
+    searching = args.action in ("run", "optimize")
+    wrong = ((args.dry_run or args.out) and not searching) or (args.json and args.action != "summary") \
+        or ((args.apply or args.rollback) and args.action != "promote") or (args.apply and args.rollback)
     if wrong:
-        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json]", file=sys.stderr)
+        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json] | "
+              "optimize PLAN [--dry-run] [--out FOLDER] | promote FOLDER [--apply | --rollback] | sample FOLDER",
+              file=sys.stderr)
         return 2
     try:
         if args.action == "summary":
             return experiment.show(paths.expand(args.path), args.json)
+        if args.action == "sample":
+            print_lines(optimize.sample(paths.expand(args.path)))
+            return 0
+        if args.action == "promote":
+            return optimize.promote(paths.expand(args.path), args.apply, args.rollback)
+        if args.action == "optimize":
+            return optimize.run(paths.expand(args.path), args.out, args.dry_run)
         return experiment.run(paths.expand(args.path), args.out, args.dry_run)
     except (experiment.Refused, tomllib.TOMLDecodeError, OSError) as e:
         print(e, file=sys.stderr)
@@ -1798,12 +1808,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
 
-    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, or summarize its results")
-    p.add_argument("action", choices=("run", "summary"))
-    p.add_argument("path", metavar="MANIFEST | FILE", help="run: the manifest; summary: the results file")
-    p.add_argument("--dry-run", action="store_true", help="with run: validate and print the plan; writes and calls nothing")
-    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for the manifest")
+    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, summarize its results, "
+                                          "or search for a better setting and promote the winner")
+    p.add_argument("action", choices=("run", "summary", "optimize", "promote", "sample"))
+    p.add_argument("path", metavar="MANIFEST | FILE | PLAN | FOLDER",
+                   help="run: the manifest; summary: the results file; optimize: the plan; promote: the trail "
+                        "folder; sample: a new folder for the replay fixture")
+    p.add_argument("--dry-run", action="store_true", help="with run or optimize: validate and print the plan; "
+                                                          "writes and calls nothing")
+    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for "
+                                                             "the manifest; with optimize: the trail folder")
     p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
+    p.add_argument("--apply", action="store_true", help="with promote: write the winner's keys to config.toml")
+    p.add_argument("--rollback", action="store_true", help="with promote: undo the last apply")
     p.set_defaults(fn=cmd_experiment)
 
     p = sub.add_parser("benchmark", help="measure already configured local model endpoints under 8K and 32K context "
