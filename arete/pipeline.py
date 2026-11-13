@@ -72,6 +72,7 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
 SLOTS_LOCK = "run-slots"
+SLOT_KINDS = ("pipeline", "experiment")
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
@@ -282,6 +283,15 @@ class AgentRun:
                              {**self.overrides, **self.step_overrides.get(role, {})},
                              self.step_overrides.get(config.INHERITS.get(role, ""), {}))
 
+    def time_for(self, seconds: float) -> float:
+        return seconds
+
+    def wait_for_network(self) -> bool:
+        return util.wait_for_network()
+
+    def retry_kw(self) -> dict:
+        return {}
+
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         s = self.settings(role) if role else None
         if self.budget:
@@ -338,14 +348,15 @@ class AgentRun:
             res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
             if res.connection_failed:
                 self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
-                if util.wait_for_network():
+                if self.wait_for_network():
                     dropped = res
                     self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                     if res.session.id and res.turns > 1 and kw.get("persist", True):
                         res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
-                                         **{**kw, "resume": res.session})
+                                         **{**kw, "resume": res.session, **self.retry_kw()})
                     else:
-                        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+                        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                                         **{**kw, **self.retry_kw()})
                     res = runner.with_spent(res, [dropped])
         if s and res.session.id:
             self.sessions[config.INHERITS.get(s.step, s.step)] = res.session
@@ -882,7 +893,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     with nullcontext() if layer.parallel_checks else machine_to_itself(run):
         for name, cmd in layer.checks.items():
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=timeout)
+                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
@@ -2921,9 +2932,9 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
         run.say(f"Run `{run.id}` {record.INTERRUPTED}; I will start it again.")
 
 
-def holding(rows: list[dict], lock_kind: str) -> list[dict]:
+def holding(rows: list[dict], lock_kind: str, kinds: tuple[str, ...] = ("pipeline",)) -> list[dict]:
     return [r for r in rows
-            if r["kind"] == "pipeline" and util.lock_is_held(state.run_lock(lock_kind, r["repo"], r["issue"]))]
+            if r["kind"] in kinds and util.lock_is_held(state.run_lock(lock_kind, r["repo"], r["issue"]))]
 
 
 def live_pipeline_runs() -> list[dict]:
@@ -2931,7 +2942,7 @@ def live_pipeline_runs() -> list[dict]:
 
 
 def runs_in_slots() -> list[dict]:
-    return holding(state.runs_marked_running(), "slot")
+    return holding(state.runs_marked_running(), "slot", SLOT_KINDS)
 
 
 def runs_waiting_for_a_slot() -> list[dict]:
