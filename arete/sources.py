@@ -239,27 +239,17 @@ class Log(Source):
             except OSError:
                 continue
             size, inode = info.st_size, info.st_ino
-            mark = offsets.get(name)
-            start, known_inode = mark if isinstance(mark, list) else (mark, inode)
+            start = log_start(offsets.get(name), size, inode)
             if cursor is None or start is None:
                 offsets[name] = [size, inode]
                 if cursor is None:
                     continue
                 start = 0
-            if size < start or known_inode != inode:
-                start = 0
-            try:
-                with open(name, "rb") as f:
-                    f.seek(max(start, size - MAX_LOG_READ))
-                    chunk = f.read(size - f.tell())
-            except OSError:
+            if (read := read_lines(name, max(start, size - MAX_LOG_READ), size)) is None:
                 continue
-            last_newline = chunk.rfind(b"\n")
-            if last_newline == -1:
-                offsets[name] = [start, inode]
-                continue
-            offsets[name] = [size - len(chunk) + last_newline + 1, inode]
-            for raw in chunk[:last_newline].decode("utf-8", "replace").splitlines():
+            found, end = read
+            offsets[name] = [start if end is None else end, inode]
+            for raw in found:
                 if not pattern.search(raw):
                     continue
                 sig = signature(raw)
@@ -270,6 +260,26 @@ class Log(Source):
                 out[key] = event("log.error", sid, key, sig, trust="untrusted",
                                  data={"file": name, "sample": raw.strip()[:1500], "signature": sig, "count": 1})
         return list(out.values()), json.dumps({k: v for k, v in offsets.items() if k in files})
+
+
+def log_start(mark, size: int, inode: int) -> int | None:
+    start, known = mark if isinstance(mark, list) else (mark, inode)
+    if start is None:
+        return None
+    return 0 if size < start or known != inode else start
+
+
+def read_lines(name: str, start: int, end: int) -> tuple[list[str], int | None] | None:
+    try:
+        with open(name, "rb") as f:
+            f.seek(start)
+            chunk = f.read(max(0, end - start))
+    except OSError:
+        return None
+    last_newline = chunk.rfind(b"\n")
+    if last_newline == -1:
+        return [], None
+    return chunk[:last_newline].decode("utf-8", "replace").splitlines(), start + last_newline + 1
 
 
 def signature(line: str) -> str:

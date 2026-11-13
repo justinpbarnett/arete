@@ -24,6 +24,7 @@ from . import (
     explain,
     hold_review,
     loops,
+    oncall,
     paths,
     record,
     runner,
@@ -108,6 +109,8 @@ class Server:
         self.started = util.now()
         self.polls: dict[str, Future] = {}
         self.sweep: Future | None = None
+        self.oncall: Future | None = None
+        self.oncall_error = ""
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
@@ -141,6 +144,7 @@ class Server:
             self.watch_metric(loop, st)
             self.poll(loop)
         self.forget_unpolled_errors(live)
+        self.watch_oncall()
         self.loaded = True
         self.dispatch({x.name: x for x in reversed(every_loop)})
         self.start_approval_jobs()
@@ -203,6 +207,25 @@ class Server:
         polled = {sources.source_id(loop, i) for loop in live for i in range(len(loop.sources))}
         for sid in set(self.errors) - polled:
             self.errors.pop(sid, None)
+
+    def watch_oncall(self) -> None:
+        if not self.cfg.oncall.enabled or (self.oncall and not self.oncall.done()):
+            return
+        self.oncall = self.pool.submit(self.scan_oncall, self.cfg)
+
+    def scan_oncall(self, cfg: config.Config) -> None:
+        try:
+            found = oncall.scan(cfg)
+        except Exception as e:
+            text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
+            oncall.crashed(text)
+            if self.oncall_error != text:
+                self.say(f"on-call scan failed: {text}")
+            self.oncall_error = text
+            return
+        self.oncall_error = ""
+        if found and found.get("opened"):
+            self.say(f"on-call: {oncall.said(found)}")
 
     def sweeping(self) -> bool:
         return bool(self.sweep) and not self.sweep.done()
@@ -335,6 +358,8 @@ class Server:
             return "a source poll is still running"
         if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
             return running[0]
+        if self.oncall and not self.oncall.done():
+            return "an on-call scan is still running"
         if self.sweeping():
             return "a sweep of left-over VMs is still running"
         if dashboard.POSTS_IN_FLIGHT.count:

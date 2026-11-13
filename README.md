@@ -53,6 +53,64 @@ A `loop` emit hands each finding to another loop, so one loop can find and anoth
 [arete/loops/README.md](arete/loops/README.md) has the rules for both.
 A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
 
+## On-call
+
+The watcher notices operational failures on its own and keeps one durable incident for each underlying symptom.
+This part only watches and records: it calls no model and repairs nothing.
+
+```toml
+[oncall]
+enabled = false
+
+[[oncall.source]]
+path = "~/Library/Logs/myapp/*.log"
+pattern = "ERROR|panic"
+repo = "myapp"
+check = "make check"
+```
+
+`enabled` defaults to false. With it off, `arete serve` does no on-call work and creates no cursor or incident.
+When on, serve scans on its tick, on the poll pool, so a slow scan never blocks the tick.
+Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
+`repo` and `check` are recorded for a later repair part and start nothing now.
+
+**Sources.** Arete's own files are watched without being listed: the `*.log` files in the log folder, each live run's `run.jsonl`, `heartbeat.json` and serve's beat file.
+Other application or service logs are watched only when listed as `[[oncall.source]]`.
+
+**Cursors.** Each file has a durable cursor (`oncall:` in the `cursors` table) holding its offset, inode and a hash of the bytes before the offset.
+A first sight of a file reads nothing old; a file that appears later is read from its start.
+Rotation, including the copy-then-truncate of `arete install`'s log rotation, truncation and a restart neither replay old lines nor lose new ones.
+A scan reads at most 1,000,000 bytes per file; the rest waits for the next scan.
+An incident keeps the five lines either side of the first match, at most 4,000 characters.
+
+**Classes.** A cheap filter runs first: a pattern match, then coalescing by normalized signature, so many lines of one failure become one event with a count.
+Each event then gets a class without a model:
+
+| Class | Meaning |
+| --- | --- |
+| `unexpected` | A failure nothing else explains. |
+| `heartbeat` | A check failing in `heartbeat.json` across two or more beats. |
+| `stalled` | A run marked running whose `run.jsonl` heartbeats stopped or whose process is gone. |
+| `orchestration` | Serve's `tick failed`, a broken loop or a poll error. |
+| `expected` | A check or repair step failing inside a run, normal backoff and retries, quota and limit waits, or a failure of a ticket that already has a live run. |
+
+Expected events are counted and open no incident.
+
+**Incidents.** The `incidents` table holds the fingerprint, class, source, state, first and last occurrence, count and evidence.
+A repeat of an open incident's fingerprint, minutes or hours later, updates it instead of opening another.
+The append-only `incident_notes` table records what happened and when.
+Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
+
+```
+arete oncall             # incidents, newest first, then the watcher's state
+arete oncall show ID     # one incident with its evidence and notes
+arete oncall scan        # one scan now
+```
+
+`--json` prints one JSON line per incident (`scan --json` prints the summary).
+While the watcher is on, the heartbeat's `oncall:scan` check fails when the last scan crashed or is more than five minutes old.
+The regression checks are in `tests/test_oncall.py` and run with `uv run python -m unittest discover -s tests -v`.
+
 ## Runners, devices and sessions
 
 A model name picks its runner. A claude alias or a `claude-*` id runs on the `claude` CLI on a Claude subscription. A `provider/model` id, such as `deepseek/deepseek-flash` or `ollama/gemma4`, runs on `pi`. A `gpt-` or `codex-` name, in any case, runs on the `codex` CLI (see [Codex](#codex)); `openai/<model>` stays on pi. A `pi:` or `codex:` prefix forces that runner, and a `replay:` prefix answers from files (see [Replay](#replay)). Claude and pi both report tokens and cost per step, and codex reports tokens; `[pricing]` sets a price for a model whose runner reports none, and a provider in `local_providers` costs nothing. Budgets meter pi and Codex API-key spend. Codex has no per-call dollar cap. A run on claude has no dollar cap: the subscription carries it, and its cost is still recorded, though every sum arete shows you counts only what you pay. When claude reports a usage limit, the call moves to the next allowed route of its tier at once (see [Steps](#steps)); only when no route is eligible does it wait until the earliest limit resets, resuming its session where it can. The serve holds a queued loop only when no route of a required call is eligible, the heartbeat counts a held loop as healthy, and chat and loop drafts return the limit at once instead of waiting.
@@ -514,6 +572,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. See [Triage](#triage). |
+| `[oncall]` | `enabled` (default false) turns on the log watcher; `[[oncall.source]]` adds other logs. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |

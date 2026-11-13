@@ -287,6 +287,52 @@ def cmd_heartbeat(args) -> int:
     return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
 
 
+def cmd_oncall(args) -> int:
+    from . import oncall, state
+
+    cfg = config.load()
+    if args.action == "scan":
+        summary = oncall.scan(cfg)
+        if summary is None:
+            print(f"on-call is off; set [oncall] enabled = true in {paths.CONFIG_FILE}")
+        elif "skipped" in summary:
+            print(summary["skipped"])
+        else:
+            print(json.dumps(summary) if args.json else f"on-call: {oncall.said(summary)}")
+        return 0
+    if args.action == "show":
+        found = state.incident(int(args.id)) if args.id.isdigit() else None
+        if not found:
+            print(f"no incident {args.id}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(found))
+            return 0
+        print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
+              f"{found['first_seen']} to {found['last_seen']}")
+        print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
+        for note in found["notes"]:
+            print(f"{note['ts']}  {note['note']}")
+        return 0
+    rows = state.incidents()
+    if args.json:
+        for row in rows:
+            print(json.dumps(row))
+        return 0
+    for r in rows:
+        print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
+              f"x{r['count']:<4} {r['signature']}")
+    now = oncall.status(cfg)
+    if not now["enabled"]:
+        print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
+    else:
+        last = "no scan yet"
+        if now["last_scan"]:
+            last = f"last scan {when(now['last_scan'])}" + ("" if now["ok"] else f" failed: {now['detail']}")
+        print(f"on-call is on; {last}; {now['expected']} expected events counted")
+    return 0
+
+
 def cmd_hook(args) -> int:
     from . import hook
 
@@ -1243,6 +1289,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force-probes", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_heartbeat)
+
+    p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
+    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan"))
+    p.add_argument("id", nargs="?", default="", help="with show: the incident number")
+    p.add_argument("--json", action="store_true", help="one JSON line per incident")
+    p.set_defaults(fn=cmd_oncall)
 
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
