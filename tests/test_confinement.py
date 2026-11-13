@@ -369,7 +369,7 @@ class EscapeTests(unittest.TestCase):
             "#!/bin/sh\n"
             'case "$1" in\n'
             "status) echo '{\"BackendState\":\"Running\",\"TailscaleIPs\":[\"127.0.0.1\"],"
-            "\"Self\":{\"UserID\":1,\"DNSName\":\"n.\"},\"User\":{\"1\":{\"LoginName\":\"me@example.com\"}}}';;\n"
+            "\"Self\":{\"UserID\":1,\"DNSName\":\"n.\",\"TailscaleIPs\":[\"127.0.0.1\"]},\"User\":{\"1\":{\"LoginName\":\"me@example.com\"}}}';;\n"
             "whois) echo '{\"UserProfile\":{\"LoginName\":\"me@example.com\"}}';;\n"
             "esac\n")
         tailscale.chmod(0o755)
