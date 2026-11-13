@@ -17,7 +17,6 @@ function wireForms() {
   }
   document.getElementById("launch").addEventListener("submit", launch);
   document.getElementById("loop-new").addEventListener("submit", draftLoop);
-  document.getElementById("launch-device").addEventListener("change", repoFollowsDevice);
   document.getElementById("launch-reset").addEventListener("click", async () => {
     document.getElementById("launch").reset();
     document.getElementById("launch-result").hidden = true;
