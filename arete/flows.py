@@ -68,21 +68,23 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.tid}"
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
-    job = Job(cfg, run, ws, slot=slot, continues=continues)
-    refusal = guard(job, continues) if continues and not only else ""
-    if continues and not only and not refusal:
-        if again == "prepare" and job.pending:
-            refusal = pending_refusal(job, continues)
-        elif not job.pending and (moved := base_moved(continues)):
-            run.log(f"{moved} since run {continues} prepared, so this run prepares again and redoes every step after it")
-            again = "prepare"
+    job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
+    refusal = guard(job, continues) if continues else ""
+    if refusal:
+        job.note_task()
+    elif continues and not only and not job.pending and (moved := base_moved(continues)):
+        run.log(f"{moved} since run {continues} prepared, so this run prepares again and redoes every step after it")
+        again = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
-                        restore=lambda line: restore(job, line, only), refusal=refusal)
+                        restore=lambda line: restore(job, line, only), refusal=refusal, hold=job.hold)
 
 
-def pending_refusal(job: Job, run_id: str) -> str:
+def pending_refusal(job: Job) -> str:
+    source = job.continues if job.only else job.run.id
+    step = " --step pr" if factory.started(job.continues, "pr") else ""
     return (f"{', '.join(job.pending)} holds commits of this run's chain that are not on origin, and preparing again "
-            f"would drop them, so arete ran no model and left them as they are; `arete resume {run_id}` publishes them")
+            "would drop them, so arete ran no model, reset nothing and left the commits on the branch and in the "
+            f"worktree; `arete resume {source}{step}` publishes them")
 
 
 def guard(job: Job, continues: str) -> str:
@@ -91,10 +93,16 @@ def guard(job: Job, continues: str) -> str:
     if not continues or not branch or not isinstance(listed, list):
         return ""
     job.branch = branch
-    runs, heads = chain_runs(continues), published_heads(continues)
-    for entry in listed:
-        c = pipeline.Checkout(**{**entry, "src": Path(entry["src"]), "wt": Path(entry["wt"])})
-        if why := job.reclaim(c, heads.get(c.github) or c.lease, runs, attached=c.wt.is_dir()):
+    try:
+        checkouts = [pipeline.Checkout(**{**e, "src": Path(e["src"]), "wt": Path(e["wt"])}) for e in listed]
+        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
+        if why := pipeline.kept_work(job.ws, checkouts, job.run.repo.path, layer.copy, commits=False):
+            return f"arete started no step and made no tracker call: {why}"
+    except (pipeline.RunFailed, RuntimeError, OSError, KeyError, TypeError) as e:
+        return f"arete started no step and made no tracker call: could not check the worktree: {e}"
+    runs = chain_runs(continues)
+    for c in checkouts:
+        if why := job.reclaim(c, *authority(continues, c, c.lease), runs, attached=c.wt.is_dir()):
             return why
     return ""
 
@@ -123,14 +131,20 @@ def chain_runs(run_id: str) -> set[str]:
     return {str(read[0].get("run") or "") for read in factory.chain(run_id) if read} - {""}
 
 
-def published_heads(run_id: str) -> dict[str, str]:
+def publication(run_id: str) -> dict:
     for read in factory.chain(run_id):
         for line in reversed(factory.ends(read)):
             data = line.get("data")
             if line.get("step") == "pr" and line.get("result") == "pass" and isinstance(data, dict):
-                heads = data.get("heads")
-                return dict(heads) if isinstance(heads, dict) else {}
+                return data
     return {}
+
+
+def authority(run_id: str, c: pipeline.Checkout, lease: str) -> tuple[str, bool]:
+    pub = publication(run_id)
+    heads = pub.get("heads") if isinstance(pub.get("heads"), dict) else {}
+    changed = pub.get("changed") if isinstance(pub.get("changed"), list) else []
+    return str(heads.get(c.github) or lease), c.github in changed
 
 
 def foreign(wt: Path, tip: str, bases: list[str], runs: set[str]) -> list[str]:
@@ -162,7 +176,7 @@ def remade(line: dict) -> tuple[str, list[pipeline.Checkout], str]:
                 return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
                                       "and no starting revision was recorded")
             local = util.git(["rev-parse", "--verify", f"refs/heads/{branch}"], c.src, check=False).strip()
-            if c.resumes or c.pr or local != c.revision:
+            if c.resumes or c.pr or not local:
                 return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
                                       "and it was not left unchanged")
     except RuntimeError as e:
@@ -182,9 +196,10 @@ def rebuild(job: Job, line: dict) -> str:
     if why:
         return why
     job.branch = branch
-    runs, heads = chain_runs(job.continues), published_heads(job.continues)
+    leases = {str(e.get("github")): str(e.get("lease") or "") for e in line["data"]["checkouts"]}
+    runs = chain_runs(job.continues)
     for c in made:
-        if why := job.reclaim(c, heads.get(c.github) or c.lease, runs, attached=False):
+        if why := job.reclaim(c, *authority(job.continues, c, leases.get(c.github, "")), runs, attached=False):
             return why
     ws = Path(line["tree"])
     layer = pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
@@ -266,6 +281,8 @@ class Job:
     carried: bool = False
     committed: bool = True
     pending: list[str] = field(default_factory=list)
+    only: str = ""
+    noted: bool = False
 
     @property
     def with_prs(self) -> list[pipeline.Checkout]:
@@ -369,7 +386,21 @@ class Job:
             for c in self.picked(self.changed):
                 c.lease = util.git(["rev-parse", "HEAD"], c.wt).strip()
 
-    def reclaim(self, c: pipeline.Checkout, expected: str, runs: set[str], attached: bool = True) -> str:
+    def hold(self, name: str) -> str:
+        if name != "prepare" or not self.pending:
+            return ""
+        self.note_task()
+        return pending_refusal(self)
+
+    def note_task(self) -> None:
+        data = prepared_data(self.continues)
+        if self.noted or not isinstance(data.get("ticket"), dict):
+            return
+        self.noted = True
+        opened(self.run, tracker.Ticket(**data["ticket"]))
+
+    def reclaim(self, c: pipeline.Checkout, expected: str, published: bool, runs: set[str],
+                attached: bool = True) -> str:
         branch, remote, head = self.branch, "", ""
         here = c.wt if attached else c.src
         try:
@@ -388,7 +419,7 @@ class Job:
                 head = util.git(["rev-parse", "HEAD"], c.wt).strip()
             else:
                 head = util.git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], c.src, check=False).strip() or remote
-            if expected and not remote:
+            if (expected or published) and not remote:
                 return f"{branch} is gone from origin for {c.github}, so arete ran no model and published nothing"
             if remote:
                 if expected and not ancestor(here, expected, remote):
@@ -421,6 +452,7 @@ class Job:
         self.expertise, self.approval = data["expertise"], data.get("approval")
         self.checkouts = [pipeline.Checkout(**{**c, "src": Path(c["src"]), "wt": Path(c["wt"])})
                           for c in data["checkouts"]]
+        leases = {c.github: c.lease for c in self.checkouts}
         for c in self.checkouts:
             if str(c.wt) in self.restored:
                 c.lease = self.restored[str(c.wt)]
@@ -433,9 +465,9 @@ class Job:
                 raise pipeline.RunFailed(why)
             run.workspace = self.ws, self.checkouts
         if stored:
-            runs, heads = chain_runs(self.continues), published_heads(self.continues)
+            runs = chain_runs(self.continues)
             for c in self.checkouts:
-                if why := self.reclaim(c, heads.get(c.github) or c.lease, runs):
+                if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
                     raise pipeline.RunFailed(why)
             opened(run, self.ticket)
             if not run.alone:
