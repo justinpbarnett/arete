@@ -176,6 +176,13 @@ def pending(workspace: Path) -> bool:
         return os.path.lexists(AUTHORITY)
 
 
+def root_names() -> set[str] | None:
+    try:
+        return {Path(d["attempt"]["root"]).name for d in records(True)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def overlap(a: Path, b: Path) -> bool:
     return a.is_relative_to(b) or b.is_relative_to(a)
 
