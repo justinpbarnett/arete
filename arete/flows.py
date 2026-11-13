@@ -9,9 +9,11 @@ from . import (
     asks,
     config,
     diffguard,
+    document,
     factory,
     gh,
     lines,
+    outbound,
     paths,
     pipeline,
     record,
@@ -29,7 +31,24 @@ ADW = "adw"
 TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url")
 BUILD = "build"
 REVIEW_FIX = "review_fix"
-ROLE_OF = {"plan": "plan", "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn"}
+CHECK_REPAIR = "check_repair"
+REVIEW_REPAIR = "review_repair"
+CI_REPAIR = "ci_repair"
+ROLE_OF = {"plan": "plan", "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn",
+           "document": "document"}
+SETTABLE = {**ROLE_OF, CHECK_REPAIR: CHECK_REPAIR, REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
+
+
+def atom_of(name: str, kw: dict) -> str:
+    if name == "repair":
+        return REVIEW_REPAIR
+    if name != "implement":
+        return ROLE_OF.get(name, "")
+    if kw.get("asks"):
+        return CI_REPAIR
+    if str(kw.get("round") or BUILD).startswith(REVIEW_FIX):
+        return REVIEW_REPAIR
+    return BUILD if kw.get("round", BUILD) == BUILD else CHECK_REPAIR
 
 
 def wanted(repo: config.Repo) -> str:
@@ -170,6 +189,7 @@ class Job:
     replies: list[dict] = field(default_factory=list)
     attempts: int = 1
     report_body: str = ""
+    document: str = ""
     draft_why: str = ""
     summary: str = ""
     opened: list[str] = field(default_factory=list)
@@ -219,12 +239,13 @@ class Job:
             self.b.restage()
         return self.b
 
-    def labels(self, name: str) -> dict:
-        if name not in ROLE_OF:
+    def labels(self, name: str, kw: dict | None = None) -> dict:
+        atom = atom_of(name, kw or {})
+        if not atom:
             return {}
-        s = self.run.settings(ROLE_OF[name])
+        s = self.run.settings(atom)
         return {"runner": s.runner, "model": s.model, "effort": s.effort, "tier": s.tier, "kind": self.run.kind,
-                "env": runner.env_names(s.model, s.runner, self.cfg, self.run.repo, self.run.id)}
+                "env": runner.env_names(s.model, s.runner, self.cfg, self.run.repo, self.run.id), "atom": s.step}
 
     def with_left(self, text: str) -> str:
         if not self.left_for_a_person:
@@ -263,6 +284,8 @@ class Job:
             self.b.steps = Counter(data["names"])
         elif name == "review" and "review" in data:
             self.review, self.reviews = data["review"], data.get("attempt", 0)
+        elif name == "document" and outcome.passed:
+            self.document = data.get("text", "")
         elif name == "pr" and outcome.passed:
             self.published(data, stored)
         elif name == "ci" and outcome.passed:
@@ -489,7 +512,7 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
                                               findings=findings, expertise=job.expertise, checks=job.checks,
                                               commands=job.commands, max_lines=layer.max_diff_lines,
                                               owner=run.owner_note),
-                    job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
+                    job.ws, role=REVIEW_REPAIR, allowed_tools=pipeline.bash_rules(job.builder_bash),
                     disallowed_tools=runner.NO_GIT_WRITES)
     if not res.ok:
         return end_as("fail", "failed", why="repair step failed", said=res.text)
@@ -509,16 +532,17 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
               tries: int = 1, asks: str = "") -> Outcome:
     job: Job = flow.ctx
     run = job.run
+    atom = atom_of("implement", {"round": round, "asks": asks})
     if asks:
-        res = job.b.resume(round, asks, json_schema=pipeline.CI_FIX_SCHEMA)
+        res = job.b.resume(round, asks, role=atom, json_schema=pipeline.CI_FIX_SCHEMA)
         return Outcome("pass" if res.ok and isinstance(res.structured, dict) else "fail",
                        data={"round": round, "failures": feedback, "verdicts": res.structured, "said": res.text},
                        session=run.sessions.get(BUILD, NO_SESSION))
     if round.startswith(REVIEW_FIX):
-        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback))
+        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback), role=atom)
     elif round != BUILD:
         res = job.b.resume(round, pipeline.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
-                                                  checks=job.b.check_commands))
+                                                  checks=job.b.check_commands), role=atom)
     else:
         return build(job)
     return Outcome("pass" if res.ok else "fail", data={"round": round},
@@ -598,6 +622,21 @@ def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
     return Outcome("pass", data={"applied": apply})
 
 
+def documents(job: Job) -> bool:
+    return config.document_for(job.cfg, job.run.repo, job.layer).enabled
+
+
+@factory.step("document")
+def write_document(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    staged = job.staged().staged
+    size = f"{len(staged.files)} files, {staged.lines} lines"
+    text = document.pr_text(job.run, job.ticket, pipeline.summary_of(job.review, job.build_summary), job.review,
+                            job.verified, size, pipeline.draft_reason(job.review, job.verified, job.reviews),
+                            job.cfg, job.layer)
+    return Outcome("pass", data={"text": text})
+
+
 def change(job: Job, staged: pipeline.Staged | None = None) -> tuple[pipeline.Staged, str, str]:
     staged = job.b.restage() if staged is None else staged
     if staged.empty:
@@ -656,7 +695,7 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
     report_body = pipeline.report_body(run, summary=job.build_summary, review=job.review, verified=job.verified,
                                        left=left, images=images, approval=job.approval, attempts=job.attempts,
                                        checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size,
-                                       held=draft_why)
+                                       held=draft_why, written=job.document)
     link = tk.pr_link(t, whole=not left)
     opened = [c for c in opened if c in staged.changed]
     for c in staged.changed:
@@ -771,7 +810,7 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
 def done_comment(job: Job, summary: str) -> str:
     said = job.review
     problems = "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in said.get("problems", []))
-    return (f"Done: {summary}.\n\n## Summary\n\n{pipeline.summary_of(said, job.build_summary)}\n\n"
+    return (f"Done: {summary}.\n\n## Summary\n\n{job.document or pipeline.summary_of(said, job.build_summary)}\n\n"
             f"{pipeline.assumed_block(job.run)}"
             f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown()}\n\n"
             f"## Review\n\n**{said.get('verdict', 'none')}**: {said.get('summary', '')}\n{problems}\n\n"
@@ -795,8 +834,14 @@ def ended(flow: factory.Flow, outcome: Outcome) -> tuple[str, str, str]:
 
 
 def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
-    staged, _, outcome_text = change(flow.ctx)
-    flow.ctx.run.save("diff.patch", staged.patch)
+    job = flow.ctx
+    staged, size, outcome_text = change(job)
+    job.run.save("diff.patch", staged.patch)
+    job.run.save("pr_body.md", outbound.screen(pipeline.report_body(
+        job.run, summary=job.build_summary, review=job.review, verified=job.verified,
+        left=job.left_for_a_person, images={}, approval=job.approval, attempts=job.attempts,
+        checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size,
+        held=pipeline.draft_reason(job.review, job.verified, job.reviews), written=job.document)))
     return finish(flow, "dry-run", summary=outcome_text)
 
 

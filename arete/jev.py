@@ -141,6 +141,8 @@ def rate(instructions: str, levels: list[str]) -> dict:
 
 
 def key(env: dict[str, str] | None = None) -> str:
+    if paths.ISOLATED:
+        return util.read_env_file(KEY_FILE).get(KEY_NAME, "")
     return (os.environ if env is None else env).get(KEY_NAME) or util.read_env_file(KEY_FILE).get(KEY_NAME, "")
 
 

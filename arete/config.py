@@ -6,24 +6,32 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import paths
+from . import outbound, paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research", "research_plan", "explain")
+               "classify", "loop", "session", "research", "research_plan", "explain", "document")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
                    "research": "opus", "research_plan": "opus", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
-STEP_NAMES = (*MODEL_ROLES, *STEP_ALIASES)
+INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify"}
+STEP_ROLES = (*MODEL_ROLES, *INHERITS)
+STEP_NAMES = (*STEP_ROLES, *STEP_ALIASES)
 STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
-             "session")
-STEP_COUNTS = ("timeout_minutes", "tries")
-STEP_LISTS = ("tools", "mcp", "instructions")
+             "session", "modalities", "min_context", "structured_output", "data_handling", "floor", "budget_usd")
+STEP_COUNTS = ("timeout_minutes", "tries", "min_context")
+STEP_AMOUNTS = ("budget_usd",)
+STEP_LISTS = ("tools", "mcp", "instructions", "modalities", "data_handling")
+CAPABILITY_KEYS = ("modalities", "context", "structured_output", "data_handling")
 INSTRUCTIONS = ("user", "repo")
 SESSIONS = ("resume", "fresh")
 MCP_KEYS = ("command", "args", "url")
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 TIER_KEYS = ("runner", "provider", "model")
 PAYMENT_MODES = ("subscription", "api_key", "local")
+DOCUMENT_KINDS = ("message", "ticket", "pr", "doc")
+DOCUMENT_KEYS = ("enabled", "voice", "style", "words")
+DOCUMENT_WORDS = {"message": (20, 60), "ticket": (80, 140)}
+WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
@@ -172,6 +180,8 @@ class Config:
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     tier_map: str = ""
     routing_fallback: bool = True
+    capabilities: dict[str, dict] = field(default_factory=dict)
+    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
     payment_modes: tuple[str, ...] = PAYMENT_MODES
     adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
@@ -179,6 +189,7 @@ class Config:
     mcp: dict[str, dict] = field(default_factory=dict)
     research_planner: bool = False
     ask: AskConfig = field(default_factory=AskConfig)
+    document: dict = field(default_factory=dict)
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -236,6 +247,9 @@ def step_table(table, where: str) -> dict:
     for key in STEP_COUNTS:
         if key in table and (type(table[key]) is not int or table[key] < 1):
             raise ValueError(f"[{where}]: {key} must be a whole number of at least 1, not {table[key]!r}")
+    for key in STEP_AMOUNTS:
+        if key in table and (type(table[key]) not in (int, float) or not table[key] > 0):
+            raise ValueError(f"[{where}]: {key} must be a number of dollars above 0, not {table[key]!r}")
     for key in STEP_LISTS:
         if key in table and not (isinstance(table[key], list | tuple) and all(isinstance(v, str) for v in table[key])):
             raise ValueError(f"[{where}]: {key} must be a list of names, not {table[key]!r}")
@@ -243,7 +257,11 @@ def step_table(table, where: str) -> dict:
         raise ValueError(f"[{where}]: instructions {', '.join(map(repr, bad))} is not one of {', '.join(INSTRUCTIONS)}")
     if "session" in table and table["session"] not in SESSIONS:
         raise ValueError(f"[{where}]: session {table['session']!r} is not one of {', '.join(SESSIONS)}")
-    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else v if k in STEP_COUNTS else str(v) for k, v in table.items()}
+    if "structured_output" in table and type(table["structured_output"]) is not bool:
+        raise ValueError(f"[{where}]: structured_output must be true or false, not {table['structured_output']!r}")
+    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else float(v) if k in STEP_AMOUNTS
+            else v if k in STEP_COUNTS or type(v) is bool else str(v)
+            for k, v in table.items()}
 
 
 def mcp_tables(data) -> dict[str, dict]:
@@ -316,21 +334,54 @@ def tier_maps(data, where: str) -> dict[str, dict[str, tuple[dict[str, str], ...
     return maps
 
 
-def routing_table(data) -> tuple[bool, tuple[str, ...] | None]:
+@dataclass(frozen=True)
+class Routing:
+    fallback: bool = True
+    capabilities: dict[str, dict] = field(default_factory=dict)
+    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    payment_modes: tuple[str, ...] | None = None
+
+
+def capability_table(key: str, table) -> dict:
+    where = f"[routing.capabilities.{key}]"
+    table = table_of(table, f"routing.capabilities.{key}")
+    if bad := sorted(set(table) - set(CAPABILITY_KEYS)):
+        raise ValueError(f"{where}: unknown key {', '.join(bad)}; use {', '.join(CAPABILITY_KEYS)}")
+    found = table.get("modalities", [])
+    if not (isinstance(found, list) and all(isinstance(v, str) and v for v in found)):
+        raise ValueError(f"{where}: modalities must be a list of names, not {found!r}")
+    if "context" in table and (type(table["context"]) is not int or table["context"] < 1):
+        raise ValueError(f"{where}: context must be a whole number of at least 1, not {table['context']!r}")
+    if "structured_output" in table and type(table["structured_output"]) is not bool:
+        raise ValueError(f"{where}: structured_output must be true or false, not {table['structured_output']!r}")
+    if "data_handling" in table and not (isinstance(table["data_handling"], str) and table["data_handling"]):
+        raise ValueError(f"{where}: data_handling must be one label, not {table['data_handling']!r}")
+    return {**table, **({"modalities": tuple(dict.fromkeys(found))} if "modalities" in table else {})}
+
+
+def routing_table(data) -> Routing:
     table = table_of(data, "routing")
-    if bad := sorted(set(table) - {"fallback", "payment_modes"}):
-        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, payment_modes")
+    if bad := sorted(set(table) - {"fallback", "payment_modes", "capabilities", "floors"}):
+        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, payment_modes, capabilities, floors")
     value = table.get("fallback", True)
     if type(value) is not bool:
         raise ValueError(f"[routing] fallback must be true or false, not {value!r}")
+    capabilities = {str(key): capability_table(str(key), entry)
+                    for key, entry in table_of(table.get("capabilities", {}), "routing.capabilities").items()}
+    floors = {}
+    for name, models in table_of(table.get("floors", {}), "routing.floors").items():
+        if not (isinstance(models, list) and models and all(isinstance(m, str) and m for m in models)):
+            raise ValueError(f"[routing.floors] {name}: must be a nonempty list of model names, not {models!r}")
+        floors[str(name)] = tuple(dict.fromkeys(models))
     modes = table.get("payment_modes")
-    if modes is None:
-        return value, None
-    if (not isinstance(modes, list) or not modes or not all(isinstance(m, str) and m in PAYMENT_MODES for m in modes)
-            or len(set(modes)) != len(modes)):
-        raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
-                         f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
-    return value, tuple(modes)
+    if modes is not None:
+        if (not isinstance(modes, list) or not modes
+                or not all(isinstance(m, str) and m in PAYMENT_MODES for m in modes)
+                or len(set(modes)) != len(modes)):
+            raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
+                             f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
+        modes = tuple(modes)
+    return Routing(value, capabilities, floors, modes)
 
 
 def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[str, ...]:
@@ -398,11 +449,71 @@ def environment_table(data, layer: bool = False) -> Environment:
     return Environment(variable_names(table.get("pass", []), "[environment] pass"), providers)
 
 
+def voice_file(entry, folder: Path) -> str:
+    if not isinstance(entry, str):
+        raise TypeError(f"[document] voice: must be a list of file names, not {entry!r}")
+    named = Path(entry)
+    found = (folder / named).resolve()
+    if (named.is_absolute() or ".." in named.parts or not found.is_relative_to(folder.resolve())
+            or not found.is_file()):
+        raise ValueError(f"[document] voice: {entry!r} is not a file in {paths.short_path(folder)}")
+    return str(found)
+
+
+def word_range(kind: str, value) -> tuple[int, int]:
+    whole = isinstance(value, list) and len(value) == 2 and all(type(n) is int for n in value)
+    if kind not in WORD_KINDS or not whole or not 1 <= value[0] <= value[1]:
+        raise ValueError(f"[document] words: {kind} must be two whole numbers, low then high, from 1 up, "
+                         f"for {', '.join(WORD_KINDS)}; got {value!r}")
+    return value[0], value[1]
+
+
+def document_table(data, folder: Path) -> dict:
+    table = table_of(data, "document")
+    if bad := sorted(set(table) - set(DOCUMENT_KEYS)):
+        raise ValueError(f"[document]: unknown key {', '.join(bad)}; use {', '.join(DOCUMENT_KEYS)}")
+    found = {}
+    if "enabled" in table:
+        if type(table["enabled"]) is not bool:
+            raise ValueError(f"[document] enabled must be true or false, not {table['enabled']!r}")
+        found["enabled"] = table["enabled"]
+    if "style" in table:
+        if not isinstance(table["style"], str):
+            raise ValueError(f"[document] style must be a string, not {table['style']!r}")
+        found["style"] = table["style"].strip()
+    if "voice" in table:
+        if not isinstance(table["voice"], list):
+            raise ValueError(f"[document] voice must be a list of file names, not {table['voice']!r}")
+        found["voice"] = tuple(dict.fromkeys(voice_file(entry, folder) for entry in table["voice"]))
+    if "words" in table:
+        words = table_of(table["words"], "document.words")
+        found["words"] = {kind: word_range(kind, value) for kind, value in words.items()}
+    return found
+
+
+@dataclass(frozen=True)
+class Document:
+    enabled: bool = False
+    voice: tuple[str, ...] = ()
+    style: str = ""
+    words: dict[str, tuple[int, int]] = field(default_factory=lambda: dict(DOCUMENT_WORDS))
+
+
+def document_for(cfg: Config, repo: Repo | None = None, layer: RepoLayer | None = None) -> Document:
+    own = dict(layer.document) if layer else {}
+    if not (repo and repo.layer and not repo.layer.resolve().is_relative_to(repo.path.resolve())):
+        own.pop("voice", None)
+    found = {**cfg.document, **own}
+    return Document(found.get("enabled", False), tuple(found.get("voice", ())), found.get("style", ""),
+                    {**DOCUMENT_WORDS, **cfg.document.get("words", {}), **own.get("words", {})})
+
+
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
-    if not path.exists():
+    try:
+        data = tomllib.loads(paths.read_confined(path).decode())
+    except FileNotFoundError:
         return Config()
-    data = tomllib.loads(path.read_text())
     cfg = Config(
         alert_repo=data.get("alert_repo", ""),
         global_repo=data.get("global_repo", "ai"),
@@ -434,8 +545,9 @@ def load(path: Path | None = None) -> Config:
     cfg.pricing = {str(m): tuple(price_rate(r[k], f"[pricing.models.{m}] {k}") if k in r else None
                                 for k in ("input", "output"))
                    for m, r in (pricing.get("models") or {}).items()}
-    cfg.routing_fallback, modes = routing_table(data.get("routing", {}))
-    cfg.payment_modes = modes or PAYMENT_MODES
+    found = routing_table(data.get("routing", {}))
+    cfg.routing_fallback, cfg.capabilities, cfg.floors = found.fallback, found.capabilities, found.floors
+    cfg.payment_modes = found.payment_modes or PAYMENT_MODES
     j = data.get("jira", {})
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
@@ -525,6 +637,7 @@ def load(path: Path | None = None) -> Config:
     cfg.research_planner = research_table(data.get("research") or {})
     cfg.ask = ask_table(data.get("ask") or {})
     cfg.environment = environment_table(data.get("environment") or {})
+    cfg.document = document_table(data.get("document") or {}, path.parent)
     from . import steps
     steps.check(cfg, defer_tiers=True)
     return cfg
@@ -566,6 +679,8 @@ class Verify:
     allow_bash: list[str] = field(default_factory=list)
     notes: str = ""
     publish_evidence: bool = True
+    preflight: dict[str, str] = field(default_factory=dict)
+    preflight_seconds: float = 30
 
     @property
     def bash(self) -> list[str]:
@@ -588,16 +703,23 @@ class RepoLayer:
     subject: str = "{kind}: {title}"
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
+    max_repair_cycles: int = 2
+    max_run_minutes: int = 60
+    max_verify_minutes: int = 20
+    parallel_checks: bool = False
     verify: Verify | None = None
     research_dir: str = ""
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     routing_fallback: bool = True
+    capabilities: dict[str, dict] = field(default_factory=dict)
+    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
     payment_modes: tuple[str, ...] | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
     tier_map: str = ""
     passes: tuple[str, ...] = ()
+    document: dict = field(default_factory=dict)
 
     @property
     def builder_bash(self) -> list[str]:
@@ -617,7 +739,7 @@ class RepoLayer:
 
 
 LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
-                  "factory", "environment", "routing"}
+                  "factory", "environment", "routing", "document"}
 
 
 def section(data: dict, name: str) -> dict:
@@ -641,6 +763,14 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.deny = list(lim.get("deny", []))
     layer.max_attempts = int(lim.get("max_attempts", layer.max_attempts))
     layer.timeout_minutes = int(lim.get("timeout_minutes", layer.timeout_minutes))
+    for name in ("max_repair_cycles", "max_run_minutes", "max_verify_minutes"):
+        value = lim.get(name, getattr(layer, name))
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"[limits] {name} must be a positive integer")
+        setattr(layer, name, value)
+    layer.parallel_checks = lim.get("parallel_checks", False)
+    if type(layer.parallel_checks) is not bool:
+        raise ValueError("[limits] parallel_checks must be true or false")
     agent = section(data, "agent")
     layer.allow_bash = list(DEFAULT_ALLOW_BASH) + list(agent.get("allow_bash", []))
     trust = section(data, "trust")
@@ -652,7 +782,9 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")
     layer.tiers = tier_maps(section(data, "tiers"), "tiers")
-    layer.routing_fallback, layer.payment_modes = routing_table(section(data, "routing"))
+    found = routing_table(section(data, "routing"))
+    layer.routing_fallback, layer.capabilities, layer.floors = found.fallback, found.capabilities, found.floors
+    layer.payment_modes = found.payment_modes
     layer.steps = step_tables(section(data, "steps"), "steps")
     layer.kinds = kind_tables(section(data, "kinds"), "kinds")
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
@@ -660,12 +792,22 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     layer.passes = environment_table(section(data, "environment"), layer=True).passes
+    layer.document = document_table(section(data, "document"), layer_dir)
     if "verify" in data:
         v = section(data, "verify")
         publish_evidence = v.get("publish_evidence", True)
         if type(publish_evidence) is not bool:
             raise ValueError("[verify] publish_evidence must be true or false")
+        preflight = table_of(v.get("preflight", {}), "verify.preflight")
+        if any(not isinstance(name, str) or not name.strip() or not isinstance(command, str) or not command.strip()
+               for name, command in preflight.items()):
+            raise ValueError("[verify.preflight] must map names to nonempty command strings")
+        seconds = v.get("preflight_seconds", Verify.preflight_seconds)
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= 300:
+            raise ValueError("[verify] preflight_seconds must be greater than 0 and at most 300")
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
-                              allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip())
+                              allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),
+                              preflight=dict(preflight), preflight_seconds=float(seconds))
+        outbound.keep_verify_private(layer.verify.url)
     return layer
