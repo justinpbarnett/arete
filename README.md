@@ -1072,6 +1072,57 @@ The grader is the pipeline's verifier, started on the layer's `[verify]`. It res
 
 `arete eval REPO --prompts DIR` runs the plan, build and fix steps with the prompts in `DIR`. The grader keeps the installed prompt, so the judge never moves with what it judges.
 
+## Retrieval experiments
+
+`arete retrieval run REPO SUITE` measures whether embeddings or reranking improve the context an agent gets, before any retrieval service exists. It is offline: it installs no service and changes no retrieval default. Every arm searches the same corpus revision and gets the same token budget. For each arm and query it reports recall, whether the downstream answer was accepted, tokens supplied, latency and total retrieval plus generation cost.
+
+A suite is `retrieval/<suite>.toml` in the repo's layer, so queries, labels, adapter routes and tariffs stay in a private layer:
+
+```toml
+budget_tokens = 400        # required, the same for every arm
+top_k = 20                 # candidates ranked before the budget cut
+spend_usd = 1.0            # required with [generate]
+
+[corpus]
+revision = "4f1c2ab"       # any git rev, HEAD when left out; .agents/ is never read
+include = ["**"]
+exclude = []
+passage_lines = 40
+max_files = 2000           # a bigger corpus is refused
+
+[generate]                 # without it downstream is reported as not run
+model = "..."
+
+[adapters.rerank]
+kind = "rerank"            # embedding | rerank
+replay = "rerank.json"     # or command = "..."; a path is relative to the suite's folder
+route = "..."              # route, model and version are stored as written
+model = "..."
+version = "..."
+
+[arms.hybrid-rerank]
+search = "hybrid"          # exact | hybrid
+embedding = "embed"        # hybrid only, optional
+rerank = "rerank"          # hybrid only, optional
+
+[queries.cap]
+query = "nightly export row cap"
+relevant = ["docs/limits.md", "src/a.py:10-30"]   # files or path:start-end lines
+accept = ["250"]           # strings the answer must contain, any case
+check = "grep -q 250"      # the answer on stdin, exit 0 accepts
+split = "holdout"          # train | validation | holdout
+```
+
+The suite needs an `exact` arm and a `hybrid` arm with no adapters, the baseline. `--split NAME` runs one split, so a held out split can be scored apart from the ones used to tune. Exact search matches code names as case sensitive substrings and otherwise whole words; hybrid fuses exact, BM25 and, with an embedding adapter, cosine ranks by reciprocal rank; a rerank adapter then reorders the candidates. Passages fill the budget in ranked order and one that does not fit is skipped.
+
+An adapter is a replay file or a command. An embedding reply is `{"vectors": {"<passage id>": [..], "query:<name>": [..]}, "corpus"?, "cost_usd"?, "seconds"?}`, where passage ids are `path:start-end`; `corpus` is the corpus fingerprint it was made for. A rerank reply is `{"queries": {"<name>": {"scores": {"<passage id>": 0.9}, "cost_usd"?, "seconds"?}}}`. A command gets the request as JSON on stdin (`{"kind": "embedding", "texts": [{"id", "text"}]}` or `{"kind": "rerank", "query_id", "query", "passages": [{"id", "text"}]}`) and prints the same shapes, a rerank one as the per query object.
+
+Nothing is guessed. An adapter that is missing, unreadable, made for another corpus, timed out, exited non-zero or has no entry for a query makes that result `unavailable` with the reason; it never falls back to the baseline and never scores zero. Embedding vectors must all have one nonzero length, or the adapter is unavailable for every query of each arm that uses it. A query without `relevant` has no recall, and one without `accept` or `check` has no acceptance; both are listed under `Missing labels:`. An arm's retrieval cost counts its unavailable results too. A rejected reply keeps its `cost_usd`. The cost is `unknown` after a failed, timed out or non-JSON command, a reply without `cost_usd`, or a missing or unreadable replay file, and then retrieval and total read `unknown`. Recall, acceptance, tokens and latency count available results only. Generation stops at `spend_usd` of charged spend and the rest read `not run: the spend limit ... was reached`. Failed answers are listed under `Downstream failures:`; the exit code is still 0.
+
+Limits: a passage with no vector is left out of the cosine ranking without a notice. Tokens are arete's byte estimate, not a tokenizer's count. Each arm counts its embedding index cost once, and every split row includes it. A replayed adapter's latency is the file's `seconds` plus local time. Each arm and query is answered once, so there is no variance estimate. Nothing here was run against a live embedding or rerank service.
+
+Answers are generated with the `retrieval_answer` prompt on `[generate]`'s model. With `[replay] all = true` they come from `retrieval-<arm>-<query>.json` in the replay folder. The run is an `eval` run, so charged calls show in `arete costs`. The results file `retrieval.json` in the run's folder (and `--out FILE`) stores the corpus commit and fingerprint, the suite and prompt fingerprints, each adapter's route, model, version and fingerprint, and one result per arm and query. `--json` prints it, `--dry-run` checks the suite and corpus and calls nothing. `arete retrieval sample FOLDER` writes a tiny code and document corpus with distractors, exact name queries and replayed adapters, and prints the config lines to try it in a scratch `ARETE_CONFIG_DIR`.
+
 ## Prompt changes
 
 Arete's own step prompts, `arete/prompts/*.md`, are harness too. When the miner sees the same problem in how arete's steps do their job across repos, it proposes a change to the plan, build, fix, verify, review or other step prompts in the `arete_repo`. The grader, the eval writer, the miner and apply prompts stay human edited. Apply refuses a change that adds or drops a `$placeholder`, or adds or deletes a prompt file.
