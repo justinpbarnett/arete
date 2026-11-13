@@ -33,6 +33,9 @@ SAMPLE_ANSWERS = {
                     "saw": SAMPLE_WORD, "passed": True}]}},
     "review": {"text": "The change does what the plan says.", "structured": {
         "verdict": "approve", "summary": "One line added, as planned.", "problems": []}},
+    "document": {"text": "", "structured": {
+        "title": "", "text": f"Adds the word {SAMPLE_WORD} on a last line of its own in {SAMPLE_FILE}, "
+                             "which is all the task asks for."}},
     "learn": {"text": "Nothing new to learn.", "structured": {"expertise": "# Expertise\n", "added": [], "removed": []}},
 }
 
