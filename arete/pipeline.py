@@ -27,6 +27,7 @@ from . import (
     config,
     control,
     diffguard,
+    document,
     environment,
     factory,
     gh,
@@ -1502,9 +1503,14 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
     outcome = f"{size}, review {review.get('verdict')}, in use {verified.verdict}"
+    written = document.pr_text(run, t, summary_of(review, build_summary), review, verified, size, draft_why, cfg, layer)
 
     if run.dry_run:
         run.save("diff.patch", staged.patch)
+        run.save("pr_body.md", outbound.screen(report_body(
+            run, summary=build_summary, review=review, verified=verified, left=left_for_a_person, images={},
+            approval=approval, attempts=attempts, checks=checks, plan_text=plan_text, size=size, held=draft_why,
+            written=written)))
         run.log(f"dry run: {outcome}; worktree kept at {ws}")
         return "dry-run", outcome, ""
 
@@ -1512,7 +1518,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     pr_report = report_body(run, summary=build_summary, review=review, verified=verified, left=left_for_a_person,
                             images=evidence_images(run, staged.changed[0], verified), approval=approval,
                             attempts=attempts, checks=checks, plan_text=plan_text, size=size,
-                            held=draft_why)
+                            held=draft_why, written=written)
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
@@ -1589,10 +1595,10 @@ def summary_of(review: dict, build_summary: str) -> str:
 
 def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
-                size: str, held: str = "") -> str:
+                size: str, held: str = "", written: str = "") -> str:
     problems = review.get("problems", [])
     return public_text(run, (
-        f"## Summary\n\n{summary_of(review, summary)}\n\n"
+        f"## Summary\n\n{written or summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
         + left_block(left)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
@@ -1681,9 +1687,10 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
 
 def left_section(run: Run, text: str) -> str:
     if len(text) <= MAX_LEFT_FOR_A_PERSON_CHARS:
-        return text
-    return (f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
-            f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
+        return outbound.screen(text)
+    return outbound.screen(
+        f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
+        f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
 
 
 def left_block(left: str) -> str:
