@@ -120,7 +120,8 @@ if importlib.util.find_spec("arete.scratch"):
         scratch.AUTHORITY = root / "authority-parent/verification-authority"
 lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
-    "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=1\n")
+    "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
+    ("2" if scenario == "edited-after-held-pr" else "1") + "\n")
 if scenario == "failed-check":
     with (root / "sample/layer/config.toml").open("a") as out:
         out.write('\n[steps.check_repair]\ntries=1\n')
@@ -128,14 +129,29 @@ if scenario == "failed-check":
     layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "exit 7"))
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
-elif scenario == "review-rejected":
+elif scenario in ("review-rejected", "edited-after-held-pr"):
     file = root / "sample/replay/review.json"
     data = json.loads(file.read_text())
+    if scenario == "edited-after-held-pr":
+        (root / "sample/replay/review2.json").write_text(file.read_text())
+        (root / "sample/replay/verify2.json").write_text((root / "sample/replay/verify.json").read_text())
+        (root / "sample/replay/review_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
     data["structured"] = {"verdict":"request_changes", "summary":"A real behavior is still wrong.",
                            "problems":[{"file":"notes.txt", "problem":"fixture blocker", "severity":"major"}]}
     file.write_text(json.dumps(data))
 cfg = config.load()
 task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+if scenario == "edited-after-held-pr":
+    from arete import lines
+    old = record.start("pipeline", repo="replay-sample", issue=task)
+    lines.write(old, "step_end", step="prepare", result="pass",
+                data={"ticket": {"title": "Add kumquat", "body": "Add kumquat to the fixture notes"}})
+    for n in (1, 2, 3):
+        lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
+    record.settle(old, "pr")
+    with state.db() as connection:
+        connection.execute("UPDATE tasks SET body = ? WHERE id = ?",
+                           ("Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", task))
 feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
 try:
     factory.main(feature, ["replay-sample", task, "--force"])
@@ -148,6 +164,10 @@ verification = [e.get("data", {}).get("verified") for e in events
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
           "verified":[v["verdict"] for v in verification if v],
           "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git")}
+if scenario == "edited-after-held-pr":
+    result["old"] = old
+    result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+    result["budget"] = json.loads((paths.RUNS_DIR / row["id"] / "budget.json").read_text())
 if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
@@ -186,6 +206,14 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["status"], "failed")
         self.assertIn("review", result["summary"])
         self.assertIn("requested changes", result["summary"])
+
+    def test_forced_run_after_a_specification_edit_repairs_instead_of_parking(self):
+        result = self.workflow("edited-after-held-pr")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("review_fix", result["steps"])
+        self.assertIn("left out 3 earlier repair cycles", result["log"])
+        self.assertEqual(result["budget"]["left_out"], [result["old"]])
+        self.assertEqual(result["budget"]["parents"], [])
 
 
 @unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
