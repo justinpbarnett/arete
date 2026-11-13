@@ -291,9 +291,14 @@ def carried(folder: Path, own: Path) -> Totals:
     return used
 
 
-def phase(s: Search, folder: Path, tag: str, split: str, arms: dict, champion: str) -> Path:
+def phase(s: Search, folder: Path, tag: str, split: str, arms: dict, champion: str,
+          pinned: dict[str, dict] | None = None) -> Path:
     file = folder / f"{tag}.jsonl"
     exp = experiment.build(manifest(s.fields, tag, split, arms, champion), carried(folder, file), follow=True)
+    for arm, recorded in (pinned or {}).items():
+        if recorded and exp.design["arms"][arm]["fingerprints"] != recorded:
+            raise Refused(f"the prompts or context of candidate {arm} changed since it was selected; "
+                          "pass --out for a new folder")
     if environment(exp) != s.environment or any(s.task_evidence.get(n) != t for n, t in exp.design["tasks"].items()):
         raise Refused("the fixed steps, grader, harness, prompts, tasks or live baseline changed since the search "
                       "began; pass --out for a new folder")
@@ -306,7 +311,12 @@ def phase(s: Search, folder: Path, tag: str, split: str, arms: dict, champion: s
 
 def settled(file: Path, arm: str) -> dict:
     design = next(e for e in events(file) if e.get("event") == "manifest")["design"]
-    return {"settings": design["arms"][arm]["settings"], "inheritors": design["arms"][arm]["inheritors"]}
+    return {"settings": design["arms"][arm]["settings"], "inheritors": design["arms"][arm]["inheritors"],
+            "fingerprints": design["arms"][arm]["fingerprints"]}
+
+
+def fingerprints_of(file: Path, arm: str) -> dict:
+    return settled(file, arm)["fingerprints"]
 
 
 def train_view(file: Path) -> dict[str, dict]:
@@ -330,14 +340,17 @@ def rank(name: str, order: int, found: dict) -> tuple:
 def play(s: Search, folder: Path, n: int, rnd: dict, champion: dict) -> dict:
     held, name = champion["overrides"], champion["name"]
     candidates = {c: {**held, **keys} for c, keys in rnd["candidates"].items()}
-    train = train_view(phase(s, folder, f"r{n}-train", "train", {name: held, **candidates}, name))
+    trained = phase(s, folder, f"r{n}-train", "train", {name: held, **candidates}, name,
+                    {name: champion.get("fingerprints", {})})
+    train = train_view(trained)
     proposals = [c for c in rnd["candidates"] if train[c]["proposed"]]
     seen = {c: {"keys": keys, "train": train[c], "validation": None, "decision": None}
             for c, keys in rnd["candidates"].items()}
     won, after = "", champion
     if proposals:
         file = phase(s, folder, f"r{n}-validation", "validation",
-                     {name: held, **{c: candidates[c] for c in proposals}}, name)
+                     {name: held, **{c: candidates[c] for c in proposals}}, name,
+                     {c: fingerprints_of(trained, c) for c in [name, *proposals]})
         found = experiment.summary(file)
         pairs = {p["candidate"]: p for p in found["pairs"]["validation"]}
         for c in proposals:
@@ -354,7 +367,8 @@ def play(s: Search, folder: Path, n: int, rnd: dict, champion: dict) -> dict:
 
 def score_holdout(s: Search, folder: Path, champion: dict) -> dict:
     name, floor = champion["name"], s.fields["floor"]
-    file = phase(s, folder, "holdout", "holdout", {BASELINE: {}, name: champion["overrides"]}, BASELINE)
+    file = phase(s, folder, "holdout", "holdout", {BASELINE: {}, name: champion["overrides"]}, BASELINE,
+                 {name: champion.get("fingerprints", {})})
     found = experiment.summary(file)
     arm, other, pair = found["arms"][name], found["arms"][BASELINE], found["pairs"]["holdout"][0]
     costs = (arm["charged_usd"], arm["reference_usd"], other["charged_usd"], other["reference_usd"])

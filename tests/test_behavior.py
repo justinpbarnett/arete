@@ -448,6 +448,94 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
         self.assertEqual(r["rollback_again"]["code"], 1, shown)
         self.assertIn("nothing applied", r["rollback_again"]["err"])
 
+    def test_a_changed_winning_prompt_is_refused_before_any_trial_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = r"""
+import contextlib, importlib.util, io, json, shutil, sys
+from pathlib import Path
+from arete import cli, experiment, optimize, paths, util
+root = Path(sys.argv[1])
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(list(argv))
+    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
+sample = root / "sample"
+call("prices", "import", str(sample / "prices.json"))
+for name in ("tuned", "tuned2"):
+    shutil.copytree(sample / "replay" / "stronger", sample / "replay" / name)
+    shutil.copytree(paths.PROMPTS_DIR, root / name)
+text = (sample / "plan.toml").read_text()
+head, tail = text.split("[[rounds]]")[0], "[tasks." + text.split("\n[tasks.", 1)[1]
+rounds = ('[[rounds]]\nvary = "effort"\n[rounds.candidates.cheap]\neffort = "low"\n\n'
+          f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned]\nprompts = "{root / "tuned"}"\n\n'
+          f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned2]\nprompts = "{root / "tuned2"}"\n\n')
+plan = sample / "plan.toml"
+plan.write_text(head + rounds + tail.replace("rounds = 2", "rounds = 3"))
+s = optimize.load(plan)
+folder = paths.STATE_DIR / "experiments" / "sample-search"
+folder.mkdir(parents=True)
+trail = folder / "trail.jsonl"
+trials = lambda: sum(line.count('"event": "trial"') for f in folder.glob("*.jsonl") for line in f.read_text().splitlines())
+optimize.append(trail, {"event": "search", "digest": s.digest, "design": s.design, "baseline": s.snapshot, "at": util.iso()})
+champion = {"name": optimize.BASELINE, "overrides": {}, "settings": s.snapshot["settings"],
+            "inheritors": s.snapshot["inheritors"], "round": 0}
+for n in (1, 2):
+    result = optimize.play(s, folder, n, s.rounds[n - 1], champion)
+    optimize.append(trail, result)
+    champion = result["champion"]
+r = {"champion": champion["name"], "recorded": bool(champion.get("fingerprints")), "ran": trials()}
+build = root / "tuned" / "build.md"
+original = build.read_text()
+build.write_text(original + "\nPrefer another approach.\n")
+def refused(action):
+    try:
+        action()
+    except experiment.Refused as e:
+        return str(e)
+    return ""
+r["next_round"] = refused(lambda: optimize.play(s, folder, 3, s.rounds[2], champion))
+r["holdout"] = refused(lambda: optimize.score_holdout(s, folder, champion))
+r["resume"] = call("experiment", "optimize", str(plan))
+r["after_refusals"] = trials()
+build.write_text(original)
+r["proceed"] = call("experiment", "optimize", str(plan))
+r["final"] = trials()
+print("BEHAVIOR_RESULT=" + json.dumps(r))
+"""
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
+                                  capture_output=True, timeout=600)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            r = json.loads(output)
+        shown = json.dumps(r, indent=1)
+        self.assertEqual((r["champion"], r["recorded"]), ("tuned", True), shown)
+        self.assertIn("candidate tuned changed since it was selected", r["next_round"], shown)
+        self.assertIn("candidate tuned changed since it was selected", r["holdout"], shown)
+        self.assertEqual(r["resume"]["code"], 1, shown)
+        self.assertIn("candidate tuned changed since it was selected", r["resume"]["err"], shown)
+        self.assertEqual(r["after_refusals"], r["ran"], shown)
+        self.assertEqual(r["proceed"]["code"], 0, shown)
+        self.assertIn("holdout (scored once): tuned", r["proceed"]["out"], shown)
+        self.assertGreater(r["final"], r["ran"], shown)
+
 
 class FailedPrepareHistoryTests(unittest.TestCase):
     @staticmethod
