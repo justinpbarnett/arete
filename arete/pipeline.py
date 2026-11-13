@@ -158,6 +158,8 @@ REVISE_SCHEMA = {
     },
     "required": ["summary", "replies"],
 }
+RESOLVER_SETS = {"RUFF_NO_CACHE": "true"}
+
 RESOLVE_SCHEMA = {
     "type": "object",
     "properties": {"resolved": {"type": "boolean"}, "summary": {"type": "string"}},
@@ -1933,7 +1935,7 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
         try:
             res = run.agent(round_name("resolve", n), text, c.wt, role="build",
                             allowed_tools=bash_rules(layer.builder_bash), disallowed_tools=runner.NO_GIT_WRITES,
-                            json_schema=RESOLVE_SCHEMA, resume=NO_SESSION)
+                            json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:
             if previous is None:
                 run.sessions.pop("build", None)

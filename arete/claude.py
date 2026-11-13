@@ -185,7 +185,7 @@ def _run(
                   instructions=instructions)
     if remote:
         env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, **AGENT_SETS, **(extra_env or {})}
-        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, dict(AGENT_SETS))
+        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, {**AGENT_SETS, **(extra_env or {})})
     else:
         env = agent_env(passing, extra_env)
     try:
