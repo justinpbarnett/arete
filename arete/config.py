@@ -9,9 +9,9 @@ from typing import Literal
 from . import paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research", "explain")
+               "classify", "loop", "session", "research", "research_plan", "explain")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
-                   "research": "opus", "explain": "haiku"}
+                   "research": "opus", "research_plan": "opus", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
 STEP_NAMES = (*MODEL_ROLES, *STEP_ALIASES)
 STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
@@ -24,6 +24,7 @@ SESSIONS = ("resume", "fresh")
 MCP_KEYS = ("command", "args", "url")
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 TIER_KEYS = ("runner", "provider", "model")
+PAYMENT_MODES = ("subscription", "api_key", "local")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
@@ -167,10 +168,12 @@ class Config:
     routing_fallback: bool = True
     capabilities: dict[str, dict] = field(default_factory=dict)
     floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    payment_modes: tuple[str, ...] = PAYMENT_MODES
     adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
+    research_planner: bool = False
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -316,6 +319,7 @@ class Routing:
     fallback: bool = True
     capabilities: dict[str, dict] = field(default_factory=dict)
     floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    payment_modes: tuple[str, ...] | None = None
 
 
 def capability_table(key: str, table) -> dict:
@@ -337,8 +341,8 @@ def capability_table(key: str, table) -> dict:
 
 def routing_table(data) -> Routing:
     table = table_of(data, "routing")
-    if bad := sorted(set(table) - {"fallback", "capabilities", "floors"}):
-        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, capabilities, floors")
+    if bad := sorted(set(table) - {"fallback", "payment_modes", "capabilities", "floors"}):
+        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, payment_modes, capabilities, floors")
     value = table.get("fallback", True)
     if type(value) is not bool:
         raise ValueError(f"[routing] fallback must be true or false, not {value!r}")
@@ -349,7 +353,21 @@ def routing_table(data) -> Routing:
         if not (isinstance(models, list) and models and all(isinstance(m, str) and m for m in models)):
             raise ValueError(f"[routing.floors] {name}: must be a nonempty list of model names, not {models!r}")
         floors[str(name)] = tuple(dict.fromkeys(models))
-    return Routing(value, capabilities, floors)
+    modes = table.get("payment_modes")
+    if modes is not None:
+        if (not isinstance(modes, list) or not modes
+                or not all(isinstance(m, str) and m in PAYMENT_MODES for m in modes)
+                or len(set(modes)) != len(modes)):
+            raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
+                             f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
+        modes = tuple(modes)
+    return Routing(value, capabilities, floors, modes)
+
+
+def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[str, ...]:
+    if layer is None or layer.payment_modes is None:
+        return cfg.payment_modes
+    return tuple(m for m in cfg.payment_modes if m in layer.payment_modes)
 
 
 def price_rate(value, where: str) -> float:
@@ -366,6 +384,16 @@ def replay_table(data) -> ReplayConfig:
     if bad := sorted(set(table) - set(REPLAY_KEYS)):
         raise ValueError(f"[replay]: unknown key {', '.join(bad)}; use {', '.join(REPLAY_KEYS)}")
     return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
+
+
+def research_table(data) -> bool:
+    table = table_of(data, "research")
+    if bad := sorted(set(table) - {"planner"}):
+        raise ValueError(f"[research]: unknown key {', '.join(bad)}; use planner")
+    planner = table.get("planner", False)
+    if type(planner) is not bool:
+        raise ValueError(f"[research] planner must be true or false, not {planner!r}")
+    return planner
 
 
 def variable_names(value, where: str) -> tuple[str, ...]:
@@ -427,6 +455,7 @@ def load(path: Path | None = None) -> Config:
                    for m, r in (pricing.get("models") or {}).items()}
     found = routing_table(data.get("routing", {}))
     cfg.routing_fallback, cfg.capabilities, cfg.floors = found.fallback, found.capabilities, found.floors
+    cfg.payment_modes = found.payment_modes or PAYMENT_MODES
     j = data.get("jira", {})
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
@@ -513,6 +542,7 @@ def load(path: Path | None = None) -> Config:
         )
     cfg.replay = replay_table(data.get("replay") or {})
     cfg.mcp = mcp_tables(data.get("mcp") or {})
+    cfg.research_planner = research_table(data.get("research") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     from . import steps
     steps.check(cfg, defer_tiers=True)
@@ -583,6 +613,7 @@ class RepoLayer:
     routing_fallback: bool = True
     capabilities: dict[str, dict] = field(default_factory=dict)
     floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    payment_modes: tuple[str, ...] | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
@@ -644,6 +675,7 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.tiers = tier_maps(section(data, "tiers"), "tiers")
     found = routing_table(section(data, "routing"))
     layer.routing_fallback, layer.capabilities, layer.floors = found.fallback, found.capabilities, found.floors
+    layer.payment_modes = found.payment_modes
     layer.steps = step_tables(section(data, "steps"), "steps")
     layer.kinds = kind_tables(section(data, "kinds"), "kinds")
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()

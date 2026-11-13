@@ -793,6 +793,7 @@ def _run(
     providers: dict[str, tuple[str, ...]] | None = None,
     auth: accounts.Auth | None = None,
     selected: Route | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> Result:
     if refusal := remote_refusal(remote):
         return Result(ok=False, error=refusal, session=resume, runner="pi", model=model)
@@ -837,7 +838,7 @@ def _run(
         cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir(remote),))
     else:
         folder = selected.view
-        env = {**selected.env, "PI_CODING_AGENT_DIR": str(folder),
+        env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
                **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files)}
     try:
         with refresh_channel(selected, env) as descriptors:

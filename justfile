@@ -28,6 +28,10 @@ adw-answer id text:
 adw-resume id step="":
     uv run arete resume {{quote(id)}} --step={{quote(step)}}
 
+# Repair a held PR from its run's saved review; prints the repair run
+adw-repair id:
+    uv run arete repair {{quote(id)}}
+
 # Run one step of a run alone, with key=value overrides
 adw-step id step *sets:
     uv run arete step "$@"

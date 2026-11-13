@@ -17,6 +17,7 @@ from . import (
     config,
     control,
     dashboard,
+    delivery,
     devices,
     engine,
     environment,
@@ -50,13 +51,16 @@ class ApprovalJob:
     not_written: str
     model_for: Callable[[dict, config.Config], str]
     write: Callable[[dict, config.Config], str]
+    tools: tuple[str, ...] = ()
+    denied: tuple[str, ...] = ()
 
 
 APPROVAL_JOBS = (
     ApprovalJob("plain_summary", "a plain summary of an approval is still being written", "no plain summary",
                 model_for=lambda approval, cfg: cfg.model("explain"), write=explain.write_plain_summary),
     ApprovalJob("review", "a held push is still being reviewed", "no review",
-                model_for=hold_review.model_for, write=hold_review.review),
+                model_for=hold_review.model_for, write=hold_review.review,
+                tools=tuple(hold_review.REVIEW_TOOLS), denied=tuple(hold_review.REVIEW_DENIED)),
 )
 
 
@@ -291,7 +295,8 @@ class Server:
                 continue
             due = (a for a in decidable if (model := job.model_for(a, self.cfg)) and not a[job.note]
                    and a[f"{job.note}_tried"] <= retry_from and not runner.usage_hold(
-                       model, cfg=self.cfg, repo=next((r for r in self.cfg.repos if r.name == a["repo"]), None)))
+                       model, cfg=self.cfg, repo=delivery.repo_for(a, self.cfg), tools=list(job.tools),
+                       denied=list(job.denied)))
             if approval := next(due, None):
                 state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
                 self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)

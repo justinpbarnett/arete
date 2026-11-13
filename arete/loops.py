@@ -6,6 +6,7 @@ import shlex
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 from . import config, cron, devices, paths, runner, state, util
@@ -129,18 +130,38 @@ class Loop:
             return []
         return [self.model_for(cfg), *([self.classify.get("model") or cfg.model("classify")] if self.classify else [])]
 
-    def meters_spend(self, cfg: config.Config) -> bool:
+    def routing_repo(self, cfg: config.Config) -> config.Repo | None:
         repo = self.work_repo(cfg) if self.repo else None
-        repo = (cfg.repo_for_path(repo.path) or repo) if repo else None
-        return any(runner.metered(model, self.runner, cfg=cfg, repo=repo, device=self.device)
-                   for model in self.agent_models(cfg))
+        return (cfg.repo_for_path(repo.path) or repo) if repo else None
+
+    def outlooks(self, cfg: config.Config, connect=state.db) -> list[list]:
+        from . import routing
+
+        if not self.agent:
+            return []
+        tightest = tightest_limit(self, cfg)
+        left = tightest[1] if tightest else None
+        calls = [(self.model_for(cfg), self.tools)]
+        if self.classify:
+            calls.append((self.classify.get("model") or cfg.model("classify"), []))
+        repo = self.routing_repo(cfg)
+        return [routing.outlook(cfg, repo, self.device, model, self.runner, tools, runner.NO_GIT_WRITES, left, connect)
+                for model, tools in calls]
+
+    def meters_spend(self, cfg: config.Config) -> bool:
+        from . import routing
+
+        return any(routing.can_charge(found) for found in self.outlooks(cfg))
 
     def usage_hold(self, cfg: config.Config, connect=state.db) -> str:
-        repo = self.work_repo(cfg) if self.repo else None
-        repo = (cfg.repo_for_path(repo.path) or repo) if repo else None
-        held = next(filter(None, (runner.usage_hold(model, self.runner, connect, cfg=cfg, repo=repo, device=self.device)
-                                  for model in self.agent_models(cfg))), None)
-        return runner.hold_words(held) if held else ""
+        from . import routing
+
+        return next(filter(None, (routing.held_words(found) for found in self.outlooks(cfg, connect))), "")
+
+    def budget_blocked(self, cfg: config.Config) -> bool:
+        from . import routing
+
+        return any(routing.budget_blocked(found) for found in self.outlooks(cfg))
 
     def work_repo(self, cfg: config.Config) -> config.Repo:
         for r in cfg.repos:
@@ -361,7 +382,22 @@ def proof_problems(loop: Loop) -> list[str]:
     return problems
 
 
+def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) -> tuple[str, float] | None:
+    day_ago = util.iso(util.now() - timedelta(days=1))
+    limits = []
+    if loop.budget_usd:
+        limits.append(("run budget", loop.budget_usd - spent_this_run))
+    if loop.daily_budget_usd:
+        limits.append(("daily loop budget", loop.daily_budget_usd
+                       - state.loop_spent_since(day_ago, loop.name, cfg.local_providers)))
+    if cfg.daily_budget_usd:
+        limits.append(("daily budget for all loops",
+                       cfg.daily_budget_usd - state.loop_spent_since(day_ago, None, cfg.local_providers)))
+    return min(limits, key=lambda x: x[1]) if limits else None
+
+
 def validate(loop: Loop, cfg: config.Config) -> None:
+    from . import routing
     from .delivery import EMITS
     from .sources import SOURCES, metric_event
 
@@ -387,8 +423,12 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems += proof_problems(loop)
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
-    if loop.agent and (refusal := runner.device_refusal(loop.model_for(cfg), loop.runner, device)):
-        problems.append(refusal)
+    if loop.agent and not cfg.replay.all:
+        which, name = runner.route(loop.model_for(cfg), loop.runner)
+        asked = runner.request_for(cfg, loop.routing_repo(cfg), which, name, None, True,
+                                   {"tools": loop.tools, "disallowed_tools": runner.NO_GIT_WRITES})
+        if refusal := routing.fit_refusal(asked, device, routing.modes_for(cfg, loop.routing_repo(cfg))):
+            problems.append(refusal)
     if loop.agent:
         problems += [f"{reason}, so a loop run by {runner.route(loop.model_for(cfg), loop.runner)[0]} cannot have {', '.join(tools)}"
                      for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
