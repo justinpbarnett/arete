@@ -1193,6 +1193,71 @@ class Decisions(Scratch):
         rows = self.sql("SELECT source, count FROM incidents ORDER BY id")
         self.assertEqual(rows, [(str(mailer), 1), (str(worker), 2)])
 
+    def test_a_repeat_never_lands_in_an_incident_whose_file_changed_policy_after_two_config_edits(self):
+        app = Path(self.tmp.name) / "app"
+        app.mkdir()
+        mailer, uploader, sender = (app / f"{n}.log" for n in ("mailer", "uploader", "sender"))
+        for log in (mailer, uploader, sender):
+            log.write_text("2026-11-13T10:00:00Z INFO started\n")
+        broad = DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+        self.write_config(broad)
+        self.scanned()
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.append(line, to=mailer)
+        self.scanned()
+        narrower = broad + f'[[oncall.source]]\npath = "{mailer}"\nscope = "Only the mailer module"\n'
+        self.write_config(narrower)
+        self.scanned()
+        self.append(line, to=uploader)
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        self.write_config(narrower + f'[[oncall.source]]\npath = "{uploader}"\nscope = "Only the uploader"\n')
+        self.scanned()
+        self.calls()
+        self.append("2026-11-13T10:07:30Z INFO sender context", line, to=sender)
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        self.assertEqual(self.ids(), [[FOUR]])
+        self.append(line, to=sender)
+        self.scanned()
+        rows = self.sql("SELECT source, count, evidence FROM incidents ORDER BY id")
+        self.assertEqual([r[:2] for r in rows], [(str(mailer), 1), (str(uploader), 1), (str(sender), 2)])
+        self.assertNotIn("sender context", rows[1][2])
+
+    def assert_one_file_under_two_spellings_never_wakes(self, app, spelled):
+        worker, mailer = app / "worker.log", app / "mailer.log"
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{spelled}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.append("2026-11-13T10:06:00Z INFO mailer context", line, to=mailer)
+        self.assertEqual(self.scanned()["decisions"], {"unsure": 2})
+        self.append("2026-11-13T10:06:30Z INFO worker context", line, to=worker)
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        self.append("2026-11-13T10:07:00Z INFO mailer again", line, to=mailer)
+        self.scanned()
+        rows = self.sql("SELECT source, decision, count, evidence FROM incidents ORDER BY id")
+        woken = [r for r in rows if r[1] == "wake"]
+        self.assertEqual([(r[0], r[2]) for r in woken], [(str(worker), 1)])
+        self.assertNotIn("mailer", woken[0][3])
+        self.assertEqual(sorted(r[2] for r in rows if r[1] == "unsure"), [2, 2])
+
+    def test_one_file_reached_through_a_symlink_is_under_both_policies(self):
+        app = Path(self.tmp.name) / "app"
+        app.mkdir()
+        for name in ("worker.log", "mailer.log"):
+            (app / name).write_text("2026-11-13T10:00:00Z INFO started\n")
+        link = Path(self.tmp.name) / "link"
+        link.symlink_to(app, target_is_directory=True)
+        self.assert_one_file_under_two_spellings_never_wakes(app, link / "mailer.log")
+
+    def test_one_file_named_in_another_letter_case_is_under_both_policies(self):
+        app = Path(self.tmp.name) / "app"
+        app.mkdir()
+        for name in ("worker.log", "mailer.log"):
+            (app / name).write_text("2026-11-13T10:00:00Z INFO started\n")
+        if not (app / "Mailer.log").exists():
+            self.skipTest("this file system tells letter case apart")
+        self.assert_one_file_under_two_spellings_never_wakes(app, app / "Mailer.log")
+
 
 if __name__ == "__main__":
     unittest.main()

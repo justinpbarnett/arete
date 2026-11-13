@@ -330,22 +330,41 @@ def thresholds(cfg: config.Config) -> tuple[float, float]:
             cfg.jev.injection if cfg.oncall.injection is None else cfg.oncall.injection)
 
 
-def owner_text(cfg: config.Config, incident: dict) -> tuple[str, str]:
-    for s in cfg.oncall.sources:
-        if fnmatch.fnmatchcase(incident["source"], str(paths.expand(s.path))):
-            return entry_policy(cfg, s)
-    return entry_policy(cfg)
-
-
 def entry_policy(cfg: config.Config, entry: config.OncallSource | None = None) -> tuple[str, str]:
     if entry is None:
         return cfg.oncall.vision, cfg.oncall.scope
     return entry.vision or cfg.oncall.vision, entry.scope or cfg.oncall.scope
 
 
-def policies(cfg: config.Config, source: str) -> frozenset[tuple[str, str]]:
-    found = {entry_policy(cfg, s) for s in cfg.oncall.sources if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))}
-    return frozenset(found or {entry_policy(cfg)})
+def identity(name: str) -> tuple[int, int] | None:
+    try:
+        info = os.stat(name)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+class Policies:
+    def __init__(self, cfg: config.Config) -> None:
+        self.cfg = cfg
+        self.files = [(s, sorted(glob.glob(str(paths.expand(s.path))))) for s in cfg.oncall.sources]
+        self.named: dict[str, tuple[int, int] | str] = {}
+        self.entries: dict[tuple[int, int] | str, list[config.OncallSource]] = {}
+        for entry, files in self.files:
+            for name in files:
+                self.entries.setdefault(self.named.setdefault(name, identity(name) or name), []).append(entry)
+
+    def matching(self, source: str) -> list[config.OncallSource]:
+        key = self.named.get(source) or identity(source)
+        if key is None:
+            return [s for s in self.cfg.oncall.sources if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))]
+        return self.entries.get(key, [])
+
+    def text(self, source: str) -> tuple[str, str]:
+        return entry_policy(self.cfg, next(iter(self.matching(source)), None))
+
+    def of(self, source: str) -> frozenset[tuple[str, str]]:
+        return frozenset({entry_policy(self.cfg, s) for s in self.matching(source)} or {entry_policy(self.cfg)})
 
 
 def bounded(scope: str, rule: frozenset[tuple[str, str]]) -> str:
@@ -356,8 +375,8 @@ def fingerprint_of(kind: str, scope: str, signature: str) -> str:
     return hashlib.sha1(f"{kind}\n{scope}\n{signature}".encode()).hexdigest()[:16]
 
 
-def questions(cfg: config.Config, incident: dict) -> dict[str, dict]:
-    vision, scope = owner_text(cfg, incident)
+def questions(policies: Policies, incident: dict) -> dict[str, dict]:
+    vision, scope = policies.text(incident["source"])
     asking = {"injection": jev.yes_no(jev.INJECTION), "actionable": jev.yes_no(ACTIONABLE)}
     if vision:
         asking["vision"] = jev.yes_no(VISION.format(text=vision))
@@ -405,7 +424,8 @@ def injected(a: jev.Answer) -> str:
     return f"the evidence reads as instructions to an agent (p {a.yes:.2f})"
 
 
-def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, row: dict) -> tuple[str, float, str, dict, int]:
+def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, policies: Policies,
+            row: dict) -> tuple[str, float, str, dict, int]:
     line, injection_line = thresholds(cfg)
     if reply.error or set(asking) - set(reply.answers):
         return "", 0.0, reply.error or "its reply left questions out", {}, 0
@@ -420,10 +440,10 @@ def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, row: dict) -> tu
         if not a.sure(line):
             return UNSURE, a.confidence, f"{name} is uncertain ({a.note()})", answers, 0
     least = min(a.confidence for a in got.values())
-    for name, text in zip(("vision", "scope"), owner_text(cfg, row), strict=True):
+    for name, text in zip(("vision", "scope"), policies.text(row["source"]), strict=True):
         if not text:
             return UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0
-    if len(policies(cfg, row["source"])) > 1:
+    if len(policies.of(row["source"])) > 1:
         why = "more than one [[oncall.source]] vision or scope applies to this file, so the owner decides"
         return UNSURE, least, why, answers, 0
     return WAKE, least, "actionable, fits the vision and is in scope", answers, 0
@@ -475,7 +495,7 @@ def settle(row: dict, outcome: tuple[str, float, str, dict, int]) -> None:
                           shapes=json.dumps(kept))
 
 
-def decide(cfg: config.Config, budget: int = MAX_ASKS) -> dict:
+def decide(cfg: config.Config, policies: Policies, budget: int = MAX_ASKS) -> dict:
     counts: dict[str, int] = {}
     now = util.iso()
     ask = []
@@ -491,10 +511,10 @@ def decide(cfg: config.Config, budget: int = MAX_ASKS) -> dict:
         else:
             ask.append(row)
     ask = ask[:max(budget, 0)]
-    asking = [questions(cfg, row) for row in ask]
+    asking = [questions(policies, row) for row in ask]
     replies = asked([(subject(row), q) for row, q in zip(ask, asking, strict=True)], cfg) if ask else []
     for row, q, reply in zip(ask, asking, replies, strict=True):
-        outcome = verdict(reply, q, cfg, row)
+        outcome = verdict(reply, q, cfg, policies, row)
         if outcome[0]:
             settle(row, outcome)
             counts[outcome[0]] = counts.get(outcome[0], 0) + 1
@@ -512,16 +532,16 @@ def decision_line(row: dict) -> str:
     return f"{row['decision']} {row['confidence']:.2f}{mark}: {row['reason']}"
 
 
-def known_twins(cfg: config.Config, rows: list[tuple], known: dict[str, str],
+def known_twins(cfg: config.Config, policies: Policies, rows: list[tuple], known: dict[str, str],
                 budget: int = MAX_ASKS) -> tuple[list, dict, int]:
     open_rows = [r for r in state.open_incidents() if not r["injection"]]
     line, injection_line = thresholds(cfg)
     fresh, candidates = [], []
     homes = {r["id"]: origin_repo(r["source"], r["repo"]) for r in open_rows}
-    rules = {r["id"]: policies(cfg, r["source"]) for r in open_rows}
+    rules = {r["id"]: policies.of(r["source"]) for r in open_rows}
     for row in rows:
         home = origin_repo(row[2], row[3])
-        rule = policies(cfg, row[2])
+        rule = policies.of(row[2])
         same = [r for r in open_rows if homes[r["id"]] == home and rules[r["id"]] == rule][:TWINS_OFFERED]
         if (row[0] not in known and same and not refused(cfg, home)
                 and not owner_run({"class": row[1], "source": row[2], "evidence": row[6]})):
@@ -558,6 +578,7 @@ def known_twins(cfg: config.Config, rows: list[tuple], known: dict[str, str],
 class Watch:
     def __init__(self, cfg: config.Config) -> None:
         self.cfg = cfg
+        self.policies = Policies(cfg)
         self.found: dict[tuple, Event] = {}
         self.sources = self.lines = self.asks = 0
         self.cursors: list[tuple[str, str, bool, str]] = []
@@ -572,7 +593,7 @@ class Watch:
 
     def consider(self, name: str, rows: list[str], origin: Origin) -> None:
         self.lines += len(rows)
-        rule = policies(self.cfg, name)
+        rule = self.policies.of(name)
         policy_scope = origin.scope if rule == origin.home else bounded(origin.scope, rule)
         i = 0
         while i < len(rows):
@@ -677,12 +698,13 @@ class Watch:
             if e.kind == ORCHESTRATION:
                 signature = signature.removeprefix("<time> ")
             evidence = outbound.redact(record.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
-            fingerprint = fingerprint_of(e.kind, e.scope, signature)
-            rule = policies(self.cfg, e.source)
-            if fingerprint in held and policies(self.cfg, held[fingerprint]) != rule:
-                fingerprint = fingerprint_of(e.kind, bounded(e.scope, rule), signature)
+            scope, rule = e.scope, self.policies.of(e.source)
+            fingerprint = fingerprint_of(e.kind, scope, signature)
+            while fingerprint in held and self.policies.of(held[fingerprint]) != rule:
+                scope = bounded(scope, rule)
+                fingerprint = fingerprint_of(e.kind, scope, signature)
             rows.append((fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence))
-        matched, marks, self.asks = known_twins(self.cfg, rows, held)
+        matched, marks, self.asks = known_twins(self.cfg, self.policies, rows, held)
         opened = sum(state.commit_scan(rows, self.cursors, matched, marks))
         return opened, len(events) - opened, len(self.found) - len(events)
 
@@ -704,8 +726,7 @@ def scan_once(cfg: config.Config) -> dict:
     logs = [str(p) for p in sorted(paths.LOG_DIR.glob("*.log"))]
     watch.follow("logs", logs, Origin("arete", everywhere, folder=True))
     watch.follow("runs", watch.run_files((previous or {}).get("since")), Origin("arete", everywhere))
-    for source in cfg.oncall.sources:
-        files = sorted(glob.glob(str(paths.expand(source.path))))
+    for source, files in watch.policies.files:
         pattern = re.compile(source.pattern or sources.LOG_PATTERN)
         own = frozenset({entry_policy(cfg, source)})
         watch.follow(f"path:{source.path}", files, Origin(source.path, own, source.repo, pattern))
@@ -713,8 +734,9 @@ def scan_once(cfg: config.Config) -> dict:
     watch.serve()
     watch.stalls()
     opened, updated, expected = watch.store()
+    decisions = decide(cfg, watch.policies, MAX_ASKS - watch.asks)
     summary = {"sources": watch.sources, "lines": watch.lines, "events": len(watch.found), "opened": opened,
-               "updated": updated, "expected": expected, "decisions": decide(cfg, MAX_ASKS - watch.asks)}
+               "updated": updated, "expected": expected, "decisions": decisions}
     total = (previous or {}).get("expected", 0) + expected
     state.set_cursor(SCAN, json.dumps({"expected": total, "last": summary, "since": started}), True, said(summary))
     return summary

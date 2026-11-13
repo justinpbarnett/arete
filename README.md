@@ -82,6 +82,7 @@ When on, serve scans on its tick, on the poll pool, so a slow scan never blocks 
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
 `repo` and `check` are recorded for a later repair part and start nothing now.
 When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is still asked, and a result that would be `wake` is stored as `unsure` for the owner.
+An entry matches a file when its glob finds that file by any path, so a symlink or another letter case names the same file.
 
 **Sources.** Arete's own files are watched without being listed: the `*.log` files in the log folder, each live run's `run.jsonl`, `heartbeat.json` and serve's beat file.
 Other application or service logs are watched only when listed as `[[oncall.source]]`.
