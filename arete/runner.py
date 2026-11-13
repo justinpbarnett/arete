@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import (
@@ -24,6 +24,7 @@ from . import (
     jev,
     paths,
     pi,
+    prices,
     record,
     replay,
     state,
@@ -717,6 +718,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         rec.line(line)
     refresh_hidden()
     started = time.monotonic()
+    at = util.now()
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
         budget_error = kw.pop("budget_error", "")
         if budget_error:
@@ -745,6 +747,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
         else:
             res.cost_usd = 0.0 if on_local else priced(res, cfg)
+        if not budget_error:
+            quote_calls(res, which, name, at)
         if selected:
             refresh_hidden()
             res.error = record.scrub(res.error, hidden)
@@ -762,6 +766,19 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                         effort=kw.get("effort", ""), tier=tier, kind=kind, try_no=try_no,
                         auth_mode="local" if route.get("credential") == "local" else "")
     return res
+
+
+def quote_calls(res: Result, which: str, name: str, at: datetime) -> None:
+    snapshot = prices.load()
+    for call in res.calls or [res]:
+        call.quote = prices.applied(snapshot, which, (call.model, name), at,
+                                    call.tokens_in if call.turns <= 1 else None)
+        call.reference_usd = prices.reference_usd(call.quote, call.tokens_in, call.tokens_out, call.cache_read,
+                                                  call.cache_write)
+    if res.calls:
+        res.quote = res.calls[-1].quote
+        known = [call.reference_usd for call in res.calls]
+        res.reference_usd = None if None in known else round(sum(known), 6)
 
 
 def origin(cwd: Path | str, cfg: config.Config, target: devices.Device) -> dict:

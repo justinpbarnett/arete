@@ -362,9 +362,13 @@ class Recorder:
                   "provider": res.provider, "runner": res.runner, "auth_mode": res.auth_mode,
                   "auth_modes": list(res.modes), "paid_usd": res.paid_usd, "credential": res.credential,
                   "effort": res.effort, "requested_effort": res.requested_effort, "skipped": res.skipped,
+                  "cache_read": res.cache_read, "cache_write": res.cache_write,
+                  "reference_usd": res.reference_usd, "quote": res.quote,
                   **({"calls": [{"runner": c.runner, "model": c.model, "provider": c.provider,
                                 "auth_mode": c.auth_mode, "cost_usd": c.cost_usd, "paid_usd": c.paid_usd,
-                                "tokens_in": c.tokens_in, "tokens_out": c.tokens_out} for c in res.calls]}
+                                "tokens_in": c.tokens_in, "tokens_out": c.tokens_out,
+                                "cache_read": c.cache_read, "cache_write": c.cache_write, "turns": c.turns,
+                                "reference_usd": c.reference_usd, "quote": c.quote} for c in res.calls]}
                      if res.calls else {}),
                   "session": res.session.id, "seconds": round(seconds, 1)})
 
