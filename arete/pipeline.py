@@ -1227,6 +1227,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         producer_baseline = scratch.process_ids()
     except OSError:
         producer_baseline = None
+    service_labels = scratch.service_labels()
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
@@ -1281,6 +1282,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
             scratch.RUN_BASELINES[run_id] = producer_baseline
+            scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
@@ -2468,7 +2470,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                         f"{archived}")
             if kept:
                 fixture_blocker = "Verification scratch resources remain unresolved; the workspace is retained."
-                run.log(f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree")
+                run.log(retained_line(step, attempt))
         finally:
             restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
@@ -2970,6 +2972,12 @@ class SkipLog:
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
+
+
+def retained_line(step: str, attempt: scratch.Attempt) -> str:
+    line = f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree"
+    held = scratch.named_holders(scratch.holding(attempt))
+    return f"{line}; held by {held}" if held else line
 
 
 def retry_scratch() -> None:

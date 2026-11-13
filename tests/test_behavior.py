@@ -187,7 +187,7 @@ if scenario.startswith("held-scratch"):
     for fd in list(scratch.LEASES.values()):
         os.close(fd)
     scratch.LEASES.clear()
-    with mock.patch.object(scratch, "producers_done", return_value=True):
+    with mock.patch.object(scratch, "holders", return_value=[]):
         pipeline.retry_scratch()
     (root / "finalized").mkdir()
     for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
@@ -436,7 +436,7 @@ class VerificationOutputTests(unittest.TestCase):
             self.skipTest("needs APFS")
         (self.root / "home").mkdir()
         for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
-                      mock.patch.object(scratch, "producers_done", return_value=True)):
+                      mock.patch.object(scratch, "holders", return_value=[])):
             patch.start()
             self.addCleanup(patch.stop)
         self.ws = self.root / "worktrees/ticket"
