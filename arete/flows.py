@@ -409,7 +409,7 @@ class Job:
                 c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
 
     def hold(self, name: str) -> str:
-        if name != "prepare" or not self.pending:
+        if name != "prepare" or kept_pending(self, self.continues):
             return ""
         self.note_task()
         return pending_refusal(self)

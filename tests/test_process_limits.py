@@ -21,6 +21,7 @@ from arete import (
     config,
     diffguard,
     factory,
+    flows,
     gh,
     lines,
     paths,
@@ -32,6 +33,7 @@ from arete import (
     tracker,
     util,
 )
+from arete.agent import Result
 
 
 class Isolated(unittest.TestCase):
@@ -704,13 +706,16 @@ class KeptEditsTests(Isolated):
         pipeline.note_made(ws, checkouts)
         return ws, checkouts[0]
 
-    def push_from_elsewhere(self, name, text):
+    def push_from_elsewhere(self, name, text, ref=BRANCH):
         src = self.repo.path
         util.git(["fetch", "-q", "origin"], src)
-        util.git(["checkout", "-q", "--detach", f"origin/{self.BRANCH}"], src)
+        util.git(["checkout", "-q", "--detach", f"origin/{ref}"], src)
         self.commit(src, name, text, "moved")
-        util.git(["push", "-q", "origin", f"HEAD:refs/heads/{self.BRANCH}"], src)
+        util.git(["push", "-q", "origin", f"HEAD:refs/heads/{ref}"], src)
         util.git(["checkout", "-q", "main"], src)
+
+    def run_of(self, where, rev="HEAD"):
+        return util.git(["log", "-1", "--format=%(trailers:key=Arete-Run,valueonly)", rev], where).strip()
 
     def test_next_run_continues_on_the_kept_edits_over_the_pr_head(self):
         _, first = self.parked_edit()
@@ -745,6 +750,26 @@ class KeptEditsTests(Isolated):
         self.assertEqual(util.git(["rev-list", "--parents", "-n1", "HEAD"], wt).split()[1:], [kept, new_head])
         self.assertEqual(checkouts[0].onto, new_head)
         self.assertTrue((wt / "edit.txt").exists() and (wt / "moved.txt").exists())
+        self.assertEqual(self.run_of(wt), run.id)
+        self.assertEqual(flows.foreign(wt, "HEAD", [kept, new_head], {run.id}), [])
+
+    def test_base_merged_into_a_published_branch_through_a_resolved_conflict_stays_in_the_runs_chain(self):
+        self.push_from_elsewhere("shared.txt", "mine\n")
+        self.push_from_elsewhere("shared.txt", "theirs\n", "main")
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        wt = checkouts[0].wt
+
+        def resolver(step, text, cwd, **kw):
+            (cwd / "shared.txt").write_text("mine and theirs\n")
+            return Result(True, structured={"resolved": True})
+
+        with patch.object(run, "agent", side_effect=resolver):
+            pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(checkouts[0].resolved, ["shared.txt"])
+        self.assertEqual((wt / "shared.txt").read_text(), "mine and theirs\n")
+        self.assertEqual(self.run_of(wt), run.id)
+        self.assertEqual(flows.foreign(wt, "HEAD", [f"origin/{self.BRANCH}"], {run.id}), [])
 
     def test_denied_paths_stay_out_of_the_kept_commit(self):
         run = self.made_run()

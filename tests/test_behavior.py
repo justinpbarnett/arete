@@ -160,7 +160,7 @@ def forced(*extra):
     except SystemExit:
         pass
     return state.ticket_runs("replay-sample", task, whole=True)[0]
-if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits", "failed-resume-moved", "kept-push-then-fail"):
+if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits", "kept-push-then-fail") or scenario.startswith(("failed-resume", "failed-again")):
     layer, replays, src, origin = root / "sample/layer/config.toml", root / "sample/replay", root / "sample/repo", root / "sample/origin.git"
     plain, stock = layer.read_text(), (replays / "build.patch").read_text()
     ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
@@ -180,20 +180,40 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
     def edit_spec(text):
         with state.db() as c:
             c.execute("UPDATE tasks SET body = ? WHERE id = ?", (text, task))
-    if scenario == "failed-resume-moved":
+    if scenario.startswith(("failed-resume", "failed-again")):
         layer.write_text(plain.replace("grep -q kumquat", "grep -q quince"))
         failed = forced()
         layer.write_text(plain)
-        pipeline.git(["checkout", "-q", "main"], src)
-        commit_in_src("moved.txt", "move main", "HEAD:main")
-        row = forced("--continue", failed["id"], "--from", "checks")
+        kept_head, last, mid = pipeline.git(["rev-parse", "HEAD"], ws).strip(), failed, {}
+        if "unrecorded" in scenario:
+            (ws / "hand.txt").write_text("hand\n")
+            pipeline.git(["add", "hand.txt"], ws)
+            pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "hand\n\nArete-Run: " + failed["id"]], ws)
+        before = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+        if "moved" in scenario:
+            pipeline.git(["checkout", "-q", "main"], src)
+            commit_in_src("moved.txt", "move main", "HEAD:main")
+        if "reopened" in scenario:
+            layer.write_text(plain + '\n[setup]\ncommands = ["exit 3"]\n')
+            last = mid = forced("--continue", failed["id"])
+            layer.write_text(plain)
+            mid["log"] = (paths.RUNS_DIR / mid["id"] / "run.log").read_text()
+        if scenario != "failed-resume-moved":
+            (replays / "build.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+        again = ["--from", "prepare"] if "again-prepare" in scenario else ["--from", "checks"] if scenario == "failed-resume-moved" else []
+        row = forced("--continue", last["id"], *again)
         log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+        published = "refs/heads/" + branch in og("for-each-ref", "--format=%(refname)", "refs/heads")
         result = {"failed": failed["summary"], "status": row["status"], "summary": row["summary"], "log": log,
                   "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
                   "steps": [s["step"] for s in state.steps(row["id"])], "failed_id": failed["id"],
-                  "moved": og("show", f"{branch}:moved.txt"), "published": og("show", f"{branch}:notes.txt"),
-                  "head_parents": og("log", "-1", "--format=%P", branch).split(), "main": og("rev-parse", "main"),
-                  "trailers": og("log", "--format=%B", f"main..{branch}"), "prompts": [t[1] for t, _ in prompts if t and t[0] == row["id"]]}
+                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log")},
+                  "unmoved": ws.exists() and pipeline.git(["rev-parse", "HEAD"], ws).strip() == before,
+                  "moved": og("show", f"{branch}:moved.txt") if "moved" in scenario and published else "",
+                  "published": og("show", f"{branch}:notes.txt") if published else "",
+                  "kept_published": published and pipeline.util.sh(["git", "merge-base", "--is-ancestor", kept_head, branch], cwd=origin).returncode == 0,
+                  "head_parents": og("log", "-1", "--format=%P", branch).split() if published else [], "main": og("rev-parse", "main"),
+                  "trailers": og("log", "--format=%B", f"main..{branch}") if published else "", "prompts": [t[1] for t, _ in prompts if t and t[0] == row["id"]]}
         print("BEHAVIOR_RESULT=" + json.dumps(result))
         raise SystemExit(0)
     seed = ""
@@ -405,6 +425,50 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["moved"], "moved.txt")
         self.assertIn(result["main"], result["head_parents"])
         self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
+
+    def test_resume_after_a_renewed_prepare_failed_past_its_merge_continues_from_the_kept_edits(self):
+        result = self.workflow("failed-resume-reopened-moved")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["mid"]["status"], "failed")
+        self.assertIn("setup command `exit 3` failed", result["mid"]["summary"])
+        self.assertIn("merged `origin/main` into the edits the last run kept", result["mid"]["log"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertTrue(result["kept_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+        self.assertEqual(result["moved"], "moved.txt")
+        self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
+        self.assertIn(f"Arete-Run: {result['mid']['id']}", result["trailers"])
+
+    def assert_prepared_again_on_the_kept_edits(self, result):
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertNotIn("preparing again would drop them", result["summary"])
+        self.assertIn("left unpushed", result["log"])
+        self.assertIn("plan", result["steps"])
+        self.assertTrue(result["kept_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+        self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
+
+    def test_preparing_a_failed_run_again_continues_from_its_kept_edits(self):
+        result = self.workflow("failed-again-prepare")
+        self.assert_prepared_again_on_the_kept_edits(result)
+        self.assertEqual(result["moved"], "")
+
+    def test_preparing_a_failed_run_again_after_main_moved_continues_from_its_kept_edits(self):
+        result = self.workflow("failed-again-prepare-moved")
+        self.assert_prepared_again_on_the_kept_edits(result)
+        self.assertEqual(result["moved"], "moved.txt")
+        self.assertIn("merged `origin/main` into the edits the last run kept", result["log"])
+
+    def test_preparing_again_over_a_chain_commit_with_no_kept_record_is_still_held(self):
+        result = self.workflow("failed-again-prepare-unrecorded")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("preparing again would drop them", result["summary"])
+        self.assertEqual(result["steps"], [])
+        self.assertTrue(result["unmoved"])
+        self.assertEqual(result["published"], "")
 
     def test_behavioral_check_failure_stops_before_verification_or_publication(self):
         result = self.workflow("failed-check")

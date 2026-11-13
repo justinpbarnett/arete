@@ -2296,8 +2296,7 @@ def merge_kept(run: AgentRun, c: Checkout, layer: config.RepoLayer, ticket: trac
     if git(["rev-list", "--count", f"HEAD..{arrived}"], c.wt).strip() != "0":
         with record.timed(run.id, "kept_merge", repo=c.github, kept=c.kept, onto=arrived):
             try:
-                with util.repo_lock(c.src):
-                    util.git_as_owner(["merge", "-q", "--no-edit", arrived], c.wt)
+                merge_as_run(run.id, c, arrived, start)
             except RuntimeError as e:
                 conflicts = unmerged_paths(c.wt)
                 if not conflicts:
@@ -2307,6 +2306,12 @@ def merge_kept(run: AgentRun, c: Checkout, layer: config.RepoLayer, ticket: trac
         c.onto = arrived
         run.log(f"merged `{start}` into the edits the last run kept in {c.github}")
     c.kept = ""
+
+
+def merge_as_run(run_id: str, c: Checkout, commit: str, named: str) -> None:
+    with util.repo_lock(c.src):
+        util.git_as_owner(["merge", "-q", "--no-edit", "-m", f"Merge {named} at {commit[:12]}",
+                           "-m", f"Arete-Run: {run_id}", commit], c.wt)
 
 
 def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
@@ -2324,8 +2329,7 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
                           head=head) as rec:
             try:
                 try:
-                    with util.repo_lock(c.src):
-                        util.git_as_owner(["merge", "-q", "--no-edit", c.base_commit], c.wt)
+                    merge_as_run(run.id, c, c.base_commit, c.origin_base)
                 except RuntimeError as e:
                     conflicts = unmerged_paths(c.wt)
                     if not conflicts:
