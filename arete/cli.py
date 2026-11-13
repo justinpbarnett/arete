@@ -78,7 +78,7 @@ def cmd_init(args) -> int:
 
 
 def cmd_status(args) -> int:
-    from . import board, control
+    from . import board, control, record
 
     if args.json:
         return status_lines(args.run_id)
@@ -90,7 +90,7 @@ def cmd_status(args) -> int:
     snap = board.snapshot(recent_runs=args.limit)
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
-    print("models:" + "".join(f"\n  {role:<13} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
+    print("models:" + "".join(f"\n  {role:<15} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
     show(snap["checks"], "the heartbeat", print_checks)
@@ -102,6 +102,7 @@ def cmd_status(args) -> int:
     show(snap["alerts"], "the alerts", print_alerts)
     show(snap["recent"], "the recent runs", print_recent)
     show(snap["proposals"], "the miner proposals", print_proposals)
+    show(board.panel(record.store), "the record store", lambda s: print_records(s, cfg.retention))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
     show(snap["triage"], "triage", print_triage)
@@ -181,6 +182,17 @@ def print_recent(runs: list[dict]) -> None:
         print("recent runs:")
         print_table([(r["id"], r["kind"], r["ticket"], r["status"], util.paid_note(r["paid"]), r["pr_url"] or r["summary"])
                      for r in runs], 200)
+
+
+def print_records(s: dict, limits) -> None:
+    from . import record, util
+
+    kept = f"kept {limits.days:g} days, up to {limits.max_gb:g} GB"
+    if not s["oldest"]:
+        print(f"records: none ({kept}), {s['pins']} pinned")
+        return
+    print(f"records: {record.size_text(s['bytes'])} in {util.count(s['records'], 'record')} ({kept}), "
+          f"oldest {s['oldest']['run_id']} written {when(s['oldest']['written'])}, {s['pins']} pinned")
 
 
 def print_proposals(p: dict) -> None:
@@ -697,8 +709,15 @@ def cmd_triage(args) -> int:
 
 
 def cmd_research(args) -> int:
-    from . import research
+    from . import research, research_search
 
+    if args.ref and args.evidence:
+        found = research_search.shown(args.ref)
+        if found is None:
+            print(f"no search evidence for {args.ref}", file=sys.stderr)
+            return 1
+        print(found)
+        return 0
     if args.next or (args.dry_run and not args.ref):
         return research.next_due(dry_run=args.dry_run, asked=piped_events())
     if args.ref and args.run:
@@ -1106,7 +1125,7 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import routing, runner, steps
+    from . import research_search, routing, runner, steps
 
     where = ""
     try:
@@ -1123,6 +1142,8 @@ def cmd_steps(args) -> int:
     found = None if cfg.replay.all else routing.Discovery(cfg, repo, layer=layer)
     for s in sheet:
         notes = list(s.notes)
+        if s.step in steps.SEARCHES and (why := research_search.unavailable(s)):
+            notes.append(why)
         if s.runner == "pi" and not cfg.replay.all:
             selected = runner.pi_route(s.model, cfg, repo)
             if selected.login_refused:
@@ -1174,6 +1195,18 @@ def cmd_document(args) -> int:
 def cmd_record(args) -> int:
     from . import record
 
+    if args.run_id in ("pin", "unpin"):
+        if not args.step:
+            print("usage: arete record pin|unpin RUN_ID", file=sys.stderr)
+            return 2
+        try:
+            (record.pin if args.run_id == "pin" else record.unpin)(args.step)
+        except LookupError as e:
+            print(e, file=sys.stderr)
+            return 1
+        print(f"pinned {args.step}: its record stays until `arete record unpin {args.step}`" if args.run_id == "pin"
+              else f"unpinned {args.step}: its record ages out like any other")
+        return 0
     if args.follow and not args.step:
         print("arete record --follow requires STEP", file=sys.stderr)
         return 2
@@ -1601,8 +1634,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_document)
 
     p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
-                                      "events")
-    p.add_argument("run_id")
+                                      "events; `pin RUN_ID` and `unpin RUN_ID` keep a record from rotating out")
+    p.add_argument("run_id", help="a run id, or pin RUN_ID or unpin RUN_ID")
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")
@@ -1812,6 +1845,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("research", help="the reports arete writes for research tickets on the triage board")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="print one ticket's report")
+    p.add_argument("--evidence", action="store_true", help="with REF: print the sources its search workers found")
     p.add_argument("--run", action="store_true", help="with REF: research it now")
     p.add_argument("--force", action="store_true", help="with --run: skip the JEV injection screen")
     p.add_argument("--next", action="store_true", help="research the next ticket due; what the research loop runs")
