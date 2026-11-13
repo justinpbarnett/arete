@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+from datetime import timedelta
 from pathlib import Path
 import re
 import secrets
@@ -11,13 +12,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from types import SimpleNamespace
 import unittest
 import urllib.error
 from unittest import mock
 
 import arete
-from arete import config, control, devices, gh, paths, pipeline, sessions, state, verify
+from arete import config, control, devices, gh, paths, pipeline, sessions, state, util, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -94,6 +96,18 @@ class VerificationPreflightTests(unittest.TestCase):
             loaded = config.load_layer(root).verify
             self.assertEqual(loaded.preflight, {"python": "python3 --version"})
             self.assertEqual(loaded.preflight_seconds, 3)
+
+
+class AskConfigTests(unittest.TestCase):
+    def test_expire_days_is_a_finite_number_of_at_most_ten_years(self):
+        for entry in ("expire_days = inf", "expire_days = nan", "expire_days = 999999", "expire_days = 0",
+                      "expire_days = true", 'expire_days = "7"'):
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                config.ask_table(tomllib.loads(entry))
+        self.assertEqual(config.ask_table({}).expire_days, 7)
+        self.assertEqual(config.ask_table(tomllib.loads("expire_days = 0.5")).expire_days, 0.5)
+        longest = config.ask_table({"expire_days": config.MAX_ASK_EXPIRE_DAYS}).expire_days
+        self.assertTrue(util.iso(util.now() - timedelta(days=longest)))
 
 
 class OfflineWorkflowTests(unittest.TestCase):
@@ -323,6 +337,140 @@ if scenario.startswith("held-scratch"):
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git") if len(branches) == 1 else ""
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
+if scenario.startswith("asked"):
+    from arete import alerts, asks
+    notices = []
+    alerts.notify = lambda title, message: notices.append(title)
+    answers = root / "sample/replay"
+    passing, patch = (answers / "build.json").read_text(), (answers / "build.patch").read_text()
+    asking = {"questions": [{"header": "Spelling", "question": "How is it spelled?", "kind": "text"}],
+              "why": "The task leaves it open.", "tried": "Read the task."}
+    placing = {**asking, "questions": [{"header": "Place", "question": "Where does it go?", "kind": "text"}]}
+    calls = [asking, placing] if scenario == "asked-twice" else [asking]
+    (answers / "build.json").write_text(json.dumps({"text": "Asked.", "ok": True,
+                                                    "tool_calls": [{"name": "ask_owner", "input": a} for a in calls]}))
+    edited = scenario == "asked-edited"
+    if not edited:
+        (answers / "build.patch").unlink()
+    parked = forced()
+    ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+    waiting = state.asks_of(parked["id"], "open")
+    first = [json.loads(line) for line in (paths.RUNS_DIR / parked["id"] / "run.jsonl").read_text().splitlines()]
+    result = {"parked": parked["status"], "worktree": ws.is_dir(), "open": len(waiting), "notices": len(notices),
+              "parked_id": parked["id"], "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.is_dir() else "",
+              "dirty": pipeline.git(["status", "--short"], ws).strip() if ws.is_dir() else ""}
+    if scenario == "asked-moved":
+        src = root / "sample/repo"
+        pipeline.git(["checkout", "-q", "main"], src)
+        (src / "moved.txt").write_text("moved\n")
+        pipeline.git(["add", "moved.txt"], src)
+        pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "move main"], src)
+        pipeline.git(["push", "-q", "origin", "HEAD:main"], src)
+    if scenario == "asked-twice":
+        from arete import control, tasks
+        tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "Spelled with a K, as in kumquat-7."}]})
+        for name, call in (("resent", lambda: tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "again"}]})),
+                           ("resumed", lambda: tasks.resume(parked["id"]))):
+            try:
+                result[name] = call()
+            except control.Refused as e:
+                result[name] = str(e)
+    for ask in waiting:
+        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
+    gone = scenario == "asked-gone"
+    (answers / "build.json").write_text(json.dumps({"ok": False, "error": "No conversation found with session ID x"})
+                                        if gone else passing)
+    if gone:
+        (answers / "build2.json").write_text(passing)
+    if edited:
+        (answers / "build.patch").unlink()
+    else:
+        (answers / "build.patch").write_text(patch)
+    continuing = ["replay-sample", task, "--force", "--continue", parked["id"]]
+    if scenario.endswith("-waiting"):
+        import signal, subprocess
+        from arete import control, tasks
+        full = lambda: mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
+                                           slots_free_to_start=mock.Mock(return_value=0))
+        if scenario == "asked-stopped-waiting":
+            said = pipeline.Run.log
+            def stop_while_waiting(run, text):
+                said(run, text)
+                if "waiting for a free run slot" in text:
+                    try:
+                        tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "again"}]})
+                    except control.Refused as e:
+                        result["while_starting"] = str(e)
+                    record.ask_stop(run.id)
+                    os.kill(os.getpid(), signal.SIGTERM)
+            with full(), mock.patch.object(pipeline.Run, "log", stop_while_waiting):
+                try:
+                    factory.main(feature, continuing)
+                except SystemExit:
+                    pass
+        else:
+            killed_while_waiting = """
+import os, runpy, signal, sys, urllib.request
+from unittest import mock
+from arete import accounts, factory, gh, paths, pipeline
+def forbidden(*args, **kwargs):
+    raise AssertionError("offline workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+gh.gh = forbidden
+said = pipeline.Run.log
+def kill_while_waiting(run, text):
+    said(run, text)
+    if "waiting for a free run slot" in text:
+        os.kill(os.getpid(), signal.SIGKILL)
+feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
+                         slots_free_to_start=mock.Mock(return_value=0)), \\
+        mock.patch.object(pipeline.Run, "log", kill_while_waiting):
+    factory.main(feature, sys.argv[1:])
+"""
+            source = str(Path(pipeline.__file__).resolve().parent.parent)
+            subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{source!r});" + killed_while_waiting,
+                            *continuing], start_new_session=True, timeout=60)
+            record.interrupt(state.ticket_runs("replay-sample", task, limit=1, whole=True)[0])
+        waited = state.ticket_runs("replay-sample", task, limit=1, whole=True)[0]
+        lines_of = [json.loads(line) for line in (paths.RUNS_DIR / waited["id"] / "run.jsonl").read_text().splitlines()]
+        result |= {"waited": waited["status"],
+                   "waited_continues": [e.get("continues") for e in lines_of if e.get("event") == "route"] == [parked["id"]],
+                   "untaken": [a["taken_by"] for a in state.asks_of(parked["id"])]}
+        if scenario == "asked-stopped-waiting":
+            try:
+                tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "again"}]})
+            except control.Refused as e:
+                result["refusal_names_it"] = f"arete resume {waited['id']}" in str(e)
+            with mock.patch.object(tasks, "launch", side_effect=lambda cfg, repo, tid, command, ahead=False: command):
+                command = tasks.resume(waited["id"])
+            result["resumes_it"] = command[-2:] == ["--continue", waited["id"]] and "feature.py" in " ".join(command)
+            continuing = [*continuing[:-1], waited["id"]]
+        else:
+            continuing = continuing[:3]
+    try:
+        factory.main(feature, continuing)
+    except SystemExit:
+        pass
+    row = state.ticket_runs("replay-sample", task, whole=True)[0]
+    events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+    session = lambda read: next(e["session"]["id"] for e in read if e.get("event") == "step_end" and e.get("step") == "implement" and e.get("session"))
+    header = json.loads(next(record.raw_lines([f for f in record.record_files(row["id"]) if "build" in f.name][-1])))
+    prompts = str(header.get("prompt"))
+    result |= {"status": row["status"], "id": row["id"], "again": row["id"] != parked["id"],
+               "skipped": next((e["skipped"] for e in events if e.get("event") == "route" and "skipped" in e), None),
+               "same_session": session(first) == session(events),
+               "answered": "Spelled with a K, as in kumquat-7." in prompts,
+               "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])],
+               "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
+               "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text()}
+    origin = root / "sample/origin.git"
+    branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines()
+                if b != "refs/heads/main"]
+    result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], origin) if len(branches) == 1 else ""
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
 row = forced()
 events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
@@ -354,6 +502,82 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
+
+    def test_run_that_asks_parks_with_its_folder_and_resumes_its_session(self):
+        result = self.workflow("asked")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertTrue(result["worktree"])
+        self.assertEqual((result["open"], result["notices"]), (1, 1))
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["skipped"], 2)
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True])
+
+    def test_answered_run_stopped_while_waiting_for_a_slot_resumes_with_the_answers(self):
+        result = self.workflow("asked-stopped-waiting")
+        self.assertEqual(result["waited"], "stopped")
+        self.assertTrue(result["waited_continues"])
+        self.assertEqual(result["untaken"], [""])
+        self.assertTrue(result["refusal_names_it"])
+        self.assertIn("which is starting with them", result["while_starting"])
+        self.assertNotIn("arete resume", result["while_starting"])
+        self.assertTrue(result["resumes_it"])
+        self.assertEqual((result["status"], result["skipped"]), ("done", 2))
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True])
+
+    def test_answer_after_main_moved_resumes_the_asking_step_without_preparing_again(self):
+        result = self.workflow("asked-moved")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["renewed"], [])
+        self.assertNotIn("prepares again", result["log"])
+        self.assertEqual(result["skipped"], 2)
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True])
+        self.assertIn("kumquat", result["published"])
+
+    def test_edits_made_before_an_ask_are_kept_while_it_waits_and_published_after_the_answer(self):
+        result = self.workflow("asked-edited")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertIn(f"Arete-Run: {result['parked_id']}", result["kept"])
+        self.assertEqual(result["dirty"], "")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["skipped"], 2)
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertIn("kumquat", result["published"])
+
+    def test_answer_sent_again_while_another_ask_waits_names_that_ask_not_a_resume(self):
+        result = self.workflow("asked-twice")
+        self.assertEqual((result["parked"], result["open"]), ("needs-info", 2))
+        self.assertIn(f"stored for run {result['parked_id']}, which goes on with them when its 1 other ask is answered",
+                      result["resent"])
+        self.assertNotIn("arete resume", result["resent"])
+        self.assertIn("ended needs-info", result["resumed"])
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True, True])
+
+    def test_answered_run_killed_while_waiting_for_a_slot_restarts_with_the_answers(self):
+        result = self.workflow("asked-killed-waiting")
+        self.assertEqual(result["waited"], "interrupted")
+        self.assertTrue(result["waited_continues"])
+        self.assertEqual(result["untaken"], [""])
+        self.assertEqual((result["status"], result["skipped"]), ("done", 2))
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [True])
+
+    def test_run_whose_kept_session_is_gone_restarts_the_step_with_the_ask_and_answers(self):
+        result = self.workflow("asked-gone")
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["answered"])
+        self.assertFalse(result["same_session"])
+        self.assertEqual(result["taken"], [True])
 
     def test_run_parked_with_scratch_held_records_its_work_without_scratch(self):
         result = self.workflow("held-scratch")
