@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -380,8 +381,10 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
 
 
 def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dirs: list,
-           family: list[str]) -> tuple[Result, float]:
+           family: list[str], started: float | None = None) -> tuple[Result, float]:
     budget = research_plan.Budget(BUDGET_USD, TIMEOUT_SECONDS, REPORT_RESERVE_USD, REPORT_RESERVE_SECONDS)
+    if started is not None:
+        budget.started = started
     planned = research_plan.plan(cfg, budget, prompt("research_plan", **values), cwd, add_dirs, ref, family)
     if not planned.plan:
         return Result(ok=False, error=planned.error), budget.spent_usd
@@ -401,6 +404,7 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
 
 
 def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = False) -> tuple[str, str]:
+    started = time.monotonic() if cfg.research_planner else None
     ref = r["ref"]
     base = {"source": r["source"], "title": r["title"], "url": r["url"], "updated": r["updated"],
             "run_id": os.environ.get("ARETE_RUN_ID", ""), "answered_by": ""}
@@ -459,7 +463,7 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
               "repos": "\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none"}
     cwd = dirs[0] if dirs else REPORTS_DIR
     if cfg.research_planner:
-        res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:], [o["ref"] for _, o, _ in done])
+        res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:], [o["ref"] for _, o, _ in done], started)
     else:
         res = runner.run(prompt("research", **values, **filing(h, filed_path)),
                          cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,

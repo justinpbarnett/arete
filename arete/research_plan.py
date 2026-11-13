@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from decimal import Decimal
 
 from . import config, runner, steps, util
 from .agent import Result
@@ -76,6 +78,8 @@ def problems(plan, family: list[str]) -> list[str]:
         found += texts(plan.get("source_criteria"), "source_criteria", LISTED)
         found += texts(plan.get("claims"), "claims", LISTED)
     else:
+        found += texts(plan.get("source_criteria"), "source_criteria", (0, LISTED[1]))
+        found += texts(plan.get("claims"), "claims", (0, LISTED[1]))
         if tasks != []:
             found.append("tasks must be empty when needs_search is false")
         if not covered:
@@ -94,38 +98,69 @@ class Budget:
     spent_usd: float = 0.0
     used_seconds: float = 0.0
     waited: float = 0.0
+    started: float = field(default_factory=lambda: time.monotonic())
+    error: str = ""
+
+    def elapsed(self) -> float:
+        self.used_seconds = max(self.used_seconds, time.monotonic() - self.started)
+        return self.used_seconds
 
     def stage(self, timeout_seconds: float) -> tuple[float, float]:
         return (self.usd - self.spent_usd - self.reserve_usd,
-                min(timeout_seconds, self.seconds - self.used_seconds - self.reserve_seconds))
+                min(timeout_seconds, self.seconds - self.elapsed() - self.reserve_seconds))
 
     def final(self) -> tuple[float, float]:
-        return self.usd - self.spent_usd, self.seconds - self.used_seconds
+        return self.usd - self.spent_usd, self.seconds - self.elapsed()
 
     def short(self, usd: float, seconds: float) -> bool:
-        return usd <= runner.BUDGET_FLOOR_USD or seconds < MIN_CALL_SECONDS
+        return bool(self.error) or not (math.isfinite(usd) and math.isfinite(seconds)) or (
+            usd <= runner.BUDGET_FLOOR_USD or seconds < MIN_CALL_SECONDS)
 
-    def wait_until(self, until: str) -> None:
+    def wait_until(self, until: str, deadline: float) -> bool:
         started = time.monotonic()
         while (left := (util.parse_iso(until) - util.now()).total_seconds()) > 0:
-            time.sleep(max(1.0, min(runner.HOLD_CHECK_SECONDS, left)))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(runner.HOLD_CHECK_SECONDS, left, remaining))
         self.waited += time.monotonic() - started
+        self.elapsed()
+        return (util.parse_iso(until) - util.now()).total_seconds() <= 0
 
-    def call(self, text: str, cwd, usd: float, seconds: float, **kw) -> Result:
-        spent, active = 0.0, 0.0
+    def call(self, text: str, cwd, usd: float, seconds: float, *, reserve: bool = False, **kw) -> Result:
+        spent = 0.0
+        usd = min(usd, self.usd - self.spent_usd - (self.reserve_usd if reserve else 0))
+        deadline = min(self.started + self.seconds - (self.reserve_seconds if reserve else 0),
+                       time.monotonic() + seconds)
+        which = runner.chosen(kw.get("model", ""), kw.get("runner", ""), kw["cfg"])[0]
         while True:
-            started = time.monotonic()
-            res = runner.run(text, cwd, max_budget_usd=usd - spent, timeout=int(seconds - active), persist=False,
-                             wait_out_limits=False, **kw)
-            took = time.monotonic() - started
-            active += took
-            spent += res.paid_usd
-            self.used_seconds += took
-            self.spent_usd += res.paid_usd
-            limit = res.usage_limit
-            if not limit or not limit.until or self.short(usd - spent, seconds - active):
+            remaining, seconds = usd - spent, deadline - time.monotonic()
+            if self.short(remaining, seconds):
+                return Result(ok=False, error=self.error or "the research call exhausted its shared budget")
+            res = runner.run(text, cwd, max_budget_usd=remaining, timeout=int(seconds), persist=False,
+                             wait_out_limits=False,
+                             remaining_budget=lambda amount=remaining: 0.0 if which in ("claude", "codex") else amount,
+                             **kw)
+            paid = res.paid_usd
+            self.elapsed()
+            if type(paid) not in (float, int) or not math.isfinite(paid) or paid < 0:
+                self.error = f"the research call's paid cost is unknown; known prior spend is {util.money(self.spent_usd)}"
+            else:
+                spent = float(Decimal(str(spent)) + Decimal(str(paid)))
+                self.spent_usd = float(Decimal(str(self.spent_usd)) + Decimal(str(paid)))
+                if spent > usd:
+                    self.error = "the research call exceeded its allowance; its incurred cost is recorded"
+            if time.monotonic() > deadline:
+                self.error = self.error or "the research call exceeded its shared deadline"
+            if self.error:
+                res.ok, res.error = False, self.error
                 return res
-            self.wait_until(limit.until)
+            limit = res.usage_limit
+            if not limit or not limit.until:
+                return res
+            if not self.wait_until(limit.until, deadline - MIN_CALL_SECONDS):
+                res.ok, res.error = False, "the usage limit outlasts the research call's remaining deadline"
+                return res
 
     def spent_words(self) -> str:
         return (f"{util.money(self.spent_usd)} of {util.money(self.usd)} and "
@@ -152,10 +187,13 @@ def plan(cfg: config.Config, budget: Budget, text: str, cwd, add_dirs: list, ref
         if budget.short(usd, seconds):
             return Planned(None, f"planning used its share of the research budget ({budget.spent_words()}), "
                                  "so no search ran", n - 1)
-        res = budget.call(text + feedback, cwd, usd, seconds, model=s.model, runner=s.runner, effort=s.effort,
+        res = budget.call(text + feedback, cwd, usd, seconds, reserve=True,
+                          model=s.model, runner=s.runner, effort=s.effort,
                           tools=list(s.tools), allowed_tools=list(s.tools), instructions=list(s.instructions),
                           json_schema=PLAN_SCHEMA, add_dirs=add_dirs, tier=s.tier, trace=("", f"research {ref} plan"),
                           cfg=cfg)
+        if budget.error:
+            return Planned(None, budget.error + "; no search ran", n)
         faults = problems(res.structured, family) if res.ok else [
             util.first_line(res.error or "the planner gave no plan")]
         if not faults:
