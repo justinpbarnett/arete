@@ -37,6 +37,7 @@ from . import (
     pi,
     record,
     runner,
+    scratch,
     state,
     steps,
     tracker,
@@ -1816,21 +1817,30 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> verify.Verified:
-    run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
+    run, t = b.run, b.ticket
     step = b.next_step(step_name)
     evidence = run.dir / "evidence"
     evidence.mkdir(exist_ok=True)
     if evidence not in run.add_dirs:
         run.add_dirs.append(evidence)
-    bash = b.read_bash + v.bash
     untracked_before = untracked_by_dir(b.git_dirs)
     try:
-        with verify.serving(v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo) as url:
+        grant = scratch.make(run.id, step, b.ws)
+    except OSError as e:
+        return verify.Verified("blocked", "The check in use did not start.", finished=False,
+                               blocked_by=f"Arete could not make the scratch folder: {util.first_line(str(e), 300)}")
+    try:
+        run.log(f"{step}: scratch folder {grant.root}")
+        v = verify.with_scratch(verify.with_free_ports(b.layer.verify), grant.root)
+        bash = b.read_bash + v.bash
+        with verify.serving(v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo,
+                            sets={scratch.ENV_NAME: grant.root}) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
             res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
+                                         scratch=scratch.note(grant),
                                          commands=code_list(bash), checks=check_list(b.layer), **values),
                             b.ws, role="verify",
                             allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
@@ -1840,7 +1850,12 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
         run.log(f"{step}: the app did not start")
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
-        restore_worktrees(untracked_before, evidence)
+        try:
+            kept = scratch.end(grant, run.dir / f"{step}-scratch.json")
+            run.log(f"{step}: removed the scratch folder {grant.root}"
+                    + (f", kept {util.count(len(kept), 'file')} that existed before it" if kept else ""))
+        finally:
+            restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
         return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
@@ -2328,6 +2343,8 @@ class SkipLog:
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
     record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
+    for root in scratch.sweep():
+        print(f"removed the scratch folder {root} of a run that died")
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:

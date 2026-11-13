@@ -18,6 +18,7 @@ from .util import git
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
 PORT_FIELD = re.compile(r"\{(port\d*)\}")
+SCRATCH_FIELD = "{scratch}"
 STOP_GRACE_SECONDS = 10
 EVIDENCE_BRANCH = "arete/evidence"
 MAX_SCREENSHOTS = 8
@@ -65,16 +66,20 @@ def with_free_ports(v: config.Verify) -> config.Verify:
     return replace(v, start=filled(v.start), url=filled(v.url), notes=filled(v.notes))
 
 
+def with_scratch(v: config.Verify, root: str) -> config.Verify:
+    return replace(v, start=v.start.replace(SCRATCH_FIELD, root), notes=v.notes.replace(SCRATCH_FIELD, root))
+
+
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
-            repo: config.Repo | None = None):
+            repo: config.Repo | None = None, sets: dict[str, str] | None = None):
     if not v.start:
         yield ""
         return
     url = v.url.rstrip("/")
     with open(log, "w") as out:
         proc = subprocess.Popen(v.start, shell=True, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, env=environment.commands(cfg or config.load(), repo),
+                                stdin=subprocess.DEVNULL, env=environment.commands(cfg or config.load(), repo, sets),
                                 **util.own_group_args())
     try:
         wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)

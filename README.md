@@ -254,7 +254,7 @@ A codex agent adds `CODEX_HOME`, and never gets `CODEX_API_KEY`, `OPENAI_API_KEY
 It also gets `ARETE_AGENT=1`.
 The commands it runs get only the list above, `ARETE_AGENT` and `ARETE_RUN_ID`, through codex's `shell_environment_policy`, so `CODEX_HOME` stays out of them.
 
-These commands start from the same list, plus the values arete sets for them, such as a loop check's `ARETE_RUN_ID` and `ARETE_SCRATCH`:
+These commands start from the same list, plus the values arete sets for them, such as a loop check's `ARETE_RUN_ID` and `ARETE_SCRATCH`, or the verify start command's `ARETE_VERIFY_SCRATCH`:
 
 - a layer's `[setup] commands`, `[checks]` and `[verify] start`
 - a loop's check and measure commands, and a `push` emit's gate check
@@ -658,12 +658,12 @@ path = "classic"
 | `git.base` | Branch PRs target. Defaults to the GitHub default branch. |
 | `git.subject` | Commit subject and PR title. Fields: `{kind}` (`feat` or `fix`) and `{title}`. The ticket ref is appended to the commit subject, like `(#35)` or `(ABC-12)`, and to a Jira PR title; a GitHub PR links its issue with `Closes #35` instead, or with `Part of #35` when the plan leaves a change for a person. |
 | `git.branch` | Branch name. Fields: `{kind}`, `{id}` (`35` or `ABC-12`) and `{slug}` (the title in short url safe form, cut at a word). |
-| `verify.start` | Shell command, run in the worktree, that serves the change. `{port}` is a free port arete picks; `{port2}` and up give more. Leave it empty for a CLI or a library: the verifier then drives the change through Bash alone. Leave `[verify]` out and nothing checks the change in use, and the PR says so. |
+| `verify.start` | Shell command, run in the worktree, that serves the change. `{port}` is a free port arete picks; `{port2}` and up give more. Leave it empty for a CLI or a library: the verifier then drives the change through Bash alone. `{scratch}` is the attempt's [scratch folder](#verify-in-use), and the start command also gets it as `ARETE_VERIFY_SCRATCH`. Leave `[verify]` out and nothing checks the change in use, and the PR says so. |
 | `verify.url` | Where the served app answers. Default `http://localhost:{port}`. |
 | `verify.ready`, `verify.ready_seconds` | Path arete waits on before the verifier starts, and how long. Any answer below 500 counts as ready. Defaults `/` and 180. |
 | `verify.allow_bash` | Bash patterns the verifier may run, on top of `curl` and `echo`. |
 | `verify.publish_evidence` | Boolean, default `true`. Set `false` to keep screenshots in the local run folder without uploading them or linking images in PRs. Verification and ordinary PR delivery still run. |
-| `verify.notes` | What the verifier must know: how to sign in, what not to touch, what is shared. |
+| `verify.notes` | What the verifier must know: how to sign in, what not to touch, what is shared. `{scratch}` is the attempt's scratch folder. |
 | `research.dir` | Folder, from the repo root, where arete files the reports of this repo's research tickets as pull requests. Leave it out and the reports stay in arete. See [Triage](#triage). |
 | `factory.path` | `classic` (default) or `adw`, which runs a ticket through the [adw flow](#the-adw-flow) on any repo. |
 | `environment.pass` | More server variables this repo's local agents and commands get, on top of the engine's `[environment] pass`. Read from the layer folder, never from a worktree. A layer takes no `[environment.providers]`. See [An agent's environment](#an-agents-environment). |
@@ -806,6 +806,8 @@ A replayed call is recorded like any other: its step row, its record header and 
 ## Verify in use
 
 Checks passing is not the bar. After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw. Reading the code and running the test suite do not count as checks. The builder does not add tests unless the repo's own rules ask for them.
+
+Each attempt gets a fresh scratch folder, `.arete-scratch-<random>` in its worktree, that git ignores. It holds `fixtures`, `config`, `state` and `out` for fixtures, scratch config, scratch state and temporary output, and the verifier's prompt names it. Arete records it as a grant in `verify-scratch/` in the state folder. When the attempt ends, even by failure or `arete stop`, arete writes `<step>-scratch.json` (the folder's entries) in the run folder and removes only the folder it made; `arete poll` removes the folder of a run that died. Files that existed before the folder, and anything a link points to, are left alone.
 
 - Pass: the verification report goes in the PR body. By default, screenshots are pushed to the orphan branch `arete/evidence` and linked from the body. Set the repo layer’s `[verify] publish_evidence = false` to retain screenshots locally without uploading them; both classic and ADW runs still deliver the PR and its text report.
 - Fail: the build session resumes with what failed, then the checks and the verifier run again, up to the verify step's `tries` (default `limits.max_attempts`).

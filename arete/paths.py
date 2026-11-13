@@ -19,6 +19,7 @@ HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 SERVER_FILE = STATE_DIR / "server.json"
 LOOP_MARKS_FILE = STATE_DIR / "loops.json"
 LOCKS_DIR = STATE_DIR / "locks"
+VERIFY_SCRATCH_DIR = STATE_DIR / "verify-scratch"
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
