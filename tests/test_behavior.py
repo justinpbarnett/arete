@@ -96,7 +96,7 @@ class VerificationPreflightTests(unittest.TestCase):
 class OfflineWorkflowTests(unittest.TestCase):
     def workflow(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
+            root = Path(directory)
             for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
                 (root / folder).mkdir()
             env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
