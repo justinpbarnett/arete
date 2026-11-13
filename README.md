@@ -83,6 +83,7 @@ Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, de
 `repo` and `check` are recorded for a later repair part and start nothing now.
 When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is still asked, and a result that would be `wake` is stored as `unsure` for the owner.
 An entry matches a file when its glob finds that file by any path, so a symlink or another letter case names the same file.
+When the file is gone by the time its incident is decided, the entries that match it cannot be told, so a result that would be `wake` is stored as `unsure`, unless every entry that could match it has the same text.
 
 **Sources.** Arete's own files are watched without being listed: the `*.log` files in the log folder, each live run's `run.jsonl`, `heartbeat.json` and serve's beat file.
 Other application or service logs are watched only when listed as `[[oncall.source]]`.
@@ -111,7 +112,7 @@ Expected events are counted and open no incident.
 **Incidents.** The `incidents` table holds the fingerprint, class, source, state, first and last occurrence, count and evidence.
 A repeat of an open incident's fingerprint, minutes or hours later, updates it instead of opening another.
 A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
-The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines from files under the same set as its own file.
+The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines from files under the same set as its own file, and by no other file once its own file is gone and that set cannot be told.
 The append-only `incident_notes` table records what happened and when.
 Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
 
@@ -129,7 +130,7 @@ The evidence is redacted before it is stored and is sent fenced as data. It is n
 | `wake` | Every question was answered with confidence: actionable, fits the vision, in scope. It may later wake a repair. |
 | `ignore` | A confident "no" to `actionable`, `vision` or `scope`. |
 | `ignore` with the injection mark | The evidence reads as instructions to an agent. It is never asked again and can never wake a model. |
-| `unsure` | An answer was under the confidence line, no vision or scope is set, or more than one source entry with different text applies to the file. It never wakes a model; the owner decides. |
+| `unsure` | An answer was under the confidence line, no vision or scope is set, more than one source entry with different text applies to the file, or the file is gone and more than one could. It never wakes a model; the owner decides. |
 | undecided | JEV is off, has no key, is not allowed for the incident's repo or the call failed. The reason is stored and nothing wakes. |
 
 Each decision is stored on the incident with every answer's value and confidence and a one-line reason, and added to its notes.

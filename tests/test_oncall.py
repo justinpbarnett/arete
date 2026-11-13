@@ -1258,6 +1258,64 @@ class Decisions(Scratch):
             self.skipTest("this file system tells letter case apart")
         self.assert_one_file_under_two_spellings_never_wakes(app, app / "Mailer.log")
 
+    def two_logs(self):
+        app = Path(self.tmp.name) / "app"
+        app.mkdir()
+        for name in ("worker.log", "mailer.log"):
+            (app / name).write_text("2026-11-13T10:00:00Z INFO started\n")
+        return app
+
+    def decided_once_the_file_is_gone(self, app, entries=""):
+        mailer = app / "mailer.log"
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n' + entries)
+        self.scanned()
+        self.append("2026-11-13T10:06:30Z INFO mailer context",
+                    self.failure_line("payments ledger write failed: KeyError"), to=mailer)
+        self.assertEqual(set(self.scanned({"mailer context": {"error": "HTTP 503"}})["decisions"]), {"undecided"})
+        mailer.unlink()
+        self.sql("UPDATE incidents SET retry_at = ''")
+        return self.scanned()["decisions"], [r[0] for r in self.sql("SELECT reason FROM incidents")]
+
+    def assert_a_gone_file_under_two_spellings_is_unsure(self, app, spelled):
+        decisions, reasons = self.decided_once_the_file_is_gone(
+            app, f'[[oncall.source]]\npath = "{spelled}"\nscope = "Only the mailer module"\n')
+        self.assertEqual(decisions, {"unsure": 2})
+        self.assertEqual(len(reasons), 2)
+        for reason in reasons:
+            self.assertIn("gone", reason)
+
+    def test_a_file_reached_through_a_symlink_and_gone_before_its_decision_is_unsure(self):
+        app = self.two_logs()
+        link = Path(self.tmp.name) / "link"
+        link.symlink_to(app, target_is_directory=True)
+        self.assert_a_gone_file_under_two_spellings_is_unsure(app, link / "mailer.log")
+
+    def test_a_file_named_in_another_letter_case_and_gone_before_its_decision_is_unsure(self):
+        app = self.two_logs()
+        if not (app / "Mailer.log").exists():
+            self.skipTest("this file system tells letter case apart")
+        self.assert_a_gone_file_under_two_spellings_is_unsure(app, app / "Mailer.log")
+
+    def test_a_gone_file_still_wakes_when_every_entry_gives_the_same_text(self):
+        decisions, _ = self.decided_once_the_file_is_gone(self.two_logs())
+        self.assertEqual(decisions, {"wake": 1})
+
+    def test_a_repeat_never_lands_in_an_incident_whose_file_is_gone_under_two_policies(self):
+        app = self.two_logs()
+        gone, worker = app / "gone.log", app / "worker.log"
+        gone.write_text("2026-11-13T10:00:00Z INFO started\n")
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{app / "mailer.log"}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.append(line, to=gone)
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        gone.unlink()
+        self.append(line, to=worker)
+        self.scanned()
+        self.assertEqual(self.sql("SELECT source, count FROM incidents ORDER BY id"),
+                         [(str(gone), 1), (str(worker), 1)])
+
 
 if __name__ == "__main__":
     unittest.main()

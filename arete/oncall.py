@@ -353,18 +353,26 @@ class Policies:
         for entry, files in self.files:
             for name in files:
                 self.entries.setdefault(self.named.setdefault(name, identity(name) or name), []).append(entry)
+        self.every = frozenset(entry_policy(cfg, s) for s in cfg.oncall.sources)
 
-    def matching(self, source: str) -> list[config.OncallSource]:
+    def matching(self, source: str) -> tuple[list[config.OncallSource], bool]:
         key = self.named.get(source) or identity(source)
-        if key is None:
-            return [s for s in self.cfg.oncall.sources if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))]
-        return self.entries.get(key, [])
+        if key is not None:
+            return self.entries.get(key, []), True
+        spelled = [s for s in self.cfg.oncall.sources if fnmatch.fnmatchcase(source, str(paths.expand(s.path)))]
+        if not spelled and not os.path.isabs(source):
+            return [], True
+        could = self.every if spelled else self.every | {entry_policy(self.cfg)}
+        return spelled, len(could) == 1
 
     def text(self, source: str) -> tuple[str, str]:
-        return entry_policy(self.cfg, next(iter(self.matching(source)), None))
+        return entry_policy(self.cfg, next(iter(self.matching(source)[0]), None))
 
     def of(self, source: str) -> frozenset[tuple[str, str]]:
-        return frozenset({entry_policy(self.cfg, s) for s in self.matching(source)} or {entry_policy(self.cfg)})
+        found, sure = self.matching(source)
+        if not sure:
+            return frozenset()
+        return frozenset({entry_policy(self.cfg, s) for s in found} or {entry_policy(self.cfg)})
 
 
 def bounded(scope: str, rule: frozenset[tuple[str, str]]) -> str:
@@ -440,10 +448,14 @@ def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, policies: Polici
         if not a.sure(line):
             return UNSURE, a.confidence, f"{name} is uncertain ({a.note()})", answers, 0
     least = min(a.confidence for a in got.values())
+    rule = policies.of(row["source"])
+    if not rule:
+        why = "its file is gone, so which [[oncall.source]] vision and scope apply cannot be told; the owner decides"
+        return UNSURE, least, why, answers, 0
     for name, text in zip(("vision", "scope"), policies.text(row["source"]), strict=True):
         if not text:
             return UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0
-    if len(policies.of(row["source"])) > 1:
+    if len(rule) > 1:
         why = "more than one [[oncall.source]] vision or scope applies to this file, so the owner decides"
         return UNSURE, least, why, answers, 0
     return WAKE, least, "actionable, fits the vision and is in scope", answers, 0
@@ -543,7 +555,7 @@ def known_twins(cfg: config.Config, policies: Policies, rows: list[tuple], known
         home = origin_repo(row[2], row[3])
         rule = policies.of(row[2])
         same = [r for r in open_rows if homes[r["id"]] == home and rules[r["id"]] == rule][:TWINS_OFFERED]
-        if (row[0] not in known and same and not refused(cfg, home)
+        if (row[0] not in known and rule and same and not refused(cfg, home)
                 and not owner_run({"class": row[1], "source": row[2], "evidence": row[6]})):
             fresh.append(row)
             candidates.append(same)
