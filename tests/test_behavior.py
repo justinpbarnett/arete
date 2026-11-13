@@ -288,9 +288,10 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["budget"]["parents"], [])
 
 
-class OptimizeTests(unittest.TestCase):
-    FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
+PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
 
+
+class OptimizeTests(unittest.TestCase):
     def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
         from arete import experiment, optimize
 
@@ -307,7 +308,7 @@ class OptimizeTests(unittest.TestCase):
         pair = experiment.pairing(done, "champ", "cand", "validation", 0.95)
         verdict = experiment.judge(pair, accept)
         return optimize.decide(experiment.arm_summary("cand", rows, 0.95), experiment.arm_summary("champ", rows, 0.95),
-                               pair, verdict, self.FLOOR)
+                               pair, verdict, PROMOTION_FLOOR)
 
     def test_a_clear_quality_win_is_promoted_on_quality(self):
         found = self.decision([False] * 6, [True] * 6)
@@ -411,7 +412,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
 '''
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
             done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
-                                  capture_output=True, timeout=600)
+                                  capture_output=True, timeout=600, check=False)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
             output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
                            if line.startswith("BEHAVIOR_RESULT=")), None)
@@ -520,7 +521,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
 """
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
             done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
-                                  capture_output=True, timeout=600)
+                                  capture_output=True, timeout=600, check=False)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
             output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
                            if line.startswith("BEHAVIOR_RESULT=")), None)
