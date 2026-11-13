@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import html
 import json
 import re
+import string
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from . import config, research_plan, research_search, runner, steps, util
 from .agent import Result
@@ -18,8 +21,20 @@ TEXT = {"type": "string"}
 TEXTS = {"type": "array", "items": TEXT}
 BOOL = {"type": "boolean"}
 CITE = re.compile(r"\[(S\d+)\]")
-CITE_LINK = re.compile(r"\[(S\d+)\](\([^)\s]*\))?")
-LINK = re.compile(r"https?://[^\s<>\"'\])]+", re.IGNORECASE)
+CITE_LINK = re.compile(r"\[(S\d+)\](\((?:[^()\s]|\([^()\s]*\))*\))?")
+INLINE = re.compile(r"\]\(")
+DEFINITION = re.compile(r"^ {0,3}\[(?:\\.|[^\\\[\]])+\]:", re.MULTILINE)
+SPACING = re.compile(r"[ \t]*(?:\n[ \t]*)?")
+ANGLED = re.compile(r"<((?:\\.|[^<>\\\n])*)>")
+AUTOLINK = re.compile(r"<([a-z][a-z0-9+.-]{1,31}:[^\x00-\x20\x7f<>]*)>", re.IGNORECASE)
+AUTOLINK_END = re.compile(r"[^\x00-\x20\x7f<>]*>")
+ATTRIBUTE = re.compile(r"(?<![\w-])(?:href|src|srcset|longdesc|cite)[ \t\n\r\f\v]*=[ \t\n\r\f\v]*"
+                       r"(\"[^\"]*\"|'[^']*'|[^ \t\n\r\f\v\"'=<>`]+)", re.IGNORECASE)
+BARE = re.compile(r"(?:https?://|ftp://|www\.)[^ \t\n\r\f\v<]*", re.IGNORECASE)
+ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+ENTITY_END = re.compile(r"&[a-z]+;$", re.IGNORECASE)
+TRAILING = "?!.,:*_~'\""
+PORTS = {"http": 80, "https": 443}
 SECTIONS = ("Supported conclusions", "Inference", "Unresolved contradictions", "Gaps", "Sources")
 
 
@@ -50,14 +65,97 @@ class Asked:
     why: str = ""
 
 
-def urls_in(text: str) -> set[str]:
+def escaped(text: str, at: int) -> bool:
+    back = at
+    while back and text[back - 1] == "\\":
+        back -= 1
+    return (at - back) % 2 == 1
+
+
+def literal(text: str) -> str:
+    return html.unescape(ESCAPE.sub(r"\1", text))
+
+
+def target(text: str, at: int) -> str:
+    at = SPACING.match(text, at).end()
+    if angled := ANGLED.match(text, at):
+        return literal(angled[1])
+    end, depth = at, 0
+    while end < len(text) and " " < text[end] != "\x7f":
+        if text[end] == "\\" and end + 1 < len(text) and text[end + 1] in string.punctuation:
+            end += 2
+            continue
+        if text[end] == ")" and not depth:
+            break
+        depth += {"(": 1, ")": -1}.get(text[end], 0)
+        end += 1
+    return literal(text[at:end])
+
+
+def trimmed(token: str) -> str:
+    while token:
+        if token[-1] in TRAILING:
+            token = token[:-1]
+        elif token[-1] == ";":
+            token = token[:entity.start()] if (entity := ENTITY_END.search(token)) else token[:-1]
+        elif token[-1] == ")" and token.count(")") > token.count("("):
+            token = token[:-1]
+        else:
+            break
+    return token
+
+
+def bare(text: str, found: re.Match) -> str:
+    token, start = found[0], found.start()
+    opener = text[start - 1] if start and not escaped(text, start - 1) else ""
+    if opener == "<" and (end := AUTOLINK_END.match(token)):
+        return token[:end.end() - 1]
+    if opener == "[" and "]" in token:
+        token = token[:token.index("]")]
+    token = trimmed(token)
+    return f"http://{token}" if token[:4].lower() == "www." else token
+
+
+def link_targets(text: str) -> list[str]:
+    found = [target(text, m.end()) for m in INLINE.finditer(text)]
+    found += [target(text, m.end()) for m in DEFINITION.finditer(text)]
+    found += [m[1] for m in AUTOLINK.finditer(text)]
+    found += [html.unescape(m[1][1:-1] if m[1][0] in "\"'" else m[1]) for m in ATTRIBUTE.finditer(text)]
+    found += [bare(text, m) for m in BARE.finditer(text)]
+    return [url for url in dict.fromkeys(found) if url]
+
+
+def destination(url: str) -> tuple:
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        raise ValueError(f"the link {url} is not a valid address") from None
+    scheme = parts.scheme.lower()
+    if "@" in parts.netloc:
+        raise ValueError(f"the link {url} puts user details before its host, so it may lead elsewhere")
+    if scheme not in PORTS or not parts.hostname or "\\" in parts.netloc:
+        raise ValueError(f"the link {url} is not an http or https address with a plain host")
+    plain = urlsplit(research_search.canonical(url))
+    return scheme, parts.hostname, PORTS[scheme] if port is None else port, plain.path, plain.query
+
+
+def destinations(urls) -> set[tuple]:
     found = set()
-    for url in LINK.findall(text or ""):
+    for url in urls:
         try:
-            found.add(research_search.canonical(url.rstrip(".,;:!?")))
+            found.add(destination(url))
         except ValueError:
             continue
     return found
+
+
+def ticket_links(text: str) -> set[tuple]:
+    return destinations(link_targets(text or ""))
+
+
+def without_cited_targets(text: str, known) -> str:
+    return CITE_LINK.sub(lambda m: f"[{m[1]}]" if m[1] in known else m[0], text)
 
 
 def present(value) -> bool:
@@ -128,14 +226,15 @@ def faults(answer, known, links) -> list[str]:
         found.append(f"searches must be at most {GAP_TASKS} tasks")
     for i, task in enumerate(searches[:GAP_TASKS], 1):
         found += research_plan.task_problems(i, task)
-    allowed = {research_search.canonical(url) for url in known.values()} | links
+    allowed = destinations(known.values()) | links
     for text in text_fields(answer):
         found += [f"[{sid}] was not supplied" for sid in dict.fromkeys(CITE.findall(text)) if sid not in known]
-        for url in dict.fromkeys(LINK.findall(text)):
+        for url in link_targets(without_cited_targets(text, known)):
             try:
-                outside = research_search.canonical(url.rstrip(".,;:!?")) not in allowed
-            except ValueError:
-                outside = True
+                outside = destination(url) not in allowed
+            except ValueError as e:
+                found.append(str(e))
+                continue
             found += [f"the link {url} is neither a supplied source nor in the ticket"] if outside else []
     return list(dict.fromkeys(found))
 
@@ -242,7 +341,7 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, evidence: 
         values: dict, where: dict, cwd, add_dirs: list) -> Result:
     s = steps.resolve(cfg, None, "research_synthesis")
     tools = [t for t in s.tools if t not in runner.WEB_TOOLS]
-    links = urls_in(values.get("ticket", "")) | urls_in(values.get("related", ""))
+    links = ticket_links(values.get("ticket", "")) | ticket_links(values.get("related", ""))
     current, last, rounds, extra = evidence, None, [], []
     for round_no in range(MAX_ROUNDS + 1):
         got = ask(cfg, budget, s, tools, plan, current, ref, values, where, cwd, add_dirs, round_no, links)

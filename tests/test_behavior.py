@@ -373,14 +373,17 @@ try:
     out["web"] = ""
 except ValueError as e:
     out["web"] = str(e)
+out["home"] = os.environ.get("HOME", "")
 print("RESULT" + json.dumps(out))
 '''
 
     @classmethod
     def setUpClass(cls):
+        gh_state = SOURCE / ".local/state/gh"
+        had_gh_state = gh_state.exists()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "replay"):
+            for folder in ("config", "state", "logs", "replay", "home"):
                 (root / folder).mkdir()
             (root / "config/config.toml").write_text(
                 '[replay]\nall = true\n\n[research]\nplanner = true\nsearch = true\nsynthesis = true\n\n'
@@ -388,13 +391,15 @@ print("RESULT" + json.dumps(out))
             env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
             env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
                        ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
-                       TMPDIR=str(root), PYTHONPATH=str(SOURCE))
+                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
             done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
-                                  capture_output=True, text=True, timeout=120)
+                                  capture_output=True, text=True, timeout=120, check=False)
             line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
             if not line:
                 raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
             cls.out = json.loads(line[len("RESULT"):])
+            cls.home = str(root / "home")
+        cls.wrote_gh_state = not had_gh_state and gh_state.exists()
 
     def names(self, which):
         return [c[0] for c in self.out[which]["calls"]]
@@ -459,6 +464,44 @@ print("RESULT" + json.dumps(out))
         found = rs.faults(answer, known, set())
         self.assertEqual(len(found), 1)
         self.assertIn("outside.example", found[0])
+
+    def test_links_are_checked_whole_as_the_report_renders_them(self):
+        from arete import research_synthesis as rs
+        known = {"S1": "https://example.org/", "S2": "https://en.wikipedia.org/wiki/Mercury_(planet)",
+                 "S3": "https://example.com/what's-new"}
+
+        def faults(text):
+            answer = {"summary": "s", "name": "", "answer": text,
+                      "conclusions": [{"claim": "c", "sources": ["S1"], "critical": True}], "inferences": [],
+                      "contradictions": [], "gaps": [], "searches": []}
+            return rs.faults(answer, known, set())
+
+        for text in ("See <https://example.org)@outside.example/>.", "See https://example.org)@outside.example/ now.",
+                     "See [it](https://example.org\\)@outside.example/).",
+                     "See [it](https://example.org&#64;outside.example/).",
+                     "See [https://example.org/](https://outside.example/).", "See [it](//outside.example/)."):
+            found = faults(text)
+            self.assertTrue(found, text)
+            self.assertIn("outside.example", " ".join(found), text)
+        self.assertEqual(faults("See https://en.wikipedia.org/wiki/Mercury_(planet), "
+                                "[it](https://en.wikipedia.org/wiki/Mercury_(planet)) and "
+                                "(https://en.wikipedia.org/wiki/Mercury_(planet))."), [])
+        self.assertEqual(faults("See https://example.com/what's-new, [it](https://example.com/what's-new) and "
+                                "'https://example.org/'."), [])
+        self.assertEqual(faults("See <https://example.org/> and [https://example.org/](https://example.org/)."), [])
+        self.assertEqual(rs.ticket_links("Read https://u@outside.example/ and "
+                                         "https://en.wikipedia.org/wiki/Mercury_(planet)."),
+                         {("https", "en.wikipedia.org", 443, "/wiki/Mercury_(planet)", "")})
+
+    def test_cited_link_with_parentheses_renders_whole(self):
+        from arete import research_synthesis as rs
+        urls = {"S2": "https://en.wikipedia.org/wiki/Mercury_(planet)"}
+        self.assertEqual(rs.link_ids("See [S2](https://en.wikipedia.org/wiki/Mercury_(planet)).", urls),
+                         "See [S2](https://en.wikipedia.org/wiki/Mercury_(planet)).")
+
+    def test_research_subprocess_keeps_gh_state_out_of_the_worktree(self):
+        self.assertEqual(self.out["home"], self.home)
+        self.assertFalse(self.wrote_gh_state)
 
     def test_synthesis_needs_search(self):
         with self.assertRaisesRegex(ValueError, "synthesis needs search = true"):
