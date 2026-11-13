@@ -4,8 +4,11 @@ import json
 import math
 import os
 import shutil
+import threading
+import time
 import tomllib
-from dataclasses import dataclass, replace
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import evals, experiment, paths, pipeline, record, replay, routing, runner, state, steps, util
@@ -14,6 +17,7 @@ GROUPS = ("ordinary", "difficult")
 DECIDES = "holdout"
 NOTE = "This report changes no route, tier or config."
 WORDS = {"add-word": "kumquat", "exact-word": "quince", "two-files": "medlar"}
+SETUP = "setup"
 SAMPLE_ARMS = {"current": 0.04, "strong": 0.09, "cheap": 0.004}
 
 
@@ -122,6 +126,58 @@ def load(path: Path) -> Bench:
                          checks_required=True), groups, references)
 
 
+@dataclass
+class Clock:
+    exp: experiment.Experiment
+    path: Path
+    used: experiment.Totals
+    began: float = field(default_factory=time.monotonic)
+    noted: float = field(default_factory=time.monotonic)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def left(self) -> float:
+        return self.exp.limits["minutes"] * 60 - self.used.seconds - (time.monotonic() - self.began)
+
+    def check(self) -> None:
+        if self.left() <= 0:
+            spent = replace(self.used, seconds=self.exp.limits["minutes"] * 60)
+            raise experiment.Capped(experiment.reached(self.exp.limits, spent, launching=False))
+
+    def note(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            seconds = round(now - self.noted, 2)
+            if seconds > 0:
+                experiment.append(self.path, {"event": SETUP, "seconds": seconds, "at": util.iso()})
+            self.noted = now
+
+    @contextmanager
+    def saving(self):
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(experiment.ALIVE_SECONDS):
+                self.note()
+
+        beater = threading.Thread(target=beat, name="benchmark setup", daemon=True)
+        beater.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            beater.join()
+            self.note()
+
+
+@dataclass
+class ProofRun(evals.EvalRun):
+    clock: Clock | None = None
+
+    def time_for(self, seconds: float) -> float:
+        self.clock.check()
+        return min(seconds, self.clock.left())
+
+
 def default_path(name: str) -> Path:
     return paths.STATE_DIR / "benchmarks" / f"{name}.jsonl"
 
@@ -130,17 +186,25 @@ def proven(path: Path) -> set[str]:
     return {e.get("task") for e in experiment.events(path) if e.get("event") == "proof"}
 
 
-def exit_code(exp: experiment.Experiment, task: evals.Task, commit: str, run: evals.EvalRun) -> int:
+def exit_code(exp: experiment.Experiment, task: evals.Task, commit: str, run: ProofRun) -> int:
     wt = paths.WORKTREES_DIR / f"eval-{exp.repo.name}-{task.name}-proof"
     try:
+        run.clock.check()
         evals.checkout_without_origin_refs(exp.repo.path, commit, wt)
-        evals.prepare(exp.repo, evals.Source(exp.repo), wt, run)
-        return evals.hidden_check(exp.cfg, exp.repo, task, wt, task.timeout_minutes * 60).returncode
+        try:
+            evals.prepare(exp.repo, evals.Source(exp.repo), wt, run)
+        except pipeline.RunFailed as e:
+            run.clock.check()
+            raise experiment.Refused(f"tasks.{task.name}: {e.why} on {commit[:7]}") from e
+        code = evals.hidden_check(exp.cfg, exp.repo, task, wt, run.time_for(task.timeout_minutes * 60)).returncode
+        if code == util.TIMED_OUT:
+            run.clock.check()
+        return code
     finally:
         shutil.rmtree(wt, ignore_errors=True)
 
 
-def prove_check(bench: Bench, path: Path, name: str, run: evals.EvalRun) -> str:
+def prove_check(bench: Bench, path: Path, name: str, run: ProofRun) -> str:
     exp, task, reference = bench.exp, bench.exp.tasks[name], bench.references[name]
     on_reference = exit_code(exp, task, reference, run)
     on_base = exit_code(exp, task, task.base, run)
@@ -156,7 +220,7 @@ def prove_check(bench: Bench, path: Path, name: str, run: evals.EvalRun) -> str:
     return ""
 
 
-def prove(bench: Bench, path: Path) -> None:
+def prove(bench: Bench, path: Path, clock: Clock) -> None:
     exp = bench.exp
     todo = [t for t in exp.tasks if t not in proven(path)]
     for name in (t for t in todo if not exp.tasks[t].check):
@@ -166,11 +230,16 @@ def prove(bench: Bench, path: Path) -> None:
     checked = [t for t in todo if exp.tasks[t].check]
     if not checked:
         return
+    clock.check()
     run_id = record.start("eval", tag=f"benchmark-{exp.name}-proof", repo=exp.repo.name)
     with record.failed_on_crash(run_id):
-        run = evals.EvalRun(id=run_id, repo=exp.repo, dir=paths.RUNS_DIR / run_id, cfg=exp.cfg, task="proof")
+        run = ProofRun(id=run_id, repo=exp.repo, dir=paths.RUNS_DIR / run_id, cfg=exp.cfg, task="proof", clock=clock)
         run.dir.mkdir(parents=True, exist_ok=True)
-        failures = [why for name in checked if (why := prove_check(bench, path, name, run))]
+        try:
+            failures = [why for name in checked if (why := prove_check(bench, path, name, run))]
+        except experiment.Capped as e:
+            record.settle(run_id, "stopped", summary=str(e))
+            raise
         record.settle(run_id, "failed" if failures else "done",
                       summary="; ".join(failures) or f"{util.count(len(checked), 'task')} proven")
     if failures:
@@ -205,20 +274,30 @@ def drive(bench: Bench, path: Path) -> int:
     if not any(e.get("event") == "manifest" for e in found):
         experiment.append(path, {"event": "manifest", "digest": exp.digest, "design": exp.design})
     experiment.append(path, {"event": "session", "at": util.iso(), "limits": exp.limits, "pid": os.getpid()})
-    prove(bench, path)
-    missing = unavailable(exp)
-    experiment.append(path, {"event": "availability", "at": util.iso(), "arms": missing})
-    for arm, why in missing.items():
-        print(f"unavailable {arm}: {why}", flush=True)
-    baseline = exp.accept["baseline"]
-    if baseline in missing:
-        raise experiment.Refused(f"the baseline {baseline} is unavailable: {missing[baseline]}")
-    experiment.settle_interrupted(exp, path)
-    planned = len(exp.tasks) * exp.repeats * (len(exp.arms) - len(missing))
-    if done := len(experiment.completed(experiment.events(path))):
-        print(f"{done} of {planned} trials already done in {paths.short_path(path)}", flush=True)
+    used = experiment.totals_of(experiment.events(path))
+    if used.seconds > 0:
+        print(f"{used.seconds:.1f} seconds of limits.minutes = {exp.limits['minutes']:g} already used in "
+              f"{paths.short_path(path)}", flush=True)
+    clock = Clock(exp, path, used)
     try:
+        with clock.saving():
+            prove(bench, path, clock)
+            missing = unavailable(exp)
+        experiment.append(path, {"event": "availability", "at": util.iso(), "arms": missing})
+        for arm, why in missing.items():
+            print(f"unavailable {arm}: {why}", flush=True)
+        baseline = exp.accept["baseline"]
+        if baseline in missing:
+            raise experiment.Refused(f"the baseline {baseline} is unavailable: {missing[baseline]}")
+        experiment.settle_interrupted(exp, path)
+        planned = len(exp.tasks) * exp.repeats * (len(exp.arms) - len(missing))
+        if done := len(experiment.completed(experiment.events(path))):
+            print(f"{done} of {planned} trials already done in {paths.short_path(path)}", flush=True)
         code = experiment.work(replace(exp, skip=frozenset(missing)), path)
+    except experiment.Capped as e:
+        experiment.append(path, {"event": "stop", "why": str(e), "at": util.iso()})
+        print(f"stopped: {e}", flush=True)
+        code = experiment.LIMIT_EXIT
     except (KeyboardInterrupt, pipeline.Stopped):
         experiment.append(path, {"event": "stop", "why": "interrupted", "at": util.iso()})
         code = experiment.INTERRUPT_EXIT
@@ -323,6 +402,7 @@ def report(path: Path) -> dict:
     planned = len(design["tasks"]) * design["repeats"] * (len(design["arms"]) - len(missing))
     return {"name": design["name"], "digest": manifest["digest"], "atom": design["atom"], "accept": design["accept"],
             "planned": planned, "done": len(done), "availability": missing,
+            "setup_seconds": round(sum(e.get("seconds") or 0 for e in found if e.get("event") == SETUP), 2),
             "groups": {g: group_report(design, g, trials, missing) for g in GROUPS}, "note": NOTE}
 
 
@@ -362,6 +442,8 @@ def render_group(group: str, g: dict, accept: dict, missing: dict[str, str]) -> 
 def render(found: dict) -> str:
     out = [f"benchmark {found['name']} (design {found['digest']}), atom {found['atom']}",
            f"{found['done']} of {found['planned']} trials done"]
+    if found["setup_seconds"] > 0:
+        out.append(f"proof and setup: {found['setup_seconds']:g} seconds, counted against limits.minutes")
     for group, g in found["groups"].items():
         out += render_group(group, g, found["accept"], found["availability"])
     return "\n".join([*out, found["note"]])

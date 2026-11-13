@@ -1275,13 +1275,15 @@ The plan, repair, grader and reviewer steps are fixed for every arm; only the `a
 
 A task is proven before any trial runs. Its hidden check must pass on `reference` and fail on `base`, each in a clean checkout; the result is a `proof` event in the results file, and a task already proven is not checked again. A check that fails on the reference, or passes on the base, refuses the run with the task named and no trial runs. A mined task with only `verify` steps needs no `reference`, but only when its mined row is `accepted` for this repo and the task as it is now (title, prompt, steps, base and source) equals the task the mining run validated; an edited or copied task is refused. Any other task with only `verify` is refused: add a `check` with hidden files and a `reference`.
 
+The time spent on proof, on the layer's setup commands and on the availability check counts against `limits.minutes`. Each hidden check and setup command gets at most the time left. When the time runs out the run stops and exits 3 before any trial starts. The time is saved as `setup` events, so running the same command again continues from the time already used and prints it; raise `limits.minutes` to go on.
+
 An arm whose route has no credential, login or required tool is `unavailable`, with routing's reason, and runs no trial. That is never counted as a quality failure: the report says `unavailable, not judged` for it. The baseline being unavailable refuses the run. `[replay] all = true` sends every call to replay, so every arm is available; leave it out to have routing judge the arms. The check is written as an `availability` event.
 
 Each `trial` line also records `checks` (the repo checks, `pass` or `fail`), `verify` (the grader's verdict, empty with no `verify` steps), `hidden_check`, `blocking_findings` (null when no review ran), `tool_errors`, `schema_errors`, `repairs` and `cost_usd`. The report adds the total cost over every attempt and per accepted task.
 
 A trial is accepted only when its repo checks pass, its hidden check passes, its verify steps pass and the reviewer raised no blocker; `arete experiment` keeps its own rule.
 
-The results file is `benchmarks/<name>.jsonl` under the state folder, or the `--out` path. It holds the experiment events plus `proof` and `availability`.
+The results file is `benchmarks/<name>.jsonl` under the state folder, or the `--out` path. It holds the experiment events plus `proof`, `availability` and `setup` (`seconds`, `at`; written every 10 seconds and when the phase ends). The report shows the total as `proof and setup`.
 
 The quality rule: on the holdout tasks of a group, a candidate wins only when its pairs against the baseline reach `min_pairs` and the lower end of the difference interval is above `min_difference` and the sign test is significant at `confidence`. The report recommends the cheapest winner per accepted task, ties to the larger difference; with no winner it keeps the baseline.
 
@@ -1295,7 +1297,28 @@ arete benchmark run /tmp/bench/benchmark.toml
 
 It runs 54 replay trials (three tasks, three arms, six repeats; the fourth arm is unavailable). Expect `strong` to win in `ordinary` over a baseline that fails one task, `cheap` to hold at the baseline on cost alone with no accepted task, `difficult` to keep the baseline, and `absent` to read `unavailable, not judged`.
 
-For real routes, keep the manifest and the tasks in your own config and layer, then bound the run: run `--dry-run` first, set all four `[limits]`, and start small (few tasks, `repeats` at the experiment minimum). A run that reaches a limit stops and exits 3; the same command resumes after you raise it. Tool errors read 0 on replay, since a replay record holds no tool results. Candidate ids, rankings, tariffs and task data belong in the owner's manifest and layer, never in this repository.
+For real routes, keep the manifest and the tasks in your own config and layer, then bound the run: run `--dry-run` first, set all four `[limits]`, and start small (few tasks, `repeats` at the experiment minimum). A run that reaches a limit stops and exits 3; the same command resumes after you raise it. A bounded invocation, with a manifest in your config folder and placeholder arm names only:
+
+```
+# ~/.config/arete/benchmarks/routes.toml
+name = "routes"
+repo = "my-repo"
+repeats = 6
+[arms.baseline]
+tier = "<tier>"
+[arms.candidate]
+model = "<provider/model>"
+[limits]
+spend_usd = 20
+minutes = 120
+calls = 2000
+tokens = 5000000
+
+arete benchmark run ~/.config/arete/benchmarks/routes.toml --dry-run
+arete benchmark run ~/.config/arete/benchmarks/routes.toml
+```
+
+The manifest also needs your `[tasks.NAME]` and `[accept]` tables. Tool errors read 0 on replay, since a replay record holds no tool results. Candidate ids, rankings, tariffs and task data belong in the owner's manifest and layer, never in this repository.
 
 ## Verifier suites
 

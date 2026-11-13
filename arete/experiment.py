@@ -386,7 +386,7 @@ def totals_of(found: list[dict]) -> Totals:
             used.calls += e.get("calls") or 0
             used.tokens += (e.get("tokens_in") or 0) + (e.get("tokens_out") or 0)
             used.seconds += (e.get("wall_seconds") or 0) + (e.get("wait_seconds") or 0)
-        elif e.get("event") == "wait" and attempt_of(e) not in settled:
+        elif e.get("event") == "setup" or (e.get("event") == "wait" and attempt_of(e) not in settled):
             used.seconds += e.get("seconds") or 0
     return used
 
