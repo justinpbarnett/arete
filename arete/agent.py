@@ -157,6 +157,8 @@ class Result:
     requested_effort: str = ""
     skipped: list[dict] = field(default_factory=list)
     record: str = ""
+    quote: dict | None = None
+    reference_usd: float | None = None
 
     @property
     def modes(self) -> tuple[str, ...]:

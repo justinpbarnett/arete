@@ -950,7 +950,7 @@ def cmd_steps(args) -> int:
         where = f"{paths.short_path(layer_dir / 'config.toml')}: " if layer_dir else ""
         layer = config.load_layer(layer_dir) if layer_dir else None
         steps.check(cfg, layer)
-        sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.MODEL_ROLES]
+        sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.STEP_ROLES]
     except (ValueError, TypeError) as e:
         print(f"{where}{e}", file=sys.stderr)
         return 1
@@ -1007,6 +1007,39 @@ def cmd_record(args) -> int:
     names = ", ".join(f.name for f in record.record_files(args.run_id)) or "none"
     print(f"no step {args.step} in run {args.run_id}; its records: {names}", file=sys.stderr)
     return 1
+
+
+def cmd_prices(args) -> int:
+    from . import prices, util
+
+    words = args.words
+    if (args.action, len(words)) not in (("diff", 0), ("diff", 1), ("import", 1), ("recompute", 2)):
+        print("usage: arete prices diff [FILE] | import FILE | recompute RUN_ID STEP", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "recompute":
+            print_lines([json.dumps(prices.recompute(*words), ensure_ascii=False)])
+            return 0
+        old = prices.load()
+        if words:
+            new = prices.read_file(words[0])
+        elif old is None:
+            print("no price snapshot imported", file=sys.stderr)
+            return 1
+        else:
+            new = old
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    found = prices.diff(old if words else None, new, util.now())
+    importing = args.action == "import"
+    print_lines([*(json.dumps(f, ensure_ascii=False) for f in found),
+                 json.dumps({"source": new["source"], "observed": new["observed"], "version": new["version"],
+                             "routes": len(new["routes"]), "against": old["version"] if words and old else None,
+                             "findings": dict(Counter(f["finding"] for f in found)), "imported": importing})])
+    if importing:
+        prices.store(new)
+    return 0
 
 
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
@@ -1298,6 +1331,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")
     p.set_defaults(fn=cmd_record)
+
+    p = sub.add_parser("prices", help="import, diff or recompute from an owner-supplied price and lifecycle "
+                                      "snapshot")
+    p.add_argument("action", choices=("import", "diff", "recompute"))
+    p.add_argument("words", nargs="*", help="diff [FILE], import FILE, or recompute RUN_ID STEP")
+    p.set_defaults(fn=cmd_prices)
 
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))

@@ -273,15 +273,18 @@ class AgentRun:
         return self.cfg
 
     def settings(self, role: str) -> steps.Settings:
-        own = self.step_overrides.get(config.STEP_ALIASES.get(role, role), {})
-        return steps.resolve(self.config, self.layer, role, self.kind, {**self.overrides, **own})
+        role = config.STEP_ALIASES.get(role, role)
+        return steps.resolve(self.config, self.layer, role, self.kind,
+                             {**self.overrides, **self.step_overrides.get(role, {})},
+                             self.step_overrides.get(config.INHERITS.get(role, ""), {}))
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         s = self.settings(role) if role else None
         if s:
             reach = s.agent_kw(self.config, kw.pop("allowed_tools", ()), kw.pop("mcp_config", ""))
             kw = {**s.call, **reach,
-                  "resume": self.sessions.get(s.step, NO_SESSION) if s.session == "resume" else NO_SESSION, **kw}
+                  "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
+                  if s.session == "resume" else NO_SESSION, **kw}
         cfg = kw.get("cfg") or self.config
         if s and s.requires.declared and not cfg.replay.all:
             size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
@@ -313,6 +316,8 @@ class AgentRun:
                 fields = {k: route.get(k) for k in ("runner", "model", "provider", "auth_mode", "credential",
                                                     "billing", "effort", "requested_effort", "tier", "position",
                                                     "requested", "env", "skipped", "launch") if k in route}
+                if s:
+                    fields["atom"] = s.step
                 if seam is None:
                     self.write_line("step_start", step=step, kind=kind, **fields)
                 else:
@@ -337,7 +342,7 @@ class AgentRun:
                         res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
                     res = runner.with_spent(res, [dropped])
         if s and res.session.id:
-            self.sessions[s.step] = res.session
+            self.sessions[config.INHERITS.get(s.step, s.step)] = res.session
         self.cost += res.cost_usd
         self.paid += res.paid_usd
         usage = {"runner": res.runner or which, "model": res.model or model, "effort": res.effort or effort, "tier": tier,
@@ -346,6 +351,8 @@ class AgentRun:
                  "kind": kind, "cost_usd": round(self.cost - spent, 6), "tokens_in": res.tokens_in,
                  "tokens_out": res.tokens_out, "turns": res.turns, "cache_read": res.cache_read,
                  "cache_write": res.cache_write, "api_seconds": round(res.api_seconds, 2)}
+        if s:
+            usage["atom"] = s.step
         if seam is not None:
             seam.add(error="" if res.ok else res.error or "", **usage)
         else:
@@ -942,9 +949,9 @@ class Build(TicketWork):
     plan_text: str = ""
     build_summary: str = ""
 
-    def resume(self, step: str, text: str, **kw) -> Result:
+    def resume(self, step: str, text: str, role: str = "build", **kw) -> Result:
         saved = self.run.sessions.get("build", NO_SESSION)
-        settings = self.run.settings("build")
+        settings = self.run.settings(role)
 
         def switched(which: str) -> str:
             plan = self.run.dir / "plan.md"
@@ -958,11 +965,14 @@ class Build(TicketWork):
                        "Keep the current task's tool restrictions and never write git metadata or secret files.")
             return f"{context}\n\n## Current feedback\n\n{text}"
 
-        if saved.id and settings.session == "resume":
+        if saved.id and saved.runner != settings.runner and settings.explicit_route:
+            kw["resume"] = NO_SESSION
+            text = switched(settings.runner)
+        elif saved.id and settings.session == "resume":
             kw["fresh_prompt"] = switched
         elif saved.id and saved.runner != settings.runner:
             text = switched(settings.runner)
-        return self.run.agent(step, text, self.ws, role="build", allowed_tools=self.tools,
+        return self.run.agent(step, text, self.ws, role=role, allowed_tools=self.tools,
                               disallowed_tools=runner.NO_GIT_WRITES, **kw)
 
     def check(self) -> bool:
@@ -1103,11 +1113,14 @@ def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Scri
         layer = config.load_layer(repo.layer_dir)
     except (ValueError, TypeError, OSError):
         layer = None
-    for role, table in script.overrides.items():
-        try:
-            steps.resolve(cfg, layer, role, "", table)
-        except ValueError as e:
-            return f"--set: {e}"
+    for role in config.STEP_ROLES:
+        inherited = script.overrides.get(config.INHERITS.get(role, ""), {})
+        own = script.overrides.get(role, {})
+        if own or inherited:
+            try:
+                steps.resolve(cfg, layer, role, "", own, inherited)
+            except ValueError as e:
+                return f"--set: {e}"
     return ""
 
 
@@ -1508,13 +1521,13 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
               left_for_a_person=left_for_a_person, check_commands=runs_checks,
               plan_text=plan_text, build_summary=build_summary)
 
-    attempts, tries = 1, run.settings("build").tries
+    attempts, tries = 1, run.settings("check_repair").tries
     ok = b.check()
     while not ok and attempts < tries:
         run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(b.report, 2500)}")
         attempts += 1
         b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=tries, failures=b.report,
-                                          checks=runs_checks))
+                                          checks=runs_checks), role="check_repair")
         ok = b.check()
     run.save("checks.md", b.report)
     record.note(run.id, attempts=attempts)
@@ -1532,7 +1545,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     while review.get("verdict") == "request_changes" and n < reviews:
         if problems := review_findings(review):
             run.story.append(f"Review requested changes:\n{problems}")
-            b.resume(round_name("review_fix", n), prompt("review_fix", problems=problems))
+            b.resume(round_name("review_fix", n), prompt("review_fix", problems=problems), role="review_repair")
             b.recheck("the review fixes")
             verified = verify_in_use(b, goal, build_summary)
         n += 1
@@ -1793,7 +1806,7 @@ CiFix = Callable[[str, str, str], Result]
 
 def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_prs: list[Checkout],
              draft_why: str, fix: CiFix | None = None) -> str:
-    run, max_rounds = b.run, b.run.settings("build").tries
+    run, max_rounds = b.run, b.run.settings("ci_repair").tries
     stopped_before = [c for c in pushed if stopped_by_ci(run, c)]
     rounds: list[ci.Round] = []
     try:
@@ -2070,7 +2083,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     name = b.next_step("ci_fix")
     text = prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=b.check_commands,
                   merged_base=merged_base, left_for_a_person=left)
-    res = fix(name, text, failures) if fix else b.resume(name, text, json_schema=CI_FIX_SCHEMA)
+    res = fix(name, text, failures) if fix else b.resume(name, text, role="ci_repair", json_schema=CI_FIX_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         for r in reds:
             r.reason = "The CI fix step failed before it judged this check."
@@ -2226,7 +2239,8 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         if attempt == tries:
             break
         b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=tries,
-                                                   failures=verified.markdown(), checks=b.check_commands))
+                                                   failures=verified.markdown(), checks=b.check_commands),
+                 role="check_repair")
         b.recheck("fixing what the check in use found")
     b.run.story.append("Still failing in use after the last attempt.")
     _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, b.expertise, apply=False)
@@ -2239,7 +2253,7 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
                        diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT))
 
 
-def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> verify.Verified:
+def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:
     run, t = b.run, b.ticket
     step = b.next_step(step_name)
     evidence = run.dir / "evidence"
@@ -2278,7 +2292,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
                                          surface=surface_note(v, url, evidence), notes=v.notes,
                                          scratch=scratch.note(attempt),
                                          commands=code_list(bash), checks=check_list(b.layer), **values),
-                            b.ws, role="verify",
+                            b.ws, role=role,
                             allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=verify.mcp_config(evidence) if url else "",

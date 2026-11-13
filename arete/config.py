@@ -13,10 +13,13 @@ MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "ap
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
                    "research": "opus", "research_plan": "opus", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
-STEP_NAMES = (*MODEL_ROLES, *STEP_ALIASES)
+INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify"}
+STEP_ROLES = (*MODEL_ROLES, *INHERITS)
+STEP_NAMES = (*STEP_ROLES, *STEP_ALIASES)
 STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
-             "session", "modalities", "min_context", "structured_output", "data_handling", "floor")
+             "session", "modalities", "min_context", "structured_output", "data_handling", "floor", "budget_usd")
 STEP_COUNTS = ("timeout_minutes", "tries", "min_context")
+STEP_AMOUNTS = ("budget_usd",)
 STEP_LISTS = ("tools", "mcp", "instructions", "modalities", "data_handling")
 CAPABILITY_KEYS = ("modalities", "context", "structured_output", "data_handling")
 INSTRUCTIONS = ("user", "repo")
@@ -231,6 +234,9 @@ def step_table(table, where: str) -> dict:
     for key in STEP_COUNTS:
         if key in table and (type(table[key]) is not int or table[key] < 1):
             raise ValueError(f"[{where}]: {key} must be a whole number of at least 1, not {table[key]!r}")
+    for key in STEP_AMOUNTS:
+        if key in table and (type(table[key]) not in (int, float) or not table[key] > 0):
+            raise ValueError(f"[{where}]: {key} must be a number of dollars above 0, not {table[key]!r}")
     for key in STEP_LISTS:
         if key in table and not (isinstance(table[key], list | tuple) and all(isinstance(v, str) for v in table[key])):
             raise ValueError(f"[{where}]: {key} must be a list of names, not {table[key]!r}")
@@ -240,7 +246,8 @@ def step_table(table, where: str) -> dict:
         raise ValueError(f"[{where}]: session {table['session']!r} is not one of {', '.join(SESSIONS)}")
     if "structured_output" in table and type(table["structured_output"]) is not bool:
         raise ValueError(f"[{where}]: structured_output must be true or false, not {table['structured_output']!r}")
-    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else v if k in STEP_COUNTS or type(v) is bool else str(v)
+    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else float(v) if k in STEP_AMOUNTS
+            else v if k in STEP_COUNTS or type(v) is bool else str(v)
             for k, v in table.items()}
 
 
