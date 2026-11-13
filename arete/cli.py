@@ -90,7 +90,7 @@ def cmd_status(args) -> int:
     snap = board.snapshot(recent_runs=args.limit)
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
-    print("models:" + "".join(f"\n  {role:<13} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
+    print("models:" + "".join(f"\n  {role:<15} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
     show(snap["checks"], "the heartbeat", print_checks)
@@ -523,8 +523,15 @@ def cmd_triage(args) -> int:
 
 
 def cmd_research(args) -> int:
-    from . import research
+    from . import research, research_search
 
+    if args.ref and args.evidence:
+        found = research_search.shown(args.ref)
+        if found is None:
+            print(f"no search evidence for {args.ref}", file=sys.stderr)
+            return 1
+        print(found)
+        return 0
     if args.next or (args.dry_run and not args.ref):
         return research.next_due(dry_run=args.dry_run, asked=piped_events())
     if args.ref and args.run:
@@ -917,7 +924,7 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import routing, runner, steps
+    from . import research_search, routing, runner, steps
 
     where = ""
     try:
@@ -934,6 +941,8 @@ def cmd_steps(args) -> int:
     found = None if cfg.replay.all else routing.Discovery(cfg, repo)
     for s in sheet:
         notes = list(s.notes)
+        if s.step in steps.SEARCHES and (why := research_search.unavailable(s)):
+            notes.append(why)
         if s.runner == "pi" and not cfg.replay.all:
             selected = runner.pi_route(s.model, cfg, repo)
             if selected.login_refused:
@@ -1396,6 +1405,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("research", help="the reports arete writes for research tickets on the triage board")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="print one ticket's report")
+    p.add_argument("--evidence", action="store_true", help="with REF: print the sources its search workers found")
     p.add_argument("--run", action="store_true", help="with REF: research it now")
     p.add_argument("--force", action="store_true", help="with --run: skip the JEV injection screen")
     p.add_argument("--next", action="store_true", help="research the next ticket due; what the research loop runs")

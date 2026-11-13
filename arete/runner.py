@@ -44,6 +44,8 @@ CODEX_NAMES = ("gpt-", "codex-")
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
 SECRET_SEARCH_DEPTH = 4
 BUDGET_FLOOR_USD = 0.005
+WEB_TOOLS = ("WebSearch", "WebFetch")
+WEB_TOOLS_OF = {"claude": WEB_TOOLS}
 EDIT_TOOLS = [*READ_TOOLS, "Edit", "Write"]
 BUILD_TOOLS = [*EDIT_TOOLS, "TodoWrite"]
 WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write"})
@@ -79,6 +81,10 @@ def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
 def stands_for(model: str, run_with: str) -> tuple[str, str]:
     which, name = route(model, "" if run_with == REPLAY else run_with)
     return (which if which != REPLAY else route(name)[0]), name
+
+
+def web_tools(model: str, run_with: str) -> tuple[str, ...]:
+    return WEB_TOOLS_OF.get(stands_for(model, run_with)[0], ())
 
 
 def run_env(run_id: str) -> dict[str, str]:
