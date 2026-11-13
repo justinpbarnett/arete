@@ -302,8 +302,8 @@ def cmd_guard(args) -> int:
 
 def scratch_hook(p) -> None:
     p.add_argument("--scratch", default="", help="the verification attempt's scratch folder, set by arete")
-    p.add_argument("--scratch-id", default="", help="device:inode:ignore-file inode of that folder, set by arete")
-    p.add_argument("--scratch-saves", default="", help="where to save copies before a command, set by arete")
+    p.add_argument("--scratch-id", default="", help="selector for protected harness authority; never proves ownership")
+    p.add_argument("--scratch-saves", default="", help="must match the authenticated evidence destination")
 
 
 def cmd_codex_guard(args) -> int:

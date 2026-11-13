@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
 
-from . import accounts, claude, config, devices, environment, paths, state, util
+from . import accounts, claude, config, devices, environment, paths, scratch, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -558,20 +558,48 @@ def guard_env(auth_paths: list[Path] | None = None, secret_paths: tuple[Path, ..
 
 
 def can_confine(remote: bool) -> bool:
-    return not remote and sys.platform == "darwin" and bool(shutil.which("sandbox-exec"))
+    return not remote and sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK)
 
 
-def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None) -> list[str]:
-    roots = [cwd, *add_dirs, AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR]
+def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
+                      *, hidden: tuple[Path, ...] = (), restrict_writes: bool = True,
+                      agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False) -> list[str]:
+    roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
     allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
-    profile = f'(version 1)(allow default)(deny file-write* (subpath "/"))(allow file-write* {allow})'
+    profile = '(version 1)(allow default)'
+    if restrict_writes:
+        profile += f'(deny file-write* (subpath "/"))(allow file-write* {allow})'
     if auth_path is not None:
         profile += '(allow file-write* (literal (param "AUTH")) (literal (param "LOCK")))'
     params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={Path(root).resolve()}")]
     if auth_path is not None:
         params += ["-D", f"AUTH={auth_path.resolve()}", "-D", f"LOCK={auth_path.resolve()}.lock"]
-    return ["sandbox-exec", *params, "-p", profile]
+    for i, path in enumerate(hidden):
+        params += ["-D", f"H{i}={path.resolve()}"]
+        profile += f'(deny file-read* file-write* (subpath (param "H{i}")))'
+    if peers:
+        params += ["-D", f"PEERS={peers.resolve()}", "-D", f"WORK={cwd.resolve()}"]
+        profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
+                    '(require-not (subpath (param "WORK")))))')
+    if secrets_denied:
+        from . import guard
+
+        def pattern(names, descendants=False):
+            return "(^|/)(" + "|".join(re.escape(n).replace(r"\*", "[^/]*") for n in names) + (
+                ")($|/)" if descendants else ")$")
+
+        params += ["-D", "NAMES=" + pattern(guard.SECRET_NAMES), "-D", "SAFE=" + pattern(guard.SAFE_NAMES),
+                   "-D", "DIRS=" + pattern(guard.SECRET_DIRS, True)]
+        profile += ('(deny file-read* file-write* (require-all (regex (param "NAMES")) '
+                    '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
+    params += ["-D", f"ENGINE={paths.PACKAGE_DIR.resolve()}", "-D", f"RUNTIME={Path(sys.prefix).resolve()}"]
+    profile += '(deny file-write* (subpath (param "ENGINE")) (subpath (param "RUNTIME")))'
+    ancestors = {p for root in (*hidden, paths.PACKAGE_DIR, Path(sys.prefix)) for p in Path(root).resolve().parents}
+    for i, path in enumerate(sorted(ancestors)):
+        params += ["-D", f"A{i}={path}"]
+        profile += f'(deny file-write* (literal (param "A{i}")))'
+    return ["/usr/bin/sandbox-exec", *params, "-p", profile]
 
 
 def sessions_dir(remote: devices.Device | None) -> str:
@@ -930,8 +958,8 @@ def mcp_servers(mcp_config: str) -> dict:
 def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budget_usd: float | None,
            cost_of: Callable[[str], float],
            on_line: Callable[[str], None], *, pass_fds: tuple[int, ...] = ()) -> tuple[subprocess.CompletedProcess, str]:
-    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, errors="replace", env=env, pass_fds=pass_fds)
+    proc = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, errors="replace", env=env, pass_fds=pass_fds)
     stderr: list[str] = []
     reader = threading.Thread(target=lambda: stderr.append(proc.stderr.read()), daemon=True)
     reader.start()
@@ -955,6 +983,10 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        if scratch.PRODUCING.get() is not None:
+            from . import verify
+
+            verify.stop(proc)
     reader.join(5)
     done = subprocess.CompletedProcess(cmd, proc.returncode, "".join(lines), "".join(stderr))
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")

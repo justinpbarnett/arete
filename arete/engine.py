@@ -7,7 +7,6 @@ import re
 import shlex
 import signal
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -193,10 +192,12 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
                 stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
     local = not device.remote
     if argv and argv[0] == "arete" and local:
-        argv = [sys.executable, "-m", "arete.cli", *argv[1:]]
+        argv = control.command(argv[1:])
     full = devices.wrap(device, argv, cwd, env)
     deadline = time.monotonic() + timeout
-    proc = subprocess.Popen(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    from . import scratch
+
+    proc = scratch.spawn(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, errors="replace", env={**os.environ, **env} if local else None,
                             **util.own_group_args())
     threading.Thread(target=feed_stdin, args=(proc, stdin), daemon=True).start()

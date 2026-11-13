@@ -12,7 +12,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from . import accounts, background, config, devices, environment, paths, util
+from . import accounts, background, config, devices, environment, paths, scratch, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -261,9 +261,9 @@ def failure_reason(data: dict) -> str:
 
 
 def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str], timeout: float,
-                  on_line: Callable[[str], None]) -> subprocess.CompletedProcess:
-    child = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, errors="replace", env=env)
+                  on_line: Callable[[str], None], *, actor_confined: bool = False) -> subprocess.CompletedProcess:
+    child = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, errors="replace", env=env, actor_confined=actor_confined)
     out: list[str] = []
     err: list[str] = []
     helpers = [threading.Thread(target=feed, args=(child.stdin, prompt), daemon=True),
@@ -277,6 +277,10 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
         stop(child)
         raise
     finally:
+        if scratch.PRODUCING.get() is not None:
+            from . import verify
+
+            verify.stop(child)
         for helper in helpers:
             helper.join(DRAIN_SECONDS)
     return subprocess.CompletedProcess(cmd, child.returncode, "".join(out), "".join(err))

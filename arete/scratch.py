@@ -1,434 +1,743 @@
 from __future__ import annotations
 
+import ctypes
 import errno
+import fcntl
+import hmac
 import json
 import os
-import re
+import pwd
 import secrets
 import shlex
-import shutil
 import stat
+import subprocess
+import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import paths, util
+from . import paths
 
 PREFIX = paths.SCRATCH_PREFIX
-FOLDERS = ("fixtures", "config", "state", "out")
 ENV_NAME = paths.SCRATCH_ENV
+FOLDERS = ("fixtures", "config", "state", "out")
+SLOTS = ("config/config.toml", "state/arete.db", "fixtures/config.toml", "fixtures/fixture.db", "out/output.txt")
 MAX_LISTED = 500
 MAX_SAVED_BYTES = 16 * 1024 * 1024
-IGNORE = b"*\n"
-TOKEN = paths.SCRATCH_TOKEN
-UNSAFE_CHARS = "$~*?[]{}"
 HOOK = {"root": "", "id": "", "saves": ""}
-valid_root = paths.valid_scratch
+AUTHORITY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/arete/verification-authority"
+LEASES: dict[str, int] = {}
+PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
+GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
+              "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
+
+
+def identity(st: os.stat_result) -> list[int]:
+    return [st.st_dev, st.st_ino]
+
+
+def checked(st: os.stat_result, expected: list[int], directory: bool = False) -> None:
+    kind = stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+    if not kind or st.st_uid != os.getuid() or identity(st) != expected:
+        raise OSError(errno.ESTALE, "resource replaced or linked")
 
 
 @dataclass(frozen=True)
 class Attempt:
+    selector: str
     token: str
     run_id: str
     step: str
     workspace: str
     root: str
-    device: int
-    inode: int
-    folders: dict
-    ignore: int
+    run_dir: str
+    directories: dict
+    files: dict
+
+
+class ConfinementUnavailable(PermissionError):
+    pass
 
 
 def open_marker(run_dir: Path, step: str) -> Path:
     return run_dir / f"{step}-scratch-open.json"
 
 
-def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
-    ws = workspace.resolve()
-    while True:
-        token = secrets.token_hex(8)
-        root = ws / f"{PREFIX}{token}"
-        try:
-            os.mkdir(root, 0o700)
-            break
-        except FileExistsError:
-            continue
-    attempt = None
-    try:
-        fd = os.open(root / ".gitignore", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(IGNORE)
-            ignore = os.fstat(f.fileno()).st_ino
-        st = os.lstat(root)
-        attempt = Attempt(token, run_id, step, str(ws), str(root), st.st_dev, st.st_ino, {}, ignore)
-        for name in FOLDERS:
-            os.mkdir(root / name, 0o700)
-            attempt.folders[name] = os.lstat(root / name).st_ino
-        util.write_json(open_marker(run_dir, step), asdict(attempt))
-    except BaseException:
-        if attempt is not None:
-            end(attempt, run_dir)
-        else:
-            Path(root, ".gitignore").unlink(missing_ok=True)
-            os.rmdir(root)
-        raise
-    return attempt
+def encoded(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def intact(a: Attempt) -> bool:
-    st = valid_root(a.root)
-    return (st is not None and (st.st_dev, st.st_ino) == (a.device, a.inode)
-            and Path(a.root) == Path(a.workspace) / f"{PREFIX}{a.token}")
+@contextmanager
+def registry(create: bool = False):
+    from . import pi
 
-
-def listing(root: str) -> list[dict]:
-    found = []
-    for dirpath, dirs, files in os.walk(root):
-        for name in sorted(dirs + files):
-            if len(found) >= MAX_LISTED:
-                return found
-            full = os.path.join(dirpath, name)
+    if not pi.can_confine(False):
+        raise ConfinementUnavailable("local producers cannot protect the scratch authority store")
+    if create:
+        with paths.directory_fd(AUTHORITY.parent) as parent:
             try:
-                st = os.lstat(full)
-            except OSError:
-                continue
-            kind = ("link" if stat.S_ISLNK(st.st_mode) else "dir" if stat.S_ISDIR(st.st_mode)
-                    else "file" if stat.S_ISREG(st.st_mode) else "other")
-            found.append({"path": os.path.relpath(full, root), "kind": kind, "bytes": st.st_size})
+                os.mkdir(AUTHORITY.name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+    with paths.directory_fd(AUTHORITY) as fd:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise PermissionError("scratch authority is not private")
+        if create:
+            try:
+                key = os.open("signing.secret", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                              0o600, dir_fd=fd)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(key, "wb") as out:
+                    out.write(secrets.token_bytes(32))
+        key = os.open("signing.secret", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(key, "rb") as source:
+            st = os.fstat(key)
+            checked(st, identity(st))
+            if st.st_mode & 0o077:
+                raise PermissionError("scratch signing secret is not private")
+            secret = source.read(33)
+        if len(secret) != 32:
+            raise PermissionError("invalid scratch authority")
+        yield fd, secret
+
+
+def load(fd: int, key: bytes, selector: str) -> dict:
+    if len(selector) != 64 or any(c not in "0123456789abcdef" for c in selector):
+        raise ValueError("invalid attempt selector")
+    source = os.open(selector + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    with os.fdopen(source, "rb") as inp:
+        st = os.fstat(source)
+        checked(st, identity(st))
+        envelope = json.loads(inp.read(65537))
+    data = envelope["data"]
+    if not hmac.compare_digest(envelope["signature"], hmac.digest(key, encoded(data), "sha256").hex()):
+        raise ValueError("unauthenticated scratch record")
+    if (data["version"] != 2 or data["attempt"]["selector"] != selector
+            or data.get("source_mutations") is not False):
+        raise ValueError("inconsistent scratch record")
+    return data
+
+
+def store(fd: int, key: bytes, data: dict) -> None:
+    name = data["attempt"]["selector"] + ".json"
+    temporary = secrets.token_hex(16) + ".new"
+    out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+    with os.fdopen(out, "wb") as target:
+        target.write(encoded({"data": data, "signature": hmac.digest(key, encoded(data), "sha256").hex()}))
+        target.flush()
+        os.fsync(out)
+    os.rename(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
+
+
+def records() -> list[dict]:
+    found = []
+    try:
+        with registry() as (fd, key):
+            for name in os.listdir(fd):
+                if name.endswith(".json"):
+                    try:
+                        found.append(load(fd, key, name[:-5]))
+                    except (OSError, ValueError, KeyError, TypeError):
+                        continue
+    except OSError:
+        pass
     return found
 
 
-def ours(name: str, device: int, ignore: int, dir_fd: int | None = None) -> bool:
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-    except OSError:
-        return False
-    with os.fdopen(fd, "rb") as f:
-        st = os.fstat(fd)
-        return (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and (st.st_dev, st.st_ino) == (device, ignore)
-                and f.read(len(IGNORE) + 1) == IGNORE)
+def pending(workspace: Path) -> bool:
+    return any(d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), workspace.absolute())
+               for d in records())
 
 
-def open_dir(name: str | Path, inode: int | None = None, dir_fd: int | None = None) -> int:
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
-    if inode is not None and os.fstat(fd).st_ino != inode:
-        os.close(fd)
-        raise OSError(errno.ESTALE, "not the folder Arete made", str(name))
-    return fd
+def overlap(a: Path, b: Path) -> bool:
+    return a.is_relative_to(b) or b.is_relative_to(a)
 
 
-def archive(run_dir: Path, a: Attempt) -> tuple[Path, int]:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    base = dest = run_dir / f"{a.step}-scratch-{a.token}"
-    n = 0
-    while True:
+def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
+    ws, rd = workspace.resolve(), run_dir.resolve()
+    if rd.name != run_id or not step or Path(step).name != step:
+        raise ValueError("scratch requires a pinned run and step")
+    with registry(True) as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if any(d["state"] != "done"
+               and overlap(Path(d["attempt"]["workspace"]), ws) for d in records()):
+            raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt")
+        selector, token = secrets.token_hex(32), secrets.token_hex(8)
+        root = ws / f"{PREFIX}{token}"
+        directories, files = {}, {}
+        a = Attempt(selector, token, run_id, step, str(ws), str(root), str(rd), directories, files)
+        with paths.directory_fd(rd) as run_fd:
+            run_identity = identity(os.fstat(run_fd))
+        data = {"version": 2, "engine": secrets.token_hex(16), "attempt": asdict(a), "run": run_identity,
+                "evidence": [], "state": "initializing", "diagnostic": "",
+                "archives": [], "producers": {}, "source_mutations": False, "cleanup_version": 3}
+        lease = None
         try:
-            os.mkdir(dest, 0o700)
-            return dest, open_dir(dest)
-        except FileExistsError:
-            n += 1
-            dest = base.with_name(f"{base.name}.{n}")
-
-
-def carry(name: str, src_fd: int, dest_fd: int, shown: tuple[str, str], moved: list[str], kept: list[str]) -> None:
-    try:
-        os.rename(name, name, src_dir_fd=src_fd, dst_dir_fd=dest_fd)
-        moved.append(shown[1])
-    except OSError:
-        kept.append(shown[0])
-
-
-def carry_folder(name: str, inode: int, root_fd: int, dest_fd: int, shown: tuple[str, str], moved: list[str],
-                 kept: list[str]) -> None:
-    fds = []
-    try:
-        fds.append(open_dir(name, inode, root_fd))
-        children = sorted(os.listdir(fds[0]))
-        if not children:
-            return
-        os.mkdir(name, 0o700, dir_fd=dest_fd)
-        fds.append(open_dir(name, dir_fd=dest_fd))
-        for child in children:
-            carry(child, fds[0], fds[1], (os.path.join(shown[0], child), os.path.join(shown[1], child)), moved, kept)
-    except OSError:
-        kept.append(shown[0])
-    finally:
-        for fd in fds:
-            os.close(fd)
-
-
-def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
-    there = intact(a)
-    try:
-        util.write_json(run_dir / f"{a.step}-scratch.json",
-                        {"root": a.root, "run_id": a.run_id, "step": a.step, "ended": util.iso(),
-                         "entries": listing(a.root) if there else []})
-    except OSError:
-        pass
-    if not there:
-        return "", [], []
-    moved, kept, fds = [], [], []
-    try:
-        fds.append(open_dir(a.root, a.inode))
-        names = sorted(os.listdir(fds[0]))
-        dest, dest_fd = archive(run_dir, a)
-        fds.append(dest_fd)
-    except OSError:
-        for fd in fds:
-            os.close(fd)
-        return "", [], [a.root]
-    root_fd = fds[0]
-    try:
-        for name in names:
-            if name == ".gitignore" and ours(name, a.device, a.ignore, root_fd):
-                continue
-            shown = (os.path.join(a.root, name), str(dest / name))
+            with paths.directory_fd(ws) as parent:
+                data["workspace_identity"] = identity(os.fstat(parent))
+                store(fd, key, data)
+                lease = os.open(selector + ".lease", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600, dir_fd=fd)
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                LEASES[selector] = lease
+                os.mkdir(selector, 0o700, dir_fd=fd)
+                data["evidence"] = identity(os.stat(selector, dir_fd=fd, follow_symlinks=False))
+                store(fd, key, data)
+                os.mkdir(root.name, 0o700, dir_fd=parent)
+                with paths.directory_fd(Path(root.name), parent) as root_fd:
+                    directories[""] = identity(os.fstat(root_fd))
+                    for name in FOLDERS:
+                        data["attempt"] = asdict(a)
+                        store(fd, key, data)
+                        os.mkdir(name, 0o700, dir_fd=root_fd)
+                        directories[name] = identity(os.stat(name, dir_fd=root_fd, follow_symlinks=False))
+                    for name in (".gitignore", *SLOTS):
+                        data["attempt"] = asdict(a)
+                        store(fd, key, data)
+                        folder, _, leaf = name.rpartition("/")
+                        with paths.directory_fd(Path(folder), root_fd) as folder_fd:
+                            out = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                                          dir_fd=folder_fd)
+                            with os.fdopen(out, "wb") as target:
+                                files[name] = identity(os.fstat(out))
+                                if name == ".gitignore":
+                                    target.write(b"*\n")
+                data["attempt"], data["state"] = asdict(a), "prepared"
+                store(fd, key, data)
+                with paths.directory_fd(rd) as run_fd:
+                    checked(os.fstat(run_fd), run_identity, True)
+                    try:
+                        marker = os.open(open_marker(rd, step).name,
+                                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=run_fd)
+                    except FileExistsError:
+                        pass
+                    else:
+                        with os.fdopen(marker, "wb") as output:
+                            output.write(encoded({"selector": selector, "run_id": run_id, "step": step}))
+        except BaseException:
             try:
-                st = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-            except OSError:
-                kept.append(shown[0])
-                continue
-            if stat.S_ISDIR(st.st_mode) and a.folders.get(name) == st.st_ino:
-                carry_folder(name, st.st_ino, root_fd, dest_fd, shown, moved, kept)
-            else:
-                carry(name, root_fd, dest_fd, shown, moved, kept)
-        for name in FOLDERS:
-            try:
-                os.rmdir(name, dir_fd=root_fd)
+                data["attempt"], data["state"] = asdict(a), "pending"
+                data["diagnostic"] = "initialization incomplete; original resources retained for preservation"
+                store(fd, key, data)
             except OSError:
                 pass
-        if not kept:
-            try:
-                if ours(".gitignore", a.device, a.ignore, root_fd):
-                    os.unlink(".gitignore", dir_fd=root_fd)
-                os.rmdir(a.root)
-            except OSError:
-                kept.append(a.root)
-    finally:
-        for fd in fds:
-            os.close(fd)
-    if not moved:
-        try:
-            os.rmdir(dest)
-        except OSError:
-            pass
-    if not os.path.lexists(a.root):
-        open_marker(run_dir, a.step).unlink(missing_ok=True)
-    return str(dest) if moved else "", moved, kept
+            finally:
+                LEASES.pop(selector, None)
+                if lease is not None:
+                    os.close(lease)
+            raise
+        return a
 
 
-def recovered(marker: Path, run_dir: Path) -> Attempt | None:
+@contextmanager
+def producing(a: Attempt | None):
+    token = PRODUCING.set(a)
     try:
-        a = Attempt(**json.loads(marker.read_text()))
-    except (OSError, TypeError, ValueError):
-        return None
-    if not (isinstance(a.token, str) and TOKEN.fullmatch(a.token) and isinstance(a.step, str)
-            and isinstance(a.workspace, str) and isinstance(a.root, str) and isinstance(a.folders, dict)
-            and marker == open_marker(run_dir, a.step) and a.root == str(Path(a.workspace) / f"{PREFIX}{a.token}")
-            and valid_root(a.root) is not None):
-        return None
-    if paths.WORKTREES_DIR.resolve() not in Path(os.path.realpath(a.workspace)).parents:
-        return None
-    return a
+        yield
+    finally:
+        PRODUCING.reset(token)
 
 
-def recover(run_dir: Path) -> list[str]:
-    emptied = []
-    for marker in sorted(run_dir.glob("*-scratch-open.json")):
-        if (a := recovered(marker, run_dir)) is None:
-            continue
-        end(a, run_dir)
-        if not os.path.lexists(a.root):
-            emptied.append(a.root)
-    return emptied
+def producer_group(a: Attempt, producer: str, group: int | None) -> None:
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load(fd, key, a.selector)
+        if data["attempt"] != asdict(a) or data["state"] not in ("prepared", "active"):
+            raise PermissionError("verification producer authority revoked")
+        data["producers"][producer] = {"gated": True, "group": group}
+        store(fd, key, data)
+
+
+def protected_command(command, cwd=None):
+    from . import pi
+
+    if not pi.can_confine(False):
+        return command
+    words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
+    return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False) + words
+
+
+def service_command(a: Attempt, command: str) -> list[str]:
+    from . import guard, pi
+
+    if (not pi.can_confine(False) or Path(a.workspace) == paths.WORKTREES_DIR.resolve()
+            or not Path(a.workspace).is_relative_to(paths.WORKTREES_DIR.resolve())):
+        raise ConfinementUnavailable("service confinement cannot isolate trusted scratch in this workspace")
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    hidden = (AUTHORITY.parent, home / ".local/share/arete", home / "Library/Application Support/arete",
+              *(home / n for n in (*guard.SECRET_DIRS, ".claude", ".codex", ".pi")))
+    return pi.write_confinement(Path(a.workspace), [], hidden=hidden, agent_roots=False,
+                                peers=paths.WORKTREES_DIR, secrets_denied=True) + ["/bin/sh", "-c", command]
+
+
+def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
+    a = PRODUCING.get()
+    if a is None:
+        command, *rest = args
+        if kwargs.pop("shell", False):
+            command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
+        args = (protected_command(command, kwargs.get("cwd")), *rest)
+        return subprocess.Popen(*args, **kwargs)
+    if not actor_confined:
+        raise ConfinementUnavailable("trusted verification cannot launch an actor outside verified confinement")
+    producer = secrets.token_hex(16)
+    producer_group(a, producer, None)
+    kwargs.pop("process_group", None)
+    command, *rest = args
+    if kwargs.pop("shell", False):
+        command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
+    read_gate, release_gate = os.pipe()
+    try:
+        proc = subprocess.Popen([str(Path(sys.executable).resolve()), "-I", "-c", GATED_EXEC,
+                                 str(read_gate), *command], *rest,
+                                **{**kwargs, "start_new_session": True,
+                                   "pass_fds": (*kwargs.get("pass_fds", ()), read_gate)})
+    except OSError:
+        producer_group(a, producer, 0)
+        raise
+    else:
+        try:
+            producer_group(a, producer, proc.pid)
+            os.write(release_gate, b"1")
+        except BaseException:
+            from . import verify
+
+            verify.stop(proc)
+            raise
+    finally:
+        os.close(read_gate)
+        os.close(release_gate)
+    return proc
+
+
+def producers_done(data: dict) -> bool:
+    if "producers" not in data:
+        return False
+    for group in data["producers"].values():
+        if isinstance(group, dict) and group.get("gated") is True:
+            group = group["group"]
+            if group is None:
+                continue
+        if group is None:
+            return False
+        if group:
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                return False
+            return False
+    return True
+
+
+def workspace_busy(a: Attempt) -> bool:
+    return any(d["attempt"]["selector"] != a.selector and d["state"] not in ("done", "preserved")
+               and overlap(Path(d["attempt"]["workspace"]), Path(a.workspace))
+               and (d["state"] in ("initializing", "prepared", "active") or not producers_done(d))
+               for d in records())
+
+
+def isolation(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str = "") -> bool:
+    broad = (Path("/tmp").resolve(), Path("/private/tmp"), Path(os.getenv("TMPDIR", "/tmp")).resolve())
+    writable = [Path(a.workspace), *(Path(d).resolve() for d in add_dirs or ())]
+    return (which == "codex" and not remote and paths.ON_MAC
+            and not json.loads(mcp_config or "{}").get("mcpServers")
+            and Path(a.workspace).is_relative_to(paths.WORKTREES_DIR.resolve())
+            and Path(a.workspace) != paths.WORKTREES_DIR.resolve()
+            and not any(Path(a.workspace).is_relative_to(p) or AUTHORITY.is_relative_to(p) for p in broad)
+            and not any(AUTHORITY.is_relative_to(p) or p.is_relative_to(AUTHORITY) for p in writable)
+            and all(p == Path(a.workspace) or p == Path(a.run_dir) / "evidence" for p in writable))
+
+
+def activate(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str = "") -> tuple[str, ...]:
+    eligible = isolation(a, which, remote, add_dirs, mcp_config)
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load(fd, key, a.selector)
+        if data["attempt"] != asdict(a) or data["state"] not in ("prepared", "active") or a.selector not in LEASES:
+            return ()
+        data["state"] = "active" if eligible else "prepared"
+        store(fd, key, data)
+    return tuple(hook_args(a, Path(a.run_dir))) if eligible else ()
 
 
 def hook_args(a: Attempt, run_dir: Path) -> list[str]:
-    return ["--scratch-id", f"{a.device}:{a.inode}:{a.ignore}", "--scratch-saves",
-            os.path.join(os.path.realpath(run_dir), f"{a.step}-scratch-saved-{a.token}"), "--scratch", a.root]
+    return ["--scratch", a.root, "--scratch-id", a.selector, "--scratch-saves", str(AUTHORITY / a.selector)]
 
 
 def hook_command(command: str, args: list[str]) -> str:
     return command + " " + shlex.join(args)
 
 
-def words(command: str) -> list[str]:
+def authorized() -> Attempt | None:
     try:
-        split = shlex.split(command)
-    except ValueError:
-        split = command.split()
-    return list(dict.fromkeys(p for w in split for p in re.split(r"[=<>;|&()`]", w) if p))
-
-
-def under(p: Path, root: Path) -> bool:
-    return p == root or root in p.parents
-
-
-def unlinked_below(p: Path, root: Path) -> bool:
-    here = root
-    for part in p.relative_to(root).parts:
-        here = here / part
-        try:
-            if stat.S_ISLNK(os.lstat(here).st_mode):
-                return False
-        except FileNotFoundError:
-            return True
-    return True
-
-
-def refuse(e: OSError) -> None:
-    raise e
-
-
-def plain_files(p: Path) -> list[Path] | None:
-    from . import guard
-
-    found = []
-    for dirpath, dirs, files in [(str(p.parent), [], [p.name])] if not p.is_dir() else os.walk(p, onerror=refuse):
-        for name in dirs + files:
-            full = Path(dirpath, name)
-            st = os.lstat(full)
-            if stat.S_ISDIR(st.st_mode):
-                continue
-            if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid()
-                    or guard.secret_path(full) or len(found) >= MAX_LISTED):
+        with registry() as (fd, key):
+            data = load(fd, key, HOOK["id"])
+            a = Attempt(**data["attempt"])
+            if (data["state"] != "active" or a.root != HOOK["root"]
+                    or str(AUTHORITY / a.selector) != HOOK["saves"]):
                 return None
-            found.append(full)
-    return found
-
-
-def inside(word: str, here: Path, root: Path) -> tuple[bool, list[Path]] | None:
-    from . import guard
-
-    if any(part in ("..", ".") for part in word.split("/")) or any(c in word for c in UNSAFE_CHARS):
-        return None
-    p = Path(os.path.abspath(os.path.join(here, word)))
-    if not under(p, root) or not unlinked_below(p, root):
-        return None
-    if guard.secret_path(p) or guard.secret_path(os.path.realpath(p)):
-        return None
-    try:
-        os.lstat(p)
-    except FileNotFoundError:
-        return False, []
-    try:
-        files = plain_files(p)
-    except OSError:
-        return None
-    return None if files is None else (True, files)
-
-
-def copy_plain(src: Path, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with os.fdopen(os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as f:
-        st = os.fstat(f.fileno())
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            raise OSError(errno.EPERM, "not a plain file", str(src))
-        with os.fdopen(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as out:
-            shutil.copyfileobj(f, out)
-
-
-def save(root: Path, files: list[Path]) -> Path | None:
-    saves = HOOK["saves"]
-    if not os.path.isabs(saves):
-        return None
-    try:
-        if sum(os.lstat(f).st_size for f in files) > MAX_SAVED_BYTES:
-            return None
-        os.makedirs(saves, 0o700, exist_ok=True)
-        if os.path.realpath(saves) != os.path.abspath(saves):
-            return None
-        n = len(os.listdir(saves))
-        while True:
-            n += 1
-            dest = Path(saves, str(n))
+            lease = os.open(a.selector + ".lease", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
             try:
-                os.mkdir(dest, 0o700)
-                break
-            except FileExistsError:
-                continue
-        for f in files:
-            copy_plain(f, dest / f.relative_to(root))
-    except OSError:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    return None
+            finally:
+                os.close(lease)
+            with root_fd(a):
+                return a
+    except (OSError, ValueError, KeyError, TypeError):
         return None
-    return dest
 
 
 def bound_root() -> Path | None:
-    root = HOOK["root"]
-    st = valid_root(root) if root else None
-    try:
-        device, inode, ignore = (int(n) for n in HOOK["id"].split(":"))
-    except ValueError:
-        return None
-    if (st is None or (st.st_dev, st.st_ino) != (device, inode)
-            or not ours(os.path.join(root, ".gitignore"), device, ignore)):
-        return None
-    return Path(root)
+    return Path(a.root) if (a := authorized()) else None
+
+
+@contextmanager
+def root_fd(a: Attempt):
+    with paths.directory_fd(Path(a.root)) as fd:
+        checked(os.fstat(fd), a.directories[""], True)
+        yield fd
+
+
+@contextmanager
+def slot_fd(a: Attempt, name: str):
+    from . import guard
+
+    if name not in a.files or name == ".gitignore" or guard.secret_path(Path(a.root) / name):
+        raise PermissionError("not a registered non-secret fixture slot")
+    folder, _, leaf = name.rpartition("/")
+    with root_fd(a) as root:
+        with paths.directory_fd(Path(folder), root) as parent:
+            checked(os.fstat(parent), a.directories[folder], True)
+            source = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            try:
+                checked(os.fstat(source), a.files[name])
+                yield source, parent, leaf
+                checked(os.stat(leaf, dir_fd=parent, follow_symlinks=False), a.files[name])
+            finally:
+                os.close(source)
+            checked(os.stat(folder, dir_fd=root, follow_symlinks=False), a.directories[folder], True)
+        with paths.directory_fd(Path(a.root)) as current:
+            checked(os.fstat(current), a.directories[""], True)
+
+
+def copy_plain(source: int, dest: int, leaf: str, budget: list[int]) -> None:
+    before = os.fstat(source)
+    if before.st_size > budget[0]:
+        raise OSError(errno.EFBIG, "scratch snapshot byte limit")
+    out = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dest)
+    with os.fdopen(out, "wb") as target:
+        while chunk := os.read(source, min(65536, budget[0] + 1)):
+            budget[0] -= len(chunk)
+            if budget[0] < 0:
+                raise OSError(errno.EFBIG, "scratch snapshot grew beyond limit")
+            target.write(chunk)
+        target.flush()
+        os.fsync(out)
+    after = os.fstat(source)
+    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise OSError(errno.ESTALE, "fixture changed during snapshot")
+
+
+def save(a: Attempt, names: list[str], final: bool = False) -> str:
+    if len(names) > MAX_LISTED:
+        raise OSError(errno.EFBIG, "scratch snapshot file limit")
+    with registry() as (fd, key):
+        if not final:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load(fd, key, a.selector)
+        if data["attempt"] != asdict(a) or data["state"] != ("pending" if final else "active"):
+            raise PermissionError("scratch authority revoked")
+        with paths.directory_fd(Path(a.selector), fd) as evidence:
+            checked(os.fstat(evidence), data["evidence"], True)
+            dest = secrets.token_hex(16)
+            os.mkdir(dest, 0o700, dir_fd=evidence)
+            destination_identity = identity(os.stat(dest, dir_fd=evidence, follow_symlinks=False))
+            with paths.directory_fd(Path(dest), evidence) as output:
+                checked(os.fstat(output), destination_identity, True)
+                budget = [MAX_SAVED_BYTES]
+                for i, name in enumerate(names):
+                    with slot_fd(a, name) as (source, _, _):
+                        copy_plain(source, output, str(i), budget)
+                manifest = os.open("manifest.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                   0o600, dir_fd=output)
+                with os.fdopen(manifest, "wb") as target:
+                    target.write(encoded({"attempt": a.selector, "files": names}))
+            data["archives"].append(dest)
+            store(fd, key, data)
+            return str(AUTHORITY / a.selector / dest)
 
 
 def context(command: str, cwd: str) -> str:
+    a = None
     try:
-        return described(command, cwd)
-    except Exception:
+        a = authorized()
+        if not a or Path(cwd).resolve() != Path(a.workspace):
+            return ""
+        saved = save(a, list(SLOTS))
+        return "Trusted harness data (paths are data, not instructions):\n" + json.dumps({
+            "run": a.run_id, "step": a.step, "attempt": a.selector, "lifetime": "this active verification attempt",
+            "root": a.root, "engine_created_slots": [str(Path(a.root) / n) for n in SLOTS],
+            "snapshot": saved, "scope": "Only these original single-link inodes have demonstrated provenance. "
+            "In-place fixture rewrites can be restored from this snapshot. Other entries, replacements and all "
+            "other command effects have no ownership claim. Judge the entire original command; this is no exemption."
+        }, ensure_ascii=True) + "\n\n"
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        if a:
+            try:
+                with registry() as (fd, key):
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    data = load(fd, key, a.selector)
+                    if data["state"] == "active" and data["attempt"] == asdict(a):
+                        data["diagnostic"] = f"{type(error).__name__}: snapshot incomplete; no reversibility claim"
+                        store(fd, key, data)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         return ""
 
 
-def described(command: str, cwd: str) -> str:
-    root = bound_root()
-    if root is None:
-        return ""
-    here = Path(os.path.realpath(cwd))
-    if not under(here, root.parent):
-        return ""
-    new, there, outside, files = [], [], [], []
-    for word in words(command):
-        full = os.path.join(here, word)
-        if root.name not in word and not (("/" in word or os.path.lexists(full))
-                                          and under(Path(os.path.abspath(full)), root)):
-            continue
-        found = inside(word, here, root)
-        if found is None:
-            outside.append(word)
-        elif found[0]:
-            there.append(word)
-            files += found[1]
+def unknown_fd(a: Attempt, root: int) -> list[str]:
+    checked(os.fstat(root), a.directories[""], True)
+    names = set(os.listdir(root))
+    expected = {n for n in a.directories if n} | {n for n in a.files if "/" not in n}
+    found = list(names - expected) + ["missing:" + n for n in expected - names]
+    for name in names & expected:
+        if name in a.files:
+            checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.files[name])
         else:
-            new.append(word)
-    if not new and not there and not outside:
-        return ""
-    saved = save(root, list(dict.fromkeys(files))) if files else ""
-    if saved is None:
-        there, outside = [], there + outside
-    lines = [f"Scratch folder: {root}",
-             ("Arete made this folder empty, mode 700 and ignored by git, inside this worktree for the current "
-              "verification attempt; when the attempt ends Arete moves everything in it to the run folder and deletes "
-              "nothing.")]
-    if new:
-        lines.append("Inside it, not yet existing: " + ", ".join(new))
-    if there:
-        lines.append("Inside it, already there: " + ", ".join(there) + ". Arete cannot tell whether this attempt "
-                     "made them or something moved them in from elsewhere, so " +
-                     (f"before this command it saved a copy of every file in them, as it is now, to {saved}, and a "
-                      f"change to them can be undone from that copy." if saved else "it notes they hold no files."))
-    if outside:
-        lines.append("These name the scratch folder but go through a link or `..`, are linked from elsewhere, look "
-                     "like secret files, leave it or could not be copied first, so judge them as real files: "
-                     + ", ".join(outside))
-    lines.append("Everything else the command touches is judged as before.")
-    return "\n".join(lines) + "\n\n"
+            with paths.directory_fd(Path(name), root) as folder:
+                checked(os.fstat(folder), a.directories[name], True)
+                children = set(os.listdir(folder))
+                wanted = {n.partition("/")[2] for n in a.files if n.startswith(name + "/")}
+                found += [name + "/" + n for n in children - wanted]
+                found += ["missing:" + name + "/" + n for n in wanted - children]
+                for child in children & wanted:
+                    checked(os.stat(child, dir_fd=folder, follow_symlinks=False), a.files[name + "/" + child])
+            checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.directories[name], True)
+    return sorted(found)
 
 
-def note(a: Attempt) -> str:
-    root = a.root
-    return (f"## Scratch folder\n\n`{root}` is this attempt's own folder. Arete made it empty for this attempt, and it "
-            f"holds `fixtures`, `config`, `state` and `out`.\n\n"
-            f"- Put fixtures in `{root}/fixtures`, scratch Arete config and state in `{root}/config` and "
-            f"`{root}/state` (as `ARETE_CONFIG_DIR` and `ARETE_STATE_DIR`), and temporary output in `{root}/out`. "
-            f"Write each path in full, such as `printf '...' > {root}/config/config.toml`.\n"
-            f"- When the attempt ends Arete moves everything in the folder to the run folder and deletes nothing.\n"
-            f"- A fixture there is not an edit to the change.\n"
-            f"- Never copy a real credential, the live config or the live database in. Arete run on config or state "
-            f"in this folder uses no login or key of this machine, but other tools still do: a check that would read "
-            f"a credential store or call a provider needs a fake adapter, or it is `blocked`.\n"
-            f"- When a needed fixture or service still cannot be made, do not work around the guard: return "
-            f"`blocked` and name the command.")
+def unknown(a: Attempt) -> list[str]:
+    with root_fd(a) as root:
+        return unknown_fd(a, root)
+
+
+def restore_entry(source: str, source_fd: int, target: str, target_fd: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, "renameatx_np" if paths.ON_MAC else "renameat2", None)
+    if rename is None:
+        raise OSError(errno.ENOTSUP, "exclusive restoration unavailable")
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(source_fd, os.fsencode(source), target_fd, os.fsencode(target), 4 if paths.ON_MAC else 1):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def captured(a: Attempt, fd: int) -> None:
+    with paths.directory_fd(Path("tree"), fd) as tree:
+        if unknown_fd(a, tree):
+            raise OSError(errno.ESTALE, "concurrent scratch entries require restoration")
+    checked(os.stat("tree", dir_fd=fd, follow_symlinks=False), a.directories[""], True)
+
+
+def cleanup(a: Attempt, data: dict, fd: int, key: bytes) -> list[str]:
+    with paths.directory_fd(Path(a.workspace)) as workspace:
+        if data.get("cleanup_version") is None and not data.get("capture"):
+            with paths.directory_fd(Path(a.root).relative_to(a.workspace), workspace) as root:
+                if unknown_fd(a, root):
+                    raise OSError(errno.ESTALE, "legacy scratch has unregistered entries")
+            data["workspace_identity"] = identity(os.fstat(workspace))
+            data["cleanup_version"] = 3
+            store(fd, key, data)
+        if data.get("cleanup_version") != 3:
+            raise OSError(errno.ENOTSUP, "unrecognized cleanup transaction")
+        checked(os.fstat(workspace), data["workspace_identity"], True)
+        with paths.directory_fd(Path(a.selector), fd) as evidence:
+            checked(os.fstat(evidence), data["evidence"], True)
+            if not data.get("capture"):
+                name = "cleanup-" + secrets.token_hex(16)
+                os.mkdir(name, 0o700, dir_fd=evidence)
+                data["capture"] = {"name": name,
+                                   "identity": identity(os.stat(name, dir_fd=evidence, follow_symlinks=False))}
+                store(fd, key, data)
+            transaction = data["capture"]
+            with paths.directory_fd(Path(transaction["name"]), evidence) as archive:
+                checked(os.fstat(archive), transaction["identity"], True)
+                try:
+                    os.stat("tree", dir_fd=archive, follow_symlinks=False)
+                except FileNotFoundError:
+                    if transaction.get("restore"):
+                        os.stat(Path(a.root).name, dir_fd=workspace, follow_symlinks=False)
+                        data.pop("capture")
+                        store(fd, key, data)
+                        raise OSError(errno.ESTALE, "restored source retained for revalidation") from None
+                    if unknown(a):
+                        raise OSError(errno.ESTALE, "scratch changed before archival")
+                    os.rename(Path(a.root).name, "tree", src_dir_fd=workspace, dst_dir_fd=archive)
+                try:
+                    if transaction.get("restore"):
+                        raise OSError(errno.ESTALE, "restoration must finish before cleanup")
+                    captured(a, archive)
+                    with paths.directory_fd(Path(a.workspace)) as current:
+                        checked(os.fstat(current), data["workspace_identity"], True)
+                except OSError:
+                    transaction["restore"] = True
+                    store(fd, key, data)
+                    restore_entry("tree", archive, Path(a.root).name, workspace)
+                    data.pop("capture")
+                    data["diagnostic"] = "concurrent replacement restored to its original location"
+                    store(fd, key, data)
+                    raise
+                data["final_tree"] = transaction["name"] + "/tree"
+                data["state"] = "done"
+                try:
+                    os.stat(Path(a.root).name, dir_fd=workspace, follow_symlinks=False)
+                except FileNotFoundError:
+                    data["diagnostic"] = ""
+                else:
+                    data["diagnostic"] = {"replacement_retained": a.root}
+                store(fd, key, data)
+    return [a.root] if os.path.lexists(a.root) else []
+
+
+def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
+    archived, saved, kept, matched = "", [], [a.root], False
+    try:
+        with registry() as (fd, key):
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            data = load(fd, key, a.selector)
+            if data["attempt"] != asdict(a) or str(run_dir.resolve()) != a.run_dir:
+                return "", [], kept
+            matched = True
+            if data["state"] == "done":
+                return "", [], [a.root] if os.path.lexists(a.root) else []
+            data["state"] = "pending"
+            store(fd, key, data)
+            if not producers_done(data):
+                data["state"] = "retained"
+                data["diagnostic"] = "waiting for registered verification producers to exit; authority revoked"
+                store(fd, key, data)
+                return "", [], kept
+            if workspace_busy(a):
+                data["diagnostic"] = "another verification attempt still holds this workspace"
+                store(fd, key, data)
+                return "", [], kept
+            if data.get("capture"):
+                kept = cleanup(a, data, fd, key)
+                return data.get("snapshot", ""), [], kept
+            if not os.path.lexists(a.root):
+                data["state"] = "done"
+                data["diagnostic"] = "scratch absent; no source resources mutated"
+                store(fd, key, data)
+                return "", [], []
+            names = [name for name in SLOTS if name in a.files]
+            if not data.get("snapshot") and names:
+                archived = save(a, names, final=True)
+                saved = names
+                data = load(fd, key, a.selector)
+                data["snapshot"] = archived
+                store(fd, key, data)
+            unknown_entries = unknown(a)
+            if unknown_entries:
+                data["diagnostic"] = {"retained_root": a.root, "unknown_entries": unknown_entries[:MAX_LISTED]}
+                store(fd, key, data)
+                return archived, saved, kept
+            kept = cleanup(a, data, fd, key)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        if matched:
+            try:
+                with registry() as (fd, key):
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    data = load(fd, key, a.selector)
+                    if data["attempt"] == asdict(a):
+                        transaction = data.get("capture")
+                        transaction_path = (str(AUTHORITY / a.selector / transaction["name"] / "tree")
+                                            if transaction else "")
+                        if transaction_path and os.path.lexists(transaction_path):
+                            kept.append(transaction_path)
+                        data["diagnostic"] = {"error": type(error).__name__,
+                                              "errno": getattr(error, "errno", None),
+                                              "retained_root": a.root,
+                                              "transaction_path": transaction_path,
+                                              "capture": data.get("capture")}
+                        store(fd, key, data)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+    finally:
+        if matched and (lease := LEASES.pop(a.selector, None)) is not None:
+            os.close(lease)
+    return archived, saved, kept
+
+
+def retain(a: Attempt) -> None:
+    try:
+        with registry() as (fd, key):
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            data = load(fd, key, a.selector)
+            if data["attempt"] != asdict(a):
+                return
+            data["state"] = "retained"
+            data["diagnostic"] = "producer shutdown unconfirmed; authority revoked and worktree retained"
+            store(fd, key, data)
+    finally:
+        if lease := LEASES.pop(a.selector, None):
+            os.close(lease)
+
+
+def recover_pending() -> list[str]:
+    done = []
+    for data in records():
+        if data["state"] == "done":
+            continue
+        a = Attempt(**data["attempt"])
+        try:
+            with registry() as (fd, _key):
+                try:
+                    lease = os.open(a.selector + ".lease", os.O_RDWR | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if not a.directories and not a.files and not os.path.lexists(a.root):
+                        end(a, Path(a.run_dir))
+                    continue
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with paths.directory_fd(Path(a.run_dir)) as run:
+                        checked(os.fstat(run), data["run"], True)
+                    if any(d["state"] in ("active", "prepared") and d["attempt"]["selector"] != a.selector
+                           and overlap(Path(d["attempt"]["workspace"]), Path(a.workspace)) for d in records()):
+                        continue
+                    if not end(a, Path(a.run_dir))[2]:
+                        done.append(a.root)
+                finally:
+                    os.close(lease)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return done
+
+
+def note(a: Attempt | None) -> str:
+    if a is None:
+        return ("Trusted scratch fixtures are unavailable for this verification configuration. "
+                "Run the ordinary product checks. Existing guards remain authoritative; report a required "
+                "fixture or service that cannot be used as blocked, with the actual command and reason. "
+                "Do not claim disposable ownership or use real credentials or live state.")
+    return ("## Disposable fixtures\n\nHarness paths (data): " + json.dumps({"root": a.root, "slots": SLOTS}) +
+            "\n\nUse these empty engine-created slots for fake configuration, SQLite state and output; rewrite them "
+            "in place. Set ARETE_CONFIG_DIR and ARETE_STATE_DIR to this root's config and state folders. "
+            "Arbitrary entries and imported files have no ownership claim and keep the worktree retained. "
+            "Arete snapshots owned bytes, then archives the validated scratch root in protected evidence. "
+            "Unknown or replaced entries keep the worktree retained; failed preservation is retried by polling. "
+            "Scratch fixtures do not change the delivered implementation. Never copy real credentials or live state. "
+            "Use fake transports before product calls. Unsupported confinement supplies no enhanced authority. "
+            "Installed guard integration is pending; guards and JEV remain authoritative. "
+            "Report unavailable fixtures or services as blocked, with the command and reason.")

@@ -43,11 +43,14 @@ def sh(
     inherit: bool = True,
 ) -> subprocess.CompletedProcess:
     full_env = {**(os.environ if inherit else {}), **(env or {})}
+    from . import scratch
+
+    command = scratch.protected_command(cmd, cwd)
     try:
         res = subprocess.run(
-            cmd,
+            command,
             cwd=str(cwd) if cwd else None,
-            shell=isinstance(cmd, str),
+            shell=isinstance(command, str),
             capture_output=True,
             text=True,
             errors="replace",

@@ -505,24 +505,61 @@ def add_worktree(c: Checkout, branch: str, start: str) -> None:
 def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     found = []
     for d in {ws, *(c.wt for c in checkouts)}:
-        if not d.is_dir() or d.is_symlink():
-            continue
-        found += [p for p in d.iterdir() if p.name.startswith(paths.SCRATCH_PREFIX) and not p.is_symlink()
-                  and p.is_dir() and any(True for _ in p.iterdir())]
+        if scratch.pending(d):
+            found.append(d)
+        try:
+            try:
+                d.lstat()
+            except FileNotFoundError:
+                continue
+            if d.is_symlink():
+                found.append(d)
+                continue
+            for root, dirs, files in os.walk(d, onerror=lambda e, found=found, d=d: found.append(d)):
+                found += [Path(root, n) for n in dirs + files if n.startswith(paths.SCRATCH_PREFIX)]
+                dirs[:] = [n for n in dirs if n != ".git" and not n.startswith(paths.SCRATCH_PREFIX)]
+        except OSError:
+            found.append(d)
     return found
 
 
-def remove_workspace(ws: Path, checkouts: list[Checkout]) -> None:
+def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
     if scratch_left(ws, checkouts):
-        return
+        return False
+    made = made_before(ws)
+    salt = str(made.get(SALT_KEY) or "")
+
+    def unknown_outside(examined: set[Path]) -> bool:
+        try:
+            return any(not (salt and made.get(n) == fingerprint(ws / n, salt))
+                       for n in unexamined(ws, examined))
+        except OSError:
+            return True
+
+    if unknown_outside({c.wt for c in checkouts if (c.wt / ".git").exists()}):
+        return False
     for c in checkouts:
         with util.repo_lock(c.src):
+            if scratch_left(ws, checkouts):
+                return False
+            if (c.wt / ".git").exists():
+                try:
+                    if any(not (salt and made.get(c.prefix + n) == fingerprint(c.wt / n, salt))
+                           for n in [*ignored_files(c.wt), *untracked_files(c.wt)]):
+                        return False
+                except (OSError, RuntimeError):
+                    return False
             git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
+    if scratch_left(ws, checkouts) or unknown_outside(set()):
+        return False
     shutil.rmtree(ws, ignore_errors=True)
+    if os.path.lexists(ws):
+        return False
     made_record(ws).unlink(missing_ok=True)
     for c in checkouts:
         with util.repo_lock(c.src):
             git(["worktree", "prune"], c.src, check=False)
+    return True
 
 
 def made_copy(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
@@ -592,9 +629,10 @@ SALT_KEY = "\0salt"
 
 
 def note_made(ws: Path, checkouts: list[Checkout]) -> None:
+    if scratch_left(ws, checkouts):
+        return
     try:
-        names = [n for n in (leftovers(ws, checkouts) if ws.is_dir() else [])
-                 if not any(part.startswith(paths.SCRATCH_PREFIX) for part in Path(n).parts)]
+        names = leftovers(ws, checkouts) if ws.is_dir() else []
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         if names or heads:
             salt = os.urandom(16).hex()
@@ -644,9 +682,12 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
 
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
+    if scratch_left(ws, checkouts):
+        raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
     if why := kept_work(ws, checkouts, source, copies):
         raise RunFailed(why)
-    remove_workspace(ws, checkouts)
+    if not remove_workspace(ws, checkouts):
+        raise RunFailed("workspace removal withheld to preserve scratch resources")
 
 
 def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
@@ -670,7 +711,8 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
 
 def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False) -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
-    remove_workspace(c.wt, [c])
+    if not remove_workspace(c.wt, [c]):
+        raise RunFailed("worktree removal withheld to preserve existing resources")
     fetch(c.src, base)
     if resume:
         fetch(c.src, branch)
@@ -1005,7 +1047,7 @@ def flow_function(cfg: config.Config, name: str) -> Callable:
 
 
 def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
-    return [sys.executable, str(script_file(cfg, name)), *args]
+    return scratch.protected_command([sys.executable, str(script_file(cfg, name)), *args])
 
 
 def answer_text(asked_id: str) -> str:
@@ -1024,7 +1066,7 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     except (ValueError, TypeError):
         adw = False
     if not adw:
-        return [sys.executable, "-m", "arete.cli", "run", repo_name, str(tid), "--local", *flags]
+        return control.command(["run", repo_name, str(tid), "--local", *flags])
     newest = state.ticket_runs(repo_name, str(tid), limit=1, whole=True)
     if newest and newest[0]["status"] == "interrupted" and repaired_by(newest[0]["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
@@ -2205,19 +2247,32 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
     if evidence not in run.add_dirs:
         run.add_dirs.append(evidence)
     untracked_before = untracked_by_dir(b.git_dirs)
+    attempt = None
     try:
         attempt = scratch.make(run.id, step, b.ws, run.dir)
-    except OSError as e:
-        return verify.Verified("blocked", "The check in use did not start.", finished=False,
-                               blocked_by=f"Arete could not make the scratch folder: {util.first_line(str(e), 300)}")
+    except (OSError, ValueError) as e:
+        run.log(f"{step}: trusted scratch unavailable: {util.first_line(str(e), 300)}")
+    agent_started, agent_finished = False, False
+    lifetime = {"stopped": True}
+    fixture_blocker = ""
     try:
-        run.log(f"{step}: scratch folder {attempt.root}")
-        v = verify.with_scratch(verify.with_free_ports(b.layer.verify), attempt.root)
+        v = verify.with_free_ports(b.layer.verify)
+        if attempt:
+            run.log(f"{step}: scratch folder {attempt.root}")
+            v = verify.with_scratch(v, attempt.root)
+        else:
+            run.log(f"{step}: ordinary verification without trusted scratch authority")
+            if verify.SCRATCH_FIELD in v.start:
+                fixture_blocker = "Required service needs unavailable scratch fixtures for start command: " + json.dumps(v.start)
+                v = replace(v, start="", url="", notes=v.notes + "\n" + fixture_blocker)
         bash = b.read_bash + v.bash
-        with verify.serving(v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo,
-                            sets={scratch.ENV_NAME: attempt.root}) as url:
+        with verify.serving(
+                v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo,
+                sets={scratch.ENV_NAME: attempt.root} if attempt else None, lifetime=lifetime,
+                attempt=attempt) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
+            agent_started = True
             res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
                                          title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
                                          surface=surface_note(v, url, evidence), notes=v.notes,
@@ -2227,24 +2282,36 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, **values) -> ve
                             allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=verify.mcp_config(evidence) if url else "",
-                            scratch=scratch.hook_args(attempt, run.dir))
+                            scratch=attempt)
+            agent_finished = True
+    except scratch.ConfinementUnavailable as e:
+        return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
+                               blocked_by=util.first_line(str(e), 300))
     except verify.ServerError as e:
         run.log(f"{step}: the app did not start")
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
-            archived, moved, kept = scratch.end(attempt, run.dir)
+            if not attempt:
+                archived, moved, kept = "", [], []
+            elif not lifetime["stopped"] or (agent_started and not agent_finished):
+                scratch.retain(attempt)
+                archived, moved, kept = "", [], [attempt.root]
+            else:
+                archived, moved, kept = scratch.end(attempt, run.dir)
             if moved:
-                run.log(f"{step}: moved {util.count(len(moved), 'entry', 'entries')} from the scratch folder to "
+                run.log(f"{step}: preserved {util.count(len(moved), 'fixture')} from the scratch folder at "
                         f"{archived}")
             if kept:
                 run.log(f"{step}: kept the scratch folder {attempt.root}, and with it the worktree")
         finally:
-            restore_worktrees(untracked_before, evidence, Path(attempt.root))
+            restore_worktrees(untracked_before, evidence)
     if not res.ok or not isinstance(res.structured, dict):
         return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
     verified = verify.Verified.from_agent(res.structured)
+    if fixture_blocker and verified.verdict == "pass":
+        verified.verdict, verified.blocked_by = "blocked", fixture_blocker
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
@@ -2267,10 +2334,10 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
 
 
-def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path, left: Path | None = None) -> None:
+def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
     for d, name in untracked_added_since(untracked_before):
         f = d / name
-        if left and left in Path(os.path.realpath(d)).joinpath(name).parents:
+        if any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
             continue
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
@@ -2703,7 +2770,8 @@ def cleanup_worktrees(days: float = 7) -> None:
     cutoff = util.now().timestamp() - days * 86400
     for d in paths.WORKTREES_DIR.glob("*"):
         try:
-            if d.is_dir() and d.stat().st_mtime < cutoff:
+            if (d.is_dir() and not d.is_symlink() and d.stat().st_mtime < cutoff and not scratch_left(d, [])
+                    and not unexamined(d, set())):
                 shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
@@ -2735,15 +2803,16 @@ class SkipLog:
 
 
 def settle_abandoned_runs(cfg: config.Config) -> None:
-    record.reap(tickets=True, then=lambda row: settle_died(cfg, row))
+    record.reap(tickets=True, then=lambda row: tell_ticket_run_died(cfg, row))
 
 
-def settle_died(cfg: config.Config, row: dict) -> None:
-    try:
-        tell_ticket_run_died(cfg, row)
-    finally:
-        for root in scratch.recover(paths.RUNS_DIR / row["id"]):
-            print(f"moved the scratch folder {root} of a run that died to its run folder")
+def retry_scratch() -> None:
+    for root in scratch.recover_pending():
+        print(f"preserved and finalized verification scratch {root}")
+    for data in scratch.records():
+        if data["state"] in ("pending", "retained", "preserved") and data["diagnostic"]:
+            print("verification scratch retained: " + json.dumps({"run": data["attempt"]["run_id"],
+                  "attempt": data["attempt"]["selector"], "diagnostic": data["diagnostic"]}, ensure_ascii=True))
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
@@ -2943,6 +3012,8 @@ def poll(dry_run: bool = False) -> int:
         if not got:
             print(f"{util.iso()} poll already running")
             return 0
+        if not dry_run:
+            retry_scratch()
         if any(r.parts or r.tracker != "local" for r in cfg.repos) and not network_up_or_skip("poll", dry_run):
             return 0
         errors: list[str] = []

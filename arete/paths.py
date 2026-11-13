@@ -3,6 +3,7 @@ import os
 import re
 import stat
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 HOME = Path.home()
@@ -15,7 +16,7 @@ CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?
 ISOLATED_LOGINS = "scratch config and state never use this machine's logins, keys or price lookups"
 ISOLATED_REFUSAL = (f"arete: refusing to start: with {SCRATCH_ENV}, or ARETE_CONFIG_DIR or ARETE_STATE_DIR in a scratch "
                     f"folder, the config and state folders must both sit, without links, in the one scratch folder "
-                    f"Arete made (unset ones go to its config and state folders)")
+                    f"selected for isolation (unset ones go to its config and state folders)")
 
 
 def inside_scratch(d: Path) -> bool:
@@ -63,6 +64,22 @@ def confined(p: Path) -> Path | None:
     return real if real == root or root in real.parents else None
 
 
+@contextmanager
+def directory_fd(p: Path, parent: int | None = None):
+    parts = p.parts
+    if ".." in parts or (parent is not None and p.is_absolute()):
+        raise PermissionError("directory traversal refused")
+    fd = os.dup(parent) if parent is not None else os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts if parent is not None else p.absolute().parts[1:]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def read_confined(p: Path, limit: int | None = None) -> bytes:
     if not ISOLATED:
         with open(p, "rb") as f:
@@ -71,22 +88,21 @@ def read_confined(p: Path, limit: int | None = None) -> bytes:
     parts = Path(os.path.abspath(p)).parts
     if root is None or len(parts) <= len(root.parts) or ".." in Path(p).parts:
         raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p))
-    fds = []
     try:
-        fds.append(os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY))
-        for part in parts[1:-1]:
-            fds.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1]))
-        fds.append(os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fds[-1]))
-        st = os.fstat(fds[-1])
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
-            raise FileNotFoundError(errno.ENOENT, "not a plain file of this user", str(p))
-        with os.fdopen(fds.pop(), "rb") as f:
-            return f.read(-1 if limit is None else limit)
+        expected = os.lstat(root)
+        with directory_fd(root) as root_fd:
+            current = os.fstat(root_fd)
+            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+                raise PermissionError("scratch credential root replaced")
+            with directory_fd(p.absolute().parent.relative_to(root), root_fd) as parent:
+                source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                with os.fdopen(source, "rb") as f:
+                    st = os.fstat(source)
+                    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
+                        raise FileNotFoundError(errno.ENOENT, "not a plain file of this user", str(p))
+                    return f.read(-1 if limit is None else limit)
     except OSError as e:
         raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p)) from e
-    finally:
-        for fd in fds:
-            os.close(fd)
 
 
 def plain_or_missing(p: Path) -> bool:

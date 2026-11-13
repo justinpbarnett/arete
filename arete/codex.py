@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import accounts, claude, config, environment, guard, paths, util
+from . import scratch as verification_scratch
 from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
 from .pi import SCHEMA_RULE
 
@@ -160,7 +161,9 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
 def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | str],
             allowed_tools: list[str] | None = None) -> list[str]:
     name = WRITE_PROFILE if writing else READ_PROFILE
-    granted = {path: "write" for d in add_dirs for path in both(d)} if writing else {}
+    granted = {path: "write" if writing else "read" for path in both(cwd)}
+    if writing:
+        granted |= {path: "write" for d in add_dirs for path in both(d)}
     metadata = {path: "read" for root in [cwd, *add_dirs] for path in both(root / ".git")}
     result = util.sh(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], cwd=cwd,
                      timeout=10, env=agent_env(), inherit=False)
@@ -388,7 +391,13 @@ def _run(
         on_line(line)
 
     try:
-        proc = claude.run_streaming(cmd, str(cwd), prompt, env, timeout, streamed)
+        attempt = verification_scratch.PRODUCING.get()
+        protected = {Path(p).resolve() for p in hidden}
+        confined = (not json.loads(mcp_config or "{}").get("mcpServers")
+                    and (attempt is None or (verification_scratch.AUTHORITY.resolve() in protected
+                         and paths.WORKTREES_DIR.resolve() in protected
+                         and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config))))
+        proc = claude.run_streaming(cmd, str(cwd), prompt, env, timeout, streamed, actor_confined=confined)
     except subprocess.TimeoutExpired:
         return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
                       provider=provider)
