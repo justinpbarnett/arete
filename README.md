@@ -1397,6 +1397,35 @@ arete benchmark run ~/.config/arete/benchmarks/routes.toml
 
 The manifest also needs your `[tasks.NAME]` and `[accept]` tables. Tool errors read 0 on replay, since a replay record holds no tool results. Candidate ids, rankings, tariffs and task data belong in the owner's manifest and layer, never in this repository.
 
+## Bounded workers
+
+A cheap worker can look good per call and cost more once repairs and escalations are counted. `arete benchmark run MANIFEST` also runs this recipe on the experiment runner: a trial gives the worker route the task, repairs go through the existing `fix` loop, and an escalation is that same loop resolved to a stronger route through the existing router. The command tells it from the implementation benchmark by an arm table holding `attempts`, `no_progress` or `escalation`; `report FILE` tells it by the results file. `atom` is `build` and no other value is accepted. No planner runs: the task is the whole brief.
+
+The manifest is an experiment manifest plus:
+
+- on every `[arms.NAME]`: the worker route as usual, `attempts` (1 to 8, launches of that route per trial, first try plus repairs) and `no_progress` (`unchanged_patch`, `same_failure` or `either`). An optional `[arms.NAME.escalation]` holds route keys and its own `attempts` (1 to 8).
+- on every `[tasks.NAME]`: `kind` (`patch`, `test`, `explore` or `extract`), `reference`, and optionally `base` and `split` (default `validation`). `[accept] baseline` names the arm the others are compared with.
+
+The four kinds differ in what their gate checks: `patch` that the change is in the code, `test` that a test passes on the right code and fails on a mutant, `explore` that the answer file names the right path, and `extract` that the evidence file holds the source text. In each the gate is the task's own `check`, proven on `reference` and `base` before any trial, together with the layer's repo checks. A failed gate's output is what the next try and the escalation route see; the hidden files are removed after each gate run, so a later attempt never finds them.
+
+An arm hands the task to its escalation route when the worker reaches its attempt limit, when the no-progress rule fires after a failed gate, when the worker route is unavailable, or when a worker call fails. A same-runner handoff resumes the session; another runner gets the task, the summary and the diff, as any repair does. The escalation route gets its own attempts and no further handoff. An arm with an unavailable worker route and an escalation route runs, with the escalation route taking the work; without one it is `unavailable, not judged` as before.
+
+Each `trial` line adds `attempts` (every launch, with its endpoint, tokens, cost, applied tariff, gate result, whether the patch changed and seconds, including calls that never launched), `first_pass` (the first worker attempt passed its gate), `handoff` (the reason, or empty) and `unpriced_attempts`. The report counts every failed attempt and escalation in acceptance, seconds and cost, and shows first-pass success apart from eventual success, per arm and per kind. The tariff total uses the endpoint's applicable rate, pinned by the price snapshot's observation time. A launched attempt with no rate, or only a conditional rate that is not proven for the call, makes the total read `unknown`; unknown is never compared and never counted as free.
+
+A trial keeps its launches in `worker-launches.json` in its run folder as it goes. When a killed run is resumed, its interrupted trial line is rebuilt from that file and the trial's records, so its attempts, handoff and costs still count. A launch whose call left no result reads unpriced, and a trial line with no attempt list makes the arm's tariff `unknown`, its worker and escalation parts included.
+
+Nothing in `config.toml`, a layer, `tries` or routing changes: the escalation exists only inside the trial.
+
+```
+arete benchmark sample /tmp/workers --workers   # prints the [replay] and [[repo]] lines for a scratch config
+arete prices import /tmp/workers/prices.json    # without it every tariff reads unknown
+arete benchmark run /tmp/workers/workers.toml --dry-run
+arete benchmark run /tmp/workers/workers.toml
+arete benchmark report FILE [--json]
+```
+
+The sample replays an immediate success, a failed gate, an unchanged patch, an exhausted attempt limit and an unavailable worker, at placeholder tariffs from `prices.json`; `prices-conditional.json` makes the cheap route's only rate conditional. Real routes, tariffs and tasks stay in your private config and layer, never in this repository.
+
 ## Verifier suites
 
 A verifier has to catch a regression as well as accept a working UI. `arete verifiers` runs candidate verifiers (arms) over known-good states, seeded regressions and real historical failures, each with numbered requirements and an expected label, then reports how often each arm got them wrong. It uses the pipeline's own verifier call and `[verify]` browser setup, and changes no prompt.
