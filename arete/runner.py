@@ -269,7 +269,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         repo: config.Repo | None = None, remaining_budget: Callable[[], float | None] | None = None,
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
-        route: dict | None = None, refusal: str = "", mode: str = "", **kw) -> Result:
+        route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
+        **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
     which, name = chosen(model, run_with, cfg)
@@ -278,11 +279,11 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
     try_no = try_no or (state.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
-    chosen_by = {"launch": 1, "selection": route} if route else None
+    prior = route
+    chosen_by = {"launch": 1, "selection": prior} if prior else None
     if refusal:
-        return attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target,
-                       {**kw, **({"remote": target} if target.remote else {}), "budget_error": refusal},
-                       tier, kind, accounts.Auth(), chosen_by, try_no)
+        return refused(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind,
+                       chosen_by, try_no, refusal)
     if which == REPLAY:
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
@@ -291,13 +292,14 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if not target.remote:
         repo = repo or cfg.repo_for_work_dir(cwd)
     size = routing_size(prompt, settings, kw)
-    trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size), resume,
-                remaining_budget, kw.get("max_budget_usd"))
+    active = layer if layer is not None else layer_of(repo)
+    trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
+                remaining_budget, kw.get("max_budget_usd"), layer=active)
     from . import routing
 
     limited: list[Result] = []
     previous: Stopped | None = None
-    launches = 0
+    launches, measured = 0, size
     while True:
         picked, skipped = pick(trip)
         if not picked:
@@ -307,10 +309,20 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                 with waits("limit"):
                     wait_until(trip, wake)
                 continue
-            return with_spent(exhausted(trip, skipped, limited, which, name, wake), limited)
+            done = exhausted(trip, skipped, limited, which, name, wake)
+            if trip.request.requires.declared and not wake:
+                given = {"launch": launches + 1, "skipped": skipped, "requested_effort": trip.request.effort,
+                         "selection": launched_selection(trip, prior, skipped, measured, error=done.error)}
+                res = refused(which, name, prompt, cwd, done.session, cfg, trace, record_id, target, kw, tier, kind,
+                              given, try_no, done.error)
+                res.skipped, res.usage_limit = done.skipped, done.usage_limit
+                return with_spent(res, limited)
+            return with_spent(done, limited)
         chosen_route = picked.candidate
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
-        final_size = routing_size(text, settings, kw)
+        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say)
+        final_size = routing_size(text, settings, launch_kw)
+        measured = max(measured, final_size)
         if (trip.request.requires.declared and final_size > trip.request.size
                 and (why := outgrown(trip, chosen_route, final_size))):
             trip.barred[routing.route_key(chosen_route)] = why
@@ -321,8 +333,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                                      session=trip.resume), limited)
         launches += 1
         trip.launched = True
-        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say)
-        route = {**({"selection": chosen_by["selection"]} if chosen_by else {}),
+        selection = launched_selection(trip, prior, skipped, final_size, chosen_route, picked.name)
+        route = {**({"selection": selection} if selection else {}),
                  "runner": chosen_route.runner, "model": picked.name,
                  "provider": picked.selected.provider if picked.selected else chosen_route.provider,
                  "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
@@ -374,6 +386,7 @@ class Trip:
     floors: dict = field(default_factory=dict)
     launched: bool = False
     barred: dict = field(default_factory=dict)
+    layer: config.RepoLayer | None = None
 
 
 @dataclass
@@ -410,7 +423,7 @@ def routing_size(prompt: str, settings, kw: dict) -> int:
 
 
 def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: str, settings, fallback: bool,
-                kw: dict, size: int = 0):
+                kw: dict, size: int = 0, layer: config.RepoLayer | None = None):
     from . import routing, steps
 
     bare, denied = reach(kw)
@@ -427,10 +440,7 @@ def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: 
             settings.chain[0].runner, settings.chain[0].model)):
         chain, allowed = settings.chain, settings.fallback
     else:
-        try:
-            layer = config.load_layer(repo.layer_dir) if repo else None
-        except (ValueError, OSError):
-            layer = None
+        layer = layer if layer is not None else layer_of(repo)
         chain, allowed = steps.chain_for(cfg, layer, which, name, effort, explicit)
     return routing.Request(chain, allowed and fallback, bare, tuple(servers), effort, explicit, denied, requires, size)
 
@@ -438,10 +448,41 @@ def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: 
 def outgrown(trip: Trip, chosen, size: int) -> str:
     from . import routing
 
-    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=layer_of(trip.repo))
+    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer)
     key = routing.route_key(chosen)
     again = discovery.routes(replace(trip.request, size=size), request_tokens=size)
     return next((c.detail for c in again if routing.route_key(c) == key and c.state == "ineligible"), "")
+
+
+def launched_selection(trip: Trip, prior: dict | None, skipped: list[dict], size: int, chosen=None, name: str = "",
+                       error: str = "") -> dict | None:
+    from . import routing
+
+    if not trip.request.requires.declared:
+        return prior
+    base = prior or routing.described_selection(routing.Selection(None, False, ""), trip.request, size)
+    passed = [{"model": s["model"], "runner": s["runner"], "credential": s["credential"], "state": s["state"],
+               "reason": s["detail"]} for s in skipped]
+    seen = {(p["runner"], p["model"], p["credential"]) for p in passed}
+    if chosen:
+        seen.add((chosen.runner, chosen.model, chosen.credential))
+    passed += [p for p in base.get("skipped") or [] if (p["runner"], p["model"], p["credential"]) not in seen]
+    selected = None
+    if chosen:
+        why = "; ".join(f"{p['model']} ({p['runner']}, {p['credential']}) {p['state']}: {p['reason']}" for p in passed)
+        reason = ("the requested route meets the step's requirements" if chosen.requested and not why
+                  else f"took {name}" + (f" after passing over {why}" if why else ""))
+        selected = {"model": name, "runner": chosen.runner, "provider": chosen.provider,
+                    "credential": chosen.credential, "billing": chosen.billing, "reason": reason}
+    return {**base, "selected": selected, "skipped": passed, "request_tokens": size, "error": error}
+
+
+def refused(which: str, name: str, prompt: str, cwd: Path | str, session: Session, cfg: config.Config,
+            trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str, kind: str,
+            route: dict | None, try_no: int, error: str) -> Result:
+    return attempt(which, name, prompt, cwd, session, cfg, trace, record_id, target,
+                   {**kw, **({"remote": target} if target.remote else {}), "budget_error": error},
+                   tier, kind, accounts.Auth(), route, try_no)
 
 
 def layer_of(repo: config.Repo | None):
@@ -459,7 +500,7 @@ def passed_over(found, why: str, detail: str, until: str = "") -> dict:
 def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
     from . import routing
 
-    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=layer_of(trip.repo))
+    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer)
     found = discovery.routes(trip.request, request_tokens=trip.request.size)
     wanted = trip.resume
     if wanted.id and not trip.launched:

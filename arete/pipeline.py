@@ -302,6 +302,7 @@ class AgentRun:
         tier, kind = kw.setdefault("tier", s.tier if s else ""), kw.setdefault("kind", self.kind)
         kw.setdefault("waits", self.waiting)
         kw.setdefault("repo", self.repo)
+        kw.setdefault("layer", self.layer)
         seam = factory.inside(self.id)
         lined = self.writes_lines and seam is None
         if s:
