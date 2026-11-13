@@ -129,6 +129,7 @@ document.addEventListener("DOMContentLoaded", () => {
   wireForms();
   wireConsole();
   wireDialogs();
+  wireFeedback();
   document.addEventListener("keydown", onKey);
   document.addEventListener("click", onClick);
   const noteMouseAt = (e) => {

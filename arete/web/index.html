@@ -26,6 +26,7 @@
 <script src="/usage.js" defer></script>
 <script src="/tracking.js" defer></script>
 <script src="/console.js" defer></script>
+<script src="/feedback.js" defer></script>
 <script src="/find.js" defer></script>
 <script src="/keys.js" defer></script>
 <script src="/loaders.js" defer></script>
@@ -39,6 +40,7 @@
   <div class="group tools">
     <button type="button" id="find-open" aria-haspopup="dialog">Find</button>
     <button type="button" id="console-open" aria-expanded="false" aria-controls="console"><span>Console</span><span class="count" id="count-console"></span></button>
+    <button type="button" id="feedback-open" aria-haspopup="dialog">Feedback</button>
   </div>
   <p class="side-foot" id="serve-line"></p>
   <p class="side-foot hints">Ctrl or Cmd K to find<br>? for the keys</p>
@@ -273,10 +275,52 @@
     <dt><kbd>Ctrl</kbd> or <kbd>Cmd</kbd> <kbd>K</kbd></dt><dd>Find a view, loop, run, session, ticket or action</dd>
     <dt><kbd>/</kbd></dt><dd>Find, outside a field</dd>
     <dt id="keys-console"><kbd>C</kbd></dt><dd>Open or close the console</dd>
+    <dt><kbd>F</kbd></dt><dd>Write feedback: an idea, an adjustment or a bug</dd>
     <dt><kbd>Esc</kbd></dt><dd>Close the open item, then the console</dd>
     <dt><kbd>?</kbd></dt><dd>This list</dd>
   </dl>
   <div class="actions"><button type="button" id="keys-close">Close</button></div>
+</dialog>
+
+<dialog id="feedback" aria-labelledby="feedback-title">
+  <h2 id="feedback-title" tabindex="-1">Feedback</h2>
+  <p class="muted">The draft is kept as you type, on arete and on this device. Nothing is filed from here yet.</p>
+  <fieldset>
+    <legend>Kind</legend>
+    <label class="check"><input type="radio" name="feedback-kind" value="idea" checked>Idea</label>
+    <label class="check"><input type="radio" name="feedback-kind" value="adjustment">Adjustment</label>
+    <label class="check"><input type="radio" name="feedback-kind" value="bug">Bug</label>
+  </fieldset>
+  <div class="field">
+    <label for="feedback-text">Request</label>
+    <textarea id="feedback-text" rows="5" maxlength="4000" aria-required="true" aria-describedby="feedback-text-limit"></textarea>
+    <p class="muted limit" id="feedback-text-limit">Required · up to 4,000 characters</p>
+  </div>
+  <div id="feedback-bug" hidden>
+    <div class="field">
+      <label for="feedback-expected">Expected</label>
+      <textarea id="feedback-expected" rows="3" maxlength="2000" aria-describedby="feedback-expected-limit"></textarea>
+      <p class="muted limit" id="feedback-expected-limit">Optional · up to 2,000 characters</p>
+    </div>
+    <div class="field">
+      <label for="feedback-actual">Actual</label>
+      <textarea id="feedback-actual" rows="3" maxlength="2000" aria-describedby="feedback-actual-limit"></textarea>
+      <p class="muted limit" id="feedback-actual-limit">Optional · up to 2,000 characters</p>
+    </div>
+    <div class="field">
+      <label for="feedback-steps">Steps</label>
+      <textarea id="feedback-steps" rows="3" maxlength="2000" aria-describedby="feedback-steps-limit"></textarea>
+      <p class="muted limit" id="feedback-steps-limit">Optional · up to 2,000 characters</p>
+    </div>
+  </div>
+  <label class="check"><input type="checkbox" id="feedback-include">Include app state</label>
+  <p class="muted limit">arete adds its version, this view, the open item's id and, for a run, its kind, status, last step, times and the first line of its error. It never adds page content, config, logs or transcripts. Up to 8 KB.</p>
+  <div id="feedback-context" hidden>
+    <pre id="feedback-context-json" tabindex="0"></pre>
+    <div class="actions"><button type="button" id="feedback-context-again">Capture again</button><button type="button" id="feedback-context-drop">Remove</button></div>
+  </div>
+  <p id="feedback-result" aria-live="polite" tabindex="-1" hidden></p>
+  <div class="actions"><button type="button" id="feedback-close">Close</button><button type="button" id="feedback-discard">Discard</button><span class="muted keys">Esc closes · the draft is kept</span></div>
 </dialog>
 </body>
 </html>

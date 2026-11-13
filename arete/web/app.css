@@ -163,7 +163,15 @@ dialog > .actions { margin: 14px 0 12px; }
 #palette-list [aria-selected="true"] { background: var(--ink); color: var(--ground); }
 #palette-list [aria-selected="true"] .muted { color: var(--ground); }
 #palette-list [aria-selected="true"] .tag { border-color: var(--ground); }
-#keys h2 { margin: 0 0 16px; padding: 0; border: 0; font-size: 24px; }
+#keys h2, #feedback h2 { margin: 0 0 16px; padding: 0; border: 0; font-size: 24px; }
+#feedback { overflow-y: auto; }
+#feedback textarea { width: 100%; }
+#feedback fieldset label.check { display: inline-flex; margin-right: 18px; }
+#feedback .limit { margin: 0; font-size: 13px; }
+#feedback-context-json { max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (pointer: coarse), (max-width: 520px) {
+  #feedback { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0; border: 0; padding: 16px; }
+}
 dl.keys-list { grid-template-columns: max-content 1fr; gap: 8px 18px; font-size: 14px; }
 @media (max-width: 520px) {
   dl.keys-list { grid-template-columns: 1fr; gap: 2px; }

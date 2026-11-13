@@ -1094,15 +1094,15 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 It listens only on the machine's tailnet addresses.
 A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 
-A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find and Console.
+A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find, Console and Feedback.
 It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
 Below 1040 px the sidebar wraps into a block above the page.
 Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME` and `#ticket/REF`, so reload, Back and Forward put you where you were.
-An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find or the key list open, text selected or an action still going.
+An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find, the key list or the feedback composer open, feedback text not yet saved, text selected or an action still going.
 Then the status line says what the new version waits for.
 Close or Escape on an open item goes back to where you opened it, with focus on its row.
 Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, ticket or action.
-`g` and a letter goes to a view, `c` opens or closes the console, and `?` lists the keys.
+`g` and a letter goes to a view, `c` opens or closes the console, `f` opens the feedback composer, and `?` lists the keys.
 
 - Live: Running now, with each run's start, last step and time, and Stop; then Needs you, where each row names its repo: the pushes waiting for approval with Approve and Reject, each led by a plain summary that the `explain` model writes about a minute after it arrives, then the reason it was held and the reviewer's verdict, a failed delivery with Try again, the ready tickets one press sends to the pipeline, the skipped tickets with Run anyway, the console's drafted issue, and the harness fixes and memory facts the miner leaves for you to make by hand, each with Mark done.
   None of these buttons asks you to confirm.
@@ -1142,6 +1142,14 @@ Each call to the model stops at $2, and a reply on a paid runner shows what it c
 Each chat continues its own session and waits on its own answer, so several chats can wait at once.
 On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
 
+The Feedback button and `f` open a composer over any view without changing the URL; on a phone it fills the screen.
+Write an Idea (the default), an Adjustment or a Bug in one text box of up to 4,000 characters; a Bug also shows optional Expected, Actual and Steps boxes of up to 2,000 characters each.
+Include app state, off by default, previews the exact JSON that would be sent, up to 8 KB, with Remove and Capture again.
+The page sends only its view name and open item, and the server builds the snapshot from an allow-list: arete's version and web code, the view, the open run, loop, session or ticket id, for a run its kind, status, last step, start, finish and the first line of its error, and the time of the capture.
+It never holds page content, config files, the environment, database dumps, transcripts or logs, and every string is redacted and screened for private addresses and home paths.
+One draft is kept in `arete.db` and mirrored in the browser, so it survives closing the composer, a reload and a server restart; when a save fails, the page says the draft is kept on this device and saves again when the server answers.
+Discard removes the draft. Nothing is filed yet.
+
 Money counts only what you pay, on the dashboard and everywhere else arete shows a sum: the CLI, a run's end line in its feed, PR bodies, research reports and eval results.
 Explicit subscription calls contribute no paid spend and retain all their tokens and reported cost. API-key calls contribute their cost even on a runner that also supports subscriptions. `arete costs` shows paid spend; `arete costs --by model` and other groupings show raw call cost and tokens, including subscription usage. Run details split the same model into subscription and metered rows when both occur, independent of call order. A zero-cost metered call says nothing paid without claiming subscription use. Chat stores each new reply's paid amount in `paid_usd` and its reported cost in `cost`, retaining full precision until display. Paid amounts show independently of the current login. Historical messages retain their old reported `cost` and a NULL `paid_usd`; the console labels those amounts as reported with payment unknown, rather than inferring billing from today's login. Chat paid totals sum only known paid amounts, while the stored `spent` total continues to track reported cost. Histories remain readable when a project leaves the configuration.
 
@@ -1169,6 +1177,14 @@ These routes steer a ticket's run. The first four answer `{"task", "repo", "run"
 - `POST /api/runs/RUN_ID/stop` stops a running run as before, and the run ends with a `stopped` report.
 
 Each refuses a run in the wrong state and names the state. `answer` and `resume` also refuse a run that is not the ticket's latest and name the run that came after it; runs of one step alone do not count. `steps` has no such rule.
+
+The feedback draft has five routes. Each answers `{"draft", "limits", "kinds"}`: `draft` is the open draft (`id`, `status`, `kind`, `text`, `expected`, `actual`, `steps`, `context`, `revision`, `created`, `updated`) or `null`, and `limits` holds the character limits and `context_bytes`.
+
+- `GET /api/capture` returns the draft and the limits.
+- `POST /api/capture` saves `kind` (`idea`, `adjustment` or `bug`) and any of `text`, `expected`, `actual` and `steps`, and creates the draft when none is open. Only a change bumps `revision`. It answers 400 for no field, an unknown kind, a field that is not text, or text over its limit.
+- `POST /api/capture/context` with `{"view": "runs", "detail": {"kind": "run", "id": "ID"}}` builds the app-state snapshot and keeps it in the draft. `detail` is optional. It answers 400 for an unknown view, a bad `detail`, or a snapshot over 8 KB.
+- `POST /api/capture/context/drop` removes the snapshot.
+- `POST /api/capture/discard` discards the draft. With no draft it still answers 200.
 
 ```sh
 curl -H 'X-Arete: 1' -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' http://HOST:PORT/api/tasks
