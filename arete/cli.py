@@ -917,12 +917,13 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import steps
+    from . import runner, steps
 
     where = ""
     try:
         cfg = config.load()
-        layer_dir = cfg.repo(args.repo).layer_dir if args.repo else None
+        repo = cfg.repo(args.repo) if args.repo else None
+        layer_dir = repo.layer_dir if repo else None
         where = f"{paths.short_path(layer_dir / 'config.toml')}: " if layer_dir else ""
         layer = config.load_layer(layer_dir) if layer_dir else None
         steps.check(cfg, layer)
@@ -930,7 +931,17 @@ def cmd_steps(args) -> int:
     except (ValueError, TypeError) as e:
         print(f"{where}{e}", file=sys.stderr)
         return 1
-    print_lines(json.dumps(dataclasses.asdict(s)) for s in sheet)
+    for s in sheet:
+        notes = list(s.notes)
+        if s.runner == "pi" and not cfg.replay.all:
+            selected = runner.pi_route(s.model, cfg, repo)
+            if selected.login_refused:
+                notes.append(f"pi {selected.provider} login refused: {selected.login_refused}")
+            if selected.error:
+                notes.append(selected.error)
+            elif selected.provider == "anthropic" and selected.key_available:
+                notes.append("pi anthropic: paid api_key route (Anthropic Console key)")
+        print(json.dumps({**dataclasses.asdict(s), "notes": notes}))
     return 0
 
 

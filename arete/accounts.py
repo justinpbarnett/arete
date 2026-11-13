@@ -16,7 +16,7 @@ MAX_METADATA = 64 * 1024
 MAX_LOGIN_METADATA = 4 * 1024 * 1024
 CACHE_SECONDS = 300
 CACHE_SIZE = 128
-PI_SUBSCRIPTIONS = frozenset({"anthropic", "openai", "openai-codex", "github-copilot", "xai", "kimi-coding", "meta"})
+PI_SUBSCRIPTIONS = frozenset({"openai", "openai-codex", "github-copilot", "xai", "kimi-coding", "meta"})
 
 
 @dataclass(frozen=True)
@@ -173,11 +173,7 @@ def pi(provider: str, credential=None, source: str = "", lookup=None) -> Auth:
         return Auth("api_key", generation=generation, credential=local, provider=provider)
     if provider not in PI_SUBSCRIPTIONS:
         return Auth("api_key", generation=generation, credential=local, provider=provider)
-    family = {"anthropic": "claude", "openai-codex": "codex"}.get(provider, "")
-    if family == "claude":
-        found = claude(account={"accountUuid": credential.get("accountUuid")},
-                       token=credential.get("access", ""), source=source, lookup=lookup)
-        return Auth("subscription", family, found.identity, generation, local, provider)
+    family = "codex" if provider == "openai-codex" else ""
     if family == "codex":
         token = credential.get("access")
         claims = jwt(token) if token else {}
