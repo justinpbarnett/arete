@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import urllib.error
 from unittest import mock
 
 import arete
-from arete import config, control, devices, gh, pipeline, sessions, verify
+from arete import config, control, devices, gh, paths, pipeline, sessions, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -183,7 +184,8 @@ if scenario.startswith("held-scratch"):
     result = {"parked": parked["summary"], "recorded": [k for k in made if not k.startswith("\0")],
               "head_recorded": made.get(pipeline.head_key(pipeline.Checkout("", "", ws, ws, "main"))) == pipeline.git(["rev-parse", "HEAD"], ws).strip(),
               "unpushed": pipeline.git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], ws).strip(),
-              "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")]}
+              "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")],
+              "left": [p.name for p in pipeline.scratch_left(ws, [])]}
     with state.db() as c:
         c.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Add kumquat on a last line of its own", task))
     refused = forced()
@@ -194,9 +196,10 @@ if scenario.startswith("held-scratch"):
     scratch.LEASES.clear()
     with mock.patch.object(scratch, "holders", return_value=[]):
         pipeline.retry_scratch()
-    (root / "finalized").mkdir()
-    for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
-        p.rename(root / "finalized" / p.name)
+    if result["held"] == [prefix]:
+        (root / "finalized").mkdir()
+        for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
+            p.rename(root / "finalized" / p.name)
     if scenario == "held-scratch-edited":
         with (ws / "notes.txt").open("a") as out:
             out.write("edited by hand\n")
@@ -246,8 +249,17 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         result = self.workflow("held-scratch")
         self.assertIn("parked", result["parked"])
         self.assertIn("notes.txt", result["recorded"])
-        self.assertFalse([n for n in result["recorded"] if ".arete-scratch-" in n])
-        self.assertTrue(result["held"])
+        look = ".arete-scratch-0123456789abcdef"
+        engine = [n for n in result["held"] if n != look]
+        self.assertIn(look, result["held"])
+        if engine:
+            self.assertTrue(all(n in result["left"] for n in engine))
+            self.assertNotIn(look, result["left"])
+            self.assertIn(look + "/.gitignore", result["recorded"])
+            self.assertFalse([n for n in result["recorded"] if any(n.startswith(e) for e in engine)])
+        else:
+            self.assertIn(look, result["left"])
+            self.assertFalse([n for n in result["recorded"] if ".arete-scratch-" in n])
         self.assertTrue(result["head_recorded"])
         self.assertEqual(result["unpushed"], "1")
         self.assertIn("unresolved or unknown scratch resources", result["while_held"])
@@ -290,6 +302,188 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("left out 3 earlier repair cycles", result["log"])
         self.assertEqual(result["budget"]["left_out"], [result["old"]])
         self.assertEqual(result["budget"]["parents"], [])
+
+
+class ScratchLookAlikeTests(unittest.TestCase):
+    PRELUDE = r'''
+import json, os, secrets, subprocess, sys, time
+from pathlib import Path
+t = Path(sys.argv[1])
+from arete import pipeline, scratch, paths
+scratch.AUTHORITY = t / "authority"
+'''
+    REPO = r'''
+src, ws = t / "src", t / "worktrees" / ("ws-" + secrets.token_hex(4))
+src.mkdir()
+git = lambda *a: subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *a], cwd=src, check=True, capture_output=True)
+git("init", "-q", "-b", "main")
+(src / "a.txt").write_text("a")
+git("add", "a.txt")
+git("commit", "-qm", "a")
+git("worktree", "add", "-q", str(ws), "HEAD")
+c = pipeline.Checkout("", "o/r", src, ws, "main")
+'''
+
+    def run_body(self, body, repo=True):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for folder in ("config", "state", "logs", "worktrees", "tmp"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            bootstrap = (f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE +
+                         (self.REPO if repo else "") + body)
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertEqual(done.stdout.strip().splitlines()[-1:], ["ok"], done.stdout)
+
+    def test_replay_of_the_incident_clears_after_note_made(self):
+        self.run_body(r'''
+done = [{"state": "done", "attempt": {"workspace": str(ws), "root": str(ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8)))}} for i in range(5)]
+scratch.records = lambda strict=False: done
+made = []
+for i in range(25):
+    root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+    for d in (root, root / "state", root / "config"):
+        d.mkdir(mode=0o700)
+    (root / ".gitignore").write_text("*\n")
+    (root / ("scenario-" + str(i))).write_text("fake")
+    made.append(root)
+assert all(paths.valid_scratch(str(r)) for r in made)
+assert pipeline.scratch_left(ws, [c]) == []
+assert paths.SCRATCH_PREFIX in pipeline.kept_work(ws, [c], src, [])
+pipeline.note_made(ws, [c])
+assert pipeline.kept_work(ws, [c], src, []) == ""
+pipeline.clear_workspace(ws, [c], src, [])
+assert not ws.exists()
+assert list((t / "state/locks").glob("git-*.lock"))
+print("ok")
+''')
+
+    def test_recorded_root_keeps_the_workspace_and_note_made_skips_it(self):
+        self.run_body(r'''
+(t / "via").symlink_to(t)
+spelled = t / "via" / "worktrees" / ws.name
+link = t / "link"
+link.symlink_to(ws)
+lc = pipeline.Checkout("", "o/r", src, link, "main")
+root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+for d in (root, look):
+    d.mkdir(mode=0o700)
+    (d / "fixture.txt").write_text("fake")
+scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(spelled), "root": str(spelled / root.name)}, "diagnostic": {"replacement_retained": str(spelled / root.name)}}]
+assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
+assert pipeline.scratch_left(spelled, [pipeline.Checkout("", "o/r", src, spelled, "main")]) == [spelled / root.name]
+assert pipeline.scratch_left(link, [lc]) == [link]
+for w, k in ((ws, c), (link, lc)):
+    pipeline.note_made(w, [k])
+    made = json.loads(pipeline.made_record(w).read_text())
+    assert not any(n.startswith(root.name) for n in made), w
+    assert any(n.startswith(look.name) for n in made), w
+try:
+    pipeline.clear_workspace(ws, [c], src, [])
+    raise SystemExit("cleared a workspace that holds an engine root")
+except pipeline.RunFailed as e:
+    assert "unresolved or unknown scratch" in e.why and str(root) in e.why, e.why
+assert (root / "fixture.txt").exists() and (look / "fixture.txt").exists()
+print("ok")
+''')
+
+    def test_unreadable_store_keeps_every_prefixed_entry_held(self):
+        self.run_body(r'''
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look.mkdir(mode=0o700)
+(look / "fixture.txt").write_text("fake")
+def unreadable(strict=False):
+    if strict:
+        raise OSError("authority store unreadable")
+    return []
+scratch.records = unreadable
+assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
+pipeline.note_made(ws, [c])
+made = json.loads(pipeline.made_record(ws).read_text())
+assert not any(k.startswith(look.name) for k in made)
+try:
+    pipeline.clear_workspace(ws, [c], src, [])
+    raise SystemExit("cleared a workspace while the store was unreadable")
+except pipeline.RunFailed as e:
+    assert "unresolved or unknown scratch" in e.why and str(look) in e.why, e.why
+assert (look / "fixture.txt").exists()
+print("ok")
+''')
+
+    def test_look_alike_changed_after_note_made_is_named_and_kept(self):
+        self.run_body(r'''
+scratch.records = lambda strict=False: []
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look.mkdir(mode=0o700)
+(look / ".gitignore").write_text("*\n")
+(look / "fixture.txt").write_text("fake")
+pipeline.note_made(ws, [c])
+(look / "fixture.txt").write_text("changed by a person")
+try:
+    pipeline.clear_workspace(ws, [c], src, [])
+    raise SystemExit("removed a look alike that changed after the run")
+except pipeline.RunFailed as e:
+    assert look.name in e.why, e.why
+assert (look / "fixture.txt").read_text() == "changed by a person"
+print("ok")
+''')
+
+    def test_record_that_appears_after_the_first_read_still_holds_its_root(self):
+        self.run_body(r'''
+root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+root.mkdir(mode=0o700)
+reads = []
+def late(strict=False):
+    reads.append(strict)
+    return [] if len(reads) == 1 else [{"state": "done", "attempt": {"workspace": str(ws), "root": str(root)}}]
+scratch.records = late
+assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
+print("ok")
+''')
+
+    def test_unreadable_folder_inside_a_look_alike_keeps_the_workspace(self):
+        self.run_body(r'''
+scratch.records = lambda strict=False: []
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+locked = look / "locked"
+locked.mkdir(parents=True)
+locked.chmod(0)
+try:
+    assert pipeline.scratch_left(ws, [c]) == [locked], pipeline.scratch_left(ws, [c])
+    try:
+        pipeline.clear_workspace(ws, [c], src, [])
+        raise SystemExit("cleared a workspace that could not be read")
+    except pipeline.RunFailed as e:
+        assert "unresolved or unknown scratch" in e.why and str(locked) in e.why, e.why
+finally:
+    locked.chmod(0o700)
+assert locked.is_dir()
+print("ok")
+''')
+
+    def test_cleanup_removes_only_stale_folders_with_no_file_and_no_recorded_root(self):
+        self.run_body(r'''
+empty, recorded, full = (paths.WORKTREES_DIR / n for n in ("empty", "recorded", "full"))
+look, root, kept = (d / (paths.SCRATCH_PREFIX + secrets.token_hex(8)) for d in (empty, recorded, full))
+for d in (look, root, kept):
+    d.mkdir(parents=True)
+(kept / "fixture.txt").write_text("fake")
+scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(recorded), "root": str(root)}}]
+old = time.time() - 8 * 86400
+for d in (empty, recorded, full):
+    os.utime(d, (old, old))
+pipeline.cleanup_worktrees(7)
+assert not empty.exists()
+assert root.is_dir()
+assert (kept / "fixture.txt").exists()
+print("ok")
+''', repo=False)
 
 
 PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
@@ -956,6 +1150,19 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertFalse(self.scratch.pending(self.ws))
         self.assertEqual(pipeline.scratch_left(self.ws, []), [])
         self.attempt()
+
+    def test_look_alike_is_free_and_a_folder_made_again_at_the_recorded_root_is_held(self):
+        a = self.attempt()
+        self.write(a, "out/output.txt", "fake")
+        self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [])
+        self.assertFalse(os.path.lexists(a.root))
+        look = self.ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+        look.mkdir(mode=0o700)
+        (look / ".gitignore").write_text("*\n")
+        self.assertTrue(paths.valid_scratch(str(look)))
+        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        Path(a.root).mkdir(mode=0o700)
+        self.assertEqual(pipeline.scratch_left(self.ws, []), [Path(a.root)])
 
     def retained(self, a, name):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
