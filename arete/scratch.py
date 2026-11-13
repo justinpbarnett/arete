@@ -39,13 +39,14 @@ except KeyError:
     AUTHORITY = paths.NOWHERE
 LEASES: dict[str, int] = {}
 RUN_BASELINES: dict[str, dict[int, int] | None] = {}
+RUN_LABELS: dict[str, dict | None] = {}
+MAX_RECORD_BYTES = 1024 * 1024
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
 IN_GROUP = "in a producer group"
 ORPHAN = "orphan of a producer"
 SUBMITTED = "submitted launchd job"
-UNCLASSIFIED = "unclassified"
+UNCLASSIFIED_HOLDER = "unclassified"
 WAITING = "waiting for registered verification producers to exit; authority revoked"
-APPLE_SERVICES: set[int] = set()
 GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
               "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
 
@@ -129,7 +130,7 @@ def load(fd: int, key: bytes, selector: str) -> dict:
     with os.fdopen(source, "rb") as inp:
         st = os.fstat(source)
         checked(st, identity(st))
-        envelope = json.loads(inp.read(65537))
+        envelope = json.loads(inp.read(MAX_RECORD_BYTES + 1))
     data = envelope["data"]
     if not hmac.compare_digest(envelope["signature"], hmac.digest(key, encoded(data), "sha256").hex()):
         raise ValueError("unauthenticated scratch record")
@@ -182,6 +183,7 @@ def overlap(a: Path, b: Path) -> bool:
 def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
     ws, rd = workspace.resolve(), run_dir.resolve()
     before = RUN_BASELINES[run_id] if run_id in RUN_BASELINES else process_ids()
+    labels = RUN_LABELS.get(run_id) if run_id in RUN_BASELINES else service_labels()
     if before is None:
         raise ConfinementUnavailable("no producer baseline before repository execution")
     if rd.name != run_id or not step or Path(step).name != step:
@@ -199,7 +201,7 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
             run_identity = identity(os.fstat(run_fd))
         data = {"version": 2, "engine": secrets.token_hex(16), "attempt": asdict(a), "run": run_identity,
                 "evidence": [], "state": "initializing", "diagnostic": "",
-                "archives": [], "producers": {}, "before": sorted(before),
+                "archives": [], "producers": {}, "before": sorted(before), "labels": labels,
                 "source_mutations": False, "cleanup_version": 3}
         lease = None
         try:
@@ -423,26 +425,32 @@ def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
     return proc
 
 
-def service_reason(p: Process, current: dict[int, Process], unrelated: set[int], table: launchd.Table) -> str:
-    if p.identity in APPLE_SERVICES:
-        return ""
+def service_labels() -> dict[str, list[str]] | None:
+    return launchd.labels(os.getuid())
+
+
+def service_reason(p: Process, current: dict[int, Process], unrelated: set[int], table: launchd.Table,
+                   labels: dict | None) -> str:
     try:
         job = table.job(p.pid, launchd.bundled(p.executable))
     except launchd.Unreadable:
-        return UNCLASSIFIED
+        return UNCLASSIFIED_HOLDER
     if job is None:
         return ORPHAN
     if not launchd.sealed(job.path):
         return SUBMITTED
+    if not job.domain.startswith("pid/"):
+        if not isinstance(labels, dict):
+            return UNCLASSIFIED_HOLDER
+        if job.label not in labels.get(job.domain.split("/")[0], ()):
+            return SUBMITTED
     if (identity_of(p.pid) != p.identity or not launchd.sealed(p.executable)
             or not launchd.runs(job.path, p.executable)):
-        return UNCLASSIFIED
+        return UNCLASSIFIED_HOLDER
     if job.domain.startswith("pid/"):
         owner = current.get(int(job.domain[4:]))
         if owner is None or owner.identity not in unrelated or identity_of(owner.pid) != owner.identity:
-            return UNCLASSIFIED
-        return ""
-    APPLE_SERVICES.add(p.identity)
+            return UNCLASSIFIED_HOLDER
     return ""
 
 
@@ -471,7 +479,7 @@ def live_groups(data: dict) -> list[int] | None:
 
 
 def holders(data: dict) -> list[dict]:
-    unknown_holder = {"pid": 0, "name": "unknown", "reason": UNCLASSIFIED}
+    unknown_holder = {"pid": 0, "name": "unknown", "reason": UNCLASSIFIED_HOLDER}
     if "producers" not in data or "before" not in data:
         return [unknown_holder]
     groups = live_groups(data)
@@ -487,30 +495,26 @@ def holders(data: dict) -> list[dict]:
         while descendants := {i for i, p in current.items() if p.parent in unrelated} - unrelated:
             unrelated.update(descendants)
         exempt = {i for i, p in current.items() if p.parent == 0 and i not in unrelated and i not in why
-                  and not service_reason(p, by_pid, unrelated, table)}
+                  and not service_reason(p, by_pid, unrelated, table, data.get("labels"))}
         if not exempt:
             break
         unrelated.update(exempt)
     rest = [i for i in current if i not in unrelated and i not in why]
     for i in rest:
         if current[i].parent == 0:
-            why[i] = service_reason(current[i], by_pid, unrelated, table) or UNCLASSIFIED
+            why[i] = service_reason(current[i], by_pid, unrelated, table, data.get("labels")) or UNCLASSIFIED_HOLDER
     rest = [i for i in rest if i not in why]
     while rest:
         placed = [i for i in rest if current[i].parent in why or current[i].parent not in current]
         for i in placed:
-            why[i] = why.get(current[i].parent, UNCLASSIFIED)
+            why[i] = why.get(current[i].parent, UNCLASSIFIED_HOLDER)
         if not placed:
             placed = rest
             for i in rest:
-                why[i] = UNCLASSIFIED
+                why[i] = UNCLASSIFIED_HOLDER
         rest = [i for i in rest if i not in placed]
     held.extend(holder(current[i], reason) for i, reason in why.items())
     return sorted(held, key=lambda h: h["pid"])
-
-
-def producers_done(data: dict) -> bool:
-    return not holders(data)
 
 
 def holding(a: Attempt) -> list[dict]:
@@ -521,7 +525,7 @@ def holding(a: Attempt) -> list[dict]:
     return []
 
 
-def named(held: list[dict]) -> str:
+def named_holders(held: list[dict]) -> str:
     return ", ".join(f"pid {h['pid']} {h['name']} ({h['reason']})" for h in held)
 
 
@@ -535,10 +539,6 @@ def blocking_holders(a: Attempt) -> list[dict] | None:
                 blocked = True
                 found.extend(held)
     return found if blocked else None
-
-
-def workspace_busy(a: Attempt) -> bool:
-    return blocking_holders(a) is not None
 
 
 def isolation(a: Attempt, which: str, remote: bool, add_dirs=(), mcp_config: str = "") -> bool:

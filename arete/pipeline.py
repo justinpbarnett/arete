@@ -1158,6 +1158,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         producer_baseline = scratch.process_ids()
     except OSError:
         producer_baseline = None
+    service_labels = scratch.service_labels()
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
@@ -1212,6 +1213,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
             scratch.RUN_BASELINES[run_id] = producer_baseline
+            scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
@@ -2882,7 +2884,7 @@ def settle_abandoned_runs(cfg: config.Config) -> None:
 
 def retained_line(step: str, attempt: scratch.Attempt) -> str:
     line = f"{step}: retained unresolved scratch at {attempt.root}, and with it the worktree"
-    held = scratch.named(scratch.holding(attempt))
+    held = scratch.named_holders(scratch.holding(attempt))
     return f"{line}; held by {held}" if held else line
 
 

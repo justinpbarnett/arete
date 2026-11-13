@@ -55,6 +55,29 @@ def running(text: str) -> dict[int, list[str]] | None:
     return found
 
 
+def listed(text: str) -> list[str] | None:
+    rows = block(text, "services")
+    if rows is None:
+        return None
+    found = set()
+    for row in rows:
+        parts = row.split(None, 2)
+        if len(parts) == 3:
+            found.add(parts[2].strip())
+    return sorted(found)
+
+
+def labels(uid: int) -> dict[str, list[str]] | None:
+    found = {}
+    for kind in ("gui", "user"):
+        text = printed(f"{kind}/{uid}")
+        names = None if text is None else listed(text)
+        if names is None:
+            return None
+        found[kind] = names
+    return found
+
+
 def pid_domains(text: str) -> list[str]:
     return [row.strip() for row in block(text, "subdomains") or [] if re.fullmatch(r"pid/\d+", row.strip())]
 

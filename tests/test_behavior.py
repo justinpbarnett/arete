@@ -337,7 +337,7 @@ class VerificationOutputTests(unittest.TestCase):
             self.skipTest("needs APFS")
         (self.root / "home").mkdir()
         for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
-                      mock.patch.object(scratch, "producers_done", return_value=True)):
+                      mock.patch.object(scratch, "holders", return_value=[])):
             patch.start()
             self.addCleanup(patch.stop)
         self.ws = self.root / "worktrees/ticket"
