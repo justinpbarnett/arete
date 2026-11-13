@@ -7,7 +7,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, jev, paths, runner, state, tracker, triage, util, verdicts
+from . import config, gh, jev, paths, research_plan, runner, state, tracker, triage, util, verdicts
+from .agent import Result
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import fill_template, make_worktree, prompt, remove_worktree, slug
 
@@ -15,6 +16,8 @@ REPORTS_DIR = paths.STATE_DIR / "research"
 TOOLS = [*runner.READ_TOOLS, "WebSearch", "WebFetch"]
 TIMEOUT_SECONDS = 40 * 60
 BUDGET_USD = 5.0
+REPORT_RESERVE_USD = 4.0
+REPORT_RESERVE_SECONDS = 30 * 60
 SCHEMA = {
     "type": "object",
     "properties": {"summary": {"type": "string"}, "report": {"type": "string"}, "name": {"type": "string"}},
@@ -376,6 +379,27 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
             + "\n\n".join(parts))
 
 
+def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dirs: list,
+           family: list[str]) -> tuple[Result, float]:
+    budget = research_plan.Budget(BUDGET_USD, TIMEOUT_SECONDS, REPORT_RESERVE_USD, REPORT_RESERVE_SECONDS)
+    planned = research_plan.plan(cfg, budget, prompt("research_plan", **values), cwd, add_dirs, ref, family)
+    if not planned.plan:
+        return Result(ok=False, error=planned.error), budget.spent_usd
+    plan = planned.plan
+    print(f"{util.iso()} {ref}: " + (
+        f"planned {util.count(len(plan['tasks']), 'search task')} (try {planned.tries})" if plan["needs_search"]
+        else f"planned no search: the reports for {', '.join(plan['covered_by'])} cover it"), flush=True)
+    usd, seconds = budget.final()
+    if budget.short(usd, seconds):
+        return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
+                                      "so no report was written"), budget.spent_usd
+    tools = TOOLS if plan["needs_search"] else runner.READ_TOOLS
+    res = budget.call(prompt("research", **values, **where) + "\n\n" + research_plan.brief(plan), cwd, usd, seconds,
+                      model=cfg.model("research"), tools=tools, allowed_tools=tools, json_schema=SCHEMA,
+                      add_dirs=add_dirs, trace=("", f"research {ref} report"), cfg=cfg)
+    return res, budget.spent_usd
+
+
 def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = False) -> tuple[str, str]:
     ref = r["ref"]
     base = {"source": r["source"], "title": r["title"], "url": r["url"], "updated": r["updated"],
@@ -431,41 +455,47 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     filed_path = kept_path(h, prior)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"{util.iso()} {ref}: researching", flush=True)
-    res = runner.run(prompt("research", ref=ref, title=r["title"], ticket=text, related=related(src, r, done),
-                            repos="\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none",
-                            **filing(h, filed_path)),
-                     dirs[0] if dirs else REPORTS_DIR, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
-                     json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
-                     timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"), cfg=cfg)
+    values = {"ref": ref, "title": r["title"], "ticket": text, "related": related(src, r, done),
+              "repos": "\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none"}
+    cwd = dirs[0] if dirs else REPORTS_DIR
+    if cfg.research_planner:
+        res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:], [o["ref"] for _, o, _ in done])
+    else:
+        res = runner.run(prompt("research", **values, **filing(h, filed_path)),
+                         cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
+                         json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
+                         timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),
+                         cfg=cfg)
+        paid = res.paid_usd
     answer = res.structured if res.ok and isinstance(res.structured, dict) else {}
     report = str(answer.get("report") or "").strip()
     if not report:
         why = util.first_line(res.error or "the agent gave no report")
-        state.research_set(ref, status=FAILED, error=why, cost=res.paid_usd)
+        state.research_set(ref, status=FAILED, error=why, cost=paid)
         move(cfg, r, "failed")
         return FAILED, why
     summary = " ".join(str(answer.get("summary") or "").split())
     if not h:
         report_file(ref).write_text(f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} "
-                                    f"({util.paid_note(res.paid_usd)}).\n\n**Summary:** {summary}\n\n{report}\n")
-        state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=res.paid_usd,
+                                    f"({util.paid_note(paid)}).\n\n**Summary:** {summary}\n\n{report}\n")
+        state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=paid,
                            ticket=said, basis=basis, filed_path="", filed_url="")
         settle_status(cfg, r)
-        return DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(res.paid_usd)})"
+        return DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(paid)})"
     titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
     report_file(ref).write_text(f"{titled.rstrip()}\n")
     try:
         filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
     except RuntimeError as e:
-        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=res.paid_usd,
+        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=paid,
                            summary=summary, report=TITLE_LINE.sub("", titled, count=1))
         move(cfg, r, "failed")
         return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
     state.research_set(ref, status=DONE, summary=summary, report=TITLE_LINE.sub("", titled, count=1), error="",
-                       cost=res.paid_usd, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
+                       cost=paid, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
     ok, why = file_in_home(cfg, h, r)
     settle_status(cfg, r)
-    return DONE if ok else FAILED, f"{why} ({util.paid_note(res.paid_usd)})"
+    return DONE if ok else FAILED, f"{why} ({util.paid_note(paid)})"
 
 
 def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:

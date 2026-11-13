@@ -9,9 +9,9 @@ from typing import Literal
 from . import paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research", "explain")
+               "classify", "loop", "session", "research", "research_plan", "explain")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
-                   "research": "opus", "explain": "haiku"}
+                   "research": "opus", "research_plan": "opus", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
 STEP_NAMES = (*MODEL_ROLES, *STEP_ALIASES)
 STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
@@ -167,6 +167,7 @@ class Config:
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
+    research_planner: bool = False
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -295,6 +296,16 @@ def replay_table(data) -> ReplayConfig:
     if bad := sorted(set(table) - set(REPLAY_KEYS)):
         raise ValueError(f"[replay]: unknown key {', '.join(bad)}; use {', '.join(REPLAY_KEYS)}")
     return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
+
+
+def research_table(data) -> bool:
+    table = table_of(data, "research")
+    if bad := sorted(set(table) - {"planner"}):
+        raise ValueError(f"[research]: unknown key {', '.join(bad)}; use planner")
+    planner = table.get("planner", False)
+    if type(planner) is not bool:
+        raise ValueError(f"[research] planner must be true or false, not {planner!r}")
+    return planner
 
 
 def variable_names(value, where: str) -> tuple[str, ...]:
@@ -439,6 +450,7 @@ def load(path: Path | None = None) -> Config:
         )
     cfg.replay = replay_table(data.get("replay") or {})
     cfg.mcp = mcp_tables(data.get("mcp") or {})
+    cfg.research_planner = research_table(data.get("research") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     from . import steps
     steps.check(cfg, defer_tiers=True)

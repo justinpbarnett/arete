@@ -90,7 +90,7 @@ def cmd_status(args) -> int:
     snap = board.snapshot(recent_runs=args.limit)
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
-    print("models:" + "".join(f"\n  {role:<10} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
+    print("models:" + "".join(f"\n  {role:<13} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
     show(snap["checks"], "the heartbeat", print_checks)
