@@ -543,6 +543,7 @@ def unexamined(ws: Path, examined: set[Path]) -> list[str]:
     for root, dirs, files in os.walk(ws):
         dirs[:] = [d for d in dirs if Path(root, d) not in examined]
         found += [Path(root, f).relative_to(ws).as_posix() for f in files]
+        found += [Path(root, d).relative_to(ws).as_posix() for d in dirs if Path(root, d).is_symlink()]
     return sorted(found)
 
 
@@ -733,6 +734,12 @@ def lines_by_file(staged: Staged, top: int = 12) -> str:
 
 def untracked_files(wt: Path) -> set[str]:
     return set(util.git_records(["ls-files", "--others", "--exclude-standard"], wt))
+
+
+def ignored_state(wt: Path) -> dict[str, str]:
+    names = util.git_records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt)
+    return {n: fingerprint(wt / n, "") for n in names
+            if not (Path(n).parent.name == "__pycache__" and Path(n).suffix == ".pyc")}
 
 
 def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
@@ -1900,6 +1907,7 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
     feedback = "this is the first attempt"
     for n in range(1, tries + 1):
         untracked_before = untracked_files(c.wt)
+        ignored_before = ignored_state(c.wt)
         previous = run.sessions.get("build")
         text = prompt("resolve", repo=run.repo.name, github=c.github, base=c.origin_base,
                       base_commit=c.base_commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
@@ -1926,7 +1934,11 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
         for name in untracked_files(c.wt) - untracked_before:
             if Path(name).parent.name == "__pycache__" and Path(name).suffix == ".pyc":
                 remove_untracked(c.wt, name)
-        touched = set(util.git_records(["diff", "--name-only"], c.wt)) | (untracked_files(c.wt) - untracked_before)
+        ignored_after = ignored_state(c.wt)
+        changed_ignored = {n for n in ignored_before.keys() | ignored_after.keys()
+                           if ignored_before.get(n) != ignored_after.get(n)}
+        touched = (set(util.git_records(["diff", "--name-only"], c.wt)) | (untracked_files(c.wt) - untracked_before)
+                   | changed_ignored)
         if outside := sorted(touched - set(conflicts)):
             raise RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
         if left := marked(c.wt, conflicts):
