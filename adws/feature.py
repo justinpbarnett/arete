@@ -1,4 +1,5 @@
 from arete import factory
+from arete.pipeline import round_name
 from arete.flows import BUILD, REVIEW_FIX, end_dry_run, ended, finish, step
 
 
@@ -23,12 +24,16 @@ def built(flow, first):
         step(flow, "learn", tree=ws, apply=False)
         return finish(flow, "failed", why=f"checks still failing after {attempt} attempts")
     step(flow, "verify", tree=ws)
-    if not (outcome := step(flow, "review")).passed:
-        step(flow, "implement", tree=ws, round=REVIEW_FIX, feedback=outcome.feedback)
-        if not (outcome := step(flow, "checks", tree=ws, after="the review fixes")).passed:
-            return finish(flow, "failed", why="the checks failed after the review fixes", detail=outcome.feedback)
-        step(flow, "verify", tree=ws)
-        step(flow, "review", second=True)
+    reviews = max(1, job.run.settings("review").tries)
+    n, outcome = 1, step(flow, "review", attempt=1, tries=reviews)
+    while not outcome.passed and n < reviews:
+        if outcome.feedback:
+            step(flow, "implement", tree=ws, round=round_name(REVIEW_FIX, n), feedback=outcome.feedback)
+            if not (checked := step(flow, "checks", tree=ws, after="the review fixes")).passed:
+                return finish(flow, "failed", why="the checks failed after the review fixes", detail=checked.feedback)
+            step(flow, "verify", tree=ws)
+        n += 1
+        outcome = step(flow, "review", attempt=n, tries=reviews)
     step(flow, "learn", tree=ws, apply=True)
     if job.run.dry_run:
         return end_dry_run(flow)

@@ -1043,6 +1043,12 @@ def cmd_resume(args) -> int:
     return client.say("POST", client.run_path(args.run_id, "resume"), {"step": args.step} if args.step else {})
 
 
+def cmd_repair(args) -> int:
+    from . import client
+
+    return client.say("POST", client.run_path(args.run_id, "repair"), {})
+
+
 def cmd_step(args) -> int:
     from urllib.parse import quote
 
@@ -1305,6 +1311,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_id")
     p.add_argument("--step", default="", help="run this step and every step after it again")
     p.set_defaults(fn=cmd_resume)
+
+    p = steering(sub.add_parser("repair", help="repair the open held PR of a run from its saved internal review, "
+                                               "through the server"))
+    p.add_argument("run_id")
+    p.set_defaults(fn=cmd_repair)
 
     p = steering(sub.add_parser("step", help="run one step of a run that ended alone, through the server"))
     p.add_argument("run_id")
