@@ -337,6 +337,7 @@ class Run(AgentRun):
     path: str = ""
     alone: bool = False
     facts: dict = field(default_factory=dict)
+    repairs: str = ""
 
     @property
     def ref(self) -> str:
@@ -352,13 +353,15 @@ class Run(AgentRun):
 
     @property
     def failed_state(self) -> str:
-        return "pr" if self.feedback else "failed"
+        return "pr" if self.feedback or self.repairs else "failed"
 
     @property
     def retry_hint(self) -> str:
         if self.feedback:
             return (f"Comment on the PR again to retry: a submitted review starts at once, a comment after "
                     f"{FEEDBACK_QUIET_MINUTES} quiet minutes")
+        if self.repairs:
+            return f"Continue it with `arete resume {self.id}`"
         return f"Remove `{self.tracker.label_name('failed')}` to retry"
 
     def enter(self, status: str) -> None:
@@ -761,6 +764,7 @@ class Script:
     only: str = ""
     overrides: dict[str, dict] = field(default_factory=dict)
     again: str = ""
+    repairs: str = ""
 
     @property
     def run_fields(self) -> dict:
@@ -809,6 +813,9 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
         adw = False
     if not adw:
         return [sys.executable, "-m", "arete.cli", "run", repo_name, str(tid), "--local", *flags]
+    newest = state.ticket_runs(repo_name, str(tid), limit=1, whole=True)
+    if newest and newest[0]["status"] == "interrupted" and repaired_by(newest[0]["id"]):
+        return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
     return script_command(cfg, name, repo_name, str(tid), *flags)
 
@@ -823,7 +830,13 @@ def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
     os.execv(command[0], command)
 
 
-def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script) -> str:
+def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script, dry_run: bool = False) -> str:
+    if script.repairs:
+        if script.continues or script.only or script.again or dry_run:
+            return "--repair does not go with --continue, --only, --from or --dry-run"
+        row = state.run_get(script.repairs) or {}
+        if (row.get("repo"), str(row.get("issue"))) != (repo.name, str(tid)):
+            return f"--repair {script.repairs}: no run of {repo.name} {tid} has that id"
     if script.again and not script.continues:
         return "--from needs --continue"
     if script.again and script.only:
@@ -879,7 +892,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         return 1
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
-    if script and (refusal := script_refusal(cfg, repo, tid, script)):
+    if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
         print(refusal)
         return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
@@ -888,6 +901,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        if script and script.repairs and (later := state.later_run(repo.name, tid, script.repairs)):
+            print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
+            return 1
         with util.lock(SLOTS_LOCK, wait=True):
             slot = RunSlot(repo.name, str(tid), cfg.max_parallel)
             if not dry_run:
@@ -899,13 +915,18 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             only = script.only if script else ""
             earlier = [] if only else state.ticket_runs(repo.name, tid, limit=1, whole=True)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
+            mending = (script.repairs or repaired_by(script.continues or (earlier[0]["id"] if restarting else ""))
+                       ) if script else ""
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=pending_feedback(repo.name, tid),
+                      feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
                       **(script.run_fields if script else {}))
             run.dir.mkdir(parents=True, exist_ok=True)
+            if mending:
+                lines.write(run_id, "repair", source=mending)
+                run.log(f"repairing the review findings of run {mending}")
         opening_waits(run_id, run.answering,
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
         if restarting:
@@ -965,7 +986,8 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple
     extra = f"\n\n{detail.strip()}" if detail.strip() else ""
     if builder_said.strip():
         extra += f"\n\n### What the builder said\n\n{builder_said.strip()[:4000]}"
-    task = "apply your feedback" if run.feedback else "finish this one"
+    task = ("apply your feedback" if run.feedback else "repair the review findings" if run.repairs
+            else "finish this one")
     run.say(f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
             f"Mac. {run.retry_hint}.")
     return "failed", why, ""
@@ -988,14 +1010,27 @@ def report_fields(row: dict, facts: dict) -> dict:
     return {"task": str(row.get("issue") or ""), "status": row.get("status") or "",
             "prs": (row.get("pr_url") or "").split(), "summary": row.get("summary") or "",
             "requirements": facts.get("requirements") or [], "assumptions": facts.get("assumptions") or [],
-            "left_for_a_person": facts.get("left_for_a_person") or "",
+            "left_for_a_person": facts.get("left_for_a_person") or "", "held": facts.get("held") or "",
             "review": facts.get("review") or report_review({}), "question": str(asked.get("summary") or ""),
             "steps": factory.tally(row["id"]), "minutes": run_minutes(row),
             "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": lines.wait_minutes(row["id"])}
 
 
+def round_name(name: str, n: int) -> str:
+    return name if n == 1 else f"{name}{n}"
+
+
+def review_findings(review: dict) -> str:
+    return "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
+
+
+def repaired_by(run_id: str) -> str:
+    return str(factory.first(lines.read(run_id), "repair").get("source") or "") if run_id else ""
+
+
 def report_review(review: dict) -> dict:
     return {"verdict": str(review.get("verdict") or ""), "summary": str(review.get("summary") or ""),
+            "unresolved": review.get("verdict") == "request_changes",
             "problems": [{"file": p["file"], "text": p["problem"], "severity": p["severity"]}
                          for p in review_problems(review.get("problems"))]}
 
@@ -1226,18 +1261,18 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     b.require_valid_diff("the build and its fixes", f" (the plan estimated {estimate})" if estimate else "")
 
     verified = verify_in_use(b, goal, build_summary)
+    reviews, n = max(1, run.settings("review").tries), 1
     review = _review(b, plan_to_review, verified)
-    run.facts.update(requirements=verified.requirements(), review=report_review(review))
-    if review.get("verdict") == "request_changes":
-        problems = "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
-        run.story.append(f"Review requested changes:\n{problems}")
-        b.resume("review_fix", prompt("review_fix", problems=problems))
-        b.recheck("the review fixes")
-        verified = verify_in_use(b, goal, build_summary)
-        review = _review(b, plan_to_review, verified, "review2")
-        run.facts.update(requirements=verified.requirements(), review=report_review(review))
-
-    draft_why = draft_reason(review.get("verdict") == "approve", verified)
+    while review.get("verdict") == "request_changes" and n < reviews:
+        if problems := review_findings(review):
+            run.story.append(f"Review requested changes:\n{problems}")
+            b.resume(round_name("review_fix", n), prompt("review_fix", problems=problems))
+            b.recheck("the review fixes")
+            verified = verify_in_use(b, goal, build_summary)
+        n += 1
+        review = _review(b, plan_to_review, verified, round_name("review", n))
+    draft_why = draft_reason(review, verified, n)
+    run.facts.update(requirements=verified.requirements(), review=report_review(review), held=draft_why)
     _learn(run, ws, layer.expertise_file, t.title, expertise, apply=True)
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
@@ -1251,7 +1286,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     subject = fill_template(layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
     pr_report = report_body(run, summary=build_summary, review=review, verified=verified, left=left_for_a_person,
                             images=evidence_images(run, staged.changed[0], verified), approval=approval,
-                            attempts=attempts, checks=checks, plan_text=plan_text, size=size)
+                            attempts=attempts, checks=checks, plan_text=plan_text, size=size,
+                            held=draft_why)
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
@@ -1328,7 +1364,7 @@ def summary_of(review: dict, build_summary: str) -> str:
 
 def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
-                size: str) -> str:
+                size: str, held: str = "") -> str:
     problems = review.get("problems", [])
     return public_text(run, (
         f"## Summary\n\n{summary_of(review, summary)}\n\n"
@@ -1337,10 +1373,12 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
         + "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems)
+        + (f"\n\nHeld as a draft: {held}." if held else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else
            f"<details><summary>Plan</summary>\n\n{cut_at_end(plan_text, PLAN_CHARS)}\n\n</details>\n\n")
         + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
+        + (f" Repairs the review findings of run `{run.repairs}`." if run.repairs else "")
     ))
 
 
@@ -1895,15 +1933,21 @@ def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[st
     return images
 
 
-def draft_reason(approved: bool, verified: verify.Verified) -> str:
+def draft_reason(review: dict, verified: verify.Verified, reviews: int = 0) -> str:
     if verified.verdict == "blocked":
         return "the check in use was blocked"
-    return "" if approved else "the review did not approve it"
+    if review.get("verdict") == "approve":
+        return ""
+    if review.get("verdict") == "request_changes" and reviews:
+        return (f"the review still requested changes after {util.count(reviews, 'review')}, the most the review "
+                f"step's tries allow, so {util.count(len(review.get('problems', [])), 'finding')} stay unresolved")
+    return "the review did not approve it"
 
 
-def draft_note(draft_why: str, verified: verify.Verified) -> str:
+def draft_note(draft_why: str, verified: verify.Verified, kept: bool = False) -> str:
     blocked_by = f" {verified.blocked_by}" if verified.verdict == "blocked" else ""
-    return f"\n\nThe new PRs are drafts: {draft_why}.{blocked_by}".rstrip() if draft_why else ""
+    lead = "The PR stays a draft" if kept else "The new PRs are drafts"
+    return f"\n\n{lead}: {draft_why}.{blocked_by}".rstrip() if draft_why else ""
 
 
 def check_list(layer: config.RepoLayer) -> str:
