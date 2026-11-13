@@ -1120,8 +1120,16 @@ The certificate and key are `dashboard.crt` and `dashboard.key` in the state fol
 The first fetch makes Tailscale issue a public certificate, which lists the tailnet name in certificate transparency logs.
 Plain HTTP on the same port answers 308 and redirects to HTTPS, so webhooks should use the HTTPS address.
 Admission is the same over HTTPS: the host must be the tailnet name or address, the login must be the owner's, and a change needs `X-Arete`.
-When `tailscale cert` cannot run, as under the sandboxed macOS app, arete asks `tailscale serve` to answer HTTPS on the same port and listens on 127.0.0.1 only, trusting Tailscale's login header from loopback alone; plain HTTP then gets Tailscale's own refusal.
-When that fails too, the dashboard serves plain HTTP as before and tries for a certificate again every hour.
+When `tailscale cert` cannot run, as under the sandboxed macOS app, arete falls back to `tailscale serve`, and only ever changes a mapping it made itself.
+It reserves its listener first, writes `dashboard-proxy-PORT.json` in the state folder before it asks for the mapping, and completes that record from `tailscale serve status`.
+It never uses, replaces or removes a mapping it did not record, and when the port already has one it serves plain HTTP.
+Its own mapping stays when the dashboard stops, and the next start on that port reuses it.
+It removes the mapping only when a certificate is ready for a dashboard on that port and every mapping on the port is its own; otherwise remove it by hand with `tailscale serve --https=PORT off`.
+A dashboard moved to another port therefore leaves the old mapping and its record where they were.
+While its mapping is, or may be, on the port the dashboard keeps listening on 127.0.0.1 only, trusting Tailscale's login header from loopback alone.
+A second dashboard on the same state folder and port waits and changes nothing.
+On scratch state the dashboard asks for no certificate and changes no mapping.
+When the fallback fails too, the dashboard serves plain HTTP as before and tries for a certificate again every hour.
 Over HTTPS the page can be added to the Home Screen of a phone, where it opens as the app Arete without browser chrome.
 
 A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find and Console.
@@ -1225,7 +1233,7 @@ Each of these commands makes one call to the server and prints JSON and nothing 
 | `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
 
-They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, scheme, tailnet name, process id, state folder and config file to `server.json` in the state folder; over HTTPS the commands verify the certificate against that name. The commands call that server while its process is alive, it works on the same state folder and config file as they do, and its address answers within a second; when it does not answer, a command says so and names `arete serve` and `ARETE_SERVER`. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check; a plain HTTP address follows the dashboard's redirect to HTTPS. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
+They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, scheme, tailnet name, process id, state folder and config file to `server.json` in the state folder; over HTTPS the commands verify the certificate against that name. The commands call that server while its process is alive, it works on the same state folder and config file as they do, and its address answers within a second; when it does not answer, a command says so and names `arete serve` and `ARETE_SERVER`. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check; a plain HTTP address follows the dashboard's redirect to HTTPS. Behind `tailscale serve`, `server.json` names the loopback listener and the owner's login, and the commands call it there with the tailnet name as host, so any process on the machine is trusted as the owner. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
 
 A failed command prints one line with `error` and no `event`, with `code` when the server answered with an HTTP status, and exits 1. A command line these commands cannot parse, such as a missing argument or an unknown flag, prints one line with `error` and `usage` and exits 1. A `step_end` line or a step row with an `error` field is a step's error, not the command's. When no server works on the state, the readers (`task show`, `lines` and `status --json`) read the local state instead, and the others print one `error` line and exit 1. When a stream of lines drops, as it does when serve restarts on new code, `wait`, `lines --follow` and `arete run` connect again and go on from the last line they read. They give up with an `error` line when the run ended with no `report` line, or when no line came for 2 minutes.
 

@@ -14,6 +14,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from . import config, lines, paths, util
 
 ENV = "ARETE_SERVER"
+IDENTITY_HEADER = "Tailscale-User-Login"
 CONNECT_SECONDS = 5
 PROBE_SECONDS = 1
 CALL_SECONDS = 120
@@ -39,6 +40,7 @@ class Server:
     host: str
     port: int
     name: str
+    login: str = ""
 
 
 def named_server(wanted: str) -> Server:
@@ -66,13 +68,22 @@ def server() -> Server:
     addresses = [str(a) for a in found["addresses"]]
     scheme = found.get("scheme") or "http"
     host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
-    here = Server(scheme, host, port, found.get("host") or host)
+    here = Server(scheme, host, port, found.get("host") or host, str(found.get("login") or ""))
     try:
         socket.create_connection((host, port), timeout=PROBE_SECONDS).close()
     except OSError as e:
         raise Down(f"the arete server named in {where} does not answer on {address(here)} ({e}); start it "
                    f"with `arete serve`, or set {ENV}") from None
     return here
+
+
+def headers_for(where: Server) -> dict[str, str]:
+    headers = {"X-Arete": "1"}
+    if where.scheme == "http" and where.name != where.host:
+        headers["Host"] = f"{where.name}:{where.port}"
+    if where.login:
+        headers[IDENTITY_HEADER] = where.login
+    return headers
 
 
 def address(where: Server) -> str:
@@ -124,13 +135,14 @@ def moved_to(resp: http.client.HTTPResponse, where: Server) -> Server | None:
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS) -> http.client.HTTPResponse:
     where = server()
-    headers, payload = {"X-Arete": "1"}, None
-    if method == "POST":
-        headers["Content-Type"], payload = "application/json", json.dumps(body or {}).encode()
+    payload = json.dumps(body or {}).encode() if method == "POST" else None
     followed = False
     while True:
         conn = connect(where)
         conn.sock.settimeout(read_seconds)
+        headers = headers_for(where)
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
         try:
             conn.request(method, path, payload, headers)
             resp = conn.getresponse()

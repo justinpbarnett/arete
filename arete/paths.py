@@ -238,6 +238,10 @@ def short_path(p: str | Path) -> str:
     return "~/" + s[len(below_home):] if s.startswith(below_home) else s
 
 
+def proxy_file(port: int) -> Path:
+    return STATE_DIR / f"dashboard-proxy-{port}.json"
+
+
 def scratch_dir(run_id: str) -> Path:
     return RUNS_DIR / run_id / "scratch"
 
