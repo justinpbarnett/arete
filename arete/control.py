@@ -299,7 +299,7 @@ def paid_since(since: str, connect=state.db, cfg: config.Config | None = None) -
     total = 0.0
     cfg = cfg or config.load()
     for s in state.steps_since(since, connect, paid_only=True):
-        if billing_of(s, cfg) == "local":
+        if billing_of(s, cfg) in ("local", "replay"):
             continue
         cost = s["cost_usd"] or 0
         total += cost

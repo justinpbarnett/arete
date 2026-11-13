@@ -486,7 +486,7 @@ def paid_by_run(run_ids: list[str], connect=db, local_providers=None) -> dict[st
         rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "
                          f"WHERE run_id IN ({','.join('?' * len(run_ids))}) AND {PAID_STEP}", run_ids)
         for r in rows:
-            if not local_step(dict(r), local_providers):
+            if not unbilled_step(dict(r), local_providers):
                 paid[r[0]] = paid.get(r[0], 0.0) + float(r["cost_usd"] or 0)
     return {k: round(v, 6) for k, v in paid.items()}
 
@@ -906,6 +906,10 @@ def local_step(step: dict, local_providers) -> bool:
     return mode == "local" or (step.get("runner") == "pi" and mode != "subscription" and provider in local_providers)
 
 
+def unbilled_step(step: dict, local_providers) -> bool:
+    return step.get("runner") == "replay" or local_step(step, local_providers)
+
+
 def loop_spent_since(since: str, loop: str | None = None, local_providers=()) -> float:
     q = ("SELECT steps.cost_usd, steps.runner, steps.provider, steps.model, steps.auth_mode FROM steps "
          f"JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop' AND {PAID_STEP}")
@@ -914,7 +918,8 @@ def loop_spent_since(since: str, loop: str | None = None, local_providers=()) ->
         q += " AND r.loop = ?"
         args.append(loop)
     with db() as c:
-        return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args) if not local_step(dict(r), local_providers))
+        return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args)
+                   if not unbilled_step(dict(r), local_providers))
 
 
 def hold(scope: str, until: str, why: str, connect=db) -> None:
