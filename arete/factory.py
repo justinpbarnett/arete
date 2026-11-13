@@ -103,15 +103,25 @@ def fingerprint(folder: Path | str) -> str:
     found = util.sh(["git", "rev-parse", "--git-path", "index"], cwd=where)
     if found.returncode != 0:
         return ""
-    with tempfile.TemporaryDirectory() as tmp:
-        index, real = Path(tmp) / "index", where / found.stdout.strip()
+    try:
+        handle, name = tempfile.mkstemp(prefix="arete-index-")
+    except OSError:
+        return ""
+    os.close(handle)
+    index, real = Path(name), where / found.stdout.strip()
+    try:
         if real.is_file():
             shutil.copyfile(real, index)
+        else:
+            index.unlink()
         env = {"GIT_INDEX_FILE": str(index)}
         if util.sh(["git", "add", "-A"], cwd=where, env=env).returncode != 0:
             return ""
         tree = util.sh(["git", "write-tree"], cwd=where, env=env)
         return tree.stdout.strip() if tree.returncode == 0 else ""
+    finally:
+        index.unlink(missing_ok=True)
+        index.with_name(index.name + ".lock").unlink(missing_ok=True)
 
 
 def first(read: list[dict], event: str) -> dict:
@@ -385,7 +395,7 @@ def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
             int(value) if key in config.STEP_COUNTS and value.isdigit()
             else float(value) if key in config.STEP_AMOUNTS and value.replace(".", "", 1).isdigit()
             else [v for v in value.split(",") if v] if key in config.STEP_LISTS
-            else value == "true" if key == "structured_output" and value in ("true", "false") else value)
+            else value == "true" if key in ("structured_output", "directory_cleanup") and value in ("true", "false") else value)
     return config.step_tables(table, "--set")
 
 
