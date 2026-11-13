@@ -218,7 +218,8 @@ class Flow:
                  labels: Callable[[str, dict], dict] | None = None, again: str = "",
                  restore: Callable[[dict], str] | None = None, refusal: str = "",
                  hold: Callable[[str], str] | None = None, renew: str = "",
-                 keeps: Callable[[str, dict], bool] | None = None) -> None:
+                 keeps: Callable[[str, dict], bool] | None = None,
+                 stepped: list[list[dict]] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         if again and again not in STEPS:
@@ -235,6 +236,7 @@ class Flow:
         self.tries = tries_in([lines.read(run_id), *chained])
         self.last_prints = {str(line["tree"]): str(line.get("fingerprint") or "")
                             for line in self.earlier if line.get("tree")}
+        self.restamped = self.restamps(stepped or [])
         self.prints: dict[str, str] = {}
         self.renew, self.keeps = renew, keeps or (lambda name, kw: False)
         self.carrying, self.carry = False, 0
@@ -280,10 +282,26 @@ class Flow:
         finally:
             self.done = self.done or name == self.only
 
+    def restamps(self, stepped: list[list[dict]]) -> dict[int, str]:
+        newest = max((str(line.get("ts") or "") for line in self.earlier), default="")
+        found: dict[int, str] = {}
+        for read in stepped:
+            step = str(first(read, "route").get("only") or "")
+            last = max((i for i, line in enumerate(self.earlier) if line.get("step") == step), default=-1)
+            for line in ends(read):
+                if line.get("tree") and str(line.get("ts") or "") >= newest:
+                    for i in range(last + 1):
+                        if self.earlier[i].get("tree") == line["tree"]:
+                            found[i] = str(line.get("fingerprint") or "")
+        return found
+
+    def expected(self, index: int, tree: str) -> str:
+        return self.restamped.get(index, self.last_prints.get(tree, ""))
+
     def renewed(self, name: str, args: tuple, kw: dict) -> Outcome:
         line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         tree = str(line.get("tree") or "")
-        now, then = self.print_of(kw.get("tree") or tree) if tree else "", self.last_prints.get(tree, "")
+        now, then = self.print_of(kw.get("tree") or tree) if tree else "", self.expected(self.at, tree)
         intact = (line.get("step") == name and line.get("result") == "pass" and bool(tree)
                   and (bool(then) and now == then or not then and not now and self.holds_worktrees(line)))
         self.route()
@@ -328,7 +346,7 @@ class Flow:
                               f"ended, and {why}")
         if not self.only and line.get("tree"):
             now = self.print_of(kw.get("tree") or line["tree"])
-            if not now or now != self.last_prints.get(str(line["tree"])):
+            if not now or now != self.expected(self.at, str(line["tree"])):
                 return None
         return outcome_of(line)
 

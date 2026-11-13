@@ -185,9 +185,21 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
     def edit_spec(text):
         with state.db() as c:
             c.execute("UPDATE tasks SET body = ? WHERE id = ?", (text, task))
+    def seed_origin_branch():
+        pipeline.git(["checkout", "-q", "--detach"], src)
+        commit_in_src("seed.txt", "seed", f"HEAD:refs/heads/{branch}")
+        pipeline.git(["checkout", "-q", "main"], src)
     if scenario.startswith(("failed-resume", "failed-again")):
-        layer.write_text(plain.replace("grep -q kumquat", "grep -q quince"))
+        layer.write_text(plain if "late" in scenario else plain.replace("grep -q kumquat", "grep -q quince"))
+        if "pushed" in scenario:
+            seed_origin_branch()
+        if "late" in scenario:
+            from arete import flows
+            real_publish = factory.STEPS["publish"]
+            factory.STEPS["publish"] = lambda flow: flows.end_as("fail", "failed", why="publishing failed after the push")
         failed = forced()
+        if "late" in scenario:
+            factory.STEPS["publish"] = real_publish
         layer.write_text(plain)
         kept_head, last, mid = pipeline.git(["rev-parse", "HEAD"], ws).strip(), failed, {}
         if "unrecorded" in scenario:
@@ -210,17 +222,37 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
                 pass
             mid = state.ticket_runs("replay-sample", task)[0]
             mid["unmoved"] = pipeline.git(["rev-parse", "HEAD"], ws).strip() == before
-        resuming = scenario in ("failed-resume-moved", "failed-resume-only-prepare-moved")
+        quince = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n"
+        if "stepped" in scenario:
+            (replays / "build.patch").write_text(quince)
+            try:
+                factory.main(feature, ["replay-sample", task, "--continue", failed["id"], "--only", "implement"])
+            except SystemExit:
+                pass
+            mid = state.ticket_runs("replay-sample", task)[0]
+            mid["head"] = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+            if scenario.endswith(("-hand", "-forged")):
+                trailer = "\n\nArete-Run: " + mid["id"] if scenario.endswith("-forged") else ""
+                (ws / "hand.txt").write_text("hand\n")
+                pipeline.git(["add", "hand.txt"], ws)
+                pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "hand" + trailer], ws)
+            before = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+        resuming = "stepped" in scenario or scenario in ("failed-resume-moved", "failed-resume-only-prepare-moved")
         if not resuming:
-            (replays / "build.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
-        again = ["--from", "prepare"] if "again-prepare" in scenario else ["--from", "checks"] if resuming else []
+            (replays / "build.patch").write_text(quince)
+        again = (["--from", "prepare"] if "again-prepare" in scenario else ["--from", "pr"] if "late" in scenario
+                 else ["--from", "checks"] if resuming else [])
         row = forced("--continue", last["id"], *again)
         log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
         published = "refs/heads/" + branch in og("for-each-ref", "--format=%(refname)", "refs/heads")
         result = {"failed": failed["summary"], "status": row["status"], "summary": row["summary"], "log": log,
                   "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
-                  "steps": [s["step"] for s in state.steps(row["id"])], "failed_id": failed["id"],
-                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved")},
+                  "steps": [s["step"] for s in state.steps(row["id"])],
+                  "started": [l["step"] for l in __import__("arete.lines", fromlist=["read"]).read(row["id"]) if l.get("event") == "step_start"],
+                  "failed_id": failed["id"],
+                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved", "head")},
+                  "stepped_published": published and bool(mid.get("head")) and pipeline.util.sh(["git", "merge-base", "--is-ancestor", mid["head"], branch], cwd=origin).returncode == 0,
+                  "seed": og("show", f"{branch}:seed.txt") if "pushed" in scenario and published else "",
                   "unmoved": ws.exists() and pipeline.git(["rev-parse", "HEAD"], ws).strip() == before,
                   "moved": og("show", f"{branch}:moved.txt") if "moved" in scenario and published else "",
                   "published": og("show", f"{branch}:notes.txt") if published else "",
@@ -479,6 +511,56 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["moved"], "moved.txt")
         self.assertIn(result["main"], result["head_parents"])
         self.assertNotIn(f"Arete-Run: {result['mid']['id']}", result["trailers"])
+
+    def assert_stepped_edits_published(self, result):
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["mid"]["only_step"], "implement")
+        self.assertEqual(result["mid"]["status"], "step", result["mid"]["summary"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertTrue(result["kept_published"])
+        self.assertTrue(result["stepped_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+        self.assertIn(f"Arete-Run: {result['failed_id']}", result["trailers"])
+        self.assertIn(f"Arete-Run: {result['mid']['id']}", result["trailers"])
+        self.assertNotIn("plan", result["steps"])
+        self.assertNotIn("build", result["steps"])
+
+    def test_resume_after_an_implement_run_alone_publishes_its_kept_edits(self):
+        self.assert_stepped_edits_published(self.workflow("failed-resume-stepped"))
+
+    def test_resume_after_an_implement_run_alone_on_a_pushed_branch_publishes_its_kept_edits(self):
+        result = self.workflow("failed-resume-stepped-pushed")
+        self.assert_stepped_edits_published(result)
+        self.assertEqual(result["seed"], "seed.txt")
+
+    def test_resume_after_an_implement_run_alone_validates_the_changed_code_again(self):
+        result = self.workflow("failed-resume-stepped-late")
+        self.assertIn("publishing failed", result["failed"])
+        self.assertEqual(result["mid"]["status"], "step", result["mid"]["summary"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        for step in ("checks", "verify", "review"):
+            self.assertIn(step, result["started"])
+        self.assertNotIn("plan", result["started"])
+        self.assertNotIn("implement", result["started"])
+        self.assertTrue(result["stepped_published"])
+        self.assertIn("quince", result["published"])
+
+    def test_hand_commit_after_an_implement_run_alone_still_stops_the_resume(self):
+        result = self.workflow("failed-resume-stepped-hand")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("were not made by this run's chain", result["summary"])
+        self.assertEqual(result["steps"], [])
+        self.assertTrue(result["unmoved"])
+        self.assertEqual(result["published"], "")
+
+    def test_forged_trailer_after_an_implement_run_alone_still_stops_the_resume(self):
+        result = self.workflow("failed-resume-stepped-forged")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("preparing again would drop them", result["summary"])
+        self.assertEqual(result["steps"], [])
+        self.assertTrue(result["unmoved"])
+        self.assertEqual(result["published"], "")
 
     def assert_prepared_again_on_the_kept_edits(self, result):
         self.assertIn("checks still failing", result["failed"])
