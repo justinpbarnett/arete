@@ -1213,6 +1213,27 @@ def cmd_replay(args) -> int:
     return 0
 
 
+def cmd_retrieval(args) -> int:
+    import tomllib
+
+    from . import retrieval
+
+    words = list(args.words)
+    if (args.action, len(words)) not in (("sample", 1), ("run", 2)):
+        print("usage: arete retrieval run REPO SUITE [--split S] [--dry-run] [--json] [--out FILE] | sample FOLDER",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print_lines(retrieval.sample(paths.expand(words[0])))
+            return 0
+        return retrieval.run(words[0], words[1], split=args.split, dry_run=args.dry_run, as_json=args.json,
+                             out=args.out)
+    except (retrieval.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError, config.UnknownRepo) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
 def print_lines(lines: Iterable[str], *, flush: bool = False) -> None:
     try:
         for line in lines:
@@ -1490,6 +1511,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("folder")
     p.add_argument("--adw", action="store_true", help="turn on [factory] path = \"adw\" in the sample layer")
     p.set_defaults(fn=cmd_replay)
+
+    p = sub.add_parser("retrieval", help="offline experiment: compare exact, hybrid, embedding and rerank retrieval on "
+                                         "a layer's labeled queries; `retrieval sample FOLDER` writes a fixture")
+    p.add_argument("action", choices=("run", "sample"))
+    p.add_argument("words", nargs="+", help="run: REPO SUITE; sample: FOLDER")
+    p.add_argument("--split", default="", help="keep only the queries of this split (train, validation, holdout)")
+    p.add_argument("--dry-run", action="store_true", help="check the suite and corpus, call no adapter or model")
+    p.add_argument("--json", action="store_true", help="print the results as one JSON line")
+    p.add_argument("--out", default="", help="also write the results JSON to this file")
+    p.set_defaults(fn=cmd_retrieval)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")
