@@ -88,14 +88,15 @@ def run_env(run_id: str) -> dict[str, str]:
     return {"ARETE_RUN_ID": run_id} if run_id else {}
 
 
-def env_names(model: str, run_with: str, cfg: config.Config, repo: config.Repo | None, run_id: str) -> list[str]:
+def env_names(model: str, run_with: str, cfg: config.Config, repo: config.Repo | None, run_id: str,
+              extra: dict | None = None) -> list[str]:
     which, _ = stands_for(model, run_with)
     passing = environment.passed(cfg, repo)
     if which == "pi":
-        return sorted(environment.build(passing))
+        return sorted({*environment.build(passing), *(extra or {})})
     if which == "codex":
-        return sorted(codex.agent_env(passing, run_env(run_id)))
-    return sorted(claude.agent_env(passing, run_env(run_id)))
+        return sorted(codex.agent_env(passing, {**(extra or {}), **run_env(run_id)}))
+    return sorted(claude.agent_env(passing, {**(extra or {}), **run_env(run_id)}))
 
 
 def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: config.Repo | None = None) -> str:
@@ -278,7 +279,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     try_no = try_no or (state.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
     if which == REPLAY:
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
-                   "env": env_names(model, run_with, cfg, repo, trace[0])})
+                   "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
         return attempt(which, name, prompt, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
                        accounts.Auth(), {"launch": 1}, try_no)
     if not target.remote:
@@ -314,7 +315,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
                  "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
                  "position": chosen_route.position, "requested": chosen_route.requested,
-                 "env": launch_env(picked, cfg, repo, trace[0]), "skipped": skipped, "launch": launches}
+                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env")), "skipped": skipped, "launch": launches}
         on_launch(route)
         started = util.iso()
         res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
@@ -558,11 +559,13 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     return kw
 
 
-def launch_env(picked: Picked, cfg: config.Config, repo: config.Repo | None, run_id: str) -> list[str]:
+def launch_env(picked: Picked, cfg: config.Config, repo: config.Repo | None, run_id: str,
+               extra: dict | None = None) -> list[str]:
     if picked.selected:
-        return pi.launch_env_names(picked.selected)
+        return sorted({*pi.launch_env_names(picked.selected), *(extra or {})})
     passing = environment.passed(cfg, repo)
-    return sorted((codex if picked.candidate.runner == "codex" else claude).agent_env(passing, run_env(run_id)))
+    return sorted((codex if picked.candidate.runner == "codex" else claude).agent_env(
+        passing, {**(extra or {}), **run_env(run_id)}))
 
 
 def with_spent(res: Result, earlier: list[Result]) -> Result:
@@ -605,7 +608,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         hidden.extend(selected.hidden)
         hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
                            key=len, reverse=True)
-        header["env"] = pi.launch_env_names(selected)
+        header["env"] = sorted({*pi.launch_env_names(selected), *(kw.get("extra_env") or {})})
         header["provider"] = selected.provider
     def refresh_hidden():
         if selected and selected.using_login:
@@ -691,7 +694,7 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
 
 def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: Callable[[str], None],
                  repo: config.Repo | None) -> dict:
-    kw = {**kw, "extra_env": run_env(run_id)}
+    kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings()
         if runs_bash(kw) and (note := judge_note(cfg, kw["passing"], repo)):
@@ -704,7 +707,7 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
 
 def local_codex(kw: dict, cfg: config.Config, run_id: str, say: Callable[[str], None],
                 repo: config.Repo | None) -> dict:
-    kw = {**kw, "extra_env": run_env(run_id)}
+    kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
         kw["judge"] = True
         if note := judge_note(cfg, kw["passing"], repo):
