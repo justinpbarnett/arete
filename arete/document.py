@@ -17,8 +17,13 @@ CHECK_SAW_CHARS = 300
 TICKET_BODY_CHARS = 4000
 VOICE_LINE_CHARS = 400
 CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
-WARNING_LINE = re.compile(r"^\W*(?:warning|caution|danger|important|prerequisites?|requires?|before you start)\b",
-                          re.IGNORECASE)
+WARNING_LINE = re.compile(r"^\W*(?:warnings?|caution|danger|important|prerequisites?|requires?|before you start|"
+                          r"expected (?:output|result))\b", re.IGNORECASE)
+HEADING = re.compile(r"^ {0,3}(#{1,6})\s")
+FENCE = re.compile(r"^\s*(?:`{3,}|~{3,})")
+UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+INDENTED = re.compile(r"^ {4}")
+LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 HANDLE = re.compile(r"(?<![\w@.])@[A-Za-z0-9_][\w-]*")
 ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 WEEKDAY = re.compile(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE)
@@ -90,16 +95,22 @@ def brief_from(data: dict) -> Brief:
 
 
 def code_in(text: str, *, fenced_only: bool = False, inline_only: bool = False) -> list[str]:
-    found, fence = [], ""
+    found, fence, indented, after_blank = [], "", False, True
     for line in text.splitlines():
         stripped = line.strip()
         marker = re.fullmatch(r"(`{3,}|~{3,})(.*)", stripped)
+        indented = bool(stripped) and not fence and INDENTED.match(line.expandtabs(4)) is not None and (
+            indented or after_blank)
+        after_blank = not stripped
         if fence:
             if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
                     and not marker[2].strip()):
                 fence = ""
             elif stripped and not inline_only:
                 found.append(line)
+        elif indented:
+            if not inline_only:
+                found.append(line.expandtabs(4)[4:].rstrip())
         elif marker and (marker[1][0] == "~" or "`" not in marker[2]):
             fence = marker[1]
         elif not fenced_only:
@@ -107,8 +118,47 @@ def code_in(text: str, *, fenced_only: bool = False, inline_only: bool = False) 
     return found
 
 
+def heading_level(lines: list[str], i: int) -> int:
+    if atx := HEADING.match(lines[i]):
+        return len(atx[1])
+    if (i + 1 < len(lines) and lines[i].strip() and not LIST_MARK.match(lines[i])
+            and (under := UNDERLINE.match(lines[i + 1]))):
+        return 1 if under[1][0] == "=" else 2
+    return 0
+
+
+def block_end(lines: list[str], start: int) -> int:
+    end = start
+    while end < len(lines) and lines[end].strip() and not (end > start and heading_level(lines, end)):
+        end += 1
+    return end
+
+
+def section_end(lines: list[str], start: int) -> int:
+    if level := heading_level(lines, start):
+        end = start + 1
+        while end < len(lines) and not (0 < heading_level(lines, end) <= level):
+            end += 1
+        return end
+    end = block_end(lines, start)
+    if not lines[end - 1].rstrip().endswith(":"):
+        return end
+    while end < len(lines) and not lines[end].strip():
+        end += 1
+    return end if end == len(lines) or heading_level(lines, end) else block_end(lines, end)
+
+
 def warnings_in(text: str) -> list[str]:
-    return [line.strip() for line in text.splitlines() if WARNING_LINE.match(line)]
+    lines, found, i = text.splitlines(), [], 0
+    while i < len(lines):
+        if not WARNING_LINE.match(lines[i]):
+            i += 1
+            continue
+        end = section_end(lines, i)
+        found += [LIST_MARK.sub("", line, count=1).strip() for line in lines[i:end]
+                  if line.strip() and not FENCE.match(line) and not UNDERLINE.match(line)]
+        i = end
+    return [line for line in found if line]
 
 
 def protected(brief: Brief) -> list[str]:
@@ -153,8 +203,27 @@ def voice_lines(files: tuple[str, ...]) -> list[str]:
 def voice_pieces(samples: list[str]) -> list[str]:
     pieces = []
     for line in samples:
-        pieces += [line, line[:VOICE_LINE_CHARS], *SENTENCE_END.split(line)]
+        pieces += [line, *SENTENCE_END.split(line)]
     return pieces
+
+
+def clipped(line: str) -> str:
+    if len(line) <= VOICE_LINE_CHARS:
+        return line
+    space = line.rfind(" ", 0, VOICE_LINE_CHARS + 1)
+    return line[:space].rstrip() if space > 0 else line[:VOICE_LINE_CHARS]
+
+
+def prefix_in(value: str, text: str) -> bool:
+    return re.search(r"(?<![\w@-])" + re.escape(flat(value)), flat(text)) is not None
+
+
+def repeats_voice(samples: list[str], whole: str, known: str) -> bool:
+    if any(piece.strip() and supplied_in(piece, whole) and not supplied_in(piece, known)
+           for piece in voice_pieces(samples)):
+        return True
+    return any(len(line) > VOICE_LINE_CHARS and prefix_in(clipped(line), whole)
+               and not prefix_in(clipped(line), known) for line in samples)
 
 
 def plain_code_in(span: str, text: str) -> bool:
@@ -182,9 +251,7 @@ def faults(brief: Brief, text: str, samples: list[str], title: str = "") -> list
         found += [f"left out the {name}, {value}" for name in SUPPLIED if (value := getattr(brief, name))
                   and not supplied_in(value, text)]
     found += [f"names {t}, which the brief does not supply" for t in invented(brief, whole)]
-    known = brief_text(brief)
-    if any(piece.strip() and supplied_in(piece, whole) and not supplied_in(piece, known)
-           for piece in voice_pieces(samples)):
+    if repeats_voice(samples, whole, brief_text(brief)):
         found.append("repeats a voice example")
     if REASONING_TAG.search(whole):
         found.append("holds a reasoning tag")
@@ -197,7 +264,7 @@ def bullets(items) -> str:
 
 def fill(brief: Brief, doc: config.Document, samples: list[str], target: tuple[int, int] | None) -> str:
     supplied = [f"{name}: {getattr(brief, name)}" for name in SUPPLIED if getattr(brief, name)]
-    voice = "\n".join(f"- {line[:VOICE_LINE_CHARS]}" for line in samples)
+    voice = "\n".join(f"- {clipped(line)}" for line in samples)
     words = f"about {target[0]} to {target[1]} words" if target else "as short as completeness allows"
     pinned = protected(brief)
     return Template((paths.PROMPTS_DIR / "document.md").read_text()).safe_substitute(
