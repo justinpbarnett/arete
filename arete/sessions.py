@@ -132,7 +132,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
     asked = runner.request_for(cfg, work_repo, which, name, None, True,
                                {"tools": tools, "disallowed_tools": runner.NO_GIT_WRITES})
-    if (refusal := "" if cfg.replay.all else routing.fit_refusal(asked, target)):
+    if (refusal := "" if cfg.replay.all else routing.fit_refusal(asked, target, routing.modes_for(cfg, work_repo))):
         raise control.Refused(refusal)
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
                 budget_usd, created=util.iso())

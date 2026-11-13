@@ -222,13 +222,12 @@ def cost_window(days: float | None) -> tuple[float, str]:
 def costs(days: float | None = None, connect=state.db, cfg: config.Config | None = None) -> dict:
     days, since = cost_window(days)
     by_route = step_costs("route", days, connect, cfg)["groups"]
-    return {"days": days, **paid_since(since, connect), "by_route": by_route}
+    return {"days": days, **paid_since(since, connect, cfg), "by_route": by_route}
 
 
 def billing_of(step: dict, cfg: config.Config) -> str:
-    which, mode, model = step.get("runner") or "", step.get("auth_mode") or "", step.get("model") or ""
-    provider = step.get("provider") or (model.partition("/")[0] if "/" in model else "")
-    if mode == "local" or (which == "pi" and mode != "subscription" and provider in cfg.local_providers):
+    which, mode = step.get("runner") or "", step.get("auth_mode") or ""
+    if state.local_step(step, cfg.local_providers):
         return "local"
     return "subscription" if subscription(which, step.get("provider") or "", mode) else "api_key"
 
@@ -257,7 +256,8 @@ def step_costs(by: str, days: float | None = None, connect=state.db, cfg: config
                                        **({k: route[k] for k in ("runner", "provider", "model", "billing")}
                                           if by == "route" else {}),
                                        **dict.fromkeys(TOKEN_FIELDS, 0), "minutes": 0.0, "api_minutes": 0.0})
-        cost = s["cost_usd"] or 0
+        local = route["billing"] == "local"
+        cost = 0 if local else s["cost_usd"] or 0
         side = "subscription_usd" if route["billing"] == "subscription" else "paid_usd"
         row["runs"].add(s["run_id"])
         row["calls"] += 1
@@ -291,10 +291,13 @@ def step_costs(by: str, days: float | None = None, connect=state.db, cfg: config
             "wait_minutes": {cause: round(minutes, 2) for cause, minutes in waits.items()}}
 
 
-def paid_since(since: str, connect=state.db) -> dict:
+def paid_since(since: str, connect=state.db, cfg: config.Config | None = None) -> dict:
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
+    cfg = cfg or config.load()
     for s in state.steps_since(since, connect, paid_only=True):
+        if billing_of(s, cfg) == "local":
+            continue
         cost = s["cost_usd"] or 0
         total += cost
         keys = {"model": s["model"] or "no model", "runner": s["runner"] or "no runner",

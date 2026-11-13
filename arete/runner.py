@@ -165,11 +165,11 @@ def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=
 
 def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None,
                repo: config.Repo | None = None, device: devices.Device | str = "local",
-               tools: list[str] | None = None, remaining: float | None = None) -> str:
+               tools: list[str] | None = None, remaining: float | None = None, denied=NO_GIT_WRITES) -> str:
     from . import routing
 
     cfg = cfg or config.load()
-    return routing.held_words(routing.outlook(cfg, repo, device, model, run_with, tools, NO_GIT_WRITES, remaining,
+    return routing.held_words(routing.outlook(cfg, repo, device, model, run_with, tools, denied, remaining,
                                                connect))
 
 

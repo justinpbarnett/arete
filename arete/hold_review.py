@@ -43,6 +43,10 @@ class Review:
         return f"{self.by} says {self.decision} with {self.confidence} confidence"
 
 
+REVIEW_TOOLS = runner.READ_TOOLS + pipeline.bash_rules(GIT_READS)
+REVIEW_DENIED = pipeline.bash_rules(GIT_READS_OUTSIDE_THE_WORKTREE)
+
+
 def model_for(approval: dict, cfg: config.Config) -> str:
     return delivery.reviewer_of(approval) if approval["status"] == "pending" else ""
 
@@ -107,10 +111,10 @@ def read_change(approval: dict, wt: Path, base: str, diff: str, model: str, cfg:
                            briefing=briefing_without_patch[:BRIEFING_SHOWN],
                            diff=push.shown_patch(diff, f"git diff origin/{base} HEAD", DIFF_SHOWN),
                            log=log.strip() or "none")
-    res = runner.run(text, wt, model=model, allowed_tools=runner.READ_TOOLS + pipeline.bash_rules(GIT_READS),
-                     disallowed_tools=pipeline.bash_rules(GIT_READS_OUTSIDE_THE_WORKTREE), ask_jev=False,
+    res = runner.run(text, wt, model=model, allowed_tools=REVIEW_TOOLS, disallowed_tools=REVIEW_DENIED, ask_jev=False,
                      json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS,
-                     wait_out_limits=False, trace=(approval["run_id"], f"review #{approval['id']}"), cfg=cfg)
+                     wait_out_limits=False, trace=(approval["run_id"], f"review #{approval['id']}"), cfg=cfg,
+                     repo=delivery.repo_for(approval, cfg))
     said = res.structured if res.ok and isinstance(res.structured, dict) else {}
     reason = outbound.plain(str(said.get("reason") or ""), LONGEST_REASON).strip()
     if said.get("decision") not in DECISIONS or said.get("confidence") not in CONFIDENCES or not reason:

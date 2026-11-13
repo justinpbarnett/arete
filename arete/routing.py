@@ -218,14 +218,33 @@ def budget_blocked(found: list[Candidate]) -> bool:
     return (not any(c.state in ("ready", "held") for c in found)) and any(c.state == "budget_spent" for c in found)
 
 
-def fit_refusal(request: Request, device: devices.Device) -> str:
+def modes_for(cfg: config.Config, repo: config.Repo | None) -> tuple[str, ...]:
+    try:
+        return config.allowed_payment_modes(cfg, config.load_layer(repo.layer_dir) if repo else None)
+    except (ValueError, TypeError, OSError):
+        return ()
+
+
+POSSIBLE_MODES = {"claude": ("subscription",), "codex": ("subscription", "api_key"),
+                  "pi": ("subscription", "api_key", "local")}
+
+
+def policy_fit(which: str, modes: tuple[str, ...]) -> str:
+    possible = POSSIBLE_MODES.get(which)
+    if not possible or any(m in modes for m in possible):
+        return ""
+    return f"[routing] payment_modes allows {', '.join(modes) or 'no mode'}; {which} routes are {' or '.join(possible)}"
+
+
+def fit_refusal(request: Request, device: devices.Device, modes: tuple[str, ...] | None = None) -> str:
     first = ""
     for link in request.chain if request.fallback else request.chain[:1]:
         vendor, _ = identity(link.runner, link.model)
         serving = SERVES.get(vendor, (link.runner,)) if request.fallback else (link.runner,)
         for which in serving:
             way = Way(link, which, link.model, "", "")
-            why = runner.device_refusal(link.model, which, device) or incompatible(way, request, device)
+            why = (policy_fit(which, modes) if modes is not None else "") or runner.device_refusal(
+                link.model, which, device) or incompatible(way, request, device)
             if not why:
                 return ""
             first = first or why
@@ -308,10 +327,7 @@ class Discovery:
         self.device = devices.resolve(device)
         self.connect = connect
         self.priced = priced
-        try:
-            self.modes = config.allowed_payment_modes(cfg, config.load_layer(repo.layer_dir) if repo else None)
-        except (ValueError, TypeError, OSError):
-            self.modes = ()
+        self.modes = modes_for(cfg, repo)
         self.passing = environment.passed(cfg, repo)
         self.probes: dict[tuple[str, str], pi.Route] = {}
         self.cache: dict[str, object] = {}
@@ -510,4 +526,5 @@ def described(candidates: list[Candidate]) -> list[dict]:
 def loop_budget_left(cfg: config.Config) -> float | None:
     if not cfg.daily_budget_usd:
         return None
-    return cfg.daily_budget_usd - state.loop_spent_since(util.iso(util.now() - timedelta(days=1)))
+    return cfg.daily_budget_usd - state.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None,
+                                                         cfg.local_providers)

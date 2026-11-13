@@ -388,9 +388,11 @@ def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) 
     if loop.budget_usd:
         limits.append(("run budget", loop.budget_usd - spent_this_run))
     if loop.daily_budget_usd:
-        limits.append(("daily loop budget", loop.daily_budget_usd - state.loop_spent_since(day_ago, loop.name)))
+        limits.append(("daily loop budget", loop.daily_budget_usd
+                       - state.loop_spent_since(day_ago, loop.name, cfg.local_providers)))
     if cfg.daily_budget_usd:
-        limits.append(("daily budget for all loops", cfg.daily_budget_usd - state.loop_spent_since(day_ago)))
+        limits.append(("daily budget for all loops",
+                       cfg.daily_budget_usd - state.loop_spent_since(day_ago, None, cfg.local_providers)))
     return min(limits, key=lambda x: x[1]) if limits else None
 
 
@@ -425,7 +427,7 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         which, name = runner.route(loop.model_for(cfg), loop.runner)
         asked = runner.request_for(cfg, loop.routing_repo(cfg), which, name, None, True,
                                    {"tools": loop.tools, "disallowed_tools": runner.NO_GIT_WRITES})
-        if refusal := routing.fit_refusal(asked, device):
+        if refusal := routing.fit_refusal(asked, device, routing.modes_for(cfg, loop.routing_repo(cfg))):
             problems.append(refusal)
     if loop.agent:
         problems += [f"{reason}, so a loop run by {runner.route(loop.model_for(cfg), loop.runner)[0]} cannot have {', '.join(tools)}"
