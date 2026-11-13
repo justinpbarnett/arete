@@ -90,7 +90,7 @@ def brief_from(data: dict) -> Brief:
     return Brief(**found)
 
 
-def code_in(text: str) -> list[str]:
+def code_in(text: str, *, fenced_only: bool = False) -> list[str]:
     found, fence = [], ""
     for line in text.splitlines():
         stripped = line.strip()
@@ -100,10 +100,10 @@ def code_in(text: str) -> list[str]:
                     and not marker[2].strip()):
                 fence = ""
             elif stripped:
-                found.append(stripped)
+                found.append(line)
         elif marker and (marker[1][0] == "~" or "`" not in marker[2]):
             fence = marker[1]
-        else:
+        elif not fenced_only:
             found += [m.strip() for m in CODE_SPAN.findall(line) if m.strip()]
     return found
 
@@ -126,6 +126,10 @@ def flat(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
+def supplied_in(value: str, text: str) -> bool:
+    return re.search(r"(?<![\w@-])" + re.escape(flat(value)) + r"(?![\w-])", flat(text)) is not None
+
+
 def brief_text(brief: Brief) -> str:
     return flat("\n".join([*brief.facts, brief.action, *brief.acceptance, brief.audience, brief.channel, brief.draft,
                            brief.ask, brief.owner, brief.deadline, *brief.keep]))
@@ -134,9 +138,9 @@ def brief_text(brief: Brief) -> str:
 def invented(brief: Brief, text: str) -> list[str]:
     if brief.kind not in ("message", "ticket"):
         return []
-    known = brief_text(brief)
-    tokens = [m.group(0) for pattern in (HANDLE, ISO_DATE, WEEKDAY, MONTH_DAY, RELATIVE_DAY)
-              for m in pattern.finditer(text)]
+    patterns = (HANDLE, ISO_DATE, WEEKDAY, MONTH_DAY, RELATIVE_DAY)
+    known = {flat(m.group(0)) for pattern in patterns for m in pattern.finditer(brief_text(brief))}
+    tokens = [m.group(0) for pattern in patterns for m in pattern.finditer(text)]
     return [t for t in dict.fromkeys(tokens) if flat(t) not in known]
 
 
@@ -162,9 +166,15 @@ def faults(brief: Brief, text: str, samples: list[str], title: str = "") -> list
         return ["the answer held no text"]
     whole = f"{title}\n{text}"
     found = [f"dropped `{s}`" for s in protected(brief) if s not in text]
+    if brief.kind != "pr":
+        sources = (*brief.facts, brief.action, *brief.acceptance, brief.ask,
+                   *([brief.draft] if brief.kind == "doc" else []))
+        required = {line for source in sources for line in code_in(source, fenced_only=True)} - set(brief.drop)
+        said_code = set(code_in(text, fenced_only=True))
+        found += [f"changed fenced code line `{line}`" for line in sorted(required - said_code) if line in text]
     if brief.kind == "message":
         found += [f"left out the {name}, {value}" for name in SUPPLIED if (value := getattr(brief, name))
-                  and flat(value) not in flat(text)]
+                  and not supplied_in(value, text)]
     found += [f"names {t}, which the brief does not supply" for t in invented(brief, whole)]
     known, said = brief_text(brief), flat(whole)
     if any(len(piece) >= MIN_VOICE_LINE and flat(piece) in said and flat(piece) not in known

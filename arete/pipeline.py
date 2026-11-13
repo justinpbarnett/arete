@@ -21,7 +21,6 @@ from datetime import timedelta
 from pathlib import Path
 from string import Template
 from typing import TextIO
-from urllib.parse import urlsplit
 
 from . import (
     ci,
@@ -1290,11 +1289,6 @@ def checked_layer(cfg: config.Config, layer_dir: Path) -> config.RepoLayer:
         steps.check(cfg, layer)
     except (ValueError, TypeError) as e:
         raise RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
-    if layer.verify:
-        try:
-            outbound.keep_private(urlsplit(verify.PORT_FIELD.sub("0", layer.verify.url)).hostname or "")
-        except ValueError:
-            pass
     return layer
 
 

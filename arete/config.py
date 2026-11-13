@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import paths
+from . import outbound, paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
                "classify", "loop", "session", "research", "research_plan", "explain", "document")
@@ -765,4 +765,5 @@ def load_layer(layer_dir: Path) -> RepoLayer:
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip())
+        outbound.keep_verify_private(layer.verify.url)
     return layer

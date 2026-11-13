@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import socket
 import tomllib
+from urllib.parse import urlsplit
 
 from . import paths, util
 
@@ -44,6 +45,27 @@ def normalized_host(host: str) -> str:
 
 def keep_private(*hosts: str) -> None:
     extra_hosts.update(h for h in (normalized_host(h) for h in hosts if h) if h and h != "localhost")
+
+
+def keep_verify_private(url: str) -> None:
+    try:
+        keep_private(urlsplit(re.sub(r"\{port\d*\}", "0", url)).hostname or "")
+    except ValueError:
+        pass
+
+
+def keep_configured_private() -> None:
+    try:
+        repos = tomllib.loads(paths.CONFIG_FILE.read_text()).get("repo", [])
+    except (OSError, ValueError):
+        return
+    for repo in repos:
+        layer = paths.expand(repo["layer"]) if repo.get("layer") else paths.expand(repo["path"]) / ".agents"
+        try:
+            data = tomllib.loads((layer / "config.toml").read_text())
+            keep_verify_private(data.get("verify", {}).get("url", ""))
+        except (OSError, ValueError):
+            continue
 
 
 def machine_hosts() -> list[str]:
@@ -116,6 +138,7 @@ def registered(text: str) -> str:
 
 
 def screen(text: str) -> str:
+    keep_configured_private()
     text = ORIGIN.sub(screen_origin, text)
     text = BARE_PRIVATE.sub(screen_bare, text)
     return HOME_PATH.sub("~", registered(text))
