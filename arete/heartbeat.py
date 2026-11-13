@@ -149,8 +149,7 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
             key += f":{devices.resolve(device).name}"
         missing = (f"pi {provider}: no usable login or supported key; checked {selected.owner}, "
                    f"{pi.KEYS_FILE} and Arete environment")
-        optional_missing = (not required and selected.error == missing and provider not in stored
-                            and "apiKey" not in accounts.mapping(configured.get(provider)))
+        optional_missing = not required and selected.error == missing
         check = Check(key, not selected.error or optional_anthropic, f"{provider}: {detail}",
                       "warn" if optional_missing else "fail")
         if key not in out or out[key].ok or out[key].severity == "warn" and check.severity == "fail":
