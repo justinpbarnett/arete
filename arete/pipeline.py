@@ -1149,6 +1149,10 @@ def runnable(repo: config.Repo) -> bool:
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
               script: Script | None = None) -> int:
+    try:
+        producer_baseline = scratch.process_ids()
+    except OSError:
+        producer_baseline = None
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
@@ -1192,6 +1196,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                        ) if script else ""
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
+            scratch.RUN_BASELINES[run_id] = producer_baseline
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},

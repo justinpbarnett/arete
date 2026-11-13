@@ -28,6 +28,7 @@ MAX_SAVED_BYTES = 16 * 1024 * 1024
 HOOK = {"root": "", "id": "", "saves": ""}
 AUTHORITY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/arete/verification-authority"
 LEASES: dict[str, int] = {}
+RUN_BASELINES: dict[str, set[int] | None] = {}
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
 GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
               "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
@@ -166,6 +167,9 @@ def overlap(a: Path, b: Path) -> bool:
 
 def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
     ws, rd = workspace.resolve(), run_dir.resolve()
+    before = RUN_BASELINES[run_id] if run_id in RUN_BASELINES else process_ids()
+    if before is None:
+        raise ConfinementUnavailable("no producer baseline before repository execution")
     if rd.name != run_id or not step or Path(step).name != step:
         raise ValueError("scratch requires a pinned run and step")
     with registry(True) as (fd, key):
@@ -181,7 +185,8 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
             run_identity = identity(os.fstat(run_fd))
         data = {"version": 2, "engine": secrets.token_hex(16), "attempt": asdict(a), "run": run_identity,
                 "evidence": [], "state": "initializing", "diagnostic": "",
-                "archives": [], "producers": {}, "source_mutations": False, "cleanup_version": 3}
+                "archives": [], "producers": {}, "before": sorted(before),
+                "source_mutations": False, "cleanup_version": 3}
         lease = None
         try:
             with paths.directory_fd(ws) as parent:
@@ -249,7 +254,7 @@ def producing(a: Attempt | None):
         PRODUCING.reset(token)
 
 
-def process_ids() -> set[int]:
+def process_tree() -> dict[int, int]:
     if not paths.ON_MAC:
         raise ConfinementUnavailable("producer lifetime inspection unavailable")
     lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -262,15 +267,25 @@ def process_ids() -> set[int]:
     size = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids))
     if size <= 0 or size >= ctypes.sizeof(pids):
         raise OSError(errno.EBUSY, "producer enumeration incomplete")
-    found = set()
+    found = {}
     for pid in pids[:size // 4]:
         if not pid or pid == os.getpid():
             continue
         info = (ctypes.c_uint64 * 7)()
         if lib.proc_pidinfo(pid, 17, 0, info, ctypes.sizeof(info)) != ctypes.sizeof(info):
             raise OSError(errno.EBUSY, "producer changed during enumeration")
-        found.add(info[2])
+        parent = (ctypes.c_uint32 * 16)()
+        after = (ctypes.c_uint64 * 7)()
+        if (lib.proc_pidinfo(pid, 13, 0, parent, ctypes.sizeof(parent)) != ctypes.sizeof(parent)
+                or lib.proc_pidinfo(pid, 17, 0, after, ctypes.sizeof(after)) != ctypes.sizeof(after)
+                or after[2] != info[2]):
+            raise OSError(errno.EBUSY, "producer ancestry changed during enumeration")
+        found[info[2]] = info[3] if parent[1] != 1 else 0
     return found
+
+
+def process_ids() -> set[int]:
+    return set(process_tree())
 
 
 def producer_group(a: Attempt, producer: str, group: int | None) -> None:
@@ -280,7 +295,7 @@ def producer_group(a: Attempt, producer: str, group: int | None) -> None:
         if data["attempt"] != asdict(a) or data["state"] not in ("prepared", "active"):
             raise PermissionError("verification producer authority revoked")
         if producer not in data["producers"]:
-            data["producers"][producer] = {"gated": True, "before": sorted(process_ids())}
+            data["producers"][producer] = {"gated": True}
         entry = data["producers"][producer]
         entry["group"] = group
         store(fd, key, data)
@@ -359,18 +374,15 @@ def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
 
 
 def producers_done(data: dict) -> bool:
-    if "producers" not in data:
+    if "producers" not in data or "before" not in data:
         return False
-    current = None
+    current, unrelated = process_tree(), set(data["before"])
+    while descendants := {child for child, parent in current.items() if parent in unrelated} - unrelated:
+        unrelated.update(descendants)
+    if current.keys() - unrelated:
+        return False
     for group in data["producers"].values():
         if isinstance(group, dict) and group.get("gated") is True:
-            if group["group"]:
-                if "before" not in group:
-                    return False
-                if current is None:
-                    current = process_ids()
-                if current - set(group["before"]):
-                    return False
             group = group["group"]
             if group is None:
                 continue

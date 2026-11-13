@@ -6,6 +6,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -117,8 +118,10 @@ def read_confined(p: Path, limit: int | None = None) -> bytes:
 
 class FixtureConnection(sqlite3.Connection):
     def close(self):
-        super().close()
-        self.handles.close()
+        try:
+            super().close()
+        finally:
+            self.handles.close()
 
 
 def connect_db(p: Path, readonly: bool = False) -> sqlite3.Connection:
@@ -135,7 +138,15 @@ def connect_db(p: Path, readonly: bool = False) -> sqlite3.Connection:
     handles.callback(setattr, DB_THREAD, "active", False)
     try:
         parent = handles.enter_context(directory_fd(p.absolute().parent))
-        fcntl.flock(parent, fcntl.LOCK_EX)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PermissionError("busy isolated state directory refused") from None
+                time.sleep(0.05)
         for suffix in ("-wal", "-shm", "-journal"):
             try:
                 os.stat(p.name + suffix, dir_fd=parent, follow_symlinks=False)
