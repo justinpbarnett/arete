@@ -305,6 +305,38 @@ class BrowserServerTests(unittest.TestCase):
         scratch.update_browser(self.a, loopback=False)
         self.assertEqual(scratch.browser_config(self.a, self.config, [self.evidence]), self.config)
 
+    def answering(self, family, host):
+        class Answer(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        app = type("App", (http.server.ThreadingHTTPServer,), {"address_family": family})((host, 0), Answer)
+        threading.Thread(target=app.serve_forever, daemon=True).start()
+        self.addCleanup(app.server_close)
+        self.addCleanup(app.shutdown)
+        return app.server_address[1]
+
+    def test_the_default_localhost_verify_url_reaches_the_browser_as_the_loopback_literal_that_answers(self):
+        self.install()
+        idle = lambda *args, **kwargs: subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+        for family, host, literal in ((socket.AF_INET, "127.0.0.1", "127.0.0.1"), (socket.AF_INET6, "::1", "[::1]")):
+            with self.subTest(host):
+                port = self.answering(family, host)
+                scratch.update_browser(self.a, port=0, loopback=False)
+                v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
+                with mock.patch.object(scratch, "service_command", side_effect=lambda a, command: command), \
+                        mock.patch.object(scratch, "spawn", side_effect=idle), \
+                        mock.patch.object(verify.environment, "commands", return_value={}), \
+                        verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a) as url:
+                    self.assertEqual(url, f"http://{literal}:{port}")
+                    self.assertEqual(scratch.browser_record(self.a)["port"], port)
+                    built = scratch.browser_config(self.a, self.config, [self.evidence])
+                self.assertEqual(json.loads(built)["mcpServers"]["playwright"], scratch.browser_server(self.a))
+
     def launch(self, mcp_config, said=None):
         picked = SimpleNamespace(candidate=SimpleNamespace(runner="codex", effort="", instructions=()))
         trip = SimpleNamespace(cfg=SimpleNamespace(jev=SimpleNamespace(guard=False)), repo=None, scratch=self.a,

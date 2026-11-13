@@ -13,7 +13,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from . import config, environment, paths, scratch, util
 from .util import git
@@ -145,6 +145,9 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         lifetime["stopped"] = False
     try:
         wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
+        if attempt and (literal := loopback_literal(url)) != url:
+            url = literal
+            scratch.app_port(attempt, url)
         yield url
     finally:
         stop(proc)
@@ -155,6 +158,24 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
                 lifetime["stopped"] = True
             except PermissionError:
                 pass
+
+
+def loopback_literal(url: str) -> str:
+    parts = urlsplit(url)
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return url
+    if parts.hostname != "localhost" or "@" in parts.netloc:
+        return url
+    for host in ("127.0.0.1", "::1"):
+        try:
+            socket.create_connection((host, port), timeout=2).close()
+        except OSError:
+            continue
+        name = f"[{host}]" if ":" in host else host
+        return urlunsplit(parts._replace(netloc=f"{name}:{parts.port}" if parts.port else name))
+    return url
 
 
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
