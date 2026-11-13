@@ -193,6 +193,8 @@ class Job:
     summary: str = ""
     opened: list[str] = field(default_factory=list)
     pushed: list[str] = field(default_factory=list)
+    drafted: list[str] = field(default_factory=list)
+    ci_stopped: list[str] = field(default_factory=list)
     changed: list[str] = field(default_factory=list)
     ci_result: str = ""
     check_commands: list[str] = field(default_factory=list)
@@ -294,6 +296,7 @@ class Job:
         for c in self.checkouts:
             c.pr = data["prs"].get(c.github, c.pr)
         self.opened, self.pushed, self.changed = data["opened"], data["pushed"], data["changed"]
+        self.drafted, self.ci_stopped = data.get("drafted", []), data.get("ci_stopped", [])
         self.draft_why, self.report_body, self.summary = data["draft_why"], data["report_body"], data["summary"]
         self.b.committed_lines = data["committed_lines"]
         if stored:
@@ -708,6 +711,7 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             run.log(f"pushed to {c.pr}")
     pushed = [c for c in staged.changed if c not in opened]
     with_prs = job.with_prs
+    ci_stopped: list[pipeline.Checkout] = []
     for c in with_prs:
         others = pipeline.sibling_section(t.ref, c, with_prs)
         if c in opened:
@@ -715,6 +719,8 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
                 gh.pr_edit_body(c.pr, f"{link}\n\n{report_body}{others}")
             continue
         body = gh.pr_body(c.pr)
+        if c in pushed and pipeline.ci.stopped(body):
+            ci_stopped.append(c)
         new_body = pipeline.synced_pr_body(run, c.pr, body, t, left)
         if opened:
             new_body = pipeline.with_siblings(new_body, others)
@@ -722,9 +728,11 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             gh.pr_edit_body(c.pr, new_body)
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
+    drafted = pipeline.hold_pushed(run, pushed, ci_stopped, draft_why)
     return Outcome("pass", data={
         "summary": outcome, "prs": {c.github: c.pr for c in with_prs}, "opened": [c.github for c in opened],
-        "pushed": [c.github for c in pushed], "changed": [c.github for c in staged.changed], "draft_why": draft_why,
+        "pushed": [c.github for c in pushed], "drafted": [c.github for c in drafted],
+        "ci_stopped": [c.github for c in ci_stopped], "changed": [c.github for c in staged.changed], "draft_why": draft_why,
         "report_body": report_body, "committed_lines": b.committed_lines})
 
 
@@ -771,8 +779,9 @@ def publish(flow: factory.Flow) -> Outcome:
                    or "\n\nThe review now approves it. The PR is still a draft until a person marks it ready."))
     else:
         run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {job.ci_result}."
-                + ("" if not opened else pipeline.draft_note(job.draft_why, job.verified)))
-    pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, opened,
+                + pipeline.published_note(job.draft_why, job.verified, opened, job.picked(job.drafted)))
+    ready = pipeline.ready_pushed(run, pushed, job.picked(job.ci_stopped), job.draft_why)
+    pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, opened + ready,
                        f"{job.ticket.title}\n\n{job.build_summary.strip()[:3000]}")
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
 

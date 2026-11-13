@@ -473,5 +473,127 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertTrue(Path(a.root).exists())
 
 
+class PushedPrDraftTests(unittest.TestCase):
+    URL = "https://github.com/fixture/repo/pull/7"
+
+    def setUp(self):
+        from arete import gh, jev
+        self.gh, self.jev = gh, jev
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+
+        def sh(*args):
+            return subprocess.run([*git, *args], cwd=self.root, check=True, capture_output=True, text=True).stdout.strip()
+
+        sh("init", "-b", "main")
+        (self.root / "a.txt").write_text("a\n")
+        sh("add", ".")
+        sh("commit", "-m", "base")
+        sh("update-ref", "refs/remotes/origin/main", "HEAD")
+        sh("checkout", "-b", "work")
+        (self.root / "a.txt").write_text("b\n")
+        sh("commit", "-am", "change")
+        self.head = sh("rev-parse", "HEAD")
+        self.calls, self.logs = [], []
+        self.draft, self.remote_head, self.score, self.fail = True, self.head, 0.1, False
+        self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=self.root), repairs="", feedback=[],
+                                   log=self.logs.append)
+        self.layer = SimpleNamespace(trust_level="automerge")
+        self.cfg = config.Config()
+        self.c = pipeline.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
+        for target, name, fake in [(gh, "gh", self.fake_gh), (jev, "ready", lambda *a, **k: True),
+                                   (jev, "ask", self.fake_ask)]:
+            patcher = mock.patch.object(target, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_gh(self, args, input=None, **kw):
+        self.calls.append((list(args), input))
+        if args[:2] == ["pr", "view"] and "isDraft,headRefOid" in args:
+            if self.fail:
+                raise self.gh.GhError("gh pr view: boom")
+            return json.dumps({"isDraft": self.draft, "headRefOid": self.remote_head})
+        if args[:2] == ["pr", "view"]:
+            return json.dumps({"mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE"})
+        if args[0] == "api":
+            return json.dumps({"allow_auto_merge": False})
+        return ""
+
+    def fake_ask(self, *a, **k):
+        answers = {n: self.jev.Answer(self.score, 1.0) for n in self.jev.RISK}
+        answers["irreversible"] = self.jev.Answer(False, 1.0, {"yes": 0.0})
+        return self.jev.Reply(answers=answers)
+
+    def names(self, *prefix):
+        return [a for a, _ in self.calls if a[:len(prefix)] == list(prefix)]
+
+    def test_pushed_draft_is_marked_ready_then_merged(self):
+        ready = pipeline.ready_pushed(self.run, [self.c], [], "")
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
+        self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]])
+        self.assertEqual(len(self.names("pr", "merge")), 1)
+        self.assertIn(f"pr: marked {self.URL} ready for review", self.logs)
+
+    def test_pushed_draft_over_risk_line_stays_for_a_person(self):
+        self.score = 0.9
+        ready = pipeline.ready_pushed(self.run, [self.c], [], "")
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
+        self.assertEqual(len(self.names("pr", "ready")), 1)
+        self.assertEqual(self.names("pr", "merge"), [])
+        comments = [i for a, i in self.calls if a[:2] == ["pr", "comment"]]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("Automerge stays off for this PR", comments[0])
+
+    def test_pushed_ready_pr_is_made_a_draft_when_held(self):
+        self.draft = False
+        why, verified = "the check in use was blocked", verify.Verified("blocked", "", [])
+        drafted = pipeline.hold_pushed(self.run, [self.c], [], why)
+        self.assertEqual(drafted, [self.c])
+        self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL, "--undo"]])
+        self.assertIn(f"{why}.", pipeline.published_note(why, verified, [], drafted))
+        self.calls.clear()
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], why), [])
+        self.assertEqual(self.calls, [])
+
+    def test_opened_pr_behaves_as_before(self):
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", [self.c], "about")
+        self.assertEqual([a for a in self.calls if "isDraft,headRefOid" in a[0]], [])
+        self.assertEqual(self.names("pr", "ready"), [])
+        verified = verify.Verified("blocked", "", [])
+        self.assertEqual(pipeline.published_note("why", verified, [self.c], []), pipeline.draft_note("why", verified))
+        self.assertEqual(pipeline.published_note("", verified, [self.c], []), "")
+
+    def test_ci_stopped_repair_and_changed_head_are_left_alone(self):
+        for why in ("", "held"):
+            self.assertEqual(pipeline.hold_pushed(self.run, [self.c], [self.c], why), [])
+            self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [self.c], why), [])
+        self.assertEqual(self.calls, [])
+        self.run.repairs = "old"
+        self.assertEqual(pipeline.hold_pushed(self.run, [self.c], [], "held"), [])
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], ""), [])
+        self.assertEqual(self.calls, [])
+        self.run.repairs = ""
+        self.remote_head = "f" * 40
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], ""), [])
+        self.draft = False
+        self.assertEqual(pipeline.hold_pushed(self.run, [self.c], [], "held"), [])
+        self.assertEqual(self.names("pr", "ready"), [])
+        self.assertTrue(any(f"left {self.URL} as it is" in line for line in self.logs))
+
+    def test_unreadable_state_is_left_alone(self):
+        self.fail = True
+        self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], ""), [])
+        self.assertIn(f"pr: left {self.URL} as it is: arete could not read its state: gh pr view: boom", self.logs)
+
+    def test_trust_level_pr_marks_ready_without_merging(self):
+        self.layer.trust_level = "pr"
+        ready = pipeline.ready_pushed(self.run, [self.c], [], "")
+        pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
+        self.assertEqual(len(self.names("pr", "ready")), 1)
+        self.assertEqual(self.names("pr", "merge"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
