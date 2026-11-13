@@ -336,6 +336,115 @@ class BudgetTests(Isolated):
         self.assertIn("repair cycles", latest["summary"])
         self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
 
+    def legacy_held_run(self, recorded=True, status="pr"):
+        rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
+        if recorded:
+            ticket = self.local.get(self.ticket)
+            lines.write(rid, "step_end", step="prepare", result="pass",
+                        data={"ticket": {"title": ticket.title, "body": ticket.body}})
+        for n in (1, 2, 3):
+            lines.write(rid, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
+        record.settle(rid, status)
+        return rid
+
+    def started_after(self, force):
+        def drive(flow):
+            flow.ctx.run.budget.charge("review_fix", "review_repair")
+            return "failed", "fixture ended", ""
+        with patch.object(config, "load", return_value=self.cfg), \
+                patch.object(pipeline, "run_refusal", return_value=(True, "")):
+            code = pipeline.run_issue(self.repo.name, self.ticket, force=force,
+                                      script=pipeline.Script("feature", drive))
+        latest = state.ticket_runs(self.repo.name, self.ticket)[0]
+        directory = paths.RUNS_DIR / latest["id"]
+        return code, latest, (directory / "run.log").read_text(), runlimits.metadata(latest["id"], "budget.json")
+
+    def edit_ticket(self):
+        with state.db() as connection:
+            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Edited with a follow up", self.ticket))
+
+    def test_forced_run_leaves_out_repairs_spent_under_another_specification(self):
+        legacy = self.legacy_held_run()
+        self.edit_ticket()
+        code, latest, log, budget = self.started_after(True)
+        self.assertEqual(code, 1)
+        self.assertIn("left out 3 earlier repair cycles", log)
+        self.assertIn("specification changed", log)
+        self.assertEqual((budget["parents"], budget["left_out"]), ([], [legacy]))
+        self.assertFalse((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
+        self.assertEqual(runlimits.repair_count(latest["id"]), 1)
+        second = self.started_after(True)[3]
+        self.assertEqual(second["parents"], [latest["id"]])
+        self.assertNotIn(legacy, runlimits.family(latest["id"]))
+
+    def test_forcing_without_an_edit_or_polling_after_one_still_counts_everything(self):
+        self.legacy_held_run()
+        _, latest, log, _ = self.started_after(True)
+        self.assertIn("repair cycles", latest["summary"])
+        self.assertNotIn("left out", log)
+        self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
+
+    def test_polled_run_after_an_edit_counts_earlier_repairs(self):
+        legacy = self.legacy_held_run()
+        self.edit_ticket()
+        _, latest, log, budget = self.started_after(False)
+        self.assertIn("repair cycles", latest["summary"])
+        self.assertNotIn("left out", log)
+        self.assertEqual(budget["parents"], [legacy])
+
+    def test_unreadable_specification_counts_in_full(self):
+        self.legacy_held_run(recorded=False)
+        self.edit_ticket()
+        _, latest, log, _ = self.started_after(True)
+        self.assertIn("repair cycles", latest["summary"])
+        self.assertNotIn("left out", log)
+
+    def exhausted_then_edited(self, **budget):
+        old = self.made_run()
+        with state.db() as connection:
+            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Edited with a follow up", self.ticket))
+        if "verification_seconds" in budget:
+            saved = runlimits.metadata(old.id, "budget.json")
+            util.write_json(paths.RUNS_DIR / old.id / "budget.json", {**saved, **budget})
+        else:
+            record.note(old.id, started=util.iso(util.now() - timedelta(minutes=61)))
+        record.settle(old.id, "pr")
+        return old
+
+    def forced_budget(self, previous, forced):
+        rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
+        run = pipeline.Run(rid, self.repo, paths.RUNS_DIR / rid, tracker=self.local, tid=self.ticket, cfg=self.cfg)
+        return runlimits.Budget(run, runlimits.Policy(), previous, self.local.get(self.ticket), forced)
+
+    def test_forced_run_leaves_out_run_and_verification_minutes_of_another_specification(self):
+        for budget in ({}, {"verification_seconds": 21 * 60}):
+            old = self.exhausted_then_edited(**budget)
+            fresh = self.forced_budget(old.id, True)
+            with fresh.watching(), fresh.verifying():
+                pass
+            self.assertEqual((fresh.parents, fresh.left_out), ([], [old.id]))
+            kept = self.forced_budget(old.id, False)
+            with self.assertRaises(runlimits.Parked):
+                with kept.watching(), kept.verifying():
+                    pass
+            record.settle(fresh.run.id, "failed")
+            record.settle(kept.run.id, "failed")
+            with state.db() as connection:
+                connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Original", self.ticket))
+
+    def test_restarting_an_interrupted_run_keeps_inherited_usage_after_an_edit(self):
+        legacy = self.legacy_held_run(status="interrupted")
+        self.edit_ticket()
+        _, latest, log, budget = self.started_after(True)
+        self.assertEqual(budget["parents"], [legacy])
+        self.assertNotIn("left out", log)
+
+    def test_invalid_left_out_lineage_is_refused(self):
+        run = self.made_run()
+        util.write_json(paths.RUNS_DIR / run.id / "budget.json", {"version": 1, "parents": [], "left_out": "x"})
+        with self.assertRaises(ValueError):
+            runlimits.family(run.id)
+
     def test_whole_pipeline_deadline_stops_child_keeps_workspace_and_frees_slot(self):
         pid_file = self.root / "child-pid"
         workspace = paths.WORKTREES_DIR / "fixture-held"
