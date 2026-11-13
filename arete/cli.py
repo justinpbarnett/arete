@@ -603,20 +603,99 @@ def cmd_eval(args) -> int:
 def cmd_experiment(args) -> int:
     import tomllib
 
-    from . import experiment
+    from . import experiment, optimize
 
-    wrong = (args.dry_run and args.action == "summary") or (args.out and args.action == "summary") \
-        or (args.json and args.action == "run")
+    searching = args.action in ("run", "optimize")
+    wrong = ((args.dry_run or args.out) and not searching) or (args.json and args.action != "summary") \
+        or ((args.apply or args.rollback) and args.action != "promote") or (args.apply and args.rollback)
     if wrong:
-        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json]", file=sys.stderr)
+        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json] | "
+              "optimize PLAN [--dry-run] [--out FOLDER] | promote FOLDER [--apply | --rollback] | sample FOLDER",
+              file=sys.stderr)
         return 2
     try:
         if args.action == "summary":
             return experiment.show(paths.expand(args.path), args.json)
+        if args.action == "sample":
+            print_lines(optimize.sample(paths.expand(args.path)))
+            return 0
+        if args.action == "promote":
+            return optimize.promote(paths.expand(args.path), args.apply, args.rollback)
+        if args.action == "optimize":
+            return optimize.run(paths.expand(args.path), args.out, args.dry_run)
         return experiment.run(paths.expand(args.path), args.out, args.dry_run)
     except (experiment.Refused, tomllib.TOMLDecodeError, OSError) as e:
         print(e, file=sys.stderr)
         return 1
+
+
+def implementation_manifest(path) -> bool:
+    import tomllib
+
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return "candidates" not in data and ("arms" in data or "tasks" in data)
+
+
+def cmd_implementations(args) -> int:
+    import tomllib
+
+    from . import experiment, implbench
+
+    if args.action == "run" and args.json:
+        print("usage: arete benchmark run MANIFEST [--dry-run] [--out FILE] | report FILE [--json] | sample FOLDER",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print("\n".join(implbench.sample(paths.expand(args.folder))))
+            return 0
+        if args.action == "report":
+            return implbench.show(paths.expand(args.file), args.json)
+        return implbench.run(paths.expand(args.manifest), args.out or "", args.dry_run)
+    except (experiment.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
+BENCHMARK_NEVER = "It never pulls weights, provisions a device or schedules load."
+
+
+def cmd_benchmark(args) -> int:
+    from pathlib import Path
+
+    from . import benchmark, devices, util
+
+    if args.action in ("report", "sample") or (args.action == "run" and implementation_manifest(
+            paths.expand(args.manifest))):
+        return cmd_implementations(args)
+    if args.action == "fixture":
+        if not 1 <= args.seconds <= 3600:
+            print("arete benchmark: --seconds must be from 1 to 3600", file=sys.stderr)
+            return 2
+        try:
+            return benchmark.serve_fixture(args.port, args.seconds)
+        except OSError as e:
+            print(f"arete benchmark: cannot serve the fixture on port {args.port}: {util.first_line(str(e), 200)}",
+                  file=sys.stderr)
+            return 1
+    if args.dry_run:
+        print("arete benchmark: --dry-run applies to a manifest of arms and tasks", file=sys.stderr)
+        return 2
+    try:
+        found = benchmark.run(benchmark.read_manifest(paths.expand(args.manifest)))
+        if args.out:
+            util.write_json(Path(args.out), found)
+    except (benchmark.Refused, ValueError, TypeError, OSError, devices.DeviceError) as e:
+        print(f"arete benchmark: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(found))
+    else:
+        print_lines(benchmark.report_lines(found))
+    return 0
 
 
 def cmd_triage(args) -> int:
@@ -1203,38 +1282,6 @@ def cmd_prices(args) -> int:
     return 0
 
 
-BENCHMARK_NEVER = "It never pulls weights, provisions a device or schedules load."
-
-
-def cmd_benchmark(args) -> int:
-    from pathlib import Path
-
-    from . import benchmark, devices, util
-
-    if args.action == "fixture":
-        if not 1 <= args.seconds <= 3600:
-            print("arete benchmark: --seconds must be from 1 to 3600", file=sys.stderr)
-            return 2
-        try:
-            return benchmark.serve_fixture(args.port, args.seconds)
-        except OSError as e:
-            print(f"arete benchmark: cannot serve the fixture on port {args.port}: {util.first_line(str(e), 200)}",
-                  file=sys.stderr)
-            return 1
-    try:
-        found = benchmark.run(benchmark.read_manifest(paths.expand(args.manifest)))
-        if args.out:
-            util.write_json(Path(args.out), found)
-    except (benchmark.Refused, ValueError, TypeError, OSError, devices.DeviceError) as e:
-        print(f"arete benchmark: {util.first_line(str(e), 400)}", file=sys.stderr)
-        return 2
-    if args.json:
-        print(json.dumps(found))
-    else:
-        print_lines(benchmark.report_lines(found))
-    return 0
-
-
 def cmd_writers(args) -> int:
     from pathlib import Path
 
@@ -1558,7 +1605,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", default="")
     p.add_argument("--runner", default="", help="claude, pi or codex; by the model when left out")
     p.add_argument("--tools", default=None, help="comma separated; Read,Edit,Write,Glob,Grep,Bash by default")
-    p.add_argument("--repo", default="", help="a repo name from the config; work in a new worktree of it on a device of kind local")
+    p.add_argument("--repo", default="", help="a repo name from the config; local works in a new worktree of it, another device in a "
+                                              "fresh clone whose work arete fetches back and pushes")
     p.add_argument("--budget", type=float, default=None, help="USD for the whole session")
     p.add_argument("--attach", action="store_true", help="start: follow it at once")
     p.set_defaults(fn=cmd_session_args)
@@ -1619,20 +1667,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rater", default="", metavar="NAME", help="rate: the rater, instead of the file's rater")
     p.add_argument("--json", action="store_true", help="report: one JSON line")
     p.set_defaults(fn=cmd_writers)
-
-    p = sub.add_parser("benchmark", help="measure already configured local model endpoints under 8K and 32K context "
-                                         "and concurrency; " + BENCHMARK_NEVER,
-                       description="Benchmark already configured local model endpoints once, on request. "
-                                   + BENCHMARK_NEVER)
-    bsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
-    b = bsub.add_parser("run", help="run the manifest's candidates once and print the comparable report")
-    b.add_argument("manifest", metavar="MANIFEST", help="a TOML manifest of candidates")
-    b.add_argument("--json", action="store_true", help="print the report as one JSON line")
-    b.add_argument("--out", metavar="FILE", help="also write the report JSON to FILE")
-    b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
-    b.add_argument("--port", type=int, required=True)
-    b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
-    p.set_defaults(fn=cmd_benchmark)
 
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))
@@ -1737,8 +1771,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_poll)
 
-    p = sub.add_parser("mine", help="loop 1: mine transcripts into harness PRs")
-    p.add_argument("--hours", type=float, default=None)
+    p = sub.add_parser("mine", help="loop 1: mine transcripts and recorded runs into harness PRs")
+    p.add_argument("--hours", type=float, default=None,
+                   help="window for both sources; without it recorded runs are read since the last mine")
     p.add_argument("--dry-run", action="store_true", help="print proposals, change nothing")
     p.add_argument("--no-apply", action="store_true", help="record proposals but open no PRs")
     p.set_defaults(fn=cmd_mine)
@@ -1773,13 +1808,45 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
 
-    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, or summarize its results")
-    p.add_argument("action", choices=("run", "summary"))
-    p.add_argument("path", metavar="MANIFEST | FILE", help="run: the manifest; summary: the results file")
-    p.add_argument("--dry-run", action="store_true", help="with run: validate and print the plan; writes and calls nothing")
-    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for the manifest")
+    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, summarize its results, "
+                                          "or search for a better setting and promote the winner")
+    p.add_argument("action", choices=("run", "summary", "optimize", "promote", "sample"))
+    p.add_argument("path", metavar="MANIFEST | FILE | PLAN | FOLDER",
+                   help="run: the manifest; summary: the results file; optimize: the plan; promote: the trail "
+                        "folder; sample: a new folder for the replay fixture")
+    p.add_argument("--dry-run", action="store_true", help="with run or optimize: validate and print the plan; "
+                                                          "writes and calls nothing")
+    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for "
+                                                             "the manifest; with optimize: the trail folder")
     p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
+    p.add_argument("--apply", action="store_true", help="with promote: write the winner's keys to config.toml")
+    p.add_argument("--rollback", action="store_true", help="with promote: undo the last apply")
     p.set_defaults(fn=cmd_experiment)
+
+    p = sub.add_parser("benchmark", help="measure already configured local model endpoints under 8K and 32K context "
+                                         "and concurrency, or compare implementation routes on ordinary and "
+                                         "difficult tasks; " + BENCHMARK_NEVER,
+                       description="Benchmark already configured local model endpoints once, on request. "
+                                   + BENCHMARK_NEVER + " `run` takes a manifest of candidates (endpoints) or of arms "
+                                   "and tasks (implementation routes); `report` and `sample` belong to the latter.")
+    bsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
+    b = bsub.add_parser("run", help="run a manifest once: endpoint candidates print a comparable report; arms and "
+                                    "tasks run the implementation benchmark")
+    b.add_argument("manifest", metavar="MANIFEST", help="a TOML manifest of candidates, or of arms and tasks")
+    b.add_argument("--json", action="store_true", help="endpoint manifests: print the report as one JSON line")
+    b.add_argument("--out", metavar="FILE", help="endpoint manifests: also write the report JSON to FILE; "
+                                                  "implementation manifests: the results file")
+    b.add_argument("--dry-run", action="store_true",
+                   help="implementation manifests: validate and print the plan; writes and calls nothing")
+    b = bsub.add_parser("report", help="print the report of an implementation benchmark results file")
+    b.add_argument("file", metavar="FILE", help="the results file")
+    b.add_argument("--json", action="store_true", help="print one JSON line")
+    b = bsub.add_parser("sample", help="write a replay fixture for the implementation benchmark into a new folder")
+    b.add_argument("folder", metavar="FOLDER", help="a new, empty folder")
+    b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
+    b.add_argument("--port", type=int, required=True)
+    b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
+    p.set_defaults(fn=cmd_benchmark)
 
     p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
                                          "`sample FOLDER`, `run SUITE`, `report FILE`")
