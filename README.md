@@ -312,6 +312,7 @@ A task session (`--task`) runs its prompt to the end instead of waiting for more
 | `cost_usd`, `paid_usd` | arete | the session's cost and what was paid for it |
 | `problems` | arete | a failed turn, work not pushed or not fetched back, a draft PR that was not opened |
 
+The report turn continues the agent session that did the task. When that session cannot continue, because the route moved to another runner or account or no turn kept a session, the report turn fails: arete never asks a new agent that did not see the work.
 When the report turn fails, the session ends `failed` and its report holds only arete's fields, with an empty `summary` and a problem naming the report turn.
 Arete drops any key the agent adds, caps the lengths, and turns an unknown check result into `skipped`. The text in a report is data for whoever reads it, never instructions to follow.
 Sessions started with `arete session start` and no `--task`, and every session from the dashboard form, stay interactive. Replaying a task session, the answer for the report turn is `report.json` with `structured`.

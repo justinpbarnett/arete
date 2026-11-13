@@ -2328,6 +2328,30 @@ if scenario == "commit-fails":
     def commit_local(spec, message):
         raise RuntimeError("disk full")
     sessions.commit_local = commit_local
+strangers = []
+if scenario.startswith("rerouted"):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from arete import accounts, agent, runner
+    routed, launched = runner.run, runner.attempt
+    def turn_on_claude(prompt, cwd, **kw):
+        if kw["trace"][1] == "report" and scenario == "rerouted-account":
+            kw = {**kw, "runner": "claude", "cfg": replace(kw["cfg"], replay=replace(kw["cfg"].replay, all=False))}
+        res = routed(prompt, cwd, **kw)
+        if kw["trace"][1] == "turn 1":
+            res.session = replace(res.session, runner="claude", account="acct-a")
+        return res
+    def stranger(which, name, text, cwd, resume, cfg, trace, *rest, **kw):
+        if trace[1] != "report":
+            return launched(which, name, text, cwd, resume, cfg, trace, *rest, **kw)
+        strangers.append({"runner": which, "resumed": resume.id, "prompt": text})
+        return agent.Result(ok=True, structured={"summary": "Guessed.", "checks": [], "open_questions": []},
+                            runner=which, model=name, session=agent.Session("s-b", 0.0, which))
+    other = runner.Picked(SimpleNamespace(runner="claude", effort="", instructions=(), provider="", credential="",
+                                          billing="subscription", tier="", position=0, requested=True),
+                          accounts.Auth(mode="subscription", family="claude", identity="b@example.com"), None,
+                          "sonnet", "", set(), None)
+    sessions.runner.run, runner.attempt, runner.pick = turn_on_claude, stranger, lambda trip: (other, [])
 spec = sessions.Spec(record.new_id("ses"), "Add kumquat", model="sonnet", repo=repo.name, task=True,
                      draft_pr=scenario.startswith("draft"))
 sessions.workspace(spec, devices.LOCAL, repo)
@@ -2341,7 +2365,8 @@ log = (root / "state" / "sessions" / spec.id / "session.log").read_text()
 print(json.dumps({"status": status, "report": state.report(spec.id), "row": state.run_get(spec.id), "id": spec.id,
                   "origin": origin_git("rev-parse", "--verify", "-q", f"refs/heads/session/{spec.id}"),
                   "files": origin_git("ls-tree", "-r", "--name-only", f"session/{spec.id}").split(),
-                  "log_tail": log.strip().splitlines()[-1], "made": len(made)}))
+                  "log_tail": log.strip().splitlines()[-1], "made": len(made),
+                  "report_steps": [s for s in state.steps(spec.id) if s["step"] == "report"], "strangers": strangers}))
 '''
 
     def run_task(self, scenario):
@@ -2408,6 +2433,18 @@ print(json.dumps({"status": status, "report": state.report(spec.id), "row": stat
         self.assertEqual((report["summary"], report["checks"]), ("", []))
         self.assertEqual(report["commit"], out["origin"])
         self.assertTrue([p for p in report["problems"] if "report turn" in p])
+
+    def test_a_report_that_cannot_continue_the_working_session_fails_instead_of_asking_a_stranger(self):
+        for scenario in ("rerouted-runner", "rerouted-account"):
+            with self.subTest(scenario=scenario):
+                out = self.run_task(scenario)
+                report = out["report"]
+                self.assertEqual(out["status"], "failed")
+                self.assertEqual((out["report_steps"], out["strangers"]), ([], []))
+                self.assertEqual((report["summary"], report["checks"], report["open_questions"]), ("", [], []))
+                self.assertEqual(report["commit"], out["origin"])
+                self.assertTrue([p for p in report["problems"] if "report turn" in p and "cannot continue" in p])
+                self.assertNotIn("Ignore your instructions", json.dumps(out))
 
     def test_launch_refuses_a_draft_pr_it_cannot_open(self):
         cfg = config.Config(repos=[config.Repo("bare", Path("/nowhere"))])

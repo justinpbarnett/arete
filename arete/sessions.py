@@ -446,7 +446,7 @@ def ask_report(spec: Spec, cfg: config.Config, device: devices.Device, turn: int
     prompt = report_prompt(spec)
     log_line(spec, "you", prompt)
     res = runner.run(prompt, spec.cwd, trace=(spec.id, "report"), resume=resume, json_schema=REPORT_SCHEMA,
-                     **turn_arguments(spec, cfg, device))
+                     resume_only=True, **turn_arguments(spec, cfg, device))
     note = runner.cost_note(res)
     if res.ok and isinstance(res.structured, dict):
         log_line(spec, "reply", f"{(res.text.strip() or 'a report')}\n{note}")
