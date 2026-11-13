@@ -36,6 +36,7 @@ from . import (
     paths,
     pi,
     record,
+    routing,
     runner,
     state,
     steps,
@@ -272,6 +273,17 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(s.step, NO_SESSION) if s.session == "resume" else NO_SESSION, **kw}
         cfg = kw.get("cfg") or self.config
+        if s and s.requires.declared and not cfg.replay.all:
+            size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
+            found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer)
+            picked = routing.select(found, s, request_tokens=size)
+            kw["route"] = routing.described_selection(picked, s, size)
+            if picked.error:
+                kw["refusal"] = picked.error
+            elif alternative := picked.route:
+                kw.update(model=alternative.model, runner=alternative.runner, effort=alternative.effort,
+                          instructions=list(alternative.instructions), mode=alternative.mode)
+                self.log(f"{step}: {picked.reason}")
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
         which, model = runner.chosen(kw.get("model", ""), run_with, cfg)
         effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost

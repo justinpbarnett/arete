@@ -40,6 +40,20 @@ class Link:
 
 
 @dataclass(frozen=True)
+class Requirements:
+    modalities: tuple[str, ...] = ()
+    min_context: int = 0
+    structured_output: bool = False
+    data_handling: tuple[str, ...] = ()
+    floor: str = ""
+    approved: tuple[str, ...] = ()
+
+    @property
+    def declared(self) -> bool:
+        return bool(self.modalities or self.min_context or self.structured_output or self.data_handling or self.floor)
+
+
+@dataclass(frozen=True)
 class Quote:
     input: float | None = None
     output: float | None = None
@@ -68,6 +82,8 @@ class Candidate:
     price: Quote | None
     state: str
     detail: str
+    capabilities: dict | None = None
+    mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,15 @@ class Way:
     credential: str
     billing: str
     mode: str = ""
+
+
+@dataclass(frozen=True)
+class Selection:
+    route: Candidate | None
+    kept: bool
+    reason: str
+    skipped: tuple[Candidate, ...] = ()
+    error: str = ""
 
 
 def nearest_effort(which: str, effort: str) -> str:
@@ -151,14 +176,27 @@ def per_million(value) -> float | None:
     return None if scaled is None else round(scaled, 6)
 
 
+def whole(value) -> int | None:
+    return value if type(value) is int and value >= 1 else None
+
+
+def names(value) -> list[str] | None:
+    return list(value) if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value) else None
+
+
+def listing(entry) -> dict:
+    entry = accounts.mapping(entry)
+    return {**{key: number(entry.get(key)) for key in ("input", "output", "cache_read", "cache_write")},
+            "context": whole(entry.get("context")), "modalities": names(entry.get("modalities")),
+            "structured_output": entry["structured_output"] if type(entry.get("structured_output")) is bool else None}
+
+
 def openrouter_prices() -> dict[str, dict]:
     file = paths.STATE_DIR / PRICE_FILE
     try:
         cached = util.read_json(file, {})
         if isinstance(cached.get("models"), dict) and util.now() - util.parse_iso(cached["fetched"]) < PRICE_FRESH:
-            return {name: {key: number(accounts.mapping(rates).get(key))
-                           for key in ("input", "output", "cache_read", "cache_write")}
-                    for name, rates in cached["models"].items()}
+            return {name: listing(rates) for name, rates in cached["models"].items()}
     except (AttributeError, KeyError, OSError, TypeError, ValueError):
         pass
     request = urllib.request.Request(OPENROUTER_URL, headers={"Accept": "application/json", "User-Agent": "arete"})
@@ -170,9 +208,14 @@ def openrouter_prices() -> dict[str, dict]:
         models = {}
         for item in json.loads(data)["data"]:
             rates = item.get("pricing") or {}
-            models[item["id"]] = {"input": per_million(rates.get("prompt")), "output": per_million(rates.get("completion")),
-                                  "cache_read": per_million(rates.get("input_cache_read")),
-                                  "cache_write": per_million(rates.get("input_cache_write"))}
+            parameters = item.get("supported_parameters")
+            models[item["id"]] = listing({
+                "input": per_million(rates.get("prompt")), "output": per_million(rates.get("completion")),
+                "cache_read": per_million(rates.get("input_cache_read")),
+                "cache_write": per_million(rates.get("input_cache_write")),
+                "context": item.get("context_length"),
+                "modalities": accounts.mapping(item.get("architecture")).get("input_modalities"),
+                "structured_output": "structured_outputs" in parameters if isinstance(parameters, list) else None})
     except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError, AttributeError):
         return {}
     try:
@@ -205,7 +248,9 @@ def paid_key(found: Candidate) -> tuple:
 
 class Discovery:
     def __init__(self, cfg: config.Config, repo: config.Repo | None = None, device: devices.Device | str = "local",
-                 connect=state.db):
+                 connect=state.db, layer: config.RepoLayer | None = None):
+        self.declared = {key: {**cfg.capabilities.get(key, {}), **(layer.capabilities.get(key, {}) if layer else {})}
+                         for key in dict.fromkeys([*cfg.capabilities, *(layer.capabilities if layer else {})])}
         self.cfg = cfg
         self.repo = repo
         self.device = devices.resolve(device)
@@ -298,11 +343,77 @@ class Discovery:
             return "instructions user cannot load on codex, which runs without your own codex setup"
         return ""
 
-    def judge(self, way: Way, settings, remaining: float | None) -> tuple[str, str]:
+    def pi_capabilities(self, model: str) -> dict:
+        configured = self.remembered("models.json", pi.model_configuration)
+        provider, _, name = model.partition("/")
+        listed = accounts.mapping(accounts.mapping(configured.get("providers")).get(provider)).get("models", [])
+        entry = next((item for item in listed if accounts.mapping(item).get("id") == name), {})
+        entry = accounts.mapping(entry)
+        return {"modalities": names(entry.get("input")), "context": whole(entry.get("contextWindow"))}
+
+    def capabilities(self, way: Way) -> dict:
+        found: dict = {}
+        sources: dict[str, str] = {}
+
+        def take(values: dict, source: str, only_missing: bool = False) -> None:
+            for key in config.CAPABILITY_KEYS:
+                if values.get(key) is not None and not (only_missing and key in found):
+                    found[key], sources[key] = values[key], source
+
+        if way.runner == "pi":
+            take(self.pi_capabilities(way.model), "models.json")
+            if way.model.startswith(f"{OPENROUTER_PROVIDER}/") and any(
+                    key not in found for key in ("modalities", "context", "structured_output")):
+                take(self.openrouter().get(way.model.partition("/")[2], {}), "openrouter", only_missing=True)
+        for key in (way.model, f"{way.runner}:{way.model}"):
+            take(self.declared.get(key, {}), "config")
+        return {**found, "source": sources}
+
+    def unmet(self, way: Way, settings, request_tokens: int = 0) -> str:
+        need = settings.requires
+        if not need.declared:
+            return ""
+        have = self.capabilities(way)
+        reasons = []
+        if need.floor and not way.link.requested:
+            approved = {identity(*runner.route(m)) for m in need.approved}
+            if identity(way.runner, way.model) not in approved:
+                reasons.append(f"is not in [routing.floors] {need.floor}")
+        if need.modalities:
+            offered = have.get("modalities")
+            if offered is None:
+                reasons.append(f"modalities are not declared for this route; the step needs {', '.join(need.modalities)}")
+            elif missing := [m for m in need.modalities if m not in offered]:
+                reasons.append(f"takes {', '.join(offered) or 'nothing'} only; the step needs {', '.join(missing)}")
+        if need.min_context:
+            wanted = max(need.min_context, request_tokens)
+            offered = have.get("context")
+            if offered is None:
+                reasons.append("context is not declared for this route")
+            elif offered < wanted:
+                who = "this request needs about" if request_tokens > need.min_context else "the step needs"
+                reasons.append(f"advertises {offered} tokens of context; {who} {wanted}")
+        if need.structured_output:
+            offered = have.get("structured_output")
+            if offered is None:
+                reasons.append("structured output is not declared for this route")
+            elif not offered:
+                reasons.append("does not give structured output")
+        if need.data_handling:
+            offered = have.get("data_handling")
+            if offered is None:
+                reasons.append("data handling is not declared for this route")
+            elif offered not in need.data_handling:
+                reasons.append(f"data handling is '{offered}'; the step allows {', '.join(need.data_handling)}")
+        return "; ".join(reasons)
+
+    def judge(self, way: Way, settings, remaining: float | None, request_tokens: int = 0) -> tuple[str, str]:
         if why := runner.device_refusal(way.model, way.runner, self.device):
             return "excluded", why
         if why := self.incompatible(way, settings):
             return "incompatible", why
+        if why := self.unmet(way, settings, request_tokens):
+            return "ineligible", why
         auth = accounts.Auth()
         if way.runner == "pi":
             selected = self.probe(way.model, way.mode)
@@ -336,13 +447,14 @@ class Discovery:
             return "budget_spent", f"the daily loop budget has {max(remaining, 0):.4f} USD left"
         return "ready", ""
 
-    def candidate(self, way: Way, settings, remaining: float | None) -> Candidate:
+    def candidate(self, way: Way, settings, remaining: float | None, request_tokens: int = 0) -> Candidate:
         link = way.link
-        state_name, detail = self.judge(way, settings, remaining)
+        state_name, detail = self.judge(way, settings, remaining, request_tokens)
         return Candidate(0, way.model, way.runner, self.provider(way), way.credential, way.billing, link.tier,
                          link.position, link.requested, settings.effort_on(way.runner),
                          settings.instructions_on(way.runner), self.quote(way) if way.billing == "paid" else None,
-                         state_name, " ".join(detail.split()))
+                         state_name, " ".join(detail.split()),
+                         self.capabilities(way) if settings.requires.declared else None, way.mode)
 
     def provider(self, way: Way) -> str:
         if way.runner == "claude":
@@ -351,7 +463,7 @@ class Discovery:
             return "openai" if way.credential == "cli_key" else "openai-codex"
         return runner.provider_of(way.model) or way.link.provider
 
-    def routes(self, settings, remaining_budget: float | None = None) -> list[Candidate]:
+    def routes(self, settings, remaining_budget: float | None = None, request_tokens: int = 0) -> list[Candidate]:
         seen = set()
         found = []
         for link in settings.chain if settings.fallback else settings.chain[:1]:
@@ -374,7 +486,7 @@ class Discovery:
                 key = (way.runner, identity(way.runner, way.model), way.credential)
                 if key not in seen:
                     seen.add(key)
-                    found.append(self.candidate(way, settings, remaining_budget))
+                    found.append(self.candidate(way, settings, remaining_budget, request_tokens))
         free = sorted((c for c in found if c.billing == "free"), key=free_key)
         paid = sorted((c for c in found if c.billing == "paid"), key=paid_key)
         return [replace(c, order=n) for n, c in enumerate([*free, *paid], 1)]
@@ -397,8 +509,49 @@ def described(candidates: list[Candidate]) -> list[dict]:
         rows.append({"order": c.order, "model": c.model, "runner": c.runner, "provider": c.provider,
                      "credential": c.credential, "billing": c.billing, "tier": c.tier, "position": c.position,
                      "requested": c.requested, "effort": c.effort, "instructions": list(c.instructions),
-                     "price": price, "state": c.state, "detail": c.detail})
+                     "price": price, "state": c.state, "detail": c.detail, "capabilities": c.capabilities})
     return rows
+
+
+def request_tokens(prompt: str, system: str, schema) -> int:
+    text = prompt + system + (json.dumps(schema) if schema else "")
+    return math.ceil(len(text.encode("utf-8")) / 3)
+
+
+def select(found: Discovery, settings, remaining: float | None = None, request_tokens: int = 0) -> Selection:
+    own = Way(settings.chain[0], settings.runner, settings.model, "", "")
+    why = found.unmet(own, settings, request_tokens)
+    if not why:
+        return Selection(None, True, "the requested route meets the step's requirements")
+    candidates = found.routes(settings, remaining, request_tokens)
+    chosen = next((n for n, c in enumerate(candidates)
+                   if c.state == "ready" and not (c.requested and c.runner == settings.runner)), None)
+    if chosen is None:
+        tried = "; ".join(f"{c.model} ({c.runner}, {c.credential}): {c.state}: {c.detail}" for c in candidates)
+        return Selection(None, False, "", tuple(candidates),
+                         f"no route meets step {settings.step}'s requirements: {tried}")
+    picked = candidates[chosen]
+    skipped = tuple(c for n, c in enumerate(candidates) if n != chosen and (c.requested or n < chosen))
+    return Selection(picked, False, f"requested {settings.model} {why}; took {picked.model}", skipped)
+
+
+def described_selection(selection: Selection, settings, request_tokens: int) -> dict:
+    need = settings.requires
+    if selection.kept:
+        selected = {"model": settings.model, "runner": settings.runner, "provider": settings.provider,
+                    "credential": "", "billing": "", "reason": selection.reason}
+    elif picked := selection.route:
+        selected = {"model": picked.model, "runner": picked.runner, "provider": picked.provider,
+                    "credential": picked.credential, "billing": picked.billing, "reason": selection.reason}
+    else:
+        selected = None
+    return {"selected": selected,
+            "skipped": [{"model": c.model, "runner": c.runner, "credential": c.credential, "state": c.state,
+                         "reason": c.detail} for c in selection.skipped],
+            "requires": {"modalities": list(need.modalities), "min_context": need.min_context,
+                         "structured_output": need.structured_output, "data_handling": list(need.data_handling),
+                         "floor": need.floor},
+            "request_tokens": request_tokens, "error": selection.error}
 
 
 def loop_budget_left(cfg: config.Config) -> float | None:

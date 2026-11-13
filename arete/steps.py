@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import claude, codex, config, pi, routing, runner
@@ -35,6 +35,7 @@ class Settings:
     chain: tuple[routing.Link, ...] = ()
     fallback: bool = True
     instructions_explicit: bool = False
+    requires: routing.Requirements = field(default_factory=routing.Requirements)
 
     def effort_on(self, which: str) -> str:
         return routing.nearest_effort(which, self.effort)
@@ -191,11 +192,19 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     if effort and effort not in supported:
         raise ValueError(f"{where}: effort '{effort}' is not a level its routes take; use "
                          f"{', '.join(level for level in routing.EFFORT_ORDER if level in supported)}")
+    floor = found.get("floor", "")
+    floors = {**cfg.floors, **layer.floors}
+    if floor and floor not in floors:
+        raise ValueError(f"{where}: floor '{floor}' is not in [routing.floors]")
+    requires = routing.Requirements(
+        modalities=tuple(found.get("modalities", ())), min_context=found.get("min_context", 0),
+        structured_output=found.get("structured_output", False), data_handling=tuple(found.get("data_handling", ())),
+        floor=floor, approved=floors.get(floor, ()))
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
                     mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,
                     chain=chain, fallback=fallback,
-                    instructions_explicit=explicit is not None)
+                    instructions_explicit=explicit is not None, requires=requires)
 
 
 def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_tiers: bool = False) -> None:

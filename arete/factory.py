@@ -334,7 +334,8 @@ def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
             raise ValueError(f"--set {item}: {name} is not a step that calls an agent; use {', '.join(role_of)}")
         table.setdefault(role_of[name], {})[key] = (
             int(value) if key in config.STEP_COUNTS and value.isdigit()
-            else [v for v in value.split(",") if v] if key in config.STEP_LISTS else value)
+            else [v for v in value.split(",") if v] if key in config.STEP_LISTS
+            else value == "true" if key == "structured_output" and value in ("true", "false") else value)
     return config.step_tables(table, "--set")
 
 

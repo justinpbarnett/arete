@@ -105,7 +105,8 @@ def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: confi
 
 
 def authentication(model: str, run_with: str = "", *, cfg: config.Config | None = None,
-                   repo: config.Repo | None = None, device: devices.Device | str = "local") -> accounts.Auth:
+                   repo: config.Repo | None = None, device: devices.Device | str = "local",
+                   mode: str = "") -> accounts.Auth:
     which, name = route(model, run_with)
     if which == REPLAY or (cfg and cfg.replay.all):
         return accounts.Auth()
@@ -114,7 +115,7 @@ def authentication(model: str, run_with: str = "", *, cfg: config.Config | None 
     passing = environment.passed(cfg, repo)
     remote = target if target.remote else None
     if which == "pi":
-        return pi_route(name, cfg, repo, target).auth
+        return pi_route(name, cfg, repo, target, mode=mode).auth
     return (codex if which == "codex" else claude).authentication(passing, remote=remote)
 
 
@@ -282,7 +283,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(),
         repo: config.Repo | None = None, selected: pi.Route | None = None,
         remaining_budget: Callable[[], float | None] | None = None,
-        on_launch: Callable[[pi.Route], None] = lambda selected: None, **kw) -> Result:
+        on_launch: Callable[[pi.Route], None] = lambda selected: None, route: dict | None = None,
+        refusal: str = "", mode: str = "", **kw) -> Result:
     cfg = cfg or config.load()
     which, name = chosen(model, runner or (resume.runner if not model else ""), cfg)
     if resume.runner != which:
@@ -298,6 +300,9 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kw["passing"] = environment.passed(cfg, repo)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
+    if refusal:
+        return attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target,
+                       {**kw, "budget_error": refusal}, tier, kind, accounts.Auth(), route)
     if which == "claude":
         kw.pop("max_budget_usd", None)
         if not target.remote:
@@ -315,12 +320,13 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     pinned = selected is not None
     while True:
         if which == "pi" and not target.remote:
-            selected = selected or pi_route(name, cfg, repo, target)
+            selected = selected or pi_route(name, cfg, repo, target, mode=mode)
             auth = selected.auth
             name = selected.model
             kw["selected"] = selected
         else:
-            auth = authentication(name, which, cfg=cfg, repo=repo, device=target) if which != REPLAY else accounts.Auth()
+            auth = (authentication(name, which, cfg=cfg, repo=repo, device=target, mode=mode)
+                    if which != REPLAY else accounts.Auth())
         unknown = "local-" + accounts.fingerprint(invocation, auth.generation)
         auths = {auth, *(selected.refreshed_auths if selected else ())}
         active = [h for a in auths if (h := usage_hold(name, which, cfg=cfg, auth=a, unknown=unknown))]
@@ -331,7 +337,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             say(hold_words(held))
             with waits("limit"):
                 wait_out(held["scope"], lambda auth=auth, name=name, pinned=pinned: not (which == "pi" and pinned) and
-                         authentication(name, which, cfg=cfg, repo=repo, device=target) != auth)
+                         authentication(name, which, cfg=cfg, repo=repo, device=target, mode=mode) != auth)
             say(f"the {which} usage limit has lifted, going on")
             if not pinned:
                 selected = None
@@ -351,7 +357,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         started = util.iso()
         if selected:
             on_launch(selected)
-        res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind, auth)
+        res = attempt(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind, auth, route)
         if not res.usage_limit:
             if res.ok and which != REPLAY:
                 state.clear_holds([accounts.scope(a, s, unknown)
@@ -392,7 +398,7 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
-            kind: str = "", auth: accounts.Auth | None = None) -> Result:
+            kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None) -> Result:
     auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
     header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
               "auth_mode": auth.mode,
@@ -404,6 +410,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
+    if route:
+        header["route"] = route
     found = secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg)
     selected = kw.get("selected")
     if selected:
