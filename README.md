@@ -288,7 +288,7 @@ arete session send ID "now try the cache"
 arete session attach ID | stop ID | list
 ```
 
-`--repo` gives it a new worktree of a config repo; a device of any kind but `local` takes no repo and starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Sessions view starts one with the same choices, under New session.
+`--repo` gives a local session a new worktree of a config repo. A session on another device gets a fresh clone of the repo's `github` project in the device's `dir`, on a new branch `session/<id>` from the repo's base branch. Arete mints a GitHub App token for that one repository with `contents: read` only, sends it to the device on stdin, and the device uses it for the clone alone through a git credential helper: the token is never in the repo, a prompt, a log or a record, and the device keeps none, so it can never push. The session's work is committed on the device after each turn (paths the repo layer denies, such as `.github/workflows/**` and `.env`, are left out), carried back as a git bundle over ssh, and fetched into the config repo's own folder. The controller pushes `session/<id>` to `origin` with its own credentials, as a local session does; the push is held, and the work only fetched, when any commit of it touches a denied path, even if a later commit removes that path. An `exe` device needs egress that reaches github.com, and the controller needs `openssl` to sign for the app. Without `[github_app]` set (see [Global config](#global-config)), a remote session with a repo is refused and names the missing setting; a repo with no `github` starts only on `local`. A device with no repo starts in its `dir`. `--budget` caps the whole session in dollars when it runs on pi; a claude session has no cap. A session with no message for `session_idle_hours` closes. The dashboard's Sessions view starts one with the same choices, under New session.
 
 `arete costs` shows what you paid for model calls, by model, runner, loop and route, with subscription usage kept apart from paid spend and local routes shown at $0.00 with their tokens. A call's explicit authentication mode decides whether it uses a subscription and counts nothing as paid; older rows keep their runner/provider interpretation.
 
@@ -595,8 +595,16 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 
 ## Global config
 
+```toml
+[github_app]
+app_id = "123456"
+installation_id = "7890123"
+private_key = "~/.config/arete/github-app.pem"
+```
+
 | Key | Meaning |
 |-----|---------|
+| `[github_app]` | `app_id`, `installation_id` and `private_key` (the app's PEM file, signed with `openssl`). Remote sessions with a repo clone with a token this app mints for that one repository. The app needs only Contents: read, and it must be installed on the repos those sessions use. |
 | `alert_repo` | GitHub repo where each failing heartbeat check opens one issue. Bodies carry check names and a short status only. Until the repo exists, alerts fall back to macOS notifications. |
 | `global_repo` | Name of the `[[repo]]` that holds global skills and settings. |
 | `arete_repo` | Name of the `[[repo]]` that is this checkout. Its step prompts are harness files the miner may change. Default `arete`. |
