@@ -511,6 +511,57 @@ print("RESULT" + json.dumps(out))
         self.assertEqual(rs.link_ids("See [S2](https://en.wikipedia.org/wiki/Mercury_(planet)).", urls),
                          "See [S2](https://en.wikipedia.org/wiki/Mercury_(planet)).")
 
+    def test_links_in_containers_line_ends_attributes_and_emails_are_refused(self):
+        from arete import research_synthesis as rs
+        known, far = {"S1": "https://example.org"}, "//outside.example/"
+
+        def faults(text, gaps=(), links=frozenset()):
+            answer = {"summary": "s", "name": "", "answer": text,
+                      "conclusions": [{"claim": "c", "sources": ["S1"], "critical": True}], "inferences": [],
+                      "contradictions": [], "gaps": [{"question": q, "why": w} for q, w in gaps], "searches": []}
+            return rs.faults(answer, known, set(links))
+
+        for text in (f"See [x][r].\n\n> [r]: {far}", f"See [x][r].\n\n> [r]: https\\:{far}",
+                     f"See [x][r].\n\n- [r]: https&#58;{far}", f"See [x][r].\n\n* [r]: {far}",
+                     f"See [x][r].\n\n1. a\n\n    [r]: https\\:{far}", f"See [r].\n\n> [r]: https\\:{far}",
+                     f"See [S1][r].\n\n> [r]: {far}", f"See [x][r].\r\r[r]: https\\:{far}",
+                     f"[r]:\r{far}\r\rSee [x][r].", f"See [x][r].\n\n> [r]: {far} \"t\"",
+                     f"See [x](\rhttps\\:{far}).", f"See [x](\r\n{far}).",
+                     f"See <a title='href=\"https://example.org/#' href=\"https&#58;{far}\">x</a>.",
+                     f"<img alt='src=\"https://example.org/#' src=\"{far}p.png\">",
+                     "<div>\n<a href=https&#58;//example.org'@outside.example/>x</a>\n</div>",
+                     "<div>\n<a href=https&#58;//example.org=@outside.example/>x</a>\n</div>",
+                     "<div>\n<a href=https&#58;//example.org`@outside.example/>x</a>\n</div>",
+                     "<p>\n<a href=ht&#9;tps://example.org'@outside.example/>x</a>\n</p>",
+                     "Write to <admin@outside.example>.", "Write to sales@outside.example today.",
+                     "Write to mailto:admin@outside.example today.", "See \\[S1](https://outside.example/) now."):
+            self.assertIn("outside.example", " ".join(faults(text)), repr(text))
+        for why in (far, f"https\\:{far}"):
+            self.assertIn("outside.example", " ".join(faults("See [x][r].", [("[r]", why)])), why)
+        self.assertEqual(faults("See [S1]'s note, ([S1]) and [S1].", [("Which limit applies?", "[S1] is dated")]), [])
+        self.assertEqual(faults("Write to admin@vendor.example.", links=rs.ticket_links("Mail admin@vendor.example.")),
+                         [])
+
+    def test_escaped_cites_and_source_details_render_as_plain_text(self):
+        from arete import research_synthesis as rs
+        evidence = {"sources": [
+            {"id": "S1", "url": "https://example.org/a) [docs](https://outside.example",
+             "title": "Vendor [docs](https://outside.example/)", "published": "", "event_date": ""},
+            {"id": "S2", "url": "https://example.org", "title": "Q&A: <b>R&D</b> *notes*", "published": "2025-01-02",
+             "event_date": ""}]}
+        answer = {"summary": "s", "name": "", "answer": "Limit 10 [S1]; see \\[S2]@outside.example now.",
+                  "conclusions": [{"claim": "c", "sources": ["S1", "S2"], "critical": True}], "inferences": [],
+                  "contradictions": [], "gaps": [], "searches": []}
+        self.assertEqual(rs.faults(answer, {s["id"]: s["url"] for s in evidence["sources"]}, set()), [])
+        report, used = rs.assemble(answer, evidence, [])
+        self.assertEqual(used, ["S1", "S2"])
+        self.assertIn("Limit 10 [S1](https://example.org/a%29%20[docs]%28https://outside.example); "
+                      "see \\[S2]@outside.example now.", report)
+        self.assertIn("- [S1](https://example.org/a%29%20[docs]%28https://outside.example) "
+                      "`Vendor [docs](https://outside.example/)`; published not stated", report)
+        self.assertIn("- [S2](https://example.org) Q&#38;A\\: &#60;b&#62;R&#38;D&#60;\\/b&#62; \\*notes\\*; "
+                      "published 2025-01-02", report)
+
     def test_research_subprocess_keeps_gh_state_out_of_the_worktree(self):
         self.assertEqual(self.out["home"], self.home)
         self.assertFalse(self.wrote_gh_state)

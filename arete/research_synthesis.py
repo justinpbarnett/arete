@@ -23,15 +23,22 @@ BOOL = {"type": "boolean"}
 CITE = re.compile(r"\[(S\d+)\]")
 CITE_LINK = re.compile(r"\[(S\d+)\](\((?:[^()\s]|\([^()\s]*\))*\))?")
 INLINE = re.compile(r"\]\(")
-DEFINITION = re.compile(r"^ {0,3}\[(?:\\.|[^\\\[\]])+\]:", re.MULTILINE)
+DEFINITION = re.compile(r"^(?:[ \t>*+-]|\d{1,9}[.)]|\[\^(?:\\.|[^\\\[\]])*\]:)*\[(?:\\.|[^\\\[\]])+\]:", re.MULTILINE)
 SPACING = re.compile(r"[ \t]*(?:\n[ \t]*)?")
 ANGLED = re.compile(r"<((?:\\.|[^<>\\\n])*)>")
 AUTOLINK = re.compile(r"<([a-z][a-z0-9+.-]{1,31}:[^\x00-\x20\x7f<>]*)>", re.IGNORECASE)
 AUTOLINK_END = re.compile(r"[^\x00-\x20\x7f<>]*>")
-ATTRIBUTE = re.compile(r"(?<![\w-])(?:href|src|srcset|longdesc|cite)[ \t\n\r\f\v]*=[ \t\n\r\f\v]*"
-                       r"(\"[^\"]*\"|'[^']*'|[^ \t\n\r\f\v\"'=<>`]+)", re.IGNORECASE)
+ATTRIBUTE = re.compile(r"(?<![\w-])(?=(?:href|src|srcset|longdesc|cite)[ \t\n\r\f\v]*=[ \t\n\r\f\v]*"
+                       r"(\"[^\"]*\"|'[^']*'|[^ \t\n\r\f>]{1,2048}))", re.IGNORECASE)
 BARE = re.compile(r"(?:https?://|ftp://|www\.)[^ \t\n\r\f\v<]*", re.IGNORECASE)
+EMAIL = re.compile(r"(?<![A-Za-z0-9.+_-])[A-Za-z0-9.+_-]+@[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+"
+                   r"|(?<=<)[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?=>)")
+LINE_END = re.compile(r"\r\n?")
+UNSAFE_IN_URL = re.compile(r"[\x00-\x20\x7f<>\\`]")
+ENTITY_START = re.compile(r"&(?=#[0-9]{1,7};|#[xX][0-9a-fA-F]{1,6};|[A-Za-z][A-Za-z0-9]{1,31};)")
 ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+BACKTICKS = re.compile(r"`+")
+EDGES = "".join(map(chr, range(33)))
 ENTITY_END = re.compile(r"&[a-z]+;$", re.IGNORECASE)
 TRAILING = "?!.,:*_~'\""
 PORTS = {"http": 80, "https": 443}
@@ -117,15 +124,23 @@ def bare(text: str, found: re.Match) -> str:
 
 
 def link_targets(text: str) -> list[str]:
+    text = LINE_END.sub("\n", text)
     found = [target(text, m.end()) for m in INLINE.finditer(text)]
     found += [target(text, m.end()) for m in DEFINITION.finditer(text)]
     found += [m[1] for m in AUTOLINK.finditer(text)]
     found += [html.unescape(m[1][1:-1] if m[1][0] in "\"'" else m[1]) for m in ATTRIBUTE.finditer(text)]
-    found += [bare(text, m) for m in BARE.finditer(text)]
+    for view in (text, literal(text)):
+        found += [bare(view, m) for m in BARE.finditer(view)]
+        found += [f"mailto:{m[0]}" for m in EMAIL.finditer(view)]
     return [url for url in dict.fromkeys(found) if url]
 
 
 def destination(url: str) -> tuple:
+    url = url.strip(EDGES)
+    if any(c <= " " or c == "\x7f" for c in url):
+        raise ValueError(f"the link {url!r} holds a space or control character, so it is not one address")
+    if url[:7].lower() == "mailto:":
+        return "mailto", url[7:].lower()
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -151,11 +166,17 @@ def destinations(urls) -> set[tuple]:
 
 
 def ticket_links(text: str) -> set[tuple]:
-    return destinations(link_targets(text or ""))
+    found = link_targets(text or "")
+    whole = [url for url in found if url[:7].lower() != "mailto:"]
+    return destinations(url for url in found if url in whole or not any(url[7:] in other for other in whole))
+
+
+def cite_links(text: str, known, written_as) -> str:
+    return CITE_LINK.sub(lambda m: written_as(m[1]) if m[1] in known and not escaped(text, m.start()) else m[0], text)
 
 
 def without_cited_targets(text: str, known) -> str:
-    return CITE_LINK.sub(lambda m: f"[{m[1]}]" if m[1] in known else m[0], text)
+    return cite_links(text, known, lambda sid: f"[{sid}]")
 
 
 def present(value) -> bool:
@@ -227,9 +248,15 @@ def faults(answer, known, links) -> list[str]:
     for i, task in enumerate(searches[:GAP_TASKS], 1):
         found += research_plan.task_problems(i, task)
     allowed = destinations(known.values()) | links
+    texts = [without_cited_targets(text, known) for text in text_fields(answer)]
+    if not found:
+        unlinked = dict.fromkeys(known, "")
+        for extra in ([(task["goal"], NOTHING_NEW) for task in searches], [("new evidence", NOT_SYNTHESIZED)]):
+            texts.append(report(answer, unlinked, extra, {})[0])
     for text in text_fields(answer):
         found += [f"[{sid}] was not supplied" for sid in dict.fromkeys(CITE.findall(text)) if sid not in known]
-        for url in link_targets(without_cited_targets(text, known)):
+    for text in texts:
+        for url in link_targets(text):
             try:
                 outside = destination(url) not in allowed
             except ValueError as e:
@@ -294,11 +321,41 @@ def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, too
 
 
 def link_ids(text: str, urls: dict[str, str]) -> str:
-    return CITE_LINK.sub(lambda m: f"[{m[1]}]({urls[m[1]]})" if m[1] in urls else m[0], text)
+    return cite_links(text, urls, lambda sid: source_link(sid, urls))
 
 
 def source_link(sid: str, urls: dict[str, str]) -> str:
     return f"[{sid}]({urls[sid]})"
+
+
+def balanced(url: str) -> bool:
+    depth = 0
+    for c in url:
+        depth += {"(": 1, ")": -1}.get(c, 0)
+        if not 0 <= depth <= 32:
+            return False
+    return not depth
+
+
+def written(url: str) -> str:
+    url = UNSAFE_IN_URL.sub(lambda m: f"%{ord(m[0]):02X}", url)
+    if not balanced(url):
+        url = url.replace("(", "%28").replace(")", "%29")
+    return ENTITY_START.sub(r"\\&", url)
+
+
+def inert_text(text: str) -> str:
+    text = " ".join(text.split())
+    if link_targets(text):
+        fence = "`" * (max(map(len, BACKTICKS.findall(text)), default=0) + 1)
+        pad = " " if "`" in (text[0], text[-1]) else ""
+        return f"{fence}{pad}{text}{pad}{fence}"
+    return "".join(f"&#{ord(c)};" if c in "&<>" else f"\\{c}" if c in string.punctuation else c for c in text)
+
+
+def source_line(sid: str, urls: dict[str, str], source: dict) -> str:
+    return (f"- {source_link(sid, urls)} {inert_text(source.get('title') or '') or 'untitled'}; published "
+            f"{source.get('published') or 'not stated'}, event {source.get('event_date') or 'not stated'}")
 
 
 def ids_in(answer: dict) -> list[str]:
@@ -309,10 +366,7 @@ def ids_in(answer: dict) -> list[str]:
     return sorted(dict.fromkeys(found), key=lambda sid: int(sid[1:]))
 
 
-def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]]) -> tuple[str, list[str]]:
-    sources = {source["id"]: source for source in evidence["sources"]}
-    urls = {sid: source["url"] for sid, source in sources.items()}
-
+def report(answer: dict, urls: dict[str, str], extra: list[tuple[str, str]], sources: dict) -> tuple[str, list[str]]:
     def linked(item: dict) -> str:
         return ", ".join(source_link(sid, urls) for sid in item["sources"] if sid in urls)
 
@@ -326,15 +380,16 @@ def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]]) -> tupl
     gaps = [f"- {link_ids(g['question'], urls)}: {link_ids(g['why'], urls)}" for g in answer["gaps"]]
     gaps += [f"- {question}: {why}" for question, why in extra]
     used = [sid for sid in ids_in(answer) if sid in urls]
-    lines = []
-    for sid in used:
-        source = sources[sid]
-        lines.append(f"- {source_link(sid, urls)} {source['title'] or 'untitled'}; published "
-                     f"{source['published'] or 'not stated'}, event {source['event_date'] or 'not stated'}")
+    cited_sources = [source_line(sid, urls, sources.get(sid, {})) for sid in used]
     parts = [link_ids(answer["answer"].strip(), urls)]
-    for title, body in zip(SECTIONS, (conclusions, inferences, contradictions, gaps, lines)):
-        parts.append(f"## {title}\n\n" + ("\n".join(body) or "None."))
+    for title, lines in zip(SECTIONS, (conclusions, inferences, contradictions, gaps, cited_sources)):
+        parts.append(f"## {title}\n\n" + ("\n".join(lines) or "None."))
     return "\n\n".join(parts), used
+
+
+def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]]) -> tuple[str, list[str]]:
+    sources = {source["id"]: source for source in evidence["sources"]}
+    return report(answer, {sid: written(source["url"]) for sid, source in sources.items()}, extra, sources)
 
 
 def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, evidence: dict, ref: str, judged: bool,
