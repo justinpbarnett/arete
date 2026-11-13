@@ -242,31 +242,37 @@ def plain_code_in(span: str, text: str) -> bool:
                      text, re.MULTILINE) is not None
 
 
-def faults(brief: Brief, text: str, samples: list[str], title: str = "") -> list[str]:
+def fault_pairs(brief: Brief, text: str, samples: list[str], title: str = "") -> list[tuple[str, str]]:
     if not text.strip():
-        return ["the answer held no text"]
+        return [("other", "the answer held no text")]
     whole = f"{title}\n{text}"
-    found = [f"dropped `{s}`" for s in protected(brief) if s not in text]
+    sources = (*brief.facts, brief.action, *brief.acceptance, brief.ask, *([brief.draft] if brief.kind == "doc" else []))
+    code = {c for source in sources for c in code_in(source)} if brief.kind != "pr" else set()
+    found = [("damaged" if s in code else "missing", f"dropped `{s}`") for s in protected(brief) if s not in text]
     if brief.kind != "pr":
-        sources = (*brief.facts, brief.action, *brief.acceptance, brief.ask,
-                   *([brief.draft] if brief.kind == "doc" else []))
         required = {line for source in sources for line in code_in(source, fenced_only=True)} - set(brief.drop)
         said_code = set(code_in(text, fenced_only=True))
-        found += [f"changed fenced code line `{line}`" for line in sorted(required - said_code) if line in text]
+        found += [("damaged", f"changed fenced code line `{line}`") for line in sorted(required - said_code)
+                  if line in text]
         required_inline = {span for source in sources for span in code_in(source, inline_only=True)} - set(brief.drop)
         said_inline = set(code_in(text, inline_only=True)) | said_code
         if re.search(r"\b(?:plain[ -]?text|sms)\b", brief.channel or "plain text", re.IGNORECASE):
             said_inline.update(span for span in required_inline if plain_code_in(span, text))
-        found += [f"changed inline code span `{span}`" for span in sorted(required_inline - said_inline) if span in text]
+        found += [("damaged", f"changed inline code span `{span}`") for span in sorted(required_inline - said_inline)
+                  if span in text]
     if brief.kind == "message":
-        found += [f"left out the {name}, {value}" for name in SUPPLIED if (value := getattr(brief, name))
+        found += [("missing", f"left out the {name}, {value}") for name in SUPPLIED if (value := getattr(brief, name))
                   and not supplied_in(value, text)]
-    found += [f"names {t}, which the brief does not supply" for t in invented(brief, whole)]
+    found += [("invented", f"names {t}, which the brief does not supply") for t in invented(brief, whole)]
     if repeats_voice(samples, whole, brief_text(brief)):
-        found.append("repeats a voice example")
+        found.append(("other", "repeats a voice example"))
     if REASONING_TAG.search(whole):
-        found.append("holds a reasoning tag")
+        found.append(("other", "holds a reasoning tag"))
     return found
+
+
+def faults(brief: Brief, text: str, samples: list[str], title: str = "") -> list[str]:
+    return [said for _, said in fault_pairs(brief, text, samples, title)]
 
 
 def bullets(items) -> str:
@@ -291,7 +297,8 @@ def refusal(problems: list[str]) -> str:
             + "\n\nReturn the whole text again with these fixed.")
 
 
-def ask(text: str, s: steps.Settings, cfg: config.Config, repo, layer, run):
+def ask(text: str, s: steps.Settings, cfg: config.Config, repo, layer, run, *,
+        trace: tuple[str, str] = ("", "document"), fallback: bool = True):
     if run is not None:
         cwd = run.dir / "document"
         shutil.rmtree(cwd, ignore_errors=True)
@@ -301,8 +308,8 @@ def ask(text: str, s: steps.Settings, cfg: config.Config, repo, layer, run):
     with tempfile.TemporaryDirectory() as empty:
         return runner.run(text, empty, **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
                           instructions=list(s.instructions), json_schema=SCHEMA, persist=False,
-                          wait_out_limits=False, tier=s.tier, trace=("", "document"), cfg=cfg, repo=repo, layer=layer,
-                          settings=s)
+                          wait_out_limits=False, tier=s.tier, trace=trace, cfg=cfg, repo=repo, layer=layer,
+                          settings=s, fallback=fallback)
 
 
 def measured(text: str, title: str, source: str, problems, target, tries: int, brief: Brief) -> Written:

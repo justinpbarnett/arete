@@ -1073,6 +1073,41 @@ def cmd_prices(args) -> int:
     return 0
 
 
+def cmd_writers(args) -> int:
+    from pathlib import Path
+
+    from . import util, writers
+
+    words = args.words
+    counts = {"sample": 1, "run": 1, "export": 1, "rate": 2, "report": 1}
+    if len(words) != counts[args.action]:
+        print("usage: arete writers sample FOLDER | run REPO [--dry-run] | export RUN [--out FILE] | "
+              "rate RUN FILE [--rater NAME] | report RUN [--json]", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print_lines(writers.sample(Path(words[0])))
+        elif args.action == "run":
+            return writers.run(words[0], args.dry_run)
+        elif args.action == "export":
+            found = writers.export(words[0])
+            if args.out:
+                util.write_json(Path(args.out), found)
+                print(json.dumps({"run": words[0], "out": args.out,
+                                  "texts": sum(len(c["texts"]) for c in found["cases"])}))
+            else:
+                print(json.dumps(found, indent=2))
+        elif args.action == "rate":
+            print(json.dumps(writers.rate(words[0], words[1], args.rater)))
+        else:
+            found = writers.report(words[0])
+            print(json.dumps(found) if args.json else "\n".join(writers.report_lines(found)))
+    except (writers.Refused, ValueError, TypeError, OSError, config.UnknownRepo) as e:
+        print(f"arete writers: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
     from . import lines, state
 
@@ -1155,6 +1190,27 @@ def cmd_replay(args) -> int:
         return 1
     print_lines(lines)
     return 0
+
+
+def cmd_retrieval(args) -> int:
+    import tomllib
+
+    from . import retrieval
+
+    words = list(args.words)
+    if (args.action, len(words)) not in (("sample", 1), ("run", 2)):
+        print("usage: arete retrieval run REPO SUITE [--split S] [--dry-run] [--json] [--out FILE] | sample FOLDER",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print_lines(retrieval.sample(paths.expand(words[0])))
+            return 0
+        return retrieval.run(words[0], words[1], split=args.split, dry_run=args.dry_run, as_json=args.json,
+                             out=args.out)
+    except (retrieval.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError, config.UnknownRepo) as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 def print_lines(lines: Iterable[str], *, flush: bool = False) -> None:
@@ -1377,6 +1433,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("words", nargs="*", help="diff [FILE], import FILE, or recompute RUN_ID STEP")
     p.set_defaults(fn=cmd_prices)
 
+    p = sub.add_parser("writers", help="compare owner-configured writer routes with blinded team ratings and "
+                                       "factual checks; proposals only")
+    p.add_argument("action", choices=("sample", "run", "export", "rate", "report"))
+    p.add_argument("words", nargs="*", help="sample FOLDER, run REPO, export RUN, rate RUN FILE or report RUN")
+    p.add_argument("--dry-run", action="store_true", help="run: list the candidates and cases without a call")
+    p.add_argument("--out", metavar="FILE", help="export: write the rating view to FILE")
+    p.add_argument("--rater", default="", metavar="NAME", help="rate: the rater, instead of the file's rater")
+    p.add_argument("--json", action="store_true", help="report: one JSON line")
+    p.set_defaults(fn=cmd_writers)
+
     p = steering(sub.add_parser("lines", help="a run's run.jsonl, one JSON line per event: task, steps, heartbeats, "
                                               "questions, errors and the report"))
     p.add_argument("run_id")
@@ -1424,6 +1490,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("folder")
     p.add_argument("--adw", action="store_true", help="turn on [factory] path = \"adw\" in the sample layer")
     p.set_defaults(fn=cmd_replay)
+
+    p = sub.add_parser("retrieval", help="offline experiment: compare exact, hybrid, embedding and rerank retrieval on "
+                                         "a layer's labeled queries; `retrieval sample FOLDER` writes a fixture")
+    p.add_argument("action", choices=("run", "sample"))
+    p.add_argument("words", nargs="+", help="run: REPO SUITE; sample: FOLDER")
+    p.add_argument("--split", default="", help="keep only the queries of this split (train, validation, holdout)")
+    p.add_argument("--dry-run", action="store_true", help="check the suite and corpus, call no adapter or model")
+    p.add_argument("--json", action="store_true", help="print the results as one JSON line")
+    p.add_argument("--out", default="", help="also write the results JSON to this file")
+    p.set_defaults(fn=cmd_retrieval)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")
