@@ -155,4 +155,5 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   resumeCarried();
   applyRoute(first, CARRIED ? "return" : "start");
+  if ("serviceWorker" in navigator && window.isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});
 });

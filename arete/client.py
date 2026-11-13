@@ -4,9 +4,11 @@ import http.client
 import json
 import os
 import socket
+import ssl
 import sys
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from urllib.parse import quote, urlencode, urlsplit
 
 from . import config, lines, paths, util
@@ -31,18 +33,26 @@ class Failed(Exception):
         self.answer, self.code = answer, code
 
 
-def named_server(wanted: str) -> tuple[str, int]:
+@dataclass(frozen=True)
+class Server:
+    scheme: str
+    host: str
+    port: int
+    name: str
+
+
+def named_server(wanted: str) -> Server:
     parts = urlsplit(wanted if "://" in wanted else f"http://{wanted}")
     try:
         host, port = parts.hostname, parts.port
     except ValueError:
         host, port = "", None
-    if parts.scheme != "http" or not host:
-        raise Failed({"error": f"{ENV}={wanted} is not http://HOST:PORT"})
-    return host, port or config.load().dashboard_port
+    if parts.scheme not in ("http", "https") or not host:
+        raise Failed({"error": f"{ENV}={wanted} is not http://HOST:PORT or https://HOST:PORT"})
+    return Server(parts.scheme, host, port or config.load().dashboard_port, host)
 
 
-def server() -> tuple[str, int]:
+def server() -> Server:
     if wanted := os.environ.get(ENV, "").strip():
         return named_server(wanted)
     found, mine = util.read_json(paths.SERVER_FILE, None), paths.state_and_config()
@@ -54,46 +64,93 @@ def server() -> tuple[str, int]:
         raise Down(f"the arete server named in {where} works on {found.get('state')} with {found.get('config')}, "
                    f"not on {mine['state']} with {mine['config']}; set {ENV} to call it anyway")
     addresses = [str(a) for a in found["addresses"]]
+    scheme = found.get("scheme") or "http"
     host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
+    here = Server(scheme, host, port, found.get("host") or host)
     try:
         socket.create_connection((host, port), timeout=PROBE_SECONDS).close()
     except OSError as e:
-        raise Down(f"the arete server named in {where} does not answer on {address(host, port)} ({e}); start it "
+        raise Down(f"the arete server named in {where} does not answer on {address(here)} ({e}); start it "
                    f"with `arete serve`, or set {ENV}") from None
-    return host, port
+    return here
 
 
-def address(host: str, port: int) -> str:
-    return f"http://{f'[{host}]' if ':' in host else host}:{port}"
+def address(where: Server) -> str:
+    return f"{where.scheme}://{f'[{where.host}]' if ':' in where.host else where.host}:{where.port}"
+
+
+class SecureConnection(http.client.HTTPSConnection):
+    def __init__(self, where: Server, timeout: float):
+        self.tls = ssl.create_default_context()
+        super().__init__(where.name, where.port, timeout=timeout, context=self.tls)
+        self.address = where.host
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self.address, self.port), self.timeout)
+        try:
+            self.sock = self.tls.wrap_socket(sock, server_hostname=self.host)
+        except OSError:
+            sock.close()
+            raise
+
+
+def connect(where: Server) -> http.client.HTTPConnection:
+    conn = SecureConnection(where, CONNECT_SECONDS) if where.scheme == "https" \
+        else http.client.HTTPConnection(where.host, where.port, timeout=CONNECT_SECONDS)
+    try:
+        conn.connect()
+    except ssl.SSLError as e:
+        raise Down(f"the certificate of the arete server at {address(where)} was not accepted "
+                   f"({getattr(e, 'verify_message', None) or e.reason or e})") from None
+    except OSError as e:
+        raise Down(f"the arete server is not up at {address(where)} ({e.strerror or e}); start it with "
+                   f"`arete serve`, or set {ENV}") from None
+    return conn
+
+
+def moved_to(resp: http.client.HTTPResponse, where: Server) -> Server | None:
+    target = urlsplit(resp.getheader("Location") or "")
+    if resp.status not in (301, 302, 307, 308) or target.scheme != "https" or not target.hostname:
+        return None
+    try:
+        port = target.port or 443
+    except ValueError:
+        return None
+    if port != where.port:
+        return None
+    return Server("https", where.host, where.port, target.hostname)
 
 
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS) -> http.client.HTTPResponse:
-    host, port = server()
-    conn = http.client.HTTPConnection(host, port, timeout=CONNECT_SECONDS)
-    try:
-        conn.connect()
-    except OSError as e:
-        raise Down(f"the arete server is not up at {address(host, port)} ({e.strerror or e}); start it with "
-                   f"`arete serve`, or set {ENV}") from None
-    conn.sock.settimeout(read_seconds)
+    where = server()
     headers, payload = {"X-Arete": "1"}, None
     if method == "POST":
         headers["Content-Type"], payload = "application/json", json.dumps(body or {}).encode()
-    try:
-        conn.request(method, path, payload, headers)
-        resp = conn.getresponse()
-        if resp.status < 400:
-            return resp
-        text = resp.read()
-    except BROKE as e:
-        raise Failed({"error": f"the server at {address(host, port)} broke off: {e}"}) from None
+    followed = False
+    while True:
+        conn = connect(where)
+        conn.sock.settimeout(read_seconds)
+        try:
+            conn.request(method, path, payload, headers)
+            resp = conn.getresponse()
+            if not followed and (moved := moved_to(resp, where)):
+                resp.read()
+                conn.close()
+                where, followed = moved, True
+                continue
+            if resp.status < 400:
+                return resp
+            text = resp.read()
+        except BROKE as e:
+            raise Failed({"error": f"the server at {address(where)} broke off: {e}"}) from None
+        break
     try:
         answer = json.loads(text)
     except ValueError:
         answer = None
     raise Failed(answer if isinstance(answer, dict) and "error" in answer
-                 else {"error": f"the server at {address(host, port)} answered {resp.status}"}, resp.status)
+                 else {"error": f"the server at {address(where)} answered {resp.status}"}, resp.status)
 
 
 def call(method: str, path: str, body: dict | None = None) -> dict:

@@ -3,11 +3,14 @@ from __future__ import annotations
 import atexit
 import glob
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
 import socket
+import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -42,12 +45,21 @@ from . import (
     tasks,
     triage,
     util,
+    webapp,
 )
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
-             ".js": "text/javascript; charset=utf-8"}
+             ".js": "text/javascript; charset=utf-8", ".webmanifest": "application/manifest+json",
+             ".png": "image/png"}
 CODE_MARK = b'<meta name="arete-code" content="">'
+THEME_MARK = b'<meta name="theme-color" content="">'
+CERT_SECONDS = 120
+RENEW_SECONDS = 7 * 24 * 3600
+CERT_RETRY_SECONDS = 3600
+HANDSHAKE_SECONDS = 10
+LOOPBACK = "127.0.0.1"
+IDENTITY_HEADER = "Tailscale-User-Login"
 TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
                   "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
 TAILSCALE_AS_CLI = {"TAILSCALE_BE_CLI": "1"}
@@ -94,31 +106,49 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
         digest.update(f"{f.name}\0{len(body)}\0".encode())
         digest.update(body)
     code = digest.hexdigest()[:12]
+    colors = webapp.tokens(next(body for f, body in bodies.items() if f.name == "pattern.css"))
     served = {}
     for f, body in bodies.items():
         if f.name == "index.html":
-            if CODE_MARK not in body:
-                raise RuntimeError(f"index.html lost {CODE_MARK.decode()}, so an open page could not tell when its "
-                                   "code is old.")
-            served["/"] = (body.replace(CODE_MARK, f'<meta name="arete-code" content="{code}">'.encode()),
+            for mark in (CODE_MARK, THEME_MARK):
+                if mark not in body:
+                    raise RuntimeError(f"index.html lost {mark.decode()}, so an open page could not tell when its "
+                                       "code is old or take its colours.")
+            page = body.replace(CODE_MARK, f'<meta name="arete-code" content="{code}">'.encode())
+            served["/"] = (page.replace(THEME_MARK, f'<meta name="theme-color" content="{colors["ground"]}">'.encode()),
                            WEB_TYPES[f.suffix])
+        elif f.suffix == ".webmanifest":
+            served[f"/{f.name}"] = (webapp.manifest(body, colors), WEB_TYPES[f.suffix])
         else:
             served[f"/{f.name}"] = (body, WEB_TYPES[f.suffix])
+    for path, png in webapp.icons(colors).items():
+        served[path] = (png, WEB_TYPES[".png"])
     return code, served
 
 
 WEB_CODE, WEB_BY_PATH = web_snapshot()
 
 
-def tailscale(*args: str) -> dict:
-    exe = shutil.which("tailscale") or next((m for pattern in TAILSCALE_APPS for m in sorted(glob.glob(pattern))), "")
+def tailscale_exe() -> str:
+    return shutil.which("tailscale") or next((m for pattern in TAILSCALE_APPS for m in sorted(glob.glob(pattern))), "")
+
+
+def tailscale_run(*args: str, timeout: float) -> subprocess.CompletedProcess | None:
+    exe = tailscale_exe()
     if not exe:
-        return {}
+        return None
     try:
-        proc = subprocess.run([exe, *args], capture_output=True, text=True, errors="replace", timeout=10, check=False,
-                              env={**os.environ, **TAILSCALE_AS_CLI})
-        return json.loads(proc.stdout) if proc.returncode == 0 else {}
-    except (subprocess.TimeoutExpired, json.JSONDecodeError):
+        return subprocess.run([exe, *args], capture_output=True, text=True, errors="replace", timeout=timeout,
+                              check=False, env={**os.environ, **TAILSCALE_AS_CLI})
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def tailscale(*args: str) -> dict:
+    proc = tailscale_run(*args, timeout=10)
+    try:
+        return json.loads(proc.stdout) if proc and proc.returncode == 0 else {}
+    except json.JSONDecodeError:
         return {}
 
 
@@ -127,6 +157,7 @@ class Node:
     addresses: tuple[str, ...]
     names: frozenset[str]
     owner: str
+    name: str
 
 
 def this_node(owner: str) -> Node | None:
@@ -137,7 +168,7 @@ def this_node(owner: str) -> Node | None:
     owner = owner or ((status.get("User") or {}).get(str(me.get("UserID"))) or {}).get("LoginName", "")
     if status.get("BackendState") != "Running" or not addresses or not owner:
         return None
-    return Node(addresses, frozenset({*addresses, dns_name, dns_name.split(".")[0]} - {""}), owner)
+    return Node(addresses, frozenset({*addresses, dns_name, dns_name.split(".")[0]} - {""}), owner, dns_name)
 
 
 @dataclass
@@ -168,6 +199,88 @@ class Logins:
             with self.guard:
                 self.seen[address] = (time.monotonic(), login)
         return login
+
+
+class CertError(Exception):
+    pass
+
+
+PEM_BLOCK = re.compile(r"-----BEGIN ([A-Z ]+)-----.*?-----END \1-----\n?", re.DOTALL)
+
+
+def pem_parts(text: str) -> tuple[bytes, bytes]:
+    blocks = [(m[1], m[0]) for m in PEM_BLOCK.finditer(text)]
+    key = "".join(b for label, b in blocks if "PRIVATE KEY" in label)
+    chain = "".join(b for label, b in blocks if "CERTIFICATE" in label)
+    return chain.encode(), key.encode()
+
+
+def store_private(path: Path, content: bytes) -> bool:
+    try:
+        current = path.read_bytes()
+    except OSError:
+        current = None
+    if current == content:
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            path.chmod(0o600)
+        return False
+    temp = path.with_name(f"{path.name}.{os.getpid()}.key")
+    temp.unlink(missing_ok=True)
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+    return True
+
+
+def fetch_certificate(name: str) -> bool:
+    if not name:
+        raise CertError("this machine has no tailnet name")
+    proc = tailscale_run("cert", "--cert-file", "-", "--key-file", "-", name, timeout=CERT_SECONDS)
+    if proc is None:
+        raise CertError("tailscale is missing or did not finish in time")
+    if proc.returncode != 0:
+        raise CertError(util.first_line(proc.stderr or "", 200) or f"tailscale cert exited {proc.returncode}")
+    chain, key = pem_parts(proc.stdout)
+    if not chain or not key:
+        raise CertError("tailscale cert did not give a certificate and a key")
+    try:
+        paths.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        changed = store_private(paths.TLS_KEY_FILE, key)
+        return store_private(paths.TLS_CERT_FILE, chain) or changed
+    except OSError as e:
+        raise CertError(f"cannot store the certificate: {e.strerror or e}") from None
+
+
+@dataclass(frozen=True)
+class Front:
+    scheme: str
+    tls: ssl.SSLContext | None = None
+    fronted: bool = False
+    why: str = ""
+
+
+def tls_context() -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(paths.TLS_CERT_FILE, paths.TLS_KEY_FILE)
+    return context
+
+
+def front_for(node: Node, port: int) -> Front:
+    try:
+        fetch_certificate(node.name)
+        tailscale_run("serve", f"--https={port}", "off", timeout=10)
+        return Front("https", tls=tls_context())
+    except (CertError, ssl.SSLError, OSError) as e:
+        why = util.first_line(str(e), 200)
+    proc = tailscale_run("serve", "--bg", f"--https={port}", f"http://{LOOPBACK}:{port}", timeout=10)
+    if proc is not None and proc.returncode == 0:
+        return Front("https", fronted=True, why=why)
+    return Front("http", why=why)
 
 
 def host_name(host: str) -> str:
@@ -514,13 +627,70 @@ class Handler(BaseHTTPRequestHandler):
             super().log_message(format, *args)
 
 
+class Redirect(Handler):
+    def answer(self, method: str) -> None:
+        node: Node = self.server.node
+        length = (self.headers.get("Content-Length") or "0").strip()
+        if length.isdigit():
+            self.rfile.read(min(int(length), hooks.MAX_HOOK_BODY))
+        path = self.path if self.path.startswith("/") else "/"
+        self.send_response(308)
+        self.send_header("Location", f"https://{node.name}:{self.server.server_port}{path}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+@dataclass
+class FrontedLogins:
+    seen: threading.local = field(default_factory=threading.local)
+
+    def note(self, login: str) -> None:
+        self.seen.login = login
+
+    def of(self, address: str) -> str:
+        try:
+            loopback = ipaddress.ip_address(address).is_loopback
+        except ValueError:
+            return ""
+        return getattr(self.seen, "login", "") if loopback else ""
+
+
+class FrontedHandler(Handler):
+    def answer(self, method: str) -> None:
+        self.server.logins.note(self.headers.get(IDENTITY_HEADER, ""))
+        super().answer(method)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: str, port: int, node: Node, logins: Logins, inside_serve: bool):
+    def __init__(self, address: str, port: int, node: Node, logins: Logins | FrontedLogins, inside_serve: bool,
+                 tls: ssl.SSLContext | None = None, handler: type[Handler] = Handler):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
-        self.node, self.logins, self.inside_serve = node, logins, inside_serve
-        super().__init__((address, port), Handler)
+        self.node, self.logins, self.inside_serve, self.tls = node, logins, inside_serve, tls
+        super().__init__((address, port), handler)
+
+    def finish_request(self, request, client_address) -> None:
+        if self.tls is None:
+            return super().finish_request(request, client_address)
+        request.settimeout(HANDSHAKE_SECONDS)
+        try:
+            first = request.recv(1, socket.MSG_PEEK)
+            if first != b"\x16":
+                request.settimeout(None)
+                return Redirect(request, client_address, self)
+            secure = self.tls.wrap_socket(request, server_side=True)
+        except OSError:
+            return
+        try:
+            secure.settimeout(None)
+            self.RequestHandlerClass(secure, client_address, self)
+        finally:
+            try:
+                secure.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            secure.close()
 
 
 def event_line(line: dict) -> bytes:
@@ -601,11 +771,14 @@ def start_poll_without_failing_the_send() -> str:
     return "Started a poll to build it."
 
 
-def open_servers(node: Node, port: int, logins: Logins, inside_serve: bool) -> list[Server]:
+def open_servers(node: Node, port: int, logins: Logins, inside_serve: bool, front: Front) -> list[Server]:
     servers: list[Server] = []
     try:
-        for address in node.addresses:
-            servers.append(Server(address, port, node, logins, inside_serve))
+        if front.fronted:
+            servers.append(Server(LOOPBACK, port, node, FrontedLogins(), inside_serve, handler=FrontedHandler))
+        else:
+            for address in node.addresses:
+                servers.append(Server(address, port, node, logins, inside_serve, tls=front.tls))
     except OSError:
         for s in servers:
             s.server_close()
@@ -631,7 +804,8 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
             try:
                 if node is None:
                     raise OSError("tailscale is not running or reports no address")
-                servers = open_servers(node, port, logins, inside_serve)
+                front = front_for(node, port)
+                servers = open_servers(node, port, logins, inside_serve, front)
             except OSError as e:
                 if str(e) != waiting_for:
                     say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
@@ -641,17 +815,63 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
             waiting_for = ""
             for s in servers:
                 threading.Thread(target=s.serve_forever, daemon=True).start()
-            say(f"dashboard listening on port {port} at {', '.join(node.addresses)}")
+            say(listening_line(node, port, front))
             util.write_json(paths.SERVER_FILE, {"pid": os.getpid(), "addresses": list(node.addresses), "port": port,
+                                                "scheme": front.scheme, "host": node.name,
                                                 **paths.state_and_config(), "at": util.iso()})
+            certificate_due = time.monotonic() + (RENEW_SECONDS if front.tls else CERT_RETRY_SECONDS)
+            renewal_failed = False
+            reload_pending = False
+            upgraded = False
             while this_node(cfg.dashboard_owner) == node:
                 time.sleep(WATCH_SECONDS)
-            say("the tailnet address or owner changed; listening again")
+                if time.monotonic() < certificate_due:
+                    continue
+                try:
+                    reload_pending = fetch_certificate(node.name) or reload_pending
+                    if front.tls and reload_pending:
+                        fresh = tls_context()
+                        for s in servers:
+                            s.tls = fresh
+                        reload_pending = False
+                except (CertError, ssl.SSLError, OSError) as e:
+                    certificate_due = time.monotonic() + CERT_RETRY_SECONDS
+                    if front.tls and not renewal_failed:
+                        say(f"the certificate was not renewed ({util.first_line(str(e), 200)}); keeping the old one")
+                    renewal_failed = True
+                    continue
+                renewal_failed = False
+                if not front.tls:
+                    upgraded = True
+                    break
+                certificate_due = time.monotonic() + RENEW_SECONDS
+            say("a certificate is available; listening again over HTTPS" if upgraded
+                else "the tailnet address or owner changed; listening again")
             for s in servers:
                 s.shutdown()
                 s.server_close()
     finally:
         forget_server()
+
+
+def listening_line(node: Node, port: int, front: Front) -> str:
+    if front.tls:
+        return f"dashboard listening on port {port} at {', '.join(node.addresses)} over HTTPS as {node.name}"
+    if front.fronted:
+        return (f"dashboard listening on port {port} at {LOOPBACK} behind tailscale serve as {node.name}; "
+                f"no certificate ({front.why})")
+    return (f"dashboard listening on port {port} at {', '.join(node.addresses)} over plain HTTP; "
+            f"no certificate ({front.why}); trying again every hour")
+
+
+def url(node: Node | None, port: int) -> str:
+    found = util.read_json(paths.SERVER_FILE, None)
+    mine = paths.state_and_config()
+    recorded = isinstance(found, dict) and {k: found.get(k) for k in mine} == mine
+    scheme = found["scheme"] if recorded and found.get("scheme") in ("http", "https") else "https"
+    if node is None:
+        return f"{scheme}://<this machine's tailnet name>:{port}"
+    return f"{scheme}://{node.name if scheme == 'https' else node.addresses[0]}:{port}"
 
 
 def forget_server() -> None:

@@ -961,6 +961,15 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 It listens only on the machine's tailnet addresses.
 A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 
+It answers over HTTPS on the machine's tailnet name (`https://NAME:PORT`) with a tailnet certificate from `tailscale cert`.
+The certificate and key are `dashboard.crt` and `dashboard.key` in the state folder, mode 0600; arete fetches them at start and every week, and keeps the old ones when a renewal fails.
+The first fetch makes Tailscale issue a public certificate, which lists the tailnet name in certificate transparency logs.
+Plain HTTP on the same port answers 308 and redirects to HTTPS, so webhooks should use the HTTPS address.
+Admission is the same over HTTPS: the host must be the tailnet name or address, the login must be the owner's, and a change needs `X-Arete`.
+When `tailscale cert` cannot run, as under the sandboxed macOS app, arete asks `tailscale serve` to answer HTTPS on the same port and listens on 127.0.0.1 only, trusting Tailscale's login header from loopback alone; plain HTTP then gets Tailscale's own refusal.
+When that fails too, the dashboard serves plain HTTP as before and tries for a certificate again every hour.
+Over HTTPS the page can be added to the Home Screen of a phone, where it opens as the app Arete without browser chrome.
+
 A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find and Console.
 It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
 Below 1040 px the sidebar wraps into a block above the page.
@@ -1038,10 +1047,10 @@ These routes steer a ticket's run. The first four answer `{"task", "repo", "run"
 Each refuses a run in the wrong state and names the state. `answer` and `resume` also refuse a run that is not the ticket's latest and name the run that came after it; runs of one step alone do not count. `steps` has no such rule.
 
 ```sh
-curl -H 'X-Arete: 1' -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' http://HOST:PORT/api/tasks
-curl 'http://HOST:PORT/api/runs/RUN_ID/events?follow=1'
-curl -H 'X-Arete: 1' -d '{"text": "Put the toggle in the header."}' http://HOST:PORT/api/runs/RUN_ID/answer
-curl -H 'X-Arete: 1' -d '{"step": "verify"}' http://HOST:PORT/api/runs/RUN_ID/resume
+curl -H 'X-Arete: 1' -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' https://NAME:PORT/api/tasks
+curl 'https://NAME:PORT/api/runs/RUN_ID/events?follow=1'
+curl -H 'X-Arete: 1' -d '{"text": "Put the toggle in the header."}' https://NAME:PORT/api/runs/RUN_ID/answer
+curl -H 'X-Arete: 1' -d '{"step": "verify"}' https://NAME:PORT/api/runs/RUN_ID/resume
 ```
 
 ### From the CLI
@@ -1062,7 +1071,7 @@ Each of these commands makes one call to the server and prints JSON and nothing 
 | `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
 
-They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, process id, state folder and config file to `server.json` in the state folder. The commands call that server while its process is alive, it works on the same state folder and config file as they do, and its address answers within a second; when it does not answer, a command says so and names `arete serve` and `ARETE_SERVER`. `ARETE_SERVER=http://HOST:PORT` names a server and skips that check. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
+They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, scheme, tailnet name, process id, state folder and config file to `server.json` in the state folder; over HTTPS the commands verify the certificate against that name. The commands call that server while its process is alive, it works on the same state folder and config file as they do, and its address answers within a second; when it does not answer, a command says so and names `arete serve` and `ARETE_SERVER`. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check; a plain HTTP address follows the dashboard's redirect to HTTPS. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
 
 A failed command prints one line with `error` and no `event`, with `code` when the server answered with an HTTP status, and exits 1. A command line these commands cannot parse, such as a missing argument or an unknown flag, prints one line with `error` and `usage` and exits 1. A `step_end` line or a step row with an `error` field is a step's error, not the command's. When no server works on the state, the readers (`task show`, `lines` and `status --json`) read the local state instead, and the others print one `error` line and exit 1. When a stream of lines drops, as it does when serve restarts on new code, `wait`, `lines --follow` and `arete run` connect again and go on from the last line they read. They give up with an `error` line when the run ended with no `report` line, or when no line came for 2 minutes.
 
