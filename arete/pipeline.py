@@ -1323,8 +1323,6 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.log(f"repairing the review findings of run {mending}")
         opening_waits(run_id, run.answering,
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
-        if due and not slot.held and not dry_run:
-            slot.take(run.log, run.waiting, "answer")
         if restarting:
             run.log(f"restarting after run {earlier[0]['id']} was interrupted")
         flow = (flows.start(cfg, run, earlier[0] if restarting else {}, slot, script.continues, script.only,
@@ -1336,6 +1334,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
         pr_url, passed = "", None
         try:
+            if due and not slot.held and not dry_run and not flow.refusal:
+                slot.take(run.log, run.waiting, "answer")
             parent = (script.repairs or script.continues if script else "") or (
                 earlier[0]["id"] if earlier and earlier[0]["status"] not in ("done", "merged", "rejected") else "")
             if budget_history and budget_history[0]["status"] not in ("done", "merged", "rejected"):
@@ -1386,7 +1386,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if run.feedback and not dry_run and not run.alone:
             state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         if status == "failed":
-            if flow and flow.matching:
+            if flow and flow.matching and flow.stepped:
                 flow.route()
             if not lines.ended_in_error(run_id, reply="respond" if flow else ""):
                 lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)

@@ -198,7 +198,8 @@ def step_named(step: str) -> str:
 
 
 def script_path(row: dict) -> str:
-    return str(factory.first(lines.read(row["id"]), "task").get("path") or "")
+    return next((str(path) for read in factory.chain(row["id"]) if (path := factory.first(read, "task").get("path"))),
+                "")
 
 
 def command_of(cfg: config.Config, name: str, *args: str) -> list[str]:
@@ -267,8 +268,9 @@ def answer_ask(ask_id: str, body) -> dict:
         if not ask:
             raise control.NotFound(f"no ask {ask_id}")
         if ask["status"] != "open":
-            held = (f"; its answers are stored, and `arete resume {ask['run']}` continues the run if it did not start"
-                    if ask["status"] == "answered" and not ask["taken_by"] else "")
+            holder = answers_holder(ask) if ask["status"] == "answered" and not ask["taken_by"] else ""
+            held = (f"; its answers are stored for run {holder}, and `arete resume {holder}` continues it with them "
+                    "if it is not running" if holder else "")
             raise control.Refused(f"ask {ask_id} is {ask['status']}, so it takes no answer{held}")
         cfg, repo, row = run_of(ask["run"])
         if row["status"] != "needs-info":
@@ -292,6 +294,13 @@ def answer_ask(ask_id: str, body) -> dict:
             return answer(tid, repo.name, "", "waiting",
                           f"{util.count(len(more), 'more ask')} of run {row['id']} wait for an answer")
         return continue_asked(cfg, repo, row, command)
+
+
+def answers_holder(ask: dict) -> str:
+    newest = state.ticket_runs(ask["repo"], ask["ticket"], limit=1, whole=True)
+    if newest and ask["run"] in {newest[0]["id"], *flows.chain_runs(newest[0]["id"])}:
+        return newest[0]["id"]
+    return ""
 
 
 def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:

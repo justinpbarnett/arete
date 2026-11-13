@@ -236,7 +236,7 @@ class Flow:
                             for line in self.earlier if line.get("tree")}
         self.prints: dict[str, str] = {}
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
-        self.redone = 0
+        self.redone, self.stepped = 0, False
         self.reopens = (bool(continues) and not only and again != OPENING and reopening(chained)
                         and bool(self.earlier) and self.earlier[0].get("step") == OPENING)
         if self.matching:
@@ -245,6 +245,7 @@ class Flow:
     def step(self, name: str, *args, **kw) -> Outcome:
         if name not in STEPS:
             raise KeyError(f"no step {name}")
+        self.stepped = True
         if self.done:
             raise OnlyDone(f"only {self.only} runs in this flow")
         if self.refusal:
@@ -370,7 +371,7 @@ class Flow:
                     error=error[:MAX_ERROR_CHARS], **tree)
 
     def respond(self, status: str, **fields) -> dict:
-        if self.matching:
+        if self.matching and self.stepped:
             self.route()
         return lines.write(self.run_id, "report", **{**fields, "status": status, "steps": tally(self.run_id)})
 

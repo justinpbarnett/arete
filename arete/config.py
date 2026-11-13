@@ -39,6 +39,7 @@ KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle", "expire_days")
+MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
@@ -448,8 +449,8 @@ def ask_table(data) -> AskConfig:
     if type(settle) is not bool:
         raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
     days = table.get("expire_days", 7)
-    if type(days) not in (int, float) or days <= 0:
-        raise ValueError(f"[ask] expire_days must be a number above 0, not {days!r}")
+    if type(days) not in (int, float) or not math.isfinite(days) or not 0 < days <= MAX_ASK_EXPIRE_DAYS:
+        raise ValueError(f"[ask] expire_days must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS}, not {days!r}")
     return AskConfig(max_per_run=limit, settle=settle, expire_days=days)
 
 
