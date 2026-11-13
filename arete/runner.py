@@ -114,8 +114,7 @@ def authentication(model: str, run_with: str = "", *, cfg: config.Config | None 
     passing = environment.passed(cfg, repo)
     remote = target if target.remote else None
     if which == "pi":
-        return (accounts.Auth("api_key") if remote else
-                pi_route(name, cfg, repo, target).auth)
+        return pi_route(name, cfg, repo, target).auth
     return (codex if which == "codex" else claude).authentication(passing, remote=remote)
 
 
@@ -153,7 +152,7 @@ def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
 def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=state.db,
              mode: str = "") -> pi.Route | None:
     if devices.resolve(device).remote:
-        return None
+        return pi.Route(provider_of(model), model, accounts.Auth(), error=pi.REMOTE_AUTH_UNVERIFIED)
     return pi.select(model, environment.passed(cfg, repo), cfg.environment.providers,
                      held=lambda auth, name: auth_hold(auth, name, connect), mode=mode,
                      local_providers=cfg.local_providers)
@@ -218,6 +217,8 @@ def agent_problems(run_with: str, tools: list[str]) -> list[str]:
 
 def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
     which = route(model, run_with)[0]
+    if which == "pi" and device.remote:
+        return pi.REMOTE_AUTH_UNVERIFIED
     if which == "codex" and device.remote:
         return codex.RUNS_LOCALLY
     return SANDBOX_RUNS_PI if device.exe_sandbox and which == "claude" else ""
@@ -287,6 +288,9 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if resume.runner != which:
         resume = NO_SESSION
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
+    if which == "pi" and target.remote:
+        return Result(ok=False, error=pi.REMOTE_AUTH_UNVERIFIED, runner=which, model=name,
+                      provider=provider_of(name), session=resume)
     if target.remote:
         kw["remote"] = target
     elif which in ("claude", "pi", "codex"):

@@ -107,7 +107,7 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
     names |= {p for p, n in pi.KEY_NAMES.items() if keys.get(n)}
     if default := pi.default_provider():
         names.add(default)
-    calls = [(f"{p}/*", None, "local") for p in names]
+    calls = [(f"{p}/*", None, "local", False) for p in names]
     for repo in [None, *cfg.repos]:
         try:
             layer = config.load_layer(repo.layer_dir) if repo else None
@@ -118,28 +118,37 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
                 try:
                     step = steps.resolve(cfg, layer, role, kind)
                     if step.runner == "pi":
-                        calls.append((step.model, repo, "local"))
+                        calls.append((step.model, repo, "local", True))
                 except ValueError:
                     continue
     for loop in loops.load_all(cfg):
-        if not loop.error and not devices.resolve(loop.device).remote:
+        if not loop.error:
             repo = loop.work_repo(cfg) if loop.repo else None
-            calls += [(runner.route(m, loop.runner)[1], repo, loop.device) for m in loop.agent_models(cfg)
+            calls += [(runner.route(m, loop.runner)[1], repo, loop.device, True) for m in loop.agent_models(cfg)
                       if runner.route(m, loop.runner)[0] == "pi"]
     out = {}
-    for model, repo, device in calls:
+    for model, repo, device, required in calls:
         selected = runner.pi_route(model, cfg, repo, device)
         provider = selected.provider or "unspecified"
         hold = runner.auth_hold(selected.auth, selected.model)
         source = f"SDK-managed {selected.managed.kind}" if selected.managed else "key"
-        detail = ("missing login and key" if selected.error else "held login; waiting" if hold else
+        detail = (selected.error if selected.error else "held login; waiting" if hold else
                   f"login-backed ({'subscription' if selected.auth.mode == 'subscription' else 'metered'})"
                   if selected.using_login else
                   f"login held; using {source}" if selected.login_held and selected.key_available else
                   source if selected.managed else "key-only" if selected.key_available else
                   "unauthenticated local")
+        if selected.login_refused:
+            detail = f"login refused: {selected.login_refused}; {detail}"
+        if provider == "anthropic" and selected.key_available and not selected.error:
+            detail += "; paid api_key route"
+        optional_anthropic = not required and selected.error == pi.ANTHROPIC_KEY_REQUIRED
         key = f"pi:{provider}:auth" + (f":{repo.name}" if repo else "")
-        out[key] = Check(key, not selected.error, f"{provider}: {detail}")
+        if devices.resolve(device).remote:
+            key += f":{devices.resolve(device).name}"
+        check = Check(key, not selected.error or optional_anthropic, f"{provider}: {detail}")
+        if key not in out or out[key].ok:
+            out[key] = check
     return list(out.values())
 
 

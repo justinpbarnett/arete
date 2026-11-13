@@ -55,6 +55,11 @@ WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
 NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+ANTHROPIC_LOGIN_REASON = "a Claude plan login runs only on the claude runner"
+ANTHROPIC_KEY_REQUIRED = (f"pi anthropic: {ANTHROPIC_LOGIN_REASON}; "
+                          "put an Anthropic Console key in pi.env or use claude:<model>")
+REMOTE_AUTH_UNVERIFIED = ("pi cannot validate or isolate credentials on a remote device; "
+                          "run pi locally or use the claude runner")
 KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azure": "AZURE_OPENAI_API_KEY",
              "amazon-bedrock": "AWS_BEARER_TOKEN_BEDROCK",
              "google": "GEMINI_API_KEY", "google-vertex": "GOOGLE_CLOUD_API_KEY", "huggingface": "HF_TOKEN",
@@ -100,6 +105,10 @@ def owner_dir() -> Path:
     return paths.expand(os.environ.get("PI_CODING_AGENT_DIR") or PI_HOME / "agent").absolute()
 
 
+def remote_refusal(remote: devices.Device | str | None) -> str:
+    return REMOTE_AUTH_UNVERIFIED if remote and devices.resolve(remote).remote else ""
+
+
 @dataclass(frozen=True)
 class ManagedCredential:
     kind: str
@@ -113,7 +122,9 @@ class Route:
     model: str
     auth: accounts.Auth = field(repr=False)
     error: str = ""
+    token_error: str = ""
     login_available: bool = False
+    login_refused: str = ""
     login_held: bool = False
     owner: Path = field(default_factory=lambda: owner_dir() / "auth.json", repr=False)
     key: str = field(default="", repr=False)
@@ -232,6 +243,22 @@ def credential_values(value) -> list[str]:
     return []
 
 
+def plan_token_error(values, source: str = "") -> str:
+    for name, value in values:
+        if any("sk-ant-oat" in v for v in credential_values(value)):
+            return f"pi: refused Claude plan token in {source}{name}; {ANTHROPIC_LOGIN_REASON}"
+    return ""
+
+
+def route_token_error(route: Route) -> str:
+    values = [*route.env.items(), (route.key_name or "selected key", route.key)]
+    if route.managed:
+        values.extend(route.managed.env.items())
+    if route.using_login:
+        values.append((f"{route.owner} provider {route.provider}", accounts.read(route.owner).get(route.provider)))
+    return plan_token_error(values)
+
+
 def credential_config(value) -> list[str]:
     if isinstance(value, dict):
         return [s for k, v in value.items() for s in
@@ -309,18 +336,25 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
              and bool(credential.get("access")) and isinstance(credential.get("refresh"), str)
              and isinstance(credential.get("expires"), (int, float))
              and not isinstance(credential["expires"], bool) and math.isfinite(credential["expires"]))
+    login_refused = ANTHROPIC_LOGIN_REASON if provider == "anthropic" and credential.get("type") == "oauth" else ""
+    login = login and provider != "anthropic"
     auth = accounts.pi(provider, credential, str(owner)) if login else accounts.Auth("api_key")
     keys = util.read_env_file(KEYS_FILE)
-    available = {**(os.environ if source is None else source), **keys}
+    source = os.environ if source is None else source
+    token_error = plan_token_error(source.items()) or plan_token_error(keys.items(), f"{KEYS_FILE} variable ")
+    available = {**source, **keys}
     configured = accounts.mapping(accounts.mapping(models.get("providers")).get(provider))
     supported = (provider in KEY_NAMES or bool(configured.get("api")) or
                  any(accounts.mapping(m).get("api") for m in configured.get("models", []) if isinstance(m, dict)))
     names = [KEY_NAMES[provider]] if provider in KEY_NAMES else []
     raw = configured.get("apiKey", "")
+    resolved_key = configured_key(raw, available)
+    token_error = token_error or plan_token_error(
+        [(f"{owner.parent / 'models.json'} provider {provider} apiKey", resolved_key)])
+    if login:
+        token_error = token_error or plan_token_error([(f"{owner} provider {provider}", credential)])
     if supported and provider != "openai-codex":
         names += list(providers.get(provider, ()))
-        if provider == "anthropic":
-            names.insert(0, "ANTHROPIC_OAUTH_TOKEN")
     else:
         names = []
     context = {*MANAGED_NAMES, *TRANSPORT_NAMES.get(provider, ())}
@@ -328,11 +362,10 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     key_name = next((n for n in exact if keys.get(n)), "") or next((n for n in exact if available.get(n)), "")
     key = available.get(key_name, "")
     if supported and provider != "openai-codex" and raw and not keys.get(key_name):
-        key = configured_key(raw, available)
+        key = resolved_key
         key_name = "ARETE_PI_SELECTED_KEY" if key else ""
-    prefer_header = (provider == "anthropic" and available.get("ANTHROPIC_AUTH_TOKEN") and
-                     (not keys.get(key_name) or keys.get("ANTHROPIC_AUTH_TOKEN")))
-    managed = managed_credential(provider, available) if not key or prefer_header or provider == "cloudflare-ai-gateway" else None
+    managed = (managed_credential(provider, available)
+               if provider != "anthropic" and (not key or provider == "cloudflare-ai-gateway") else None)
     if provider == "cloudflare-ai-gateway":
         key, key_name = "", ""
     if provider == "cloudflare-workers-ai" and not available.get("CLOUDFLARE_ACCOUNT_ID"):
@@ -341,14 +374,17 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     local = provider == "ollama" or (provider in local_providers and bool(configured))
     local |= bool(configured and re.match(r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::|/|$)",
                                          str(configured.get("baseUrl", ""))))
-    local = local and provider != "openai-codex"
-    login_held = bool(login and held(auth, resolved))
-    chosen_login = login and mode != "api_key" and (mode in ("login", "subscription") or auth.mode != "subscription"
-                                                   or not login_held or not has_key)
-    error = ""
-    if not provider:
+    local = local and provider not in ("openai-codex", "anthropic")
+    login_held = bool(login and not token_error and held(auth, resolved))
+    chosen_login = (login and not token_error and mode != "api_key" and
+                    (mode in ("login", "subscription") or auth.mode != "subscription" or not login_held or not has_key))
+    error = token_error
+    if not error and not provider:
         error = f"pi needs provider/model or defaultProvider in {owner.parent / 'settings.json'} before choosing credentials"
-    elif (mode in ("login", "subscription") and not login) or (not chosen_login and not (has_key or local)):
+    elif not error and provider == "anthropic" and not key:
+        error = ANTHROPIC_KEY_REQUIRED
+    elif not error and provider != "anthropic" and (
+            (mode in ("login", "subscription") and not login) or (not chosen_login and not (has_key or local))):
         error = (f"pi {provider}: no usable login or supported key; checked {owner}, {KEYS_FILE} and Arete environment")
     chosen_auth = auth if chosen_login else accounts.Auth(
         "subscription" if mode in ("login", "subscription") and provider in accounts.PI_SUBSCRIPTIONS else "api_key")
@@ -398,7 +434,9 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     files = {paths.expand(available[name]).absolute() for name in CREDENTIAL_FILES if available.get(name)}
     if managed:
         files.update(managed.files)
-    return Route(provider, resolved, chosen_auth, error, login_available=login, login_held=login_held,
+    return Route(provider, resolved, chosen_auth, error, token_error=token_error,
+                 login_available=login, login_refused=login_refused,
+                 login_held=login_held,
                  owner=owner, key=key, key_name=key_name, models=clean_models, settings=clean_settings, env=env,
                  hidden=tuple(v for v in hidden if len(v) >= 8), managed=managed if not chosen_login else None,
                  using_login=chosen_login, sensitive_files=tuple(sorted(files)))
@@ -534,6 +572,9 @@ def sessions_dir(remote: devices.Device | None) -> str:
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
             persist: bool = True, add_dirs: list[Path] | None = None,
             remote: devices.Device | None = None) -> list[str]:
+    if refusal := remote_refusal(remote):
+        raise ValueError(refusal)
+    remote = None
     cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp"]
     if not remote:
@@ -557,7 +598,7 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
 
 
 def authentication(model: str, passing=None, providers=None, remote=None) -> accounts.Auth:
-    return accounts.Auth("api_key") if remote else select(model, passing, providers).auth
+    return accounts.Auth() if remote_refusal(remote) else select(model, passing, providers).auth
 
 
 def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "") -> UsageLimit | None:
@@ -674,18 +715,21 @@ def refresh_channel(route: Route | None, env: dict):
 
 
 def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None, **kw) -> Result:
-    if kw.get("remote"):
-        selected = None
-    else:
-        selected = selected or select(kw.get("model", ""), kw.get("passing"), kw.get("providers"))
-        auth = selected.auth
-        kw["model"] = selected.model
+    if refusal := remote_refusal(kw.get("remote")):
+        return Result(ok=False, error=refusal, runner="pi", model=kw.get("model", ""),
+                      session=kw.get("resume", NO_SESSION))
+    kw["remote"] = None
+    selected = selected or select(kw.get("model", ""), kw.get("passing"), kw.get("providers"))
+    auth = selected.auth
+    kw["model"] = selected.model
     auth = auth or accounts.Auth("api_key")
     if auth.mode == "subscription":
         kw["max_budget_usd"] = None
     started = time.monotonic()
-    if selected and selected.error:
-        result = Result(ok=False, error=selected.error, runner="pi", model=selected.model,
+    error = ((selected.token_error or route_token_error(selected) or selected.error) if selected else
+             plan_token_error(os.environ.items()))
+    if error:
+        result = Result(ok=False, error=error, runner="pi", model=kw.get("model", ""),
                         session=kw.get("resume", NO_SESSION))
     elif selected and selected.using_login and not login_unchanged(selected):
         result = Result(ok=False, error=f"pi {selected.provider}: selected login changed or is no longer available",
@@ -747,6 +791,9 @@ def _run(
     auth: accounts.Auth | None = None,
     selected: Route | None = None,
 ) -> Result:
+    if refusal := remote_refusal(remote):
+        return Result(ok=False, error=refusal, session=resume, runner="pi", model=model)
+    remote = None
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
@@ -764,7 +811,8 @@ def _run(
         names = [name for name in names if name in GUARDED_TOOLS]
     if (persist or resume.id) and not remote:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = command(names, model=model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
+    launch_model = selected.model.partition("/")[2] if selected else model
+    cmd = command(names, model=launch_model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
                   remote=remote)
     if selected and selected.provider:
         cmd += ["--provider", selected.provider]
@@ -790,6 +838,8 @@ def _run(
                **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files)}
     try:
         with refresh_channel(selected, env) as descriptors:
+            if error := plan_token_error(env.items()):
+                return Result(ok=False, session=resume, error=error, runner="pi", model=model)
             proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
                                        lambda line: reply_cost(line, model, price, auth.mode), on_line,
                                        **({"pass_fds": descriptors} if descriptors else {}))
@@ -832,6 +882,9 @@ def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd
             passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
             price: Callable[[Result], float] = lambda reply: reply.cost_usd,
             max_budget_usd: float | None = None, selected: Route | None = None) -> None:
+    if refusal := remote_refusal(remote):
+        result.ok, result.error, result.structured = False, refusal, None
+        return
     if not ending_text:
         return
     auth = selected.auth if selected else authentication(model, passing, providers, remote)
@@ -966,7 +1019,7 @@ def error_messages(data) -> list[str]:
 def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None,
           auth: accounts.Auth | None = None) -> Result:
     provider = model.partition("/")[0]
-    auth = auth or accounts.Auth("subscription", "claude" if provider == "anthropic" else "", provider=provider)
+    auth = auth or accounts.Auth("api_key" if provider == "anthropic" else "subscription", provider=provider)
     stream = events(proc.stdout)
     end = next((e for e in reversed(stream) if e.get("type") == "agent_end"), {})
     replies = [m for m in end.get("messages", []) if m.get("role") == "assistant"]
