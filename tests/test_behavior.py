@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -1189,7 +1188,7 @@ print(json.dumps({"status": status, "hub": ref_in(hub), "tip": tip, "asked": ask
                        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SESSION
             run = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario], cwd=root, env=env,
-                                 capture_output=True, text=True, timeout=120)
+                                 capture_output=True, text=True, timeout=120, check=False)
             self.assertEqual(run.returncode, 0, run.stderr[-2000:])
             return json.loads(run.stdout.strip().splitlines()[-1])
 
@@ -1290,13 +1289,12 @@ print(json.dumps({"status": status, "hub": ref_in(hub), "tip": tip, "asked": ask
         self.assertIn("did not come back", out["summary"])
         kept, log, forgotten = SimpleNamespace(device=SimpleNamespace(keep=False), name="vm", delete_command=lambda: "rm"), [], []
         with mock.patch.object(devices.state, "forget_vm", forgotten.append), \
-                mock.patch.object(devices, "delete_or_say_why", side_effect=AssertionError("deleted")):
-            with devices.kept_or_deleted(kept, log.append, lambda: "the work is not back"):
-                pass
+                mock.patch.object(devices, "delete_or_say_why", side_effect=AssertionError("deleted")), \
+                devices.kept_or_deleted(kept, log.append, lambda: "the work is not back"):
+            pass
         self.assertEqual((forgotten, len(log)), (["vm"], 1))
-        with mock.patch.object(devices, "delete_or_say_why") as deleted:
-            with devices.kept_or_deleted(kept, log.append):
-                pass
+        with mock.patch.object(devices, "delete_or_say_why") as deleted, devices.kept_or_deleted(kept, log.append):
+            pass
         deleted.assert_called_once()
 
     def test_any_interrupted_return_marks_the_work_unreturned(self):
@@ -1329,16 +1327,18 @@ print(json.dumps({"status": status, "hub": ref_in(hub), "tip": tip, "asked": ask
         value = "fake-clone-value-0001"
         device = devices.Device("box", "ssh", host="dev@box.test")
         said = subprocess.CompletedProcess([], 1, "", "fatal: " + "x" * 280 + value)
-        with mock.patch.object(devices.util, "sh", return_value=said):
-            with self.assertRaises(devices.DeviceError) as caught:
-                devices.run_script(device, "true", "cloning", value)
+        with mock.patch.object(devices.util, "sh", return_value=said), \
+                self.assertRaises(devices.DeviceError) as caught:
+            devices.run_script(device, "true", "cloning", value)
         self.assertNotIn("fake-c", str(caught.exception))
         self.assertIn("***", str(caught.exception))
 
 
+READ_ONLY_GRANT = {"repositories": ["widgets"], "permissions": {"contents": "read"}}
+
+
 class CloneTokenTests(unittest.TestCase):
     VALUE = "fake-clone-value-0001"
-    READ_ONLY = {"repositories": ["widgets"], "permissions": {"contents": "read"}}
     APP = config.GithubApp("12345", "67890", Path("/nowhere"))
     URL = "https://api.github.com/app/installations/67890/access_tokens"
 
@@ -1382,7 +1382,7 @@ class CloneTokenTests(unittest.TestCase):
         self.assertEqual(gh.CLONE_TOKEN_PERMISSIONS, {"contents": "read"})
         self.assertEqual(len(seen), 1)
         self.assertEqual((seen[0].full_url, seen[0].get_method()), (self.URL, "POST"))
-        self.assertEqual(json.loads(seen[0].data), self.READ_ONLY)
+        self.assertEqual(json.loads(seen[0].data), READ_ONLY_GRANT)
 
     def test_the_mint_refuses_anything_but_read_on_this_one_repository(self):
         forbidden = urllib.error.HTTPError(self.URL, 403, "Forbidden", {},
@@ -1407,7 +1407,7 @@ class CloneTokenTests(unittest.TestCase):
                 self.assertIn(said, error)
                 self.assertTrue(seen)
                 for request in seen:
-                    self.assertEqual(json.loads(request.data), self.READ_ONLY)
+                    self.assertEqual(json.loads(request.data), READ_ONLY_GRANT)
 
     def test_app_jwt_verifies_with_the_public_key(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"HOME": directory}):
@@ -1420,7 +1420,7 @@ class CloneTokenTests(unittest.TestCase):
             (root / "signed").write_text(f"{head}.{claims}")
             (root / "sig").write_bytes(base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4)))
             checked = subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(pub), "-signature", str(root / "sig"),
-                                      str(root / "signed")], capture_output=True, text=True)
+                                      str(root / "signed")], capture_output=True, text=True, check=False)
             self.assertIn("Verified OK", checked.stdout)
 
 
@@ -1435,7 +1435,7 @@ class TokenHelperTests(unittest.TestCase):
                 env["ARETE_GIT_TOKEN"] = token
             return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + devices.TOKEN_HELPER,
                                    "credential", "fill"], cwd=home, env=env, capture_output=True, text=True,
-                                  input=f"protocol={protocol}\nhost={host}\n\n")
+                                  input=f"protocol={protocol}\nhost={host}\n\n", check=False)
 
     def test_the_helper_answers_github_over_https_with_the_token(self):
         lines = self.fill("https", "github.com", self.VALUE).stdout.splitlines()
