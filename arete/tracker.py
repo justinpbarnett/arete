@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from . import config, gh, jira, state
+from . import config, gh, jira, state, util
 
 LABEL = "agent"
 APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
@@ -193,6 +193,11 @@ class GitHubTracker:
                                   created=i.get("createdAt", "")))
         return sorted(out, key=lambda t: t.created)
 
+    def reply_since(self, tid: str, since: str) -> str:
+        full = gh.issue(self.repo.github, int(tid))
+        return reply_text([(datetime.fromisoformat(c["createdAt"]), c.get("body") or "")
+                           for c in full.get("comments", []) if self.by_owner(c) and c.get("createdAt")], since)
+
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
 
@@ -294,6 +299,11 @@ class JiraTracker:
             if answered(mine):
                 out.append(search_ticket(self.client, i))
         return out
+
+    def reply_since(self, tid: str, since: str) -> str:
+        me = self.client.me().get("accountId", "")
+        return reply_text([(jira.parse_time(c["created"]), c.get("body") or "") for c in self.client.comments(tid)
+                           if _authored_by(c, me) and c.get("created")], since)
 
     def get(self, tid: str) -> Ticket:
         issue = self.client.issue(tid, JIRA_FIELDS)
@@ -414,6 +424,10 @@ class LocalTracker:
 
     def replied(self) -> list[Ticket]:
         return [task_ticket(row) for row in state.tasks_replied(self.repo.name)]
+
+    def reply_since(self, tid: str, since: str) -> str:
+        return reply_text([(util.parse_iso(c["ts"]), c["body"] or "") for c in state.task_comments(tid)
+                           if c["author"] == "owner" and c["ts"]], since)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
@@ -566,6 +580,12 @@ def safe_filename(name: str) -> str:
 
 def from_arete(body: str) -> bool:
     return body.lstrip().startswith(ARETE_TAG)
+
+
+def reply_text(comments: list[tuple[datetime, str]], since: str) -> str:
+    cutoff = util.parse_iso(since)
+    return "\n\n".join(body.strip() for when, body in sorted(comments, key=lambda c: c[0])
+                       if when >= cutoff and body.strip() and not from_arete(body))
 
 
 def answered(comments: list[tuple[datetime, str]]) -> bool:
