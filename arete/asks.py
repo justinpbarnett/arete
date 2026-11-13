@@ -249,7 +249,20 @@ def question_text(i: int, q: dict) -> str:
     return head
 
 
-def comment(sent: list[dict], info_label: str, limit: int | None = None) -> str:
+SESSION_GONE = re.compile(r"no conversation found|no rollout found|kept session cannot continue|"
+                          r"(session|thread|conversation)\b.{0,60}(not found|does not exist|no longer exists|expired|"
+                          r"unavailable|unknown)", re.IGNORECASE)
+
+
+def session_gone(error) -> bool:
+    return bool(SESSION_GONE.search(str(error or "")))
+
+
+def has_secret(questions: list[dict]) -> bool:
+    return any(q.get("kind") == "secret" for q in questions)
+
+
+def comment(sent: list[dict], info_label: str, limit: int | None = None, run_id: str = "") -> str:
     opening = (f"This run reached its limit of {limit} asks (`[ask] max_per_run`), so it stops here. "
                if limit is not None else "")
     blocks, count = [], 0
@@ -259,8 +272,122 @@ def comment(sent: list[dict], info_label: str, limit: int | None = None) -> str:
         blocks.append(f"{questions}\n\nWhy: {outbound.plain(ask['why'], 1000)}{tried}")
         count += len(ask["questions"])
     need = "an answer" if count == 1 else "answers"
-    return (f"{opening}Before I can finish this I need {need}:\n\n" + "\n\n".join(blocks) +
-            f"\n\nReply here, then remove the `{info_label}` label and I will pick it up.")
+    head = f"{opening}Before I can finish this I need {need}:\n\n" + "\n\n".join(blocks)
+    if not run_id:
+        return head + f"\n\nReply here, then remove the `{info_label}` label and I will pick it up."
+    secret = any(has_secret(ask["questions"]) for ask in sent)
+    how = ("A reply here cannot answer this ask, because it holds a secret question, so answer on the dashboard."
+           if secret else f"A reply here also counts as the answer to every question: reply, then remove the "
+                          f"`{info_label}` label.")
+    return head + f"\n\nAnswer on the arete dashboard or with `arete answer {run_id}`. {how}"
+
+
+ANSWER_KEYS = ("answers", "recommended")
+MAX_TEXT = 20000
+DECLINED = "the owner declined"
+
+
+def options_picked(q: dict, value) -> tuple[list[str], str]:
+    values = value if isinstance(value, list) else [value]
+    labels = [o["label"] for o in q["options"]]
+    if not values or len(values) > 1 and not q.get("multiple"):
+        return [], "pick one option" if not q.get("multiple") else "pick at least one option"
+    picked = []
+    for v in values:
+        if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= len(labels):
+            picked.append(labels[v - 1])
+        elif isinstance(v, str) and v.strip().lower() in [x.lower() for x in labels]:
+            picked.append(labels[[x.lower() for x in labels].index(v.strip().lower())])
+        else:
+            return [], "that is not one of the options"
+    return picked, ""
+
+
+def one_answer(i: int, q: dict, entry, recommended: bool) -> tuple[dict, str]:
+    at = f"question {i} ({q['header']})"
+    base = {"header": q["header"], "kind": q["kind"], **({"name": q["name"]} if q["kind"] == "secret" else {})}
+    if entry is None:
+        if recommended and q["kind"] == "choice":
+            return {**base, "picked": [q["options"][0]["label"]]}, ""
+        return {}, f"{at} needs an answer"
+    if not isinstance(entry, dict):
+        return {}, f"{at}: give an object such as {{\"text\": \"...\"}} or {{\"declined\": true}}"
+    if entry == {"declined": True}:
+        return {**base, "declined": True}, ""
+    if q["kind"] == "secret":
+        return {}, (f"{at}: arete stores no secret values yet, so {q['name']} cannot be set; send "
+                    "{\"declined\": true} for it. Nothing was stored.")
+    if q["kind"] == "choice" and set(entry) == {"choice"}:
+        picked, why = options_picked(q, entry["choice"])
+        return ({**base, "picked": picked}, "") if not why else ({}, f"{at}: {why}")
+    if q["kind"] == "done" and entry == {"done": True}:
+        return {**base, "done": True}, ""
+    text = entry.get("text")
+    if set(entry) == {"text"} and isinstance(text, str) and text.strip():
+        if len(text) > MAX_TEXT:
+            return {}, f"{at}: the answer is {len(text)} characters; the most is {MAX_TEXT}"
+        return {**base, "text": text.strip()}, ""
+    return {}, f"{at}: that is not an answer for a {q['kind']} question"
+
+
+def answers_for(ask: dict, body) -> list[dict]:
+    questions = ask["questions"]
+    if not isinstance(body, dict):
+        raise TypeError("the answer must be an object")
+    problems = [f"unknown key {k}" for k in body if k not in ANSWER_KEYS]
+    recommended = body.get("recommended", False)
+    if not isinstance(recommended, bool):
+        problems.append("recommended must be true or false")
+    given = body.get("answers")
+    if given is None and recommended is True:
+        given = [None] * len(questions)
+    if not isinstance(given, list) or len(given) != len(questions):
+        problems.append(f"answers needs one entry for each of the {len(questions)} questions")
+        raise ValueError("; ".join(problems))
+    found = []
+    for i, (q, entry) in enumerate(zip(questions, given, strict=True), 1):
+        one, why = one_answer(i, q, entry, recommended is True)
+        found.append(one)
+        if why:
+            problems.append(why)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return found
+
+
+def text_answers(ask: dict, text: str) -> list[dict]:
+    return [{"header": q["header"], "kind": q["kind"], "text": text} for q in ask["questions"]]
+
+
+def answer_words(q: dict, a: dict) -> str:
+    if q["kind"] == "secret":
+        return f"`{q['name']}` is set for this repo" if a.get("set") else DECLINED
+    if a.get("declined"):
+        return DECLINED
+    if a.get("picked"):
+        return ", ".join(a["picked"])
+    return "done" if a.get("done") else str(a.get("text") or "")
+
+
+def answered_lines(rows: list[dict], why: bool = False) -> str:
+    out, n = [], 0
+    for row in rows:
+        for q, a in zip(row["questions"], row["answers"], strict=True):
+            n += 1
+            out.append(f"{n}. {q['header']}: {q['question']}\n   Answer: {answer_words(q, a)}")
+        if why and row.get("why"):
+            out.append(f"   Why you asked: {row['why']}")
+    return "\n".join(out)
+
+
+def answers_message(rows: list[dict]) -> str:
+    return ("Your owner answered what you asked:\n\n" + answered_lines(rows) +
+            "\n\nCarry on with these and finish the step.")
+
+
+def fresh_note(rows: list[dict]) -> str:
+    return ("## Earlier in this step you asked your owner\n\n" + answered_lines(rows, why=True) +
+            "\n\nThe owner has answered. Use the answers and finish the step without asking again.")
 
 
 def settles(ask: dict) -> bool:

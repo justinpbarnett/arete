@@ -17,6 +17,10 @@ def notify(title: str, message: str) -> None:
         util.sh(["notify-send", "--", title, msg], timeout=10)
 
 
+def ask_notice(where: str, summary: str) -> None:
+    notify("arete: a run asks", f"{outbound.sanitize(where, 60)}: {outbound.sanitize(summary, 140)}")
+
+
 def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = False) -> str:
     status = outbound.sanitize(status)
     prev = state.alert_get(key)
