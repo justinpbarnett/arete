@@ -14,6 +14,8 @@ import time
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
@@ -672,8 +674,28 @@ def read_pi(e: dict) -> list[dict]:
     return out
 
 
+def mcp_call(item: dict) -> dict:
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            pass
+    return {"kind": "tool_call", "id": item.get("id", ""), "name": f"mcp__{item.get('server', '')}__{item.get('tool', '')}",
+            "input": arguments}
+
+
+def mcp_result(item: dict, name: str) -> dict:
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    failure = item.get("error")
+    text = block_text(result.get("content")) or (str(failure.get("message") if isinstance(failure, dict) else failure or ""))
+    return {"kind": "tool_result", "id": item.get("id", ""), "name": name, "text": text,
+            "error": bool(failure) or item.get("status") == "failed"}
+
+
 def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
     before: dict = {}
+    started: set[str] = set()
 
     def read(e: dict) -> list[dict]:
         nonlocal before
@@ -689,8 +711,14 @@ def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
                      "cost_usd": None}]
         if e.get("type") == "item.started" and kind == "command_execution":
             return [{"kind": "tool_call", "id": at, "name": "Bash", "input": {"command": item.get("command", "")}}]
+        if e.get("type") == "item.started" and kind == "mcp_tool_call":
+            started.add(at)
+            return [mcp_call(item)]
         if e.get("type") != "item.completed":
             return []
+        if kind == "mcp_tool_call":
+            call = mcp_call(item)
+            return [*([] if at in started else [call]), mcp_result(item, call["name"])]
         if kind in ("agent_message", "reasoning"):
             role = "assistant" if kind == "agent_message" else "thinking"
             return [{"kind": "message", "role": role, "text": item.get("text", "")}]
@@ -704,9 +732,19 @@ def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
     return read
 
 
+def read_replay(e: dict) -> list[dict]:
+    if e.get("type") == "tool_call":
+        return [{"kind": "tool_call", "id": e.get("id", ""), "name": e.get("name", ""), "input": e.get("input")}]
+    if e.get("type") == "tool_result":
+        return [{"kind": "tool_result", "id": e.get("id", ""), "name": e.get("name", ""), "text": e.get("text", ""),
+                 "error": bool(e.get("error"))}]
+    return []
+
+
 READERS: dict[str, Callable[[dict], Callable[[dict], list[dict]]]] = {"claude": claude_reader,
                                                                       "pi": lambda header: read_pi,
-                                                                      "codex": codex_reader}
+                                                                      "codex": codex_reader,
+                                                                      "replay": lambda header: read_replay}
 
 
 def named_model(raw: str) -> str:
@@ -722,3 +760,112 @@ def named_model(raw: str) -> str:
     if message.get("role") != "assistant" or not message.get("model"):
         return ""
     return f"{message['provider']}/{message['model']}" if message.get("provider") else str(message["model"])
+
+
+GB = 10 ** 9
+LIVE_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class Stored:
+    run_id: str
+    size: int
+    written: float
+
+
+@dataclass(frozen=True)
+class Pruned:
+    removed: tuple[Stored, ...]
+    left: int
+    left_bytes: int
+    over: bool
+
+
+def scanned(run_id: str, folder: Path) -> Stored:
+    size, marks = 0, []
+
+    def failed(error: OSError) -> None:
+        raise error
+
+    for root, _, names in os.walk(folder, onerror=failed):
+        for name in names:
+            info = os.lstat(os.path.join(root, name))
+            size += info.st_size
+            marks.append(info.st_mtime)
+    return Stored(run_id, size, max(marks) if marks else folder.stat().st_mtime)
+
+
+def stored() -> list[Stored]:
+    try:
+        runs = sorted(paths.RUNS_DIR.iterdir())
+    except OSError:
+        return []
+    found = []
+    for run in runs:
+        folder = run / "record"
+        if run.is_symlink() or folder.is_symlink() or not folder.is_dir():
+            continue
+        with contextlib.suppress(OSError):
+            found.append(scanned(run.name, folder))
+    return sorted(found, key=lambda s: (s.written, s.run_id))
+
+
+def kept(records: Sequence[Stored]) -> set[str]:
+    ids = [r.run_id for r in records]
+    recent = time.time() - LIVE_SECONDS
+    return (state.record_pins() | state.runs_cited_by_pending_proposals(ids)
+            | {r["id"] for r in state.runs_marked_running()} | {r.run_id for r in records if r.written > recent})
+
+
+def prune(days: float, max_gb: float) -> Pruned:
+    records = stored()
+    protected = kept(records)
+    limit = max_gb * GB
+    oldest_allowed = time.time() - days * 86400
+    left_bytes, left, removed = sum(r.size for r in records), len(records), []
+    for r in records:
+        if r.run_id in protected or not (r.written < oldest_allowed or left_bytes > limit):
+            continue
+        folder = paths.record_dir(r.run_id)
+        shutil.rmtree(folder, ignore_errors=True)
+        if folder.exists():
+            continue
+        removed.append(r)
+        left, left_bytes = left - 1, left_bytes - r.size
+        with contextlib.suppress(OSError):
+            folder.parent.rmdir()
+    return Pruned(tuple(removed), left, left_bytes, left_bytes > limit)
+
+
+def one_component(run_id: str) -> bool:
+    return run_id not in ("", ".", "..") and "/" not in run_id and os.sep not in run_id
+
+
+def pin(run_id: str) -> None:
+    if not one_component(run_id) or not paths.record_dir(run_id).is_dir():
+        raise LookupError(f"no record for run {run_id}")
+    state.pin_record(run_id)
+
+
+def unpin(run_id: str) -> None:
+    if not state.unpin_record(run_id):
+        raise LookupError(f"run {run_id} is not pinned")
+
+
+def store() -> dict:
+    records = stored()
+    oldest = records[0] if records else None
+    return {"bytes": sum(r.size for r in records), "records": len(records),
+            "oldest": {"run_id": oldest.run_id, "written": util.iso(datetime.fromtimestamp(oldest.written, UTC))}
+            if oldest else None,
+            "pins": len(state.record_pins())}
+
+
+def size_text(n: int) -> str:
+    if n >= GB:
+        return f"{n / GB:.2f} GB"
+    if n >= 10 ** 6:
+        return f"{n / 10 ** 6:.1f} MB"
+    if n >= 1000:
+        return f"{n / 1000:.1f} KB"
+    return util.count(n, "byte")

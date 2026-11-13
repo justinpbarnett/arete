@@ -15,6 +15,7 @@ from pathlib import Path
 from . import (
     accounts,
     ask,
+    asks,
     claude,
     codex,
     config,
@@ -50,6 +51,8 @@ CODEX_NAMES = ("gpt-", "codex-")
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
 SECRET_SEARCH_DEPTH = 4
 BUDGET_FLOOR_USD = 0.005
+WEB_TOOLS = ("WebSearch", "WebFetch")
+WEB_TOOLS_OF = {"claude": WEB_TOOLS}
 EDIT_TOOLS = [*READ_TOOLS, "Edit", "Write"]
 BUILD_TOOLS = [*EDIT_TOOLS, "TodoWrite"]
 WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write"})
@@ -89,6 +92,10 @@ def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
 def stands_for(model: str, run_with: str) -> tuple[str, str]:
     which, name = route(model, "" if run_with == REPLAY else run_with)
     return (which if which != REPLAY else route(name)[0]), name
+
+
+def web_tools(model: str, run_with: str) -> tuple[str, ...]:
+    return WEB_TOOLS_OF.get(stands_for(model, run_with)[0], ())
 
 
 def run_env(run_id: str) -> dict[str, str]:
@@ -354,7 +361,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
                  "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
                  "position": chosen_route.position, "requested": chosen_route.requested,
-                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env")), "skipped": skipped, "launch": launches,
+                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env"), launch_kw.get("ask_owner", False)),
+                 "skipped": skipped, "launch": launches,
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         on_launch(route)
         started = util.iso()
@@ -692,6 +700,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     which = picked.candidate.runner
     kw["effort"] = picked.candidate.effort
     kw["instructions"] = list(picked.candidate.instructions)
+    asking = bool(kw.pop("ask_owner", False)) and not target.remote
     if target.remote:
         kw["remote"] = target
     else:
@@ -720,6 +729,15 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
             kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
         kw["verification_attempt"] = trip.scratch
+    if asking and hook:
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.WITHHELD]))
+    elif asking:
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.NOTE]))
+        if which in ("claude", "codex"):
+            kw["mcp_config"] = asks.with_server(kw.get("mcp_config") or "")
+            kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), asks.RULE]
+        elif which == "pi":
+            kw["ask_owner"] = True
     if trip.tokens is not None:
         kw["max_tokens"] = trip.tokens()
     if which == "claude":
@@ -743,9 +761,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
 
 
 def launch_env(picked: Picked, cfg: config.Config, repo: config.Repo | None, run_id: str,
-               extra: dict | None = None) -> list[str]:
+               extra: dict | None = None, asking: bool = False) -> list[str]:
     if picked.selected:
-        return sorted({*pi.launch_env_names(picked.selected), *(extra or {})})
+        return sorted({*pi.launch_env_names(picked.selected), *(extra or {}), *(["ARETE_ASK_TOOL"] if asking else [])})
     passing = environment.passed(cfg, repo)
     return sorted((codex if picked.candidate.runner == "codex" else claude).agent_env(
         passing, {**(extra or {}), **run_env(run_id)}))
@@ -797,7 +815,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         hidden.extend(selected.hidden)
         hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
                            key=len, reverse=True)
-        header["env"] = sorted({*pi.launch_env_names(selected), *(kw.get("extra_env") or {})})
+        header["env"] = sorted({*pi.launch_env_names(selected), *(kw.get("extra_env") or {}),
+                                *(["ARETE_ASK_TOOL"] if kw.get("ask_owner") else [])})
         header["provider"] = selected.provider
     def refresh_hidden():
         if selected and selected.using_login:

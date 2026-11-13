@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -7,7 +8,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -64,6 +67,148 @@ NOTES = ("read-only or workspace-write sandbox according to the step's tools; ne
          "only declared MCP servers/tools are enabled and preapproved; environment values stay out of argv",
          "under trusted scratch the only MCP server is the engine's pinned browser, confined by its own profile")
 LEADING_WORD = re.compile(r"\w+=.*|-.*|\d+")
+
+
+CLEANUP_TIMEOUT_SECONDS = 30
+CLEANUP_FILE_NAME = "codex-cleanup.json"
+CLEANUP_REMOVALS = ("rmdir", "rmtree", "tempdir")
+SANDBOX_PLATFORMS = {"darwin": "macos", "linux": "linux"}
+NESTED_SANDBOX = "codex sandbox could not start inside an existing sandbox; directory cleanup was not measured"
+CLEANUP_PROBE = """
+import json, os, shutil, tempfile
+results = {}
+def attempt(name, action):
+    try:
+        action()
+        results[name] = "ok"
+    except PermissionError:
+        results[name] = "denied"
+    except Exception as e:
+        results[name] = "error: " + type(e).__name__
+def tree():
+    os.makedirs("tree/inner")
+    shutil.rmtree("tree")
+def temporary():
+    with tempfile.TemporaryDirectory(dir="."):
+        pass
+attempt("mkdir", lambda: os.mkdir("made"))
+attempt("rmdir", lambda: os.rmdir("made"))
+attempt("rmtree", tree)
+attempt("tempdir", temporary)
+def reads():
+    denied = 0
+    for name in (".env", "nested/deep/.env"):
+        try:
+            open(name).read()
+        except PermissionError:
+            denied += 1
+    return "denied" if denied == 2 else "readable"
+try:
+    results["secret"] = reads()
+except Exception as e:
+    results["secret"] = "error: " + type(e).__name__
+print(json.dumps(results))
+"""
+
+
+@dataclass(frozen=True)
+class Cleanup:
+    status: str
+    detail: str
+    results: dict
+    version: str = ""
+    checked: str = ""
+
+
+def cleanup_verdict(results: dict, version: str = "") -> Cleanup:
+    secret = results.get("secret")
+    if secret != "denied":
+        return Cleanup("unchecked", f"the placeholder secret was not denied (secret: {secret or 'missing'})",
+                       results, version)
+    if results.get("mkdir") != "ok":
+        return Cleanup("unchecked", f"the probe could not create a directory (mkdir: {results.get('mkdir', 'missing')})",
+                       results, version)
+    outcomes = [results.get(name) for name in CLEANUP_REMOVALS]
+    if all(o == "ok" for o in outcomes):
+        return Cleanup("able", "codex removes directories it creates under arete's workspace-write profile",
+                       results, version)
+    if all(o == "denied" for o in outcomes):
+        return Cleanup(
+            "denied",
+            f"codex {version} cannot remove directories it creates under arete's workspace-write profile with recursive "
+            "secret exclusions (EPERM on rmdir, rmtree, tempdir). This is a codex sandbox restriction, not a test or "
+            "product failure; retrying the same verification on codex fails the same way, so steps that need directory "
+            "cleanup take another configured route, or move the step off codex.", results, version)
+    mixed = ", ".join(f"{name} {results.get(name, 'missing')}" for name in CLEANUP_REMOVALS)
+    return Cleanup("unchecked", f"mixed results: {mixed}", results, version)
+
+
+def cleanup_file() -> Path:
+    return paths.STATE_DIR / CLEANUP_FILE_NAME
+
+
+def probe_failure(found: subprocess.CompletedProcess, what: str) -> str:
+    if found.returncode == util.TIMED_OUT:
+        return f"timed out after {CLEANUP_TIMEOUT_SECONDS}s"
+    if found.returncode == 127:
+        return f"codex not found: {util.last_line(found.stderr)}"
+    return f"{what} exited {found.returncode}: {util.last_line(found.stderr)}"
+
+
+def run_cleanup_probe(version: str) -> Cleanup:
+    paths.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    workspace = Path(tempfile.mkdtemp(prefix="codex-cleanup-", dir=paths.STATE_DIR))
+    try:
+        for name in (".env", "nested/deep/.env"):
+            (workspace / name).parent.mkdir(parents=True, exist_ok=True)
+            (workspace / name).write_text("PLACEHOLDER=not-a-secret\n")
+        cmd = [binary(), "sandbox", *profile(workspace, [], True, []), "--",
+               sys.executable, "-I", "-c", CLEANUP_PROBE]
+        try:
+            proc = launch(cmd, workspace, "", {**agent_env(), "TMPDIR": str(workspace)}, CLEANUP_TIMEOUT_SECONDS,
+                          lambda line: None)
+        except subprocess.TimeoutExpired:
+            return Cleanup("unchecked", f"timed out after {CLEANUP_TIMEOUT_SECONDS}s", {}, version)
+        except FileNotFoundError as e:
+            return Cleanup("unchecked", f"codex not found: {e}", {}, version)
+        if proc.returncode != 0:
+            if "sandbox_apply" in proc.stderr:
+                return Cleanup("unchecked", NESTED_SANDBOX, {}, version)
+            return Cleanup("unchecked", f"codex sandbox exited {proc.returncode}: {util.last_line(proc.stderr)}", {},
+                           version)
+        try:
+            parsed = json.loads(util.last_line(proc.stdout, 2000))
+        except json.JSONDecodeError:
+            parsed = None
+        if not isinstance(parsed, dict):
+            return Cleanup("unchecked", "the probe printed no result", {}, version)
+        return cleanup_verdict(parsed, version)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def cleanup() -> Cleanup:
+    if sys.platform not in SANDBOX_PLATFORMS:
+        return Cleanup("unchecked", f"codex sandbox is not available on {sys.platform}", {})
+    found = util.sh([binary(), "--version"], timeout=CLEANUP_TIMEOUT_SECONDS, env=agent_env(), inherit=False)
+    if found.returncode != 0:
+        return Cleanup("unchecked", probe_failure(found, "codex --version"), {})
+    words = found.stdout.split()
+    version = words[-1] if words else ""
+    key = {"version": version, "platform": sys.platform,
+           "probe": hashlib.sha256(CLEANUP_PROBE.encode()).hexdigest()[:16]}
+    saved = util.read_json(cleanup_file(), {})
+    if (isinstance(saved, dict) and all(saved.get(k) == v for k, v in key.items())
+            and saved.get("status") in ("able", "denied")):
+        return Cleanup(saved["status"], saved.get("detail", ""), saved.get("results", {}), version,
+                       saved.get("checked", ""))
+    result = run_cleanup_probe(version)
+    if result.status == "unchecked":
+        return result
+    result = Cleanup(result.status, result.detail, result.results, version, util.iso())
+    util.write_json(cleanup_file(), {**key, "status": result.status, "detail": result.detail,
+                                     "results": result.results, "checked": result.checked})
+    return result
 
 
 def binary() -> str:
@@ -335,6 +480,15 @@ def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
     return result
 
 
+def launch(cmd, cwd, prompt, env, timeout, on_line, *, hidden=(), scratch=(), add_dirs=None, mcp_config=""):
+    attempt = verification_scratch.PRODUCING.get()
+    protected = {Path(p).resolve() for p in hidden}
+    confined = (attempt is None or not scratch or (verification_scratch.AUTHORITY.resolve() in protected
+                     and paths.WORKTREES_DIR.resolve() in protected
+                     and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
+    return claude.run_streaming(cmd, str(cwd), prompt, env, timeout, on_line, actor_confined=confined)
+
+
 def _run(
     prompt: str,
     cwd: Path | str,
@@ -407,12 +561,8 @@ def _run(
         on_line(line)
 
     try:
-        attempt = verification_scratch.PRODUCING.get()
-        protected = {Path(p).resolve() for p in hidden}
-        confined = (attempt is None or not scratch or (verification_scratch.AUTHORITY.resolve() in protected
-                         and paths.WORKTREES_DIR.resolve() in protected
-                         and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
-        proc = claude.run_streaming(cmd, str(cwd), prompt, env, timeout, streamed, actor_confined=confined)
+        proc = launch(cmd, cwd, prompt, env, timeout, streamed, hidden=hidden, scratch=scratch, add_dirs=add_dirs,
+                      mcp_config=mcp_config)
     except subprocess.TimeoutExpired:
         return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
                       provider=provider)

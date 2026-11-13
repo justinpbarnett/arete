@@ -353,10 +353,10 @@ class BrowserServerTests(unittest.TestCase):
         scratch.update_browser(self.a, groups=[41234])
         order = mock.Mock()
         with mock.patch.object(scratch, "stop_browser", order.stop), \
-                mock.patch.object(scratch, "producers_done", order.done):
-            order.done.return_value = False
+                mock.patch.object(scratch, "holders", order.held):
+            order.held.return_value = [{"pid": 41235, "name": "chrome", "reason": scratch.IN_GROUP}]
             kept = scratch.end(self.a, self.run_dir)[2]
-        self.assertEqual([c[0] for c in order.mock_calls[:2]], ["stop", "done"])
+        self.assertEqual([c[0] for c in order.mock_calls[:2]], ["stop", "held"])
         self.assertEqual(kept, [self.a.root])
         self.assertEqual(scratch.records()[0]["state"], "retained")
 
