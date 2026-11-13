@@ -59,6 +59,7 @@ SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider
                    "or openrouter/<model id>")
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
+NO_ROUTE = "no route can run this call"
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
 
 
@@ -120,10 +121,12 @@ def authentication(model: str, run_with: str = "", *, cfg: config.Config | None 
     return (codex if which == "codex" else claude).authentication(passing, remote=remote)
 
 
-def metered(model: str, run_with: str = "", **context) -> bool:
-    which = route(model, run_with)[0]
-    auth = authentication(model, run_with, **context)
-    return not subscription(which, "", auth.mode)
+def metered(model: str, run_with: str = "", *, cfg: config.Config | None = None, repo: config.Repo | None = None,
+            device: devices.Device | str = "local", tools: list[str] | None = None) -> bool:
+    from . import routing
+
+    cfg = cfg or config.load()
+    return routing.can_charge(routing.outlook(cfg, repo, device, model, run_with, tools, NO_GIT_WRITES))
 
 
 def limit_applies(scope: str, model: str) -> bool:
@@ -162,16 +165,12 @@ def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=
 
 def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None,
                repo: config.Repo | None = None, device: devices.Device | str = "local",
-               auth: accounts.Auth | None = None, unknown: str = "") -> dict | None:
-    which, name = route(model, run_with)
-    if which == REPLAY or (cfg and cfg.replay.all):
-        return None
-    if auth is None and which == "pi":
-        selected = pi_route(name, cfg or config.load(), repo, device, connect)
-        auth = selected.auth if selected else accounts.Auth("api_key")
-        name = selected.model if selected else name
-    auth = auth or authentication(model, run_with, cfg=cfg, repo=repo, device=device)
-    return auth_hold(auth, name, connect, unknown)
+               tools: list[str] | None = None, remaining: float | None = None) -> str:
+    from . import routing
+
+    cfg = cfg or config.load()
+    return routing.held_words(routing.outlook(cfg, repo, device, model, run_with, tools, NO_GIT_WRITES, remaining,
+                                               connect))
 
 
 def hold_words(hold: dict) -> str:
@@ -267,15 +266,13 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(),
         repo: config.Repo | None = None, remaining_budget: Callable[[], float | None] | None = None,
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
-        fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, **kw) -> Result:
+        fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
+        **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
     which, name = chosen(model, run_with, cfg)
     kept = resume if resume.runner == which else NO_SESSION
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
-    if which == "pi" and target.remote:
-        return Result(ok=False, error=pi.REMOTE_AUTH_UNVERIFIED, runner=which, model=name,
-                      provider=provider_of(name), session=kept)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
     try_no = try_no or (state.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
@@ -298,15 +295,19 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         if not picked:
             wake = wake_up(skipped)
             if wait_out_limits and wake:
-                say(f"no route can run this call, waiting until {local_time(util.iso(wake))}: {route_reasons(skipped)}")
+                say(f"{NO_ROUTE}, waiting until {local_time(util.iso(wake))}: {route_reasons(skipped)}")
                 with waits("limit"):
                     wait_until(trip, wake)
                 continue
             return with_spent(exhausted(trip, skipped, limited, which, name, wake), limited)
-        launches += 1
-        trip.launched = True
         chosen_route = picked.candidate
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
+        if resume_only and not session.id:
+            return with_spent(Result(ok=False, error=f"the kept session cannot continue on {chosen_route.runner} "
+                                                      f"{picked.name}", runner=chosen_route.runner, model=picked.name,
+                                     session=trip.resume), limited)
+        launches += 1
+        trip.launched = True
         launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say)
         route = {"runner": chosen_route.runner, "model": picked.name,
                  "provider": picked.selected.provider if picked.selected else chosen_route.provider,
@@ -445,6 +446,9 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
             auth, name = discovery.codex_auth(), candidate.model
         else:
             auth, name = accounts.Auth(), candidate.model
+        if why := discovery.policy_refusal(candidate.credential, auth.mode):
+            skipped.append(passed_over(candidate, "policy", why))
+            continue
         unknown = "local-" + accounts.fingerprint(trip.invocation, auth.generation)
         auths = {auth, *(selected.refreshed_auths if selected else ())}
         active = [h for a in auths if (h := auth_hold(a, name, unknown=unknown))]
@@ -480,10 +484,15 @@ def route_reasons(skipped: list[dict]) -> str:
 
 def exhausted(trip: Trip, skipped: list[dict], limited: list[Result], which: str, name: str, wake) -> Result:
     held = any(s["state"] == "held" for s in skipped)
-    return Result(ok=False, error=" ".join(f"no route can run this call: {route_reasons(skipped)}".split()),
+    return Result(ok=False, error=" ".join(f"{NO_ROUTE}: {route_reasons(skipped)}".split()),
                   runner=which, model=name, provider=provider_of(name),
                   session=limited[-1].session if limited else trip.resume, skipped=skipped,
                   usage_limit=UsageLimit(util.iso(wake) if wake else "", "", "usage") if held else None)
+
+
+def out_of_budget(res: Result) -> bool:
+    return (not res.ok and res.error.startswith(NO_ROUTE)
+            and any(s["state"] == "budget_spent" for s in res.skipped))
 
 
 def account_of(auth: accounts.Auth) -> str:
@@ -631,13 +640,14 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             if res.usage_limit and (res.usage_limit.scope not in limit_scopes(auth, name) or
                                    res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
                 res.usage_limit = None
+        on_local = route.get("credential") == "local"
         if res.calls:
             for call in res.calls:
-                call.cost_usd = priced(call, cfg)
+                call.cost_usd = 0.0 if on_local else priced(call, cfg)
             res.cost_usd = sum(call.cost_usd for call in res.calls)
             res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
         else:
-            res.cost_usd = priced(res, cfg)
+            res.cost_usd = 0.0 if on_local else priced(res, cfg)
         if selected:
             refresh_hidden()
             res.error = record.scrub(res.error, hidden)
@@ -652,7 +662,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     if trace[0]:
         for call in res.calls or [res]:
             record.step(trace[0], trace[1], call, call.call_seconds if res.calls else time.monotonic() - started,
-                        effort=kw.get("effort", ""), tier=tier, kind=kind, try_no=try_no)
+                        effort=kw.get("effort", ""), tier=tier, kind=kind, try_no=try_no,
+                        auth_mode="local" if route.get("credential") == "local" else "")
     return res
 
 

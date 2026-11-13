@@ -888,6 +888,12 @@ def cmd_costs(args) -> int:
             steps = "step " if row["steps"] == 1 else "steps"
             print(f"  {row['name']:<36} ${row['cost_usd']:>8.2f}  {row['steps']:>5} {steps}  "
                   f"{row['tokens_in']:>10,} in  {row['tokens_out']:>9,} out")
+    print("by route:")
+    for row in c["by_route"][:12]:
+        spend = (f"paid ${row['paid_usd']:.2f}" if row["billing"] != "subscription"
+                 else f"subscription reported ${row['subscription_usd']:.2f}")
+        print(f"  {row['name']:<52} {spend:<32} {row['calls']:>5} calls  {row['tokens_in']:>10,} in  "
+              f"{row['cache_read']:>10,} cache rd  {row['cache_write']:>9,} cache wr  {row['tokens_out']:>9,} out")
     return 0
 
 
@@ -899,19 +905,27 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
     except control.Refused as e:
         return refused(e)
     c = found[-1][1]
-    waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"]}
+    waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"], "paid_usd": c["paid_usd"],
+             "subscription_usd": c["subscription_usd"]}
     if as_json:
         print_lines([*(json.dumps(g) for _, each in found for g in each["groups"]), json.dumps(waits)])
         return 0
     for by, each in found:
         print(f"Every step by {by} in the last {each['days']:g} days. Cost is what each call reported; "
               "subscription calls count here too. Paid totals exclude them. `in` counts the input no cache served.")
-        rows = [(by, "runs", "calls", "cost", "in", "cache rd", "cache wr", "out", "min", "api min")]
-        rows += [(g["name"], str(g["runs"]), str(g["calls"]), f"${g['cost_usd']:.2f}",
+        routed = by == "route"
+        rows = [(by, *(("billing",) if routed else ()), "runs", "calls", *(("paid", "subscription") if routed else ("cost",)),
+                 "in", "cache rd", "cache wr", "out", "min", "api min")]
+        rows += [(g["name"], *((g["billing"],) if routed else ()), str(g["runs"]), str(g["calls"]),
+                  *((f"${g['paid_usd']:.2f}", f"${g['subscription_usd']:.2f}") if routed else (f"${g['cost_usd']:.2f}",)),
                   f"{g['tokens_in'] - g['cache_read'] - g['cache_write']:,}", f"{g['cache_read']:,}",
                   f"{g['cache_write']:,}", f"{g['tokens_out']:,}", f"{g['minutes']:.1f}", f"{g['api_minutes']:.1f}")
                  for g in each["groups"]]
         print_table(rows, 200)
+        if routed:
+            local = sum(g["calls"] for g in each["groups"] if g["billing"] == "local")
+            print(f"paid ${each['paid_usd']:.2f}  subscription reported ${each['subscription_usd']:.2f}  "
+                  f"local calls {local}")
     print("waits (minutes): " + "  ".join(f"{cause} {m:.1f}" for cause, m in c["wait_minutes"].items()))
     return 0
 
@@ -944,7 +958,8 @@ def cmd_steps(args) -> int:
                 notes.append("pi anthropic: paid api_key route (Anthropic Console key)")
         remaining = routing.loop_budget_left(cfg) if s.step in ("loop", "classify") else None
         routes = routing.described(found.routes(s, remaining)) if found else []
-        print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes}))
+        print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes,
+                          "payment_modes": list(config.allowed_payment_modes(cfg, layer))}))
     return 0
 
 
@@ -1244,9 +1259,10 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_webhook)
 
     p = steering(sub.add_parser("costs", help="what you paid for model calls, by model, runner and loop; with --by, "
-                                              "every step by step, task kind or model, and the wait minutes by cause"))
+                                              "every step by step, task kind, model or route, and the wait minutes by cause"))
     p.add_argument("--days", type=float, default=None)
-    p.add_argument("--by", nargs="+", choices=("step", "kind", "model"), help="one grouping or several, in order")
+    p.add_argument("--by", nargs="+", choices=("step", "kind", "model", "route"),
+                   help="one grouping or several, in order; route is runner/provider/model/billing")
     p.add_argument("--json", action="store_true", help="one JSON line per group, then one with the wait minutes")
     p.set_defaults(fn=cmd_costs)
 

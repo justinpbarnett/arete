@@ -23,13 +23,14 @@ from . import (
     state,
     util,
 )
+from .agent import subscription
 from .loops import Loop
 
 BEAT_FILE = paths.STATE_DIR / "serve.json"
 BEAT_STALE_SECONDS = 120
 DETACHED_LOG = "loops.log"
 COST_DAYS = 7
-COST_GROUPS = ("step", "kind", "model")
+COST_GROUPS = ("step", "kind", "model", "route")
 STEP_FIELD_OF = {"step": "step", "kind": "task_kind", "model": "model"}
 TOKEN_FIELDS = ("tokens_in", "cache_read", "cache_write", "tokens_out")
 DIGEST_DAYS = 3
@@ -218,28 +219,60 @@ def cost_window(days: float | None) -> tuple[float, str]:
         raise Refused(f"cannot look back {days:g} days: {e}") from e
 
 
-def costs(days: float | None = None, connect=state.db) -> dict:
+def costs(days: float | None = None, connect=state.db, cfg: config.Config | None = None) -> dict:
     days, since = cost_window(days)
-    return {"days": days, **paid_since(since, connect)}
+    by_route = step_costs("route", days, connect, cfg)["groups"]
+    return {"days": days, **paid_since(since, connect), "by_route": by_route}
 
 
-def step_costs(by: str, days: float | None = None, connect=state.db) -> dict:
+def billing_of(step: dict, cfg: config.Config) -> str:
+    which, mode, model = step.get("runner") or "", step.get("auth_mode") or "", step.get("model") or ""
+    provider = step.get("provider") or (model.partition("/")[0] if "/" in model else "")
+    if mode == "local" or (which == "pi" and mode != "subscription" and provider in cfg.local_providers):
+        return "local"
+    return "subscription" if subscription(which, step.get("provider") or "", mode) else "api_key"
+
+
+def route_of(step: dict, cfg: config.Config) -> dict:
+    which, model, billing = step.get("runner") or "", step.get("model") or "", billing_of(step, cfg)
+    fallback = {"claude": "anthropic", "codex": "openai" if step.get("auth_mode") == "api_key" else "chatgpt",
+                "pi": model.partition("/")[0] if "/" in model else ""}.get(which, "")
+    provider = step.get("provider") or fallback
+    return {"runner": which, "provider": provider, "model": model, "billing": billing,
+            "name": f"{which or 'no runner'}/{provider or '-'}/{model or 'no model'}/{billing}"}
+
+
+def step_costs(by: str, days: float | None = None, connect=state.db, cfg: config.Config | None = None) -> dict:
     if by not in COST_GROUPS:
         raise Refused(f"cannot group costs by {by}; pick one of {', '.join(COST_GROUPS)}")
     days, since = cost_window(days)
+    cfg = cfg or config.load()
     groups: dict[str, dict] = {}
+    paid = subscribed = 0.0
     for s in state.steps_since(since, connect):
-        name = s[STEP_FIELD_OF[by]] or f"no {by}"
+        route = route_of(s, cfg)
+        name = route["name"] if by == "route" else s[STEP_FIELD_OF[by]] or f"no {by}"
         row = groups.setdefault(name, {"by": by, "name": name, "runs": set(), "calls": 0, "cost_usd": 0.0,
+                                       "paid_usd": 0.0, "subscription_usd": 0.0,
+                                       **({k: route[k] for k in ("runner", "provider", "model", "billing")}
+                                          if by == "route" else {}),
                                        **dict.fromkeys(TOKEN_FIELDS, 0), "minutes": 0.0, "api_minutes": 0.0})
+        cost = s["cost_usd"] or 0
+        side = "subscription_usd" if route["billing"] == "subscription" else "paid_usd"
         row["runs"].add(s["run_id"])
         row["calls"] += 1
-        row["cost_usd"] += s["cost_usd"] or 0
+        row["cost_usd"] += cost
+        row[side] += cost
+        if side == "paid_usd":
+            paid += cost
+        else:
+            subscribed += cost
         for f in TOKEN_FIELDS:
             row[f] += s.get(f) or 0
         row["minutes"] += (s["seconds"] or 0) / 60
         row["api_minutes"] += (s.get("api_seconds") or 0) / 60
-    out = [{**r, "runs": len(r["runs"]), "cost_usd": round(r["cost_usd"], 4), "minutes": round(r["minutes"], 2),
+    out = [{**r, "runs": len(r["runs"]), "cost_usd": round(r["cost_usd"], 4), "paid_usd": round(r["paid_usd"], 4),
+            "subscription_usd": round(r["subscription_usd"], 4), "minutes": round(r["minutes"], 2),
             "api_minutes": round(r["api_minutes"], 2)} for r in groups.values()]
     waits = dict.fromkeys(lines.WAIT_CAUSES, 0.0)
     for r in state.runs_since(since, connect):
@@ -252,7 +285,8 @@ def step_costs(by: str, days: float | None = None, connect=state.db) -> dict:
         for cause in waits:
             if type(recorded.get(cause)) in (int, float):
                 waits[cause] += recorded[cause]
-    return {"days": days, "since": since, "by": by,
+    return {"days": days, "since": since, "by": by, "paid_usd": round(paid, 4),
+            "subscription_usd": round(subscribed, 4),
             "groups": sorted(out, key=lambda r: (-r["cost_usd"], -r["calls"], r["name"])),
             "wait_minutes": {cause: round(minutes, 2) for cause, minutes in waits.items()}}
 

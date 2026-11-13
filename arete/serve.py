@@ -291,7 +291,8 @@ class Server:
                 continue
             due = (a for a in decidable if (model := job.model_for(a, self.cfg)) and not a[job.note]
                    and a[f"{job.note}_tried"] <= retry_from and not runner.usage_hold(
-                       model, cfg=self.cfg, repo=next((r for r in self.cfg.repos if r.name == a["repo"]), None)))
+                       model, cfg=self.cfg, repo=next((r for r in self.cfg.repos if r.name == a["repo"]), None),
+                       tools=runner.READ_TOOLS))
             if approval := next(due, None):
                 state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
                 self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)

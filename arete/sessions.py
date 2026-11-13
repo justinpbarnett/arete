@@ -15,6 +15,7 @@ from . import (
     jev,
     paths,
     record,
+    routing,
     runner,
     settings,
     state,
@@ -126,11 +127,13 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
         raise control.Refused("pick a model, or set [models] session in the config")
     target = device_named(device)
     work_repo = repo_named(repo, target, cfg)
-    if refusal := runner.device_refusal(model, run_with, target):
-        raise control.Refused(refusal)
     which, name = runner.route(model, run_with)
     off = runner.withheld(model, run_with, tools, target)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
+    asked = runner.request_for(cfg, work_repo, which, name, None, True,
+                               {"tools": tools, "disallowed_tools": runner.NO_GIT_WRITES})
+    if (refusal := "" if cfg.replay.all else routing.fit_refusal(asked, target)):
+        raise control.Refused(refusal)
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
                 budget_usd, created=util.iso())
     workspace(spec, target, work_repo)
@@ -204,7 +207,8 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
 
 def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, recent: str, turn: int,
               resume: Session) -> Session:
-    if not resume.id or resume.runner != "claude" or device.remote or not recent:
+    row = state.run_get(spec.id) or {}
+    if not resume.id or resume.runner != "claude" or row.get("runner") != "claude" or device.remote or not recent:
         return resume
     if not jev.ready(cfg, [cfg.repo_for_work_dir(spec.cwd)]):
         return resume
@@ -215,9 +219,10 @@ def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
                      ).answers.get("switch")
     if not switch or switch.value is not True or not switch.sure(cfg.jev.confidence):
         return resume
-    res = runner.run("/compact", spec.cwd, model=spec.model, runner="claude", trace=(spec.id, f"turn {turn} compact"),
-                     resume=resume, cfg=cfg, device=device, timeout=TURN_TIMEOUT_SECONDS, repo=session_repo(spec, cfg),
-                     fallback=False)
+    res = runner.run("/compact", spec.cwd, model=row.get("model") or spec.model, runner="claude",
+                     trace=(spec.id, f"turn {turn} compact"), resume=resume, cfg=cfg, device=device,
+                     timeout=TURN_TIMEOUT_SECONDS, repo=session_repo(spec, cfg), fallback=False,
+                     wait_out_limits=False, resume_only=True)
     log_line(spec, "compact" if res.ok else "error",
              f"compacted {tokens:,} tokens of context before a new task (JEV {switch.note()}) {runner.cost_note(res)}"
              if res.ok else f"compaction failed: {util.first_line(res.error)}")

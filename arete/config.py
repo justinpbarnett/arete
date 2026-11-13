@@ -23,6 +23,7 @@ SESSIONS = ("resume", "fresh")
 MCP_KEYS = ("command", "args", "url")
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 TIER_KEYS = ("runner", "provider", "model")
+PAYMENT_MODES = ("subscription", "api_key", "local")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
@@ -164,6 +165,7 @@ class Config:
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     tier_map: str = ""
     routing_fallback: bool = True
+    payment_modes: tuple[str, ...] = PAYMENT_MODES
     adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
@@ -306,14 +308,27 @@ def tier_maps(data, where: str) -> dict[str, dict[str, tuple[dict[str, str], ...
     return maps
 
 
-def routing_fallback(data) -> bool:
+def routing_table(data) -> tuple[bool, tuple[str, ...] | None]:
     table = table_of(data, "routing")
-    if bad := sorted(set(table) - {"fallback"}):
-        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback")
+    if bad := sorted(set(table) - {"fallback", "payment_modes"}):
+        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, payment_modes")
     value = table.get("fallback", True)
     if type(value) is not bool:
         raise ValueError(f"[routing] fallback must be true or false, not {value!r}")
-    return value
+    modes = table.get("payment_modes")
+    if modes is None:
+        return value, None
+    if (not isinstance(modes, list) or not modes or not all(isinstance(m, str) and m in PAYMENT_MODES for m in modes)
+            or len(set(modes)) != len(modes)):
+        raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
+                         f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
+    return value, tuple(modes)
+
+
+def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[str, ...]:
+    if layer is None or layer.payment_modes is None:
+        return cfg.payment_modes
+    return tuple(m for m in cfg.payment_modes if m in layer.payment_modes)
 
 
 def price_rate(value, where: str) -> float:
@@ -399,7 +414,8 @@ def load(path: Path | None = None) -> Config:
     cfg.pricing = {str(m): tuple(price_rate(r[k], f"[pricing.models.{m}] {k}") if k in r else None
                                 for k in ("input", "output"))
                    for m, r in (pricing.get("models") or {}).items()}
-    cfg.routing_fallback = routing_fallback(data.get("routing", {}))
+    cfg.routing_fallback, modes = routing_table(data.get("routing", {}))
+    cfg.payment_modes = modes or PAYMENT_MODES
     j = data.get("jira", {})
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
@@ -555,6 +571,7 @@ class RepoLayer:
     research_dir: str = ""
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     routing_fallback: bool = True
+    payment_modes: tuple[str, ...] | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
@@ -614,7 +631,7 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")
     layer.tiers = tier_maps(section(data, "tiers"), "tiers")
-    layer.routing_fallback = routing_fallback(section(data, "routing"))
+    layer.routing_fallback, layer.payment_modes = routing_table(section(data, "routing"))
     layer.steps = step_tables(section(data, "steps"), "steps")
     layer.kinds = kind_tables(section(data, "kinds"), "kinds")
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
