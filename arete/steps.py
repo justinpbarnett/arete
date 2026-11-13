@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import claude, codex, config, pi, runner
+from . import claude, codex, config, pi, routing, runner
 
 EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS, "codex": codex.EFFORTS,
            runner.REPLAY: tuple(dict.fromkeys([*claude.EFFORTS, *pi.THINKING_LEVELS, *codex.EFFORTS]))}
@@ -32,6 +32,15 @@ class Settings:
     instructions: tuple[str, ...]
     session: str
     notes: tuple[str, ...] = ()
+    chain: tuple[routing.Link, ...] = ()
+    fallback: bool = True
+    instructions_explicit: bool = False
+
+    def effort_on(self, which: str) -> str:
+        return routing.nearest_effort(which, self.effort)
+
+    def instructions_on(self, which: str) -> tuple[str, ...]:
+        return self.instructions if self.instructions_explicit else default_instructions(which)
 
     @property
     def call(self) -> dict:
@@ -49,7 +58,44 @@ def mcp_config(cfg: config.Config, names, own: str = "") -> str:
     return json.dumps({"mcpServers": {**{n: cfg.mcp[n] for n in names}, **own_servers}})
 
 
-def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple[str, dict[str, dict[str, str]]]:
+def default_instructions(which: str) -> tuple[str, ...]:
+    return {"pi": (), "codex": CODEX_INSTRUCTIONS}.get(which, config.INSTRUCTIONS)
+
+
+def selected_tiers(cfg: config.Config, layer: config.RepoLayer) -> dict[str, tuple[dict[str, str], ...]]:
+    try:
+        return tier_map(cfg, layer)[1]
+    except ValueError:
+        return {}
+
+
+def holds_model(entries: tuple[dict[str, str], ...], wanted: tuple[str, str]) -> bool:
+    return any(e.get("model") and routing.identity(*routing.source_route(e)[:2]) == wanted for e in entries)
+
+
+def tier_of(cfg: config.Config, layer: config.RepoLayer, named: str, wanted: tuple[str, str]) -> tuple[str, tuple]:
+    tiers = selected_tiers(cfg, layer)
+    if named in tiers and holds_model(tiers[named], wanted):
+        return named, tiers[named]
+    return next(((n, e) for n, e in tiers.items() if holds_model(e, wanted)), ("", ()))
+
+
+def chain_of(requested: tuple[str, str, str], tier: str, entries: tuple[dict[str, str], ...], effort: str,
+             explicit: tuple[str, ...] | None) -> tuple[routing.Link, ...]:
+    def link(which: str, name: str, provider: str, position: int) -> routing.Link:
+        return routing.Link(name, which, provider, tier, position, position == 0, routing.nearest_effort(which, effort),
+                            default_instructions(which) if explicit is None else explicit)
+
+    wanted = routing.identity(*requested[:2])
+    chain = [link(*requested, 0)]
+    for entry in entries:
+        which, name, provider = routing.source_route(entry)
+        if entry.get("model") and routing.identity(which, name) != wanted:
+            chain.append(link(which, name, provider, len(chain)))
+    return tuple(chain)
+
+
+def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple[str, dict[str, tuple[dict[str, str], ...]]]:
     own = layer.tiers if layer else {}
     maps = {name: {**cfg.tiers.get(name, {}), **own.get(name, {})} for name in dict.fromkeys([*cfg.tiers, *own])}
     if picked := (layer.tier_map if layer else "") or cfg.tier_map:
@@ -104,6 +150,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     layer = layer or config.RepoLayer(dir=Path())
     found = merged(cfg, layer, role, kind, config.step_table(overrides or {}, f"{where}: overrides"))
     tier = ""
+    entries: tuple[dict[str, str], ...] = ()
     if found.get("model"):
         source = found
     elif found.get("tier"):
@@ -112,29 +159,34 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
         if tier not in tiers:
             defined = f"[tiers.{map_name}], which has {', '.join(tiers) or 'no tiers'}" if map_name else "no tier map"
             raise ValueError(f"{where}: tier '{tier}' is not in {defined}")
-        source = tiers[tier]
+        entries = tiers[tier]
+        source = entries[0]
     else:
         source = {**found, "model": cfg.model(role)}
     hint = source.get("runner", "")
     if hint and hint not in runner.RUNNERS:
         raise ValueError(f"{where}: runner '{hint}' is not one of {', '.join(runner.RUNNERS)}")
-    which, name = runner.route(source.get("model", ""), hint)
-    provider = source.get("provider", "") or runner.provider_of(name)
-    if which == "pi" and source.get("provider") and not name.startswith(f"{provider}/"):
-        name = f"{provider}/{name}"
+    which, name, provider = routing.source_route(source)
     effort = found.get("effort", "")
     if effort and effort not in EFFORTS[which]:
         raise ValueError(f"{where}: effort '{effort}' is not a level {which} takes; use {', '.join(EFFORTS[which])}")
-    default = {"pi": (), "codex": CODEX_INSTRUCTIONS}.get(which, config.INSTRUCTIONS)
-    instructions = found.get("instructions", default)
+    instructions = found.get("instructions", default_instructions(which))
     check_reach(where, cfg, role, which, found, instructions)
     notes = codex.NOTES if which == "codex" else ()
+    link_tier = tier
+    if not tier:
+        link_tier, entries = tier_of(cfg, layer, found.get("tier", ""), routing.identity(which, name))
     if cfg.replay.all:
         name = f"codex:{name}" if which == "codex" and runner.route(name)[0] != which else name
         which = runner.REPLAY
+        entries = ()
+    explicit = tuple(found["instructions"]) if "instructions" in found else None
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
-                    mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes)
+                    mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,
+                    chain=chain_of((which, name, provider), link_tier, entries, effort, explicit),
+                    fallback=cfg.routing_fallback and layer.routing_fallback,
+                    instructions_explicit=explicit is not None)
 
 
 def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_tiers: bool = False) -> None:
