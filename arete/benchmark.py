@@ -471,7 +471,7 @@ def preflight_endpoint(candidate: Candidate) -> str:
         return f"endpoint did not answer: status {e.code}"
     except urllib.error.URLError as e:
         return f"endpoint did not answer: {util.first_line(str(e.reason), 120)}"
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, http.client.HTTPException) as e:
         return f"endpoint did not answer: {util.first_line(str(e), 120)}"
     listed = accounts.mapping(body).get("data")
     if isinstance(listed, list):
@@ -508,7 +508,7 @@ def observed_gb(candidate: Candidate) -> float | None:
                 if number(size):
                     sizes.append(size)
         return round(max(sizes) / 1e9, 2) if sizes else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return None
 
 
