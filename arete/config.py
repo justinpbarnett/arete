@@ -40,6 +40,7 @@ TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle")
 RETENTION_KEYS = ("days", "max_gb")
+CHAT_KEYS = ("context_tokens", "summary_model")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -99,6 +100,16 @@ class JiraConfig:
 
 
 @dataclass
+class GithubApp:
+    app_id: str = ""
+    installation_id: str = ""
+    private_key: Path | None = None
+
+    def missing(self) -> list[str]:
+        return [name for name in ("app_id", "installation_id", "private_key") if not getattr(self, name)]
+
+
+@dataclass
 class JevConfig:
     enabled: bool = True
     model: str = "jev-latest"
@@ -137,6 +148,12 @@ class AskConfig:
 class Retention:
     days: float = 30
     max_gb: float = 20
+
+
+@dataclass(frozen=True)
+class ChatConfig:
+    context_tokens: int = 40_000
+    summary_model: str = "haiku"
 
 
 @dataclass
@@ -187,6 +204,7 @@ class Config:
     probes: list[Probe] = field(default_factory=list)
     jira: JiraConfig = field(default_factory=JiraConfig)
     jev: JevConfig = field(default_factory=JevConfig)
+    github_app: GithubApp = field(default_factory=GithubApp)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     environment: Environment = field(default_factory=Environment)
     miner_lookback_hours: float = 24
@@ -217,6 +235,7 @@ class Config:
     research_search_share: float = 0.6
     ask: AskConfig = field(default_factory=AskConfig)
     retention: Retention = field(default_factory=Retention)
+    chat: ChatConfig = field(default_factory=ChatConfig)
     document: dict = field(default_factory=dict)
     oncall: OncallConfig = field(default_factory=OncallConfig)
 
@@ -462,6 +481,19 @@ def retention_table(data) -> Retention:
     return Retention(**found)
 
 
+def chat_table(data) -> ChatConfig:
+    table = table_of(data, "chat")
+    if bad := sorted(set(table) - set(CHAT_KEYS)):
+        raise ValueError(f"[chat]: unknown key {', '.join(bad)}; use {', '.join(CHAT_KEYS)}")
+    tokens = table.get("context_tokens", ChatConfig.context_tokens)
+    if type(tokens) is not int or tokens < 100:
+        raise ValueError(f"[chat] context_tokens must be a whole number of at least 100, not {tokens!r}")
+    model = table.get("summary_model", ChatConfig.summary_model)
+    if type(model) is not str or not model.strip():
+        raise ValueError(f"[chat] summary_model must be a model name, not {model!r}")
+    return ChatConfig(context_tokens=tokens, summary_model=model.strip())
+
+
 def research_table(data) -> dict:
     table = table_of(data, "research")
     keys = ("planner", "search", "search_workers", "search_share")
@@ -677,6 +709,14 @@ def load(path: Path | None = None) -> Config:
     if bad := sorted(set(cfg.jev.screen_lines) - set(JevConfig().screen_lines)):
         raise ValueError(f"[jev.screen_lines]: unknown question {', '.join(bad)}; use "
                          f"{', '.join(JevConfig().screen_lines)}")
+    app = section(data, "github_app")
+    cfg.github_app = GithubApp(
+        app_id=str(app.get("app_id", "")).strip(),
+        installation_id=str(app.get("installation_id", "")).strip(),
+        private_key=paths.expand(app["private_key"]) if app.get("private_key") else None,
+    )
+    if cfg.github_app.installation_id and not cfg.github_app.installation_id.isdigit():
+        raise ValueError("[github_app] installation_id must be digits only")
     for r in data.get("repo", []):
         tracker = r.get("tracker", "github")
         if tracker not in TRACKERS:
@@ -731,6 +771,7 @@ def load(path: Path | None = None) -> Config:
     cfg.research_search_share = research["search_share"]
     cfg.ask = ask_table(data.get("ask") or {})
     cfg.retention = retention_table(data.get("retention") or {})
+    cfg.chat = chat_table(data.get("chat") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)
     from . import steps

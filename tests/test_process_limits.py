@@ -203,7 +203,9 @@ class BudgetTests(Isolated):
                 "\nexcept runlimits.Parked:print('budget remained exhausted')"
                 "\nelse:raise AssertionError('restart reset the budget')")
         done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
-                              env={k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")})
+                              cwd=str(self.root),
+                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
+                                   "HOME": str(self.root)})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("budget remained exhausted", done.stdout)
 
@@ -235,7 +237,9 @@ class BudgetTests(Isolated):
                 "lines.write=lambda *a,**k:{};"
                 "\nwith budget.watching(),budget.verifying():os._exit(0)")
         done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
-                              env={k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")})
+                              cwd=str(self.root),
+                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
+                                   "HOME": str(self.root)})
         self.assertEqual(done.returncode, 0, done.stderr)
         previous = state.ticket_runs(self.repo.name, self.ticket)[0]
         record.settle(previous["id"], "interrupted")

@@ -1,8 +1,11 @@
+import base64
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -10,10 +13,11 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
+import urllib.error
 from unittest import mock
 
 import arete
-from arete import config, pipeline, verify
+from arete import config, control, devices, gh, paths, pipeline, sessions, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -96,12 +100,13 @@ class OfflineWorkflowTests(unittest.TestCase):
     def workflow(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home"):
                 (root / folder).mkdir()
             env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
             env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
                        ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
 import importlib.util, json, os, runpy, sys, urllib.request
@@ -288,7 +293,8 @@ if scenario.startswith("held-scratch"):
               "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip(),
               "head_recorded": made.get(pipeline.head_key(pipeline.Checkout("", "", ws, ws, "main"))) == pipeline.git(["rev-parse", "HEAD"], ws).strip(),
               "unpushed": pipeline.git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], ws).strip(),
-              "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")]}
+              "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")],
+              "left": [p.name for p in pipeline.scratch_left(ws, [])]}
     with state.db() as c:
         c.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Add kumquat on a last line of its own", task))
     refused = forced()
@@ -299,9 +305,10 @@ if scenario.startswith("held-scratch"):
     scratch.LEASES.clear()
     with mock.patch.object(scratch, "holders", return_value=[]):
         pipeline.retry_scratch()
-    (root / "finalized").mkdir()
-    for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
-        p.rename(root / "finalized" / p.name)
+    if result["held"] == [prefix]:
+        (root / "finalized").mkdir()
+        for p in ws.glob(paths.SCRATCH_PREFIX + "*"):
+            p.rename(root / "finalized" / p.name)
     (root / "sample/replay/build.patch").unlink()
     if scenario == "held-scratch-edited":
         with (ws / "notes.txt").open("a") as out:
@@ -352,8 +359,17 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         result = self.workflow("held-scratch")
         self.assertIn("parked", result["parked"])
         self.assertIn("Arete-Run: ", result["kept"])
-        self.assertFalse([n for n in result["recorded"] if ".arete-scratch-" in n])
-        self.assertTrue(result["held"])
+        look = ".arete-scratch-0123456789abcdef"
+        engine = [n for n in result["held"] if n != look]
+        self.assertIn(look, result["held"])
+        if engine:
+            self.assertTrue(all(n in result["left"] for n in engine))
+            self.assertNotIn(look, result["left"])
+            self.assertIn(look + "/.gitignore", result["recorded"])
+            self.assertFalse([n for n in result["recorded"] if any(n.startswith(e) for e in engine)])
+        else:
+            self.assertIn(look, result["left"])
+            self.assertFalse([n for n in result["recorded"] if ".arete-scratch-" in n])
         self.assertTrue(result["head_recorded"])
         self.assertEqual(result["unpushed"], "2")
         self.assertIn("unresolved or unknown scratch resources", result["while_held"])
@@ -519,6 +535,439 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("left out 3 earlier repair cycles", result["log"])
         self.assertEqual(result["budget"]["left_out"], [result["old"]])
         self.assertEqual(result["budget"]["parents"], [])
+
+
+class ScratchLookAlikeTests(unittest.TestCase):
+    PRELUDE = r'''
+import json, os, secrets, subprocess, sys, time
+from pathlib import Path
+t = Path(sys.argv[1])
+from arete import pipeline, scratch, paths
+scratch.AUTHORITY = t / "authority"
+'''
+    REPO = r'''
+src, ws = t / "src", t / "worktrees" / ("ws-" + secrets.token_hex(4))
+src.mkdir()
+git = lambda *a: subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *a], cwd=src, check=True, capture_output=True)
+git("init", "-q", "-b", "main")
+(src / "a.txt").write_text("a")
+git("add", "a.txt")
+git("commit", "-qm", "a")
+git("worktree", "add", "-q", str(ws), "HEAD")
+c = pipeline.Checkout("", "o/r", src, ws, "main")
+'''
+
+    def run_body(self, body, repo=True):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for folder in ("config", "state", "logs", "worktrees", "tmp"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            bootstrap = (f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE +
+                         (self.REPO if repo else "") + body)
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertEqual(done.stdout.strip().splitlines()[-1:], ["ok"], done.stdout)
+
+    def test_replay_of_the_incident_clears_after_note_made(self):
+        self.run_body(r'''
+done = [{"state": "done", "attempt": {"workspace": str(ws), "root": str(ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8)))}} for i in range(5)]
+scratch.records = lambda strict=False: done
+made = []
+for i in range(25):
+    root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+    for d in (root, root / "state", root / "config"):
+        d.mkdir(mode=0o700)
+    (root / ".gitignore").write_text("*\n")
+    (root / ("scenario-" + str(i))).write_text("fake")
+    made.append(root)
+assert all(paths.valid_scratch(str(r)) for r in made)
+assert pipeline.scratch_left(ws, [c]) == []
+assert paths.SCRATCH_PREFIX in pipeline.kept_work(ws, [c], src, [])
+pipeline.note_made(ws, [c])
+assert pipeline.kept_work(ws, [c], src, []) == ""
+pipeline.clear_workspace(ws, [c], src, [])
+assert not ws.exists()
+assert list((t / "state/locks").glob("git-*.lock"))
+print("ok")
+''')
+
+    def test_recorded_root_keeps_the_workspace_and_note_made_skips_it(self):
+        self.run_body(r'''
+(t / "via").symlink_to(t)
+spelled = t / "via" / "worktrees" / ws.name
+link = t / "link"
+link.symlink_to(ws)
+lc = pipeline.Checkout("", "o/r", src, link, "main")
+root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+for d in (root, look):
+    d.mkdir(mode=0o700)
+    (d / "fixture.txt").write_text("fake")
+scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(spelled), "root": str(spelled / root.name)}, "diagnostic": {"replacement_retained": str(spelled / root.name)}}]
+assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
+assert pipeline.scratch_left(spelled, [pipeline.Checkout("", "o/r", src, spelled, "main")]) == [spelled / root.name]
+assert pipeline.scratch_left(link, [lc]) == [link]
+for w, k in ((ws, c), (link, lc)):
+    pipeline.note_made(w, [k])
+    made = json.loads(pipeline.made_record(w).read_text())
+    assert not any(n.startswith(root.name) for n in made), w
+    assert any(n.startswith(look.name) for n in made), w
+try:
+    pipeline.clear_workspace(ws, [c], src, [])
+    raise SystemExit("cleared a workspace that holds an engine root")
+except pipeline.RunFailed as e:
+    assert "unresolved or unknown scratch" in e.why and str(root) in e.why, e.why
+assert (root / "fixture.txt").exists() and (look / "fixture.txt").exists()
+print("ok")
+''')
+
+    def test_unreadable_store_keeps_every_prefixed_entry_held(self):
+        self.run_body(r'''
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look.mkdir(mode=0o700)
+(look / "fixture.txt").write_text("fake")
+def unreadable(strict=False):
+    if strict:
+        raise OSError("authority store unreadable")
+    return []
+scratch.records = unreadable
+assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
+pipeline.note_made(ws, [c])
+made = json.loads(pipeline.made_record(ws).read_text())
+assert not any(k.startswith(look.name) for k in made)
+try:
+    pipeline.clear_workspace(ws, [c], src, [])
+    raise SystemExit("cleared a workspace while the store was unreadable")
+except pipeline.RunFailed as e:
+    assert "unresolved or unknown scratch" in e.why and str(look) in e.why, e.why
+assert (look / "fixture.txt").exists()
+print("ok")
+''')
+
+    def test_look_alike_changed_after_note_made_is_named_and_kept(self):
+        self.run_body(r'''
+scratch.records = lambda strict=False: []
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look.mkdir(mode=0o700)
+(look / ".gitignore").write_text("*\n")
+(look / "fixture.txt").write_text("fake")
+pipeline.note_made(ws, [c])
+(look / "fixture.txt").write_text("changed by a person")
+try:
+    pipeline.clear_workspace(ws, [c], src, [])
+    raise SystemExit("removed a look alike that changed after the run")
+except pipeline.RunFailed as e:
+    assert look.name in e.why, e.why
+assert (look / "fixture.txt").read_text() == "changed by a person"
+print("ok")
+''')
+
+    def test_record_that_appears_after_the_first_read_still_holds_its_root(self):
+        self.run_body(r'''
+root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+root.mkdir(mode=0o700)
+reads = []
+def late(strict=False):
+    reads.append(strict)
+    return [] if len(reads) == 1 else [{"state": "done", "attempt": {"workspace": str(ws), "root": str(root)}}]
+scratch.records = late
+assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
+print("ok")
+''')
+
+    def test_unreadable_folder_inside_a_look_alike_keeps_the_workspace(self):
+        self.run_body(r'''
+scratch.records = lambda strict=False: []
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+locked = look / "locked"
+locked.mkdir(parents=True)
+locked.chmod(0)
+try:
+    assert pipeline.scratch_left(ws, [c]) == [locked], pipeline.scratch_left(ws, [c])
+    try:
+        pipeline.clear_workspace(ws, [c], src, [])
+        raise SystemExit("cleared a workspace that could not be read")
+    except pipeline.RunFailed as e:
+        assert "unresolved or unknown scratch" in e.why and str(locked) in e.why, e.why
+finally:
+    locked.chmod(0o700)
+assert locked.is_dir()
+print("ok")
+''')
+
+    def test_cleanup_removes_only_stale_folders_with_no_file_and_no_recorded_root(self):
+        self.run_body(r'''
+empty, recorded, full = (paths.WORKTREES_DIR / n for n in ("empty", "recorded", "full"))
+look, root, kept = (d / (paths.SCRATCH_PREFIX + secrets.token_hex(8)) for d in (empty, recorded, full))
+for d in (look, root, kept):
+    d.mkdir(parents=True)
+(kept / "fixture.txt").write_text("fake")
+scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(recorded), "root": str(root)}}]
+old = time.time() - 8 * 86400
+for d in (empty, recorded, full):
+    os.utime(d, (old, old))
+pipeline.cleanup_worktrees(7)
+assert not empty.exists()
+assert root.is_dir()
+assert (kept / "fixture.txt").exists()
+print("ok")
+''', repo=False)
+
+
+PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
+
+
+class OptimizeTests(unittest.TestCase):
+    def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
+        from arete import experiment, optimize
+
+        def trials(arm, outcomes, cost):
+            return [{"event": "trial", "task": "t", "split": "validation", "arm": arm, "repeat": n, "status": "done",
+                     "accepted": ok, "charged_usd": charged, "reference_usd": cost, "repairs": 0, "calls": 2,
+                     "tokens_in": 1, "tokens_out": 1, "wall_seconds": seconds}
+                    for n, ok in enumerate(outcomes, 1)]
+
+        accept = {"baseline": "champ", "split": "validation", "min_pairs": 6, "min_difference": 0.0,
+                  "confidence": 0.95}
+        rows = trials("champ", champion, 0.01) + trials("cand", candidate, reference)
+        done = {experiment.key_of(t): t for t in rows}
+        pair = experiment.pairing(done, "champ", "cand", "validation", 0.95)
+        verdict = experiment.judge(pair, accept)
+        return optimize.decide(experiment.arm_summary("cand", rows, 0.95), experiment.arm_summary("champ", rows, 0.95),
+                               pair, verdict, PROMOTION_FLOOR)
+
+    def test_a_clear_quality_win_is_promoted_on_quality(self):
+        found = self.decision([False] * 6, [True] * 6)
+        self.assertEqual((found["promote"], found["reason"]), (True, "promote on quality"))
+
+    def test_a_cheaper_candidate_under_the_quality_floor_is_not_promoted(self):
+        found = self.decision([True] * 6, [True, True, True, False, False, False], reference=0.002)
+        self.assertEqual((found["promote"], found["reason"]), (False, "no promotion: under the quality floor"))
+
+    def test_a_noisy_tie_at_equal_cost_is_not_a_win(self):
+        found = self.decision([True] * 6, [True] * 6)
+        self.assertEqual((found["promote"], found["reason"]), (False, "no promotion: noisy tie"))
+
+    def test_missing_costs_and_tiny_samples_block_promotion(self):
+        self.assertEqual(self.decision([False] * 6, [True] * 6, reference=None)["reason"],
+                         "no promotion: missing costs")
+        self.assertEqual(self.decision([False] * 3, [True] * 3)["reason"], "no promotion: insufficient evidence")
+
+    def test_a_cheaper_candidate_at_held_quality_is_promoted_on_economics(self):
+        found = self.decision([True] * 6, [True] * 6, reference=0.005)
+        self.assertEqual((found["promote"], found["reason"]), (True, "promote on economics"))
+        slower = self.decision([True] * 6, [True] * 6, reference=0.005, seconds=2.0)
+        self.assertTrue(slower["promote"])
+
+    def test_a_multiline_list_is_replaced_whole_and_nothing_else_moves(self):
+        import tomllib
+
+        from arete import optimize
+
+        text = '[a]\nx = 1\n\n[steps.build]\nmodel = "m"\ntools = [\n  "Read",\n  "Edit",\n]\neffort = "low"\n\n[z]\ny = 2\n'
+        after = optimize.edited(text, "steps.build", {"tools": ["Read", "Grep"], "mcp": ["one"]})
+        want = tomllib.loads(text)
+        want["steps"]["build"].update(tools=["Read", "Grep"], mcp=["one"])
+        self.assertEqual(tomllib.loads(after), want)
+        lines = after.splitlines(keepends=True)
+        optimize.write_key(lines, "steps.build", "tools", None)
+        self.assertNotIn("tools", tomllib.loads("".join(lines))["steps"]["build"])
+        self.assertEqual(tomllib.loads("".join(lines))["z"], {"y": 2})
+
+    def test_a_winner_that_needs_prompts_is_not_applied_in_part(self):
+        from arete import optimize
+
+        end = {"champion": "p", "overrides": {"model": "m", "prompts": "/x"}}
+        self.assertIn("prompts", optimize.undeployable(end))
+        self.assertEqual(optimize.undeployable({"overrides": {"model": "m"}}), "")
+
+    def test_the_sample_search_promotes_applies_and_rolls_back_one_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = r'''
+import contextlib, importlib.util, io, json, os, sys
+from pathlib import Path
+from arete import cli, optimize, paths
+root = Path(sys.argv[1])
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(list(argv))
+    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
+plan, config_file = str(root / "sample/plan.toml"), paths.CONFIG_FILE
+before = config_file.read_bytes()
+folder = paths.STATE_DIR / "experiments" / "sample-search"
+trail = lambda: [json.loads(line) for line in (folder / "trail.jsonl").read_text().splitlines()]
+holdout = lambda: sum('"event": "trial"' in line for line in (folder / "holdout.jsonl").read_text().splitlines())
+r = {"prices": call("prices", "import", str(root / "sample/prices.json"))["code"]}
+r["dry"] = call("experiment", "optimize", plan, "--dry-run")
+r["dry_wrote"] = (paths.STATE_DIR / "experiments").exists()
+r["search"] = call("experiment", "optimize", plan)
+r["holdout"] = holdout()
+r["again"] = call("experiment", "optimize", plan)
+r["holdout_again"] = holdout()
+r["preview"] = call("experiment", "promote", str(folder))
+r["preview_same"] = config_file.read_bytes() == before
+os.chmod(config_file.parent, 0o500)
+r["failed"] = call("experiment", "promote", str(folder), "--apply")
+os.chmod(config_file.parent, 0o700)
+r["failed_same"] = config_file.read_bytes() == before
+r["failed_events"] = [e.get("status") for e in trail() if e["event"] == "apply"]
+r["apply"] = call("experiment", "promote", str(folder), "--apply")
+after = config_file.read_text().splitlines()
+r["changed"] = [[a, b] for a, b in zip(before.decode().splitlines(), after) if a != b]
+r["same_length"] = len(after) == len(before.decode().splitlines())
+r["apply_again"] = call("experiment", "promote", str(folder), "--apply")
+r["rollback"] = call("experiment", "promote", str(folder), "--rollback")
+r["rolled_back"] = config_file.read_bytes() == before
+r["rollback_again"] = call("experiment", "promote", str(folder), "--rollback")
+print("BEHAVIOR_RESULT=" + json.dumps(r))
+'''
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
+                                  capture_output=True, timeout=600, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            r = json.loads(output)
+        shown = json.dumps(r, indent=1)
+        self.assertEqual(r["prices"], 0, shown)
+        self.assertEqual((r["dry"]["code"], r["dry_wrote"]), (0, False), shown)
+        self.assertIn("candidate twin", r["dry"]["out"])
+        self.assertEqual(r["search"]["code"], 0, shown)
+        out = r["search"]["out"]
+        self.assertIn("stronger: train fixed 6, broke 0: proposed", out)
+        self.assertIn("promoted: stronger", out)
+        self.assertIn("validation accepted 3 of 6 against 6 of 6: no promotion: under the quality floor", out)
+        self.assertIn("validation accepted 6 of 6 against 6 of 6: no promotion: noisy tie", out)
+        self.assertIn("promoted: none", out)
+        self.assertIn("result: promote stronger over baseline", out)
+        self.assertEqual((r["holdout"], r["holdout_again"]), (12, 12), shown)
+        self.assertEqual(r["again"]["code"], 0, shown)
+        self.assertIn("-model = \"scratch-a\"", r["preview"]["out"])
+        self.assertIn("+model = \"scratch-b\"", r["preview"]["out"])
+        self.assertIn("dry run: nothing was written", r["preview"]["out"])
+        self.assertTrue(r["preview_same"])
+        self.assertEqual(r["failed"]["code"], 1, shown)
+        self.assertIn("apply failed", r["failed"]["err"])
+        self.assertIn("config.toml is unchanged", r["failed"]["err"])
+        self.assertTrue(r["failed_same"])
+        self.assertEqual(r["failed_events"], ["failed"])
+        self.assertEqual(r["apply"]["code"], 0, shown)
+        self.assertEqual(r["changed"], [['model = "scratch-a"', 'model = "scratch-b"']], shown)
+        self.assertTrue(r["same_length"])
+        self.assertIn("already applied", r["apply_again"]["out"])
+        self.assertEqual(r["rollback"]["code"], 0, shown)
+        self.assertTrue(r["rolled_back"])
+        self.assertEqual(r["rollback_again"]["code"], 1, shown)
+        self.assertIn("nothing applied", r["rollback_again"]["err"])
+
+    def test_a_changed_winning_prompt_is_refused_before_any_trial_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = r"""
+import contextlib, importlib.util, io, json, shutil, sys
+from pathlib import Path
+from arete import cli, experiment, optimize, paths, util
+root = Path(sys.argv[1])
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(list(argv))
+    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
+sample = root / "sample"
+call("prices", "import", str(sample / "prices.json"))
+for name in ("tuned", "tuned2"):
+    shutil.copytree(sample / "replay" / "stronger", sample / "replay" / name)
+    shutil.copytree(paths.PROMPTS_DIR, root / name)
+text = (sample / "plan.toml").read_text()
+head, tail = text.split("[[rounds]]")[0], "[tasks." + text.split("\n[tasks.", 1)[1]
+rounds = ('[[rounds]]\nvary = "effort"\n[rounds.candidates.cheap]\neffort = "low"\n\n'
+          f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned]\nprompts = "{root / "tuned"}"\n\n'
+          f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned2]\nprompts = "{root / "tuned2"}"\n\n')
+plan = sample / "plan.toml"
+plan.write_text(head + rounds + tail.replace("rounds = 2", "rounds = 3"))
+s = optimize.load(plan)
+folder = paths.STATE_DIR / "experiments" / "sample-search"
+folder.mkdir(parents=True)
+trail = folder / "trail.jsonl"
+trials = lambda: sum(line.count('"event": "trial"') for f in folder.glob("*.jsonl") for line in f.read_text().splitlines())
+optimize.append(trail, {"event": "search", "digest": s.digest, "design": s.design, "baseline": s.snapshot, "at": util.iso()})
+champion = {"name": optimize.BASELINE, "overrides": {}, "settings": s.snapshot["settings"],
+            "inheritors": s.snapshot["inheritors"], "round": 0}
+for n in (1, 2):
+    result = optimize.play(s, folder, n, s.rounds[n - 1], champion)
+    optimize.append(trail, result)
+    champion = result["champion"]
+r = {"champion": champion["name"], "recorded": bool(champion.get("fingerprints")), "ran": trials()}
+build = root / "tuned" / "build.md"
+original = build.read_text()
+build.write_text(original + "\nPrefer another approach.\n")
+def refused(action):
+    try:
+        action()
+    except experiment.Refused as e:
+        return str(e)
+    return ""
+r["next_round"] = refused(lambda: optimize.play(s, folder, 3, s.rounds[2], champion))
+r["holdout"] = refused(lambda: optimize.score_holdout(s, folder, champion))
+r["resume"] = call("experiment", "optimize", str(plan))
+r["after_refusals"] = trials()
+build.write_text(original)
+r["proceed"] = call("experiment", "optimize", str(plan))
+r["final"] = trials()
+print("BEHAVIOR_RESULT=" + json.dumps(r))
+"""
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
+                                  capture_output=True, timeout=600, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            r = json.loads(output)
+        shown = json.dumps(r, indent=1)
+        self.assertEqual((r["champion"], r["recorded"]), ("tuned", True), shown)
+        self.assertIn("candidate tuned changed since it was selected", r["next_round"], shown)
+        self.assertIn("candidate tuned changed since it was selected", r["holdout"], shown)
+        self.assertEqual(r["resume"]["code"], 1, shown)
+        self.assertIn("candidate tuned changed since it was selected", r["resume"]["err"], shown)
+        self.assertEqual(r["after_refusals"], r["ran"], shown)
+        self.assertEqual(r["proceed"]["code"], 0, shown)
+        self.assertIn("holdout (scored once): tuned", r["proceed"]["out"], shown)
+        self.assertGreater(r["final"], r["ran"], shown)
 
 
 class MinerRecordedRunTests(unittest.TestCase):
@@ -935,6 +1384,19 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual(pipeline.scratch_left(self.ws, []), [])
         self.attempt()
 
+    def test_look_alike_is_free_and_a_folder_made_again_at_the_recorded_root_is_held(self):
+        a = self.attempt()
+        self.write(a, "out/output.txt", "fake")
+        self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [])
+        self.assertFalse(os.path.lexists(a.root))
+        look = self.ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+        look.mkdir(mode=0o700)
+        (look / ".gitignore").write_text("*\n")
+        self.assertTrue(paths.valid_scratch(str(look)))
+        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        Path(a.root).mkdir(mode=0o700)
+        self.assertEqual(pipeline.scratch_left(self.ws, []), [Path(a.root)])
+
     def retained(self, a, name):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
         data = self.record(a)
@@ -1015,6 +1477,425 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
         self.assertEqual(self.record(a)["state"], "pending")
         self.assertTrue(Path(a.root).exists())
+
+
+class RemoteSessionTests(unittest.TestCase):
+    SESSION = r'''
+import contextlib, json, os, shlex, shutil, subprocess, sys, urllib.request
+from pathlib import Path
+from arete import config, devices, gh, record, sessions, state, util
+root = Path(sys.argv[1])
+VALUE = "fake-clone-value-0001"
+shim_dir, shim_log = root / "device-bin", root / "shim.log"
+shim_dir.mkdir()
+(shim_dir / "git").write_text('#!/bin/sh\n{ printf "%s\\037" "${ARETE_FAKE_CALL:-agent}"; '
+    'if test -n "$ARETE_GIT_TOKEN"; then printf "token\\037"; else printf "\\037"; fi; '
+    'for a in "$@"; do printf "%s\\037" "$a"; done; printf "\\036"; } >> "$ARETE_SHIM_LOG"\n'
+    f'exec {shlex.quote(shutil.which("git"))} "$@"\n')
+(shim_dir / "git").chmod(0o755)
+device_path = f"{shim_dir}{os.pathsep}{os.environ['PATH']}"
+def git(*args, cwd):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+hub, seed, here, home = root / "hub.git", root / "seed", root / "controller", root / "device"
+home.mkdir()
+subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(hub)], check=True)
+git("clone", "-q", str(hub), str(seed), cwd=root)
+(seed / "a.txt").write_text("one\n")
+git("add", "-A", cwd=seed)
+git("commit", "-q", "-m", "first", cwd=seed)
+git("push", "-q", "origin", "HEAD:main", cwd=seed)
+git("clone", "-q", str(hub), str(here), cwd=root)
+(root / "app-key").write_text("not a key\n")
+calls, stdins, pushes, asked = [], [], [], []
+scenario = sys.argv[2]
+agent_env = {"PATH": device_path, "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1", "ARETE_SHIM_LOG": str(shim_log)}
+def dev(*args, cwd):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, env=agent_env,
+                          check=True, capture_output=True, text=True).stdout.strip()
+class Reply:
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def read(self):
+        return json.dumps({"token": VALUE, "permissions": {"contents": "read"}, "repository_selection": "selected",
+                           "repositories": [{"full_name": "octo/widgets"}]}).encode()
+urllib.request.urlopen = lambda request, timeout=None: asked.append(json.loads(request.data)) or Reply()
+gh.key_signature = lambda app, text: b"signature"
+gh.default_branch = lambda repo: "main"
+real_sh = util.sh
+def sh(cmd, *a, **k):
+    if not (isinstance(cmd, list) and cmd[:1] == ["ssh"]):
+        if "push" in cmd:
+            pushes.append(cmd)
+        return real_sh(cmd, *a, **k)
+    calls.append(cmd[-1])
+    stdins.append(k.get("input") or "")
+    if scenario == "bundle-fails" and "git bundle create" in cmd[-1]:
+        return subprocess.CompletedProcess(cmd, 1, "", "fatal: the device went away")
+    script = cmd[-1].replace("https://github.com/octo/widgets.git", hub.as_uri())
+    script = script.replace("GIT_ALLOW_PROTOCOL=https", "GIT_ALLOW_PROTOCOL=https:file")
+    env = {**agent_env, "ARETE_FAKE_CALL": str(len(calls) - 1)}
+    return subprocess.run(["sh", "-c", script], cwd=home, env=env, input=k.get("input") or "", capture_output=True, text=True)
+util.sh = sh
+box = devices.Device("box", "ssh", host="dev@box.test", dir=str(home / "work"))
+devices.get = lambda name: box
+cfg = config.Config(repos=[config.Repo("widgets", here, github="octo/widgets")], session_idle_hours=0,
+                    github_app=config.GithubApp("12345", "67890", root / "app-key"))
+config.load = lambda path=None: cfg
+def take_turn(spec, cfg, device, prompt, turn, resume):
+    work = Path(spec.cwd)
+    if scenario == "env-added-then-deleted":
+        (work / ".env").write_text("SECRET=1\n")
+        dev("add", "-f", ".env", cwd=work)
+        dev("commit", "-q", "-m", "add env", cwd=work)
+        dev("rm", "-q", ".env", cwd=work)
+        dev("commit", "-q", "-m", "remove env", cwd=work)
+    if scenario == "orphan-side-merged":
+        dev("checkout", "-q", "--orphan", "side", cwd=work)
+        dev("rm", "-rqf", ".", cwd=work)
+        (work / ".github/workflows").mkdir(parents=True)
+        (work / ".github/workflows/ci.yml").write_text("on: push\n")
+        dev("add", "-f", ".github/workflows/ci.yml", cwd=work)
+        dev("commit", "-q", "-m", "side ci", cwd=work)
+        dev("rm", "-q", "-f", ".github/workflows/ci.yml", cwd=work)
+        (work / "side.txt").write_text("side\n")
+        dev("add", "side.txt", cwd=work)
+        dev("commit", "-q", "-m", "side done", cwd=work)
+        dev("checkout", "-q", "session/ses-remote", cwd=work)
+        dev("merge", "-q", "--no-ff", "--no-commit", "--allow-unrelated-histories", "side", cwd=work)
+        (work / "config").mkdir()
+        (work / "config/.env.local").write_text("SECRET=2\n")
+        dev("add", "-f", "config/.env.local", cwd=work)
+        dev("commit", "-q", "-m", "merge side", cwd=work)
+        dev("rm", "-q", "config/.env.local", cwd=work)
+        dev("commit", "-q", "-m", "remove env local", cwd=work)
+    (work / "notes.txt").write_text("from the device\n")
+    return resume
+sessions.take_turn = take_turn
+if scenario == "local":
+    local = sessions.repo_named("widgets", devices.LOCAL, cfg)
+    spec = sessions.Spec("ses-remote", "hello", repo="widgets")
+    sessions.workspace(spec, devices.LOCAL, local)
+    print(json.dumps({"cwd": spec.cwd, "branch": spec.branch, "github": spec.github, "asked": asked, "calls": calls,
+                      "worktrees": git("worktree", "list", "--porcelain", cwd=here),
+                      "scratch": str(root / "worktrees")}))
+    sys.exit(0)
+repo = sessions.repo_named("widgets", box, cfg)
+spec = sessions.Spec("ses-remote", "hello", device="box", repo="widgets")
+sessions.workspace(spec, box, repo)
+sessions.save_spec(spec)
+record.start("session", run_id=spec.id, lock=sessions.session_lock(spec.id), pid=None, device="box")
+status = sessions.execute(spec.id)
+tip = git("rev-parse", "session/ses-remote", cwd=Path(spec.cwd))
+def ref_in(folder):
+    return subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/heads/session/ses-remote"], cwd=folder,
+                          capture_output=True, text=True).stdout.strip()
+saved = sessions.load_spec(spec.id)
+def device_config(*args):
+    return subprocess.run(["git", "config", *args], cwd=spec.cwd, capture_output=True, text=True).stdout
+shim_text = shim_log.read_text() if shim_log.exists() else ""
+records = []
+for text in shim_text.split("\036"):
+    if text:
+        fields = text.split("\037")[:-1]
+        records.append({"call": fields[0], "token": fields[1] == "token", "args": fields[2:]})
+device_leaks = [str(f.relative_to(home)) for f in home.rglob("*") if f.is_file() and VALUE.encode() in f.read_bytes()]
+print(json.dumps({"status": status, "hub": ref_in(hub), "tip": tip, "asked": asked,
+                  "records": records, "token_calls": [i for i, text in enumerate(stdins) if VALUE in text],
+                  "in_scripts": [c for c in calls if VALUE in c], "device_leaks": device_leaks,
+                  "helpers": device_config("--get-all", "credential.helper"),
+                  "origin_url": device_config("--get", "remote.origin.url").strip(),
+                  "home_files": [n for n in (".gitconfig", ".git-credentials") if (home / n).exists()],
+                  "fetched": saved.fetched, "held": saved.held, "controller_branch": ref_in(here),
+                  "tree": git("ls-tree", "-r", "--name-only", tip, cwd=Path(spec.cwd)).split(), "calls": calls,
+                  "pushes": pushes, "pushed": saved.pushed, "unreturned": saved.unreturned,
+                  "summary": state.run_get(spec.id)["summary"],
+                  "leaks": [str(f) for d in ("state", "logs") for f in (root / d).rglob("*")
+                            if f.is_file() and VALUE.encode() in f.read_bytes()]}))
+'''
+
+    def session(self, scenario):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SESSION
+            run = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario], cwd=root, env=env,
+                                 capture_output=True, text=True, timeout=120, check=False)
+            self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+            return json.loads(run.stdout.strip().splitlines()[-1])
+
+    @staticmethod
+    def subcommand(args):
+        i = 0
+        while i < len(args) and args[i] == "-c":
+            i += 2
+        return args[i] if i < len(args) else ""
+
+    def test_work_returns_through_the_controller_and_the_device_never_pushes(self):
+        out = self.session("normal")
+        self.assertEqual(out["status"], "done")
+        self.assertEqual(out["hub"], out["tip"])
+        self.assertEqual(out["pushed"], out["tip"])
+        self.assertEqual(out["tree"], ["a.txt", "notes.txt"])
+        self.assertEqual(out["asked"], [{"repositories": ["widgets"], "permissions": {"contents": "read"}}])
+        self.assertEqual(len(out["pushes"]), 1)
+        self.assertFalse([c for c in out["calls"] if " push" in c])
+        self.assertEqual(out["leaks"], [])
+        self.assertTrue(out["records"])
+        self.assertNotIn("push", [self.subcommand(r["args"]) for r in out["records"]])
+
+    def test_the_device_holds_the_token_only_for_the_clone(self):
+        out = self.session("normal")
+        value = "fake-clone-value-0001"
+        self.assertEqual(out["asked"], [{"repositories": ["widgets"], "permissions": {"contents": "read"}}])
+        self.assertEqual(out["token_calls"], [0])
+        self.assertEqual(out["in_scripts"], [])
+        holding = [r for r in out["records"] if r["token"]]
+        self.assertTrue([r for r in holding if self.subcommand(r["args"]) == "clone"])
+        self.assertTrue(all(r["call"] == "0" for r in holding))
+        for r in out["records"]:
+            if self.subcommand(r["args"]) in ("checkout", "config", "rev-parse", "reset", "add", "commit", "status", "bundle"):
+                self.assertFalse(r["token"], r)
+            self.assertFalse([a for a in r["args"] if value in a])
+        self.assertEqual(out["device_leaks"], [])
+        self.assertEqual(out["helpers"], "")
+        self.assertNotIn("@", out["origin_url"])
+        self.assertEqual(out["home_files"], [])
+
+    def test_a_commit_that_adds_then_deletes_a_denied_path_holds_the_push(self):
+        out = self.session("env-added-then-deleted")
+        self.assertEqual(out["status"], "done")
+        self.assertEqual(out["tree"], ["a.txt", "notes.txt"])
+        self.assertEqual((out["hub"], out["pushes"], out["pushed"]), ("", [], ""))
+        self.assertTrue([h for h in out["held"].split(", ") if h.startswith(".env in ")], out["held"])
+        self.assertEqual(out["controller_branch"], out["tip"])
+        self.assertEqual(out["fetched"], out["tip"])
+        self.assertIn("not pushed", out["summary"])
+        self.assertNotIn("push", [self.subcommand(r["args"]) for r in out["records"]])
+
+    def test_a_merged_orphan_side_and_the_merge_itself_are_checked(self):
+        out = self.session("orphan-side-merged")
+        self.assertEqual(out["status"], "done")
+        self.assertIn(".github/workflows/ci.yml in ", out["held"])
+        self.assertIn("config/.env.local in ", out["held"])
+        self.assertEqual((out["hub"], out["pushes"]), ("", []))
+
+    def test_a_remote_repo_is_refused_until_the_app_is_configured(self):
+        box = devices.Device("box", "ssh", host="dev@box.test", dir="/work")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "key.pem"
+            key.write_text("x\n")
+            repo = config.Repo("widgets", root, github="octo/widgets")
+
+            def refusal(cfg):
+                with self.assertRaises(control.Refused) as caught:
+                    sessions.repo_named("widgets", box, cfg)
+                return str(caught.exception)
+
+            said = refusal(config.Config(repos=[repo], github_app=config.GithubApp()))
+            for word in ("app_id", "installation_id", "private_key", "[github_app]"):
+                self.assertIn(word, said)
+            said = refusal(config.Config(repos=[repo], github_app=config.GithubApp("1", "2")))
+            self.assertIn("private_key", said)
+            self.assertNotIn("app_id", said)
+            self.assertNotIn("installation_id", said)
+            self.assertIn("is not a file", refusal(config.Config(
+                repos=[repo], github_app=config.GithubApp("1", "2", root / "missing.pem"))))
+            bare = config.Repo("widgets", root)
+            self.assertIn("no github setting", refusal(config.Config(
+                repos=[bare], github_app=config.GithubApp("1", "2", key))))
+
+    def test_a_local_session_still_works_in_a_worktree(self):
+        out = self.session("local")
+        self.assertTrue(Path(out["cwd"]).resolve().is_relative_to(Path(out["scratch"]).resolve()))
+        self.assertIn(Path(out["cwd"]).name, out["worktrees"])
+        self.assertEqual((out["branch"], out["github"]), ("session/ses-remote", ""))
+        self.assertEqual((out["asked"], out["calls"]), ([], []))
+
+    def test_a_failed_bring_back_fails_the_session_and_keeps_the_device(self):
+        out = self.session("bundle-fails")
+        self.assertEqual(out["status"], "failed")
+        self.assertEqual((out["hub"], out["pushes"]), ("", []))
+        self.assertIn("device went away", out["unreturned"])
+        self.assertIn("did not come back", out["summary"])
+        kept, log, forgotten = SimpleNamespace(device=SimpleNamespace(keep=False), name="vm", delete_command=lambda: "rm"), [], []
+        with mock.patch.object(devices.state, "forget_vm", forgotten.append), \
+                mock.patch.object(devices, "delete_or_say_why", side_effect=AssertionError("deleted")), \
+                devices.kept_or_deleted(kept, log.append, lambda: "the work is not back"):
+            pass
+        self.assertEqual((forgotten, len(log)), (["vm"], 1))
+        with mock.patch.object(devices, "delete_or_say_why") as deleted, devices.kept_or_deleted(kept, log.append):
+            pass
+        deleted.assert_called_once()
+
+    def test_any_interrupted_return_marks_the_work_unreturned(self):
+        spec = sessions.Spec("ses-y", "p", repo="widgets", github="octo/widgets", branch="session/ses-y")
+        cfg = SimpleNamespace(repo=lambda name: SimpleNamespace(path=Path("/nowhere")))
+        for failure in (OSError("disk full"), KeyError("odd")):
+            with self.subTest(failure=repr(failure)), mock.patch.object(sessions, "save_spec"), \
+                    mock.patch.object(sessions, "log_line"), mock.patch.object(sessions, "bring_back", side_effect=failure):
+                spec.unreturned = ""
+                try:
+                    sessions.return_work(spec, cfg, None, "m", last=True)
+                except KeyError:
+                    pass
+                self.assertTrue(spec.unreturned)
+                self.assertTrue(sessions.unreturned_reason(spec))
+
+    def test_the_end_note_compares_the_push_with_the_latest_fetch(self):
+        spec = sessions.Spec("ses-x", "p", repo="widgets", github="octo/widgets", branch="session/ses-x",
+                             cloned="c" * 40, fetched="b" * 40, pushed="a" * 40)
+        self.assertIn("not pushed", sessions.work_note(spec))
+        self.assertIn("aaaaaaaaaa was pushed earlier", sessions.work_note(spec))
+        spec.held = ".github/workflows/ci.yml"
+        self.assertIn("denied paths .github/workflows/ci.yml", sessions.work_note(spec))
+        spec.pushed = spec.fetched
+        self.assertIn("is pushed as bbbbbbbbbb", sessions.work_note(spec))
+        spec.unreturned = "bundle failed"
+        self.assertIn("did not come back", sessions.work_note(spec))
+
+    def test_a_device_error_is_redacted_before_it_is_cut_short(self):
+        value = "fake-clone-value-0001"
+        device = devices.Device("box", "ssh", host="dev@box.test")
+        said = subprocess.CompletedProcess([], 1, "", "fatal: " + "x" * 280 + value)
+        with mock.patch.object(devices.util, "sh", return_value=said), \
+                self.assertRaises(devices.DeviceError) as caught:
+            devices.run_script(device, "true", "cloning", value)
+        self.assertNotIn("fake-c", str(caught.exception))
+        self.assertIn("***", str(caught.exception))
+
+
+READ_ONLY_GRANT = {"repositories": ["widgets"], "permissions": {"contents": "read"}}
+
+
+class CloneTokenTests(unittest.TestCase):
+    VALUE = "fake-clone-value-0001"
+    APP = config.GithubApp("12345", "67890", Path("/nowhere"))
+    URL = "https://api.github.com/app/installations/67890/access_tokens"
+
+    def good(self, **changes):
+        return {"token": self.VALUE, "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected", "repositories": [{"full_name": "Octo/Widgets"}], **changes}
+
+    def mint(self, answer):
+        seen = []
+
+        class Reply:
+            def __init__(self, text):
+                self.text = text
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return self.text
+
+        def opened(request, timeout=None):
+            seen.append(request)
+            if isinstance(answer, Exception):
+                raise answer
+            return Reply(answer if isinstance(answer, bytes) else json.dumps(answer).encode())
+
+        with mock.patch.object(gh.urllib.request, "urlopen", opened), \
+                mock.patch.object(gh, "key_signature", return_value=b"signature"), \
+                mock.patch.object(gh.util, "wait_for_network", return_value=False):
+            try:
+                return gh.clone_token(self.APP, "octo/widgets"), seen, None
+            except gh.GhError as e:
+                return None, seen, str(e)
+
+    def test_the_mint_asks_for_read_only_on_the_one_repository(self):
+        value, seen, error = self.mint(self.good())
+        self.assertEqual((value, error), (self.VALUE, None))
+        self.assertEqual(gh.CLONE_TOKEN_PERMISSIONS, {"contents": "read"})
+        self.assertEqual(len(seen), 1)
+        self.assertEqual((seen[0].full_url, seen[0].get_method()), (self.URL, "POST"))
+        self.assertEqual(json.loads(seen[0].data), READ_ONLY_GRANT)
+
+    def test_the_mint_refuses_anything_but_read_on_this_one_repository(self):
+        forbidden = urllib.error.HTTPError(self.URL, 403, "Forbidden", {},
+                                           io.BytesIO(b'{"message": "Resource not accessible by integration"}'))
+        refusals = {
+            "write": (self.good(permissions={"contents": "write"}), ""),
+            "extra permission": (self.good(permissions={"contents": "read", "pull_requests": "write"}), ""),
+            "no permissions": ({"token": self.VALUE}, ""),
+            "all repositories": (self.good(repository_selection="all", repositories=[]), ""),
+            "another repository": (self.good(repositories=[{"full_name": "octo/other"}]), ""),
+            "no token": (self.good(token=""), ""),
+            "not json": (b"<html>", ""),
+            "http 403": (forbidden, "HTTP 403"),
+            "network down": (OSError("network is unreachable"), "network is unreachable"),
+        }
+        for name, (answer, said) in refusals.items():
+            with self.subTest(name):
+                value, seen, error = self.mint(answer)
+                self.assertIsNone(value)
+                self.assertIsNotNone(error)
+                self.assertNotIn(self.VALUE, error)
+                self.assertIn(said, error)
+                self.assertTrue(seen)
+                for request in seen:
+                    self.assertEqual(json.loads(request.data), READ_ONLY_GRANT)
+
+    def test_app_jwt_verifies_with_the_public_key(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"HOME": directory}):
+            root = Path(directory)
+            key, pub = root / "key.pem", root / "pub.pem"
+            subprocess.run(["openssl", "genrsa", "-out", str(key), "2048"], check=True, capture_output=True)
+            subprocess.run(["openssl", "rsa", "-in", str(key), "-pubout", "-out", str(pub)], check=True, capture_output=True)
+            token = gh.app_jwt(config.GithubApp("12345", "67890", key))
+            head, claims, signature = token.split(".")
+            (root / "signed").write_text(f"{head}.{claims}")
+            (root / "sig").write_bytes(base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4)))
+            checked = subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(pub), "-signature", str(root / "sig"),
+                                      str(root / "signed")], capture_output=True, text=True, check=False)
+            self.assertIn("Verified OK", checked.stdout)
+
+
+class TokenHelperTests(unittest.TestCase):
+    VALUE = "fake-clone-value-0001"
+
+    def fill(self, protocol, host, token=None):
+        with tempfile.TemporaryDirectory() as home:
+            env = {"PATH": os.environ["PATH"], "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_TERMINAL_PROMPT": "0"}
+            if token is not None:
+                env["ARETE_GIT_TOKEN"] = token
+            return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + devices.TOKEN_HELPER,
+                                   "credential", "fill"], cwd=home, env=env, capture_output=True, text=True,
+                                  input=f"protocol={protocol}\nhost={host}\n\n", check=False)
+
+    def test_the_helper_answers_github_over_https_with_the_token(self):
+        lines = self.fill("https", "github.com", self.VALUE).stdout.splitlines()
+        self.assertIn("username=x-access-token", lines)
+        self.assertIn(f"password={self.VALUE}", lines)
+
+    def test_the_helper_answers_nothing_for_another_host_or_protocol(self):
+        for protocol, host in (("https", "example.com"), ("http", "github.com"), ("https", "github.com.example.com")):
+            with self.subTest(protocol=protocol, host=host):
+                other = self.fill(protocol, host, self.VALUE)
+                self.assertNotEqual(other.returncode, 0)
+                self.assertNotIn(self.VALUE, other.stdout + other.stderr)
+
+    def test_the_helper_answers_nothing_without_the_token(self):
+        for token in (None, ""):
+            with self.subTest(token=token):
+                bare = self.fill("https", "github.com", token)
+                self.assertNotEqual(bare.returncode, 0)
+                self.assertNotIn("password=", bare.stdout)
+                self.assertNotIn("x-access-token", bare.stdout)
 
 
 class PushedPrDraftTests(unittest.TestCase):
@@ -1273,6 +2154,197 @@ class PushedPrDraftTests(unittest.TestCase):
         pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
         self.assertEqual(len(self.names("pr", "ready")), 1)
         self.assertEqual(self.names("pr", "merge"), [])
+
+
+class ChatContextTests(unittest.TestCase):
+    PRELUDE = r'''
+import json, sys, time
+from pathlib import Path
+from arete import chat, config, paths, record, state
+
+root = Path(sys.argv[1])
+answers = root / "replay"
+
+
+def put(name, body):
+    (answers / f"{name}.json").write_text(json.dumps(body))
+
+
+def reply(text):
+    return {"text": "", "structured": {"reply": text, "issue_title": "", "issue_body": ""}}
+
+
+def take(chat_id, text):
+    chat.send(chat_id, text)
+    deadline = time.monotonic() + 60
+    while chat.view(chat_id)["busy"]:
+        assert time.monotonic() < deadline, "the chat never finished"
+        time.sleep(0.05)
+    return chat.view(chat_id)
+
+
+def header(name):
+    return next(record.lines(paths.record_dir("chat") / f"{name}{record.RECORD_SUFFIX}"), {})
+
+
+def answer_of(n):
+    return "chat-1" if n == 1 else f"chat-1{n}"
+
+
+def record_of(n):
+    return "chat-1" if n == 1 else f"chat-1-{n}"
+
+
+def summary_answer_of(k):
+    return "chat-1-summary" if k == 1 else f"chat-1-summary{k}"
+
+
+def summary_records():
+    return sorted(p.name for p in paths.record_dir("chat").glob(f"chat-1-summary*{record.RECORD_SUFFIX}"))
+
+
+def summary_header(k):
+    return header("chat-1-summary" if k == 1 else f"chat-1-summary-{k}")
+
+
+def result(**fields):
+    print("BEHAVIOR_RESULT=" + json.dumps(fields))
+
+
+state.ensure_schema()
+assert chat.new("")["id"] == 1
+'''
+
+    def scratch(self, body):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay", "home", "tmp"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text(
+                f'[replay]\nall = true\ndir = "{root / "replay"}"\n\n[chat]\ncontext_tokens = 100\n\n[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=180, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            return json.loads(output)
+
+    FRUITS = r'''
+fruits = ["APRICOT" + " word" * 18, "PLUM" + " word" * 18, "PEAR" + " word" * 18, "And now?"]
+'''
+
+    def test_each_turn_is_a_fresh_call_built_from_the_saved_messages(self):
+        found = self.scratch(r'''
+put("chat-1", {**reply("The poll ran at noon."),
+               "tool_calls": [{"name": "Bash", "input": {"command": "arete status"}, "result": "poll: last ran 12:00"}]})
+put("chat-12", reply("Noted."))
+one = take(1, "When did APRICOT poll run?")
+take(1, "Thanks")
+result(senders=[m["sender"] for m in one["messages"]], first=header("chat-1")["prompt"], second=header("chat-1-2"))
+''')
+        self.assertEqual(found["senders"], ["you", "tool", "arete"])
+        self.assertEqual(found["first"], "When did APRICOT poll run?")
+        self.assertIsNone(found["second"].get("resume"))
+        for part in ("When did APRICOT poll run?", "Tool: Bash: arete status → poll: last ran 12:00", "The poll ran at noon."):
+            self.assertIn(part, found["second"]["prompt"])
+
+    def test_saved_history_over_the_budget_is_summarized_and_the_newest_messages_stay(self):
+        found = self.scratch(self.FRUITS + r'''
+for n in range(1, 5):
+    put(answer_of(n), reply(f"Reply {n}."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK the owner asked about two fruits."})
+counts = []
+for n, text in enumerate(fruits, 1):
+    last = take(1, text)
+    counts.append(len(summary_records()))
+result(counts=counts, summary=last["summary"], prompt=header(record_of(4))["prompt"], model=summary_header(1).get("model"),
+       summary_prompt=summary_header(1).get("prompt", ""))
+''')
+        self.assertEqual(found["counts"], [0, 0, 0, 1])
+        self.assertEqual(found["model"], "haiku")
+        self.assertTrue(found["summary"].startswith("SUMMARYMARK"))
+        prompt = found["prompt"]
+        self.assertIn("SUMMARYMARK", prompt)
+        self.assertIn("You: PEAR" + " word" * 18, prompt)
+        self.assertIn("Arete: Reply 3.", prompt)
+        self.assertNotIn("APRICOT", prompt)
+        self.assertNotIn("PLUM", prompt)
+        self.assertTrue(prompt.endswith("And now?"))
+
+    def test_a_long_new_message_alone_writes_no_summary(self):
+        found = self.scratch(r'''
+put("chat-1", reply("Reply 1."))
+put("chat-12", reply("Reply 2."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK wrongly written."})
+long = "long " * 120
+take(1, "When did APRICOT poll run?")
+last = take(1, long)
+result(records=summary_records(), summary=last["summary"], prompt=header(record_of(2))["prompt"], long=long)
+''')
+        self.assertEqual(found["records"], [])
+        self.assertEqual(found["summary"], "")
+        self.assertIn("You: When did APRICOT poll run?", found["prompt"])
+        self.assertIn("Arete: Reply 1.", found["prompt"])
+        self.assertTrue(found["prompt"].endswith(found["long"]))
+        self.assertNotIn("left out", found["prompt"])
+
+    def test_a_long_message_in_another_script_is_batched_within_the_budget(self):
+        found = self.scratch(r'''
+put("chat-1", reply("Reply 1."))
+put("chat-12", reply("Reply 2."))
+for k in range(1, 7):
+    put(summary_answer_of(k), {"text": "摘" * 200})
+take(1, "汉" * 200)
+last = take(1, "And now?")
+records = summary_records()
+result(counts=[summary_header(k)["prompt"].count("汉") for k in range(1, len(records) + 1)],
+       sizes=[chat.size_of(chat.render({"sender": "you", "text": "汉" * summary_header(k)["prompt"].count("汉")}))
+              for k in range(1, len(records) + 1)],
+       summary_size=chat.size_of(last["summary"]), summarized_to=state.chat_get(1)["summarized_to"],
+       chinese_id=state.chat_messages(1)[0]["id"])
+''')
+        self.assertGreaterEqual(len(found["counts"]), 2)
+        self.assertEqual(sum(found["counts"]), 200)
+        self.assertTrue(all(size <= 100 for size in found["sizes"]), found["sizes"])
+        self.assertLessEqual(found["summary_size"], 25)
+        self.assertEqual(found["summarized_to"], found["chinese_id"])
+
+    def test_a_failed_summary_keeps_the_saved_summary_and_messages_within_the_budget(self):
+        found = self.scratch(self.FRUITS + r'''
+turns = [*fruits, "FIG" + " word" * 18, "Still there?"]
+for n in range(1, 7):
+    put(answer_of(n), reply(f"Reply {n}."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK the owner asked about two fruits."})
+put(summary_answer_of(2), {"ok": False, "error": "the summary model is down"})
+counts = []
+for n, text in enumerate(turns, 1):
+    if n == 6:
+        saved = chat.view(1)["messages"]
+        before = chat.view(1)["summary"]
+    last = take(1, text)
+    counts.append(len(summary_records()))
+prompt = header(record_of(6))["prompt"]
+kept = [m for m in saved if chat.render(m) in prompt]
+result(counts=counts, before=before, summary=last["summary"], prompt=prompt, last=last["messages"][-1]["text"],
+       size=chat.size_of(last["summary"], chat.render_all(kept)), kept=len(kept))
+''')
+        self.assertEqual(found["counts"], [0, 0, 0, 1, 1, 2])
+        self.assertTrue(found["before"].startswith("SUMMARYMARK"))
+        self.assertEqual(found["summary"], found["before"])
+        prompt = found["prompt"]
+        self.assertIn(found["summary"], prompt)
+        self.assertIn("left out because their summary could not be written", prompt)
+        self.assertIn("You: FIG" + " word" * 18, prompt)
+        self.assertIn("Arete: Reply 5.", prompt)
+        self.assertNotIn("PEAR", prompt)
+        self.assertGreater(found["kept"], 0)
+        self.assertLessEqual(found["size"], 100)
+        self.assertEqual(found["last"], "Reply 6.")
 
 
 if __name__ == "__main__":
