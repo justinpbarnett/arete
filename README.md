@@ -453,6 +453,15 @@ A missing run row alone does not mean the run ended. A run that ends without cre
 Following starts at the beginning and stays on the selected file: `arete record RUN_ID plan-2.jsonl.gz -f`
 follows only the second attempt and never switches to another attempt.
 
+### Retention
+
+The hourly prune in `arete serve` deletes records oldest first until both `[retention]` limits hold: `days` (default 30, counted from the record's last write) and `max_gb` (default 20, decimal GB, `10^9` bytes).
+A record stays while it is pinned, while a pending proposal cites its run (as its own run or as a run id in its evidence) until the proposal is merged, rejected, skipped or filed, while its run is running, and for an hour after its last write.
+Only the `record/` folder of a run is removed; `run.log`, `run.jsonl` and the other files stay.
+`arete record pin RUN_ID` keeps a record; `arete record unpin RUN_ID` lets it age out like any other.
+`arete status` shows a `records:` line with the size of the store, its oldest record and the number of pins.
+When every record left is kept and the store is still over `max_gb`, the serve log says so on that hour's prune.
+
 ## Run lines
 
 Each pipeline run also tells its story as JSON lines in `runs/<run_id>/run.jsonl` under the state folder, one object per line, so one file can be followed while the run works or read after it died.
@@ -602,6 +611,7 @@ No runtime dependencies: stdlib only, so the tool install needs nothing from PyP
 | `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `[jev.screen_lines]` (the chance at which each push screen question holds a push: `weakens` 0.5, `secrets` 0.7, `outside` 0.7, `irreversible` 0.5, `feature` 0.6, `removes` 0.5, `renames` 0.5, and `reach` 0.8, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost; it outranks an imported [price snapshot](#price-snapshots) in route sorting. A component you leave out stays unknown in `arete steps`, not zero, and a call still charges it as zero. |
 | `[routing]` | `fallback` (default true) and `payment_modes` (a list of `subscription`, `api_key` and `local`; default all three). The engine's and a repo layer's `fallback` are combined with AND, so either can turn it off; a layer's `payment_modes` can only restrict the engine's. `arete steps` shows the result, and runs act on it. `capabilities` (per-route tables) and `floors` (named model lists) feed the step requirements. See [Steps](#steps). |
+| `[retention]` | `days` (default 30) and `max_gb` (default 20): records older than `days`, or the oldest ones beyond `max_gb` in total, are deleted by the hourly prune; pinned, cited, running and just-written records stay. Fractions are allowed. See [Records](#records). |
 | `[replay]` | `all` (default false, sends every agent call to the replay runner) and `dir` (the folder of answers; `ARETE_REPLAY_DIR` wins over it). See [Replay](#replay). |
 | `[environment]` | `pass`, the names of more server variables that local agents and the commands that run a repo's code get, each an exact name, a prefix ending in `*`, or `"*"` for all. `[environment.providers]` maps a pi provider to more names its agents get, such as `amazon-bedrock = ["AWS_*"]`. See [An agent's environment](#an-agents-environment). |
 
