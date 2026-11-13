@@ -312,9 +312,14 @@ def protected_command(command, cwd=None):
         return command
     lib = ctypes.CDLL(None)
     lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
-    if AUTHORITY.is_dir() and all(lib.sandbox_check(os.getpid(), op, 1, ctypes.c_char_p(os.fsencode(AUTHORITY))) == 1
-                                  for op in (b"file-read-data", b"file-write-data")):
-        return command
+    if lib.sandbox_check(os.getpid(), None, 0) == 1:
+        try:
+            os.lstat(AUTHORITY)
+        except OSError:
+            return command
+        if all(lib.sandbox_check(os.getpid(), op, 1, ctypes.c_char_p(os.fsencode(AUTHORITY))) == 1
+               for op in (b"file-read-data", b"file-write-data")):
+            return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
     return pi.write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False) + words
 
