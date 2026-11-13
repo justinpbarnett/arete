@@ -560,7 +560,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, loop digests, `serve.json`, `server.json`, `price-snapshot.json`)
+- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, `benchmarks/`, loop digests, `serve.json`, `server.json`, `price-snapshot.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -1195,7 +1195,7 @@ The results file is `experiments/<name>.jsonl` under the state folder, or the `-
 | `manifest` | `digest`, `design` (arms with their resolved runner, model, provider, tier and effort, tasks with split, full base and an evidence hash, the grader, the acceptance rule, prompt, context and tool fingerprints). First line only |
 | `session` | `at`, `limits`, `pid`; one per invocation |
 | `start` | `task`, `arm`, `repeat`, `attempt`, `run`, `at` |
-| `trial` | `task`, `split`, `base`, `arm`, `repeat`, `attempt`, `run`, `status`, `accepted`, `failures`, `repairs`, `route` (runner, model, provider, tier, credential, billing, auth_mode, position, requested), `effort`, `requested_effort`, `fingerprints`, `endpoint`, `cache_policy`, `calls`, `tokens_in`, `tokens_out`, `cache_read`, `cache_write`, `cost_usd`, `charged_usd`, `reference_usd`, `reference_unknown_calls`, `api_seconds`, `wall_seconds`, `wait_seconds` |
+| `trial` | `task`, `split`, `base`, `arm`, `repeat`, `attempt`, `run`, `status`, `accepted`, `failures`, `repairs`, `route` (runner, model, provider, tier, credential, billing, auth_mode, position, requested), `effort`, `requested_effort`, `fingerprints`, `endpoint`, `cache_policy`, `calls`, `tokens_in`, `tokens_out`, `cache_read`, `cache_write`, `cost_usd`, `charged_usd`, `reference_usd`, `reference_unknown_calls`, `api_seconds`, `wall_seconds`, `wait_seconds`, `checks`, `verify`, `hidden_check`, `blocking_findings`, `tool_errors`, `schema_errors` (the last six: repo checks, grader verdict, held out check, blocking review findings, tool results with an error and answers that lack a required key; `blocking_findings` is null when no review ran) |
 | `wait` | `task`, `arm`, `repeat`, `attempt`, `seconds`, `at`; time spent waiting for a run slot, written as it passes so a stop or crash keeps it |
 | `alive` | `run`, `seconds`; written every 10 seconds while a trial runs, so an interrupted trial's `wall_seconds` is its last one |
 | `stop` | `why`, `at` |
@@ -1211,6 +1211,43 @@ Pi launches a second call to restate an answer that lacks its structured output,
 Running the same command again resumes: a `done` trial is not repeated, and an earlier `start` with no `trial` line (a killed process) is settled as interrupted and run again as the next attempt. A `capped` trial runs again as well. With `[replay] dir` set, a trial reads its answers from the first folder holding a `.json` answer of `<dir>/<arm>/<task>/<repeat>`, `<dir>/<arm>/<task>`, `<dir>/<arm>` and `<dir>`, so two arms can be replayed over several repeats, with a failed trial, without a paid call.
 
 The summary reads only the file, so `summary FILE` reproduces the text a run prints at its end byte for byte; `--json` prints the same numbers as one line. Per arm it shows accepted of done trials with a Wilson interval, repairs, calls, tokens, cache, api, wall and wait seconds, and charged and reference cost over every attempt, failed and interrupted ones included, in total and per accepted task. Zero accepted prints "no accepted task" and an unknown reference "unknown". Per split and candidate it shows the pairs where both arms are done, the candidate-only and baseline-only accepts, the difference with its interval (the paired difference plus or minus a normal margin and one pair) and the exact sign test. Only `accept.split` gives a verdict. There is no winner when the pairs are under `max(6, min_pairs)`, when the interval reaches `min_difference` or below and `-min_difference` or above, or when the sign test p exceeds `1 - confidence`. Otherwise a candidate wins when the interval's lower bound is above `min_difference`, and the baseline holds when the upper bound is below `-min_difference`. Several winning candidates are each listed and none is named the winner. Other splits are shown as not deciding.
+
+## Implementation benchmark
+
+`arete benchmark run MANIFEST` compares implementation routes on tasks of different difficulty instead of reading a general leaderboard. It is a recipe on the experiment runner above: the same pairing, limits, slots and resume, with these additions. The same command also measures local endpoints (see the endpoint benchmark); it tells the two apart by the manifest: `[candidates.NAME]` tables are endpoints, `[arms.NAME]` and `[tasks.NAME]` tables are this benchmark. For this benchmark `--out` names the results file. `arete benchmark report FILE [--json]` reads only the results file, and `arete benchmark sample FOLDER` writes a replay fixture; `fixture` stays the endpoint fixture server. The report changes no route, tier or config.
+
+The manifest is an experiment manifest plus:
+
+- `group` on every task, `ordinary` (features and bug fixes) or `difficult` (unfamiliar multi-file changes). Each group is reported apart and has its own recommendation, and needs at least one `holdout` task.
+- `reference` on every task with a `check`: the commit that holds the accepted change.
+- `review = true` at the top (the default) runs the fixed reviewer on each trial; `false` skips it.
+- `[accept] min_difference` is required: the quality margin, declared before any trial runs. `split` is `holdout` and no other value is accepted, so only holdout tasks decide. `atom` defaults to `build`. `repeats` and `[limits]` stay required.
+
+The plan, repair, grader and reviewer steps are fixed for every arm; only the `atom` takes the arm's route.
+
+A task is proven before any trial runs. Its hidden check must pass on `reference` and fail on `base`, each in a clean checkout; the result is a `proof` event in the results file, and a task already proven is not checked again. A check that fails on the reference, or passes on the base, refuses the run with the task named and no trial runs. A mined task with only `verify` steps needs no `reference`, but only when its mined row is `accepted` for this repo and the task as it is now (title, prompt, steps, base and source) equals the task the mining run validated; an edited or copied task is refused. Any other task with only `verify` is refused: add a `check` with hidden files and a `reference`.
+
+An arm whose route has no credential, login or required tool is `unavailable`, with routing's reason, and runs no trial. That is never counted as a quality failure: the report says `unavailable, not judged` for it. The baseline being unavailable refuses the run. `[replay] all = true` sends every call to replay, so every arm is available; leave it out to have routing judge the arms. The check is written as an `availability` event.
+
+Each `trial` line also records `checks` (the repo checks, `pass` or `fail`), `verify` (the grader's verdict, empty with no `verify` steps), `hidden_check`, `blocking_findings` (null when no review ran), `tool_errors`, `schema_errors`, `repairs` and `cost_usd`. The report adds the total cost over every attempt and per accepted task.
+
+A trial is accepted only when its repo checks pass, its hidden check passes, its verify steps pass and the reviewer raised no blocker; `arete experiment` keeps its own rule.
+
+The results file is `benchmarks/<name>.jsonl` under the state folder, or the `--out` path. It holds the experiment events plus `proof` and `availability`.
+
+The quality rule: on the holdout tasks of a group, a candidate wins only when its pairs against the baseline reach `min_pairs` and the lower end of the difference interval is above `min_difference` and the sign test is significant at `confidence`. The report recommends the cheapest winner per accepted task, ties to the larger difference; with no winner it keeps the baseline.
+
+The sample runs end to end on replay with no paid call:
+
+```
+arete benchmark sample /tmp/bench      # prints the [replay] and [[repo]] lines for a scratch config
+arete benchmark run /tmp/bench/benchmark.toml --dry-run
+arete benchmark run /tmp/bench/benchmark.toml
+```
+
+It runs 54 replay trials (three tasks, three arms, six repeats; the fourth arm is unavailable). Expect `strong` to win in `ordinary` over a baseline that fails one task, `cheap` to hold at the baseline on cost alone with no accepted task, `difficult` to keep the baseline, and `absent` to read `unavailable, not judged`.
+
+For real routes, keep the manifest and the tasks in your own config and layer, then bound the run: run `--dry-run` first, set all four `[limits]`, and start small (few tasks, `repeats` at the experiment minimum). A run that reaches a limit stops and exits 3; the same command resumes after you raise it. Tool errors read 0 on replay, since a replay record holds no tool results. Candidate ids, rankings, tariffs and task data belong in the owner's manifest and layer, never in this repository.
 
 ## Retrieval experiments
 

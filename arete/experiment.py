@@ -65,6 +65,9 @@ class Experiment:
     frozen: dict[str, dict]
     design: dict
     digest: str
+    reviews: bool = False
+    checks_required: bool = False
+    skip: frozenset = frozenset()
 
 
 @dataclass
@@ -128,12 +131,12 @@ def content(src: evals.Source, rel: str) -> bytes:
     return link.encode() if link is not None else src.read(rel)
 
 
-def base_commit(repo: config.Repo, name: str, base: str) -> str:
+def base_commit(repo: config.Repo, name: str, base: str, key: str = "base") -> str:
     if not HEX.fullmatch(base):
-        raise Refused(f"tasks.{name}: base {base!r} must be 7 to 40 hex digits of a commit")
+        raise Refused(f"tasks.{name}: {key} {base!r} must be 7 to 40 hex digits of a commit")
     found = util.sh(["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"], cwd=repo.path, timeout=30)
     if found.returncode != 0 or not found.stdout.strip():
-        raise Refused(f"tasks.{name}: base {base} is not a commit in {repo.name}")
+        raise Refused(f"tasks.{name}: {key} {base} is not a commit in {repo.name}")
     return found.stdout.strip()
 
 
@@ -257,7 +260,10 @@ def evidence(task: evals.Task) -> str:
 
 
 def load(path: Path) -> Experiment:
-    data = tomllib.loads(path.read_text())
+    return designed(tomllib.loads(path.read_text()))
+
+
+def designed(data: dict) -> Experiment:
     unknown(data, TOP_KEYS, "the manifest")
     name = text(data, "name")
     if not NAME.fullmatch(name):
@@ -405,6 +411,25 @@ def framed(path: Path) -> tuple[dict, dict | None]:
     return header, result
 
 
+def missing_schema_keys(header: dict, result: dict | None) -> bool:
+    schema = header.get("json_schema")
+    if not schema or not result or not result.get("ok"):
+        return False
+    structured = result.get("structured")
+    return not isinstance(structured, dict) or any(k not in structured for k in schema.get("required") or [])
+
+
+def faults(exp: Experiment, run_id: str) -> dict:
+    tool_errors = schema_errors = 0
+    for file in record.record_files(run_id):
+        header, result = framed(file)
+        if header.get("atom") != exp.atom:
+            continue
+        tool_errors += sum(e.get("kind") == "tool_result" and bool(e.get("error")) for e in record.events(file))
+        schema_errors += missing_schema_keys(header, result)
+    return {"tool_errors": tool_errors, "schema_errors": schema_errors}
+
+
 def usage(exp: Experiment, arm: str, run_id: str) -> dict:
     rows = state.steps(run_id)
     charged = state.paid_by_run([run_id], local_providers=exp.cfg.local_providers).get(run_id, 0.0)
@@ -425,6 +450,7 @@ def usage(exp: Experiment, arm: str, run_id: str) -> dict:
         return (result or {}).get(key) or header.get(key) or (asked.get(key, "") if not launched else "")
 
     return {
+        **faults(exp, run_id),
         "targeted_step": "launched" if launched else "never launched",
         "route": {**{k: seen(k) for k in ("runner", "model", "provider", "tier", "credential", "billing",
                                           "auth_mode")},
@@ -446,7 +472,7 @@ def usage(exp: Experiment, arm: str, run_id: str) -> dict:
 
 
 def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: float, accepted: bool = False,
-               failures: list[str] | None = None, repairs: int = 0) -> dict:
+               failures: list[str] | None = None, repairs: int = 0, outcomes: dict | None = None) -> dict:
     task, arm = begun["task"], begun["arm"]
     used = usage(exp, arm, begun["run"])
     used["wait_seconds"] = round(used["wait_seconds"] + slot_seconds(events(path), begun), 2)
@@ -454,7 +480,7 @@ def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: floa
             "base": exp.tasks[task].base, "arm": arm, "repeat": begun["repeat"], "attempt": begun["attempt"],
             "run": begun["run"], "status": status, "accepted": accepted, "failures": failures or [],
             "repairs": repairs, "fingerprints": exp.design["arms"][arm]["fingerprints"],
-            **used, "wall_seconds": round(wall, 2)}
+            **(outcomes or {}), **used, "wall_seconds": round(wall, 2)}
 
 
 def last_alive(found: list[dict], run_id: str) -> float:
@@ -631,6 +657,7 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
             started = time.monotonic()
             trial = TrialRun(id=run_id, repo=exp.repo, dir=paths.RUNS_DIR / run_id, cfg=exp.cfg, task=task,
                              trial=f"{arm}-{repeat}", step_overrides=trial_overrides(exp, arm), limits=exp.limits,
+                             reviews=exp.reviews, checks_required=exp.checks_required,
                              before=replace(used, seconds=used.seconds + waited))
             trial.dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -647,7 +674,9 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                           summary=stopped_by if stopped_by else "accepted" if result["passed"]
                           else f"not accepted: {util.first_line(result['why'], 200)}")
             append(path, trial_line(exp, path, begun, "capped" if stopped_by else "done", time.monotonic() - started,
-                                    result["passed"] and not stopped_by, failures, result["repairs"]))
+                                    result["passed"] and not stopped_by, failures, result["repairs"],
+                                    {"checks": result["checks"], "verify": result["verify"],
+                                     "hidden_check": result["hidden"], "blocking_findings": result["blocking"]}))
             return stopped_by
     finally:
         held.close()
@@ -656,7 +685,7 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
 def work(exp: Experiment, path: Path) -> int:
     for task, arm, repeat in schedule(exp):
         found = events(path)
-        if (task, arm, repeat) in completed(found):
+        if arm in exp.skip or (task, arm, repeat) in completed(found):
             continue
         used = totals_of(found)
         try:
@@ -700,11 +729,11 @@ def drive(exp: Experiment, path: Path) -> int:
     return code
 
 
-def dry_run(exp: Experiment, path: Path) -> int:
+def plan_lines(exp: Experiment, path: Path, label: str = "experiment") -> list[str]:
     found = events(path)
     check_design(exp, path, found)
     grader, accept = exp.design["grader"], exp.accept
-    out = [f"experiment {exp.name} (design {exp.digest}): atom {exp.atom} on {exp.repo.name}",
+    out = [f"{label} {exp.name} (design {exp.digest}): atom {exp.atom} on {exp.repo.name}",
            f"results file: {paths.short_path(path)}"]
     for name, s in exp.settings.items():
         out.append(f"arm {name}: runner {s.runner}, model {s.model}, effort {s.effort or 'default'}, "
@@ -720,15 +749,15 @@ def dry_run(exp: Experiment, path: Path) -> int:
              f"{max(MIN_PAIRS, accept['min_pairs'])} pairs, a difference above {accept['min_difference']:g} at "
              f"{accept['confidence']:g} confidence"),
             "limits: " + ", ".join(f"{k} {exp.limits[k]:g}" for k in LIMIT_KEYS)]
-    print("\n".join(out))
+    return out
+
+
+def dry_run(exp: Experiment, path: Path) -> int:
+    print("\n".join(plan_lines(exp, path)))
     return 0
 
 
-def run(manifest: Path, out: str = "", dry: bool = False) -> int:
-    exp = load(manifest)
-    path = paths.expand(out) if out else default_path(exp.name)
-    if dry:
-        return dry_run(exp, path)
+def exclusive(exp: Experiment, action) -> int:
     paths.ensure_dirs()
     with util.lock(state.run_lock("experiment", exp.repo.name)) as got:
         if not got:
@@ -736,9 +765,17 @@ def run(manifest: Path, out: str = "", dry: bool = False) -> int:
             return 0
         earlier = signal.signal(signal.SIGTERM, terminate)
         try:
-            return drive(exp, path)
+            return action()
         finally:
             signal.signal(signal.SIGTERM, earlier)
+
+
+def run(manifest: Path, out: str = "", dry: bool = False) -> int:
+    exp = load(manifest)
+    path = paths.expand(out) if out else default_path(exp.name)
+    if dry:
+        return dry_run(exp, path)
+    return exclusive(exp, lambda: drive(exp, path))
 
 
 def wilson(k: int, n: int, confidence: float) -> list[float] | None:

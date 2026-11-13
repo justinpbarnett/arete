@@ -1440,6 +1440,12 @@ def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why:
                   "VALUES (?,?,?,?,?,?,?,?)", (pr_url, repo, issue, run_id, status, why, task, util.iso()))
 
 
+def mined_row(pr_url: str) -> dict:
+    with db() as c:
+        row = c.execute("SELECT * FROM mined WHERE pr_url = ?", (pr_url,)).fetchone()
+    return dict(row) if row else {}
+
+
 def mined_urls() -> set[str]:
     with db() as c:
         return {r["pr_url"] for r in c.execute("SELECT pr_url FROM mined")}
