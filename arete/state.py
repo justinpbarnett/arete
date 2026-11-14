@@ -405,7 +405,18 @@ CREATE TABLE IF NOT EXISTS incidents (
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     count INTEGER DEFAULT 1,
-    evidence TEXT DEFAULT ''
+    evidence TEXT DEFAULT '',
+    decision TEXT DEFAULT '',
+    confidence REAL DEFAULT 0,
+    reason TEXT DEFAULT '',
+    answers TEXT DEFAULT '',
+    injection INTEGER DEFAULT 0,
+    decided TEXT DEFAULT '',
+    tries INTEGER DEFAULT 0,
+    retry_at TEXT DEFAULT '',
+    decided_count INTEGER DEFAULT 0,
+    shapes TEXT DEFAULT '',
+    policies TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -415,6 +426,11 @@ CREATE TABLE IF NOT EXISTS incident_notes (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS incident_notes_incident ON incident_notes (incident, id);
+CREATE TABLE IF NOT EXISTS incident_aliases (
+    fingerprint TEXT PRIMARY KEY,
+    incident INTEGER NOT NULL,
+    ts TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS asks (
     id TEXT PRIMARY KEY,
     run TEXT NOT NULL,
@@ -465,7 +481,12 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
                   ("effort", "TEXT DEFAULT ''"), ("tier", "TEXT DEFAULT ''"), ("try", "INTEGER DEFAULT 0"),
                   ("kind", "TEXT DEFAULT ''"), ("cache_read", "INTEGER DEFAULT 0"), ("cache_write", "INTEGER DEFAULT 0"),
-                  ("api_seconds", "REAL DEFAULT 0"), ("auth_mode", "TEXT DEFAULT ''"))]]
+                  ("api_seconds", "REAL DEFAULT 0"), ("auth_mode", "TEXT DEFAULT ''"))],
+              *[("incidents", col, f"ALTER TABLE incidents ADD COLUMN {col} {kind}") for col, kind in (
+                  ("decision", "TEXT DEFAULT ''"), ("confidence", "REAL DEFAULT 0"), ("reason", "TEXT DEFAULT ''"),
+                  ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
+                  ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
+                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"))]]
 
 
 @contextmanager
@@ -789,22 +810,25 @@ def prune(days: float = 14) -> None:
         c.execute("DELETE FROM incident_notes WHERE ts < ?", (since,))
         c.execute("DELETE FROM incident_notes WHERE incident IN (SELECT id FROM incidents WHERE last_seen < ?)", (old,))
         c.execute("DELETE FROM incidents WHERE last_seen < ?", (old,))
+        c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
 
 
 def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signature: str, count: int,
-                   evidence: str) -> tuple[int, bool]:
+                   evidence: str, policies: str) -> tuple[int, bool]:
     now = util.iso()
-    row = c.execute("SELECT id, count FROM incidents WHERE fingerprint = ? AND state = 'open'",
-                    (fingerprint,)).fetchone()
+    row = c.execute("SELECT id, count FROM incidents WHERE state = 'open' AND (fingerprint = ? OR id IN "
+                    "(SELECT incident FROM incident_aliases WHERE fingerprint = ?)) ORDER BY fingerprint = ? DESC "
+                    "LIMIT 1", (fingerprint, fingerprint, fingerprint)).fetchone()
     if row:
-        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ? WHERE id = ?",
-                  (count, now, evidence, row["id"]))
+        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ?, "
+                  "policies = COALESCE(policies, ?) WHERE id = ?", (count, now, evidence, policies, row["id"]))
         note = f"seen again: {count} more from {source}, {row['count'] + count} in all"
         opened, incident_id = False, row["id"]
     else:
         incident_id = c.execute("INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, "
-                                "last_seen, count, evidence) VALUES (?,?,?,?,?,?,?,?,?)",
-                                (fingerprint, kind, source, repo, signature, now, now, count, evidence)).lastrowid
+                                "last_seen, count, evidence, policies) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                (fingerprint, kind, source, repo, signature, now, now, count, evidence,
+                                 policies)).lastrowid
         note, opened = f"opened: {kind}, {count} from {source}", True
     c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, now, note))
     return incident_id, opened
@@ -815,9 +839,24 @@ def record_incident(*args) -> tuple[int, bool]:
         return write_incident(c, *args)
 
 
-def commit_scan(incident_rows: list[tuple], cursor_rows: list[tuple[str, str, bool, str]]) -> list[bool]:
+def commit_scan(incident_rows: list[tuple], cursor_rows: list[tuple[str, str, bool, str]],
+                aliases=(), marks=None) -> list[bool]:
     with db() as c:
-        opened = [write_incident(c, *row)[1] for row in incident_rows]
+        for fingerprint, incident_id, note in aliases:
+            c.execute("INSERT OR REPLACE INTO incident_aliases (fingerprint, incident, ts) VALUES (?,?,?)",
+                      (fingerprint, incident_id, util.iso()))
+            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
+                      (incident_id, util.iso(), note))
+        opened = []
+        for row in incident_rows:
+            incident_id, new = write_incident(c, *row)
+            opened.append(new)
+            if new and row[0] in (marks or {}):
+                fields, note = marks[row[0]]
+                c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+                          (*fields.values(), incident_id))
+                c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
+                          (incident_id, util.iso(), note))
         for source, value, ok, detail in cursor_rows:
             c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
                       (source, value, util.iso(), int(ok), detail[:500]))
@@ -829,10 +868,47 @@ def add_incident_note(incident_id: int, note: str) -> None:
         c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, util.iso(), note))
 
 
+def open_incidents(limit: int = 500) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' "
+                                           "ORDER BY last_seen DESC, id DESC LIMIT ?", (limit,))]
+
+
+def incidents_to_decide() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM incidents WHERE state = 'open' AND injection = 0 AND class != 'expected' "
+            "AND decision IN ('', 'ignore') ORDER BY id")]
+
+
+def known_fingerprints() -> dict[str, dict]:
+    with db() as c:
+        held = {r[0]: {"source": r[1], "repo": r[2], "policies": r[3]} for r in c.execute(
+            "SELECT a.fingerprint, i.source, i.repo, i.policies FROM incident_aliases a JOIN incidents i "
+            "ON i.id = a.incident WHERE i.state = 'open'")}
+        held.update((r[0], {"source": r[1], "repo": r[2], "policies": r[3]}) for r in c.execute(
+            "SELECT fingerprint, source, repo, policies FROM incidents WHERE state = 'open'"))
+        return held
+
+
+def update_incident(incident_id: int, note: str = "", **fields) -> None:
+    with db() as c:
+        if fields:
+            c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+                      (*fields.values(), incident_id))
+        if note:
+            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
+                      (incident_id, util.iso(), note))
+
+
+def parsed(row: dict) -> dict:
+    return {**row, "answers": json.loads(row["answers"] or "{}")}
+
+
 def incidents(connect=db, limit: int = 200) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM incidents ORDER BY last_seen DESC, id DESC LIMIT ?",
-                                           (limit,))]
+        return [parsed(dict(r)) for r in c.execute("SELECT * FROM incidents ORDER BY last_seen DESC, id DESC "
+                                                   "LIMIT ?", (limit,))]
 
 
 def incident(incident_id: int, connect=db) -> dict | None:
@@ -841,7 +917,7 @@ def incident(incident_id: int, connect=db) -> dict | None:
         if not r:
             return None
         notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
-        return {**dict(r), "notes": [dict(n) for n in notes]}
+        return {**parsed(dict(r)), "notes": [dict(n) for n in notes]}
 
 
 def add_metric(name: str, value: float, loop: str = "", run_id: str = "") -> None:
