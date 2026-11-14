@@ -589,9 +589,20 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                   ("closed", "TEXT DEFAULT ''"))]]
 
 
+def refuse_empty_file() -> None:
+    if paths.ISOLATED or (paths.DB_FILE.exists() and paths.DB_FILE.stat().st_size > 0):
+        return
+    from . import backup
+
+    if newest := backup.newest_snapshot():
+        raise RuntimeError(f"{paths.DB_FILE} is missing or empty but {newest} exists; stop arete serve and run "
+                           f"`arete backup --restore {newest}` instead of starting over with an empty file")
+
+
 @contextmanager
 def db():
     paths.ensure_dirs()
+    refuse_empty_file()
     conn = paths.connect_db(paths.DB_FILE)
     try:
         conn.row_factory = sqlite3.Row

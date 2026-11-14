@@ -403,9 +403,47 @@ def read_json(p: Path, default):
         return default
 
 
-def write_json(p: Path, data) -> None:
+def flush_fd(fd: int) -> None:
+    if hasattr(fcntl, "F_FULLFSYNC"):
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    else:
+        os.fsync(fd)
+
+
+def flush_file(p: Path) -> None:
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        flush_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def flush_folder(folder: Path) -> None:
+    fd = os.open(folder, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_durably(p: Path, data: bytes, mode: int | None = None, check=None) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps(data, indent=2, default=str))
-    os.replace(tmp, p)
+    draft = Path(tmp)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), mode if mode is not None else 0o644)
+            f.write(data)
+            f.flush()
+            if check:
+                check(draft)
+            flush_fd(f.fileno())
+        os.replace(draft, p)
+    except BaseException:
+        draft.unlink(missing_ok=True)
+        raise
+    flush_folder(p.parent)
+
+
+def write_json(p: Path, data) -> None:
+    write_durably(p, json.dumps(data, indent=2, default=str).encode(), 0o600)

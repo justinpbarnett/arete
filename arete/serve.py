@@ -10,9 +10,11 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import NoReturn
 
 from . import (
+    backup,
     capture,
     chat,
     config,
@@ -173,6 +175,13 @@ class Server:
         self.beat(every_loop, live)
 
     def prune(self) -> None:
+        try:
+            made = backup.snapshot("prune")
+        except Exception as e:
+            self.say(f"backup failed, so nothing was pruned: {type(e).__name__}: {util.first_line(str(e), 300)}")
+            return
+        if made:
+            self.copy_off_machine(made)
         state.prune(keep_days=self.cfg.oncall.keep_days)
         limits = self.cfg.retention
         try:
@@ -187,6 +196,19 @@ class Server:
         if found.over:
             self.say(f"records: {record.size_text(found.left_bytes)} is over max_gb {limits.max_gb:g}; every record "
                      "left is pinned, cited by a pending proposal, running or written in the last hour")
+
+    def copy_off_machine(self, made: Path) -> None:
+        try:
+            copying = backup.daily_copy(made, self.cfg.backup.copy_to, self.pool.submit)
+        except Exception as e:
+            self.say(f"backup copy not started: {type(e).__name__}: {util.first_line(str(e), 300)}")
+            return
+        if copying:
+            copying.add_done_callback(self.copy_finished)
+
+    def copy_finished(self, done: Future) -> None:
+        if failure := done.exception() or done.result():
+            self.say(f"backup copy failed: {failure}")
 
     def schedule(self, loop: Loop, st: dict, now: datetime) -> None:
         t = loop.trigger

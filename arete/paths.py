@@ -218,6 +218,12 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 PI_KEYS_FILE = (CONFIG_DIR if SCRATCH_CONFIG or not ISOLATED else NOWHERE) / "pi.env"
 EVENTS_FILE = STATE_DIR / "events.jsonl"
 DB_FILE = STATE_DIR / "arete.db"
+
+
+def backups_dir() -> Path:
+    return DB_FILE.parent / "backups"
+
+
 RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))

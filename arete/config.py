@@ -47,6 +47,7 @@ REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle", "expire_days", "remind_hours", "push_contact")
 MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb")
+BACKUP_KEYS = ("copy_to",)
 CHAT_KEYS = ("context_tokens", "summary_model", "max_sessions", "budget_usd")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
@@ -161,6 +162,11 @@ class Retention:
 
 
 @dataclass(frozen=True)
+class BackupConfig:
+    copy_to: str = ""
+
+
+@dataclass(frozen=True)
 class ChatConfig:
     context_tokens: int = 40_000
     summary_model: str = "haiku"
@@ -263,6 +269,7 @@ class Config:
     research_search_share: float = 0.6
     ask: AskConfig = field(default_factory=AskConfig)
     retention: Retention = field(default_factory=Retention)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     document: dict = field(default_factory=dict)
     capture_vision: str = ""
@@ -559,6 +566,16 @@ def retention_table(data) -> Retention:
             raise ValueError(f"[retention] {key} must be a number above 0, not {value!r}")
         found[key] = value
     return Retention(**found)
+
+
+def backup_table(data) -> BackupConfig:
+    table = table_of(data, "backup")
+    if bad := sorted(set(table) - set(BACKUP_KEYS)):
+        raise ValueError(f"[backup]: unknown key {', '.join(bad)}; use {', '.join(BACKUP_KEYS)}")
+    copy_to = table.get("copy_to", BackupConfig.copy_to)
+    if not isinstance(copy_to, str) or copy_to != copy_to.strip() or copy_to.startswith("-"):
+        raise ValueError(f"[backup] copy_to must be an rsync destination without surrounding spaces, not {copy_to!r}")
+    return BackupConfig(copy_to=copy_to)
 
 
 def chat_table(data) -> ChatConfig:
@@ -937,6 +954,7 @@ def load(path: Path | None = None) -> Config:
     cfg.research_search_share = research["search_share"]
     cfg.ask = ask_table(data.get("ask") or {})
     cfg.retention = retention_table(data.get("retention") or {})
+    cfg.backup = backup_table(data.get("backup") or {})
     cfg.chat = chat_table(data.get("chat") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)

@@ -299,6 +299,12 @@ def cmd_heartbeat(args) -> int:
     return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
 
 
+def cmd_backup(args) -> int:
+    from . import backup
+
+    return backup.command(args.check, args.restore)
+
+
 def cmd_oncall(args) -> int:
     from . import control, oncall, state
 
@@ -1698,6 +1704,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force-probes", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_heartbeat)
+
+    p = sub.add_parser("backup", help="snapshot arete.db, check the newest snapshot, or restore one with serve stopped")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="check the newest snapshot and compare its row counts with the live file")
+    mode.add_argument("--restore", metavar="FILE", help="replace arete.db with a snapshot; refused while serve or a run is live")
+    p.set_defaults(fn=cmd_backup)
 
     p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
     p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan", "cancel", "dismiss", "retry", "off", "on"))

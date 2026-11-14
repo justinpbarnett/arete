@@ -76,20 +76,16 @@ def replace_config(text: str, wanted_limits: dict[str, int], wanted_models: dict
 
 
 def write_checked(text: str, refusal) -> None:
-    draft = paths.CONFIG_FILE.with_suffix(".toml.tmp")
+    def check(draft):
+        try:
+            cfg = config.load(draft)
+        except Exception as e:
+            raise Refused(f"The new config would not load ({util.first_line(str(e), 120)}), so config.toml is unchanged.") from e
+        if why := refusal(cfg):
+            raise Refused(why)
+
     mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
-    draft.touch(mode=mode)
-    draft.chmod(mode)
-    draft.write_text(text)
-    try:
-        cfg = config.load(draft)
-    except Exception as e:
-        draft.unlink()
-        raise Refused(f"The new config would not load ({util.first_line(str(e), 120)}), so config.toml is unchanged.") from e
-    if why := refusal(cfg):
-        draft.unlink()
-        raise Refused(why)
-    draft.replace(paths.CONFIG_FILE)
+    util.write_durably(paths.CONFIG_FILE, text.encode(), mode, check)
 
 
 def set_key(lines: list[str], table: str | None, key: str, value: str) -> None:

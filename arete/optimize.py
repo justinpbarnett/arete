@@ -549,12 +549,7 @@ def held_table(data: dict, table: str) -> dict:
 
 
 def put(data: bytes) -> None:
-    draft = paths.CONFIG_FILE.with_suffix(".toml.tmp")
-    mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
-    draft.touch(mode=mode)
-    draft.chmod(mode)
-    draft.write_bytes(data)
-    draft.replace(paths.CONFIG_FILE)
+    util.write_durably(paths.CONFIG_FILE, data, stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode))
 
 
 def restored(before: bytes, saved: Path) -> str:
