@@ -57,6 +57,15 @@ from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
 MAX_DIFF_IN_PROMPT = 60_000
+MAX_FIX_DIFF_IN_PROMPT = 20_000
+BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
+UNWAIVABLE = ("security", "data_loss")
+EARLIER_STATUSES = ("fixed", "open", "waived")
+NOTE_SEVERITIES = ("major", "minor")
+NO_FIX_REPLY = "The builder gave no reply."
+MAX_FIX_REPLY_IN_PROMPT = 4000
+NO_FIX_DIFF = "Arete could not read what changed; judge the diff above."
+REFUSAL_WORDS = re.compile(r"guard|jev|credential|secret|confine|authority", re.IGNORECASE)
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
@@ -115,7 +124,6 @@ PLAN_SCHEMA = {
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
-        "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
         "summary": {"type": "string"},
         "changes": {"type": "string"},
         "problems": {
@@ -126,12 +134,25 @@ REVIEW_SCHEMA = {
                     "file": {"type": "string"},
                     "problem": {"type": "string"},
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                    "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
                 },
                 "required": ["problem", "severity"],
             },
         },
+        "earlier": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "status": {"type": "string", "enum": list(EARLIER_STATUSES)},
+                    "why": {"type": "string"},
+                },
+                "required": ["id", "status", "why"],
+            },
+        },
     },
-    "required": ["verdict", "summary", "problems"],
+    "required": ["summary", "problems"],
 }
 LEARN_SCHEMA = {
     "type": "object",
@@ -273,8 +294,14 @@ class AgentRun:
         if self.writes_lines:
             lines.write(self.id, event, **fields)
 
+    @contextmanager
     def waiting(self, cause: str):
-        return lines.waiting(self.id, cause) if self.writes_lines else nullcontext()
+        with ExitStack() as stack:
+            if self.budget is not None:
+                stack.enter_context(self.budget.idling(cause))
+            if self.writes_lines:
+                stack.enter_context(lines.waiting(self.id, cause))
+            yield
 
     def save(self, name: str, data) -> None:
         p = self.dir / name
@@ -408,6 +435,7 @@ class Run(AgentRun):
     workspace: tuple[Path, list[Checkout]] | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
+    base_note: str = ""
 
     @property
     def ref(self) -> str:
@@ -430,7 +458,7 @@ class Run(AgentRun):
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
         if due and kw["resume"].id and not res.ok and asks.session_gone(res.error):
             self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
-            res = super().agent(step, f"{plain}\n\n{asks.fresh_note(due)}", cwd, role, ask_owner=True,
+            res = super().agent(step, self.fresh_text(plain, due), cwd, role, ask_owner=True,
                                 **{**kw, "resume": NO_SESSION})
         if due and res.ok:
             state.asks_taken([a["id"] for a in due], self.id)
@@ -447,11 +475,15 @@ class Run(AgentRun):
         here = [a for a in self.answers_due if a["step"] == seam]
         return [a for a in here if a["call"] == call] or here
 
+    def fresh_text(self, text: str, due: list[dict]) -> str:
+        return "\n\n".join(part for part in (text, asks.fresh_note(due), self.base_note) if part)
+
     def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
-        fresh = f"{text}\n\n{asks.fresh_note(due)}"
+        fresh = self.fresh_text(text, due)
         if session.id and kw.get("persist", True):
-            return asks.answers_message(due), {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
+            message = "\n\n".join(part for part in (asks.answers_message(due), self.base_note) if part)
+            return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
         return fresh, {**kw, "resume": NO_SESSION}
 
     def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
@@ -1583,7 +1615,7 @@ def round_name(name: str, n: int) -> str:
 
 
 def review_findings(review: dict) -> str:
-    return "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
+    return "" if review.get("failed") else numbered(blocking(review))
 
 
 def repaired_by(run_id: str) -> str:
@@ -1593,8 +1625,12 @@ def repaired_by(run_id: str) -> str:
 def report_review(review: dict) -> dict:
     return {"verdict": str(review.get("verdict") or ""), "summary": str(review.get("summary") or ""),
             "unresolved": review.get("verdict") == "request_changes",
-            "problems": [{"file": p["file"], "text": p["problem"], "severity": p["severity"]}
-                         for p in review_problems(review.get("problems"))]}
+            "problems": reported(blocking(review)), "notes": reported(review_notes(review))}
+
+
+def reported(listed: list[dict]) -> list[dict]:
+    return [{"file": p["file"], "text": p["problem"], "severity": p["severity"], "category": p.get("category") or ""}
+            for p in listed]
 
 
 def note_review(run: Run, review: dict, verified: verify.Verified) -> None:
@@ -1845,16 +1881,18 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
 
     verified = verify_in_use(b, goal, build_summary)
     reviews, n = max(1, run.settings("review").tries), 1
-    review = _review(b, plan_to_review, verified)
+    review, reply = _review(b, plan_to_review, verified), ""
     note_review(run, review, verified)
     while review.get("verdict") == "request_changes" and n < reviews:
         if problems := review_findings(review):
             run.story.append(f"Review requested changes:\n{problems}")
-            b.resume(round_name("review_fix", n), prompt("review_fix", problems=problems), role="review_repair")
+            reply = b.resume(round_name("review_fix", n),
+                             prompt("review_fix", problems=problems, notes=notes_text(review)),
+                             role="review_repair").text
             b.recheck("the review fixes")
             verified = verify_in_use(b, goal, build_summary)
         n += 1
-        review = _review(b, plan_to_review, verified, round_name("review", n))
+        review = _review(b, plan_to_review, verified, round_name("review", n), review, reply)
         note_review(run, review, verified)
     draft_why = draft_reason(review, verified, n)
     note_review(run, review, verified)
@@ -1961,7 +1999,6 @@ def summary_of(review: dict, build_summary: str) -> str:
 def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
                 size: str, held: str = "", written: str = "") -> str:
-    problems = review.get("problems", [])
     return public_text(run, (
         f"## Summary\n\n{written or summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
@@ -1969,7 +2006,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
         + assumed_block(run)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
-        + "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems)
+        + review_lists(review)
         + (f"\n\nHeld as a draft: {held}." if held else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else
@@ -2329,20 +2366,70 @@ def note_fresh_bases(checkouts: list[Checkout]) -> None:
             c.base_commit = git(["rev-parse", c.origin_base if c.onto else "HEAD"], c.wt).strip()
 
 
-def settle_starts(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
-                  branch: str) -> None:
-    moved = [c for c in checkouts if c.kept]
+def note_kept_head(c: Checkout) -> None:
+    c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
+
+
+def commit_edits_before_merge(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer,
+                              committed: Callable[[Checkout], None] = lambda c: None) -> None:
     try:
-        for c in moved:
+        for c in checkouts:
             drop_untracked_bytecode(c.wt)
             if uncommitted(c.wt):
                 commit_kept(run.id, c, layer)
-                c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
+                committed(c)
                 if left := uncommitted(c.wt):
                     raise RunFailed(f"{c.github} holds edits to protected paths that arete does not keep "
                                     f"({', '.join(left[:5])}), so it merged nothing into them and left them as they are")
     except RuntimeError as e:
         raise RunFailed(f"the commit of the kept edits failed, so arete merged nothing into them: {e}") from e
+
+
+class ConflictUnresolved(RunFailed):
+    def __init__(self, why: str, detail: str, paths: list[str]):
+        super().__init__(why, detail)
+        self.paths = paths
+
+
+def merge_base_into_kept(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer,
+                         ticket: tracker.Ticket) -> list[Checkout]:
+    merged = []
+    for c in checkouts:
+        try:
+            fetch(c.src, c.base)
+        except RuntimeError as e:
+            run.log(f"could not fetch `{c.origin_base}` in {c.github}, so the step resumes on the base it has: {e}")
+            continue
+        try:
+            commit_edits_before_merge(run, [c], layer)
+            merged += merge_moved_bases(run, [c], layer, ticket,
+                                        reason="since the base moved while the run waited for its answer")
+        except RunFailed as e:
+            files = f" in {', '.join(e.paths)}" if isinstance(e, ConflictUnresolved) else ""
+            raise RunFailed(f"merging `{c.origin_base}` into the edits kept in {c.github} failed{files}: {e.why}. "
+                            f"The worktree is back at the kept commit and the answers are kept, so "
+                            f"`arete resume {run.id}` continues with them", e.detail) from e
+    for c in merged:
+        if not c.resumes:
+            c.onto = c.base_commit
+    return merged
+
+
+def base_merge_note(merged: list[Checkout]) -> str:
+    if not merged:
+        return ""
+    names = ", ".join(f"`{c.origin_base}` into `{c.prefix or './'}`" for c in merged)
+    fixed = "".join(f" Arete resolved merge conflicts in {', '.join(f'`{p}`' for p in c.resolved)} of "
+                    f"`{c.prefix or './'}`." for c in merged if c.resolved)
+    return (f"Before this step arete merged {names}, since the base moved while the run waited for the owner's "
+            f"answer.{fixed} The worktree now holds the base's changes, so read a file again before relying on what "
+            "it held.")
+
+
+def settle_starts(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
+                  branch: str) -> None:
+    moved = [c for c in checkouts if c.kept]
+    commit_edits_before_merge(run, moved, layer, note_kept_head)
     try:
         for c in moved:
             git(["reset", "-q", "--hard", start_of(c, branch)], c.wt)
@@ -2383,7 +2470,7 @@ def merge_as_run(run_id: str, c: Checkout, commit: str, named: str) -> None:
 
 
 def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
-                      log_prefix: str = "") -> list[Checkout]:
+                      log_prefix: str = "", reason: str = "since the base moved after the last push") -> list[Checkout]:
     merged = []
     for c in checkouts:
         c.base_commit = git(["rev-parse", c.origin_base], c.wt).strip()
@@ -2403,7 +2490,10 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
                     if not conflicts:
                         raise RunFailed(f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}")
                     rec["conflicts"] = conflicts
-                    resolve_conflicts(run, c, conflicts, layer, ticket)
+                    try:
+                        resolve_conflicts(run, c, conflicts, layer, ticket)
+                    except RunFailed as e:
+                        raise ConflictUnresolved(e.why, e.detail, conflicts) from e
                 else:
                     conflicts = []
                 rec["outcome"] = "resolved" if conflicts else "clean"
@@ -2415,7 +2505,7 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
         c.resolved_lines = resolution_diff(c).lines
         run.log(f"{log_prefix}merged `{c.origin_base}` into the branch in {c.github}, "
                 + (f"and resolved conflicts in {', '.join(conflicts)}" if conflicts
-                   else "since the base moved after the last push"))
+                   else reason))
         merged.append(c)
     return merged
 
@@ -2644,23 +2734,115 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch
     return "pr", "answered the review without code changes", urls
 
 
-def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review") -> dict:
-    t = b.ticket
+def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: dict | None = None,
+            reply: str = "") -> dict:
+    t, before = b.ticket, before or {}
+    earlier = blocking(before)
     res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
-                                   diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT)),
+                                   diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT),
+                                   earlier=earlier_review(earlier, reply,
+                                                          fixed_since(b, before.get("trees") or {}))),
                       b.ws, role="review", allowed_tools=bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA)
-    if not res.ok or not isinstance(res.structured, dict):
-        return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
-    return {**res.structured, "problems": review_problems(res.structured.get("problems"))}
+    if not res.ok or not isinstance(res.structured, dict) or not isinstance(res.structured.get("problems"), list):
+        return {"verdict": "request_changes", "summary": "review step failed", "problems": [], "failed": True,
+                "earlier": [{**p, "id": f"B{n}", "status": "open", "why": "the review step failed"}
+                            for n, p in enumerate(earlier, 1)],
+                "waived": before.get("waived") or [], "trees": before.get("trees") or {}}
+    return judged(res.structured, earlier, before.get("waived") or [], index_trees(b.checkouts))
+
+
+def judged(said: dict, earlier: list[dict], waived: list[dict], trees: dict) -> dict:
+    answered = settled(earlier, said.get("earlier"))
+    found = {**said, "problems": review_problems(said.get("problems")), "earlier": answered, "trees": trees,
+             "waived": waived + [e for e in answered if e["status"] == "waived"]}
+    return {**found, "verdict": "request_changes" if blocking(found) else "approve"}
+
+
+def settled(earlier: list[dict], answers) -> list[dict]:
+    said = ({str(a.get("id") or "").strip().upper(): a for a in answers if isinstance(a, dict)}
+            if isinstance(answers, list) else {})
+    out = []
+    for n, p in enumerate(earlier, 1):
+        answer = said.get(f"B{n}", {})
+        status = answer.get("status") if answer.get("status") in EARLIER_STATUSES else "open"
+        if status == "waived" and (p.get("category") or "") in (*UNWAIVABLE, ""):
+            status = "open"
+        out.append({**p, "id": f"B{n}", "status": status, "why": str(answer.get("why") or "")})
+    return out
+
+
+def stored_before_blockers(review: dict) -> bool:
+    return "earlier" not in review and review.get("verdict") == "request_changes"
+
+
+def is_note(review: dict, p: dict) -> bool:
+    return p["severity"] in NOTE_SEVERITIES and not stored_before_blockers(review)
+
+
+def blocking(review: dict) -> list[dict]:
+    return ([p for p in review_problems(review.get("problems")) if not is_note(review, p)]
+            + [e for e in review.get("earlier") or [] if e.get("status") == "open"])
+
+
+def review_notes(review: dict) -> list[dict]:
+    return [p for p in review_problems(review.get("problems")) if is_note(review, p)]
+
+
+def numbered(listed: list[dict]) -> str:
+    return "\n".join(f"- B{n} [{p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
+                     for n, p in enumerate(listed, 1))
+
+
+def notes_text(review: dict) -> str:
+    return "\n".join(f"- [{p['severity']}] {p['file']}: {p['problem']}" for p in review_notes(review)) or "None."
+
+
+def review_lists(review: dict) -> str:
+    notes = ([f"[{p['severity']}] {p['file']}: {p['problem']}" for p in review_notes(review)]
+             + [f"[waived {p.get('category') or 'blocker'}] {p.get('file', '')}: {p['problem']} ({p['why']})"
+                for p in review.get("waived") or []])
+    return ("".join(f"\n- [blocker, {p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
+                    for p in blocking(review))
+            + ("\n\n### Review notes (not blocking)\n" + "".join(f"\n- {n}" for n in notes) if notes else ""))
+
+
+def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
+    if not earlier:
+        return ""
+    return prompt("review_earlier", blockers=numbered(earlier), reply=util.tail(reply.strip(), MAX_FIX_REPLY_IN_PROMPT) or NO_FIX_REPLY,
+                  fixed=fixed or NO_FIX_DIFF)
+
+
+def index_trees(checkouts: list[Checkout]) -> dict[str, str]:
+    try:
+        return {c.prefix: git(["write-tree"], c.wt).strip() for c in checkouts}
+    except RuntimeError:
+        return {}
+
+
+def fixed_since(b: Build, trees: dict[str, str]) -> str:
+    parts = []
+    for c in b.checkouts:
+        if not trees.get(c.prefix):
+            continue
+        try:
+            parts.append(checkout_patch(c, [n for n in b.staged.locks if n.startswith(c.prefix)], "--cached",
+                                        trees[c.prefix]))
+        except RuntimeError:
+            continue
+    return util.tail("".join(parts), MAX_FIX_DIFF_IN_PROMPT)
 
 
 def review_problems(listed) -> list[dict]:
     if not isinstance(listed, list):
         return []
-    return [{"file": p.get("file") or "", "problem": p.get("problem") or "", "severity": p.get("severity") or "unrated"}
+    return [{"file": p.get("file") or "", "problem": p.get("problem") or "",
+             "severity": str(p.get("severity") or "unrated").strip().lower(),
+             "category": str(p.get("category") or "").strip().lower()
+             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else ""}
             for p in listed if isinstance(p, dict)]
 
 
@@ -2756,6 +2938,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                blocked_by=util.first_line(str(e), 300))
     except verify.ServerError as e:
         run.log(f"{step}: the app did not start")
+        if fault := verify.environment_fault(str(e)):
+            return verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
+                                   blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
+                                              "the start log stays in the run folder", finished=False)
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
@@ -2835,13 +3021,19 @@ def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[st
 
 
 def draft_reason(review: dict, verified: verify.Verified, reviews: int = 0) -> str:
-    if verified.verdict == "blocked":
+    approved = review.get("verdict") == "approve"
+    refused = REFUSAL_WORDS.search(f"{verified.blocked_by} {verified.summary}")
+    if verified.verdict == "blocked" and (not approved or refused):
         return "the check in use was blocked"
-    if review.get("verdict") == "approve":
+    if approved:
         return ""
     if review.get("verdict") == "request_changes" and reviews:
+        left = len(blocking(review))
+        if review.get("failed"):
+            return (f"the last review failed after {util.count(reviews, 'review')}, with {util.count(left, 'earlier blocker')} "
+                    f"not rechecked")
         return (f"the review still requested changes after {util.count(reviews, 'review')}, the most the review "
-                f"step's tries allow, so {util.count(len(review.get('problems', [])), 'finding')} stay unresolved")
+                f"step's tries allow, so {util.count(left, 'blocker')} {'is' if left == 1 else 'are'} left unresolved")
     return "the review did not approve it"
 
 
