@@ -1627,6 +1627,257 @@ print("RESULT" + json.dumps(out))
             config.research_table({"planner": True, "synthesis": True})
 
 
+class StagedResearchAuditTests(unittest.TestCase):
+    SCRIPT = r'''
+import json, os, sys, time
+from pathlib import Path
+from arete import config, paths, research, research_audit, runner, steps
+root = Path(sys.argv[1])
+replay = root / "replay"
+paths.ensure_dirs()
+calls = []
+real = runner.run
+def spy(*args, **kwargs):
+    calls.append([kwargs["trace"][1], list(kwargs.get("tools") or []), list(kwargs.get("allowed_tools") or [])])
+    return real(*args, **kwargs)
+runner.run = spy
+def put(name, structured, cost=0):
+    (replay / f"{name}.json").write_text(json.dumps({"structured": structured, "cost_usd": cost}))
+OLD = "As of March 2021 the limit is 10 requests per second."
+NEW = "The limit was raised to 20 requests per second in June 2025."
+BETA = "Customers reported occasional throttling during the beta."
+def src(url, published, passage):
+    return {"question": "What is the limit?", "url": url, "title": "Page", "published": published,
+            "event_date": "", "passage": passage, "uncertainty": "none"}
+def task(goal):
+    return {"goal": goal, "queries": ["general terms"], "max_sources": 3}
+def concl(claim, sid, critical=False):
+    return {"claim": claim, "sources": [sid], "critical": critical}
+def chk(c, verdict, sources, quote="", note="", correction=""):
+    return {"claim": c, "verdict": verdict, "sources": sources, "quote": quote, "fetched": [], "note": note,
+            "correction": correction}
+def batch1(c3_quote=BETA):
+    return {"checks": [
+        chk("C1", "contradicted", ["S1", "S2"], NEW, "The 2021 page is outdated and the June 2025 page states 20.",
+            "The limit was 10 requests per second as of March 2021, and a June 2025 page states 20 [S1] [S2]."),
+        chk("C2", "unverifiable", ["S3"], "", "The passage reports throttling during the beta and says nothing of a fix."),
+        chk("C3", "supported", ["S3"], c3_quote),
+        chk("C4", "inference", ["S2"], "", "The page states one raise and announces no further one."),
+        chk("C5", "supported", ["S2"], NEW)],
+        "disagreements": [{"issue": "The 2021 page states 10 requests per second and the 2025 page states 20.",
+                           "sources": ["S1", "S2"]}]}
+BATCH2 = {"checks": [chk("C6", "supported", ["S2"], NEW)], "disagreements": []}
+def seed(ref, synthesis=None):
+    put(f"research-{ref}-plan", {"needs_search": True, "covered_by": [], "questions": ["What is the limit?"],
+        "tasks": [task("one"), task("two"), task("three")], "source_criteria": ["primary"],
+        "claims": ["The limit is known"]})
+    put(f"research-{ref}-task-1-search", {"sources": [src("https://example.org/old", "2021-03-01", OLD),
+                                                      src("https://example.net/new", "2025-06-01", NEW)], "notes": ""})
+    put(f"research-{ref}-task-2-search", {"sources": [], "notes": ""})
+    put(f"research-{ref}-task-3-search", {"sources": [src("https://example.com/beta", "2024-11-05", BETA)], "notes": ""})
+    put(f"research-{ref}-synthesis", synthesis or {"summary": "The limit is 10 requests per second.", "name": "",
+        "answer": "The limit is 10 requests per second [S1].",
+        "conclusions": [concl("The limit is 10 requests per second.", "S1", True),
+                        concl("Throttling is fully resolved.", "S3", True),
+                        concl("Customers reported throttling during the beta.", "S3"),
+                        concl("The vendor will raise the limit again.", "S2"),
+                        concl("The limit was raised in June 2025.", "S2")],
+        "inferences": [{"claim": "Capacity planning should assume 20 requests per second.",
+                        "basis": "The newer page states 20.", "sources": ["S2"], "critical": False}],
+        "contradictions": [], "gaps": [], "searches": []})
+def drive(ref, cfg):
+    os.environ["ARETE_RUN_ID"] = f"run-{ref}"
+    values = {"ref": ref, "title": "Invented", "ticket": "Find the limit.", "related": "none", "repos": "none"}
+    start = len(calls)
+    res, paid = research.staged(cfg, ref, values, research.filing(None, ""), research.REPORTS_DIR, [], [],
+                                time.monotonic(), False)
+    evidence = research.research_search.evidence_file(ref)
+    return {"ok": res.ok, "error": res.error, "structured": res.structured, "calls": calls[start:],
+            "evidence": json.loads(evidence.read_text()) if evidence.exists() else {}}
+cfg = config.load()
+out = {}
+seed("A")
+put("research-A-batch-1-audit", batch1("Throttling was fully resolved during the beta."))
+put("research-A-batch-1-audit2", batch1())
+put("research-A-batch-2-audit", BATCH2)
+out["a"] = drive("A", cfg)
+seed("B")
+put("research-B-batch-1-audit", batch1(), 4.996)
+put("research-B-batch-2-audit", BATCH2)
+out["b"] = drive("B", cfg)
+seed("C")
+for name in ("research-C-batch-1-audit", "research-C-batch-1-audit2"):
+    put(name, {"checks": [{"claim": "C1", "verdict": "fine"}]})
+put("research-C-batch-2-audit", BATCH2)
+out["c"] = drive("C", cfg)
+seed("D")
+cfg.research_audit = False
+out["d"] = drive("D", cfg)
+cfg.research_audit = True
+seed("E", {"summary": "The limit was raised in June 2025 and the vendor guarantees 99.99 percent uptime.", "name": "",
+           "answer": "The vendor guarantees 99.99 percent uptime [S2].",
+           "conclusions": [concl("The limit was raised in June 2025.", "S2", True),
+                           concl("Customers reported throttling during the beta.", "S3")],
+           "inferences": [], "contradictions": [], "gaps": [], "searches": []})
+put("research-E-batch-1-audit", {"checks": [chk("C1", "supported", ["S2"], NEW), chk("C2", "supported", ["S3"], BETA)],
+                                 "disagreements": []})
+out["e"] = drive("E", cfg)
+config.CONFIG_FILE = paths.CONFIG_FILE
+s = steps.resolve(config.load(), None, "research_audit")
+known = {f"S{n}": {"url": u} for n, u in enumerate(
+    ("https://localhost/a", "https://example.org/b", "https://10.0.0.1/c", "https://exa_mple.org/d",
+     "https://foo.local/e"), 1)}
+out["hosts"] = research_audit.hosts(s, [{"cited": list(known)}], known)
+with paths.CONFIG_FILE.open("a") as f:
+    f.write('\n[steps.research_audit]\ntools = ["Read", "Glob", "Grep", "WebSearch"]\n')
+try:
+    steps.resolve(config.load(), None, "research_audit")
+    out["web"] = ""
+except ValueError as e:
+    out["web"] = str(e)
+print("RESULT" + json.dumps(out))
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        gh_state = SOURCE / ".local/state/gh"
+        had_gh_state = gh_state.exists()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay", "home"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text(
+                '[replay]\nall = true\n\n[research]\nplanner = true\nsearch = true\nsynthesis = true\naudit = true\n\n'
+                '[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
+                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
+                                  capture_output=True, text=True, timeout=120, check=False)
+            line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
+            if not line:
+                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
+            cls.out = json.loads(line[len("RESULT"):])
+        cls.wrote_gh_state = not had_gh_state and gh_state.exists()
+
+    def names(self, which):
+        return [c[0] for c in self.out[which]["calls"]]
+
+    def test_audit_corrects_qualifies_and_gaps_claims_and_writes_the_lead_from_audited_claims(self):
+        a = self.out["a"]
+        self.assertTrue(a["ok"], a["error"])
+        report = a["structured"]["report"]
+        self.assertEqual(self.names("a").count("research A batch 1 audit"), 2)
+        self.assertEqual(self.names("a").count("research A batch 2 audit"), 1)
+        self.assertEqual(self.names("a").count("research A revision"), 0)
+        self.assertIn("quote is not in a retained passage of S3", a["evidence"]["audit"]["calls"][0]["refused"][0])
+        self.assertTrue(report.startswith("**Audit note:**"))
+        lead = report[:report.index("## Supported conclusions")]
+        self.assertIn("The limit was 10 requests per second as of March 2021", lead)
+        self.assertIn("(https://example.org/old)", lead)
+        self.assertIn("(https://example.net/new)", lead)
+        self.assertIn("1 decision-critical claim did not pass the audit", lead)
+        self.assertNotIn("The limit is 10 requests per second [", lead)
+        conclusions = report[report.index("## Supported conclusions"):report.index("## Inference")]
+        self.assertRegex(conclusions, r"\*\*Decision-critical:\*\* \*\*Corrected by the audit:\*\* .*example\.org/old"
+                                      r".*example\.net/new")
+        self.assertNotIn("The limit is 10 requests per second.", conclusions)
+        self.assertNotIn("Throttling is fully resolved.", conclusions)
+        inference = report[report.index("## Inference"):report.index("## Unresolved contradictions")]
+        self.assertIn("**Qualified by the audit:** The vendor will raise the limit again.", inference)
+        contradictions = report[report.index("## Unresolved contradictions"):report.index("## Gaps")]
+        self.assertIn("(https://example.org/old)", contradictions)
+        self.assertIn("(https://example.net/new)", contradictions)
+        gaps = report[report.index("## Gaps"):report.index("## Audit")]
+        self.assertIn("Throttling is fully resolved.", gaps)
+        self.assertIn("unverifiable", gaps)
+        audit = report[report.index("## Audit"):report.index("## Sources")]
+        self.assertIn("Audit complete: 6 claims checked against their sources; 3 supported, 1 corrected, "
+                      "1 qualified as inference, 1 left as gaps.", audit)
+        self.assertEqual(audit.count("\n- **"), 6)
+        sources = report[report.index("## Sources"):]
+        self.assertIn("published 2021-03-01", sources)
+        self.assertIn("published 2025-06-01", sources)
+        summary = a["structured"]["summary"]
+        self.assertTrue(summary.startswith("The limit was 10 requests per second as of March 2021"))
+        self.assertNotIn("[", summary)
+        self.assertIn(" Audit complete:", summary)
+        self.assertEqual(a["evidence"]["audit"]["status"], "complete")
+        self.assertEqual(len(a["evidence"]["audit"]["claims"]), 6)
+
+    def test_auditor_fetches_only_the_hosts_of_cited_sources(self):
+        audits = [c for c in self.out["a"]["calls"] if "audit" in c[0]]
+        self.assertEqual(len(audits), 3)
+        for _, tools, allowed in audits:
+            self.assertEqual(tools, ["Read", "Glob", "Grep", "WebFetch"])
+            self.assertNotIn("WebFetch", allowed)
+            self.assertNotIn("WebSearch", allowed)
+        self.assertEqual(sorted(a for a in audits[0][2] if a.startswith("WebFetch")),
+                         ["WebFetch(domain:example.com)", "WebFetch(domain:example.net)", "WebFetch(domain:example.org)"])
+        self.assertEqual([a for a in audits[2][2] if a.startswith("WebFetch")], ["WebFetch(domain:example.net)"])
+        for _, tools, _ in (c for c in self.out["a"]["calls"] if "synthesis" in c[0]):
+            self.assertEqual(tools, ["Read", "Glob", "Grep"])
+        self.assertEqual(self.out["hosts"], {"example.org": ["S2"]})
+        self.assertIn("WebSearch cannot load on research_audit", self.out["web"])
+
+    def test_budget_limited_audit_is_incomplete_and_marks_unaudited_claims(self):
+        b = self.out["b"]
+        self.assertTrue(b["ok"], b["error"])
+        report = b["structured"]["report"]
+        self.assertEqual([n for n in self.names("b") if "audit" in n or "revision" in n], ["research B batch 1 audit"])
+        self.assertIn("Audit incomplete:", report)
+        self.assertIn("the research budget left no room for the audit", report)
+        self.assertIn("1 of 6 claims was not audited", report)
+        self.assertIn("**Not audited:** Capacity planning", report)
+        self.assertTrue(report.startswith("**Audit note:**"))
+        self.assertNotIn("The limit is 10 requests per second", b["structured"]["summary"])
+        self.assertNotIn("Audit complete", report)
+        self.assertTrue(b["structured"]["summary"].count("Audit incomplete:"))
+        self.assertNotIn("Audit complete", b["structured"]["summary"])
+        self.assertEqual(b["evidence"]["audit"]["status"], "incomplete")
+
+    def test_malformed_audit_is_a_failure_not_a_pass(self):
+        c = self.out["c"]
+        self.assertTrue(c["ok"], c["error"])
+        report = c["structured"]["report"]
+        self.assertEqual([n for n in self.names("c") if "audit" in n],
+                         ["research C batch 1 audit", "research C batch 1 audit", "research C batch 2 audit"])
+        self.assertIn("Audit failed:", report)
+        self.assertNotIn("Audit complete", report)
+        self.assertEqual(report.count("**Not audited:**"), 5)
+        self.assertIn("Audit failed:", c["structured"]["summary"])
+        self.assertEqual(c["evidence"]["audit"]["status"], "failed")
+
+    def test_audit_off_leaves_the_report_alone(self):
+        d = self.out["d"]
+        self.assertTrue(d["ok"], d["error"])
+        report = d["structured"]["report"]
+        self.assertFalse([n for n in self.names("d") if "audit" in n or "revision" in n])
+        self.assertNotIn("## Audit", report)
+        self.assertNotIn("Not audited", report)
+        self.assertNotIn("audit", d["evidence"])
+        self.assertIn("The limit is 10 requests per second.", report)
+
+    def test_a_claim_only_in_the_summary_or_lead_is_not_published(self):
+        e = self.out["e"]
+        self.assertTrue(e["ok"], e["error"])
+        report, summary = e["structured"]["report"], e["structured"]["summary"]
+        self.assertEqual(e["evidence"]["audit"]["status"], "complete")
+        self.assertIn("Audit complete: 2 claims checked", report)
+        self.assertNotIn("99.99", report)
+        self.assertNotIn("99.99", summary)
+        self.assertTrue(report.startswith("**Audit note:**"))
+        self.assertIn("The limit was raised in June 2025", report[:report.index("## Supported conclusions")])
+        self.assertIn("The limit was raised in June 2025", summary)
+        self.assertFalse([n for n in self.names("e") if "revision" in n])
+
+    def test_audit_needs_synthesis(self):
+        with self.assertRaisesRegex(ValueError, "audit needs synthesis = true"):
+            config.research_table({"planner": True, "search": True, "audit": True})
+        self.assertFalse(self.wrote_gh_state)
+
+
 class ScratchLookAlikeTests(unittest.TestCase):
     PRELUDE = r'''
 import json, os, secrets, subprocess, sys, time

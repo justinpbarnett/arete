@@ -35,6 +35,8 @@ REPORT_RESERVE_USD = 4.0
 REPORT_RESERVE_SECONDS = 30 * 60
 SEARCHED_RESERVE_USD = 1.0
 SEARCHED_RESERVE_SECONDS = 10 * 60
+AUDIT_RESERVE_USD = 0.5
+AUDIT_RESERVE_SECONDS = 5 * 60
 SCHEMA = {
     "type": "object",
     "properties": {"summary": {"type": "string"}, "report": {"type": "string"}, "name": {"type": "string"}},
@@ -400,9 +402,12 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
 def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dirs: list,
            family: list[str], started: float | None = None, judged: bool = False) -> tuple[Result, float]:
     searching = cfg.research_search
+    audited = searching and cfg.research_audit
     budget = research_plan.Budget(BUDGET_USD, TIMEOUT_SECONDS,
-                                  SEARCHED_RESERVE_USD if searching else REPORT_RESERVE_USD,
-                                  SEARCHED_RESERVE_SECONDS if searching else REPORT_RESERVE_SECONDS)
+                                  (SEARCHED_RESERVE_USD if searching else REPORT_RESERVE_USD)
+                                  + (AUDIT_RESERVE_USD if audited else 0),
+                                  (SEARCHED_RESERVE_SECONDS if searching else REPORT_RESERVE_SECONDS)
+                                  + (AUDIT_RESERVE_SECONDS if audited else 0))
     if started is not None:
         budget.started = started
     planned = research_plan.plan(cfg, budget, prompt("research_plan", **values), cwd, add_dirs, ref, family)
