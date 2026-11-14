@@ -1271,8 +1271,20 @@ class Build(TicketWork):
         commit_and_push(self.checkouts, self.staged.changed, branch, message)
         self.committed_lines += self.staged.lines
 
+    def check_with_repairs(self) -> bool:
+        attempts, tries = 1, self.run.settings("check_repair").tries
+        ok = self.check()
+        while not ok and attempts < tries:
+            self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
+            attempts += 1
+            self.resume(self.next_step("check_repair"),
+                        prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
+                               checks=self.check_commands), role="check_repair")
+            ok = self.check()
+        return ok
+
     def recheck(self, after: str) -> None:
-        if not self.check():
+        if not self.check_with_repairs():
             raise RunFailed(f"the checks failed after {after}", self.report)
         self.require_valid_diff(after)
 
@@ -2321,7 +2333,7 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int)
     if no_pr := [c.github for c in staged.changed if not c.pr]:
         raise RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
                         ci.red_list(caused))
-    if not b.check():
+    if not b.check_with_repairs():
         report = f"checks-ci-round{n}.md"
         b.run.save(report, b.report)
         raise RunFailed("the checks failed after the CI fix",

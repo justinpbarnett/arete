@@ -187,8 +187,9 @@ if scenario == "failed-check":
     layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "exit 7"))
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
-elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault"):
-    cause = "change" if scenario == "verify-change-fault" else "environment"
+elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault",
+                  "verify-fix-breaks-check"):
+    cause = "change" if scenario in ("verify-change-fault", "verify-fix-breaks-check") else "environment"
     answers = root / "sample/replay"
     failing = json.loads((answers / "verify.json").read_text())
     failing["structured"] = {"verdict": "pass" if scenario.endswith("-pass") else "fail", "summary": "The check could not run.", "checks": [
@@ -197,6 +198,14 @@ elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "
     (answers / "verify2.json").write_text((answers / "verify.json").read_text())
     (answers / "verify.json").write_text(json.dumps(failing))
     (answers / "verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    if scenario == "verify-fix-breaks-check":
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace(
+            "[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+        layer = root / "sample/layer/config.toml"
+        layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && ! grep -q quince notes.txt"))
+        (answers / "verify_fix.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+        (answers / "check_repair.json").write_text(json.dumps({"text": "Removed quince.", "ok": True}))
+        (answers / "check_repair.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,2 @@\n A small file for replay checks.\n kumquat\n-quince\n")
 elif scenario in ("verify-start-denied", "verify-start-crash"):
     urllib.request.urlopen = mock.Mock(side_effect=OSError("refused"))
     layer = root / "sample/layer/config.toml"
@@ -1230,6 +1239,13 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         result = self.workflow("verify-change-fault")
         self.assertIn("verify_fix", result["steps"])
         self.assertEqual(result["verified"], ["pass"])
+
+    def test_check_broken_by_a_verify_fix_gets_a_repair_before_the_run_fails(self):
+        result = self.workflow("verify-fix-breaks-check")
+        self.assertIn("verify_fix", result["steps"])
+        self.assertIn("check_repair", result["steps"])
+        self.assertNotIn("the checks failed after", result["summary"])
+        self.assertEqual(result["status"], "done", result["summary"])
 
     def test_app_start_denied_by_the_sandbox_is_blocked_without_a_repair(self):
         result = self.workflow("verify-start-denied")
