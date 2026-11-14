@@ -1337,6 +1337,8 @@ PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
 
 
 class OptimizeTests(unittest.TestCase):
+    slow = True
+
     def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
         from arete import experiment, optimize
 
@@ -3397,6 +3399,58 @@ result(counts=counts, before=before, summary=last["summary"], prompt=prompt, las
         self.assertGreater(found["kept"], 0)
         self.assertLessEqual(found["size"], 100)
         self.assertEqual(found["last"], "Reply 6.")
+
+
+class ParallelSuiteTests(unittest.TestCase):
+    def run_sample(self, source: str):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        Path(folder.name, "test_sample.py").write_text(source)
+        command = [sys.executable, "-m", "tests.parallel", "-s", folder.name, "-j", "2", "--timeout", "2", "-v"]
+        done = subprocess.run(command, cwd=SOURCE, capture_output=True, text=True, timeout=120)
+        return folder.name, done, done.stdout.strip().splitlines()
+
+    def test_failing_hanging_and_serial_tests_are_reported(self):
+        _, done, lines = self.run_sample(
+            "import time, unittest\n"
+            "class Passing(unittest.TestCase):\n"
+            "    def test_ok(self): pass\n"
+            "class Failing(unittest.TestCase):\n"
+            "    def test_bad(self): self.fail('deliberate')\n"
+            "class Hanging(unittest.TestCase):\n"
+            "    def test_stuck(self): time.sleep(60)\n"
+            "class Alone(unittest.TestCase):\n"
+            "    serial = True\n"
+            "    def test_one(self): pass\n"
+            "    def test_two(self): pass\n"
+        )
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("FAIL: test_bad (test_sample.Failing.test_bad)", done.stdout)
+        self.assertIn("deliberate", done.stdout)
+        self.assertIn("ERROR: test_stuck (test_sample.Hanging.test_stuck)", done.stdout)
+        self.assertIn("killed after 2 seconds", done.stdout)
+        self.assertTrue(lines[-1].startswith("Ran 5 tests in "), lines[-1])
+        self.assertTrue(lines[-1].endswith("FAILED (failures=1, errors=1)"), lines[-1])
+        verbose = [index for index, line in enumerate(lines) if " ... " in line]
+        alone = [index for index in verbose if "Alone" in lines[index]]
+        others = [index for index in verbose if "Alone" not in lines[index]]
+        self.assertEqual(len(alone), 2)
+        self.assertGreater(min(alone), max(others))
+
+    def test_passing_sample_counts_match_discovery(self):
+        folder, done, lines = self.run_sample(
+            "import unittest\n"
+            "class Passing(unittest.TestCase):\n"
+            "    def test_one(self): pass\n"
+            "    def test_two(self): pass\n"
+            "    @unittest.skip('not now')\n"
+            "    def test_skipped(self): pass\n"
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        total = unittest.TestLoader().discover(folder).countTestCases()
+        self.assertTrue(lines[-1].startswith(f"Ran {total} tests in "), lines[-1])
+        self.assertTrue(lines[-1].endswith("OK (skipped=1)"), lines[-1])
+        self.assertEqual(len([line for line in lines if " ... " in line]), total)
 
 
 class NoLiveStateTests(unittest.TestCase):
