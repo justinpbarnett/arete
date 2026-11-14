@@ -41,6 +41,15 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
             elif gh.issue_state(repo, prev["issue"]) == "OPEN":
                 state.alert_set(key, prev["issue"], repo)
                 return f"alert {key} still open (#{prev['issue']})"
+        pages = gh.gh_json(["api", f"repos/{repo}/issues?labels={LABEL}&state=open&per_page=100",
+                            "--paginate", "--slurp"])
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            raise gh.GhUnsure("GitHub alert lookup returned no list")
+        for page in pages:
+            for row in page:
+                if f"Check `{key}` is failing." in (row.get("body") or ""):
+                    state.alert_set(key, row["number"], repo)
+                    return f"alert {key} still open (#{row['number']})"
         gh.ensure_label(repo, LABEL, "d93f0b", "Opened by arete heartbeat")
         body = (
             f"Check `{key}` is failing.\n\n"
@@ -51,7 +60,7 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
         num = gh.issue_create(repo, f"[arete] {title}", body, [LABEL])
         state.alert_set(key, num, repo)
         return f"opened #{num} for {key}{left}"
-    except gh.GhError as e:
+    except (gh.GhError, ValueError, TypeError, KeyError, AttributeError) as e:
         if not prev:
             notify("arete", f"{title}: {status}")
         state.alert_set(key, (prev or {}).get("issue"))

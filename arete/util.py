@@ -95,6 +95,10 @@ NETWORK_ERROR = re.compile(
     r"|temporary failure in name resolution|ssh: connect to host|unable to access",
     re.IGNORECASE,
 )
+NEVER_SENT = re.compile(
+    r"could not resolve host|no such host|temporary failure in name resolution|error connecting to"
+    r"|dial tcp|connection refused|tls handshake timeout", re.IGNORECASE,
+)
 NETWORK_PROBE_HOSTS = (("api.github.com", 443), ("1.1.1.1", 53))
 WAKE_NETWORK_WAIT_MINUTES = 3
 
@@ -136,9 +140,9 @@ def hours_awake_since(timestamp: float) -> float:
     return (now().timestamp() - max(timestamp, last_wake())) / 3600
 
 
-def sh_with_network(cmd: list[str] | str, **kw) -> subprocess.CompletedProcess:
+def sh_with_network(cmd: list[str] | str, rerun: re.Pattern = NETWORK_ERROR, **kw) -> subprocess.CompletedProcess:
     res = sh(cmd, **kw)
-    if res.returncode == 0 or not is_network_error(res.stdout + res.stderr):
+    if res.returncode == 0 or not rerun.search(res.stdout + res.stderr):
         return res
     print(f"{iso()} network error, waiting for the network: {first_line(res.stderr or res.stdout)}", flush=True)
     return sh(cmd, **kw) if wait_for_network() else res
