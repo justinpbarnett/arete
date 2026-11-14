@@ -22,7 +22,8 @@ $expertise
 
 - Make the change the plan describes. Add or change tests only where the repo's own docs ask for them.
 - Write self-documenting code: no docstrings, and a comment only for what the code cannot show, such as a line that looks wrong and is right. Follow the repo's own docs where they ask for more.
-- Run the checks yourself before you finish: $checks
+- Run the checks yourself before you finish: $checks. If a check cannot start in your sandbox, do not stop to ask:
+  finish, and Arete runs every check in its own checks step right after you.
 - Shell commands you may run: $commands. Others are refused. If a command is refused, do not get the same result
   another way (another interpreter, sed, perl, cp, or a heredoc that writes the file). Stop without editing for that
   part and say exactly what a human must run.
