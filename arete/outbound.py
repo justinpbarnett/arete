@@ -153,7 +153,7 @@ RAW_END = {"tag": re.compile(r"</(?:pre|script|style|textarea)>", re.IGNORECASE)
            "pi": re.compile(r"\?>"), "cdata": re.compile(r"\]\]>"), "decl": re.compile(">")}
 TICKS = re.compile(r"`+")
 LINK_DESTINATION = re.compile(r"\]\([^)]*$|(?:^|\n) {0,3}\[[^\]\n]*\]:[^\n]*$")
-MENTION = r"@[A-Za-z0-9](?:[\w./-]*\w)?"
+MENTION = r"@[A-Za-z0-9](?:[\w./-]*[^\W_])?"
 REFERENCE = (r"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|[\w.-]+/[\w.-]+#\d+"
              r"|GH-\d+|#\d+)(?![\w-])")
 OWN = re.compile(r"(?<!\\)<code>(?:" + MENTION + "|" + REFERENCE + r")</code>", re.IGNORECASE)
