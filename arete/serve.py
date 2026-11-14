@@ -158,7 +158,6 @@ class Server:
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
-        self.restarted: Counter[int] = Counter()
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
@@ -429,13 +428,8 @@ class Server:
                      f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
     def retry_once(self, item: dict, why: str) -> None:
-        if self.restarted[item["id"]]:
-            state.drop_queue_item(item["id"])
-            self.say(f"{item['loop']}: dropped queue item {item['id']}, {why}, the second time")
-            return
-        self.restarted[item["id"]] += 1
-        state.take_queue_item(item["id"], None)
-        self.say(f"{item['loop']}: queue item {item['id']} goes back in the queue, {why}")
+        self.say(f"{item['loop']}: queue item {item['id']} failed to start, {why}; "
+                 "the recovery sweep handles its claim")
 
     def reap_inherited(self) -> None:
         for pid in list(self.inherited):
