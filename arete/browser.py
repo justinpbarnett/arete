@@ -19,6 +19,7 @@ from . import paths, scratch, verify
 
 REGISTRY = "https://registry.npmjs.org/"
 PIN = "browser-server.pin"
+CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 MAX_DOWNLOAD = 64 * 1024 * 1024
 MAX_FILE = 128 * 1024 * 1024
 EXACT = re.compile(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?")
@@ -45,6 +46,12 @@ def pinned() -> tuple[str, str]:
 
 def server_folder() -> Path:
     return paths.STATE_DIR / "browser-server" / pinned()[1]
+
+
+def chrome() -> Path:
+    if not CHROME.is_file():
+        raise scratch.ConfinementUnavailable(f"Google Chrome is not installed at {CHROME}")
+    return CHROME
 
 
 def engine_node() -> Path:
