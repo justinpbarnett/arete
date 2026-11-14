@@ -25,15 +25,30 @@ from arete import (
     gh,
     lines,
     paths,
+    pi,
     pipeline,
     record,
     runlimits,
+    scratch,
     serve,
     state,
     tracker,
     util,
 )
 from arete.agent import Result
+
+
+def setUpModule():
+    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
+    unittest.addModuleCleanup(folder.cleanup)
+    root = Path(folder.name).resolve()
+    for pointer in (patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+                    patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
+                    patch.object(paths, "PI_KEYS_FILE", root / "config" / "pi.env"),
+                    *(patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                      for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
+        pointer.start()
+        unittest.addModuleCleanup(pointer.stop)
 
 
 class Isolated(unittest.TestCase):
@@ -263,6 +278,55 @@ class BudgetTests(Isolated):
         with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
             with second.budget.watching():
                 self.fail("an exhausted chain must not run")
+
+    def test_idle_waits_move_the_deadline_and_other_waits_do_not(self):
+        for cause in ("limit", "slot"):
+            with self.subTest(cause=cause):
+                run = self.made_run(policy=runlimits.Policy(max_run_minutes=.01))
+                started = time.monotonic()
+                with self.assertRaisesRegex(runlimits.Parked, "run chain"):
+                    with run.budget.watching():
+                        with run.waiting(cause):
+                            time.sleep(.9)
+                        self.assertGreater(run.budget.deadline - time.monotonic(), 0)
+                        time.sleep(2)
+                self.assertLess(time.monotonic() - started, 1.5 + .9)
+                self.assertGreater(runlimits.metadata(run.id, "budget.json")["wait_minutes_left_out"][cause], 0)
+        run = self.made_run(policy=runlimits.Policy(max_run_minutes=.01))
+        with self.assertRaisesRegex(runlimits.Parked, "run chain"):
+            with run.budget.watching(), run.waiting("ci"):
+                time.sleep(2)
+
+    def chained_after(self, *waits):
+        first = self.made_run()
+        record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
+        for cause, since, until in waits:
+            if until is None:
+                lines.wait_start(first.id, cause, util.iso(util.now() - timedelta(minutes=since)))
+            else:
+                lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
+                             util.iso(util.now() - timedelta(minutes=until)))
+        record.settle(first.id, "interrupted")
+        return first, self.made_run(first.id)
+
+    def test_limit_wait_of_an_earlier_run_is_left_out_of_prior_seconds(self):
+        for waits in ([("limit", 50, 10)], [("limit", 50, None)]):
+            with self.subTest(waits=waits):
+                first, second = self.chained_after(*waits)
+                self.assertLess(second.budget.prior_seconds, 25 * 60)
+                self.assertGreater(second.budget.earlier_idle["limit"], 35 * 60)
+                with second.budget.watching():
+                    pass
+                self.assertGreater(
+                    runlimits.metadata(second.id, "budget.json")["earlier_wait_minutes_left_out"]["limit"], 35)
+
+    def test_ci_waits_and_waits_before_the_run_started_still_count(self):
+        for waits in ([("ci", 50, 10)], [("slot", 90, 70)]):
+            with self.subTest(waits=waits):
+                first, second = self.chained_after(*waits)
+                with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
+                    with second.budget.watching():
+                        self.fail("an exhausted chain must not run")
 
     def test_verification_deadline_interrupts_and_is_accounted(self):
         run = self.made_run(policy=runlimits.Policy(max_verify_minutes=.001))
@@ -973,6 +1037,14 @@ class RecordRetentionTests(Isolated):
         self.assertEqual((found["bytes"], found["records"], found["pins"]), (1500, 2, 1))
         self.assertEqual(found["oldest"]["run_id"], "pip-a")
         self.assertEqual(record.size_text(1500), "1.5 KB")
+
+
+class NoLiveStateTests(unittest.TestCase):
+    def test_no_test_here_points_at_the_live_authority_or_state(self):
+        live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
+        for path in (scratch.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR,
+                     pi.SESSIONS_DIR):
+            self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
 if __name__ == "__main__":
