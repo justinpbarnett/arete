@@ -56,7 +56,7 @@ A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete we
 ## On-call
 
 The watcher notices operational failures on its own and keeps one durable incident for each underlying symptom.
-JEV decides whether an incident may wake a repair; no repair starts yet.
+JEV decides whether an incident may wake a repair, and a wake starts one bounded repair that is resolved only when the original failure is seen to be gone.
 
 ```toml
 [oncall]
@@ -65,6 +65,12 @@ vision = "A payments service that must stay up"
 scope = "Bug fixes in the payment worker only"
 confidence = 0.8
 injection = 0.5
+max_repairs = 1
+wakes_per_hour = 10
+max_attempts = 2
+incident_budget_usd = 5.0
+daily_budget_usd = 10.0
+cooldown_minutes = 30
 
 [[oncall.source]]
 path = "~/Library/Logs/myapp/*.log"
@@ -80,7 +86,7 @@ scope = "Only the checkout module"
 `confidence` and `injection` are numbers from 0 to 1 and default to `[jev] confidence` and `[jev] injection`.
 When on, serve scans on its tick, on the poll pool, so a slow scan never blocks the tick.
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
-`repo` and `check` are recorded for a later repair part and start nothing now.
+`repo` names the repo a repair works in and `check` is the command Arete reruns to prove recovery.
 When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is asked only `injection` and `actionable`, and a result that would be `wake` is stored as `unsure` for the owner, so no entry's text can ignore or wake it alone.
 An entry matches a file when its glob finds that file by any path, so a symlink, a hard link or another letter case names the same file, and it also matches the rotated `.1` copy of any file its glob names, which its watcher drains, even after the file itself was renamed away.
 Which entries match a file is looked up when its lines are read: a listed file renamed, re-created or linked anew after the scan began is matched again before its lines are read, and a listed file no `[[oncall.source]]` glob finds any more is treated like a gone file, never as one under the `[oncall]` text.
@@ -151,11 +157,48 @@ Twin checks and decisions share one budget: at most 20 JEV evaluations per scan,
 A symptom from a run that is still live gets no twin check and no decision until the run ends.
 All calls go through `oncall.ask_jev`, one function a test harness can replace.
 
+**Repairs.** Each scan, an incident decided `wake` starts one local task of kind `fix` with `tasks.start`, in the config's `arete_repo` for Arete's own sources (the heartbeat, serve, a run, or Arete's log and run folders) and in the source's `repo` otherwise.
+So planning, the isolated worktree, checks, verify, review, the PR, automerge and the permission rules are the ones every task has.
+The task prompt is `arete/prompts/oncall_repair.md`: diagnose and reproduce first, then make the smallest repair; the redacted evidence is a fenced block marked as untrusted data.
+Before a wake, Arete resolves the plan, build, verify, review and repair steps of that repo with `steps.resolve` and checks each with the shared route policy: `routing.fit_refusal` with `[routing] payment_modes`, and `routing.outlook` for holds and spent budgets.
+A hold, a spent budget or a payment-mode refusal leaves the incident `waiting` with that reason; with `payment_modes = ["subscription"]` no paid route is used, and no hold is bypassed.
+
+| `[oncall]` key | Default | Bound |
+| --- | --- | --- |
+| `max_repairs` | 1 | repairs running at once |
+| `wakes_per_hour` | 10 | repairs started in the last hour |
+| `max_attempts` | 2 | repairs per incident; past it the incident is `blocked` |
+| `incident_budget_usd` | 5.0 | paid spend on one incident's repairs, counted like `state.paid_by_run`; past it the incident is `blocked` |
+| `daily_budget_usd` | 10.0 | paid spend of all repairs started in the last 24 hours; past it incidents wait |
+| `cooldown_minutes` | 30 | pause after each failed, cancelled or refused attempt |
+
+**No storms.** Lines a repair's run writes (run rows, `[repo task]` lines and a stalled run of its task) never open or wake an incident; each is counted in a note on the incident being repaired.
+A failure of a ticket with a live run counts as owned.
+
+**Recovery.** A merged repair moves the incident to `verifying`, never straight to `resolved`.
+Arete then reruns the original check: the source's `check` command, or a built-in re-read of the heartbeat, the stalled run or serve's beat; an incident with neither is resolved after `cooldown_minutes` without a recurrence.
+It also requires that the signature has not recurred since the repair landed.
+Only then is the incident `resolved`, with the result in its `recovery`; a merged PR alone never resolves it.
+A failing recheck or a recurrence is a failed attempt, so repairs that never fix it stop at `max_attempts`.
+
+**Escalation.** A repair that needs you (the run asks, a held PR, a branch with no PR, a policy refusal that will not clear, attempts or budget used up) raises one alert through `alerts.raise_alert` with one sanitized line of Arete's own words; evidence and log text are never sent.
+The alert clears when the incident resolves or is dismissed, or when you `retry` it.
+
+**Switch and steering.** `arete oncall off` stops every wake and recheck until `arete oncall on`, without editing the config; both are noted on the woken incidents.
+Task start, run stop, check run, alert and route lookup go through `oncall.start_task`, `stop_run`, `run_check`, `raise_alert`, `clear_alert` and `route_outlook`, which a test harness can replace.
+
 ```
-arete oncall             # incidents, newest first, each with its decision, confidence and reason, then the watcher's state
-arete oncall show ID     # one incident with its decision, answers, evidence and notes
+arete oncall             # incidents, newest first, each with its decision, confidence, reason and repair, then the watcher's state
+arete oncall show ID     # one incident with its decision, repair attempts, answers, evidence and notes
 arete oncall scan        # one scan now
+arete oncall cancel ID   # stop the repair's run, close its still-queued task and start the cooldown
+arete oncall dismiss ID  # close an incident with no running repair and clear its alert
+arete oncall retry ID    # re-arm an incident: attempts and spend count from now, the cooldown and alert are cleared
+arete oncall off         # stop all wakes and rechecks
+arete oncall on          # allow them again
 ```
+
+Each action is written to the incident's notes; an unknown or ineligible incident prints one line on stderr and exits 1.
 
 `--json` prints one JSON line per incident (`scan --json` prints the summary).
 While the watcher is on, the heartbeat's `oncall:scan` check fails when the last scan crashed or is more than five minutes old.
@@ -694,7 +737,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. See [Triage](#triage). |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. See [The seam](#the-seam). |
-| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
+| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs a wake starts; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |

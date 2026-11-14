@@ -300,9 +300,25 @@ def cmd_heartbeat(args) -> int:
 
 
 def cmd_oncall(args) -> int:
-    from . import oncall, state
+    from . import control, oncall, state
 
     cfg = config.load()
+    if args.action in ("off", "on"):
+        print(f"on-call wakes and rechecks are {oncall.switch(args.action == 'on')['wakes']}")
+        return 0
+    if args.action in ("cancel", "dismiss", "retry"):
+        if not args.id.isdigit():
+            print(f"no incident {args.id}" if args.id else f"{args.action} needs an incident number", file=sys.stderr)
+            return 1
+        try:
+            done = getattr(oncall, args.action)(int(args.id))
+        except (control.NotFound, control.Refused) as e:
+            return refused(e)
+        stopped = f"stopped run {done['stopped']}" if done.get("stopped") else "no run was live"
+        print({"cancel": f"cancelled incident {args.id}: {stopped}; cooling down until {done.get('cooldown_until')}",
+               "dismiss": f"dismissed incident {args.id}",
+               "retry": f"incident {args.id} is re-armed; the next scan may start a repair"}[args.action])
+        return 0
     if args.action == "scan":
         summary = oncall.scan(cfg)
         if summary is None:
@@ -323,6 +339,13 @@ def cmd_oncall(args) -> int:
         print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
               f"{found['first_seen']} to {found['last_seen']}")
         print(f"decision: {oncall.decision_line(found)}")
+        if line := oncall.repair_line(found):
+            print(f"repair: {line}")
+        if found["cooldown_until"]:
+            print(f"cooldown until: {found['cooldown_until']}")
+        for n, r in enumerate(found["repairs"], 1):
+            print(f"  attempt {n} of {cfg.oncall.max_attempts}: task {r['task'] or '-'}, run {oncall.last_run_id(r)}, "
+                  f"{r['started']}, {r['outcome'] or ('running' if r['task'] else 'starting')}")
         for name, a in found["answers"].items():
             print(f"  {name}: {'yes' if a['value'] else 'no'}, confidence {a['confidence']:.2f}")
         print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
@@ -335,9 +358,11 @@ def cmd_oncall(args) -> int:
             print(json.dumps(row))
         return 0
     for r in rows:
-        print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
-              f"x{r['count']:<4} {r['signature']}")
+        print(f"#{r['id']:<4} {r['phase'] or r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  "
+              f"{when(r['last_seen'])}  x{r['count']:<4} {r['signature']}")
         print(f"      {oncall.decision_line(r)}")
+        if line := oncall.repair_line(r):
+            print(f"      repair: {line}")
     now = oncall.status(cfg)
     if not now["enabled"]:
         print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
@@ -346,6 +371,8 @@ def cmd_oncall(args) -> int:
         if now["last_scan"]:
             last = f"last scan {when(now['last_scan'])}" + ("" if now["ok"] else f" failed: {now['detail']}")
         print(f"on-call is on; {last}; {now['expected']} expected events counted")
+        if now["wakes"] == "off":
+            print("wakes and rechecks are off; `arete oncall on` turns them on")
     return 0
 
 
@@ -1531,8 +1558,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_heartbeat)
 
     p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
-    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan"))
-    p.add_argument("id", nargs="?", default="", help="with show: the incident number")
+    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan", "cancel", "dismiss", "retry", "off", "on"))
+    p.add_argument("id", nargs="?", default="", help="with show, cancel, dismiss or retry: the incident number")
     p.add_argument("--json", action="store_true", help="one JSON line per incident")
     p.set_defaults(fn=cmd_oncall)
 

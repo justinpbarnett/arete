@@ -408,7 +408,14 @@ CREATE TABLE IF NOT EXISTS incidents (
     retry_at TEXT DEFAULT '',
     decided_count INTEGER DEFAULT 0,
     shapes TEXT DEFAULT '',
-    policies TEXT
+    policies TEXT,
+    phase TEXT DEFAULT '',
+    waiting TEXT DEFAULT '',
+    cooldown_until TEXT DEFAULT '',
+    rearmed TEXT DEFAULT '',
+    landed TEXT DEFAULT '',
+    recovery TEXT DEFAULT '',
+    alerted INTEGER DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -418,6 +425,16 @@ CREATE TABLE IF NOT EXISTS incident_notes (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS incident_notes_incident ON incident_notes (incident, id);
+CREATE TABLE IF NOT EXISTS incident_repairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident INTEGER NOT NULL,
+    repo TEXT NOT NULL,
+    task TEXT DEFAULT '',
+    started TEXT NOT NULL,
+    ended TEXT DEFAULT '',
+    outcome TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS incident_repairs_incident ON incident_repairs (incident, id);
 CREATE TABLE IF NOT EXISTS incident_aliases (
     fingerprint TEXT PRIMARY KEY,
     incident INTEGER NOT NULL,
@@ -478,7 +495,10 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("decision", "TEXT DEFAULT ''"), ("confidence", "REAL DEFAULT 0"), ("reason", "TEXT DEFAULT ''"),
                   ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
                   ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
-                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"))]]
+                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"),
+                  ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"), ("cooldown_until", "TEXT DEFAULT ''"),
+                  ("rearmed", "TEXT DEFAULT ''"), ("landed", "TEXT DEFAULT ''"), ("recovery", "TEXT DEFAULT ''"),
+                  ("alerted", "INTEGER DEFAULT 0"))]]
 
 
 @contextmanager
@@ -803,6 +823,7 @@ def prune(days: float = 14) -> None:
         c.execute("DELETE FROM incident_notes WHERE incident IN (SELECT id FROM incidents WHERE last_seen < ?)", (old,))
         c.execute("DELETE FROM incidents WHERE last_seen < ?", (old,))
         c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
+        c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
 
 
 def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signature: str, count: int,
@@ -893,6 +914,29 @@ def update_incident(incident_id: int, note: str = "", **fields) -> None:
                       (incident_id, util.iso(), note))
 
 
+def woken_incidents() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' AND decision = 'wake' "
+                                           "AND injection = 0 ORDER BY id")]
+
+
+def add_repair(incident_id: int, repo: str) -> int:
+    with db() as c:
+        return c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (?,?,?)",
+                         (incident_id, repo, util.iso())).lastrowid
+
+
+def set_repair(repair_id: int, **fields) -> None:
+    with db() as c:
+        c.execute(f"UPDATE incident_repairs SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+                  (*fields.values(), repair_id))
+
+
+def incident_repairs(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM incident_repairs ORDER BY id")]
+
+
 def parsed(row: dict) -> dict:
     return {**row, "answers": json.loads(row["answers"] or "{}")}
 
@@ -909,7 +953,8 @@ def incident(incident_id: int, connect=db) -> dict | None:
         if not r:
             return None
         notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
-        return {**parsed(dict(r)), "notes": [dict(n) for n in notes]}
+        repairs = c.execute("SELECT * FROM incident_repairs WHERE incident = ? ORDER BY id", (incident_id,))
+        return {**parsed(dict(r)), "notes": [dict(n) for n in notes], "repairs": [dict(x) for x in repairs]}
 
 
 def add_metric(name: str, value: float, loop: str = "", run_id: str = "") -> None:
