@@ -1,0 +1,25 @@
+[data-pane][data-focus] { outline-color: var(--ink-2); }
+[data-row][data-cursor] { background: var(--raised); box-shadow: inset 2px 0 0 var(--rule-strong); }
+[data-focus] [data-row][data-cursor] { background: var(--selected); box-shadow: inset 2px 0 0 var(--accent); }
+.cap { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--rule-strong); color: var(--ink-2); background: var(--canvas); font: var(--text-micro) var(--font-data); }
+.key-bar { position: relative; display: flex; align-items: center; gap: 16px; padding: 0 12px; color: var(--muted); font-size: var(--text-s); white-space: nowrap; overflow: hidden; }
+.mode { font: 600 var(--text-micro) var(--font-data); letter-spacing: .06em; color: var(--ink); }
+.mode.insert { background: var(--accent); color: var(--on-accent); padding: 0 6px; }
+.hints { display: flex; gap: 14px; min-width: 0; overflow: hidden; }
+.hint { display: inline-flex; align-items: center; gap: 6px; }
+.hint .cap + .cap { margin-left: -2px; }
+.echo { margin-left: auto; min-width: 12px; color: var(--accent); }
+.echo:empty { visibility: hidden; }
+.notice { position: absolute; left: 50%; bottom: 100%; transform: translateX(-50%); max-width: 60%; padding: 4px 10px; background: var(--raised); border: 1px solid var(--rule-strong); color: var(--ink); pointer-events: none; }
+.notice:empty { display: none; }
+.help { padding: 0; border: 0; background: none; cursor: pointer; }
+.sheet-scrim { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; background: rgba(11, 12, 14, .72); }
+.key-sheet { width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 14px 16px 12px; background: var(--panel); border: 1px solid var(--rule-strong); color: var(--ink); font-size: var(--text-s); outline: 0; }
+.sheet-head { display: flex; align-items: center; gap: 12px; }
+.sheet-title { font: 600 var(--text-micro) var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+.sheet-note { flex: 1; min-width: 0; color: var(--ink-2); }
+.close { padding: 0; border: 0; background: none; cursor: pointer; }
+.sheet-group h3 { margin: 16px 0 6px; font: 500 var(--text-micro) var(--font-data); letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+.sheet-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; }
+.sheet-entry { display: flex; align-items: center; gap: 10px; min-height: 28px; color: var(--ink-2); }
+.sheet-caps { display: inline-flex; gap: 6px; flex: none; min-width: 94px; }
