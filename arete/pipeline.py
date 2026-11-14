@@ -733,7 +733,7 @@ def recorded(made: dict, base: Path, name: str, prefix: str = "") -> bool:
     return bool(salt) and made.get(prefix + name) == fingerprint(base / name, salt)
 
 
-def blocked_by(ws: Path, checkouts: list[Checkout]) -> list[str]:
+def blocked_by(ws: Path, checkouts: list[Checkout], edits: bool = False) -> list[str]:
     try:
         if left := scratch_left(ws, checkouts):
             return list(dict.fromkeys(str(p) for p in left))
@@ -742,7 +742,9 @@ def blocked_by(ws: Path, checkouts: list[Checkout]) -> list[str]:
         names = [n for n in unexamined(ws, examined) if not recorded(made, ws, n)]
         for c in checkouts:
             if (c.wt / ".git").exists():
-                names += [c.prefix + n for n in [*ignored_files(c.wt), *untracked_files(c.wt)]
+                found = ([*uncommitted(c.wt), *ignored_files(c.wt)] if edits
+                         else [*ignored_files(c.wt), *untracked_files(c.wt)])
+                names += [c.prefix + n for n in dict.fromkeys(found)
                           if not recorded(made, c.wt, n, c.prefix)]
         return names
     except (OSError, RuntimeError) as e:
@@ -3590,7 +3592,19 @@ def held_entry(d: Path, owner: dict, row: dict | None, blocked: bool, why: str, 
             "bytes": tree_bytes(d), "blocked": blocked, "why": why, "names": (names or [])[:10]}
 
 
-def sweep_owned(d: Path, owner: dict) -> dict | None:
+def ticket_closed(cfg: config.Config, repo: str, tid: str, status: str) -> bool:
+    if tracker.is_task_id(tid):
+        return tracker.task_state(tid) == "closed"
+    configured = next((r for r in cfg.repos if r.name == repo), None)
+    if configured is None or status == "pr":
+        return False
+    try:
+        return not tracker.for_repo(cfg, configured).get(tid).open
+    except Exception:
+        return False
+
+
+def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
     repo, tid = owner["repo"], str(owner["ticket"])
     lock_name = state.run_lock("pipeline", repo, tid)
     if util.lock_is_held(lock_name) or state.issue_running(repo, tid):
@@ -3600,20 +3614,19 @@ def sweep_owned(d: Path, owner: dict) -> dict | None:
            or next(iter(state.ticket_runs(repo, tid, limit=1, whole=True)), None))
     status = (row or {}).get("status") or ""
     run_id = (row or {}).get("id") or owner.get("run") or ""
-    closed = tracker.is_task_id(tid) and tracker.task_state(tid) == "closed"
+    closed = status not in SWEPT and ticket_closed(cfg, repo, tid, status)
     if status not in SWEPT and not closed:
-        names = blocked_by(d, checkouts)
-        why = f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket"
-        return held_entry(d, owner, row, False, why + (f"; removal blocked by {', '.join(names[:10])}" if names else ""))
+        return held_entry(d, owner, row, False,
+                          f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket")
     with util.lock(lock_name) as got:
         if not got:
             return None
         try:
             clear_workspace(d, checkouts, checkouts[0].src, [])
         except RunFailed as e:
-            return held_entry(d, owner, row, True, e.why, blocked_by(d, checkouts))
+            return held_entry(d, owner, row, True, e.why, blocked_by(d, checkouts, edits=True))
         except (OSError, RuntimeError) as e:
-            return held_entry(d, owner, row, True, util.first_line(str(e), 300), blocked_by(d, checkouts))
+            return held_entry(d, owner, row, True, util.first_line(str(e), 300), blocked_by(d, checkouts, edits=True))
     print(f"{util.iso()} removed the workspace {d}: "
           + (f"run {run_id} is {status}" if status in SWEPT else f"task {tid} is closed"))
     return None
@@ -3646,7 +3659,7 @@ def cleanup_worktrees(days: float = 7, cfg: config.Config | None = None) -> None
             owner = owner_of(d, cfg)
             if owner is None:
                 sweep_unowned(d, cutoff)
-            elif entry := sweep_owned(d, owner):
+            elif entry := sweep_owned(d, owner, cfg):
                 held.append(entry)
         except Exception as e:
             print(f"{util.iso()} sweeping {d}: {type(e).__name__}: {e}")

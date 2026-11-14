@@ -494,7 +494,7 @@ A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git work
 - Removed by each poll's sweep when the owning run is `merged`, `rejected` or `done` (or the ticket is a closed local task), no run holds the ticket, and every file still matches the record. The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock. A workspace waiting for its ticket, or blocked by a file arete did not make, stays.
 - Every poll also runs `git worktree prune` on each configured repo. The local `arete/<n>-...` branch stays.
 
-The sweep writes the workspaces it keeps to `held-workspaces.json` in the state folder. The heartbeat check `workspaces:held` shows their count, size and oldest, and warns when one is blocked; the Health view lists them under Held workspaces. A folder with no owner is removed after 7 days when it holds no file.
+The sweep writes the workspaces it keeps to `held-workspaces.json` in the state folder. A blocked workspace is listed with the names of the files that block it (ignored, untracked or edited tracked files that the record does not cover). The heartbeat check `workspaces:held` shows their count, size and oldest, and warns when one is blocked; the Health view lists them under Held workspaces. A folder with no owner is removed after 7 days when it holds no file.
 
 ## Records
 

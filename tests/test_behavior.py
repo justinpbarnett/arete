@@ -3774,10 +3774,37 @@ else:
                "b": b.exists(), "c": cw.exists(), "held": held, "gone": str(gone) in "\n".join(registered()),
                "check": [check.ok, check.detail]}
     (cw / "hand.txt").unlink()
+    e_task, e, e_c, e_run = make("e", "arete/e")
+    record.note(e_run, status="merged", finished=util.iso())
+    pipeline.note_made(e, [e_c], owner(e_task, e_run, e))
+    with (e / replay.SAMPLE_FILE).open("a") as out:
+        out.write("by hand\n")
     pipeline.cleanup_worktrees(cfg=config.load())
+    held_e = json.loads((paths.STATE_DIR / "held-workspaces.json").read_text())
     check = heartbeat.check_workspaces()[0]
     result |= {"c_after": cw.exists(), "c_record_after": (paths.STATE_DIR / "workspaces" / f"{cw.name}.json").exists(),
-               "check_after": [check.ok, check.detail]}
+               "e": e.exists(), "held_e": held_e, "check_e": [check.ok, check.detail]}
+    pipeline.git(["checkout", "--", replay.SAMPLE_FILE], e)
+    pipeline.cleanup_worktrees(cfg=config.load())
+    check = heartbeat.check_workspaces()[0]
+    result |= {"e_after": e.exists(), "check_after": [check.ok, check.detail]}
+    g = paths.WORKTREES_DIR / "replay-sample-42"
+    g_c = pipeline.Checkout("", "octo/widgets", src, g, "main")
+    pipeline.add_worktree(g_c, "arete/g", "main")
+    g_run = record.start("pipeline", repo="replay-sample", issue="42")
+    record.note(g_run, status="failed", finished=util.iso())
+    pipeline.note_made(g, [g_c], owner("42", g_run, g))
+    import types
+    pipeline.tracker.for_repo = lambda cfg, repo: types.SimpleNamespace(get=lambda tid: types.SimpleNamespace(open=False))
+    f_task, f, f_c, f_run = make("f", "arete/f")
+    record.note(f_run, status="failed", finished=util.iso())
+    pipeline.note_made(f, [f_c], owner(f_task, f_run, f))
+    (f / "stray.txt").write_text("x\n")
+    pipeline.cleanup_worktrees(cfg=config.load())
+    held_f = json.loads((paths.STATE_DIR / "held-workspaces.json").read_text())
+    check = heartbeat.check_workspaces()[0]
+    result |= {"g": [g.exists(), (paths.STATE_DIR / "workspaces" / f"{g.name}.json").exists(), str(g) in "\n".join(registered())]}
+    result |= {"f": f.exists(), "held_f": held_f, "check_f": [check.ok, check.detail]}
 print("BEHAVIOR_RESULT=" + json.dumps(result))
 '''
 
@@ -3821,9 +3848,26 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertFalse(out["gone"])
         self.assertFalse(out["check"][0])
         self.assertTrue(out["check"][1].startswith("1 held"), out["check"])
+        self.assertEqual(out["held"][0]["names"], ["hand.txt"])
+        self.assertIn("hand.txt", out["check"][1])
         self.assertFalse(out["c_after"])
         self.assertFalse(out["c_record_after"])
+        self.assertTrue(out["e"])
+        self.assertEqual(len(out["held_e"]), 1)
+        self.assertTrue(out["held_e"][0]["blocked"])
+        self.assertEqual(out["held_e"][0]["names"], ["notes.txt"])
+        self.assertFalse(out["check_e"][0])
+        self.assertIn("notes.txt", out["check_e"][1])
+        self.assertFalse(out["e_after"])
         self.assertEqual(out["check_after"], [True, "none held"])
+        self.assertEqual(out["g"], [False, False, False])
+        self.assertTrue(out["f"])
+        self.assertEqual(len(out["held_f"]), 1)
+        self.assertFalse(out["held_f"][0]["blocked"])
+        self.assertEqual(out["held_f"][0]["names"], [])
+        self.assertTrue(out["held_f"][0]["why"].endswith("waits for the ticket"))
+        self.assertTrue(out["check_f"][0])
+        self.assertTrue(out["check_f"][1].startswith("1 held"), out["check_f"])
 
 
 class ChatContextTests(unittest.TestCase):

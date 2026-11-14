@@ -231,7 +231,12 @@ def age_words(since: str) -> str:
 
 def blocked_words(row: dict) -> str:
     names = row.get("names") or []
-    return f"held by {', '.join(names)}" if names else util.first_line(row.get("why") or "", 160)
+    if names:
+        return f"held by {', '.join(names)}"
+    why = row.get("why") or ""
+    if row.get("path") and row.get("name"):
+        why = why.replace(row["path"], row["name"])
+    return util.first_line(why, 160)
 
 
 def check_workspaces() -> list[Check]:
