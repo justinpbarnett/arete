@@ -5,6 +5,7 @@ import { current, listen } from "./ui-router.js";
 import { shell, visit } from "./ui-data.js";
 import { startKeys, marks } from "./ui-keys.js";
 import { startHooks } from "./ui-hooks.js";
+import { normalizePrimary } from "./ui-list.js";
 
 const route = signal(current());
 const snapshot = signal({});
@@ -30,6 +31,7 @@ effect(() => {
   const selected = route.value;
   render(h(Shell, { route: selected, snapshot: snapshot.value, now: now.value }), document.getElementById("app"));
   marks();
+  normalizePrimary();
   document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "My work" : selected.screen}`;
 });
 
