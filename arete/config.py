@@ -20,6 +20,8 @@ STEP_ALIASES = {"implement": "build"}
 INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify"}
 STEP_ROLES = (*MODEL_ROLES, *INHERITS)
 STEP_NAMES = (*STEP_ROLES, *STEP_ALIASES)
+AB_KEYS = ("step", "kind", "share", "arm")
+ARM_KEYS = ("tier", "runner", "provider", "model", "effort")
 STEP_KEYS = ("tier", "runner", "provider", "model", "effort", "timeout_minutes", "tries", "tools", "mcp", "instructions",
              "session", "modalities", "min_context", "structured_output", "data_handling", "floor", "budget_usd",
              "directory_cleanup")
@@ -267,6 +269,7 @@ class Config:
     capture_evidence_branch: str = "feedback-evidence"
     capture_public_evidence: bool = False
     oncall: OncallConfig = field(default_factory=OncallConfig)
+    ab: dict[str, dict] = field(default_factory=dict)
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -374,6 +377,44 @@ def step_tables(data, where: str) -> dict[str, dict]:
         if alias in data and role in data:
             raise ValueError(f"[{where}.{alias}] and [{where}.{role}] are the same step; name the step once")
     return {STEP_ALIASES.get(name, name): step_table(table, f"{where}.{name}") for name, table in data.items()}
+
+
+def ab_tables(data, where: str = "ab") -> dict[str, dict]:
+    found = {}
+    for name, table in table_of(data, where).items():
+        label = f"[{where}.{name}]"
+        table = table_of(table, f"{where}.{name}")
+        if bad := sorted(set(table) - set(AB_KEYS)):
+            raise ValueError(f"{label}: unknown key {', '.join(bad)}; use {', '.join(AB_KEYS)}")
+        step = table.get("step")
+        if step not in STEP_NAMES:
+            raise ValueError(f"{label}: unknown step {step!r}; use {', '.join(STEP_NAMES)}")
+        kind = table.get("kind", "")
+        if kind and kind not in KINDS:
+            raise ValueError(f"{label}: unknown kind {kind!r}; use {', '.join(KINDS)}")
+        share = table.get("share")
+        if isinstance(share, bool) or not isinstance(share, (int, float)) or not 0 < share <= 0.5:
+            raise ValueError(f"{label}: share must be a number above 0 and at most 0.5, not {share!r}")
+        arm = table_of(table.get("arm"), f"{where}.{name}.arm") if "arm" in table else {}
+        if not arm:
+            raise ValueError(f"{label}: arm must set at least one of {', '.join(ARM_KEYS)}")
+        if bad := sorted(set(arm) - set(ARM_KEYS)):
+            raise ValueError(f"[{where}.{name}.arm]: unknown key {', '.join(bad)}; use {', '.join(ARM_KEYS)}")
+        found[name] = {"step": STEP_ALIASES.get(step, step), "kind": kind, "share": float(share),
+                       "arm": step_table(arm, f"{where}.{name}.arm")}
+    ab_clash(found)
+    return found
+
+
+def ab_clash(tests: dict) -> None:
+    names = list(tests)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            one, two = tests[a], tests[b]
+            if one["step"] == two["step"] and (one["kind"] == two["kind"] or not one["kind"] or not two["kind"]):
+                kind = one["kind"] or two["kind"]
+                raise ValueError(f"[ab.{a}] and [ab.{b}] both change step {one['step']}"
+                                 + (f" for {kind} tickets" if kind else "") + "; keep one A/B per step and kind")
 
 
 def kind_tables(data, where: str) -> dict[str, dict[str, dict]]:
@@ -901,6 +942,7 @@ def load(path: Path | None = None) -> Config:
     cfg.document = document_table(data.get("document") or {}, path.parent)
     cfg.capture_vision, cfg.capture_evidence_branch, cfg.capture_public_evidence = capture_table(
         data.get("capture") or {}, path.parent)
+    cfg.ab = ab_tables(data.get("ab") or {})
     from . import steps
     steps.check(cfg, defer_tiers=True)
     return cfg
@@ -983,6 +1025,7 @@ class RepoLayer:
     tier_map: str = ""
     passes: tuple[str, ...] = ()
     document: dict = field(default_factory=dict)
+    ab: dict[str, dict] = field(default_factory=dict)
 
     @property
     def builder_bash(self) -> list[str]:
@@ -1002,7 +1045,7 @@ class RepoLayer:
 
 
 LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
-                  "factory", "environment", "routing", "document"}
+                  "factory", "environment", "routing", "document", "ab"}
 
 
 def section(data: dict, name: str) -> dict:
@@ -1050,6 +1093,7 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     layer.payment_modes = found.payment_modes
     layer.steps = step_tables(section(data, "steps"), "steps")
     layer.kinds = kind_tables(section(data, "kinds"), "kinds")
+    layer.ab = ab_tables(section(data, "ab"))
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
     layer.tier_map = str(section(data, "factory").get("tier_map", "")).strip()
     if layer.factory_path not in FACTORY_PATHS:

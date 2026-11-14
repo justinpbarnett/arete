@@ -60,7 +60,10 @@ CREATE TABLE IF NOT EXISTS steps (
     kind TEXT DEFAULT '',
     cache_read INTEGER DEFAULT 0,
     cache_write INTEGER DEFAULT 0,
-    api_seconds REAL DEFAULT 0
+    api_seconds REAL DEFAULT 0,
+    atom TEXT DEFAULT '',
+    ab TEXT DEFAULT '',
+    ab_side TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS steps_ts ON steps (ts);
 CREATE INDEX IF NOT EXISTS steps_run ON steps (run_id);
@@ -572,7 +575,9 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
                   ("effort", "TEXT DEFAULT ''"), ("tier", "TEXT DEFAULT ''"), ("try", "INTEGER DEFAULT 0"),
                   ("kind", "TEXT DEFAULT ''"), ("cache_read", "INTEGER DEFAULT 0"), ("cache_write", "INTEGER DEFAULT 0"),
-                  ("api_seconds", "REAL DEFAULT 0"), ("auth_mode", "TEXT DEFAULT ''"))],
+                  ("api_seconds", "REAL DEFAULT 0"), ("auth_mode", "TEXT DEFAULT ''"),
+                  ("atom", "TEXT DEFAULT ''"), ("ab", "TEXT DEFAULT ''"), ("ab_side", "TEXT DEFAULT ''"))],
+              ("runs", "ab_held", "ALTER TABLE runs ADD COLUMN ab_held TEXT DEFAULT ''"),
               *[("incidents", col, f"ALTER TABLE incidents ADD COLUMN {col} {kind}") for col, kind in (
                   ("decision", "TEXT DEFAULT ''"), ("confidence", "REAL DEFAULT 0"), ("reason", "TEXT DEFAULT ''"),
                   ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
@@ -1520,6 +1525,31 @@ def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db, whole:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                                            + (f"AND {WHOLE_RUN} " if whole else "")
                                            + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
+
+
+def ab_placements(since: str, name: str = "", connect=db) -> list[dict]:
+    with connect() as c:
+        labelled = [dict(r) for r in c.execute(
+            "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "
+            "JOIN runs r ON r.id = steps.run_id WHERE COALESCE(steps.ab, '') != '' AND r.kind = 'pipeline' "
+            "AND r.started >= ?" + (" AND steps.ab = ?" if name else ""), (since, *([name] if name else [])))]
+        held = c.execute("SELECT repo, issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "
+                         "AND COALESCE(ab_held, '') != ''", (since,)).fetchall()
+    assigned = [{"ab": ab, "ab_side": side, "atom": role, "repo": r["repo"], "issue": r["issue"]}
+                for r in held for role, (ab, side, _) in json.loads(r["ab_held"]).items() if not name or ab == name]
+    return list({tuple(p.values()): p for p in labelled + assigned}.values())
+
+
+def ab_held(run_id: str, connect=db) -> dict[str, tuple[str, str, dict]]:
+    with connect() as c:
+        row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return {role: tuple(held) for role, held in json.loads(row["ab_held"] or "{}").items()} if row else {}
+
+
+def ticket_runs_since(repo: str, issue: int | str, since: str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+                                           "AND started >= ? ORDER BY started", (repo, issue, since))]
 
 
 def later_run(repo: str, issue: int | str, run_id: str, connect=db) -> dict | None:

@@ -19,6 +19,7 @@ from arete import (
     claude,
     cli,
     config,
+    control,
     diffguard,
     factory,
     flows,
@@ -32,6 +33,7 @@ from arete import (
     scratch,
     serve,
     state,
+    steps,
     tracker,
     util,
 )
@@ -1037,6 +1039,148 @@ class RecordRetentionTests(Isolated):
         self.assertEqual((found["bytes"], found["records"], found["pins"]), (1500, 2, 1))
         self.assertEqual(found["oldest"]["run_id"], "pip-a")
         self.assertEqual(record.size_text(1500), "1.5 KB")
+
+
+class RouteABTests(Isolated):
+    def configured(self, **test):
+        return config.Config(repos=[self.repo], steps={"plan": {"model": "opus"}}, ab={"cheap-plan": {
+            "step": "plan", "kind": "", "share": 0.5, "arm": {"model": "haiku"}, **test}})
+
+    def sides(self, cfg, kind="feat"):
+        return [steps.resolve(cfg, None, "plan", kind, ticket=("fixture", str(n))) for n in range(1, 41)]
+
+    def refused_text(self, body):
+        path = self.root / "ab.toml"
+        path.write_text(body)
+        with self.assertRaises(ValueError) as caught:
+            config.load(path)
+        return str(caught.exception)
+
+    def test_share_decides_a_stable_side_per_ticket(self):
+        cfg = self.configured()
+        first, second = self.sides(cfg), self.sides(cfg)
+        self.assertTrue(12 <= sum(s.ab_side == "arm" for s in first) <= 28)
+        self.assertEqual([s.ab_side for s in first], [s.ab_side for s in second])
+        self.assertEqual({(s.ab_side, s.model) for s in first}, {("arm", "haiku"), ("baseline", "opus")})
+        self.assertEqual({s.ab_name for s in self.sides(self.configured(kind="feat"), "fix")}, {""})
+
+    def test_config_refuses_bad_tables_with_the_reason(self):
+        head = '[ab.cheap-plan]\nstep = "plan"\n'
+        self.assertIn("[ab.cheap-plan]: share must be a number above 0 and at most 0.5, not 0.8",
+                      self.refused_text(head + 'share = 0.8\narm = { model = "haiku" }\n'))
+        self.assertIn("share must be a number", self.refused_text(head + 'share = 0\narm = { model = "haiku" }\n'))
+        self.assertIn("unknown step 'nope'", self.refused_text(
+            '[ab.cheap-plan]\nstep = "nope"\nshare = 0.2\narm = { model = "haiku" }\n'))
+        self.assertIn("unknown key tools", self.refused_text(head + 'share = 0.2\narm = { tools = ["Read"] }\n'))
+        text = self.refused_text(head + 'share = 0.2\narm = { model = "haiku", effort = "turbo" }\n')
+        self.assertTrue(text.startswith("[ab.cheap-plan]:") and "turbo" in text, text)
+        other = '[ab.other]\nstep = "plan"\nshare = 0.2\narm = { model = "sonnet" }\n'
+        for kinds in ("", 'kind = "feat"\n'):
+            self.assertIn("both change step plan", self.refused_text(
+                head + 'share = 0.2\narm = { model = "haiku" }\n' + other.replace("share", kinds + "share")))
+        self.assertIn("both change step plan for feat tickets", self.refused_text(
+            head + 'kind = "feat"\nshare = 0.2\narm = { model = "haiku" }\n'
+            + other.replace("share", 'kind = "feat"\nshare')))
+        path = self.root / "ok.toml"
+        path.write_text(head + 'share = 0.5\narm = { model = "haiku" }\n')
+        self.assertEqual(config.load(path).ab["cheap-plan"]["share"], 0.5)
+
+    def test_runs_record_the_side_and_a_retry_keeps_it(self):
+        answers = self.root / "answers"
+        answers.mkdir()
+        (answers / "plan.json").write_text(json.dumps({"text": "ok", "cost_usd": 0.5}))
+        cfg = self.configured()
+        cfg.replay = config.ReplayConfig(all=True, dir=answers)
+        tids = {side: next(str(n) for n in range(1, 99) if steps.in_arm("cheap-plan", 0.5, ("fixture", str(n)))
+                           == (side == "arm")) for side in ("arm", "baseline")}
+
+        def rows(tid):
+            rid = record.start("pipeline", repo=self.repo.name, issue=tid)
+            directory = paths.RUNS_DIR / rid
+            directory.mkdir()
+            pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=tid, cfg=cfg).agent(
+                "plan", "x", self.repo.path, role="plan")
+            with state.db() as c:
+                return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ?", (rid,))]
+
+        arm, baseline, retry = rows(tids["arm"]), rows(tids["baseline"]), rows(tids["arm"])
+        self.assertEqual([(r["model"], r["ab"], r["ab_side"], r["atom"]) for r in arm],
+                         [("haiku", "cheap-plan", "arm", "plan")])
+        self.assertEqual([(r["model"], r["ab_side"]) for r in baseline], [("opus", "baseline")])
+        self.assertEqual([(r["model"], r["ab_side"]) for r in retry], [("haiku", "arm")])
+
+    def test_a_continuation_keeps_its_route_after_the_table_is_removed(self):
+        tid = next(t for t in (state.task_add(self.repo.name, "Fixture", "Fixture", "feat") for _ in range(60))
+                   if steps.in_arm("cheap-plan", 0.5, (self.repo.name, str(t))))
+        models = []
+
+        def interrupted_call(text, cwd, **kw):
+            models.append(kw["model"])
+            record.settle(kw["trace"][0], "interrupted")
+            return Result(ok=False, error="interrupted")
+
+        def drive(flow):
+            flow.ctx.run.agent("plan", "x", self.repo.path, role="plan")
+            return "failed", "fixture ended", ""
+
+        def run_with(cfg, call):
+            with patch.object(config, "load", return_value=cfg), \
+                    patch.object(pipeline, "run_refusal", return_value=(True, "")), \
+                    patch.object(pipeline.runner, "run", side_effect=call):
+                pipeline.run_issue(self.repo.name, tid, force=True, script=pipeline.Script("feature", drive))
+            return state.ticket_runs(self.repo.name, tid, limit=1, whole=True)[0]["id"]
+
+        first = run_with(self.configured(), interrupted_call)
+        removed = self.configured()
+        removed.ab = {}
+        second = run_with(removed, interrupted_call)
+        self.assertEqual(models, ["haiku", "haiku"])
+        self.assertNotEqual(first, second)
+        self.assertEqual(state.ab_held(second), state.ab_held(first))
+        self.assertEqual(state.ab_held(first)["plan"][:2], ("cheap-plan", "arm"))
+
+    def test_the_seam_envelope_carries_the_labels(self):
+        found = factory.envelope([{"ab": "cheap-plan", "ab_side": "arm", "atom": "plan"}])
+        self.assertEqual((found["ab"], found["ab_side"]), ("cheap-plan", "arm"))
+
+    def seeded(self, per_side):
+        for side, mode, cost, merged in (("arm", "api_key", 1.0, 15), ("baseline", "subscription", 2.0, 10)):
+            for n in range(per_side):
+                rid = record.start("pipeline", repo=self.repo.name, issue=f"{side}{n}")
+                made = Result(ok=True, runner="claude", model="opus", cost_usd=cost, auth_mode=mode)
+                record.step(rid, "plan", made, 1, try_no=1)
+                record.label_step(rid, "plan", 1, atom="plan", ab="cheap-plan", ab_side=side)
+                record.step(rid, "review", made, 1, try_no=1)
+                record.label_step(rid, "review", 1, atom="review")
+                if side == "arm" and n < 3:
+                    record.step(rid, "review_fix", made, 1, try_no=1)
+                    record.label_step(rid, "review_fix", 1, atom="review_repair")
+                won = n < merged
+                record.settle(rid, "merged" if won else "failed", pr_url="https://pr/1" if won else "")
+
+    def test_report_counts_costs_and_interval(self):
+        self.seeded(25)
+        report = control.ab_report("cheap-plan", cfg=self.cfg)
+        self.assertEqual(len(report), 1)
+        arm, baseline = report[0]["sides"]["arm"], report[0]["sides"]["baseline"]
+        self.assertEqual((arm["tickets"], arm["merged"], arm["no_pr"], arm["repairs"], arm["review_rounds"]),
+                         (25, 15, 10, 3, 25))
+        self.assertEqual((baseline["tickets"], baseline["merged"], baseline["repairs"]), (25, 10, 0))
+        self.assertEqual((arm["paid_per_merged"], arm["subscription_per_merged"]), (round(53 / 15, 4), 0.0))
+        self.assertEqual((baseline["paid_per_merged"], baseline["subscription_per_merged"]), (0.0, 10.0))
+        low, high = report[0]["interval"]
+        self.assertTrue(low < report[0]["merge_rate_difference"] < high)
+        self.assertEqual(report[0]["merge_rate_difference"], 0.2)
+        self.assertFalse(report[0]["too_few"])
+        out = io.StringIO()
+        with patch.object(config, "load", return_value=self.cfg), contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["ab", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["sides"], report[0]["sides"])
+
+    def test_report_flags_too_few_tickets(self):
+        self.seeded(5)
+        self.assertTrue(control.ab_report(cfg=self.cfg)[0]["too_few"])
+        self.assertEqual(control.ab_report("nothing", cfg=self.cfg), [])
 
 
 class NoLiveStateTests(unittest.TestCase):

@@ -272,6 +272,7 @@ class AgentRun:
     writes_lines: bool = True
     step_calls: dict[str, int] = field(default_factory=dict)
     budget: runlimits.Budget | None = None
+    ab_held: dict[str, tuple[str, str, dict]] = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -314,11 +315,16 @@ class AgentRun:
             self.cfg = config.load()
         return self.cfg
 
+    @property
+    def ab_ticket(self) -> tuple[str, str] | None:
+        return None
+
     def settings(self, role: str) -> steps.Settings:
         role = config.STEP_ALIASES.get(role, role)
         return steps.resolve(self.config, self.layer, role, self.kind,
                              {**self.overrides, **self.step_overrides.get(role, {})},
-                             self.step_overrides.get(config.INHERITS.get(role, ""), {}))
+                             self.step_overrides.get(config.INHERITS.get(role, ""), {}), ticket=self.ab_ticket,
+                             held=self.ab_held.get(role))
 
     def time_for(self, seconds: float) -> float:
         return seconds
@@ -377,24 +383,30 @@ class AgentRun:
                     self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kind, **fields)
 
             kw["on_launch"] = announce
+        if s and s.ab_name:
+            record.hold_ab(self.id, s.step, s.ab_name, s.ab_side, json.loads(s.ab_arm or "{}"))
         attempt_no = self.step_calls[step] = max(state.step_tries(self.id, step), self.step_calls.get(step, 0)) + 1
         kw["try_no"] = attempt_no
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
-        with lines.beating(self.id, step) if lined else nullcontext():
-            res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
-            if res.connection_failed:
-                self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
-                if self.wait_for_network():
-                    dropped = res
-                    self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
-                    if res.session.id and res.turns > 1 and kw.get("persist", True):
-                        res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
-                                         **{**kw, "resume": res.session, **self.retry_kw()})
-                    else:
-                        res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
-                                         **{**kw, **self.retry_kw()})
-                    res = runner.with_spent(res, [dropped])
+        try:
+            with lines.beating(self.id, step) if lined else nullcontext():
+                res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+                if res.connection_failed:
+                    self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
+                    if self.wait_for_network():
+                        dropped = res
+                        self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
+                        if res.session.id and res.turns > 1 and kw.get("persist", True):
+                            res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                                             **{**kw, "resume": res.session, **self.retry_kw()})
+                        else:
+                            res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                                             **{**kw, **self.retry_kw()})
+                        res = runner.with_spent(res, [dropped])
+        finally:
+            if s:
+                record.label_step(self.id, step, attempt_no, atom=s.step, ab=s.ab_name, ab_side=s.ab_side)
         if s and res.session.id:
             self.sessions[config.INHERITS.get(s.step, s.step)] = res.session
         self.cost += res.cost_usd
@@ -407,6 +419,8 @@ class AgentRun:
                  "cache_write": res.cache_write, "api_seconds": round(res.api_seconds, 2)}
         if s:
             usage["atom"] = s.step
+        if s and s.ab_name:
+            usage.update(ab=s.ab_name, ab_side=s.ab_side)
         if seam is not None:
             seam.add(error="" if res.ok else res.error or "", **usage)
         else:
@@ -441,6 +455,10 @@ class Run(AgentRun):
     @property
     def ref(self) -> str:
         return self.tracker.ref(self.tid)
+
+    @property
+    def ab_ticket(self) -> tuple[str, str] | None:
+        return (self.repo.name, str(self.tid))
 
     @property
     def asks_owner(self) -> bool:
@@ -1606,6 +1624,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
                       **(script.run_fields if script else {}))
             run.dir.mkdir(parents=True, exist_ok=True)
+            if held_from := earlier[0]["id"] if restarting or run.answering else (
+                    script.continues or script.repairs if script else ""):
+                run.ab_held = state.ab_held(held_from)
+                for role, (ab, side, arm) in run.ab_held.items():
+                    record.hold_ab(run_id, role, ab, side, arm)
             if mending:
                 lines.write(run_id, "repair", source=mending)
                 run.log(f"repairing the review findings of run {mending}")
@@ -4007,7 +4030,7 @@ def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
     elif pending_feedback(repo.name, ticket.id):
         first = ("build",)
     for role in (*first, *(("verify",) if layer.verify else ()), "review"):
-        setting = steps.resolve(cfg, layer, role, ticket.kind)
+        setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
         if setting.runner == runner.REPLAY:
             continue
         routes = discovery.routes(setting)

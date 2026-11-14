@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +54,9 @@ class Settings:
     inherits: str = ""
     budget_usd: float | None = None
     explicit_route: bool = False
+    ab_name: str = ""
+    ab_side: str = ""
+    ab_arm: str = ""
 
     def effort_on(self, which: str) -> str:
         return routing.nearest_effort(which, self.effort)
@@ -135,8 +139,31 @@ def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple
     return next(iter(maps.items()), ("", {}))
 
 
+def experiments(cfg: config.Config, layer: config.RepoLayer | None) -> dict[str, dict]:
+    return {**cfg.ab, **(layer.ab if layer else {})}
+
+
+def experiment_for(cfg: config.Config, layer: config.RepoLayer | None, role: str,
+                   kind: str) -> tuple[str, dict] | None:
+    return next(((name, test) for name, test in experiments(cfg, layer).items()
+                 if test["step"] == role and test["kind"] in ("", kind)), None)
+
+
+def in_arm(name: str, share: float, ticket: tuple[str, str]) -> bool:
+    digest = hashlib.sha256("\0".join((name, *ticket)).encode()).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64 < share
+
+
+def ab_view(cfg: config.Config, layer: config.RepoLayer | None, role: str, kind: str) -> dict | None:
+    found = experiment_for(cfg, layer, role, kind)
+    if not found:
+        return None
+    name, test = found
+    return {"name": name, "share": test["share"], "kind": test["kind"], "arm": test["arm"]}
+
+
 def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, overrides: dict,
-           inherited: dict | None = None) -> dict:
+           inherited: dict | None = None, arm: dict | None = None) -> dict:
     base = config.INHERITS.get(role, "")
     if base:
         settings, own_route = {**merged(cfg, layer, base, kind, inherited or {}), **BUILT_IN.get(role, {})}, False
@@ -145,7 +172,7 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
                                **BUILT_IN.get(role, {})}, True
     explicit_runner = False
     for level in (cfg.steps.get(role), cfg.kinds.get(kind, {}).get(role), layer.steps.get(role),
-                  layer.kinds.get(kind, {}).get(role), overrides):
+                  layer.kinds.get(kind, {}).get(role), overrides, arm):
         explicit_runner = explicit_runner or bool(level and "runner" in level)
         if level and "model" in level:
             settings = {k: v for k, v in settings.items() if k not in MODEL_SOURCE}
@@ -197,14 +224,24 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
 
 
 def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind: str = "",
-            overrides: dict | None = None, inherited: dict | None = None) -> Settings:
+            overrides: dict | None = None, inherited: dict | None = None, *,
+            ticket: tuple[str, str] | None = None, side: str = "",
+            held: tuple[str, str, dict] | None = None) -> Settings:
     role = config.STEP_ALIASES.get(step, step)
     if role not in config.STEP_ROLES:
         raise ValueError(f"unknown step '{step}'; use {', '.join(config.STEP_NAMES)}")
     where = f"step {role}" + (f" for {kind} tickets" if kind else "")
     layer = layer or config.RepoLayer(dir=Path())
+    ab_name = ab_side = ""
+    arm = None
+    if held:
+        ab_name, ab_side, arm = held[0], held[1], (held[2] if held[1] == "arm" else None)
+    elif (test := experiment_for(cfg, layer, role, kind)) and (ticket or side):
+        ab_name = test[0]
+        ab_side = side or ("arm" if in_arm(ab_name, test[1]["share"], ticket) else "baseline")
+        arm = test[1]["arm"] if ab_side == "arm" else None
     found = merged(cfg, layer, role, kind, config.step_table(overrides or {}, f"{where}: overrides"),
-                   config.step_table(inherited or {}, f"{where}: overrides"))
+                   config.step_table(inherited or {}, f"{where}: overrides"), arm)
     tier = ""
     entries: tuple[dict[str, str], ...] = ()
     if found.get("model"):
@@ -260,7 +297,8 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
                     chain=chain, fallback=fallback,
                     instructions_explicit=explicit is not None, requires=requires,
                     inherits=config.INHERITS.get(role, ""), budget_usd=found.get("budget_usd"),
-                    explicit_route=found.get("explicit_route", False))
+                    explicit_route=found.get("explicit_route", False), ab_name=ab_name, ab_side=ab_side,
+                    ab_arm=json.dumps(arm) if arm else "")
 
 
 def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_tiers: bool = False) -> None:
@@ -275,3 +313,13 @@ def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_ti
                 if found.get("tier") and not found.get("model"):
                     continue
             resolve(cfg, layer, role, kind)
+    tests = experiments(cfg, layer)
+    config.ab_clash(tests)
+    for name, test in tests.items():
+        if deferred and "tier" in test["arm"] and "model" not in test["arm"]:
+            continue
+        for kind in (test["kind"],) if test["kind"] else ("", *config.KINDS):
+            try:
+                resolve(cfg, layer, test["step"], kind, side="arm")
+            except ValueError as e:
+                raise ValueError(f"[ab.{name}]: {e}") from None

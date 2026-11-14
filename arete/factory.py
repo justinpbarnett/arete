@@ -16,7 +16,7 @@ from . import asks, config, lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
-LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode", "atom")
+LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode", "atom", "ab", "ab_side")
 COUNTS = ("tokens_in", "tokens_out", "turns", "cache_read", "cache_write")
 MAX_ERROR_CHARS = 500
 OPENING = "prepare"

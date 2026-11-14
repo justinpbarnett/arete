@@ -1209,6 +1209,40 @@ def cmd_costs(args) -> int:
     return 0
 
 
+def cmd_ab(args) -> int:
+    from . import control
+
+    try:
+        report = control.ab_report(args.name or "", args.days)
+    except (control.Refused, ValueError, TypeError) as e:
+        return refused(e)
+    if args.json:
+        for test in report:
+            print(json.dumps(test))
+        return 0
+    if not report:
+        days = control.AB_DAYS if args.days is None else args.days
+        print(f"No ticket ran {'the A/B ' + args.name if args.name else 'an A/B'} in the last {days:g} days.")
+        return 0
+
+    def money(value: float | None) -> str:
+        return "-" if value is None else f"${value:.2f}"
+
+    for test in report:
+        print(f"A/B {test['ab']} on step {test['step']}, last {test['days']:g} days")
+        rows = [("side", "tickets", "merged", "no PR", "repairs", "review rounds", "api $/merged PR",
+                 "subscription $/merged PR")]
+        for side, s in test["sides"].items():
+            rows.append((side, str(s["tickets"]), str(s["merged"]), str(s["no_pr"]), str(s["repairs"]),
+                         str(s["review_rounds"]), money(s["paid_per_merged"]), money(s["subscription_per_merged"])))
+        print_table(rows, 200)
+        lo, hi = test["interval"]
+        print(f"merge rate arm - baseline: {test['merge_rate_difference'] * 100:+.1f} points "
+              f"(95% Wilson interval {lo * 100:+.1f} to {hi * 100:+.1f})"
+              + ("; too few tickets (under 20 a side)" if test["too_few"] else ""))
+    return 0
+
+
 def print_step_costs(groupings: list[str], days: float | None, as_json: bool) -> int:
     from . import control
 
@@ -1277,6 +1311,7 @@ def cmd_steps(args) -> int:
         selection = (routing.described_selection(routing.select(found, s, remaining), s, 0)
                      if found and s.requires.declared else None)
         print(json.dumps({**dataclasses.asdict(s), "notes": notes, "routes": routes, "selection": selection,
+                          "ab": steps.ab_view(cfg, layer, s.step, args.kind),
                           "payment_modes": list(config.allowed_payment_modes(cfg, layer))}))
     return 0
 
@@ -1787,6 +1822,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="one grouping or several, in order; route is runner/provider/model/billing")
     p.add_argument("--json", action="store_true", help="one JSON line per group, then one with the wait minutes")
     p.set_defaults(fn=cmd_costs)
+
+    p = steering(sub.add_parser("ab", help="compare the arm and baseline of each per-step A/B route on live tickets: "
+                                           "merged PRs, repairs, review rounds and cost per merged PR"))
+    p.add_argument("name", nargs="?", default="")
+    p.add_argument("--days", type=float, default=None)
+    p.add_argument("--json", action="store_true", help="one JSON line per A/B")
+    p.set_defaults(fn=cmd_ab)
 
     p = steering(sub.add_parser("steps", help="the model, runner, effort, timeout, tries, tools, mcp servers, "
                                               "instructions and session each step resolves to, one JSON line per step"))

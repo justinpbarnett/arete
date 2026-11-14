@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -26,6 +27,9 @@ from . import (
 from .agent import subscription
 from .loops import Loop
 
+AB_DAYS = 30
+AB_MIN_TICKETS = 20
+REPAIRS = tuple(r for r, b in config.INHERITS.items() if b == "build")
 BEAT_FILE = paths.STATE_DIR / "serve.json"
 BEAT_STALE_SECONDS = 120
 DETACHED_LOG = "loops.log"
@@ -310,6 +314,67 @@ def step_costs(by: str, days: float | None = None, connect=state.db, cfg: config
             "subscription_usd": round(subscribed, 4),
             "groups": sorted(out, key=lambda r: (-r["cost_usd"], -r["calls"], r["name"])),
             "wait_minutes": {cause: round(minutes, 2) for cause, minutes in waits.items()}}
+
+
+def wilson(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if not n:
+        return 0.0, 1.0
+    p = hits / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def rate_difference(arm: tuple[int, int], base: tuple[int, int]) -> tuple[float, float, float]:
+    p1, p2 = arm[0] / arm[1] if arm[1] else 0.0, base[0] / base[1] if base[1] else 0.0
+    (l1, u1), (l2, u2) = wilson(*arm), wilson(*base)
+    d = p1 - p2
+    return d, d - math.sqrt((p1 - l1) ** 2 + (u2 - p2) ** 2), d + math.sqrt((u1 - p1) ** 2 + (p2 - l2) ** 2)
+
+
+def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, connect, cfg: config.Config) -> dict:
+    runs = [r for repo, issue in tickets for r in state.ticket_runs_since(repo, issue, since, connect)]
+    merged = {(r["repo"], r["issue"]) for r in runs if r["status"] == "merged"}
+    rows = [(r["id"], s) for r in runs for s in steps_by_run.get(r["id"], ())]
+    cost = {"api_key": 0.0, "subscription": 0.0}
+    for _, s in rows:
+        billing = billing_of(s, cfg)
+        if billing in cost:
+            cost[billing] += s["cost_usd"] or 0
+
+    def counted(atoms: tuple[str, ...]) -> int:
+        return len({(run_id, s["step"], s["try"]) for run_id, s in rows if s.get("atom") in atoms})
+
+    def per(total: float) -> float | None:
+        return round(total / len(merged), 4) if merged else None
+
+    return {"tickets": len(tickets), "runs": len(runs), "merged": len(merged),
+            "no_pr": sum(1 for r in runs if r["status"] != "running" and not r["pr_url"]),
+            "repairs": counted(REPAIRS), "review_rounds": counted(("review",)),
+            "paid_usd": round(cost["api_key"], 4), "subscription_usd": round(cost["subscription"], 4),
+            "paid_per_merged": per(cost["api_key"]), "subscription_per_merged": per(cost["subscription"]),
+            "merge_rate": round(len(merged) / len(tickets), 4) if tickets else 0.0}
+
+
+def ab_report(name: str = "", days: float | None = None, connect=state.db, cfg: config.Config | None = None) -> list[dict]:
+    days, since = cost_window(AB_DAYS if days is None else days)
+    cfg = cfg or config.load()
+    placed: dict[str, dict] = {}
+    for p in state.ab_placements(since, name, connect):
+        test = placed.setdefault(p["ab"], {"step": p["atom"], "arm": set(), "baseline": set()})
+        if p["ab_side"] in ("arm", "baseline"):
+            test[p["ab_side"]].add((p["repo"], p["issue"]))
+    steps_by_run: dict[str, list[dict]] = defaultdict(list)
+    for s in state.steps_since(since, connect):
+        steps_by_run[s["run_id"]].append(s)
+    report = []
+    for ab, test in sorted(placed.items()):
+        sides = {side: ab_side(test[side], steps_by_run, since, connect, cfg) for side in ("arm", "baseline")}
+        d, lo, hi = rate_difference(*((sides[s]["merged"], sides[s]["tickets"]) for s in ("arm", "baseline")))
+        report.append({"ab": ab, "step": test["step"], "days": days, "since": since, "sides": sides,
+                       "merge_rate_difference": round(d, 4), "interval": [round(lo, 4), round(hi, 4)],
+                       "too_few": min(s["tickets"] for s in sides.values()) < AB_MIN_TICKETS})
+    return report
 
 
 def paid_since(since: str, connect=state.db, cfg: config.Config | None = None) -> dict:
