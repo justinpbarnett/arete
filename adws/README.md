@@ -12,7 +12,7 @@ A task has many runs. An answer, a resume and a step each start a **new** run wi
 
 ## Setup
 
-Run the recipes from this checkout, so `uv run arete` runs this checkout's code. The server is `arete serve`, or `arete dashboard` alone. The recipes call only the server that works on their own state and config: once it listens, the server writes where it listens, its state folder and its config file to `server.json` in the state folder. `ARETE_SERVER=http://HOST:PORT` names a server and skips that check.
+Run the recipes from this checkout, so `uv run arete` runs this checkout's code. The server is `arete serve`, or `arete dashboard` alone. The recipes call only the server that works on their own state and config: once it listens, the server writes where it listens, its state folder and its config file to `server.json` in the state folder. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check.
 
 ## Output
 
@@ -37,7 +37,7 @@ With no `code`, the recipe failed on its own side. The start of `error` says why
 | `error` starts with | means | then |
 |---|---|---|
 | `no arete server is up`, `the arete server is not up`, `the arete server named in` | no server works on this checkout's state and config | tell the person; do not start arete yourself |
-| `ARETE_SERVER=` | `ARETE_SERVER` is not `http://HOST:PORT` | tell the person |
+| `ARETE_SERVER=` | `ARETE_SERVER` is not `http://HOST:PORT` or `https://HOST:PORT` | tell the person |
 | `the server` … `broke off`, `the server answered` … `with no JSON` | the call dropped halfway, so a start, answer, resume, step or stop may have gone through | look with `just adw-status <id>` before you send it again |
 | `run` … `with no report line` | the run ended and wrote no report | read `just adw-logs <id>` and tell the person |
 | `the server stopped sending run` | the run's lines stopped for 2 minutes, and the run may still be going | `just adw-wait <id>` again |

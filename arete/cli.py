@@ -1137,8 +1137,7 @@ def cmd_webhook(args) -> int:
         return 1
     key = hooks.secret(loop.name)
     node = dashboard.this_node(config.load().dashboard_owner)
-    host = node.addresses[0] if node else "<this machine's tailnet address>"
-    print(f"POST http://{host}:{config.load().dashboard_port}{hooks.hook_path(loop.name)}")
+    print(f"POST {dashboard.url(node, config.load().dashboard_port)}{hooks.hook_path(loop.name)}")
     print(f"X-Arete-Token: {key}")
     print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
     return 0
