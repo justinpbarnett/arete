@@ -44,6 +44,8 @@ KINDS = ("idea", "adjustment", "bug")
 LIMITS = {"text": 4000, "expected": 2000, "actual": 2000, "steps": 2000}
 MOST_CONTEXT_BYTES = 8 * 1024
 MOST_ID = 120
+ABSENT = object()
+MOST_SCREEN = 200
 VIEWS = ("live", "runs", "sessions", "loops", "triage", "outcomes", "health", "incidents", "settings", "usage")
 ITEM_KINDS = ("run", "session", "loop", "ticket", "incident")
 RUN_ID = re.compile(r"\w[\w.-]*")
@@ -264,12 +266,18 @@ def run_facts(run_id: str) -> dict:
     return {key: safe(value) for key, value in facts.items() if value}
 
 
-def snapshot(view_name: str, detail, code: str) -> str:
-    if view_name not in VIEWS:
+def snapshot(view_name, detail, code: str, screen=ABSENT) -> str:
+    if screen is not ABSENT and (not isinstance(screen, str) or not screen.startswith("#") or len(screen) > MOST_SCREEN):
+        raise Refused(f"The screen must be text that starts with # and is at most {MOST_SCREEN} characters.")
+    if view_name is not ABSENT and view_name not in VIEWS:
         raise Refused(f"The view must be one of {', '.join(VIEWS)}.")
     if detail is not None and not isinstance(detail, dict):
         raise Refused("The open item must be an object with a kind and an id.")
-    snap = {"captured": util.iso(), "app": {"version": __version__, "code": code}, "view": view_name}
+    snap = {"captured": util.iso(), "app": {"version": __version__, "code": code}}
+    if view_name is not ABSENT:
+        snap["view"] = view_name
+    if screen is not ABSENT:
+        snap["screen"] = safe(screen)
     if detail:
         kind, item_id = detail.get("kind"), detail.get("id")
         if kind not in ITEM_KINDS:
@@ -287,7 +295,9 @@ def snapshot(view_name: str, detail, code: str) -> str:
 
 
 def add_context(body: dict, code: str) -> dict:
-    text = snapshot(str(body.get("view") or ""), body.get("detail"), code)
+    screen = body.get("screen", ABSENT)
+    view_name = str(body.get("view") or "") if screen is ABSENT or "view" in body else ABSENT
+    text = snapshot(view_name, body.get("detail"), code, screen)
     refuse_while_filing()
     if not state.capture_save(context=text):
         raise Conflict(FILING)

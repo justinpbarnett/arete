@@ -27,6 +27,7 @@ from . import (
     environment,
     explain,
     hold_review,
+    hook,
     loops,
     oncall,
     paths,
@@ -158,7 +159,6 @@ class Server:
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
-        self.restarted: Counter[int] = Counter()
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
@@ -222,20 +222,36 @@ class Server:
             return
         if made:
             self.copy_off_machine(made)
-        state.prune(keep_days=self.cfg.oncall.keep_days)
         limits = self.cfg.retention
+        try:
+            state.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
+        except Exception as e:
+            self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+        try:
+            purged = record.purge_folders()
+            if purged.folders:
+                self.say(f"runs: removed {util.count(purged.folders, 'folder')} ({record.size_text(purged.size)})")
+            for error in purged.errors:
+                self.say(f"folder purge failed: {util.first_line(error, 300)}")
+        except Exception as e:
+            self.say(f"folder purge failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
         try:
             found = record.prune(limits.days, limits.max_gb)
         except Exception as e:
             self.say(f"record prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
-            return
-        if found.removed:
-            self.say(f"records: removed {util.count(len(found.removed), 'record')} "
-                     f"({record.size_text(sum(r.size for r in found.removed))}), "
-                     f"{found.left} left ({record.size_text(found.left_bytes)})")
-        if found.over:
-            self.say(f"records: {record.size_text(found.left_bytes)} is over max_gb {limits.max_gb:g}; every record "
-                     "left is pinned, cited by a pending proposal, running or written in the last hour")
+        else:
+            if found.removed:
+                self.say(f"records: removed {util.count(len(found.removed), 'record')} "
+                         f"({record.size_text(sum(r.size for r in found.removed))}), "
+                         f"{found.left} left; runs/ uses {record.size_text(found.left_bytes)}")
+            if found.over:
+                self.say(f"runs/: {record.size_text(found.left_bytes)} is over max_gb {limits.max_gb:g}; records "
+                         "left are pinned, cited by a kept proposal, running or written in the last hour; "
+                         "bytes outside record/ stay until folder expiry")
+        try:
+            hook.rotate_events(limits.lines_days)
+        except Exception as e:
+            self.say(f"event rotation failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
     def copy_off_machine(self, made: Path) -> None:
         try:
@@ -429,13 +445,8 @@ class Server:
                      f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
     def retry_once(self, item: dict, why: str) -> None:
-        if self.restarted[item["id"]]:
-            state.drop_queue_item(item["id"])
-            self.say(f"{item['loop']}: dropped queue item {item['id']}, {why}, the second time")
-            return
-        self.restarted[item["id"]] += 1
-        state.take_queue_item(item["id"], None)
-        self.say(f"{item['loop']}: queue item {item['id']} goes back in the queue, {why}")
+        self.say(f"{item['loop']}: queue item {item['id']} failed to start, {why}; "
+                 "the recovery sweep handles its claim")
 
     def reap_inherited(self) -> None:
         for pid in list(self.inherited):

@@ -832,8 +832,10 @@ def loop_line(v: dict) -> str:
             f"{last.get('status', 'never ran')} {when(last.get('finished') or last.get('started'))}" if last
             else "never ran")
     due = f"next {when(v['next_due'])}" if v.get("next_due") else ""
+    dead = len(v["dead"]) if isinstance(v.get("dead"), list) else v.get("dead", 0)
     return (f"{v['name']:<22} {switch:<6} {v['kind']:<7} {v['trigger']:<22} {what:<26} {due:<17}"
-            f" {util.paid_note(v['spent_24h'])} in 24 h" + (f"\n    {v['error']}" if v["error"] else ""))
+            f" {util.paid_note(v['spent_24h'])} in 24 h" + (f", {dead} dead" if dead else "")
+            + (f"\n    {v['error']}" if v["error"] else ""))
 
 
 def print_feed_line(line: dict) -> None:
@@ -903,6 +905,14 @@ def cmd_loop(args) -> int:
     from . import control, engine, loops, scaffold, state, util
 
     try:
+        if args.action == "requeue":
+            try:
+                item_id = int(args.name)
+            except ValueError:
+                raise control.Refused("arete loop requeue needs a numeric queue ID") from None
+            state.requeue_item(item_id)
+            print(f"queue item {item_id} is pending again")
+            return 0
         if args.action == "list":
             print(serve_line(control.serve_beat()))
             for v in control.loop_views():
@@ -971,6 +981,9 @@ def cmd_loop(args) -> int:
                 print(f"  source {c['source']}: {'ok' if c['ok'] else 'FAILING'} {c['detail'] or ''} at {when(c['polled'])}")
             if d["waiting"]:
                 print(f"  waiting: {util.count(len(d['waiting']), 'firing')}")
+            for item in d["dead"]:
+                print(f"  dead item {item['id']}: run {item['run_id']}, {util.count(item['events'], 'event')}, "
+                      f"{item['dead_at']}: {item['dead_reason']}")
             if d["state"]:
                 print(f"  memory: {json.dumps(d['state'])[:300]}")
             for r in d["runs"][:8]:
@@ -1801,8 +1814,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("loop", help="list, draft, try, switch, start, stop and follow loops")
     p.add_argument("action", choices=("list", "new", "try", "enable", "disable", "start", "stop", "status", "feed",
-                                      "exec"))
-    p.add_argument("name", nargs="?", default="", help="a loop name; a run id also works for stop and feed")
+                                      "exec", "requeue"))
+    p.add_argument("name", nargs="?", default="", help="a loop name; run id for stop/feed; queue ID for requeue")
     p.add_argument("words", nargs="*", help=argparse.SUPPRESS)
     p.add_argument("--name", dest="new_name", default="", help="new: the loop name")
     p.add_argument("--repo", default="", help="new: the repo the loop works on")

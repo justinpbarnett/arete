@@ -8,6 +8,7 @@ import { configurePalette, globalCommands } from "./ui-palette.js";
 import { actions, dispatch } from "./ui-actions.js";
 import { dismissMenu } from "./ui-menu.js";
 import { startHooks } from "./ui-hooks.js";
+import { feedbackCommand, startFeedback } from "./ui-feedback.js";
 import { normalizePrimary } from "./ui-list.js";
 
 const route = signal(current());
@@ -73,7 +74,8 @@ configurePalette(screenKeys.map(([key, id, title, href], index) => ({ key, id, t
   pending.value = "";
   sheet.value = false;
   dismissMenu();
-}, () => { mode.value = "NORMAL"; });
+}, () => { mode.value = "NORMAL"; }, [feedbackCommand]);
+startFeedback();
 startKeys();
 globalCommands([{ id: "run-checks", title: "Run checks now", run: () => dispatch(actions.checks) }]);
 startHooks();

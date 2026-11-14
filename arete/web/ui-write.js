@@ -7,7 +7,11 @@ export function prepareWrite(url, data = {}, object = null, options = {}) {
 }
 
 function headers(request) {
-  return { "X-Arete": "1", "Idempotency-Key": request.key, "Content-Type": "application/json" };
+  return { "X-Arete": "1", "Idempotency-Key": request.key, "Content-Type": request.type ?? "application/json" };
+}
+
+export function postBody(url, body, type) {
+  return fetch(url, { method: "POST", headers: headers({ key: crypto.randomUUID(), type }), body });
 }
 
 export async function sendWrite(request) {

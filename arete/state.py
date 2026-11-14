@@ -533,8 +533,13 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     last_success TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS run_purges (run_id TEXT PRIMARY KEY, reason TEXT NOT NULL, queued TEXT NOT NULL);
 """
 MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
+              ("runs", "files_purged", "ALTER TABLE runs ADD COLUMN files_purged TEXT"),
+              ("queue", "attempts", "ALTER TABLE queue ADD COLUMN attempts INTEGER DEFAULT 0"),
+              ("queue", "dead_at", "ALTER TABLE queue ADD COLUMN dead_at TEXT"),
+              ("queue", "dead_reason", "ALTER TABLE queue ADD COLUMN dead_reason TEXT DEFAULT ''"),
 ("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
@@ -886,6 +891,7 @@ def cursors(connect=db) -> list[dict]:
 
 def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None) -> int:
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         if not payload and c.execute("SELECT 1 FROM queue WHERE loop = ? AND run_id IS NULL AND payload = '[]' "
                                      "AND trigger = ?", (loop, trigger)).fetchone():
             return 0
@@ -905,9 +911,10 @@ def queue_item(item_id: int) -> dict | None:
     return {**dict(r), "payload": json.loads(r["payload"] or "[]")} if r else None
 
 
-def take_queue_item(item_id: int, run_id: str | None) -> None:
+def take_queue_item(item_id: int, run_id: str) -> bool:
     with db() as c:
-        c.execute("UPDATE queue SET run_id = ? WHERE id = ?", (run_id, item_id))
+        return c.execute("UPDATE queue SET run_id = ? WHERE id = ? AND run_id IS NULL",
+                         (run_id, item_id)).rowcount == 1
 
 
 def drop_queue_item(item_id: int) -> None:
@@ -920,21 +927,86 @@ def release_claimed_items(run_id: str) -> None:
         c.execute("UPDATE queue SET run_id = NULL WHERE run_id = ?", (run_id,))
 
 
-def drop_claimed_items(run_id: str) -> None:
+def finish_claim(c, row: dict, how: str, summary: str) -> None:
+    if how == "retry":
+        duplicate = not json.loads(row["payload"] or "[]") and c.execute(
+            "SELECT 1 FROM queue WHERE loop = ? AND trigger = ? AND payload = '[]' AND run_id IS NULL",
+            (row["loop"], row["trigger"])).fetchone()
+        if duplicate:
+            how = "drop"
+        elif row["attempts"] + 1 < 2:
+            c.execute("UPDATE queue SET run_id = NULL, attempts = attempts + 1 WHERE id = ?", (row["id"],))
+            return
+        else:
+            how = "dead"
+    if how == "drop" or not json.loads(row["payload"] or "[]"):
+        c.execute("DELETE FROM queue WHERE id = ?", (row["id"],))
+    else:
+        c.execute("UPDATE queue SET dead_at = ?, dead_reason = ? WHERE id = ?",
+                  (util.iso(), summary, row["id"]))
+
+
+def end_claim(run_id: str, how: str, summary: str) -> None:
     with db() as c:
-        c.execute("DELETE FROM queue WHERE run_id = ?", (run_id,))
+        c.execute("BEGIN IMMEDIATE")
+        for row in c.execute("SELECT * FROM queue WHERE run_id = ? AND dead_at IS NULL", (run_id,)).fetchall():
+            finish_claim(c, dict(row), how, summary)
+
+
+def release_settled_claims() -> None:
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "
+                         "WHERE q.run_id IS NOT NULL AND q.dead_at IS NULL "
+                         "AND (r.status IS NULL OR r.status != 'running')").fetchall()
+        for row in rows:
+            finish_claim(c, dict(row), "dead" if row["status"] == "stopped" else "retry",
+                         row["summary"] or f"run {row['run_id']} {row['status'] or 'is missing'}")
+
+
+def dead_items(connect=db) -> list[dict]:
+    with connect() as c:
+        return [{**{k: row[k] for k in ("id", "loop", "run_id", "dead_reason", "dead_at")},
+                 "events": len(json.loads(row["payload"] or "[]"))}
+                for row in c.execute("SELECT * FROM queue WHERE dead_at IS NOT NULL ORDER BY id")]
+
+
+def requeue_item(item_id: int) -> None:
+    from . import control
+
+    with db() as c:
+        if not c.execute("UPDATE queue SET run_id = NULL, attempts = 0, dead_at = NULL, dead_reason = '' "
+                         "WHERE id = ? AND dead_at IS NOT NULL", (item_id,)).rowcount:
+            raise control.NotFound(f"no dead queue item {item_id}")
 
 
 SEEN_AGAIN = "seen again"
 CLOSED_AT = "COALESCE(NULLIF(closed, ''), last_seen)"
 
 
-def prune(days: float = 14, keep_days: float = 30) -> None:
+def prune(days: float = 14, keep_days: float = 30, lines_days: float = 90) -> None:
     since = util.iso(util.now() - timedelta(days=days))
+    lines_since, now = util.iso(util.now() - timedelta(days=lines_days)), util.iso()
     with db() as c:
+        c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "
+                  f"WHERE {FIRINGS} AND started < ?", (now, since))
         c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
         c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
-        c.execute("DELETE FROM queue WHERE run_id IS NOT NULL AND enqueued < ?", (since,))
+        eligible = c.execute(
+            "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
+            "AND status NOT IN ('running', 'pr', 'needs-info') "
+            "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
+            "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
+            "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
+            "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "
+            "(status IS NULL OR status NOT IN ('merged', 'rejected', 'skipped', 'filed')) "
+            "AND (run_id = runs.id OR instr(COALESCE(evidence, ''), runs.id) > 0)) "
+            "AND NOT EXISTS (SELECT 1 FROM runs recent WHERE recent.repo = runs.repo "
+            "AND recent.issue = runs.issue AND recent.started >= ?)", (lines_since, lines_since)).fetchall()
+        for row in eligible:
+            c.execute("INSERT OR IGNORE INTO run_purges VALUES (?, 'lines', ?)", (row["id"], now))
+            c.execute("UPDATE runs SET files_purged = ? WHERE id = ?", (now, row["id"]))
+        c.execute("DELETE FROM queue WHERE dead_at < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         old = util.iso(util.now() - timedelta(days=days * 4))
         kept = util.iso(util.now() - timedelta(days=keep_days))
@@ -1717,7 +1789,7 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
         )
 
 
-SETTLED_PROPOSALS = ("merged", "rejected", "skipped", "filed")
+RELEASING_PROPOSALS = ("rejected", "skipped", "filed")
 
 
 def pin_record(run_id: str) -> bool:
@@ -1736,11 +1808,11 @@ def record_pins(connect=db) -> set[str]:
         return {r["run_id"] for r in c.execute("SELECT run_id FROM record_pins")}
 
 
-def runs_cited_by_pending_proposals(run_ids, connect=db) -> set[str]:
-    marks = ",".join("?" * len(SETTLED_PROPOSALS))
+def runs_cited_by_kept_proposals(run_ids, connect=db) -> set[str]:
+    marks = ",".join("?" * len(RELEASING_PROPOSALS))
     with connect() as c:
         rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",
-                         SETTLED_PROPOSALS).fetchall()
+                         RELEASING_PROPOSALS).fetchall()
     return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
 
 

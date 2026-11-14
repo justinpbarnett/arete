@@ -309,6 +309,7 @@ function editing(event) {
 
 function onKey(event) {
   if (event.isComposing || event.keyCode === 229) return;
+  if (event.target.closest?.("dialog.ui-feedback")) return;
   if (paletteKey(event, writable(event.target))) return;
   if (reasonBox.peek()) {
     if (event.key === "Escape") { cancelReason(); event.target.blur?.(); mode.value = "NORMAL"; event.preventDefault(); }
@@ -330,7 +331,8 @@ function onKey(event) {
     event.preventDefault();
     return;
   }
-  if (event.key === "Enter" && event.target.closest?.("button") && !sheet.value) return;
+  if (event.key === "Enter" && event.target.closest?.("button")) return;
+  if (event.key === "Tab" && sheet.value) return;
   const handled = mode.value === "INSERT" ? editing(event) : normal(event);
   if (handled) event.preventDefault();
 }

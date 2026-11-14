@@ -128,23 +128,87 @@ def main() -> int:
     return 0
 
 
-def read_events(since_hours: float | None = None) -> list[dict]:
+def dated_events():
+    return sorted(p for p in paths.EVENTS_FILE.parent.glob("events-*.jsonl")
+                  if re.fullmatch(r"events-\d{4}(0[1-9]|1[0-2])\.jsonl", p.name)
+                  and not p.is_symlink() and p.is_file())
+
+
+def event_files():
+    return [p for p, _, _ in event_stats()]
+
+
+def event_stats():
     out = []
-    if not paths.EVENTS_FILE.exists():
-        return out
+    for path in dated_events() + [paths.EVENTS_FILE]:
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            continue
+        if path == paths.EVENTS_FILE and not os.path.isfile(path):
+            continue
+        out.append((path, st.st_mtime, st.st_ino))
+    return out
+
+
+def rotate_events(keep_days: float) -> None:
+    try:
+        with paths.EVENTS_FILE.open() as f:
+            first = f.readline()
+    except FileNotFoundError:
+        first = ""
+    try:
+        month = datetime.fromisoformat(json.loads(first)["ts"]).astimezone(UTC).strftime("%Y%m")
+    except (ValueError, KeyError, TypeError):
+        month = ""
+    if month and month < datetime.now(UTC).strftime("%Y%m"):
+        target = paths.EVENTS_FILE.with_name(f"events-{month}.jsonl")
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(f"event archive already exists: {target}")
+        os.replace(paths.EVENTS_FILE, target)
+    cutoff = datetime.now(UTC).timestamp() - keep_days * 86400
+    for path in dated_events():
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def read_events(since_hours: float | None = None) -> list[dict]:
     cutoff = None
     if since_hours is not None:
         cutoff = datetime.now(UTC).timestamp() - since_hours * 3600
-    with open(paths.EVENTS_FILE) as f:
+    out = []
+    for attempt in range(8):
+        before = event_stats()
+        out = []
+        try:
+            for path, mtime, _ in before:
+                if path != paths.EVENTS_FILE and cutoff is not None and mtime < cutoff:
+                    continue
+                out.extend(read_event_file(path, cutoff))
+        except FileNotFoundError:
+            continue
+        if [(p, i) for p, _, i in event_stats()] == [(p, i) for p, _, i in before]:
+            return out
+    return out
+
+
+def read_event_file(path, cutoff) -> list[dict]:
+    out = []
+    with path.open() as f:
         for line in f:
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(ev, dict):
+                continue
             if cutoff is not None:
                 try:
                     t = datetime.fromisoformat(ev["ts"]).timestamp()
-                except (KeyError, ValueError):
+                except (KeyError, ValueError, TypeError):
                     continue
                 if t < cutoff:
                     continue

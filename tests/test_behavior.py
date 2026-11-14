@@ -2570,6 +2570,292 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
         self.assertGreater(r["final"], r["ran"], shown)
 
 
+class LoopInputRecoveryTests(unittest.TestCase):
+    SCRIPT = r'''
+import contextlib, io, json, os, signal, subprocess, sys, time
+from datetime import timedelta
+from pathlib import Path
+from unittest import mock
+from arete import cli, config, control, engine, loops, paths, record, scratch, serve, state, util
+root, mode = Path(sys.argv[1]), sys.argv[2]
+scratch.AUTHORITY = root / "authority-parent/verification-authority"
+paths.ensure_dirs()
+paths.CONFIG_FILE.write_text('[jev]\nenabled = false\n')
+event = {"type": "test", "title": "keep me", "data": {"value": 17}, "trust": "internal"}
+def folder(name, code):
+    p = paths.CONFIG_DIR / "loops" / name
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "loop.toml").write_text('kind = "command"\nenabled = true\n[run]\ncommand = ' +
+                               json.dumps([sys.executable, "-c", code]) + '\n')
+folder("fail", "raise SystemExit(1)")
+folder("ok", "import sys; from pathlib import Path; Path(" + repr(str(root / "received")) +
+       ").write_text(sys.stdin.read())")
+folder("slow", "import os,time; from pathlib import Path; Path(" + repr(str(root / "ready")) +
+       ").write_text(str(os.getpid())); time.sleep(60)")
+def enqueue(name="fail", payload=None, trigger="event"):
+    return state.enqueue(name, name, "", trigger, [event] if payload is None else payload)
+def call(*args):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        code = cli.main(["loop", *args])
+    return code, out.getvalue()
+def wait(test):
+    until = time.monotonic() + 15
+    while time.monotonic() < until:
+        if test():
+            return
+        time.sleep(.03)
+    raise AssertionError("timed out waiting for command recovery")
+def reap():
+    with mock.patch.object(record, "SETTLE_GRACE_SECONDS", 0):
+        record.reap(tickets=False)
+def start(item):
+    (root / "ready").unlink(missing_ok=True)
+    r = engine.launch("slow", item=item)
+    wait(lambda: (root / "ready").exists() and (root / "ready").read_text().strip())
+    return r, int((root / "ready").read_text())
+def kill(r, child):
+    os.kill(r["pid"], signal.SIGKILL)
+    wait(lambda: not util.lock_is_held(r["lock"]))
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(child, signal.SIGKILL)
+if mode == "outcomes":
+    import sqlite3
+    with sqlite3.connect(paths.DB_FILE) as c:
+        c.executescript(state.SCHEMA)
+        c.execute("INSERT INTO queue (loop, queue, trigger, payload, enqueued) VALUES ('fail', 'fail', 'event', ?, ?)",
+                  (json.dumps([event]), util.iso()))
+        legacy = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    for _ in range(2):
+        row = state.queue_item(legacy)
+        assert row["payload"] == [event] and row["attempts"] == 0
+        assert row["dead_at"] is None and row["dead_reason"] == ""
+    state.drop_queue_item(legacy)
+    item = enqueue()
+    for _ in range(2):
+        with state.db() as c:
+            row = dict(c.execute("SELECT * FROM queue WHERE id = ?", (item,)).fetchone())
+        assert (row["attempts"], row["dead_at"], row["dead_reason"]) == (0, None, "")
+    r = engine.launch("fail", item=item, detach=False)
+    assert r["status"] == "failed" and not state.pending()
+    for args in (("list",), ("status", "fail")):
+        rc, shown = call(*args)
+        assert rc == 0 and "1 dead" in shown, shown
+    assert str(item) in shown and r["id"] in shown and "1 event" in shown and "exit 1" in shown, shown
+    assert call("requeue", str(item))[0] == 0
+    row = state.queue_item(item)
+    assert row["payload"] == [event] and row["run_id"] is None and row["attempts"] == 0
+    assert row["dead_at"] is None and row["dead_reason"] == ""
+    for invalid in (str(item), "9999999", "bad"):
+        assert call("requeue", invalid)[0] != 0
+    folder("fail", "import sys; from pathlib import Path; Path(" + repr(str(root / "requeued")) +
+           ").write_text(sys.stdin.read())")
+    assert engine.launch("fail", item=item, detach=False)["status"] == "done"
+    assert json.loads((root / "requeued").read_text()) == event
+    folder("fail", "raise SystemExit(1)")
+    item = enqueue("ok")
+    assert engine.launch("ok", item=item, detach=False)["status"] == "done"
+    assert state.queue_item(item) is None
+    assert json.loads((root / "received").read_text()) == event
+    item = enqueue(payload=[], trigger="every")
+    engine.launch("fail", item=item, detach=False)
+    assert state.queue_item(item) is None
+    assert engine.launch("ok", detach=False)["status"] == "done"
+    item = enqueue("ok")
+    assert state.take_queue_item(item, "first") is True
+    assert state.take_queue_item(item, "second") is False
+    assert state.queue_item(item)["run_id"] == "first"
+    assert call("requeue", str(item))[0] != 0
+    assert state.queue_item(item)["run_id"] == "first"
+    (root / "received").unlink()
+    for value in (item, 999999):
+        try:
+            engine.launch("ok", item=value, detach=False)
+        except control.NotFound:
+            pass
+        else:
+            raise AssertionError("claimed or missing item launched")
+    item = enqueue("ok")
+    take = state.take_queue_item
+    def compete(item, run_id):
+        assert take(item, "competitor")
+        return take(item, run_id)
+    with mock.patch.object(state, "take_queue_item", side_effect=compete):
+        try:
+            engine.launch("ok", item=item, detach=False)
+        except control.NotFound as e:
+            assert "was taken by another run" in str(e)
+        else:
+            raise AssertionError("lost claim launched")
+    assert not (root / "received").exists()
+    assert state.runs(kind="loop", loop="ok", firings=True)[0]["status"] == "skipped"
+    item = enqueue("ok")
+    with mock.patch.object(engine, "spent_limit", return_value="daily budget"):
+        engine.launch("ok", item=item, detach=False)
+    assert state.queue_item(item)["run_id"] is None and state.queue_item(item)["attempts"] == 0
+    with mock.patch.object(engine, "run_command", side_effect=engine.OverBudget("during execution")):
+        engine.launch("ok", item=item, detach=False)
+    assert "during execution" in state.queue_item(item)["dead_reason"]
+    item = enqueue("ok")
+    with mock.patch.object(engine, "screened", return_value=("skipped", "kind skipped")):
+        engine.launch("ok", item=item, detach=False)
+    assert state.queue_item(item) is None
+elif mode == "signals":
+    item = enqueue("slow")
+    for attempt in (1, 2):
+        r, child = start(item)
+        try:
+            kill(r, child)
+            reap()
+            row = state.queue_item(item)
+            assert row["payload"] == [event]
+            if attempt == 1:
+                assert row["run_id"] is None and row["attempts"] == 1
+            else:
+                assert row["run_id"] == r["id"] and row["dead_at"] and row["dead_reason"]
+                reap()
+                state.prune()
+                assert state.queue_item(item) == row
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal.SIGKILL)
+    for action in ("stop", "gone", "term", "empty"):
+        item = enqueue("slow", payload=[] if action == "empty" else None, trigger="every")
+        r, child = start(item)
+        try:
+            if action == "empty":
+                newer = enqueue("slow", payload=[], trigger="every")
+                other = enqueue("slow", payload=[], trigger="cron")
+            if action in ("gone", "empty"):
+                kill(r, child)
+            if action in ("stop", "gone"):
+                control.stop_run(r["id"])
+            elif action == "term":
+                os.kill(r["pid"], signal.SIGTERM)
+            wait(lambda: not util.lock_is_held(r["lock"]))
+            reap()
+            row = state.queue_item(item)
+            if action in ("stop", "gone"):
+                assert row["dead_at"] and row["run_id"] == r["id"], row
+            elif action == "term":
+                assert row["run_id"] is None and row["attempts"] == 1, row
+            else:
+                assert row is None
+                assert {i["id"] for i in state.pending() if i["loop"] == "slow"} >= {newer, other}
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal.SIGKILL)
+elif mode == "retention":
+    old = util.iso(util.now() - timedelta(days=60))
+    ids = {}
+    for status in ("running", "failed", "missing", "stopped"):
+        item = ids[status] = enqueue()
+        if status != "missing":
+            record.start("loop", run_id=status, loop="fail")
+            if status != "running":
+                record.settle(status, status, summary="settled " + status)
+        state.take_queue_item(item, status)
+    reap()
+    for status in ("failed", "missing"):
+        row = state.queue_item(ids[status])
+        assert row["run_id"] is None and row["attempts"] == 1
+    assert state.queue_item(ids["stopped"])["dead_at"]
+    before = [state.queue_item(i) for i in ids.values()]
+    reap()
+    assert before == [state.queue_item(i) for i in ids.values()]
+    waiting = enqueue()
+    with state.db() as c:
+        c.execute("UPDATE queue SET enqueued = ?", (old,))
+        c.execute("INSERT INTO events (loop, type, ts) VALUES ('fail', 'old', ?)", (old,))
+    state.prune()
+    assert all(state.queue_item(i) for i in [*ids.values(), waiting])
+    with state.db() as c:
+        assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        c.execute("UPDATE queue SET dead_at = ? WHERE id = ?", (old, ids["stopped"]))
+    state.prune()
+    assert state.queue_item(ids["stopped"]) is None
+elif mode == "never":
+    pending = state.pending()
+    item = pending[0]["id"] if pending else enqueue()
+    attempt = state.queue_item(item)["attempts"]
+    def fails(args, keep=()):
+        return control.launch([sys.executable, "-c", "raise SystemExit(7)"], keep=keep)
+    server = serve.Server()
+    try:
+        with mock.patch.object(control, "detach", side_effect=fails):
+            server.dispatch({"fail": loops.find("fail", config.load())})
+        reap()
+        row = state.queue_item(item)
+        assert (row["dead_at"] is not None) == (attempt == 1), row
+        assert row["payload"] == [event]
+        reap()
+        assert state.queue_item(item) == row
+    finally:
+        server.pool.shutdown()
+        for pool in server.job_pools.values():
+            pool.shutdown()
+elif mode == "race":
+    state.ensure_schema()
+    code = "import sys,time; from pathlib import Path; from arete import state; "
+    code += "p=Path(sys.argv[1]); Path(sys.argv[2]).touch(); "
+    code += "\nwhile not p.exists(): time.sleep(.001)\n"
+    code += "print(state.enqueue('race','race','','every'))"
+    prefix = "import sys; sys.path.insert(0," + repr(str(paths.PACKAGE_DIR.parent)) + ");"
+    for n in range(20):
+        gate = root / str(n)
+        ready = [root / f"{n}-{i}.ready" for i in range(2)]
+        procs = [subprocess.Popen([sys.executable, "-I", "-c", prefix + code, str(gate), str(marker)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for marker in ready]
+        try:
+            wait(lambda: all(marker.exists() for marker in ready))
+            gate.touch()
+            results = [p.communicate(timeout=15) for p in procs]
+            assert all(p.returncode == 0 for p in procs), results
+            assert sum(int(out.strip()) == 0 for out, err in results) == 1, results
+            rows = [i for i in state.pending() if i["loop"] == "race"]
+            assert len(rows) == 1
+            state.drop_queue_item(rows[0]["id"])
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+    assert enqueue() != enqueue()
+print("RECOVERY_OK")
+'''
+
+    def run_modes(self, *modes):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for name in ("config", "state", "logs", "tmp", "home", "worktrees", "authority-parent"):
+                (root / name).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
+            script = f"import sys; sys.path.insert(0, {str(SOURCE)!r});" + self.SCRIPT
+            for mode in modes:
+                done = subprocess.run([sys.executable, "-I", "-c", script, str(root), mode], cwd=root,
+                                      env=env, capture_output=True, text=True, timeout=180, check=False)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("RECOVERY_OK", done.stdout)
+
+    def test_command_outcomes_status_requeue_and_claim_guard(self):
+        self.run_modes("outcomes")
+
+    def test_real_kills_requested_stops_and_unsolicited_signals(self):
+        self.run_modes("signals")
+
+    def test_settled_claim_sweeps_and_retention(self):
+        self.run_modes("retention")
+
+    def test_never_began_retry_survives_a_new_server_process(self):
+        self.run_modes("never", "never")
+
+    def test_empty_enqueue_is_atomic_across_processes(self):
+        self.run_modes("race")
+
+
 class WorkerRecoveryTests(unittest.TestCase):
     SCRIPT = r'''
 import contextlib, importlib.util, io, json, os, sys
@@ -6105,7 +6391,7 @@ class BackupTests(unittest.TestCase):
         r = self.script("prune-keeps")
         self.assertEqual(r["runs"], ["free-new", "loop-new", "loop-old", "paid-old", "pipe-new", "pipe-old"])
         self.assertEqual(r["feed"], r["runs"])
-        self.assertEqual(r["queue"], ["q-new", "q-null"])
+        self.assertEqual(r["queue"], ["q-old", "q-new", "q-null"])
         self.assertEqual(r["events"], ["e-new"])
         self.assertEqual(r["incidents"], ["open-new", "closed-recent"])
         self.assertEqual(r["notes"], ["note open-new", "note closed-recent"])
@@ -7145,6 +7431,46 @@ box.componentWillUnmount();
             for banned in ("innerHTML", "insertAdjacentHTML", "eval"):
                 self.assertNotIn(banned, source)
 
+    def test_feedback_dialog_source_contract(self):
+        from arete import dashboard
+        web = SOURCE / "arete" / "web"
+        source = (web / "ui-feedback.js").read_text()
+        _, served = dashboard.web_snapshot()
+        self.assertEqual(served["/ui-feedback.js"][0], source.encode())
+        self.assertTrue(served["/ui-feedback.js"][1].startswith("text/javascript"))
+        self.assertEqual(served["/ui-feedback.css"][0], (web / "ui-feedback.css").read_bytes())
+        for name in ("/api/capture", "/api/capture/submit", "/api/capture/evidence", "Send feedback"):
+            self.assertIn(name, source)
+        self.assertIsNone(re.search(r"style\s*=", source))
+        self.assertNotIn("innerHTML", source)
+
+    def test_context_carries_screen_and_keeps_the_legacy_shape(self):
+        from arete import capture
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(paths, "STATE_DIR", Path(folder)), \
+                mock.patch.object(paths, "DB_FILE", Path(folder) / "arete.db"), \
+                mock.patch.object(util, "iso", return_value="2026-01-02T03:04:05Z"):
+            state.ensure_schema()
+
+            def stored(body):
+                capture.add_context(body, "code123")
+                return state.capture_draft()["context"]
+
+            legacy = {"captured": "2026-01-02T03:04:05Z", "app": {"version": arete.__version__, "code": "code123"}, "view": "live"}
+            self.assertEqual(stored({"view": "live"}), json.dumps(legacy, indent=2, ensure_ascii=False))
+            with_screen = json.loads(stored({"screen": "#settings/health"}))
+            self.assertEqual(with_screen["screen"], "#settings/health")
+            self.assertEqual(with_screen["app"]["code"], "code123")
+            self.assertNotIn("view", with_screen)
+            longest = "#" + "a " * 99 + "a"
+            self.assertEqual(len(longest), 200)
+            self.assertEqual(json.loads(stored({"screen": longest}))["screen"], longest)
+            before = state.capture_draft()["context"]
+            for body in ({"screen": "settings"}, {"screen": None}, {"screen": 4}, {"screen": longest + "a"},
+                         {"screen": "#floor", "view": "floor"}, {"screen": "#floor", "view": None}):
+                with self.assertRaises(capture.Refused, msg=str(body)):
+                    capture.add_context(body, "code123")
+            self.assertEqual(state.capture_draft()["context"], before)
+
     def test_palette_offline_behavior(self):
         script = r'''
 import assert from 'node:assert/strict';
@@ -7539,10 +7865,10 @@ try:
     assets.feed(page)
     check.assertEqual(assets.scripts, {
         "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js", "/ui-keys.js", "/ui-keybar.js", "/ui-hooks.js", "/ui-list.js", "/ui-menu.js",
-        "/ui-palette.js", "/ui-fuzzy.js",
+        "/ui-palette.js", "/ui-fuzzy.js", "/ui-feedback.js",
         "/ui-actions.js", "/ui-undo.js", "/ui-notice.js", "/ui-write.js",
         "/vendor-preact.js", "/vendor-htm.js", "/vendor-signals.js"})
-    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css"})
+    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css", "/ui-feedback.css"})
     check.assertIn("/icon-192.png", assets.declared)
     for path in sorted(assets.declared):
         with opener.open(base + path, timeout=5) as response:
@@ -7792,6 +8118,290 @@ class CutOffTests(unittest.TestCase):
         self.assertEqual([f["emitted"] for f in facts["rows"]], ["legacy"])
         self.assertEqual(facts["hunted"]["queued"], [])
         self.assertTrue(any(line.startswith("seen before") for line in facts["hunted"]["log"]))
+
+
+class RetentionTests(unittest.TestCase):
+    scratch = MinerRecordedRunTests.scratch
+    PRELUDE = r'''
+import io, json, os, sys, time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest import mock
+from arete import backup, config, control, heartbeat, hook, paths, record, replay, serve, state, tasks, util
+root = Path(sys.argv[1])
+paths.CONFIG_FILE.write_text("\n".join(replay.sample(root / "sample")))
+state.ensure_schema()
+server = serve.Server()
+messages = []
+server.say = messages.append
+def age(days):
+    return util.iso(util.now() - timedelta(days=days))
+def backdate(folder, days):
+    at = time.time() - days * 86400
+    for p in folder.rglob("*"):
+        if not p.is_symlink():
+            os.utime(p, (at, at))
+def made(tag, days, status="failed", kind="pipeline", raw=True, issue=None):
+    rid = record.start(kind, tag=tag, repo="replay-sample", issue=issue or tag,
+                       **({"loop_kind": "command"} if kind == "loop" else {}))
+    if raw:
+        with record.Recorder(rid, "build", {"runner": "claude", "model": "m"}, ()) as rec:
+            rec.line(json.dumps({"type": "text", "text": tag}))
+            rec.end({"ok": True, "error": "", "seconds": 1})
+    record.settle(rid, status, end_line=tag)
+    folder = paths.RUNS_DIR / rid
+    (folder / "run.log").write_text(tag)
+    (folder / "run.jsonl").write_text('{}\n')
+    with state.db() as c:
+        c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (age(days), age(days), rid))
+        c.execute("INSERT INTO steps (run_id, step, ok) VALUES (?, 'build', 1)", (rid,))
+    backdate(folder, days)
+    return rid
+def folder(rid):
+    return paths.RUNS_DIR / rid
+def queued(rid):
+    with state.db() as c:
+        return c.execute("SELECT 1 FROM run_purges WHERE run_id = ?", (rid,)).fetchone() is not None
+def proposal(rid, status):
+    state.add_proposal(rid, {"layer": "repo", "repo": "replay-sample", "file": "f", "change": "c",
+                                  "why": "w", "evidence": [rid], "confidence": 0.9}, "hand")
+    pid = state.proposals()[0]["id"]
+    state.move_proposal(pid, ("hand",), status)
+def result(**fields):
+    print("BEHAVIOR_RESULT=" + json.dumps(fields))
+'''
+
+    def test_firing_rows_folders_and_queue_are_removed_together(self):
+        found = self.scratch(r'''
+old, young = [made(str(d), d, "done", "loop", raw=False) for d in (15, 13)]
+for rid in (old, young):
+    (folder(rid) / "run.jsonl").unlink()
+    (folder(rid) / "scratch").mkdir()
+server.prune()
+with state.db() as c:
+    feed = [c.execute("SELECT COUNT(*) FROM feed WHERE run_id = ?", (rid,)).fetchone()[0] for rid in (old, young)]
+snap = backup.newest_snapshot()
+checked = backup.inspect(snap)
+result(rows=[state.run_get(r) is not None for r in (old, young)],
+       folders=[folder(r).exists() for r in (old, young)], feed=feed,
+       queues=[queued(r) for r in (old, young)], snapshot=bool(snap),
+       checked=checked["quick_check"] == "ok" and checked["counts"]["runs"] == 2)
+''')
+        self.assertEqual(found["rows"], [False, True])
+        self.assertEqual(found["folders"], [False, True])
+        self.assertEqual(found["feed"], [0, 1])
+        self.assertEqual(found["queues"], [False, False])
+        self.assertTrue(found["snapshot"] and found["checked"])
+
+    def test_folder_failure_retries_and_does_not_skip_records(self):
+        found = self.scratch(r'''
+rid = made("firing", 15, "done", "loop", raw=False)
+old = made("raw", 40)
+with mock.patch.object(record, "purge_folders", side_effect=OSError("disk busy")):
+    server.prune()
+first = [state.run_get(rid) is None, folder(rid).exists(), queued(rid), not paths.record_dir(old).exists()]
+server.prune()
+result(first=first, retried=not folder(rid).exists() and not queued(rid), messages=messages)
+''')
+        self.assertEqual(found["first"], [True] * 4)
+        self.assertTrue(found["retried"])
+        self.assertTrue(any("folder purge failed: OSError: disk busy" in m for m in found["messages"]))
+
+    def test_folder_expiry_keeps_history_and_refuses_resume(self):
+        found = self.scratch(r'''
+old = made("old", 91, "merged")
+young = made("young", 89, "merged")
+failed = made("failed", 91)
+recent_finish = made("recent-finish", 100)
+with state.db() as c:
+    c.execute("UPDATE runs SET finished = ? WHERE id = ?", (age(2), recent_finish))
+server.prune()
+row = state.run_get(failed)
+try:
+    tasks.resume(failed)
+except control.Refused as e:
+    refusal = str(e)
+with state.db() as c:
+    steps = c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ?", (old,)).fetchone()[0]
+with mock.patch.object(tasks, "script_path", return_value="feature"), mock.patch.object(tasks, "launch", return_value={"ok": True}):
+    resumed = tasks.resume(recent_finish)
+result(folders=[folder(r).exists() for r in (old, young, failed, recent_finish)],
+       young_record=paths.record_dir(young).exists(), history=bool(state.run_get(old)), steps=steps,
+       purged=state.run_get(old)["files_purged"], refusal=refusal, date=row["files_purged"], resumed=resumed)
+''')
+        self.assertEqual(found["folders"], [False, True, False, True])
+        self.assertFalse(found["young_record"])
+        self.assertTrue(found["history"] and found["purged"])
+        self.assertEqual(found["steps"], 1)
+        self.assertIn(found["date"], found["refusal"])
+        self.assertIn("POST /api/tasks", found["refusal"])
+        self.assertEqual(found["resumed"], {"ok": True})
+
+    def test_folder_protections(self):
+        found = self.scratch(r'''
+ids = {tag: made(tag, 91, status) for tag, status in
+       [("ticket", "failed"), ("open", "failed"), ("answered", "failed"), ("pin", "failed"),
+        ("cited", "failed"), ("evidence", "failed"), ("running", "running"), ("pr", "pr"), ("info", "needs-info")]}
+made("new", 10, issue="ticket")
+record.pin(ids["pin"])
+proposal(ids["cited"], "pending")
+proposal(ids["evidence"], "pending")
+with state.db() as c:
+    c.execute("UPDATE proposals SET run_id = 'miner', status = NULL WHERE run_id = ?", (ids["evidence"],))
+    for status in ("open", "answered"):
+        c.execute("INSERT INTO asks (id, run, repo, ticket, step, questions, status, asked) "
+                  "VALUES (?, ?, 'replay-sample', '1', 'build', '[]', ?, ?)",
+                  (status, ids[status], status, age(91)))
+    c.execute("UPDATE runs SET finished = NULL WHERE id = ?", (ids["running"],))
+server.prune()
+result(kept={tag: folder(rid).exists() and state.run_get(rid)["files_purged"] is None for tag, rid in ids.items()})
+''')
+        self.assertTrue(all(found["kept"].values()), found)
+
+    def test_cap_counts_evidence_and_store_counts_both_sizes(self):
+        found = self.scratch(r'''
+ids = [made(str(d), d) for d in (3, 2)]
+for rid in ids:
+    evidence = folder(rid) / "evidence"
+    evidence.mkdir()
+    (evidence / "proof").write_bytes(b"x" * 3000)
+total = record.runs_bytes()
+old_size = record.scanned(ids[0], paths.record_dir(ids[0])).size
+server.cfg = replace(server.cfg, retention=config.Retention(30, (total - old_size / 2) / record.GB))
+server.prune()
+store = record.store()
+first = [paths.record_dir(r).exists() for r in ids]
+newer_size = record.scanned(ids[1], paths.record_dir(ids[1])).size
+first_messages = list(messages)
+server.cfg = replace(server.cfg, retention=config.Retention(30, 1 / record.GB))
+server.prune()
+result(first=first,
+       total=store["runs_bytes"], expected=total-old_size, raw=store["bytes"],
+       newer=newer_size, first_messages=first_messages, messages=messages,
+       evidence=[(folder(r) / "evidence/proof").stat().st_size for r in ids])
+''')
+        self.assertEqual(found["total"], found["expected"])
+        self.assertEqual(found["raw"], found["newer"])
+        self.assertEqual(found["first"], [False, True])
+        self.assertEqual(found["evidence"], [3000, 3000])
+        self.assertFalse(any("over max_gb" in m for m in found["first_messages"]))
+        self.assertTrue(any("over max_gb" in m for m in found["messages"]))
+
+    def test_merged_citations_keep_records_until_folder_expiry(self):
+        found = self.scratch(r'''
+merged, rejected = [made(s, 40) for s in ("merged", "rejected")]
+proposal(merged, "merged"); proposal(rejected, "rejected")
+server.prune()
+first = [paths.record_dir(r).exists() for r in (merged, rejected)]
+with state.db() as c:
+    c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (age(91), age(91), merged))
+server.prune()
+result(first=first, folder=folder(merged).exists(), history=bool(state.run_get(merged)), proposals=len(state.proposals()))
+''')
+        self.assertEqual(found["first"], [True, False])
+        self.assertFalse(found["folder"])
+        self.assertTrue(found["history"])
+        self.assertEqual(found["proposals"], 2)
+
+    def test_events_rotate_read_archives_and_heartbeat(self):
+        found = self.scratch(r'''
+old = {"ts": age(40), "kind": "old"}; new = {"ts": age(0), "kind": "new"}
+paths.EVENTS_FILE.write_text(json.dumps(old) + '\ninvalid\n' + json.dumps(new) + '\n')
+expired = paths.EVENTS_FILE.with_name("events-200001.jsonl")
+expired.write_text('{}\n')
+at = time.time() - 100 * 86400
+os.utime(expired, (at, at))
+server.prune()
+archive = paths.EVENTS_FILE.with_name('events-' + datetime.fromisoformat(old["ts"]).strftime('%Y%m') + '.jsonl')
+paths.CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+paths.CLAUDE_SETTINGS.write_text(json.dumps({"hooks": {"test": "arete hook"}}))
+checks = heartbeat.check_hook()
+first = [e["kind"] for e in hook.read_events(24)]
+both = [e["kind"] for e in hook.read_events(24 * 45)]
+with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Skill", "tool_input": {"skill": "test"}}))):
+    hook.main()
+active = paths.EVENTS_FILE.exists()
+paths.EVENTS_FILE.write_text(json.dumps(old) + '\n')
+before = archive.read_bytes()
+server.prune()
+result(first=first, both=both, archive=archive.exists(), expired=expired.exists(), active=active,
+       heartbeat=all(c.ok for c in checks), collision=archive.read_bytes() == before,
+       messages=messages)
+''')
+        self.assertEqual(found["first"], ["new"])
+        self.assertEqual(found["both"], ["old", "new"])
+        for key in ("archive", "active", "heartbeat", "collision"):
+            self.assertTrue(found[key], key)
+        self.assertFalse(found["expired"])
+        self.assertTrue(any("event rotation failed: FileExistsError" in m for m in found["messages"]))
+
+    def test_read_events_survives_rotation_between_discovery_and_open(self):
+        found = self.scratch(r'''
+old = {"ts": age(40), "kind": "old"}; new = {"ts": age(0), "kind": "new"}
+paths.EVENTS_FILE.write_text(json.dumps(old) + '\n' + json.dumps(new) + '\n')
+real = hook.event_stats
+calls = []
+def racing():
+    stats = real()
+    if not calls:
+        calls.append(1)
+        hook.rotate_events(365)
+    return stats
+with mock.patch.object(hook, "event_stats", racing):
+    kinds = [e["kind"] for e in hook.read_events(24 * 45)]
+result(kinds=kinds, calls=len(calls))
+''')
+        self.assertEqual(found["kinds"], ["old", "new"])
+        self.assertEqual(found["calls"], 1)
+
+    def test_only_exact_legacy_orphans_and_safe_queued_paths_are_removed(self):
+        found = self.scratch(r'''
+for name, files in {"plain": ["run.log"], "timeline": ["run.log", "record/steps.jsonl.gz"],
+                    "chat": ["record/x"], "eva-x-prompts": ["main/x", "pr/x"],
+                    "min-x": ["prompt.md", "result.json"],
+                    "nested": ["run.log", "scratch/keep/x"], "linked": ["run.log"]}.items():
+    for file in files:
+        p = folder(name) / file
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("keep")
+    backdate(folder(name), 100 if name == "eva-x-prompts" else 20)
+(folder("plain") / "scratch").mkdir()
+sentinel = root / "sentinel"
+sentinel.mkdir(); (sentinel / "keep").write_text("safe")
+(folder("linked") / "record").symlink_to(sentinel, target_is_directory=True)
+folder("alias").symlink_to(sentinel, target_is_directory=True)
+with state.db() as c:
+    for rid in ("../sentinel", "alias", "missing"):
+        c.execute("INSERT INTO run_purges VALUES (?, 'lines', ?)", (rid, age(0)))
+server.prune()
+result(removed=[not folder(r).exists() for r in ("plain", "timeline")],
+       kept=[folder(r).exists() for r in ("chat", "eva-x-prompts", "min-x", "nested", "linked", "alias")],
+       sentinel=(sentinel / "keep").read_text(), missing=queued("missing"),
+       unsafe=[queued(r) for r in ("../sentinel", "alias")])
+''')
+        self.assertEqual(found["removed"], [True, True])
+        self.assertTrue(all(found["kept"]))
+        self.assertEqual(found["sentinel"], "safe")
+        self.assertFalse(found["missing"])
+        self.assertEqual(found["unsafe"], [True, True])
+
+    def test_phase_failures_continue_and_snapshot_failure_stops_deletions(self):
+        found = self.scratch(r'''
+old = made("old", 40)
+with mock.patch.object(state, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(hook, "rotate_events", wraps=hook.rotate_events) as rotate:
+    server.prune()
+    continued = purge.call_count == rotate.call_count == 1 and not paths.record_dir(old).exists()
+with mock.patch.object(record, "prune", side_effect=OSError("record unavailable")), mock.patch.object(hook, "rotate_events") as rotate:
+    server.prune()
+    rotated = rotate.call_count == 1
+with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(state, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(hook, "rotate_events") as rotate:
+    server.prune()
+    stopped = not any(f.called for f in (state_prune, purge, records, rotate))
+result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)
+''')
+        self.assertTrue(found["continued"] and found["rotated"] and found["stopped"])
+        self.assertTrue(any("state prune failed: OSError: state unavailable" in m for m in found["messages"]))
 
 
 if __name__ == "__main__":
