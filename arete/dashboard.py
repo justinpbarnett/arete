@@ -5,6 +5,7 @@ import glob
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -1092,27 +1093,28 @@ def claim_proxy(host: Tailscale, node: Node, port: int) -> Claim:
 
 
 def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_serve: bool,
-               kept: Server | None = None) -> Front:
+               kept: Server | None = None, secure: bool = False) -> Front:
     opened = open_servers(node.addresses, port, node, logins, inside_serve)
     try:
         tls, reason = None, ""
-        try:
-            fetch_certificate(host, node.name)
-            tls = tls_context()
-        except (CertError, ssl.SSLError, OSError) as e:
-            reason = f"no certificate ({util.first_line(str(e), 200)})"
-        if tls and release_proxy(host, port):
+        if secure:
+            try:
+                fetch_certificate(host, node.name)
+                tls = tls_context()
+            except (CertError, ssl.SSLError, OSError) as e:
+                reason = f"no certificate ({util.first_line(str(e), 200)})"
+        if (tls or not secure) and release_proxy(host, port):
             stop_listener(kept)
             for s in opened:
                 s.tls = tls
-            return Front("https", opened, tls=tls)
+            return Front("https" if tls else "http", opened, tls=tls)
         close_all(opened)
         opened = []
         loopback = kept
         if loopback is None:
             loopback = Server(LOOPBACK, port, node, FrontedLogins(), inside_serve, handler=FrontedHandler)
             opened = [loopback]
-        claim = Claim(True, f"arete's tailscale serve mapping on port {port} is still there") if tls \
+        claim = Claim(True, f"arete's tailscale serve mapping on port {port} is still there") if tls or not secure \
             else claim_proxy(host, node, port)
         why = "; ".join(x for x in (reason, claim.why) if x)
         if claim.behind:
@@ -1144,8 +1146,9 @@ def record_server(node: Node, port: int, front: Front) -> None:
 CERTIFICATE_RETRY = "trying for a certificate again"
 
 
-def watch(host: Tailscale, owner: str, node: Node, front: Front) -> str:
-    certificate_due = time.monotonic() + (RENEW_SECONDS if front.tls else CERT_RETRY_SECONDS)
+def watch(host: Tailscale, owner: str, node: Node, front: Front, secure: bool = False) -> str:
+    certificate_due = time.monotonic() + (RENEW_SECONDS if front.tls else CERT_RETRY_SECONDS) \
+        if secure or front.fronted else math.inf
     renewal_failed = False
     reload_pending = False
     while True:
@@ -1157,6 +1160,8 @@ def watch(host: Tailscale, owner: str, node: Node, front: Front) -> str:
             continue
         if front.fronted:
             return CERTIFICATE_RETRY
+        if not secure:
+            continue
         try:
             reload_pending = fetch_certificate(host, node.name) or reload_pending
             if front.tls and reload_pending:
@@ -1208,7 +1213,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
                     kept_front = resumed
                     kept = resumed.servers[0]
                     last_line = announce(node, port, resumed, last_line)
-                front = open_front(host, node, port, logins, inside_serve, kept)
+                front = open_front(host, node, port, logins, inside_serve, kept, cfg.dashboard_https)
                 opened_once = True
             except OSError as e:
                 if str(e) != waiting_for:
@@ -1221,7 +1226,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
                 if s is not kept:
                     threading.Thread(target=s.serve_forever, daemon=True).start()
             last_line = announce(node, port, front, last_line)
-            reason = watch(host, cfg.dashboard_owner, node, front)
+            reason = watch(host, cfg.dashboard_owner, node, front, cfg.dashboard_https)
             kept = front.servers[0] if front.fronted else None
             kept_front = front if front.fronted else None
             if reason != CERTIFICATE_RETRY:
@@ -1263,6 +1268,8 @@ def listening_line(node: Node, port: int, front: Front) -> str:
     if front.fronted:
         return (f"dashboard listening on port {port} at {LOOPBACK} behind tailscale serve as {node.name}; "
                 f"{front.why}")
+    if not front.why:
+        return f"dashboard listening on port {port} at {', '.join(node.addresses)} over plain HTTP"
     return (f"dashboard listening on port {port} at {', '.join(node.addresses)} over plain HTTP; "
             f"{front.why}; trying again every hour")
 
@@ -1271,10 +1278,13 @@ def url(node: Node | None, port: int) -> str:
     found = util.read_json(paths.SERVER_FILE, None)
     mine = paths.state_and_config()
     recorded = isinstance(found, dict) and {k: found.get(k) for k in mine} == mine
+    fallback = "https" if config.load().dashboard_https else "http"
     if recorded and found.get("behind"):
         scheme = "https"
     else:
-        scheme = found["scheme"] if recorded and found.get("scheme") in ("http", "https") else "https"
+        scheme = found["scheme"] if recorded and found.get("scheme") in ("http", "https") else fallback
+    if node is None and scheme == "http":
+        return f"http://<this machine's tailnet address>:{port}"
     if node is None:
         return f"{scheme}://<this machine's tailnet name>:{port}"
     return f"{scheme}://{node.name if scheme == 'https' else node.addresses[0]}:{port}"

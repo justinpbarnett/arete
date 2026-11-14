@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import socket
+import ssl
 import stat
 import subprocess
 import threading
@@ -16,7 +17,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from . import config, environment, paths, scratch, util, vault
 from .util import git
@@ -125,20 +126,60 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
                     blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
 
 
+class NamedTlsConnection(http.client.HTTPSConnection):
+    def __init__(self, address: str, port: int, hostname: str):
+        super().__init__(address, port, context=ssl.create_default_context())
+        self.hostname = hostname
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.hostname)
+        except OSError:
+            sock.close()
+            raise
+
+
+def upgrade_target(resp: http.client.HTTPResponse, port: int | None) -> SplitResult | None:
+    moved = urlsplit(resp.getheader("Location") or "")
+    if resp.status not in (301, 302, 307, 308) or moved.scheme != "https" or not moved.hostname:
+        return None
+    try:
+        return moved if (moved.port or 443) == port else None
+    except ValueError:
+        return None
+
+
 def relay_server(url: str) -> ThreadingHTTPServer:
     target = urlsplit(url)
-    connect = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+    secure: dict[str, SplitResult] = {}
+    if target.scheme == "https":
+        secure["via"] = target
+
+    def connect(address: str, port: int | None) -> http.client.HTTPConnection:
+        if "via" in secure and secure["via"] is not target:
+            return NamedTlsConnection(address, port or 443, secure["via"].hostname)
+        if target.scheme == "https":
+            return http.client.HTTPSConnection(address, port)
+        return http.client.HTTPConnection(address, port)
 
     class Relay(BaseHTTPRequestHandler):
         def forward(self):
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else None
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP | {"host"}}
-            headers["Host"] = target.netloc
+            headers["Host"] = secure["via"].netloc if "via" in secure else target.netloc
             try:
                 upstream = connect(target.hostname, target.port)
                 upstream.request(self.command, self.path, body, headers)
                 resp = upstream.getresponse()
+                if "via" not in secure and (moved := upgrade_target(resp, target.port)):
+                    upstream.close()
+                    secure["via"] = moved
+                    headers["Host"] = moved.netloc
+                    upstream = connect(target.hostname, target.port)
+                    upstream.request(self.command, self.path, body, headers)
+                    resp = upstream.getresponse()
             except (OSError, http.client.HTTPException):
                 self.send_response(502)
                 self.send_header("Content-Type", "text/plain")
