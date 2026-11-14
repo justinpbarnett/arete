@@ -96,7 +96,7 @@ def log_file(r: dict) -> Path:
 
 
 def live(running: list[dict]) -> dict:
-    in_slots = {r["id"] for r in pipeline.holding(running, "slot", pipeline.SLOT_KINDS)}
+    in_slots = {r["id"] for r in pipeline.runs_in_slots(running)}
     waiting_for_slot = {r["id"] for r in pipeline.holding(running, "slot-wait")}
     paid = state.paid_by_run([r["id"] for r in running], connect=state.reader)
     rows = []

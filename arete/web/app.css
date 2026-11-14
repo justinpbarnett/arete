@@ -148,6 +148,12 @@ form.talk .actions { margin: 6px 0 10px; }
 .msg.from-tool { padding: 6px 0 4px; }
 .msg.from-tool .who { font-size: 11px; }
 .msg.from-tool p { margin-top: 2px; font-size: 12px; color: var(--muted); }
+.msg.from-session { border-left: 3px solid var(--rule); padding-left: 10px; }
+.msg .report p { margin: 6px 0 0; }
+.msg .report ul { margin: 4px 0 0; padding-left: 20px; font-size: 14px; overflow-wrap: anywhere; }
+.chat-sessions { margin: 14px 0 0; }
+.chat-sessions ul { list-style: none; margin: 0; padding: 0; }
+.chat-sessions li { border-top: 1px solid var(--rule); padding: 6px 0; font-size: 14px; overflow-wrap: anywhere; }
 .draft { border: 1px solid var(--ink); padding: 4px 14px 2px; margin: 18px 0; }
 .draft h3 { margin-top: 12px; }
 #draft-body { margin: 0; padding: 0; border: 0; max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -248,3 +254,26 @@ form.send { margin: 8px 0 0; max-width: 72ch; }
 form.send .field > label { font-family: var(--read); text-transform: none; letter-spacing: 0; font-size: inherit; color: var(--ink); }
 form.send .actions { margin: 4px 0 8px; }
 form.send p { margin: 0 0 8px; }
+
+.waiting, #waiting-result { grid-column: 1 / -1; }
+.waiting > h2 { border: 0; padding: 0; margin: 14px 0 0; }
+.ask-card { scroll-margin-top: 12px; overflow-wrap: anywhere; max-width: 96ch; margin: 12px 0 0; padding: 18px 22px; }
+.ask-card h3 { margin: 0 0 10px; }
+.ask-card h3:focus { outline: 0; }
+.ask-card dl.w { margin: 0 0 12px; }
+.ask-q { border-top: 1px solid var(--rule); padding: 12px 0 2px; margin: 0 0 4px; }
+.ask-q .ask-text { margin: 4px 0 8px; }
+.ask-q ol.steps { margin: 0 0 10px; }
+.ask-options { display: grid; gap: 8px; margin: 0 0 12px; }
+.ask-option { display: grid; grid-template-columns: minmax(120px, max-content) 1fr; gap: 4px 14px; align-items: start; }
+.ask-option > button { text-align: left; white-space: normal; max-width: 100%; }
+.ask-note { color: var(--muted); font-size: 14px; padding-top: 6px; }
+.ask-card .actions { margin: 12px 0 0; }
+.ask-card .said { margin: 8px 0 0; }
+.ask-card .seg { margin: 0 0 10px; }
+@media (max-width: 560px) {
+  .ask-card { padding: 16px 14px; }
+  .ask-option { grid-template-columns: 1fr; }
+  .ask-card .actions > button { flex: 1 1 auto; }
+  .ask-card dl.w { grid-template-columns: 1fr; }
+}

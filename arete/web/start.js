@@ -154,5 +154,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
   resumeCarried();
+  openAskLink(asked);
   applyRoute(first, CARRIED ? "return" : "start");
 });

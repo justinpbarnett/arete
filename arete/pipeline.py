@@ -48,6 +48,7 @@ from . import (
     steps,
     tracker,
     util,
+    vault,
     verdicts,
     verify,
 )
@@ -691,6 +692,13 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     return found + [p for p in unproven if scratch_named(late, p.name)]
 
 
+def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
+    if held := scratch_left(ws, checkouts):
+        scratch.recover_pending()
+        held = scratch_left(ws, checkouts)
+    return held
+
+
 def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
     if scratch_left(ws, checkouts):
         return False
@@ -874,8 +882,10 @@ def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> Non
     drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
+    holding = vault.held(git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"],
+                             c.wt)) if vault.every() else {}
     if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
-                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny)]:
+                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny) or n in holding]:
         git(["reset", "-q", "--", *denied], c.wt)
     if git(["diff", "--cached", "--name-only"], c.wt).strip():
         message = f"wip: edits of arete run {run_id}, kept when it ended before pushing\n\nArete-Run: {run_id}"
@@ -1048,13 +1058,22 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
             out.merged.append(c)
         elif not diff.counts:
             continue
+        shown = checkout_patch(c, diff.locks, "--cached", against)
+        resolving = bool(merged and c.resolved and not from_base)
+        resolved = resolved_patch(c) if resolving else ""
+        if vault.every():
+            whole = checkout_patch(c, [], *vault.SCAN, "--cached", against)
+            diff.denied += vault.refusals(whole + (resolved_patch(c, *vault.SCAN) if resolving else ""))
         out += diff
         out.changed.append(c)
-        out.patch += checkout_patch(c, diff.locks, "--cached", against)
-        if merged and c.resolved and not from_base:
-            out.patch += git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
-                              c.base_commit, "HEAD", "--", *c.resolved], c.wt)
+        out.patch += shown + resolved
+    out.patch = vault.hidden(out.patch)
     return out
+
+
+def resolved_patch(c: Checkout, *flags: str) -> str:
+    return git(["diff", "--no-renames", *flags, f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
+                c.base_commit, "HEAD", "--", *c.resolved], c.wt)
 
 
 def pending_merge(c: Checkout) -> bool:
@@ -2034,7 +2053,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
         run.log("automerge left off: triage approved the ticket, so a person merges it")
         return
     try:
-        risk = jev.risk(patch_from_base(opened), about, cfg,
+        risk = jev.risk(vault.hidden(patch_from_base(opened)), about, cfg,
                         trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
         hold = risk.hold if risk else ""
     except jev.Unjudged as e:
@@ -2841,7 +2860,7 @@ def fixed_since(b: Build, trees: dict[str, str]) -> str:
                                         trees[c.prefix]))
         except RuntimeError:
             continue
-    return util.tail("".join(parts), MAX_FIX_DIFF_IN_PROMPT)
+    return util.tail(vault.hidden("".join(parts)), MAX_FIX_DIFF_IN_PROMPT)
 
 
 def review_problems(listed) -> list[dict]:
@@ -3587,8 +3606,16 @@ def live_pipeline_runs() -> list[dict]:
     return holding(state.runs_marked_running(), "pipeline")
 
 
-def runs_in_slots() -> list[dict]:
-    return holding(state.runs_marked_running(), "slot", SLOT_KINDS)
+def chat_sessions_going(running: list[dict]) -> list[dict]:
+    linked = {link["run_id"] for link in state.chat_sessions()}
+    return [r for r in running if r["kind"] == "session" and r["id"] in linked
+            and ((util.now() - util.parse_iso(r["started"])).total_seconds() < record.SETTLE_GRACE_SECONDS
+                 or (r["lock"] and util.lock_is_held(r["lock"])))]
+
+
+def runs_in_slots(running: list[dict] | None = None) -> list[dict]:
+    running = state.runs_marked_running() if running is None else running
+    return [*holding(running, "slot", SLOT_KINDS), *chat_sessions_going(running)]
 
 
 def runs_waiting_for_a_slot() -> list[dict]:

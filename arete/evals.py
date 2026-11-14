@@ -10,7 +10,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, environment, gh, paths, record, runner, scratch, state, tracker, util, verify
+from . import config, environment, gh, paths, record, runner, scratch, state, tracker, util, vault, verify
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
@@ -459,7 +459,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         result["repairs"] = attempts - 1
         result["checks"] = "pass" if ok else "fail"
         git(["add", "-A"], wt)
-        diff = git(["diff", "--cached", "HEAD"], wt)
+        diff = vault.hidden(git(["diff", "--cached", "HEAD"], wt))
         (run_dir / "diff.patch").write_text(diff)
         failures = ["repo checks failing"] if run.checks_required and not ok else []
         evidence ="No check in use ran for this task."

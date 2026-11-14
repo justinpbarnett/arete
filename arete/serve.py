@@ -28,6 +28,7 @@ from . import (
     paths,
     record,
     runner,
+    sessions,
     sources,
     state,
     tasks,
@@ -137,6 +138,7 @@ class Server:
         for row in record.reap(tickets=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
             self.swept = 0.0
+        sessions.tell_chats()
         states = state.loop_states()
         now = util.now()
         for loop in live:
