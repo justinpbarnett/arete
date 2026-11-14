@@ -1271,8 +1271,20 @@ class Build(TicketWork):
         commit_and_push(self.checkouts, self.staged.changed, branch, message)
         self.committed_lines += self.staged.lines
 
+    def check_with_repairs(self) -> bool:
+        attempts, tries = 1, self.run.settings("check_repair").tries
+        ok = self.check()
+        while not ok and attempts < tries:
+            self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
+            attempts += 1
+            self.resume(self.next_step("check_repair"),
+                        prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
+                               checks=self.check_commands), role="check_repair")
+            ok = self.check()
+        return ok
+
     def recheck(self, after: str) -> None:
-        if not self.check():
+        if not self.check_with_repairs():
             raise RunFailed(f"the checks failed after {after}", self.report)
         self.require_valid_diff(after)
 
@@ -2321,7 +2333,7 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int)
     if no_pr := [c.github for c in staged.changed if not c.pr]:
         raise RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
                         ci.red_list(caused))
-    if not b.check():
+    if not b.check_with_repairs():
         report = f"checks-ci-round{n}.md"
         b.run.save(report, b.report)
         raise RunFailed("the checks failed after the CI fix",
@@ -2844,7 +2856,6 @@ def review_problems(listed) -> list[dict]:
             for p in listed if isinstance(p, dict)]
 
 
-@runlimits.verification
 def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     if not b.layer.verify:
         b.run.log("verify: the layer has no [verify] section, so nothing checks the change in use")
@@ -2857,9 +2868,7 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         b.run.story.append(f"The check in use failed on attempt {attempt}:\n{util.tail(verified.markdown(), 2500)}")
         if attempt == tries:
             break
-        b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=tries,
-                                                   failures=verified.markdown(), checks=b.check_commands),
-                 role="check_repair")
+        repair_in_use(b, attempt + 1, tries, verified)
         b.recheck("fixing what the check in use found")
     b.run.story.append("Still failing in use after the last attempt.")
     _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, apply=False)
@@ -2867,6 +2876,14 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
                     verified.markdown())
 
 
+@runlimits.verification
+def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified) -> None:
+    b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt, max_attempts=tries,
+                                               failures=verified.markdown(), checks=b.check_commands),
+             role="check_repair")
+
+
+@runlimits.verification
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
                        diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT))
