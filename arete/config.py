@@ -233,6 +233,7 @@ class Config:
     max_parallel_per_repo: int = 1
     dashboard_port: int = DASHBOARD_PORT
     dashboard_owner: str = ""
+    dashboard_https: bool = False
     loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
     queues: dict[str, int] = field(default_factory=dict)
     pricing: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
@@ -733,6 +734,12 @@ def document_for(cfg: Config, repo: Repo | None = None, layer: RepoLayer | None 
                     {**DOCUMENT_WORDS, **cfg.document.get("words", {}), **own.get("words", {})})
 
 
+def dashboard_https(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"[dashboard] https must be true or false, not {value!r}")
+    return value
+
+
 def load(path: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
     try:
@@ -750,6 +757,7 @@ def load(path: Path | None = None) -> Config:
         max_parallel_per_repo=max(1, int(data.get("max_parallel_per_repo", 1))),
         dashboard_port=int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
+        dashboard_https=dashboard_https(data.get("dashboard", {}).get("https", False)),
     )
     cfg.tiers = tier_maps(data.get("tiers") or {}, "tiers")
     cfg.tier_map = str((data.get("factory") or {}).get("tier_map", ""))

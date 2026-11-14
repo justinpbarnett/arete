@@ -369,6 +369,16 @@ def cmd_guard(args) -> int:
     return guard.main()
 
 
+def cmd_upload_guard(args) -> int:
+    try:
+        from . import uploads
+
+        return uploads.main()
+    except Exception:
+        print("Arete's upload guard failed, so it refused the upload.", file=sys.stderr)
+        return 2
+
+
 def scratch_hook(p) -> None:
     p.add_argument("--scratch", default="", help="the verification attempt's scratch folder, set by arete")
     p.add_argument("--scratch-id", default="", help="selector for protected harness authority; never proves ownership")
@@ -1144,8 +1154,7 @@ def cmd_webhook(args) -> int:
         return 1
     key = hooks.secret(loop.name)
     node = dashboard.this_node(config.load().dashboard_owner)
-    host = node.addresses[0] if node else "<this machine's tailnet address>"
-    print(f"POST http://{host}:{config.load().dashboard_port}{hooks.hook_path(loop.name)}")
+    print(f"POST {dashboard.url(node, config.load().dashboard_port)}{hooks.hook_path(loop.name)}")
     print(f"X-Arete-Token: {key}")
     print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
     return 0
@@ -1455,6 +1464,22 @@ def cmd_secrets(args) -> int:
     return 2
 
 
+def cmd_rotate_authority(args) -> int:
+    from . import scratch
+
+    try:
+        records, pins = scratch.rotate()
+    except scratch.RotationRefused as e:
+        for line in str(e).splitlines():
+            print(f"refused: {line}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"cannot rotate the verification signing secret: {e}", file=sys.stderr)
+        return 1
+    print(f"re-signed records: {records}, pins: {pins}")
+    return 0
+
+
 def cmd_resume(args) -> int:
     from . import client
 
@@ -1630,6 +1655,10 @@ def main(argv: list[str] | None = None) -> int:
     scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
+    p = sub.add_parser("upload-guard", help="PreToolUse hook for the verifier's browser_file_upload: allows only files "
+                                            "in the run's evidence or browser folder (reads a payload on stdin)")
+    p.set_defaults(fn=cmd_upload_guard)
+
     p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
                                            "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
@@ -1803,6 +1832,11 @@ def main(argv: list[str] | None = None) -> int:
                                        "(rm REPO NAME); it never prints a value")
     p.add_argument("words", nargs="+", metavar="[rm] REPO [NAME]")
     p.set_defaults(fn=cmd_secrets)
+
+    p = sub.add_parser("rotate-authority", help="re-sign every scratch record and the browser pin under a new "
+                                                "verification signing secret, then swap it in; refuses while a run, "
+                                                "an attempt lease or an engine lock is live")
+    p.set_defaults(fn=cmd_rotate_authority)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))

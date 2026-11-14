@@ -21,6 +21,7 @@ from unittest import mock
 
 import arete
 from arete import config, control, devices, gh, outbound, paths, pi, pipeline, scratch, sessions, state, util, verify
+from arete import cli, codex, guard, runner, uploads
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -3039,6 +3040,186 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertTrue(Path(a.root).exists())
 
 
+@unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
+                     "needs macOS confinement")
+class AuthorityRotationTests(unittest.TestCase):
+    STATES = ("initializing", "prepared", "active", "pending", "retained", "done")
+    SCRIPT = r'''
+import contextlib, fcntl, hmac, io, json, os, sys
+from pathlib import Path
+from arete import browser, cli, hooks, record, scratch, util
+root, mode = Path(sys.argv[1]), sys.argv[2]
+scratch.AUTHORITY = root / "home/verification-authority"
+A = scratch.AUTHORITY
+def rotate():
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(["rotate-authority"])
+    print("BEHAVIOR_RESULT=" + json.dumps({"code": code, "out": out.getvalue(), "err": err.getvalue()}))
+if mode == "seed":
+    with scratch.registry(True) as (fd, key):
+        for i, s in enumerate(sys.argv[3].split(",")):
+            scratch.store(fd, key, {"version": 2, "attempt": {"selector": f"{i:064x}"}, "state": s,
+                                    "source_mutations": False})
+    browser.write_pin({"@playwright/mcp": {"version": "0.0.0", "integrity": "sha512-demo"}})
+    hooks.secret("demo")
+elif mode == "rotate":
+    rotate()
+elif mode == "kill-first-note":
+    scratch.note_resigned = lambda *a: os._exit(9)
+    rotate()
+elif mode == "kill-third-resign":
+    real, n = scratch.resign, [0]
+    def die(*a):
+        n[0] += 1
+        if n[0] == 3:
+            os._exit(9)
+        real(*a)
+    scratch.resign = die
+    rotate()
+elif mode == "kill-swap":
+    scratch.swap_secret = lambda *a: os._exit(9)
+    rotate()
+elif mode == "run":
+    record.start("pipeline", tag="x", repo="r", issue="1")
+elif mode == "lease":
+    lease = os.open(A / (f"{0:064x}" + ".lease"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lease, fcntl.LOCK_EX)
+    rotate()
+elif mode == "unheld-lease":
+    os.close(os.open(A / (f"{0:064x}" + ".lease"), os.O_RDWR | os.O_CREAT, 0o600))
+    rotate()
+elif mode == "lock":
+    with util.lock("poll"):
+        rotate()
+elif mode == "tamper":
+    p = A / (f"{int(sys.argv[3]):064x}" + ".json")
+    e = json.loads(p.read_text())
+    e["signature"] = "0" * 64
+    p.write_text(json.dumps(e))
+elif mode == "report":
+    old = bytes.fromhex(sys.argv[3])
+    envs = [json.loads(p.read_text()) for p in [*A.glob("*.json"), A / browser.PIN]]
+    broken = 0
+    for s in (f"{i:064x}" for i in range(6)):
+        try:
+            with scratch.registry() as (fd, key):
+                scratch.load(fd, key, s)
+        except (OSError, ValueError, KeyError):
+            broken += 1
+    print("BEHAVIOR_RESULT=" + json.dumps({
+        "states": sorted(r["state"] for r in scratch.records(True)) if not broken else None, "broken": broken,
+        "pin": sorted(browser.read_pin()) if not broken else None,
+        "old": sum(e["signature"] == hmac.digest(old, scratch.encoded(e["data"]), "sha256").hex() for e in envs),
+        "mode": os.stat(A / "signing.secret").st_mode & 0o777, "size": os.stat(A / "signing.secret").st_size,
+        "folder": os.stat(A).st_mode & 0o777,
+        "extra": sorted(p.name for p in A.iterdir() if p.name in ("signing.secret.next", "rotation.marker"))}))
+'''
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        for name in ("home", "config", "state", "logs", "worktrees"):
+            (self.root / name).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
+        self.env.update(ARETE_CONFIG_DIR=str(self.root / "config"), ARETE_STATE_DIR=str(self.root / "state"),
+                        ARETE_LOG_DIR=str(self.root / "logs"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"))
+        self.authority = self.root / "home/verification-authority"
+        self.hook = self.root / "config/hooks/demo.secret"
+        self.run_mode("seed", ",".join(self.STATES))
+        self.old = self.secret()
+
+    def run_mode(self, mode, *extra):
+        bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+        done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(self.root), mode, *extra], cwd=self.root,
+                              env=self.env, text=True, capture_output=True, timeout=300, check=False)
+        found = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                      if line.startswith("BEHAVIOR_RESULT=")), None)
+        result = json.loads(found) if found else {}
+        result["exit"] = done.returncode
+        result["stderr"] = done.stderr
+        return result
+
+    def secret(self):
+        return (self.authority / "signing.secret").read_bytes()
+
+    def files(self):
+        return {p.name: p.read_bytes() for p in self.authority.glob("*.json")}
+
+    def report(self):
+        return self.run_mode("report", self.old.hex())
+
+    def assertRotated(self):
+        shown = self.report()
+        self.assertEqual(shown["broken"], 0, shown)
+        self.assertEqual(sorted(shown["states"]), sorted(self.STATES), shown)
+        self.assertEqual(shown["pin"], ["@playwright/mcp"], shown)
+        self.assertEqual(shown["old"], 0, shown)
+        self.assertEqual(shown["extra"], [], shown)
+        self.assertNotEqual(self.secret(), self.old)
+
+    def test_a_clean_rotation_re_signs_every_record_and_the_pin(self):
+        hook = self.hook.read_bytes()
+        done = self.run_mode("rotate")
+        self.assertEqual((done["code"], done["out"]), (0, "re-signed records: 6, pins: 1\n"), done)
+        self.assertRotated()
+        shown = self.report()
+        self.assertEqual((shown["mode"], shown["size"], shown["folder"]), (0o600, 32, 0o700), shown)
+        self.assertEqual(self.hook.read_bytes(), hook)
+        for key in (self.old, self.secret()):
+            self.assertNotIn(key.hex(), done["out"] + done["err"])
+
+    def test_a_live_run_lease_or_engine_lock_refuses_and_changes_nothing(self):
+        cases = (("run", "pipeline"), ("lease", "attempt lease"), ("lock", "engine lock poll is held"))
+        self.assertEqual(self.run_mode("unheld-lease")["code"], 0)
+        self.assertRotated()
+        for mode, text in cases:
+            with self.subTest(mode=mode):
+                if mode == "run":
+                    self.run_mode("run")
+                before = (self.secret(), self.files())
+                done = self.run_mode("rotate" if mode == "run" else mode)
+                self.assertEqual(done["code"], 1, done)
+                self.assertIn("refused:", done["err"])
+                if mode != "run":
+                    self.assertIn(text, done["err"])
+                self.assertEqual((self.secret(), self.files()), before)
+                self.assertEqual(self.report()["extra"], [])
+
+    def test_a_killed_rotation_finishes_when_run_again(self):
+        for mode in ("kill-first-note", "kill-third-resign", "kill-swap"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.run_mode(mode)["exit"], 9)
+                self.assertEqual(self.secret(), self.old)
+                self.assertTrue((self.authority / "signing.secret.next").exists())
+                marker = self.authority / "rotation.marker"
+                if mode != "kill-first-note":
+                    names = json.loads(marker.read_text())["resigned"]
+                    self.assertTrue(names and all(n.endswith((".json", ".pin")) for n in names), names)
+                done = self.run_mode("rotate")
+                self.assertEqual(done["code"], 0, done)
+                self.assertRotated()
+                self.old = self.secret()
+
+    def test_a_file_that_verifies_under_neither_secret_stops_before_the_swap(self):
+        self.run_mode("tamper", "2")
+        name = f"{2:064x}.json"
+        done = self.run_mode("rotate")
+        self.assertEqual(done["code"], 1, done)
+        self.assertIn(name, done["err"])
+        self.assertEqual(self.secret(), self.old)
+        self.assertFalse((self.authority / "signing.secret.next").exists())
+        self.assertEqual(self.report()["broken"], 1)
+
+    def test_a_tampered_file_after_a_partial_rotation_still_stops_before_the_swap(self):
+        self.assertEqual(self.run_mode("kill-third-resign")["exit"], 9)
+        self.run_mode("tamper", "5")
+        done = self.run_mode("rotate")
+        self.assertEqual(done["code"], 1, done)
+        self.assertEqual(self.secret(), self.old)
+
+
 class EvidenceLinkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -4062,6 +4243,183 @@ print(json.dumps({"status": status, "report": state.report(spec.id), "row": stat
             self.assertEqual(control.session_report("s-done")["report"], {"summary": "s"})
 
 
+class WorkspaceOwnerTests(unittest.TestCase):
+    SETUP = "mkdir -p .venv && echo '*' > .venv/.gitignore && echo home > .venv/pyvenv.cfg"
+    SCRIPT = r'''
+import json, os, runpy, shutil, subprocess, sys, time
+from pathlib import Path
+from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, state, util
+from arete import ci
+root, scenario = Path(sys.argv[1]), sys.argv[2]
+SETUP = sys.argv[3]
+def forbidden(*args, **kwargs):
+    raise AssertionError("offline workflow attempted an external transport")
+gh.gh = forbidden
+lines = replay.sample(root / "sample", adw=True)
+paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) + '\ngithub = "octo/widgets"\n\n[jev]\nenabled=false\n')
+with (root / "sample/layer/config.toml").open("a") as out:
+    out.write("\n[setup]\ncommands = [" + json.dumps(SETUP) + "]\n")
+src = root / "sample/repo"
+def registered():
+    return [l for l in pipeline.git(["worktree", "list", "--porcelain"], src).splitlines() if l.startswith("worktree ")]
+def records():
+    return sorted(p.name for p in (paths.STATE_DIR / "workspaces").glob("*.json")) if (paths.STATE_DIR / "workspaces").exists() else []
+result = {}
+if scenario == "pr":
+    made = []
+    def pr_create(*args, **kw):
+        made.append(args)
+        return "https://github.com/octo/widgets/pull/7"
+    gh.open_pr_url = lambda repo, head: "https://github.com/octo/widgets/pull/7" if made else ""
+    gh.closed_pr_heads, gh.default_branch, gh.pr_create = lambda *a, **k: set(), lambda r: "main", pr_create
+    gh.pr_body, gh.pr_edit_body, gh.pr_comment = lambda url: "", lambda *a, **k: None, lambda *a, **k: None
+    gh.pr_view = lambda *a, **k: {"state": "OPEN", "isDraft": False, "headRefOid": "", "reviews": [], "comments": []}
+    gh.pr_draft_and_head, gh.pr_set_draft = lambda url: (False, ""), lambda *a, **k: None
+    gh.commit_checks, gh.branch_sha = lambda *a, **k: {}, lambda *a, **k: ""
+    ci.FIRST_CHECK_SECONDS = ci.SETTLE_SECONDS = ci.POLL_SECONDS = 0
+    task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+    feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+    try:
+        factory.main(feature, ["replay-sample", task, "--force"])
+    except SystemExit:
+        pass
+    row = state.ticket_runs("replay-sample", task, whole=True)[0]
+    log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+    result |= {"status": row["status"], "pr_url": row["pr_url"], "folder": (paths.WORKTREES_DIR / f"replay-sample-{task}").exists(),
+               "records": records(), "registered": len(registered()), "kept": "workspace kept" in log, "log": log[-1500:]}
+else:
+    def make(label, branch):
+        task = state.task_add("replay-sample", label, label, "feat")
+        ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+        c = pipeline.Checkout("", "octo/widgets", src, ws, "main")
+        pipeline.add_worktree(c, branch, "main")
+        (ws / ".venv").mkdir()
+        (ws / ".venv/.gitignore").write_text("*\n")
+        (ws / ".venv/pyvenv.cfg").write_text("home\n")
+        rid = record.start("pipeline", repo="replay-sample", issue=task)
+        return task, ws, c, rid
+    def owner(task, rid, ws):
+        return {"run": rid, "repo": "replay-sample", "ticket": task, "created": util.iso(),
+                "checkouts": [{"dir": "", "github": "octo/widgets", "src": str(src), "wt": str(ws)}]}
+    a_task, a, a_c, a_run = make("a", "arete/a")
+    pipeline.note_made(a, [a_c])
+    record.note(a_run, status="merged", started=util.iso(util.now() - __import__("datetime").timedelta(days=30)),
+                finished=util.iso(util.now() - __import__("datetime").timedelta(days=30)))
+    old = time.time() - 30 * 86400
+    os.utime(a, (old, old))
+    b_task, b, b_c, b_run = make("b", "arete/b")
+    pipeline.note_made(b, [b_c], owner(b_task, b_run, b))
+    held_lock = util.hold_lock(state.run_lock("pipeline", "replay-sample", b_task))
+    c_task, cw, c_c, c_run = make("c", "arete/c")
+    record.note(c_run, status="merged", finished=util.iso())
+    pipeline.note_made(cw, [c_c], owner(c_task, c_run, cw))
+    (cw / "hand.txt").write_text("mine\n")
+    gone = paths.WORKTREES_DIR / "gone"
+    pipeline.add_worktree(pipeline.Checkout("", "octo/widgets", src, gone, "main"), "arete/gone", "main")
+    shutil.rmtree(gone)
+    pipeline.cleanup_worktrees(cfg=config.load())
+    held = json.loads((paths.STATE_DIR / "held-workspaces.json").read_text())
+    check = heartbeat.check_workspaces()[0]
+    result |= {"a": [a.exists(), (paths.STATE_DIR / "workspaces" / f"{a.name}.json").exists(), str(a) in "\n".join(registered())],
+               "b": b.exists(), "c": cw.exists(), "held": held, "gone": str(gone) in "\n".join(registered()),
+               "check": [check.ok, check.detail]}
+    (cw / "hand.txt").unlink()
+    e_task, e, e_c, e_run = make("e", "arete/e")
+    record.note(e_run, status="merged", finished=util.iso())
+    pipeline.note_made(e, [e_c], owner(e_task, e_run, e))
+    with (e / replay.SAMPLE_FILE).open("a") as out:
+        out.write("by hand\n")
+    pipeline.cleanup_worktrees(cfg=config.load())
+    held_e = json.loads((paths.STATE_DIR / "held-workspaces.json").read_text())
+    check = heartbeat.check_workspaces()[0]
+    result |= {"c_after": cw.exists(), "c_record_after": (paths.STATE_DIR / "workspaces" / f"{cw.name}.json").exists(),
+               "e": e.exists(), "held_e": held_e, "check_e": [check.ok, check.detail]}
+    pipeline.git(["checkout", "--", replay.SAMPLE_FILE], e)
+    pipeline.cleanup_worktrees(cfg=config.load())
+    check = heartbeat.check_workspaces()[0]
+    result |= {"e_after": e.exists(), "check_after": [check.ok, check.detail]}
+    g = paths.WORKTREES_DIR / "replay-sample-42"
+    g_c = pipeline.Checkout("", "octo/widgets", src, g, "main")
+    pipeline.add_worktree(g_c, "arete/g", "main")
+    g_run = record.start("pipeline", repo="replay-sample", issue="42")
+    record.note(g_run, status="failed", finished=util.iso())
+    pipeline.note_made(g, [g_c], owner("42", g_run, g))
+    import types
+    pipeline.tracker.for_repo = lambda cfg, repo: types.SimpleNamespace(get=lambda tid: types.SimpleNamespace(open=False))
+    f_task, f, f_c, f_run = make("f", "arete/f")
+    record.note(f_run, status="failed", finished=util.iso())
+    pipeline.note_made(f, [f_c], owner(f_task, f_run, f))
+    (f / "stray.txt").write_text("x\n")
+    pipeline.cleanup_worktrees(cfg=config.load())
+    held_f = json.loads((paths.STATE_DIR / "held-workspaces.json").read_text())
+    check = heartbeat.check_workspaces()[0]
+    result |= {"g": [g.exists(), (paths.STATE_DIR / "workspaces" / f"{g.name}.json").exists(), str(g) in "\n".join(registered())]}
+    result |= {"f": f.exists(), "held_f": held_f, "check_f": [check.ok, check.detail]}
+print("BEHAVIOR_RESULT=" + json.dumps(result))
+'''
+
+    def run_script(self, scenario):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario, self.SETUP],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=180, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            return json.loads(output)
+
+    def test_a_ticket_that_ends_in_a_pr_leaves_no_workspace_behind(self):
+        out = self.run_script("pr")
+        self.assertEqual(out["status"], "pr", out["log"])
+        self.assertTrue(out["pr_url"])
+        self.assertFalse(out["folder"])
+        self.assertEqual(out["records"], [])
+        self.assertEqual(out["registered"], 1)
+        self.assertFalse(out["kept"])
+
+    def test_the_sweeper_removes_a_merged_ticket_and_keeps_running_and_blocked_ones(self):
+        out = self.run_script("sweep")
+        self.assertEqual(out["a"], [False, False, False])
+        self.assertTrue(out["b"])
+        self.assertTrue(out["c"])
+        self.assertEqual([h["name"] for h in out["held"]], [out["held"][0]["name"]])
+        self.assertTrue(out["held"][0]["blocked"])
+        self.assertIn("hand.txt", out["held"][0]["why"])
+        self.assertFalse(out["gone"])
+        self.assertFalse(out["check"][0])
+        self.assertTrue(out["check"][1].startswith("1 held"), out["check"])
+        self.assertEqual(out["held"][0]["names"], ["hand.txt"])
+        self.assertIn("hand.txt", out["check"][1])
+        self.assertFalse(out["c_after"])
+        self.assertFalse(out["c_record_after"])
+        self.assertTrue(out["e"])
+        self.assertEqual(len(out["held_e"]), 1)
+        self.assertTrue(out["held_e"][0]["blocked"])
+        self.assertEqual(out["held_e"][0]["names"], ["notes.txt"])
+        self.assertFalse(out["check_e"][0])
+        self.assertIn("notes.txt", out["check_e"][1])
+        self.assertFalse(out["e_after"])
+        self.assertEqual(out["check_after"], [True, "none held"])
+        self.assertEqual(out["g"], [True, True, True])
+        self.assertTrue(out["f"])
+        self.assertEqual(len(out["held_f"]), 2)
+        self.assertFalse(out["held_f"][0]["blocked"])
+        self.assertEqual(out["held_f"][0]["names"], [])
+        self.assertTrue(out["held_f"][0]["why"].endswith("waits for the ticket"))
+        self.assertTrue(out["check_f"][0])
+        self.assertTrue(out["check_f"][1].startswith("2 held"), out["check_f"])
+
+
 class ChatContextTests(unittest.TestCase):
     PRELUDE = r'''
 import json, sys, time
@@ -4615,6 +4973,140 @@ gh.issue_create("fixture/repo", "Report", probe)
                 with self.subTest(args=args), self.assertRaisesRegex(TypeError, "gh.outgoing"):
                     gh.gh(args)
         self.assertTrue(gh.outgoing("x", "Closes #5").startswith("Closes #5\n\n"))
+
+
+class UploadGuardTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        self.evidence = self.root / "runs" / "run" / "evidence"
+        self.browser = self.root / "runs" / "run" / "browser"
+        self.outside = self.root / "outside.txt"
+        for d in (self.evidence, self.browser):
+            d.mkdir(parents=True)
+        self.outside.write_text("x")
+        for patch in (mock.patch.object(paths, "RUNS_DIR", self.root / "runs"),
+                      mock.patch.dict(os.environ, {"ARETE_RUN_ID": "run"})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        noted = mock.patch.object(guard, "note")
+        self.note = noted.start()
+        self.addCleanup(noted.stop)
+
+    def call(self, payload, raw=None):
+        text = raw if raw is not None else json.dumps(payload)
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(text)), mock.patch.object(sys, "stdout", out):
+            code = uploads.main()
+        return code, out.getvalue()
+
+    def upload(self, *names):
+        return {"tool_name": uploads.TOOL, "tool_input": {"paths": [str(n) for n in names]}}
+
+    def assertDenied(self, payload, rule, shown=None):
+        reason = uploads.decide(payload)
+        self.assertIn(rule, reason)
+        self.assertIn(str(shown or payload["tool_input"]["paths"][-1]), reason)
+        self.assertIn(str(self.evidence), reason)
+        _, out = self.call(payload)
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.note.call_args.args[0].error, reason)
+
+    def test_files_in_the_run_folders_are_allowed(self):
+        good = self.evidence / "a.png"
+        also = self.browser / "b.txt"
+        good.write_text("x")
+        also.write_text("x")
+        self.assertEqual(uploads.decide(self.upload(good, also)), "")
+        self.assertEqual(self.call(self.upload(good, also)), (0, ""))
+        self.note.assert_not_called()
+
+    def test_other_files_are_denied(self):
+        (self.evidence / "leak.txt").symlink_to(self.outside)
+        for name in (".env", "id_rsa", "x.pem"):
+            (self.evidence / name).write_text("x")
+        (self.evidence / "plain.txt").symlink_to(self.evidence / ".env")
+        cases = [(self.outside, uploads.OUTSIDE), ("rel.png", uploads.OUTSIDE),
+                 (self.evidence / "leak.txt", uploads.OUTSIDE), (self.evidence / ".env", uploads.SECRET),
+                 (self.evidence / "id_rsa", uploads.SECRET), (self.evidence / "x.pem", uploads.SECRET),
+                 (self.evidence / "plain.txt", uploads.SECRET), (self.evidence / "none.png", uploads.MISSING),
+                 (self.evidence, uploads.MISSING)]
+        for path, rule in cases:
+            with self.subTest(path=str(path)):
+                self.assertDenied(self.upload(path), rule)
+
+    def test_one_bad_path_denies_the_whole_call(self):
+        good = self.evidence / "a.png"
+        good.write_text("x")
+        self.assertDenied(self.upload(good, self.outside), uploads.OUTSIDE, self.outside)
+
+    def test_closing_the_chooser_is_allowed(self):
+        for args in ({"paths": []}, {}):
+            self.assertEqual(self.call({"tool_name": uploads.TOOL, "tool_input": args}), (0, ""))
+
+    def test_errors_deny(self):
+        good = self.evidence / "a.png"
+        good.write_text("x")
+        bad = [("not json", None), ({"tool_input": {"paths": str(good)}}, None),
+               ({"tool_input": {"paths": [1]}}, None), ({"tool_input": "x"}, None)]
+        for payload, _ in bad:
+            with self.subTest(payload=payload):
+                _, out = self.call(payload, payload if isinstance(payload, str) else None)
+                self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+        with mock.patch.dict(os.environ, {"ARETE_RUN_ID": ""}):
+            _, out = self.call(self.upload(good))
+            self.assertIn("deny", out)
+        with mock.patch.object(uploads, "decide", side_effect=RuntimeError):
+            self.assertIn("deny", self.call(self.upload(good))[1])
+        self.note.side_effect = OSError
+        self.assertIn("deny", self.call(self.upload(self.outside))[1])
+
+    def test_cli_denies_and_fails_closed(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.upload(self.outside)))), \
+                mock.patch.object(sys, "stdout", out):
+            self.assertEqual(cli.main(["upload-guard"]), 0)
+        self.assertIn("deny", out.getvalue())
+        with mock.patch.object(uploads, "main", side_effect=RuntimeError), mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(cli.main(["upload-guard"]), 2)
+
+    def launch(self, which="claude", guarded=False, remote=None):
+        picked = SimpleNamespace(candidate=SimpleNamespace(runner=which, effort="", instructions=()), selected=None, budget=None)
+        trip = SimpleNamespace(cfg=SimpleNamespace(jev=SimpleNamespace(guard=guarded),
+                                                   environment=SimpleNamespace(providers=())), repo=None, scratch=None,
+                               target=SimpleNamespace(remote=remote), tokens=None, hard_cap=False)
+        tools = [uploads.TOOL, "mcp__playwright__browser_click"]
+        with mock.patch.object(runner.environment, "passed", return_value=[]):
+            return runner.launch_kwargs({"allowed_tools": tools}, picked, trip, ("r", "s"), False, [].append)
+
+    def test_only_local_claude_gets_the_tool_and_its_hook(self):
+        for guarded in (False, True):
+            kw = self.launch(guarded=guarded)
+            groups = kw["settings"]["hooks"]["PreToolUse"]
+            self.assertIn(uploads.TOOL, kw["allowed_tools"])
+            self.assertEqual([g["matcher"] for g in groups if "playwright" in g["matcher"]], [uploads.TOOL])
+            self.assertEqual(guard.MATCHER in [g["matcher"] for g in groups], guarded)
+        for which, remote in (("codex", None), ("pi", None), ("claude", SimpleNamespace())):
+            with self.subTest(which=which, remote=bool(remote)):
+                kw = self.launch(which, remote=remote)
+                self.assertEqual(kw["allowed_tools"], ["mcp__playwright__browser_click"])
+                self.assertIn(uploads.WITHHELD, kw["system"])
+
+    def test_codex_refuses_the_tool_and_keeps_other_tools(self):
+        payload = {"tool_name": uploads.TOOL, "tool_input": {"paths": []}}
+        self.assertEqual(codex.guard_reason(payload, False, []), uploads.CODEX_REFUSAL)
+        click = {"tool_name": "mcp__playwright__browser_click", "tool_input": {}}
+        self.assertEqual(codex.guard_reason(click, False, []), "")
+
+    def test_the_tool_list_prompt_and_server_limit(self):
+        self.assertIn("browser_file_upload", verify.PLAYWRIGHT_TOOLS)
+        for name in ("browser_evaluate", "browser_run_code_unsafe"):
+            self.assertNotIn(name, verify.PLAYWRIGHT_TOOLS)
+        self.assertNotIn("--allow-unrestricted-file-access", verify.mcp_config(self.evidence))
+        note = pipeline.surface_note(SimpleNamespace(start="x"), "http://127.0.0.1:1", self.evidence)
+        self.assertIn("`browser_file_upload`", note)
+        self.assertIn(f"copy a worktree file into `{self.evidence}`", note)
 
 
 class NoLiveStateTests(unittest.TestCase):
