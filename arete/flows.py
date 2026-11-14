@@ -121,6 +121,9 @@ def guard(job: Job, continues: str) -> str:
     try:
         checkouts = [pipeline.Checkout(**{**e, "src": Path(e["src"]), "wt": Path(e["wt"])}) for e in listed]
         layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
+        if held := pipeline.scratch_held(job.ws, checkouts):
+            return (f"arete started no step and made no tracker call: verification scratch at {held[0]} is still "
+                    "held; poll finalizes it once its holders end, then run again")
         if why := pipeline.kept_work(job.ws, checkouts, job.run.repo.path, layer.copy, commits=False):
             return f"arete started no step and made no tracker call: {why}"
     except (pipeline.RunFailed, RuntimeError, OSError, KeyError, TypeError) as e:
@@ -533,6 +536,9 @@ class Job:
         run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored and not run.workspace:
+            if held := pipeline.scratch_held(self.ws, self.checkouts):
+                raise pipeline.RunFailed(f"verification scratch at {held[0]} is still held; poll finalizes it once "
+                                         "its holders end, then run again")
             kept = pipeline.kept_onto(self.ws, self.checkouts, self.branch)
             if why := pipeline.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
                 raise pipeline.RunFailed(why)

@@ -692,6 +692,13 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     return found + [p for p in unproven if scratch_named(late, p.name)]
 
 
+def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
+    if held := scratch_left(ws, checkouts):
+        scratch.recover_pending()
+        held = scratch_left(ws, checkouts)
+    return held
+
+
 def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
     if scratch_left(ws, checkouts):
         return False
