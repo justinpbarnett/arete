@@ -302,6 +302,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         return refused(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind,
                        chosen_by, try_no, refusal, atom)
     if which == REPLAY and (cfg.replay.all or not (settings and settings.requires.declared)):
+        if resume_only and not kept.id:
+            return unresumable(which, name, resume)
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
         text = fresh_prompt(which) if fresh_prompt and resume.id and not kept.id else prompt
@@ -350,9 +352,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             trip.barred[routing.route_key(chosen_route)] = why
             continue
         if resume_only and not session.id:
-            return with_spent(Result(ok=False, error=f"the kept session cannot continue on {chosen_route.runner} "
-                                                      f"{picked.name}", runner=chosen_route.runner, model=picked.name,
-                                     session=trip.resume), limited)
+            return with_spent(unresumable(chosen_route.runner, picked.name, trip.resume), limited)
         launches += 1
         trip.launched = True
         selection = launched_selection(trip, prior, skipped, final_size, chosen_route, picked.name)
@@ -395,6 +395,11 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             trip.floors[key] = (ends if ends > util.now() else util.now() + timedelta(seconds=HOLD_CHECK_SECONDS),
                                 picked.auth)
         say(f"{hold_words({'why': why, 'until': limit.until})}, trying another route")
+
+
+def unresumable(which: str, name: str, resume: Session) -> Result:
+    return Result(ok=False, error=f"the kept session cannot continue on {which} {name}", runner=which, model=name,
+                  session=resume)
 
 
 @dataclass
