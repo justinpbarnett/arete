@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -11,8 +12,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields, replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -26,6 +28,8 @@ PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
 PORT_FIELD = re.compile(r"\{(port\d*)\}")
 SCRATCH_FIELD = "{scratch}"
 STOP_GRACE_SECONDS = 10
+HOP_BY_HOP = frozenset(("connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
+                        "transfer-encoding", "upgrade"))
 EVIDENCE_BRANCH = "arete/evidence"
 MAX_SCREENSHOTS = 8
 MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
@@ -121,6 +125,63 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
                     blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
 
 
+def relay_server(url: str) -> ThreadingHTTPServer:
+    target = urlsplit(url)
+    connect = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+
+    class Relay(BaseHTTPRequestHandler):
+        def forward(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else None
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP | {"host"}}
+            headers["Host"] = target.netloc
+            try:
+                upstream = connect(target.hostname, target.port)
+                upstream.request(self.command, self.path, body, headers)
+                resp = upstream.getresponse()
+            except (OSError, http.client.HTTPException):
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"the relay could not reach the app")
+                return
+            try:
+                self.send_response_only(resp.status, resp.reason)
+                for key, value in resp.getheaders():
+                    if key.lower() not in HOP_BY_HOP:
+                        self.send_header(key, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if self.command != "HEAD":
+                    while chunk := resp.read1(65536):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                upstream.close()
+
+        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = forward
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Relay)
+    server.daemon_threads = True
+    return server
+
+
+@contextmanager
+def relayed(url: str):
+    server = relay_server(url)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
             repo: config.Repo | None = None, sets: dict[str, str] | None = None, lifetime: dict | None = None,
@@ -131,40 +192,41 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         yield ""
         return
     url = v.url.rstrip("/")
-    listen = None
-    if attempt:
-        app = scratch.app_port(attempt, url)
-        listen = scratch.listen_port(attempt, app, scratch.dashboard_ports())
-        scratch.update_browser(attempt, listen=listen)
-    command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
-    env, kept = environment.started(cfg or config.load(), repo, sets)
-    if attempt:
-        env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
-        env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
-                    "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
-                    "ARETE_WORKTREES_DIR": attempt.root + "/state/worktrees"})
-    log.write_text("")
-    with scratch.producing(attempt):
-        proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
-                             actor_confined=bool(attempt), **util.own_group_args())
-    pump = threading.Thread(target=write_hidden, args=(proc, log, set(kept.values())), daemon=True)
-    pump.start()
-    if lifetime is not None:
-        lifetime["stopped"] = False
-    try:
-        wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
-        yield url
-    finally:
-        stop(proc)
-        pump.join(STOP_GRACE_SECONDS)
+    with relayed(url) if attempt and not scratch.loopback(url) else nullcontext(url) as reach:
+        listen = None
+        if attempt:
+            app = scratch.app_port(attempt, reach)
+            listen = scratch.listen_port(attempt, app, scratch.dashboard_ports())
+            scratch.update_browser(attempt, listen=listen)
+        command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
+        env, kept = environment.started(cfg or config.load(), repo, sets)
+        if attempt:
+            env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
+            env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
+                        "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
+                        "ARETE_WORKTREES_DIR": attempt.root + "/state/worktrees"})
+        log.write_text("")
+        with scratch.producing(attempt):
+            proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                                 actor_confined=bool(attempt), **util.own_group_args())
+        pump = threading.Thread(target=write_hidden, args=(proc, log, set(kept.values())), daemon=True)
+        pump.start()
         if lifetime is not None:
-            try:
-                os.killpg(proc.pid, 0)
-            except ProcessLookupError:
-                lifetime["stopped"] = True
-            except PermissionError:
-                pass
+            lifetime["stopped"] = False
+        try:
+            wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
+            yield reach
+        finally:
+            stop(proc)
+            pump.join(STOP_GRACE_SECONDS)
+            if lifetime is not None:
+                try:
+                    os.killpg(proc.pid, 0)
+                except ProcessLookupError:
+                    lifetime["stopped"] = True
+                except PermissionError:
+                    pass
 
 
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
