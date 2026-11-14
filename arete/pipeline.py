@@ -51,6 +51,7 @@ from . import (
     vault,
     verdicts,
     verify,
+    webpush,
 )
 from .agent import NO_SESSION, Result, Session
 from .heartbeat import mark_loop, network_up_or_skip
@@ -1787,6 +1788,8 @@ def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: s
         run.enter("needs-info")
         devices.release(run.id, run.log)
         alerts.ask_notice(run.where, summary)
+        for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
+            run.log(note)
         run.log("needs-info: kept the work folder and the step's session for the answer")
         return "needs-info", summary[:300], ""
     run.say(comment)

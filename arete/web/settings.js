@@ -21,6 +21,108 @@ function drawSettings(data) {
       placeholder: `default: ${defaultModel(data, role)}`, list: "model-names", autocomplete: "off", spellcheck: "false" }))));
 }
 
+let pushData = null;
+let thisDeviceId = "";
+
+function pushReady() {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window && window.isSecureContext;
+}
+
+function bytesOfBase64url(text) {
+  const padded = (text + "=".repeat((4 - (text.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+}
+
+async function deviceIdOf(endpoint) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(endpoint));
+  return [...new Uint8Array(digest)].slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function thisSubscription() {
+  const registration = await navigator.serviceWorker.getRegistration();
+  return registration ? registration.pushManager.getSubscription() : null;
+}
+
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const found = [["iPhone", /iPhone/], ["iPad", /iPad/], ["Android", /Android/], ["Mac", /Macintosh/], ["Windows", /Windows/], ["Linux", /Linux/]]
+    .find(([, pattern]) => pattern.test(ua));
+  return found ? found[0] : "Device";
+}
+
+function paintPush() {
+  const ready = pushReady();
+  document.getElementById("push-allow").disabled = !ready;
+  const devices = pushData.devices;
+  fill("push-devices",
+    ready ? null : quiet("This page cannot receive pushes. On an iPhone, open the dashboard over HTTPS in Safari, add it to the Home Screen and open it from there."),
+    devices.length ? table("Subscribed devices", [["Device"], ["Added", "c-time"], ["Last push", "c-time"], [""]],
+      devices.map((d) => el("tr", {}, cell(d.id === thisDeviceId ? `${d.label} (this device)` : d.label), cell(liveAgo(d.created), "c-time"),
+        cell(liveAgo(d.last_success), "c-time"), cell(button("Remove", "push-remove", () => removePush(d.id), { of: d.id })))))
+      : quiet("No device is subscribed."));
+}
+
+function drawPush(data) {
+  pushData = data;
+  paintPush();
+  if (!pushReady()) return;
+  thisSubscription().then((sub) => (sub ? deviceIdOf(sub.endpoint) : "")).then((id) => {
+    if (id === thisDeviceId) return;
+    thisDeviceId = id;
+    paintPush();
+  }).catch(() => {});
+}
+
+async function allowPush() {
+  trackAction("push-allow");
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") return say("push-result", "fault", "Notifications are not allowed for this page, so nothing was subscribed.");
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const key = bytesOfBase64url(pushData.key);
+    let sub = await registration.pushManager.getSubscription();
+    const held = sub?.options?.applicationServerKey;
+    if (sub && (!held || held.byteLength !== key.length || new Uint8Array(held).some((b, i) => b !== key[i]))) {
+      await sub.unsubscribe();
+      sub = null;
+    }
+    sub ||= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    const json = sub.toJSON();
+    const saved = await call("/api/push/subscribe", { endpoint: json.endpoint, keys: json.keys, label: deviceLabel() });
+    thisDeviceId = await deviceIdOf(json.endpoint);
+    drawPush(saved);
+    say("push-result", "ok", "This device will get a push when an ask needs you.");
+  } catch (e) {
+    say("push-result", "fault", e.message);
+  }
+}
+
+async function removePush(id) {
+  try {
+    const saved = await call("/api/push/remove", { id });
+    if (id === thisDeviceId) {
+      (await thisSubscription())?.unsubscribe();
+      thisDeviceId = "";
+    }
+    drawPush(saved);
+    say("push-result", "ok", "Removed the device.");
+  } catch (e) {
+    say("push-result", "fault", e.message);
+  }
+}
+
+async function testPush() {
+  trackAction("push-test");
+  try {
+    const got = await call("/api/push/test", {});
+    drawPush(got);
+    const extra = [got.removed ? `${got.removed} removed because its push service no longer knows it` : "", got.failed ? `${got.failed} failed` : ""].filter(Boolean);
+    say("push-result", got.failed ? "fault" : "ok", `Sent a test to ${got.sent} ${got.sent === 1 ? "device" : "devices"}${extra.length ? `, ${extra.join(", ")}` : ""}.`);
+  } catch (e) {
+    say("push-result", "fault", e.message);
+  }
+}
+
 function settingsChanges() {
   const changes = {};
   for (const [id, key] of RUN_LIMITS) {

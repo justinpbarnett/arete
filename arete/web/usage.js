@@ -15,7 +15,7 @@ const ACTION_WORDS = {
   "loop-new-toggle": "New loop", "draft-loop": "Draft a loop", start: "Start a loop", try: "Try a loop", switch: "Turn a loop on or off",
   "serve-install": "Install or restart serve", "filter-groups": "Triage group", "triage-refresh": "Refresh triage",
   research: "Research a ticket", "ticket-send": "Send a ticket to the pipeline", probe: "Probe a device", "checks-run": "Run the checks",
-  "settings-save": "Save the settings", "filter-window": "Usage window", "console-open": "Open the console",
+  "settings-save": "Save the settings", "push-allow": "Allow notifications", "push-test": "Send a test push", "push-remove": "Remove a notification device", "filter-window": "Usage window", "console-open": "Open the console",
   "chat-send": "Send in the console", "chat-new": "New chat", "draft-file": "File a drafted issue from the console",
   "draft-drop": "Drop a drafted issue from the console", find: "Find", "feedback-open": "Open feedback", "feedback-submit": "Submit feedback","feedback-screenshot": "Take a screenshot for feedback",
   "feedback-record": "Record a video for feedback", "feedback-attach": "Attach a file to feedback", "feedback-remove": "Remove feedback evidence", "go-key": "G then a letter",
