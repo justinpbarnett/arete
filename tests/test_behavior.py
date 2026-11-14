@@ -7442,6 +7442,271 @@ class AlertWriteRecoveryTests(unittest.TestCase):
 
 
 class NewUIShellTests(unittest.TestCase):
+    def test_action_write_boundary(self):
+        web = SOURCE / "arete" / "web"
+        names = ("ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js")
+        for name in names:
+            source = (web / name).read_text()
+            self.assertNotIn("innerHTML", source)
+            self.assertNotIn("eval", source)
+            if name != "ui-write.js":
+                for method in re.findall(r"\bmethod\s*:\s*([^,}\n]+)", source):
+                    self.assertIn(method.strip(), ('"GET"', "'GET'"))
+        write = (web / "ui-write.js").read_text()
+        for field in ("X-Arete", "Idempotency-Key", "base_version"):
+            self.assertIn(field, write)
+        for path in web.glob("ui-*.js"):
+            if path.name != "ui-write.js":
+                for method in re.findall(r"\bmethod\s*:\s*([^,}\n]+)", path.read_text()):
+                    self.assertIn(method.strip(), ('"GET"', "'GET'"), path.name)
+
+    def test_action_fixture_http_controls(self):
+        script = r'''
+import json, threading, unittest, urllib.request, urllib.error
+from unittest import mock
+from arete import dashboard
+from tests.ui_action_fixture import server
+check = unittest.TestCase()
+instance = server()
+check.assertEqual(instance.server_address[0], '127.0.0.1')
+thread = threading.Thread(target=instance.serve_forever, daemon=True)
+thread.start()
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+base = f'http://127.0.0.1:{instance.server_port}'
+def request(path, body=None, guard=True, key='replayed-key'):
+    headers = {'Content-Type':'application/json', 'Idempotency-Key':key}
+    if guard:
+        headers['X-Arete'] = '1'
+    req = urllib.request.Request(base+path, data=None if body is None else json.dumps(body).encode(), headers=headers)
+    try:
+        response = opener.open(req, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        raw = response.read()
+        return response.status, json.loads(raw) if response.headers.get_content_type() == 'application/json' else raw.decode()
+try:
+    check.assertEqual(request('/ui.html')[0],200)
+    check.assertEqual(request('/')[0],200)
+    check.assertEqual(request('/__ui_actions/control',{},guard=False)[0],403)
+    check.assertEqual(request('/__ui_actions/items/TR-209/reject',{},guard=False)[0],403)
+    with mock.patch.object(dashboard.engine, 'launch', return_value={'id':'heartbeat-test'}) as launch:
+        status, body = request('/api/checks/run',{})
+        check.assertEqual((status,body),(200,{'run':'heartbeat-test'}))
+        launch.assert_called_once_with('heartbeat')
+    current = {'id':'TR-209','version':8,'state':'<b>Changed elsewhere</b>'}
+    conflict = {'error':'version_conflict','current':current}
+    check.assertEqual(request('/__ui_actions/control',{'status':409,'body':conflict})[0],200)
+    data = {'id':'TR-209','reason':'reason','base_version':0}
+    check.assertEqual(request('/__ui_actions/items/TR-209/reject',data),(409,conflict))
+    check.assertEqual(request('/__ui_actions/items/TR-209/reject',data)[0],200)
+    check.assertEqual(request('/__ui_actions/items/TR-209/reject',data)[0],200)
+    log = request('/__ui_actions/requests')[1]
+    check.assertEqual(len(log),4)
+    check.assertEqual(log[0]['response'],{'run':'heartbeat-test'})
+    check.assertEqual(log[1]['status'],409)
+    check.assertEqual(log[2]['idempotency_key'],log[3]['idempotency_key'])
+    check.assertEqual(log[2]['serialized_body'],log[3]['serialized_body'])
+    check.assertTrue(all(entry['guard']=='1' for entry in log))
+    request('/__ui_actions/control',{'status':500,'body':{'error':'broken'}})
+    check.assertEqual(request('/__ui_actions/items/TR-209/remove',data),(500,{'error':'broken'}))
+    request('/__ui_actions/control',{'delay':0.01})
+    check.assertEqual(request('/__ui_actions/items/TR-209/remove',data)[0],200)
+    check.assertEqual(request('/api/usage',{'kind':'visit','tab':'0123456789abcdef','device':'desktop','view':'floor','via':'hash','ms':10})[0],200)
+    check.assertEqual(request('/api/usage')[0],200)
+finally:
+    instance.shutdown()
+    thread.join(timeout=5)
+    instance.server_close()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = {key: value for key, value in os.environ.items() if key in ("PATH", "LANG", "LC_ALL")}
+            for name in ("config", "state", "log", "worktrees"):
+                (root / name).mkdir()
+                env[f"ARETE_{name.upper()}_DIR"] = str(root / name)
+            command = [sys.executable, "-I", "-B", "-c", f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script]
+            done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=45)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
+    def test_actions_offline_behavior(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { webcrypto } from 'node:crypto';
+globalThis.crypto ??= webcrypto;
+const handlers = {}, marked = new Set();
+globalThis.location = {hash:'#triage'};
+globalThis.window = {addEventListener(){}};
+globalThis.document = {documentElement:{dataset:{}}, querySelector:()=>null,
+  querySelectorAll:()=>[], addEventListener(name, fn){handlers[name]=fn;}};
+const {prepareWrite, sendWrite} = await import('./ui-write.js');
+const {actions, dispatch, repeat, replayLast, openReason, cancelReason, confirmReason, reasonBox, ReasonBox, runContext, runAction} = await import('./ui-actions.js');
+const {undo, undoDepth, pushUndo} =await import('./ui-undo.js');
+const {notice} = await import('./ui-notice.js');
+const {createList, listContext, ListRow, List} = await import('./ui-list.js');
+const {actionFixture} = await import('./ui-hooks.js');
+const {startKeys, syncList, selectItem, mode} = await import('./ui-keys.js');
+const {globalCommands, openPalette, queryPalette, runPalette} = await import('./ui-palette.js');
+const {visit} = await import('./ui-data.js');
+const sent = [];
+let response = null, deferred = null;
+globalThis.fetch = async (url, options) => {
+  sent.push({url, ...options});
+  if (deferred) await deferred;
+  const next = response ?? {status:200, body:{run:'heartbeat-fixture', id:'new-1', version:4}};
+  response = null;
+  return {ok:next.status<400, status:next.status, json:async()=>next.body};
+};
+const tick = () => new Promise(resolve=>setTimeout(resolve,0));
+const payload = () => JSON.parse(sent.at(-1).body);
+const cached = {id:'zero',version:0}, data = {reason:'why'};
+const prepared = prepareWrite('/sample', data, cached);
+assert.deepEqual(data,{reason:'why'});
+await sendWrite(prepared); await sendWrite(prepared);
+assert.deepEqual(sent[0],sent[1]);
+assert.equal(payload().base_version,0);
+assert.equal(sent[0].headers['X-Arete'],'1');
+assert(sent[0].headers['Idempotency-Key']);
+assert.equal('base_version' in JSON.parse(prepareWrite('/sample',{},{}).body),false);
+globalCommands([{id:'checks',title:'Run checks now',run:()=>dispatch(actions.checks)}]);
+openPalette(); queryPalette('Run checks now'); runPalette(); await tick();
+assert.equal(sent.at(-1).url,'/api/checks/run');
+assert.equal(notice.value,'Checks started · u to undo');
+const attempts = sent.length;
+await undo(); assert.equal(notice.value,'Checks cannot be undone'); assert.equal(sent.length,attempts);
+await undo(); assert.equal(notice.value,'Nothing to undo');
+const list = actionFixture();
+const makeRow = id => ({dataset:{item:id}, getClientRects:()=>[{}], getAttribute:()=>null,
+  setAttribute(){marked.add(id);},removeAttribute(){marked.delete(id);},scrollIntoView(){},querySelectorAll:()=>[]});
+let rows = list.rows().map(row=>makeRow(row.id));
+const element = {dataset:{list:'action-fixture'}, querySelectorAll(selector){return selector==='[data-row]' ? rows : rows.filter(row=>marked.has(row.dataset.item));},
+  uiContext:id=>listContext(list,'action-fixture',id), querySelector:()=>null};
+const pane = {dataset:{pane:'queue'},toggleAttribute(){},matches:()=>false,querySelectorAll:()=>[element]};
+document.querySelectorAll = selector=>selector==='[data-pane]' ? [pane] : selector==='[data-list]' ? [element] : [];
+const refresh = () => {rows=list.rows().map(row=>makeRow(row.id)); marked.clear(); syncList(element);};
+list.subscribe(before=>{if(!before)refresh();});
+startKeys(); refresh();
+const key = (value, flags={}, target={}) => {
+  let prevented=false;
+  handlers.keydown({key:value,target,...flags,preventDefault(){prevented=true;}});
+  return prevented;
+};
+const field = {tagName:'INPUT',type:'text',blur(){},closest:()=>null};
+const context = id=>listContext(list,'action-fixture',id);
+assert.deepEqual(list.counts(),{total:7,high:2,med:4,needsYou:6});
+key('d'); key('d'); assert.equal(reasonBox.value.label,'Reject TR-209');
+const box = new ReasonBox();
+let focused=0;
+box.base={querySelector:()=>({focus(){focused++;},blur(){}})};
+box.setState=change=>Object.assign(box.state,change);
+box.componentDidMount(); assert.equal(focused,1);
+handlers.focusin({type:'focusin',target:{...field,closest:()=>null}}); assert.equal(mode.value,'INSERT');
+for (const letter of ['u','d','t']) assert.equal(key(letter,{},field),false);
+reasonBox.value={...reasonBox.value,text:'distinctive reason'};
+const before = sent.length;
+assert(key('Enter',{},field)); assert.equal(sent.length,before);
+key('Enter',{metaKey:true},field); await tick();
+assert.equal(reasonBox.value,null); assert.equal(mode.value,'NORMAL');
+assert.equal(payload().reason,'distinctive reason'); assert.equal(payload().base_version,3);
+assert.equal(list.counts().needsYou,5); assert.equal(list.counts().total,6);
+assert.deepEqual([...marked],['TR-210']);
+const firstKey = sent.at(-1).headers['Idempotency-Key'];
+key('.'); await tick();
+assert.equal(payload().id,'TR-210'); assert.equal(payload().base_version,0);
+assert.equal(payload().reason,'distinctive reason');
+assert.notEqual(sent.at(-1).headers['Idempotency-Key'],firstKey);
+const replayed = sent.at(-1), depth=undoDepth(), count=list.rows().length;
+await replayLast(); assert.deepEqual(sent.at(-1),replayed);
+assert.equal(undoDepth(),depth); assert.equal(list.rows().length,count);
+key('d'); key('d'); reasonBox.value={...reasonBox.value,text:'cancel this'};
+const cancelled = sent.length;
+key('Escape',{},field); assert.equal(reasonBox.value,null); assert.equal(mode.value,'NORMAL');
+assert.equal(sent.length,cancelled); assert.equal(location.hash,'#triage');
+openReason(actions.discard,context('TR-211')); await confirmReason();
+assert.equal(payload().reason,''); assert.equal('base_version' in payload(),false);
+location.hash='#floor'; await undo();
+assert.equal(location.hash,'#triage'); assert.equal(list.rows().length,count);
+assert.equal(notice.value,'Undid: Discarded TR-211');
+await undo(); assert(list.state.rows.some(row=>row.id==='TR-210'));
+await undo(); assert.equal(list.counts().total,7); assert.deepEqual([...marked],['TR-209']);
+response={status:409,body:{error:'version_conflict',current:{id:'TR-209',version:8,state:'<b>Changed elsewhere</b>'}}};
+const conflicts=sent.length;
+openReason(actions.reject,context('TR-209')); reasonBox.value={...reasonBox.value,text:'preserve'};
+await confirmReason(); await tick();
+assert.equal(sent.length,conflicts+1); assert.equal(undoDepth(),0); assert.equal(list.counts().total,7);
+assert.equal(reasonBox.value.text,'preserve'); assert.equal(list.state.stale['TR-209'].version,8);
+const tree = new List().render({controller:list,id:'action-fixture'});
+function nodes(node){return !node||typeof node!=='object'?[]:[node,...[node.props?.children].flat(Infinity).flatMap(nodes)];}
+assert(nodes(tree).some(node=>node.props?.role==='alert' && node.props.children.includes('<b>Changed elsewhere</b>')));
+assert(notice.value.startsWith('Failed:')); cancelReason();
+response={status:500,body:{error:'broken'}};
+assert.equal(await dispatch(actions.remove,context('TR-209')),false);
+assert.equal(undoDepth(),0); assert.equal(list.counts().total,7);
+let release;
+deferred = new Promise(resolve=>{release=resolve;});
+const pending = dispatch(actions.remove,context('TR-209'));
+const concurrency=sent.length;
+assert.equal(await dispatch(actions.remove,context('TR-209')),false); assert.equal(sent.length,concurrency);
+release(); deferred=null; await pending;
+assert.equal(list.counts().total,6); await undo();
+await dispatch(actions.remove,context('TR-213'));
+await dispatch(actions.stop,context('TR-214'));
+const stopped=sent.length;
+await undo(); assert.equal(notice.value,'Stopping a run cannot be undone'); assert.equal(sent.length,stopped);
+assert.equal(undoDepth(),1); await undo(); assert.equal(list.counts().total,6);
+list.setSort('title');
+openReason(actions.create,context()); reasonBox.value={...reasonBox.value,text:'ZZZ new item'}; await confirmReason();
+assert.equal(list.rows()[0].title,'ZZZ new item'); assert.equal(list.groups()[0][0],'New');
+assert(nodes(ListRow({row:list.rows()[0]})).some(node=>node.props?.children==='+ ZZZ new item · new'));
+assert.equal(list.counts().total,7); await undo(); assert.equal(list.counts().total,6);
+const end = createList({rows:[{id:'a'},{id:'b'}]});
+assert.equal(end.resolve(end.state.rows[1]).next,'a');
+assert.equal(end.resolve(end.state.rows[0]).next,undefined);
+assert.deepEqual(end.rows(),[]);
+const parked = createList({rows:[{id:'park',priority:'HIGH'},{id:'low',priority:'LOW'}]});
+const parking = parked.park(parked.state.rows[0],'Snoozed');
+assert.equal(parked.counts().needsYou,0); assert.equal(parked.state.parked.length,1);
+parking.undo(); assert.equal(parked.counts().needsYou,1); assert.equal(parked.state.parked.length,0);
+parked.setQuery('nothing'); parked.insert({id:'created',title:'Pinned'});
+assert.equal(parked.rows()[0].id,'created');
+await dispatch(actions.remove,context('TR-209'));
+const inverseDepth=undoDepth(), inverseCount=list.counts().total;
+response={status:500,body:{error:'inverse failed'}}; await undo();
+assert.equal(undoDepth(),inverseDepth); assert.equal(list.counts().total,inverseCount);
+await undo(); assert.equal(list.counts().total,inverseCount+1);
+{
+  const calls=[], base=undoDepth(); let free;
+  pushUndo({label:'first',inverse:()=>{calls.push('first'); return new Promise(resolve=>{free=resolve;});}});
+  const slow=undo();
+  pushUndo({label:'second',inverse:async()=>{calls.push('second');}});
+  free(); await slow;
+  assert.equal(undoDepth(),base+1); await undo();
+  assert.deepEqual(calls,['first','second']); assert.equal(undoDepth(),base);
+}
+const savedNotice=notice.value, savedDepth=undoDepth();
+await visit({tab:'tab',device:'desktop',view:'floor',via:'hash',ms:10});
+assert.equal(sent.at(-1).url,'/api/usage'); assert.equal(sent.at(-1).keepalive,true);
+assert.equal(notice.value,savedNotice); assert.equal(undoDepth(),savedDepth);
+response={status:200,body:null};
+await assert.rejects(sendWrite(prepared),/Invalid response/);
+const transport=globalThis.fetch;
+globalThis.fetch=async()=>{throw new Error('offline');};
+await assert.rejects(sendWrite(prepared),/Request failed: offline/);
+globalThis.fetch=transport;
+const repair=runAction('repair','Repair'); await repair.run(runContext({id:'run id',version:0},'repair'));
+assert.equal(sent.at(-1).url,'/api/runs/run%20id/repair'); assert.equal(payload().base_version,0);
+box.componentWillUnmount();
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text('{"type":"module"}')
+            web = SOURCE / "arete" / "web"
+            for path in [*web.glob("ui-*.js"), *web.glob("vendor-*.js")]:
+                shutil.copyfile(path, root / path.name)
+            (root / "check.mjs").write_text(script)
+            done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
     def test_palette_source_contract(self):
         web = SOURCE / "arete" / "web"
         palette = (web / "ui-palette.js").read_text()
@@ -7622,7 +7887,7 @@ component.componentWillUnmount();
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text('{"type":"module"}')
-            for name in ("ui-palette.js", "ui-fuzzy.js", "ui-hooks.js", "ui-keys.js", "ui-router.js", "ui-menu.js", "vendor-preact.js", "vendor-signals.js"):
+            for name in ("ui-palette.js", "ui-fuzzy.js", "ui-hooks.js", "ui-keys.js", "ui-router.js", "ui-menu.js", "ui-list.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js", "vendor-preact.js", "vendor-signals.js"):
                 shutil.copyfile(SOURCE / "arete" / "web" / name, root / name)
             (root / "check.mjs").write_text(script)
             done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=30)
@@ -7829,7 +8094,7 @@ assert.equal(pane.value, 'queue');
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text('{"type":"module"}')
-            for name in ("ui-list.js", "ui-menu.js", "ui-keys.js", "ui-router.js", "ui-palette.js", "ui-fuzzy.js", "vendor-preact.js", "vendor-signals.js"):
+            for name in ("ui-list.js", "ui-menu.js", "ui-keys.js", "ui-router.js", "ui-palette.js", "ui-fuzzy.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js", "vendor-preact.js", "vendor-signals.js"):
                 shutil.copyfile(SOURCE / "arete" / "web" / name, root / name)
             (root / "check.mjs").write_text(script)
             done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=30)
@@ -7887,6 +8152,7 @@ try:
     check.assertEqual(assets.scripts, {
         "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js", "/ui-keys.js", "/ui-keybar.js", "/ui-hooks.js", "/ui-list.js", "/ui-menu.js",
         "/ui-palette.js", "/ui-fuzzy.js", "/ui-feedback.js",
+        "/ui-actions.js", "/ui-undo.js", "/ui-notice.js", "/ui-write.js",
         "/vendor-preact.js", "/vendor-htm.js", "/vendor-signals.js"})
     check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css", "/ui-feedback.css"})
     check.assertIn("/icon-192.png", assets.declared)

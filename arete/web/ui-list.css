@@ -29,3 +29,5 @@
 .ui-list button.primary { color: var(--ink); border-bottom: 2px solid var(--accent); }
 [data-pane="queue"] .ui-list-header { gap: 2px; padding: 0 4px; }
 [data-pane="queue"] .ui-list-header button { padding: 0 4px; }
+.ui-stale { padding: 6px 12px; color: var(--ink); border: 1px solid var(--accent); white-space: pre-wrap; overflow-wrap: anywhere; }
+.fixture-replay { position: fixed; top: 8px; right: 16px; color: var(--ink); background: var(--panel); border: 1px solid var(--rule-strong); }
