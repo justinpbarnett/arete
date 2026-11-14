@@ -1,0 +1,101 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+
+@font-face { font-family: "JetBrains Mono"; src: url("fonts/JetBrainsMono-Regular.woff2") format("woff2"); font-weight: 100 500; font-style: normal; font-display: block; }
+@font-face { font-family: "JetBrains Mono"; src: url("fonts/JetBrainsMono-Bold.woff2") format("woff2"); font-weight: 600 900; font-style: normal; font-display: block; }
+@font-face { font-family: "JetBrains Mono"; src: url("fonts/JetBrainsMono-Italic.woff2") format("woff2"); font-weight: 100 500; font-style: italic; font-display: block; }
+@font-face { font-family: "JetBrains Mono"; src: url("fonts/JetBrainsMono-BoldItalic.woff2") format("woff2"); font-weight: 600 900; font-style: italic; font-display: block; }
+
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --canvas: #0B0C0E;
+  --panel: #121418;
+  --raised: #1A1D22;
+  --selected: #21252B;
+  --rule: #2B2C31;          /* hairline frames, decorative only */
+  --rule-strong: #6E727A;   /* input and control borders */
+
+  /* text */
+  --ink: #E7E5DF;
+  --ink-2: #BDBBB4;
+  --muted: #9C9A93;
+  --faint: #7A7973;         /* tick marks and idle glyphs, never body text */
+
+  /* state */
+  --accent: #FFD60A;        /* needs you, act here */
+  --on-accent: #0B0C0E;
+  --fault: #F5646A;
+  --on-fault: #0B0C0E;
+  --ok: var(--muted);
+  --running: var(--ink);
+  --idle: var(--faint);
+
+  /* diff */
+  --diff-add: #16301F;
+  --diff-del: #3A1719;
+  --diff-add-mark: #4CC38A;
+  --diff-del-mark: var(--fault);
+
+  /* charts */
+  --series-volume: var(--ink-2);
+  --series-other: var(--muted);
+  --series-needs-you: var(--accent);
+  --series-fault: var(--fault);
+  --band: rgba(231, 229, 223, 0.07);   /* the normal range behind a trend */
+
+  /* type */
+  --font-ui: "IBM Plex Sans", system-ui, sans-serif;
+  --font-data: "JetBrains Mono", ui-monospace, monospace;
+  --text-micro: 11px;   /* mono uppercase labels */
+  --text-s: 12px;       /* table cells, meta */
+  --text-m: 13px;       /* body */
+  --text-l: 15px;       /* panel titles */
+  --text-xl: 20px;      /* screen titles, tile values */
+  --text-kpi: 32px;     /* big numbers */
+  --text-andon: 48px;   /* the needs you count on Floor */
+  --label-tracking: 0.06em;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-strong: 600;
+  --numbers: tabular-nums;
+
+  /* space and shape */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-5: 16px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --radius: 0;
+  --radius-control: 2px;
+  --frame: 1px solid var(--rule);
+  --act-line: 2px solid var(--accent);
+  --focus-ring: 2px solid var(--ink);
+
+  /* density */
+  --row: 28px;
+  --rail: 48px;
+  --strip: 36px;
+
+  /* motion */
+  --tick-ms: 1200ms;
+  --enter-ms: 120ms;
+}
+
+[data-density="comfortable"] { --row: 32px; }
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --tick-ms: 0ms; --enter-ms: 0ms; }
+}
+
+*, *::before, *::after { box-sizing: border-box; transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+
+html, body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--text-m);
+}
