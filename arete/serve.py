@@ -34,6 +34,7 @@ from . import (
     state,
     tasks,
     util,
+    webpush,
 )
 from .loops import Loop
 
@@ -163,6 +164,11 @@ class Server:
                 self.say(note)
         except Exception as e:
             self.say(f"expiring asks: {type(e).__name__}: {e}")
+        try:
+            for note in webpush.remind(self.cfg):
+                self.say(note)
+        except Exception as e:
+            self.say(f"reminding of asks: {type(e).__name__}")
         self.ticks += 1
         self.beat(every_loop, live)
 
@@ -249,7 +255,7 @@ class Server:
             self.oncall_error = text
             return
         self.oncall_error = ""
-        if found and (found.get("opened") or found.get("decisions")):
+        if found and (found.get("opened") or found.get("decisions") or found.get("repairs")):
             self.say(f"on-call: {oncall.said(found)}")
 
     def sweeping(self) -> bool:

@@ -466,7 +466,9 @@ CREATE TABLE IF NOT EXISTS incidents (
     retry_at TEXT DEFAULT '',
     decided_count INTEGER DEFAULT 0,
     shapes TEXT DEFAULT '',
-    policies TEXT
+    policies TEXT,
+    phase TEXT DEFAULT '',
+    waiting TEXT DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -476,6 +478,16 @@ CREATE TABLE IF NOT EXISTS incident_notes (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS incident_notes_incident ON incident_notes (incident, id);
+CREATE TABLE IF NOT EXISTS incident_repairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident INTEGER NOT NULL,
+    repo TEXT NOT NULL,
+    task TEXT DEFAULT '',
+    started TEXT NOT NULL,
+    ended TEXT DEFAULT '',
+    outcome TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS incident_repairs_incident ON incident_repairs (incident, id);
 CREATE TABLE IF NOT EXISTS incident_aliases (
     fingerprint TEXT PRIMARY KEY,
     incident INTEGER NOT NULL,
@@ -496,12 +508,23 @@ CREATE TABLE IF NOT EXISTS asks (
     answered TEXT,
     session TEXT DEFAULT '{}',
     answers TEXT DEFAULT '[]',
-    taken_by TEXT DEFAULT ''
+    taken_by TEXT DEFAULT '',
+    reminded TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS asks_run ON asks (run);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    label TEXT DEFAULT '',
+    contact TEXT DEFAULT '',
+    created TEXT NOT NULL,
+    last_success TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 """
-MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
+("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
               ("capture_evidence", "inspection", "ALTER TABLE capture_evidence ADD COLUMN inspection TEXT DEFAULT ''"),
@@ -549,7 +572,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("decision", "TEXT DEFAULT ''"), ("confidence", "REAL DEFAULT 0"), ("reason", "TEXT DEFAULT ''"),
                   ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
                   ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
-                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"))]]
+                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"),
+                  ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"))]]
 
 
 @contextmanager
@@ -874,6 +898,7 @@ def prune(days: float = 14) -> None:
         c.execute("DELETE FROM incident_notes WHERE incident IN (SELECT id FROM incidents WHERE last_seen < ?)", (old,))
         c.execute("DELETE FROM incidents WHERE last_seen < ?", (old,))
         c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
+        c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
 
 
 def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signature: str, count: int,
@@ -964,6 +989,29 @@ def update_incident(incident_id: int, note: str = "", **fields) -> None:
                       (incident_id, util.iso(), note))
 
 
+def woken_incidents() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' AND decision = 'wake' "
+                                           "AND injection = 0 ORDER BY id")]
+
+
+def add_repair(incident_id: int, repo: str) -> int:
+    with db() as c:
+        return c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (?,?,?)",
+                         (incident_id, repo, util.iso())).lastrowid
+
+
+def set_repair(repair_id: int, **fields) -> None:
+    with db() as c:
+        c.execute(f"UPDATE incident_repairs SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+                  (*fields.values(), repair_id))
+
+
+def incident_repairs(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM incident_repairs ORDER BY id")]
+
+
 def parsed(row: dict) -> dict:
     return {**row, "answers": json.loads(row["answers"] or "{}")}
 
@@ -980,7 +1028,8 @@ def incident(incident_id: int, connect=db) -> dict | None:
         if not r:
             return None
         notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
-        return {**parsed(dict(r)), "notes": [dict(n) for n in notes]}
+        repairs = c.execute("SELECT * FROM incident_repairs WHERE incident = ? ORDER BY id", (incident_id,))
+        return {**parsed(dict(r)), "notes": [dict(n) for n in notes], "repairs": [dict(x) for x in repairs]}
 
 
 def add_metric(name: str, value: float, loop: str = "", run_id: str = "") -> None:
@@ -2155,6 +2204,36 @@ def asks_retire(run_id: str, status: str) -> None:
 def asks_taken(ids: list[str], run_id: str) -> None:
     with db() as c:
         c.executemany("UPDATE asks SET taken_by = ? WHERE id = ?", [(run_id, i) for i in ids])
+
+
+def ask_remind(ask_id: str) -> bool:
+    with db() as c:
+        return c.execute("UPDATE asks SET reminded = ? WHERE id = ? AND status = 'open' AND reminded = ''",
+                         (util.iso(), ask_id)).rowcount > 0
+
+
+def push_add(endpoint: str, p256dh: str, auth: str, label: str, contact: str) -> None:
+    with db() as c:
+        c.execute("INSERT INTO push_subscriptions (endpoint, p256dh, auth, label, contact, created) "
+                  "VALUES (?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, "
+                  "auth = excluded.auth, label = excluded.label, contact = excluded.contact",
+                  (endpoint, p256dh, auth, label, contact, util.iso()))
+
+
+def push_list(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM push_subscriptions ORDER BY created, rowid")]
+
+
+def push_drop(endpoints: list[str]) -> int:
+    with db() as c:
+        return sum(c.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (e,)).rowcount for e in endpoints)
+
+
+def push_succeeded(endpoints: list[str]) -> None:
+    with db() as c:
+        c.executemany("UPDATE push_subscriptions SET last_success = ? WHERE endpoint = ?",
+                      [(util.iso(), e) for e in endpoints])
 
 
 def asks_asked_before(iso: str) -> list[dict]:

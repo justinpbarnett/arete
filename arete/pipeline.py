@@ -51,6 +51,7 @@ from . import (
     vault,
     verdicts,
     verify,
+    webpush,
 )
 from .agent import NO_SESSION, Result, Session
 from .heartbeat import mark_loop, network_up_or_skip
@@ -1787,6 +1788,8 @@ def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: s
         run.enter("needs-info")
         devices.release(run.id, run.log)
         alerts.ask_notice(run.where, summary)
+        for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
+            run.log(note)
         run.log("needs-info: kept the work folder and the step's session for the answer")
         return "needs-info", summary[:300], ""
     run.say(comment)
@@ -3104,6 +3107,11 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "- After each state you check, wait until the page settles (loading done, entrance animations finished) "
             "so the shot shows what a person sees, then call `browser_take_screenshot` with `filename` set to an "
             f"absolute path in `{evidence}`, such as `{evidence}/01-list.png`.\n"
+            "- For a file chooser, click the control that opens it, then call `browser_file_upload` with `paths` set "
+            f"to absolute paths of files in `{evidence}`; empty `paths` closes the chooser. Arete's guard refuses a "
+            "path outside that folder, a path that leaves it through a symlink and any secret file, and the browser "
+            f"server reads only its own folders, so copy a worktree file into `{evidence}` first. A screenshot you "
+            "saved there also serves as a fixture.\n"
             "- Read `browser_console_messages` after each state. Name each console error and each dev error overlay "
             "or badge in `saw`, and say whether the change causes it.\n"
             "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")

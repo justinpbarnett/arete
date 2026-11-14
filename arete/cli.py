@@ -323,6 +323,11 @@ def cmd_oncall(args) -> int:
         print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
               f"{found['first_seen']} to {found['last_seen']}")
         print(f"decision: {oncall.decision_line(found)}")
+        if line := oncall.repair_line(found):
+            print(f"repair: {line}")
+        for n, r in enumerate(found["repairs"], 1):
+            print(f"  attempt {n} of {cfg.oncall.max_attempts}: task {r['task'] or '-'}, run {oncall.last_run_id(r)}, "
+                  f"{r['started']}, {r['outcome'] or ('running' if r['task'] else 'starting')}")
         for name, a in found["answers"].items():
             print(f"  {name}: {'yes' if a['value'] else 'no'}, confidence {a['confidence']:.2f}")
         print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
@@ -335,9 +340,11 @@ def cmd_oncall(args) -> int:
             print(json.dumps(row))
         return 0
     for r in rows:
-        print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
-              f"x{r['count']:<4} {r['signature']}")
+        print(f"#{r['id']:<4} {r['phase'] or r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  "
+              f"{when(r['last_seen'])}  x{r['count']:<4} {r['signature']}")
         print(f"      {oncall.decision_line(r)}")
+        if line := oncall.repair_line(r):
+            print(f"      repair: {line}")
     now = oncall.status(cfg)
     if not now["enabled"]:
         print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
@@ -360,6 +367,16 @@ def cmd_guard(args) -> int:
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     return guard.main()
+
+
+def cmd_upload_guard(args) -> int:
+    try:
+        from . import uploads
+
+        return uploads.main()
+    except Exception:
+        print("Arete's upload guard failed, so it refused the upload.", file=sys.stderr)
+        return 2
 
 
 def scratch_hook(p) -> None:
@@ -1447,6 +1464,22 @@ def cmd_secrets(args) -> int:
     return 2
 
 
+def cmd_rotate_authority(args) -> int:
+    from . import scratch
+
+    try:
+        records, pins = scratch.rotate()
+    except scratch.RotationRefused as e:
+        for line in str(e).splitlines():
+            print(f"refused: {line}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"cannot rotate the verification signing secret: {e}", file=sys.stderr)
+        return 1
+    print(f"re-signed records: {records}, pins: {pins}")
+    return 0
+
+
 def cmd_resume(args) -> int:
     from . import client
 
@@ -1622,6 +1655,10 @@ def main(argv: list[str] | None = None) -> int:
     scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
+    p = sub.add_parser("upload-guard", help="PreToolUse hook for the verifier's browser_file_upload: allows only files "
+                                            "in the run's evidence or browser folder (reads a payload on stdin)")
+    p.set_defaults(fn=cmd_upload_guard)
+
     p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
                                            "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
@@ -1795,6 +1832,11 @@ def main(argv: list[str] | None = None) -> int:
                                        "(rm REPO NAME); it never prints a value")
     p.add_argument("words", nargs="+", metavar="[rm] REPO [NAME]")
     p.set_defaults(fn=cmd_secrets)
+
+    p = sub.add_parser("rotate-authority", help="re-sign every scratch record and the browser pin under a new "
+                                                "verification signing secret, then swap it in; refuses while a run, "
+                                                "an attempt lease or an engine lock is live")
+    p.set_defaults(fn=cmd_rotate_authority)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))

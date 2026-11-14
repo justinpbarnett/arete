@@ -42,7 +42,7 @@ WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
-ASK_KEYS = ("max_per_run", "settle", "expire_days")
+ASK_KEYS = ("max_per_run", "settle", "expire_days", "remind_hours", "push_contact")
 MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb")
 CHAT_KEYS = ("context_tokens", "summary_model", "max_sessions", "budget_usd")
@@ -148,6 +148,8 @@ class AskConfig:
     max_per_run: int = 3
     settle: bool = True
     expire_days: float = 7
+    remind_hours: float = 24
+    push_contact: str = ""
 
 
 @dataclass(frozen=True)
@@ -205,6 +207,12 @@ class OncallConfig:
     scope: str = ""
     confidence: float | None = None
     injection: float | None = None
+    max_repairs: int = 1
+    wakes_per_hour: int = 10
+    max_attempts: int = 2
+    incident_budget_usd: float = 5.0
+    daily_budget_usd: float = 10.0
+    cooldown_minutes: float = 30.0
 
 
 @dataclass
@@ -488,7 +496,14 @@ def ask_table(data) -> AskConfig:
     days = table.get("expire_days", 7)
     if type(days) not in (int, float) or not math.isfinite(days) or not 0 < days <= MAX_ASK_EXPIRE_DAYS:
         raise ValueError(f"[ask] expire_days must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS}, not {days!r}")
-    return AskConfig(max_per_run=limit, settle=settle, expire_days=days)
+    hours = table.get("remind_hours", 24)
+    if type(hours) not in (int, float) or not math.isfinite(hours) or not 0 < hours <= MAX_ASK_EXPIRE_DAYS * 24:
+        raise ValueError(f"[ask] remind_hours must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS * 24}, not {hours!r}")
+    contact = table.get("push_contact", "")
+    if (not isinstance(contact, str) or len(contact) > 200 or re.search(r"\s", contact)
+            or contact and not contact.startswith(("mailto:", "https://"))):
+        raise ValueError("[ask] push_contact must be empty or a mailto: or https:// address without spaces, at most 200 characters")
+    return AskConfig(max_per_run=limit, settle=settle, expire_days=days, remind_hours=hours, push_contact=contact)
 
 
 def retention_table(data) -> Retention:
@@ -577,9 +592,29 @@ def oncall_source(entry, repos: list[Repo]) -> OncallSource:
     return OncallSource(**{key: table.get(key, "") for key in keys})
 
 
+ONCALL_BOUNDS = {"max_repairs": (int, 0), "wakes_per_hour": (int, 0), "max_attempts": (int, 1),
+                 "incident_budget_usd": (float, 0), "daily_budget_usd": (float, 0), "cooldown_minutes": (float, 0)}
+
+
+def oncall_bounds(table: dict) -> dict:
+    found = {}
+    for key, (kind, least) in ONCALL_BOUNDS.items():
+        if key not in table:
+            continue
+        value = table[key]
+        spend = key.endswith("_usd")
+        whole = type(value) is int
+        if not (whole if kind is int else whole or type(value) is float) or not (value > least if spend else value >= least):
+            what = "a whole number" if kind is int else "a number"
+            bound = f"above {least}" if spend else f"{least} or more"
+            raise ValueError(f"[oncall] {key} must be {what} {bound}, not {value!r}")
+        found[key] = kind(value)
+    return found
+
+
 def oncall_table(data, repos: list[Repo]) -> OncallConfig:
     table = table_of(data, "oncall")
-    allowed = ("enabled", "source", "vision", "scope", "confidence", "injection")
+    allowed = ("enabled", "source", "vision", "scope", "confidence", "injection", *ONCALL_BOUNDS)
     if bad := sorted(set(table) - set(allowed)):
         raise ValueError(f"[oncall]: unknown key {', '.join(bad)}; use {', '.join(allowed)}")
     enabled = table.get("enabled", False)
@@ -598,7 +633,7 @@ def oncall_table(data, repos: list[Repo]) -> OncallConfig:
     return OncallConfig(enabled, tuple(oncall_source(entry, repos) for entry in entries),
                         table.get("vision", ""), table.get("scope", ""),
                         None if table.get("confidence") is None else float(table["confidence"]),
-                        None if table.get("injection") is None else float(table["injection"]))
+                        None if table.get("injection") is None else float(table["injection"]), **oncall_bounds(table))
 
 
 def variable_names(value, where: str) -> tuple[str, ...]:

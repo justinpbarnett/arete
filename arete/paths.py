@@ -224,6 +224,7 @@ HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 SERVER_FILE = STATE_DIR / "server.json"
 TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
 TLS_KEY_FILE = STATE_DIR / "dashboard.key"
+PUSH_KEY_FILE = STATE_DIR / "webpush.key"
 LOOP_MARKS_FILE = STATE_DIR / "loops.json"
 LOCKS_DIR = STATE_DIR / "locks"
 

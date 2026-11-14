@@ -260,7 +260,7 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
 
 
 def asks_view() -> dict:
-    keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions")
+    keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
     return {"asks": [{k: a[k] for k in keys} for a in state.open_asks(connect=state.reader)]}
 
 

@@ -25,7 +25,7 @@ from .util import git
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
     "navigate", "navigate_back", "snapshot", "click", "type", "press_key", "hover", "select_option", "fill_form",
-    "wait_for", "take_screenshot", "console_messages", "network_requests", "resize", "handle_dialog", "tabs", "close"))
+    "wait_for", "take_screenshot", "console_messages", "network_requests", "resize", "handle_dialog", "tabs", "close", "file_upload"))
 PORT_FIELD = re.compile(r"\{(port\d*)\}")
 SCRATCH_FIELD = "{scratch}"
 STOP_GRACE_SECONDS = 10
