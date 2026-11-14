@@ -32,6 +32,7 @@ from . import (
     sources,
     state,
     util,
+    vault,
 )
 from .agent import Result
 from .loops import Loop
@@ -751,7 +752,12 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     if files and (outside := [p for p in changed if not util.matches_any(p, files)]):
         revert(ws.wt)
         return "", f"{idea} (thrown away: touched {', '.join(outside[:5])})"
-    if why := diffguard.stage(ws.wt, ws.deny, against=ws.start).refusal(ws.max_diff_lines, since=ws.base):
+    staged = diffguard.stage(ws.wt, ws.deny, against=ws.start)
+    if vault.every():
+        patch = util.git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
+                          ws.start], ws.wt)
+        staged.denied += vault.refusals(patch)
+    if why := staged.refusal(ws.max_diff_lines, since=ws.base):
         revert(ws.wt)
         return "", f"{idea} (thrown away: {why})"
     return idea, ""

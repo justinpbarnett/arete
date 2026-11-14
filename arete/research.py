@@ -35,6 +35,8 @@ REPORT_RESERVE_USD = 4.0
 REPORT_RESERVE_SECONDS = 30 * 60
 SEARCHED_RESERVE_USD = 1.0
 SEARCHED_RESERVE_SECONDS = 10 * 60
+AUDIT_RESERVE_USD = 0.5
+AUDIT_RESERVE_SECONDS = 5 * 60
 SCHEMA = {
     "type": "object",
     "properties": {"summary": {"type": "string"}, "report": {"type": "string"}, "name": {"type": "string"}},
@@ -122,7 +124,8 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
     branch = f"arete/{key}"
     subject = tk.pr_title(fill_template(h.layer.subject, config.RepoLayer.subject, kind="docs(research)", id=t.id,
                                         title=r["title"]), t)
-    body = (f"{tk.pr_link(t, whole=True)}\n\n**Summary:** {report['summary']}\n\n"
+    link = tk.pr_link(t, whole=True)
+    body = (f"**Summary:** {report['summary']}\n\n"
             f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
             "When the ticket changes, arete researches it again and pushes the new report here.")
     base = h.base
@@ -136,9 +139,9 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
         util.git_as_owner(["commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
         util.git(["push", "-q", "--force", "-u", "origin", branch], wt)
         if url := gh.open_pr_url(h.repo.github, branch):
-            gh.pr_edit_body(url, body)
+            gh.pr_edit_body(url, body, link=link)
             return url
-        return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt)
+        return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt, link=link)
     finally:
         remove_worktree(h.repo, wt)
 
@@ -399,9 +402,12 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
 def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dirs: list,
            family: list[str], started: float | None = None, judged: bool = False) -> tuple[Result, float]:
     searching = cfg.research_search
+    audited = searching and cfg.research_audit
     budget = research_plan.Budget(BUDGET_USD, TIMEOUT_SECONDS,
-                                  SEARCHED_RESERVE_USD if searching else REPORT_RESERVE_USD,
-                                  SEARCHED_RESERVE_SECONDS if searching else REPORT_RESERVE_SECONDS)
+                                  (SEARCHED_RESERVE_USD if searching else REPORT_RESERVE_USD)
+                                  + (AUDIT_RESERVE_USD if audited else 0),
+                                  (SEARCHED_RESERVE_SECONDS if searching else REPORT_RESERVE_SECONDS)
+                                  + (AUDIT_RESERVE_SECONDS if audited else 0))
     if started is not None:
         budget.started = started
     planned = research_plan.plan(cfg, budget, prompt("research_plan", **values), cwd, add_dirs, ref, family)

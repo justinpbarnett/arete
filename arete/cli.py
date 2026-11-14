@@ -1148,7 +1148,7 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import research_search, routing, runner, steps
+    from . import research_audit, research_search, routing, runner, steps
 
     where = ""
     try:
@@ -1166,6 +1166,8 @@ def cmd_steps(args) -> int:
     for s in sheet:
         notes = list(s.notes)
         if s.step in steps.SEARCHES and (why := research_search.unavailable(s)):
+            notes.append(why)
+        if s.step in steps.FETCHES and (why := research_audit.fetch_note(s)):
             notes.append(why)
         if s.runner == "pi" and not cfg.replay.all:
             selected = runner.pi_route(s.model, cfg, repo)
@@ -1367,6 +1369,27 @@ def cmd_answer(args) -> int:
     from . import client
 
     return client.answer(args.run_id, " ".join(args.text), args.json, args.ask)
+
+
+def cmd_secrets(args) -> int:
+    from . import vault
+
+    words = args.words
+    if len(words) == 1:
+        names = sorted(vault.read(config.load().repo(words[0]).name))
+        print("\n".join(names), end="\n" if names else "")
+        if not names:
+            print(f"{words[0]} has no stored secrets", file=sys.stderr)
+        return 0
+    if len(words) == 3 and words[0] == "rm":
+        repo = config.load().repo(words[1])
+        if vault.remove(repo.name, words[2]):
+            print(f"removed {words[2]} from {words[1]}")
+            return 0
+        print(f"{words[1]} has no stored secret {words[2]}", file=sys.stderr)
+        return 1
+    print("usage: arete secrets REPO | arete secrets rm REPO NAME", file=sys.stderr)
+    return 2
 
 
 def cmd_resume(args) -> int:
@@ -1701,13 +1724,19 @@ def main(argv: list[str] | None = None) -> int:
 
     p = steering(sub.add_parser("answer", help="answer the ask of a run that parked needs-info, through the server, "
                                                "which continues the run: per question on a terminal, or with --json "
-                                               "BODY such as {\"recommended\": true}; TEXT answers the run's text "
+                                               "BODY such as {\"recommended\": true}; a secret is typed at the prompt "
+                                               "or piped, never given with --json; TEXT answers the run's text "
                                                "question the older way"))
     p.add_argument("run_id")
     p.add_argument("text", nargs="*")
     p.add_argument("--json", default="", metavar="BODY", help="the body of POST /api/asks/ID/answer")
     p.add_argument("--ask", default="", metavar="ID", help="the ask to answer when the run holds several")
     p.set_defaults(fn=cmd_answer)
+
+    p = sub.add_parser("secrets", help="list the names of the secrets stored for a repo (REPO), or remove one "
+                                       "(rm REPO NAME); it never prints a value")
+    p.add_argument("words", nargs="+", metavar="[rm] REPO [NAME]")
+    p.set_defaults(fn=cmd_secrets)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))

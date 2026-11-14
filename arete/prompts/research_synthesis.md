@@ -58,7 +58,7 @@ Return these fields:
 - `summary`: two sentences at most: the answer, and how sure you are. Cite no source id here.
 - `name`: $file_name
 - `answer`: the lead of the report, under 600 words. $shape Arete adds the sections for conclusions, inference,
-  contradictions, gaps and sources after it, so do not write them.
+  contradictions, gaps and sources after it, so do not write them. $audit
 - `conclusions`: what a source states. Each has a `claim`, the `sources` ids that support it and `critical`, true when
   the decision rests on it. A conclusion with no source is refused.
 - `inferences`: what you conclude beyond what any source states. Each has a `claim`, the `basis` it rests on, the

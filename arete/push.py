@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import config, diffguard, environment, jev, outbound, paths, state, util
+from . import config, diffguard, environment, jev, outbound, paths, state, util, vault
 from .emits import Emit, config_repo
 from .loops import Loop, as_list, blank, check_env, worktree_kinds
 
@@ -53,7 +53,7 @@ class Push(Emit):
                 "title": outbound.plain(f"{loop.name}: run {run_id}" if public else outcome.get("title", ""), 120),
                 "report": outbound.plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000),
                 "about": outbound.plain(outcome.get("title", ""), 120), "story": outbound.plain(outcome.get("report", ""), 6000),
-                "patch": shown_patch(util.git(["diff", "--no-renames", start, branch], src),
+                "patch": shown_patch(vault.hidden(util.git(["diff", "--no-renames", start, branch], src)),
                                      f"git diff {start[:10]} {branch}"),
                 "proof": outcome.get("proof")}
 
