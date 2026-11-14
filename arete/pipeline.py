@@ -2856,7 +2856,6 @@ def review_problems(listed) -> list[dict]:
             for p in listed if isinstance(p, dict)]
 
 
-@runlimits.verification
 def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     if not b.layer.verify:
         b.run.log("verify: the layer has no [verify] section, so nothing checks the change in use")
@@ -2869,9 +2868,7 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         b.run.story.append(f"The check in use failed on attempt {attempt}:\n{util.tail(verified.markdown(), 2500)}")
         if attempt == tries:
             break
-        b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=tries,
-                                                   failures=verified.markdown(), checks=b.check_commands),
-                 role="check_repair")
+        repair_in_use(b, attempt + 1, tries, verified)
         b.recheck("fixing what the check in use found")
     b.run.story.append("Still failing in use after the last attempt.")
     _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, apply=False)
@@ -2879,6 +2876,14 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
                     verified.markdown())
 
 
+@runlimits.verification
+def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified) -> None:
+    b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt, max_attempts=tries,
+                                               failures=verified.markdown(), checks=b.check_commands),
+             role="check_repair")
+
+
+@runlimits.verification
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
                        diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT))
