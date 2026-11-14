@@ -30,8 +30,7 @@ MAX_SCREENSHOTS = 8
 MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_SAW_CHARS = 1200
 VERDICTS = ("pass", "fail", "blocked")
-ENVIRONMENT_FAULT = re.compile(r"[Oo]peration not permitted|[Pp]ermission denied|\bPermissionError\b|\bEPERM\b|"
-                               r"\bsandbox-exec\b|exited 12[67] before")
+ENVIRONMENT_FAULT = re.compile(r"[Oo]peration not permitted|\bEPERM\b|\[Errno 1\]|\bsandbox-exec\b")
 
 SCHEMA = {
     "type": "object",
@@ -181,8 +180,8 @@ def environment_fault(error: str) -> str:
     lines = error.splitlines()
     if not lines or not lines[0].startswith("the start command exited"):
         return ""
-    found = next((line.strip() for line in lines[1:] if ENVIRONMENT_FAULT.search(line)), "")
-    return found or (lines[0].strip() if ENVIRONMENT_FAULT.search(lines[0]) else "")
+    found = next((m for line in lines[1:] if (m := ENVIRONMENT_FAULT.search(line))), None)
+    return found.group(0) if found else ""
 
 
 def output(log: Path) -> str:

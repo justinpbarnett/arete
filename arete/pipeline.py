@@ -2753,8 +2753,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         run.log(f"{step}: the app did not start")
         if fault := verify.environment_fault(str(e)):
             return verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
-                                   blocked_by="the app could not start in the verifier's sandbox: "
-                                              + util.first_line(fault, 300), finished=False)
+                                   blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
+                                              "the start log stays in the run folder", finished=False)
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
