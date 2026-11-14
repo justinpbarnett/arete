@@ -42,7 +42,7 @@ WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
-ASK_KEYS = ("max_per_run", "settle", "expire_days")
+ASK_KEYS = ("max_per_run", "settle", "expire_days", "remind_hours", "push_contact")
 MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb")
 CHAT_KEYS = ("context_tokens", "summary_model", "max_sessions", "budget_usd")
@@ -148,6 +148,8 @@ class AskConfig:
     max_per_run: int = 3
     settle: bool = True
     expire_days: float = 7
+    remind_hours: float = 24
+    push_contact: str = ""
 
 
 @dataclass(frozen=True)
@@ -488,7 +490,14 @@ def ask_table(data) -> AskConfig:
     days = table.get("expire_days", 7)
     if type(days) not in (int, float) or not math.isfinite(days) or not 0 < days <= MAX_ASK_EXPIRE_DAYS:
         raise ValueError(f"[ask] expire_days must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS}, not {days!r}")
-    return AskConfig(max_per_run=limit, settle=settle, expire_days=days)
+    hours = table.get("remind_hours", 24)
+    if type(hours) not in (int, float) or not math.isfinite(hours) or not 0 < hours <= MAX_ASK_EXPIRE_DAYS * 24:
+        raise ValueError(f"[ask] remind_hours must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS * 24}, not {hours!r}")
+    contact = table.get("push_contact", "")
+    if (not isinstance(contact, str) or len(contact) > 200 or re.search(r"\s", contact)
+            or contact and not contact.startswith(("mailto:", "https://"))):
+        raise ValueError("[ask] push_contact must be empty or a mailto: or https:// address without spaces, at most 200 characters")
+    return AskConfig(max_per_run=limit, settle=settle, expire_days=days, remind_hours=hours, push_contact=contact)
 
 
 def retention_table(data) -> Retention:
