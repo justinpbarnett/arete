@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import io
@@ -163,25 +164,26 @@ def resolved() -> Path:
     folder = server_folder()
     try:
         with paths.directory_fd(folder.parent, create=True) as parent:
+            fcntl.flock(parent, fcntl.LOCK_EX)
             try:
                 os.lstat(folder.name, dir_fd=parent)
                 return folder
             except FileNotFoundError:
                 pass
-        packages = download(name, version)
-        pin = {n: {"version": v, "integrity": i} for n, (v, i, _) in packages.items()}
-        build = folder.parent / f".build-{secrets.token_hex(8)}"
-        try:
-            build.mkdir(mode=0o700)
-            (build / "tarballs").mkdir(mode=0o700)
-            (build / "node_modules").mkdir(mode=0o700)
-            for n, (v, _i, data) in packages.items():
-                (build / "tarballs" / tarball_name(n, v)).write_bytes(data)
-                extract(data, build / "node_modules" / n)
-            write_pin(pin)
-            os.rename(build, folder)
-        finally:
-            shutil.rmtree(build, ignore_errors=True)
+            packages = download(name, version)
+            pin = {n: {"version": v, "integrity": i} for n, (v, i, _) in packages.items()}
+            build = folder.parent / f".build-{secrets.token_hex(8)}"
+            try:
+                build.mkdir(mode=0o700)
+                (build / "tarballs").mkdir(mode=0o700)
+                (build / "node_modules").mkdir(mode=0o700)
+                for n, (v, _i, data) in packages.items():
+                    (build / "tarballs" / tarball_name(n, v)).write_bytes(data)
+                    extract(data, build / "node_modules" / n)
+                write_pin(pin)
+                os.rename(build, folder)
+            finally:
+                shutil.rmtree(build, ignore_errors=True)
     except scratch.ConfinementUnavailable:
         raise
     except FAILURES as error:
