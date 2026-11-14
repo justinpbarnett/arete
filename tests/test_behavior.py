@@ -179,6 +179,23 @@ def forced(*extra):
     except SystemExit:
         pass
     return state.ticket_runs("replay-sample", task, whole=True)[0]
+if "limit-wait" in scenario or scenario == "work-over-budget":
+    import time as real_time
+    from datetime import timedelta
+    from types import SimpleNamespace
+    ahead, real_now, real_launch = [0.0], pipeline.util.now, runner.run
+    pipeline.util.now = lambda: real_now() + timedelta(seconds=ahead[0])
+    runlimits.time = SimpleNamespace(monotonic=lambda: real_time.monotonic() + ahead[0])
+    def jumping(prompt, cwd, **kw):
+        if kw.get("waits") and not ahead[0]:
+            if scenario == "work-over-budget":
+                ahead[0] = 600.0
+            else:
+                with kw["waits"]("limit"):
+                    ahead[0] = 600.0
+        return real_launch(prompt, cwd, **kw)
+    runner.run = jumping
+    mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=1)).start()
 if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits", "kept-push-then-fail") or scenario.startswith(("failed-resume", "failed-again")):
     layer, replays, src, origin = root / "sample/layer/config.toml", root / "sample/replay", root / "sample/repo", root / "sample/origin.git"
     plain, stock = layer.read_text(), (replays / "build.patch").read_text()
@@ -240,6 +257,7 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
                   "published": og("show", f"{branch}:notes.txt") if published else "",
                   "kept_published": published and pipeline.util.sh(["git", "merge-base", "--is-ancestor", kept_head, branch], cwd=origin).returncode == 0,
                   "head_parents": og("log", "-1", "--format=%P", branch).split() if published else [], "main": og("rev-parse", "main"),
+                  "budget": runlimits.metadata(row["id"], "budget.json"),
                   "trailers": og("log", "--format=%B", f"main..{branch}") if published else "", "prompts": [t[1] for t, _ in prompts if t and t[0] == row["id"]]}
         print("BEHAVIOR_RESULT=" + json.dumps(result))
         raise SystemExit(0)
@@ -482,6 +500,10 @@ if scenario == "edited-after-held-pr":
     result["old"] = old
     result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
     result["budget"] = json.loads((paths.RUNS_DIR / row["id"] / "budget.json").read_text())
+if scenario in ("limit-wait", "work-over-budget"):
+    wall = (runlimits.parsed(row["finished"]) - runlimits.parsed(row["started"])).total_seconds() / 60
+    result |= {"budget": runlimits.metadata(row["id"], "budget.json"),
+               "parked": runlimits.metadata(row["id"], "parked.json"), "wall": wall}
 if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
@@ -725,6 +747,28 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assert_prepared_again_on_the_kept_edits(result)
         self.assertEqual(result["moved"], "moved.txt")
         self.assertIn("merged `origin/main` into the edits the last run kept", result["log"])
+
+    def test_a_limit_wait_longer_than_the_budget_does_not_park_the_run(self):
+        result = self.workflow("limit-wait")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertGreater(result["wall"], 1)
+        self.assertAlmostEqual(result["budget"]["wait_minutes_left_out"]["limit"], 10, delta=0.1)
+        self.assertEqual(result["parked"], {})
+
+    def test_work_longer_than_the_budget_still_parks_the_run(self):
+        result = self.workflow("work-over-budget")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("parked: the run chain reached its cumulative 1 minute budget", result["summary"])
+        self.assertEqual(result["parked"]["wait_minutes_left_out"], {"limit": 0, "slot": 0})
+
+    def test_a_continuation_leaves_out_the_limit_wait_of_the_earlier_run(self):
+        result = self.workflow("failed-again-prepare-limit-wait")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
+        self.assertAlmostEqual(result["budget"]["earlier_wait_minutes_left_out"]["limit"], 10, delta=0.1)
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
 
     def test_preparing_again_over_a_chain_commit_with_no_kept_record_is_still_held(self):
         result = self.workflow("failed-again-prepare-unrecorded")
