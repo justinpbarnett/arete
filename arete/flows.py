@@ -82,6 +82,7 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
         renew = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
                         restore=lambda line: restore(job, line, only), refusal=refusal, hold=job.hold, renew=renew,
+                        step_runs=list(step_runs(continues).values()) if continues else [],
                         keeps=lambda name, kw: any(c.onto for c in job.checkouts) and (
                             name in ("plan", "revise", "repair") or name == "implement" and kw.get("round") == BUILD))
 
@@ -121,7 +122,7 @@ def guard(job: Job, continues: str) -> str:
             return f"arete started no step and made no tracker call: {why}"
     except (pipeline.RunFailed, RuntimeError, OSError, KeyError, TypeError) as e:
         return f"arete started no step and made no tracker call: could not check the worktree: {e}"
-    runs = chain_runs(continues)
+    runs = authors(continues)
     for c in checkouts:
         if why := job.reclaim(c, *authority(continues, c, c.lease), runs, attached=c.wt.is_dir()):
             return why
@@ -150,6 +151,27 @@ def base_moved(continues: str) -> str:
 
 def chain_runs(run_id: str) -> set[str]:
     return {str(read[0].get("run") or "") for read in factory.chain(run_id) if read} - {""}
+
+
+STEP_RUNS_READ = 500
+
+
+def step_runs(run_id: str) -> dict[str, list[dict]]:
+    row, known, found = state.run_get(run_id) or {}, chain_runs(run_id), {}
+    if not row:
+        return found
+    for other in reversed(state.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ)):
+        if not other.get("only_step") or other["id"] in known:
+            continue
+        read = lines.read(other["id"])
+        if str(factory.first(read, "route").get("continues") or "") in known:
+            known.add(other["id"])
+            found[other["id"]] = read
+    return found
+
+
+def authors(run_id: str) -> set[str]:
+    return chain_runs(run_id) | set(step_runs(run_id))
 
 
 def publication(run_id: str) -> dict:
@@ -218,7 +240,7 @@ def rebuild(job: Job, line: dict) -> str:
         return why
     job.branch = branch
     leases = {str(e.get("github")): str(e.get("lease") or "") for e in line["data"]["checkouts"]}
-    runs = chain_runs(job.continues)
+    runs = authors(job.continues)
     for c in made:
         if why := job.reclaim(c, *authority(job.continues, c, leases.get(c.github, "")), runs, attached=False):
             return why
@@ -500,7 +522,7 @@ class Job:
                 c.onto = ""
         run.workspace = self.ws, self.checkouts
         if stored:
-            runs = chain_runs(self.continues)
+            runs = authors(self.continues)
             for c in self.checkouts:
                 if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
                     raise pipeline.RunFailed(why)

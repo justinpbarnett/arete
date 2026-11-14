@@ -2730,7 +2730,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                          commands=code_list(bash), checks=check_list(b.layer),
                                          owner=run.owner_note, **values),
                             b.ws, role=role,
-                            allowed_tools=bash_rules(bash) + (["mcp__playwright"] if url else []),
+                            allowed_tools=bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=verify.mcp_config(evidence) if url else "",
                             scratch=attempt)
@@ -2779,8 +2779,9 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
         return ("Arete started no app for this repo. Run the commands its user runs, with real arguments, and read "
                 "the output and the exit code.")
     return (f"Arete started the app with `{v.start}` and it answers at {url}. Arete stops it when you finish.\n\n"
-            "- Do in the browser what a person does in the browser, with the `mcp__playwright__browser_*` tools "
-            "(load them with ToolSearch first): navigate, read the page with `browser_snapshot`, click, type.\n"
+            "- Do in the browser what a person does in the browser, with these `mcp__playwright__` tools (load "
+            f"them with ToolSearch first): {', '.join(f'`{t}`' for t in verify.PLAYWRIGHT_TOOLS)}. Read the page "
+            "with `browser_snapshot`; no tool runs your own script in the page.\n"
             "- After each state you check, wait until the page settles (loading done, entrance animations finished) "
             "so the shot shows what a person sees, then call `browser_take_screenshot` with `filename` set to an "
             f"absolute path in `{evidence}`, such as `{evidence}/01-list.png`.\n"

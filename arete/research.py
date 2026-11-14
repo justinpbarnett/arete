@@ -8,7 +8,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, jev, paths, research_plan, research_search, runner, state, tracker, triage, util, verdicts
+from . import (
+    config,
+    gh,
+    jev,
+    paths,
+    research_plan,
+    research_search,
+    research_synthesis,
+    runner,
+    state,
+    tracker,
+    triage,
+    util,
+    verdicts,
+)
 from .agent import Result
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import fill_template, make_worktree, prompt, remove_worktree, slug
@@ -412,6 +426,9 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
         if budget.short(usd, seconds):
             return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
                                           "so no report was written"), budget.spent_usd
+        if cfg.research_synthesis:
+            res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
+            return res, budget.spent_usd
         brief, tools = research_search.brief(plan, found.evidence), runner.READ_TOOLS
     res = budget.call(prompt("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
                       model=cfg.model("research"), tools=tools, allowed_tools=tools, json_schema=SCHEMA,
