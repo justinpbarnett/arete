@@ -868,7 +868,7 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
 
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
-    if left := scratch_left(ws, checkouts):
+    if left := scratch_held(ws, checkouts):
         held = ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
         raise RunFailed(f"unresolved or unknown scratch resources keep the existing workspace retained ({held})")
     if why := kept_work(ws, checkouts, source, copies):
@@ -948,7 +948,7 @@ def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str
 
 def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
                     branch: str) -> dict[str, str]:
-    if scratch_left(ws, checkouts):
+    if scratch_held(ws, checkouts):
         raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
     kept = kept_onto(ws, checkouts, branch)
     if not kept:
