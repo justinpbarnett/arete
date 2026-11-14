@@ -51,6 +51,7 @@ REPORT_SCHEMA = {
 REPORT_PROMPT = ("The task is over. Change no file and run nothing new. Report: a summary of what was done and what is "
                  "left undone; each check you ran with its result (pass, fail or skipped) and one line of detail, or an "
                  "empty list when you ran none; and the open questions for whoever gave the task, or an empty list for none.")
+NO_SUMMARY = "the report turn gave no summary"
 SWITCHES_TASK = ("Does the new message start a different task from the recent work, so that the details of the recent "
                  "work no longer matter for it?")
 
@@ -519,14 +520,26 @@ def publish_then_ask_report(spec: Spec, cfg: config.Config, device: devices.Devi
     return ask_report(spec, cfg, device, turn, resume)
 
 
+def draft_pr_problem(spec: Spec, cfg: config.Config, report: dict, answer: dict | None, blank: bool) -> str:
+    if answer is None:
+        return "no draft PR: the report turn failed"
+    if blank:
+        return "no draft PR: the report has no summary"
+    return open_draft_pr(spec, cfg, report)
+
+
 def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: str) -> tuple[str, str]:
     report = shaped(answer or {})
+    blank = answer is not None and not report["summary"].strip()
+    if blank:
+        report["summary"] = ""
     pr_problem = ""
     if spec.draft_pr:
-        pr_problem = open_draft_pr(spec, cfg, report) if answer is not None else "no draft PR: the report turn failed"
+        pr_problem = draft_pr_problem(spec, cfg, report, answer, blank)
     row = state.run_get(spec.id) or {}
     problems = [p for p in (f"the last turn failed: {spec.turn_error}" if spec.turn_error else "",
                             f"the report turn gave no report: {error}" if error else "",
+                            NO_SUMMARY if blank else "",
                             *publication_problems(spec), pr_problem) if p]
     report |= {"branch": spec.branch, "commit": spec.pushed, "pr_url": spec.pr,
                "cost_usd": round(row.get("cost_usd") or 0, 4), "paid_usd": record.metered_spent(spec.id),
@@ -535,6 +548,8 @@ def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: st
     log_line(spec, "report", json.dumps(report))
     if error:
         return "failed", f"the report turn gave no report: {error}"
+    if blank:
+        return "failed", NO_SUMMARY
     return "done", "reported: " + util.first_line(report["summary"], 200)
 
 
