@@ -26,6 +26,7 @@ const FEEDBACK_LENGTH_SLACK = 0.5;
 const FEEDBACK_FLAGS = { credential: "a credential", personal: "private personal information", private_address: "a private address", agent_text: "text addressed to an agent" };
 let feedbackLimits = { image_bytes: 5 * FEEDBACK_MB, video_bytes: 25 * FEEDBACK_MB, evidence_items: 6, evidence_bytes: 40 * FEEDBACK_MB, video_seconds: 30 };
 let feedbackDraft = null;
+let feedbackFiled = null;
 let feedbackAside = false;
 let feedbackCapturing = false;
 let feedbackStopRecording = null;
@@ -97,7 +98,30 @@ function failedFeedback(e) {
   return e instanceof ErrorAnswer ? withPeriod(e.message) : "arete did not answer.";
 }
 
+function drawFeedbackFiled() {
+  const line = feedbackBox("filed");
+  line.hidden = !feedbackFiled;
+  if (feedbackFiled) line.replaceChildren("Filed ", link(feedbackFiled.url, `#${feedbackFiled.number} ${feedbackFiled.title}`));
+}
+
+function forgetFeedbackFiled() {
+  feedbackFiled = null;
+  drawFeedbackFiled();
+}
+
+function takeFeedbackAnswer(answered, reading = false) {
+  const held = feedbackDraft?.id;
+  const filed = answered.filed;
+  const sawFiling = Boolean(filed) && held !== undefined && filed.id === held;
+  if (filed && (!answered.draft || sawFiling)) feedbackFiled = filed;
+  if (sawFiling || reading) mergeFeedback(answered.draft);
+  else drawFeedbackDraft(answered.draft);
+  drawFeedbackFiled();
+  if (sawFiling) feedbackBox("filed").focus();
+}
+
 function onFeedbackInput() {
+  forgetFeedbackFiled();
   feedbackDirty = true;
   keepFeedbackHere(true);
   feedbackBox("bug").hidden = feedbackFields().kind !== "bug";
@@ -152,7 +176,7 @@ async function readFeedbackDraft() {
       line.textContent = `${name === "text" ? "Required" : "Optional"} · up to ${answered.limits[name].toLocaleString("en-US")} characters`;
     }
     if (feedbackDiscarding) return;
-    mergeFeedback(answered.draft);
+    takeFeedbackAnswer(answered, true);
     feedbackBox("result").hidden = true;
   } catch (e) {
     sayFeedback("caution", `${failedFeedback(e)} ${feedbackDirty ? FEEDBACK_ON_DEVICE : "This shows the copy kept on this device."}`);
@@ -238,6 +262,7 @@ function drawFeedbackText() {
   const written = Boolean(feedbackDraft?.text?.trim());
   feedbackBox("sending-title").textContent = written ? sending.title : "";
   feedbackBox("sending-text").textContent = written ? sending.body : "Nothing written yet.";
+  feedbackBox("sending-source").textContent = !written ? "" : sending.source === "writer" ? "Written by the writer from your words." : sending.note;
 }
 
 const FEEDBACK_CHIPS = { pass: "ok", hold: "caution", interrupted: "caution", fail: "fault" };
@@ -257,12 +282,14 @@ function feedbackCheckRow(check) {
 
 function drawFeedbackChecks(draft) {
   const checks = draft?.checks ?? [];
-  const shown = JSON.stringify([checks, draft?.summary, draft?.jev_cost_usd, draft?.inspect_cost_usd, draft?.vision]);
+  const shown = JSON.stringify([checks, draft?.summary, draft?.jev_cost_usd, draft?.inspect_cost_usd, draft?.vision,
+    draft?.delivery, draft?.status, draft?.working]);
   const checking = draft?.status === "checking";
+  const inFlight = checking || (draft?.status === "filing" && draft.working);
   const submit = feedbackBox("submit");
-  submit.disabled = checking;
-  submit.textContent = checking ? "Checking…" : "Submit";
-  if (checking) pollFeedbackChecks();
+  submit.disabled = inFlight;
+  submit.textContent = checking ? "Checking…" : inFlight ? "Filing…" : "Submit";
+  if (inFlight) pollFeedbackChecks();
   if (shown === feedbackChecksShown) return;
   feedbackChecksShown = shown;
   feedbackBox("checks").replaceChildren(...checks.map(feedbackCheckRow));
@@ -279,7 +306,7 @@ function pollFeedbackChecks() {
   feedbackPolling = setTimeout(async function again() {
     feedbackPolling = 0;
     try {
-      drawFeedbackDraft((await call("/api/capture")).draft);
+      takeFeedbackAnswer(await call("/api/capture"));
     } catch {
       feedbackPolling = setTimeout(again, FEEDBACK_RETRY_MS);
     }
@@ -294,8 +321,7 @@ function submitFeedback() {
       return sayFeedback("caution", feedbackDraft ? "The draft is not saved yet, or a file is still sending. Submit again once it is." : "Write the request before you submit it.");
     }
     try {
-      const answered = await call("/api/capture/submit", { revision: feedbackDraft.revision });
-      drawFeedbackDraft(answered.draft);
+      takeFeedbackAnswer(await call("/api/capture/submit", { id: feedbackDraft.id, revision: feedbackDraft.revision }));
       feedbackBox("result").hidden = true;
     } catch (e) {
       if (e instanceof ErrorAnswer && e.status === 409) {
@@ -332,7 +358,8 @@ function stagedEvidenceItem(row) {
   if (row.kind === "video") media.addEventListener("loadedmetadata", () => checkEvidenceLength(row, media, details));
   const remove = button("Remove", "feedback-remove", () => removeFeedbackEvidence(row, `Removed ${row.name}.`, remove), { of: String(row.id) });
   const inspection = el("span", { class: "evidence-inspection" });
-  return el("li", {}, media, el("div", { class: "evidence-words" }, el("strong", { text: row.name }), el("br"), details, el("br"), inspection), remove);
+  const uploaded = el("span", { class: "evidence-uploaded" });
+  return el("li", {}, media, el("div", { class: "evidence-words" }, el("strong", { text: row.name }), el("br"), details, el("br"), inspection, uploaded), remove);
 }
 
 function inspectionLine(found) {
@@ -364,7 +391,11 @@ function drawFeedbackList() {
   const ids = new Set(staged.map((row) => row.id));
   for (const id of [...feedbackItems.keys()]) if (!ids.has(id)) feedbackItems.delete(id);
   for (const row of staged) if (!feedbackItems.has(row.id)) feedbackItems.set(row.id, stagedEvidenceItem(row));
-  for (const row of staged) feedbackItems.get(row.id).querySelector(".evidence-inspection").textContent = inspectionLine(row.inspection);
+  for (const row of staged) {
+    const item = feedbackItems.get(row.id);
+    item.querySelector(".evidence-inspection").textContent = inspectionLine(row.inspection);
+    item.querySelector(".evidence-uploaded").replaceChildren(...(row.link ? [" ", link(row.link, "Uploaded")] : []));
+  }
   const wanted = [...staged.map((row) => feedbackItems.get(row.id)), ...feedbackPending.map(pendingEvidenceItem)];
   const list = feedbackBox("evidence");
   wanted.forEach((node, i) => {
@@ -373,6 +404,15 @@ function drawFeedbackList() {
   while (list.children.length > wanted.length) list.lastElementChild.remove();
   const bytes = staged.reduce((sum, row) => sum + row.bytes, 0);
   feedbackBox("evidence-total").textContent = `${staged.length} of ${feedbackLimits.evidence_items} items · ${(bytes / FEEDBACK_MB).toFixed(1)} of ${feedbackLimits.evidence_bytes / FEEDBACK_MB} MB`;
+  lockFeedback(feedbackDraft?.status === "filing");
+}
+
+function lockFeedback(locked) {
+  for (const radio of document.querySelectorAll("input[name=feedback-kind]")) radio.disabled = locked;
+  for (const name of FEEDBACK_TEXTS) feedbackBox(name).readOnly = locked;
+  const controls = ["include", "context-again", "context-drop", "shot", "record", "attach", "discard"];
+  for (const id of controls) document.getElementById(`feedback-${id}`).disabled = locked;
+  for (const remove of feedbackBox("evidence").querySelectorAll("button")) remove.disabled = locked;
 }
 
 function onFeedbackUploads(work) {
@@ -619,6 +659,7 @@ async function dropFeedbackContext() {
 async function discardFeedback() {
   if (feedbackDiscarding) return;
   feedbackDiscarding = true;
+  forgetFeedbackFiled();
   clearTimeout(feedbackTimer);
   feedbackTimer = 0;
   const clicked = feedbackFields();
