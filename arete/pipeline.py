@@ -3607,6 +3607,7 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
 
 
 SWEPT = ("merged", "rejected", "done")
+WAITING = ("running", "pr", "needs-info")
 HELD_FILE = paths.STATE_DIR / "held-workspaces.json"
 
 
@@ -3618,7 +3619,7 @@ def owner_of(d: Path, cfg: config.Config) -> dict | None:
     owner = made_before(d).get(OWNER_KEY)
     if isinstance(owner, dict) and owner.get("repo") and owner.get("checkouts"):
         return owner
-    for repo in sorted(cfg.repos, key=lambda r: len(r.name), reverse=True):
+    for repo in sorted(cfg.repos, key=lambda r: len(r.name), reverse=True) if made_record(d).is_file() else []:
         tid = d.name.removeprefix(f"{repo.name}-")
         if tid != d.name and state.ticket_runs(repo.name, tid, limit=1):
             return {"run": "", "repo": repo.name, "ticket": tid, "created": "",
@@ -3672,7 +3673,7 @@ def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
            or next(iter(state.ticket_runs(repo, tid, limit=1, whole=True)), None))
     status = (row or {}).get("status") or ""
     run_id = (row or {}).get("id") or owner.get("run") or ""
-    closed = status not in SWEPT and ticket_closed(cfg, repo, tid, status)
+    closed = status not in SWEPT and status not in WAITING and ticket_closed(cfg, repo, tid, status)
     if status not in SWEPT and not closed:
         return held_entry(d, owner, row, False,
                           f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket")
