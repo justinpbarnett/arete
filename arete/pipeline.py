@@ -2825,8 +2825,7 @@ def sibling_section(ref: str, c: Checkout, with_prs: list[Checkout]) -> str:
 def supersede_older_runs(run: Run, urls: list[str]) -> None:
     for r in state.open_runs(run.repo.name, run.tid):
         older = (r.get("pr_url") or "").split()
-        if older and set(older) <= set(urls):
-            record.note(r["id"], status="superseded")
+        if older and set(older) <= set(urls) and record.move(r["id"], "superseded", expect=(r["status"],)):
             run.log(f"run {r['id']} superseded: its PRs carry on in this run")
 
 
@@ -3428,14 +3427,14 @@ def sync_outcomes(cfg: config.Config) -> None:
         merged = all(pr.get("mergedAt") for pr in prs)
         if r["status"] == "rejected" and not merged:
             if not closed:
-                record.note(r["id"], status="pr")
+                record.move(r["id"], "pr", expect=("rejected",))
             continue
         if not closed:
             continue
         for url, pr in zip(urls, prs):
             state.close_feedback(url, pr["state"])
         closed_at = max(pr.get("closedAt") or "" for pr in prs) or util.iso()
-        record.note(r["id"], status="merged" if merged else "rejected", finished=closed_at)
+        record.move(r["id"], "merged" if merged else "rejected", expect=(r["status"],), finished=closed_at)
     util.write_json(PR_SEEN_FILE, fresh)
     for repo in cfg.repos:
         if repo.pipeline and repo.github and not repo.layer:
@@ -3480,12 +3479,21 @@ def sync_moves(cfg: config.Config) -> None:
                   + (f"not moved: {util.first_line(m.error, 300)}" if m.error else f"{status}, moved to {target}"))
 
 
+def carried_by_newer(rows: list[dict], i: int) -> bool:
+    row = rows[i]
+    prs = set((row.get("pr_url") or "").split())
+    return bool(prs) and any(r["status"] == "merged" and r["repo"] == row["repo"] and r["issue"] == row["issue"]
+                             and prs <= set((r.get("pr_url") or "").split()) for r in rows[:i])
+
+
 def sync_landings(cfg: config.Config) -> None:
     branches = list(cfg.jira.landed)
     if not branches:
         return
-    for r in state.runs(kind="pipeline", limit=200):
-        if r["status"] != "merged" or not r.get("pr_url") or r.get("landed") == branches[-1]:
+    rows = state.runs(kind="pipeline", limit=200)
+    for i, r in enumerate(rows):
+        if (r["status"] != "merged" or not r.get("pr_url") or r.get("landed") == branches[-1]
+                or carried_by_newer(rows, i)):
             continue
         try:
             repo = cfg.repo(r["repo"])
@@ -3495,7 +3503,10 @@ def sync_landings(cfg: config.Config) -> None:
             continue
         try:
             reached = furthest_branch(branches, r["pr_url"].split(), str(r["issue"]))
-            already = branches.index(r["landed"]) if r.get("landed") in branches else -1
+            progress = [older.get("landed") for older in rows[i:]
+                        if older["status"] == "merged" and older["repo"] == r["repo"] and older["issue"] == r["issue"]
+                        and set((older.get("pr_url") or "").split()) == set(r["pr_url"].split())]
+            already = max((branches.index(b) for b in progress if b in branches), default=-1)
             if reached is None or branches.index(reached) <= already:
                 continue
             target = cfg.jira.landed[reached]
@@ -3569,8 +3580,10 @@ def branch_holds_work(repo: str, branch: str, merge_sha: str, key: str) -> bool:
 
 def streak(repo_name: str, since: str = "") -> int:
     n = 0
-    for r in state.runs(kind="pipeline", repo=repo_name, limit=100):
-        if r["status"] == "merged" and (not since or (r["finished"] or "") > since):
+    rows = state.runs(kind="pipeline", repo=repo_name, limit=100)
+    for i, r in enumerate(rows):
+        if (r["status"] == "merged" and (not since or (r["finished"] or "") > since)
+                and not carried_by_newer(rows, i)):
             n += 1
         elif r["status"] in ("rejected", "failed"):
             break
@@ -4060,8 +4073,9 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
         return "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
     text = tk.reply_since(tid, waiting[0]["asked"])
     if text and not dry_run:
-        for a in waiting:
-            state.ask_close(a["id"], "answered", asks.text_answers(a, text))
+        with util.lock(asks.STEER_LOCK, wait=True):
+            for a in state.asks_of(newest[0]["id"], "open"):
+                state.ask_close(a["id"], "answered", asks.text_answers(a, text))
     return ""
 
 

@@ -101,8 +101,20 @@ def metered_spent(run_id: str) -> float:
 
 
 def note(run_id: str, **fields) -> None:
+    if "status" in fields:
+        raise ValueError("use move to change a run's status")
     with state.db() as c:
         c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
+
+
+def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
+    if not expect:
+        return False
+    fields = {**fields, "status": to}
+    with state.db() as c:
+        return c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} "
+                         f"WHERE id = ? AND status IN ({','.join('?' * len(expect))})",
+                         (*fields.values(), run_id, *expect)).rowcount > 0
 
 
 def ask_stop(run_id: str) -> dict | None:

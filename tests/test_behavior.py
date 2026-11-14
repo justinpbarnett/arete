@@ -3022,6 +3022,266 @@ def result(**fields):
             self.assertIsNotNone(output, done.stdout + done.stderr)
             return json.loads(output)
 
+    def test_pr_poll_and_supersede_preserve_the_winning_status(self):
+        found = self.scratch(r'''
+from types import SimpleNamespace
+from arete import pipeline
+repo = config.Repo("race", root, github="example/race")
+cfg = config.Config(repos=[repo])
+logs = []
+run = SimpleNamespace(repo=repo, tid="R-1", log=logs.append)
+first = made("first", "pr", minutes=1, repo=repo.name, issue=run.tid)
+second = made("second", "pr", minutes=2, repo=repo.name, issue=run.tid)
+record.note(first, pr_url="one two")
+record.note(second, pr_url="three")
+finished = state.run_get(first)["finished"]
+closed = "2099-01-01T00:00:00+00:00"
+def view(url):
+    if url == "two":
+        pipeline.supersede_older_runs(run, ["one", "two"])
+    return {"state": "MERGED", "mergedAt": closed, "closedAt": closed}
+with mock.patch.object(pipeline.gh, "pr_view", side_effect=view), \
+        mock.patch.object(pipeline, "record_feedback"):
+    pipeline.sync_outcomes(cfg)
+row = state.run_get(first)
+assert row["status"] == "superseded" and row["finished"] == finished, row
+third = made("third", "pr", minutes=0, repo=repo.name, issue=run.tid)
+record.note(third, pr_url="three")
+original = state.open_runs
+def snapshot(*args):
+    rows = original(*args)
+    pipeline.sync_outcomes(cfg)
+    return rows
+logs.clear()
+with mock.patch.object(state, "open_runs", side_effect=snapshot), \
+        mock.patch.object(pipeline.gh, "pr_view", return_value=view("three")), \
+        mock.patch.object(pipeline, "record_feedback"):
+    pipeline.supersede_older_runs(run, ["three"])
+assert state.run_get(third)["status"] == "merged"
+assert not logs, logs
+result(status=row["status"], finished=row["finished"], logs=logs)
+''')
+        self.assertEqual(found["status"], "superseded")
+        self.assertEqual(found["logs"], [])
+
+    def test_status_moves_compare_fields_and_rejected_prs_can_reopen(self):
+        found = self.scratch(r'''
+from arete import pipeline
+rid = made("move", "pr")
+before = state.run_get(rid)
+assert not record.move(rid, "merged", expect=(), summary="wrong")
+assert not record.move(rid, "merged", expect=("running",), finished="wrong", summary="wrong")
+assert state.run_get(rid) == before
+try:
+    record.note(rid, status="merged")
+except ValueError:
+    pass
+else:
+    raise AssertionError("note accepted status")
+assert record.move(rid, "rejected", expect=("pr",), pr_url="one")
+with mock.patch.object(pipeline.gh, "pr_view", return_value={"state": "OPEN"}), \
+        mock.patch.object(pipeline, "record_feedback"):
+    pipeline.sync_outcomes(config.Config())
+assert state.run_get(rid)["status"] == "pr"
+for merged in (False, True):
+    pr = {"state": "MERGED" if merged else "CLOSED", "closedAt": util.iso()}
+    if merged:
+        pr["mergedAt"] = pr["closedAt"]
+    with mock.patch.object(pipeline.gh, "pr_view", return_value=pr), \
+            mock.patch.object(pipeline, "record_feedback"):
+        pipeline.sync_outcomes(config.Config())
+    assert state.run_get(rid)["status"] == ("merged" if merged else "rejected")
+result(status=state.run_get(rid)["status"])
+''')
+        self.assertEqual(found["status"], "merged")
+
+    def test_carried_merges_count_and_report_landings_once(self):
+        for wider in (False, True):
+            for landed in ("", "staging"):
+                with self.subTest(wider=wider, landed=landed):
+                    found = self.scratch(f"wider, landed = {wider!r}, {landed!r}\n" + r'''
+from types import SimpleNamespace
+from arete import pipeline
+repo = config.Repo("landing", root, tracker="jira")
+cfg = config.Config(repos=[repo])
+cfg.jira.landed = {"staging": "Testing", "main": "Done"}
+old = made("old", "merged", minutes=2, repo=repo.name, issue="R-1")
+new = made("new", "merged", minutes=1, repo=repo.name, issue="R-1")
+record.note(old, pr_url="one", landed=landed)
+record.note(new, pr_url="two one" if wider else " one  ")
+other_ticket = made("other-ticket", "merged", minutes=3, repo=repo.name, issue="R-2")
+other_repo = made("other-repo", "merged", minutes=3, repo="elsewhere", issue="R-1")
+record.note(other_ticket, pr_url="one two", landed="main")
+record.note(other_repo, pr_url="one two", landed="main")
+record.move(other_ticket, "done", expect=("merged",))
+assert pipeline.streak(repo.name) == 1
+assert pipeline.streak(repo.name, since="9999") == 0
+comments, moves = [], []
+tk = SimpleNamespace(move_to=lambda *args: moves.append(args) or "")
+with mock.patch.object(pipeline.tracker, "for_repo", return_value=tk), \
+        mock.patch.object(pipeline, "furthest_branch", return_value="staging") as branch, \
+        mock.patch.object(pipeline, "uat_steps", return_value="test here"), \
+        mock.patch.object(pipeline.Run, "say", lambda run, text: comments.append((run.id, text)) or ""):
+    pipeline.sync_landings(cfg)
+    expected = int(wider or not landed)
+    assert len(comments) == len(moves) == expected, (comments, moves)
+    assert all(rid == new for rid, _ in comments), comments
+    pipeline.sync_landings(cfg)
+    assert len(comments) == len(moves) == expected
+    branch.return_value = "main"
+    pipeline.sync_landings(cfg)
+    assert len(comments) == expected and len(moves) == expected + 1
+    pipeline.sync_landings(cfg)
+    assert len(moves) == expected + 1
+rows = state.runs(kind="pipeline", repo=repo.name)
+assert pipeline.carried_by_newer(rows, 1)
+for field, value in (("repo", "other"), ("issue", "R-2"), ("pr_url", "")):
+    changed = [rows[0], rows[1] | {field: value}]
+    assert not pipeline.carried_by_newer(changed, 1), changed
+for status in ("rejected", "failed"):
+    boundary = made(status, status, minutes=1.5, repo=repo.name, issue="R-2")
+    assert pipeline.streak(repo.name) == 1
+    record.move(boundary, "done", expect=(status,))
+result(streak=pipeline.streak(repo.name), comments=comments, moves=moves)
+''')
+                    self.assertEqual(found["streak"], 1)
+
+    def test_ask_answers_serialize_with_tracker_replies(self):
+        for in_flight in (False, True):
+            with self.subTest(in_flight=in_flight):
+                found = self.scratch(f"in_flight = {in_flight!r}\n" + r'''
+import threading
+from types import SimpleNamespace
+from arete import asks, control, pipeline, tasks
+repo = config.Repo("asking", root)
+cfg = config.Config(repos=[repo])
+rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
+state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
+              [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
+row = state.run_get(rid)
+fetched, threads, errors, launches = threading.Event(), [], [], []
+lock_requested, tracker_closes = threading.Event(), []
+original_lock, original_close = util.lock, state.ask_close
+def lock(name, *args, **kwargs):
+    if name == asks.STEER_LOCK and threading.current_thread() is not threading.main_thread():
+        lock_requested.set()
+    return original_lock(name, *args, **kwargs)
+def close(*args, **kwargs):
+    if threading.current_thread() is not threading.main_thread():
+        tracker_closes.append(args)
+    return original_close(*args, **kwargs)
+def reply(*args):
+    fetched.set()
+    return "tracker text"
+tk = SimpleNamespace(reply_since=reply)
+def tracker_thread():
+    try:
+        pipeline.tracker_reply(repo, tk, "R-1", False)
+    except BaseException as e:
+        errors.append(repr(e))
+def continuing(*args):
+    if in_flight:
+        thread = threading.Thread(target=tracker_thread, daemon=True)
+        threads.append(thread)
+        thread.start()
+        assert fetched.wait(5), "tracker did not fetch"
+        assert lock_requested.wait(5), "tracker did not take the steering lock"
+    else:
+        ask = state.ask_get("ask")
+        state.ask_close("ask", "answered", asks.text_answers(ask, "tracker text"))
+    return ["resume"]
+def launch(*args, **kwargs):
+    launches.append(args)
+    return {"state": "started"}
+with mock.patch.object(util, "lock", side_effect=lock), mock.patch.object(state, "ask_close", side_effect=close), \
+        mock.patch.object(tasks, "run_of", return_value=(cfg, repo, row)), \
+        mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
+        mock.patch.object(tasks, "free_to_start"), mock.patch.object(tasks, "continuing", side_effect=continuing), \
+        mock.patch.object(tasks, "launch", side_effect=launch):
+    try:
+        answer = tasks.answer_ask("ask", {"answers": [{"text": "dashboard text"}]})
+        assert in_flight and answer["state"] == "started", answer
+    except control.Refused as e:
+        assert not in_flight and "was answered from the tracker a moment ago" in str(e), str(e)
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive(), "tracker deadlocked"
+assert not errors, errors
+assert not tracker_closes, tracker_closes
+stored = state.ask_get("ask")
+expected = "dashboard text" if in_flight else "tracker text"
+assert expected in json.dumps(stored["answers"]), stored
+assert len(launches) == int(in_flight)
+result(answers=stored["answers"], launches=len(launches))
+''')
+                self.assertEqual(found["launches"], int(in_flight))
+
+    def test_tracker_dry_run_and_secret_restriction_leave_asks_open(self):
+        found = self.scratch(r'''
+from types import SimpleNamespace
+from arete import asks, pipeline, tasks
+repo = config.Repo("asking", root)
+cfg = config.Config(repos=[repo])
+rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
+state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
+              [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
+tk = SimpleNamespace(reply_since=mock.Mock(return_value="tracker text"))
+assert pipeline.tracker_reply(repo, tk, "R-1", True) == ""
+assert state.ask_get("ask")["status"] == "open"
+with mock.patch.object(tasks, "run_of", return_value=(cfg, repo, state.run_get(rid))), \
+        mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
+        mock.patch.object(tasks, "free_to_start"), mock.patch.object(tasks, "continuing", return_value=["resume"]), \
+        mock.patch.object(tasks, "launch", return_value={"state": "started"}) as launch:
+    answer = tasks.answer_ask("ask", {"answers": [{"text": "dashboard text"}]})
+    assert answer["state"] == "started"
+    launch.assert_called_once()
+assert "dashboard text" in json.dumps(state.ask_get("ask")["answers"])
+state.ask_add("secret", rid, repo.name, "R-1", "build", "secret", "why", "tried",
+              [{"kind": "secret", "header": "Key", "question": "Key?", "name": "EXAMPLE_TOKEN"}], {})
+tk.reply_since.reset_mock()
+assert "secret" in pipeline.tracker_reply(repo, tk, "R-1", False)
+tk.reply_since.assert_not_called()
+assert state.ask_get("secret")["status"] == "open"
+assert tasks.STEER_LOCK == asks.STEER_LOCK
+result(status=answer["state"])
+''')
+        self.assertEqual(found["status"], "started")
+
+    def test_refused_stop_leaves_asks_and_folder_and_success_retires_them(self):
+        found = self.scratch(r'''
+from arete import control, pipeline, tasks
+repo = config.Repo("stopping", root)
+cfg = config.Config(repos=[repo])
+rid = made("stop", "needs-info", repo=repo.name, issue="R-1")
+row = state.run_get(rid)
+state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried", [], {})
+folder = root / "kept"
+folder.mkdir()
+assert record.move(rid, "merged", expect=("needs-info",))
+with mock.patch.object(tasks, "kept_folder_removed") as remove:
+    try:
+        tasks.let_go(cfg, repo, row, "stopped")
+    except control.Refused:
+        pass
+    else:
+        raise AssertionError("stale stop accepted")
+    remove.assert_not_called()
+assert state.run_get(rid)["status"] == "merged"
+assert state.ask_get("ask")["status"] == "open" and folder.exists()
+assert record.move(rid, "needs-info", expect=("merged",))
+def remove(*args):
+    folder.rmdir()
+    return True
+with mock.patch.object(tasks, "kept_folder_removed", side_effect=remove), \
+        mock.patch.object(pipeline.tracker, "for_ticket"), \
+        mock.patch.object(pipeline.Run, "give_up"), mock.patch.object(pipeline, "write_report"):
+    answer = tasks.let_go(cfg, repo, row, "stopped")
+assert answer["state"] == state.run_get(rid)["status"] == "stopped"
+assert state.ask_get("ask")["status"] == "stopped" and not folder.exists()
+result(status=answer["state"])
+''')
+        self.assertEqual(found["status"], "stopped")
+
     def test_flagged_runs_come_out_worst_first_and_clean_ones_are_left_out(self):
         found = self.scratch(r'''
 clean = made("clean"); call(clean, "build")
@@ -5015,7 +5275,7 @@ else:
                 "checkouts": [{"dir": "", "github": "octo/widgets", "src": str(src), "wt": str(ws)}]}
     a_task, a, a_c, a_run = make("a", "arete/a")
     pipeline.note_made(a, [a_c])
-    record.note(a_run, status="merged", started=util.iso(util.now() - __import__("datetime").timedelta(days=30)),
+    record.settle(a_run, "merged", started=util.iso(util.now() - __import__("datetime").timedelta(days=30)),
                 finished=util.iso(util.now() - __import__("datetime").timedelta(days=30)))
     old = time.time() - 30 * 86400
     os.utime(a, (old, old))
@@ -5023,7 +5283,7 @@ else:
     pipeline.note_made(b, [b_c], owner(b_task, b_run, b))
     held_lock = util.hold_lock(state.run_lock("pipeline", "replay-sample", b_task))
     c_task, cw, c_c, c_run = make("c", "arete/c")
-    record.note(c_run, status="merged", finished=util.iso())
+    record.settle(c_run, "merged", finished=util.iso())
     pipeline.note_made(cw, [c_c], owner(c_task, c_run, cw))
     (cw / "hand.txt").write_text("mine\n")
     gone = paths.WORKTREES_DIR / "gone"
@@ -5037,7 +5297,7 @@ else:
                "check": [check.ok, check.detail]}
     (cw / "hand.txt").unlink()
     e_task, e, e_c, e_run = make("e", "arete/e")
-    record.note(e_run, status="merged", finished=util.iso())
+    record.settle(e_run, "merged", finished=util.iso())
     pipeline.note_made(e, [e_c], owner(e_task, e_run, e))
     with (e / replay.SAMPLE_FILE).open("a") as out:
         out.write("by hand\n")
@@ -5054,12 +5314,12 @@ else:
     g_c = pipeline.Checkout("", "octo/widgets", src, g, "main")
     pipeline.add_worktree(g_c, "arete/g", "main")
     g_run = record.start("pipeline", repo="replay-sample", issue="42")
-    record.note(g_run, status="failed", finished=util.iso())
+    record.settle(g_run, "failed", finished=util.iso())
     pipeline.note_made(g, [g_c], owner("42", g_run, g))
     import types
     pipeline.tracker.for_repo = lambda cfg, repo: types.SimpleNamespace(get=lambda tid: types.SimpleNamespace(open=False))
     f_task, f, f_c, f_run = make("f", "arete/f")
-    record.note(f_run, status="failed", finished=util.iso())
+    record.settle(f_run, "failed", finished=util.iso())
     pipeline.note_made(f, [f_c], owner(f_task, f_run, f))
     (f / "stray.txt").write_text("x\n")
     pipeline.cleanup_worktrees(cfg=config.load())
