@@ -4280,7 +4280,8 @@ class ParallelSuiteTests(unittest.TestCase):
     def run_sample(self, source: str, *extra: str):
         folder, env = self.sample_folder(source)
         command = self.command(folder, "-j", "2", "--timeout", "2", "-v", *extra)
-        done = subprocess.run(command, cwd=SOURCE, capture_output=True, text=True, timeout=120, env=env)
+        done = subprocess.run(command, cwd=SOURCE, capture_output=True, text=True, timeout=120, env=env,
+                              check=False)
         return folder, done, done.stdout.strip().splitlines()
 
     def start_sample(self, source: str, *extra: str):
