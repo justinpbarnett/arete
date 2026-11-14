@@ -8,6 +8,7 @@ from typing import TextIO
 from . import outbound, paths
 
 TOOL = "ask_owner"
+STEER_LOCK = "task-steer"
 SERVER = "arete"
 RULE = f"mcp__{SERVER}__{TOOL}"
 SETTLE_AT = 0.9
