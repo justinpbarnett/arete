@@ -41,10 +41,14 @@ def foreground_maintenance(env: dict) -> dict:
         held = max(int(env.get("GIT_CONFIG_COUNT", "0")), 0)
     except ValueError:
         held = 0
+    set_false = {env.get(f"GIT_CONFIG_KEY_{i}") for i in range(held) if env.get(f"GIT_CONFIG_VALUE_{i}") == "false"}
+    missing = [key for key in FOREGROUND_MAINTENANCE if key not in set_false]
+    if not missing:
+        return env
     added = {}
-    for i, key in enumerate(FOREGROUND_MAINTENANCE, held):
+    for i, key in enumerate(missing, held):
         added[f"GIT_CONFIG_KEY_{i}"], added[f"GIT_CONFIG_VALUE_{i}"] = key, "false"
-    return {**env, **added, "GIT_CONFIG_COUNT": str(held + len(FOREGROUND_MAINTENANCE))}
+    return {**env, **added, "GIT_CONFIG_COUNT": str(held + len(missing))}
 
 
 def sh(
