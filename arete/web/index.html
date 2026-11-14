@@ -20,6 +20,7 @@
 <script src="/sessions.js" defer></script>
 <script src="/loops.js" defer></script>
 <script src="/triage.js" defer></script>
+<script src="/asks.js" defer></script>
 <script src="/outcomes.js" defer></script>
 <script src="/health.js" defer></script>
 <script src="/settings.js" defer></script>
@@ -34,6 +35,8 @@
 <body>
 <button type="button" class="skip" id="skip">Skip to the content</button>
 <div class="wrap sidebar-page">
+<section id="waiting" class="waiting" aria-labelledby="waiting-title" hidden><h2 id="waiting-title">Waiting on you <span class="digits" id="waiting-count"></span></h2><div id="waiting-list"></div></section>
+<p id="waiting-result" class="said" aria-live="polite" tabindex="-1" hidden></p>
 
 <nav class="side" aria-label="Views">
   <div class="group tools">
