@@ -1,7 +1,26 @@
+import hashlib
 import json
+import math
+import os
 import re
+import shutil
+import threading
+from pathlib import Path
 
-from . import __version__, outbound, state, util
+from . import __version__, outbound, paths, state, tracker, util
+
+MB = 1024 * 1024
+MOST_IMAGE_BYTES = 5 * MB
+MOST_VIDEO_BYTES = 25 * MB
+MOST_ITEMS = 6
+MOST_DRAFT_BYTES = 40 * MB
+MOST_VIDEO_SECONDS = 30
+MOST_NAME = 120
+SOURCES = ("screenshot", "recording", "attached")
+CAPTURES_DIR = paths.STATE_DIR / "captures"
+FILES = threading.Lock()
+MP4_BRANDS = {b"isom", b"iso2", b"iso3", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"M4V ", b"dash", b"mmp4"}
+NOT_EVIDENCE = "Evidence must be a PNG, JPEG or WebP image or a WebM or MP4 video, and this file is none of them."
 
 KINDS = ("idea", "adjustment", "bug")
 LIMITS = {"text": 4000, "expected": 2000, "actual": 2000, "steps": 2000}
@@ -18,8 +37,102 @@ class Refused(ValueError):
     pass
 
 
+class TooLarge(Refused):
+    pass
+
+
+class NotStaged(LookupError):
+    pass
+
+
 def view(connect=state.db) -> dict:
-    return {"draft": state.capture_draft(connect), "limits": {**LIMITS, "context_bytes": MOST_CONTEXT_BYTES}, "kinds": list(KINDS)}
+    limits = {**LIMITS, "context_bytes": MOST_CONTEXT_BYTES, "image_bytes": MOST_IMAGE_BYTES, "video_bytes": MOST_VIDEO_BYTES,
+              "evidence_items": MOST_ITEMS, "evidence_bytes": MOST_DRAFT_BYTES, "video_seconds": MOST_VIDEO_SECONDS}
+    return {"draft": state.capture_draft(connect), "limits": limits, "kinds": list(KINDS)}
+
+
+def sniffed(data: bytes) -> tuple[str, str, str]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image", "image/png", "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image", "image/jpeg", "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image", "image/webp", "webp"
+    if data.startswith(b"\x1a\x45\xdf\xa3") and b"webm" in data[:64]:
+        return "video", "video/webm", "webm"
+    if data[4:8] == b"ftyp":
+        size = int.from_bytes(data[:4], "big")
+        head = data[8:min(max(size, 16), 256)]
+        brands = {head[:4], *(head[i:i + 4] for i in range(8, len(head) - 3, 4))}
+        if brands & MP4_BRANDS:
+            return "video", "video/mp4", "mp4"
+    raise Refused(NOT_EVIDENCE)
+
+
+def megabytes(size: int) -> str:
+    return f"{size / MB:.1f} MB"
+
+
+def checked_seconds(raw: str) -> float | None:
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or not 0 <= value <= 86400:
+        raise Refused("The length must be a number of seconds from 0 to 86,400.")
+    return round(value, 1)
+
+
+def stage(data: bytes, name: str, source: str, seconds: str) -> dict:
+    source = source or "attached"
+    if source not in SOURCES:
+        raise Refused(f"The source must be one of {', '.join(SOURCES)}.")
+    length = checked_seconds(seconds)
+    kind, mime, extension = sniffed(data)
+    most, label = (MOST_IMAGE_BYTES, "An image") if kind == "image" else (MOST_VIDEO_BYTES, "A video")
+    if len(data) > most:
+        raise TooLarge(f"{label} is limited to {most // MB} MB and this one has {megabytes(len(data))}.")
+    digest = hashlib.sha256(data).hexdigest()
+    row = {"name": tracker.safe_filename(name)[:MOST_NAME] if name.strip() else f"{source}.{extension}", "kind": kind,
+           "type": mime, "bytes": len(data), "sha256": digest, "source": source,
+           "seconds": length if kind == "video" else None}
+
+    def admit(held: list[dict]) -> None:
+        if len(held) >= MOST_ITEMS:
+            raise Refused(f"A draft holds at most {MOST_ITEMS} items and this one has {len(held)}. Remove one first.")
+        used = sum(r["bytes"] for r in held)
+        if used + len(data) > MOST_DRAFT_BYTES:
+            raise TooLarge(f"A draft holds at most {MOST_DRAFT_BYTES // MB} MB of evidence; it has {megabytes(used)} "
+                           f"and this file adds {megabytes(len(data))}.")
+
+    def keep(draft_id: int) -> None:
+        folder = CAPTURES_DIR / str(draft_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        temp = folder / f".{digest}.{os.getpid()}.part"
+        temp.write_bytes(data)
+        os.replace(temp, folder / digest)
+
+    with FILES:
+        staged, existing = state.capture_stage(row, admit, keep)
+    return {**view(), "evidence": staged, "existing": existing}
+
+
+def staged_file(evidence_id: int) -> tuple[Path, dict]:
+    row = state.capture_evidence(evidence_id, state.reader)
+    path = CAPTURES_DIR / str(row["capture"]) / row["sha256"] if row else None
+    if not path or not path.is_file():
+        raise NotStaged(f"No staged evidence has the id {evidence_id}.")
+    return path, row
+
+
+def drop_evidence(evidence_id: int) -> dict:
+    with FILES:
+        row = state.capture_drop_evidence(evidence_id)
+        if row:
+            (CAPTURES_DIR / str(row["capture"]) / row["sha256"]).unlink(missing_ok=True)
+    return view()
 
 
 def checked_fields(body: dict) -> dict:
@@ -99,5 +212,8 @@ def drop_context() -> dict:
 
 
 def discard() -> dict:
-    state.capture_discard()
+    with FILES:
+        draft_id = state.capture_discard()
+        if draft_id is not None:
+            shutil.rmtree(CAPTURES_DIR / str(draft_id), ignore_errors=True)
     return view()

@@ -37,9 +37,10 @@ let changesInFlight = 0;
 class NoAnswer extends Error {}
 
 class ErrorAnswer extends Error {
-  constructor(message, answer) {
+  constructor(message, answer, status) {
     super(message);
     this.answer = answer;
+    this.status = status;
   }
 }
 
@@ -261,14 +262,15 @@ function count(n, one, many) {
 
 async function call(path, body, signal) {
   const changes = body !== undefined;
-  const options = changes ? { method: "POST", headers: { "Content-Type": "application/json", "X-Arete": "1" }, body: JSON.stringify(body) }
+  const raw = body instanceof Blob;
+  const options = changes ? { method: "POST", headers: { "Content-Type": raw ? "application/octet-stream" : "application/json", "X-Arete": "1" }, body: raw ? body : JSON.stringify(body) }
     : { cache: "no-store", signal };
   if (changes) changesInFlight++;
   try {
     const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });
     noteServedCode(response);
     const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
-    if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data);
+    if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data, response.status);
     return data;
   } finally {
     // the caller says its result in the microtasks after this returns, so the change still counts until then

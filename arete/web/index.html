@@ -327,8 +327,27 @@
     <pre id="feedback-context-json" tabindex="0"></pre>
     <div class="actions"><button type="button" id="feedback-context-again">Capture again</button><button type="button" id="feedback-context-drop">Remove</button></div>
   </div>
+  <div class="actions">
+    <button type="button" id="feedback-shot">Take a screenshot</button>
+    <button type="button" id="feedback-record">Record a video</button>
+    <button type="button" id="feedback-attach">Attach a file</button>
+    <input type="file" id="feedback-file" accept="image/png,image/jpeg,image/webp,video/webm,video/mp4" multiple hidden>
+  </div>
+  <p class="muted limit">PNG, JPEG or WebP images up to 5 MB and WebM or MP4 videos up to 25 MB and 30 seconds. A draft holds six items and 40 MB. Nothing is captured until you press a button, and staged files stay on this machine.</p>
+  <p id="feedback-evidence-said" aria-live="polite" tabindex="-1" hidden></p>
+  <h3>What will be sent</h3>
+  <div id="feedback-sending">
+    <pre id="feedback-sending-text"></pre>
+    <p id="feedback-sending-context"></p>
+    <ul id="feedback-evidence"></ul>
+    <p class="muted" id="feedback-evidence-total"></p>
+  </div>
   <p id="feedback-result" aria-live="polite" tabindex="-1" hidden></p>
   <div class="actions"><button type="button" id="feedback-close">Close</button><button type="button" id="feedback-discard">Discard</button><span class="muted keys">Esc closes · the draft is kept</span></div>
 </dialog>
+<div id="feedback-recording" hidden role="status">
+  <span id="feedback-recording-time">Recording 0:00 of 0:30</span>
+  <button type="button" id="feedback-recording-stop">Stop</button>
+</div>
 </body>
 </html>

@@ -373,6 +373,19 @@ CREATE TABLE IF NOT EXISTS captures (
     updated TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS captures_open ON captures (status) WHERE status = 'draft';
+CREATE TABLE IF NOT EXISTS capture_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    capture INTEGER NOT NULL,      -- the captures row it is staged on
+    name TEXT,
+    kind TEXT,                     -- image | video
+    type TEXT,                     -- the MIME type decided from the file's first bytes
+    bytes INTEGER,
+    sha256 TEXT,
+    source TEXT,                   -- screenshot | recording | attached
+    seconds REAL,                  -- NULL when unknown
+    added TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS capture_evidence_once ON capture_evidence (capture, sha256);
 CREATE TABLE IF NOT EXISTS vms (
     name TEXT PRIMARY KEY,         -- a VM arete asked for and has not yet seen deleted
     run_id TEXT,                   -- NULL for a probe
@@ -1778,7 +1791,53 @@ def add_usage(row: dict, keep_days: float) -> None:
 def capture_draft(connect=db) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM captures WHERE status = 'draft'").fetchone()
+        if not r:
+            return None
+        draft = dict(r)
+        draft["evidence"] = [dict(e) for e in c.execute(
+            "SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft["id"],))]
+        return draft
+
+
+def capture_evidence(evidence_id: int, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT e.* FROM capture_evidence e JOIN captures k ON k.id = e.capture "
+                      "WHERE e.id = ? AND k.status = 'draft'", (evidence_id,)).fetchone()
         return dict(r) if r else None
+
+
+def capture_stage(row: dict, admit, keep) -> tuple[dict, bool]:
+    now = util.iso()
+    with db() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        draft = c.execute("SELECT id FROM captures WHERE status = 'draft'").fetchone()
+        draft_id = draft["id"] if draft else c.execute(
+            "INSERT INTO captures (status, revision, created, updated) VALUES ('draft', 0, ?, ?)", (now, now)).lastrowid
+        held = [dict(r) for r in c.execute("SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft_id,))]
+        same = next((r for r in held if r["sha256"] == row["sha256"]), None)
+        if same:
+            return same, True
+        admit(held)
+        keep(draft_id)
+        row = {**row, "capture": draft_id, "added": now}
+        columns = tuple(row)
+        row["id"] = c.execute(insert_sql("capture_evidence", columns), tuple(row[k] for k in columns)).lastrowid
+        c.execute("UPDATE captures SET revision = revision + 1, updated = ? WHERE id = ?", (now, draft_id))
+        return row, False
+
+
+def capture_drop_evidence(evidence_id: int) -> dict | None:
+    with db() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        r = c.execute("SELECT e.* FROM capture_evidence e JOIN captures k ON k.id = e.capture "
+                      "WHERE e.id = ? AND k.status = 'draft'", (evidence_id,)).fetchone()
+        if not r:
+            return None
+        c.execute("DELETE FROM capture_evidence WHERE id = ?", (evidence_id,))
+        c.execute("UPDATE captures SET revision = revision + 1, updated = ? WHERE id = ?", (util.iso(), r["capture"]))
+        return dict(r)
 
 
 def capture_save(**fields) -> None:
@@ -1793,10 +1852,17 @@ def capture_save(**fields) -> None:
                       f"VALUES ({', '.join('?' * len(names))}, 'draft', 1, ?, ?)", (*fields.values(), now, now))
 
 
-def capture_discard() -> bool:
+def capture_discard() -> int | None:
     with db() as c:
-        return c.execute("UPDATE captures SET status = 'discarded', revision = revision + 1, updated = ? WHERE status = 'draft'",
-                         (util.iso(),)).rowcount > 0
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        draft = c.execute("SELECT id FROM captures WHERE status = 'draft'").fetchone()
+        if not draft:
+            return None
+        c.execute("DELETE FROM capture_evidence WHERE capture = ?", (draft["id"],))
+        c.execute("UPDATE captures SET status = 'discarded', revision = revision + 1, updated = ? WHERE id = ?",
+                  (util.iso(), draft["id"]))
+        return draft["id"]
 
 
 def usage_since(since: str, connect=db) -> list[dict]:

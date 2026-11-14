@@ -16,6 +16,22 @@ let feedbackDiscarding = false;
 let feedbackSaveWaits = null;
 let feedbackBase = { ...FEEDBACK_EMPTY };
 let feedbackLine = Promise.resolve();
+const FEEDBACK_MB = 1024 * 1024;
+const FEEDBACK_TYPES = { "image/png": "PNG image", "image/jpeg": "JPEG image", "image/webp": "WebP image", "video/webm": "WebM video", "video/mp4": "MP4 video" };
+const FEEDBACK_SOURCES = { screenshot: "Screenshot", recording: "Recording", attached: "Attached" };
+const FEEDBACK_RECORDER_TYPES = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"];
+const FEEDBACK_NO_CAPTURE = "This browser cannot capture the screen here. Take a screenshot with the device and use Attach a file.";
+const FEEDBACK_LABELS = { text: "Request", expected: "Expected", actual: "Actual", steps: "Steps" };
+const FEEDBACK_LENGTH_SLACK = 0.5;
+let feedbackLimits = { image_bytes: 5 * FEEDBACK_MB, video_bytes: 25 * FEEDBACK_MB, evidence_items: 6, evidence_bytes: 40 * FEEDBACK_MB, video_seconds: 30 };
+let feedbackDraft = null;
+let feedbackAside = false;
+let feedbackCapturing = false;
+let feedbackStopRecording = null;
+let feedbackPending = [];
+let feedbackUploads = Promise.resolve();
+let feedbackKeys = 0;
+const feedbackItems = new Map();
 
 function inFeedbackTurn(work) {
   const turn = feedbackLine.then(work);
@@ -69,7 +85,7 @@ function forgetFeedbackHere() {
 }
 
 function feedbackUnsaved() {
-  return feedbackDirty || feedbackSaving;
+  return feedbackDirty || feedbackSaving || feedbackAside || feedbackCapturing || feedbackPending.length > 0;
 }
 
 function sayFeedback(state, sentence) {
@@ -84,6 +100,7 @@ function onFeedbackInput() {
   feedbackDirty = true;
   keepFeedbackHere(true);
   feedbackBox("bug").hidden = feedbackFields().kind !== "bug";
+  drawFeedbackText();
   clearTimeout(feedbackTimer);
   feedbackTimer = 0;
   saveFeedbackLater(FEEDBACK_SAVE_MS);
@@ -121,12 +138,13 @@ function mergeFeedback(draft) {
   feedbackRead = true;
   feedbackDirty = JSON.stringify(merged) !== JSON.stringify(held);
   keepFeedbackHere(feedbackDirty);
-  drawFeedbackContext(draft);
+  drawFeedbackDraft(draft);
 }
 
 async function readFeedbackDraft() {
   try {
     const answered = await feedbackAnswer();
+    noteFeedbackLimits(answered.limits);
     for (const name of FEEDBACK_TEXTS) {
       feedbackBox(name).maxLength = answered.limits[name];
       const line = feedbackBox(`${name}-limit`);
@@ -165,7 +183,7 @@ async function sendFeedbackFields() {
       feedbackDirty = false;
       keepFeedbackHere(false);
     }
-    drawFeedbackContext(answered.draft);
+    drawFeedbackDraft(answered.draft);
     sayFeedback("ok", `Draft saved at ${clock(new Date())}. It is kept, and nothing is filed.`);
   } catch (e) {
     sayFeedback("caution", `${failedFeedback(e)} ${FEEDBACK_ON_DEVICE}`);
@@ -192,6 +210,304 @@ function drawFeedbackContext(draft) {
   feedbackBox("context-json").textContent = json;
 }
 
+function drawFeedbackDraft(draft) {
+  const held = feedbackDraft;
+  if (draft && held && draft.id === held.id && draft.revision < held.revision) return drawFeedbackList();
+  feedbackDraft = draft;
+  drawFeedbackContext(draft);
+  drawFeedbackText();
+  drawFeedbackList();
+}
+
+function noteFeedbackLimits(limits) {
+  if (limits) feedbackLimits = { ...feedbackLimits, ...limits };
+}
+
+function feedbackSize(bytes) {
+  return bytes >= FEEDBACK_MB ? `${(bytes / FEEDBACK_MB).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function sayEvidence(state, sentence) {
+  sayIn(feedbackBox("evidence-said"), state, sentence);
+}
+
+function drawFeedbackText() {
+  const fields = feedbackFields();
+  const shown = FEEDBACK_TEXTS.filter((name) => (name === "text" || fields.kind === "bug") && fields[name].trim());
+  feedbackBox("sending-text").textContent = shown.length
+    ? [`Kind: ${capitalized(fields.kind)}`, ...shown.map((name) => `${FEEDBACK_LABELS[name]}:\n${fields[name]}`)].join("\n\n")
+    : "Nothing written yet.";
+}
+
+function evidenceDetails(row, seen) {
+  const seconds = row.seconds ?? (Number.isFinite(seen) ? seen : null);
+  return [FEEDBACK_TYPES[row.type] || row.type, feedbackSize(row.bytes), seconds === null ? null : `${Math.round(seconds)} s`,
+    FEEDBACK_SOURCES[row.source] || row.source].filter(Boolean).join(" · ");
+}
+
+function checkEvidenceLength(row, video, details) {
+  const seconds = video.duration;
+  if (!Number.isFinite(seconds)) return;
+  const most = feedbackLimits.video_seconds;
+  if (seconds > most + FEEDBACK_LENGTH_SLACK) {
+    removeFeedbackEvidence(row, `${row.name} is ${Math.round(seconds)} s long and the limit is ${most} s, so it was removed.`);
+  } else {
+    details.textContent = evidenceDetails(row, seconds);
+  }
+}
+
+function stagedEvidenceItem(row) {
+  const src = `/api/capture/evidence/${row.id}`;
+  const details = el("span", { text: evidenceDetails(row) });
+  const media = row.kind === "image" ? el("img", { src, alt: row.name }) : el("video", { controls: true, preload: "metadata", src });
+  if (row.kind === "video") media.addEventListener("loadedmetadata", () => checkEvidenceLength(row, media, details));
+  const remove = button("Remove", "feedback-remove", () => removeFeedbackEvidence(row, `Removed ${row.name}.`, remove), { of: String(row.id) });
+  return el("li", {}, media, el("div", { class: "evidence-words" }, el("strong", { text: row.name }), el("br"), details), remove);
+}
+
+function pendingEvidenceItem(item) {
+  const failed = item.state === "failed";
+  const status = failed ? `Not staged: ${item.why}` : "Sending…";
+  const again = el("button", { type: "button", "data-focus": `feedback-again:${item.key}`, text: "Try again", on: { click: () => uploadFeedbackItem(item) } });
+  const remove = button("Remove", "feedback-remove", () => {
+    feedbackPending = feedbackPending.filter((p) => p !== item);
+    drawFeedbackList();
+    feedbackBox("attach").focus();
+  }, { of: `pending-${item.key}` });
+  return el("li", {}, el("div", { class: "evidence-words" }, el("strong", { text: item.name }), el("br"),
+    el("span", { text: `${feedbackSize(item.blob.size)} · ${status}` })), failed ? [again, remove] : null);
+}
+
+function drawFeedbackList() {
+  const staged = feedbackDraft?.evidence ?? [];
+  const json = feedbackDraft?.context || "";
+  feedbackBox("sending-context").textContent = json
+    ? `App state: Included, ${new TextEncoder().encode(json).length} bytes, shown above.` : "App state: Not included.";
+  const ids = new Set(staged.map((row) => row.id));
+  for (const id of [...feedbackItems.keys()]) if (!ids.has(id)) feedbackItems.delete(id);
+  for (const row of staged) if (!feedbackItems.has(row.id)) feedbackItems.set(row.id, stagedEvidenceItem(row));
+  const wanted = [...staged.map((row) => feedbackItems.get(row.id)), ...feedbackPending.map(pendingEvidenceItem)];
+  const list = feedbackBox("evidence");
+  wanted.forEach((node, i) => {
+    if (list.children[i] !== node) list.insertBefore(node, list.children[i] ?? null);
+  });
+  while (list.children.length > wanted.length) list.lastElementChild.remove();
+  const bytes = staged.reduce((sum, row) => sum + row.bytes, 0);
+  feedbackBox("evidence-total").textContent = `${staged.length} of ${feedbackLimits.evidence_items} items · ${(bytes / FEEDBACK_MB).toFixed(1)} of ${feedbackLimits.evidence_bytes / FEEDBACK_MB} MB`;
+}
+
+function onFeedbackUploads(work) {
+  const turn = feedbackUploads.then(work);
+  feedbackUploads = turn.catch(() => {});
+  return turn;
+}
+
+function queueFeedbackFiles(files) {
+  const items = files.map((file) => ({ key: ++feedbackKeys, state: "sending", why: "", seconds: null, ...file }));
+  feedbackPending.push(...items);
+  drawFeedbackList();
+  for (const item of items) uploadFeedbackItem(item);
+}
+
+function uploadFeedbackItem(item) {
+  return onFeedbackUploads(async () => {
+    if (!feedbackPending.includes(item)) return;
+    item.state = "sending";
+    drawFeedbackList();
+    const path = `/api/capture/evidence?name=${encodeURIComponent(item.name)}&source=${item.source}&seconds=${item.seconds ?? ""}`;
+    try {
+      const answered = await call(path, item.blob);
+      noteFeedbackLimits(answered.limits);
+      feedbackPending = feedbackPending.filter((p) => p !== item);
+      drawFeedbackDraft(answered.draft);
+      sayEvidence("ok", answered.existing ? "That file is already staged." : `Staged ${answered.evidence.name}.`);
+    } catch (e) {
+      item.state = "failed";
+      item.why = failedFeedback(e);
+      drawFeedbackList();
+      sayEvidence("caution", `${item.name} was not staged: ${failedFeedback(e)}`);
+    }
+  });
+}
+
+function removeFeedbackEvidence(row, said, from) {
+  const buttons = [...feedbackBox("evidence").querySelectorAll("button[data-focus^='feedback-remove']")];
+  const at = from ? buttons.indexOf(from) : -1;
+  return onFeedbackUploads(async () => {
+    try {
+      drawFeedbackDraft((await call(`/api/capture/evidence/${row.id}/drop`, {})).draft);
+      sayEvidence("ok", said);
+    } catch (e) {
+      sayEvidence("caution", `${row.name} was not removed: ${failedFeedback(e)}`);
+      return;
+    }
+    if (!from) return;
+    const left = [...feedbackBox("evidence").querySelectorAll("button[data-focus^='feedback-remove']")];
+    (left[Math.min(at, left.length - 1)] ?? feedbackBox("attach")).focus();
+  });
+}
+
+function refusedFeedbackFile(file, count, bytes) {
+  const label = FEEDBACK_TYPES[file.type];
+  if (!label) return `${file.name} is not a PNG, JPEG or WebP image or a WebM or MP4 video, so it was not added.`;
+  const image = file.type.startsWith("image/");
+  const most = image ? feedbackLimits.image_bytes : feedbackLimits.video_bytes;
+  if (file.size > most) return `${file.name} is ${feedbackSize(file.size)} and ${image ? "an image" : "a video"} is limited to ${most / FEEDBACK_MB} MB, so it was not added.`;
+  if (count >= feedbackLimits.evidence_items) return `A draft holds at most ${feedbackLimits.evidence_items} items, so ${file.name} was not added. Remove one first.`;
+  if (bytes + file.size > feedbackLimits.evidence_bytes) return `A draft holds at most ${feedbackLimits.evidence_bytes / FEEDBACK_MB} MB of evidence, so ${file.name} was not added.`;
+  return "";
+}
+
+function attachFeedbackFiles(input) {
+  const files = [...input.files];
+  input.value = "";
+  const staged = feedbackDraft?.evidence ?? [];
+  let count = staged.length + feedbackPending.length;
+  let bytes = staged.reduce((sum, row) => sum + row.bytes, 0) + feedbackPending.reduce((sum, item) => sum + item.blob.size, 0);
+  const accepted = [];
+  const refused = [];
+  for (const file of files) {
+    const why = refusedFeedbackFile(file, count, bytes);
+    if (why) {
+      refused.push(why);
+      continue;
+    }
+    count++;
+    bytes += file.size;
+    accepted.push({ blob: file, name: file.name, source: "attached" });
+  }
+  if (refused.length) sayEvidence("caution", refused.join(" "));
+  if (accepted.length) queueFeedbackFiles(accepted);
+}
+
+function stamp() {
+  const now = new Date();
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function stepFeedbackAside() {
+  feedbackAside = true;
+  document.getElementById("feedback").close();
+}
+
+function returnToFeedback(focus) {
+  feedbackAside = false;
+  const dialog = document.getElementById("feedback");
+  if (!dialog.open) dialog.showModal();
+  (focus ?? (COARSE.matches ? document.getElementById("feedback-title") : feedbackBox("text"))).focus();
+}
+
+function stopTracks(stream) {
+  for (const track of stream?.getTracks() ?? []) track.stop();
+}
+
+function pausedFor(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nextFrames() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+function canvasPng(canvas) {
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+}
+
+async function framePng(stream) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.srcObject = stream;
+  await video.play();
+  await nextFrames();
+  await pausedFor(250);
+  const full = document.createElement("canvas");
+  full.width = video.videoWidth;
+  full.height = video.videoHeight;
+  full.getContext("2d").drawImage(video, 0, 0);
+  stopTracks(stream);
+  video.srcObject = null;
+  for (const scale of [1, 0.75, 0.5]) {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(full.width * scale));
+    canvas.height = Math.max(1, Math.round(full.height * scale));
+    canvas.getContext("2d").drawImage(full, 0, 0, canvas.width, canvas.height);
+    const blob = await canvasPng(canvas);
+    if (blob && blob.size <= feedbackLimits.image_bytes) return { blob, name: `screenshot-${stamp()}.png`, source: "screenshot" };
+  }
+  throw new Error(`The screenshot is over ${feedbackLimits.image_bytes / FEEDBACK_MB} MB even scaled down, so it was not staged`);
+}
+
+function recordedClock(seconds) {
+  return `${Math.floor(seconds / 60)}:${pad(Math.floor(seconds % 60))}`;
+}
+
+async function recordStream(stream) {
+  const most = feedbackLimits.video_seconds;
+  const mimeType = FEEDBACK_RECORDER_TYPES.find((type) => MediaRecorder.isTypeSupported(type));
+  const recorder = new MediaRecorder(stream, { ...(mimeType ? { mimeType } : {}), videoBitsPerSecond: 4_000_000 });
+  const chunks = [];
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data.size) chunks.push(event.data);
+  });
+  const stopped = new Promise((resolve) => recorder.addEventListener("stop", resolve, { once: true }));
+  const halt = () => {
+    if (recorder.state !== "inactive") recorder.stop();
+  };
+  const bar = document.getElementById("feedback-recording");
+  const started = performance.now();
+  const elapsed = () => Math.min(most, (performance.now() - started) / 1000);
+  const tick = () => {
+    document.getElementById("feedback-recording-time").textContent = `Recording ${recordedClock(elapsed())} of ${recordedClock(most)}`;
+  };
+  stepFeedbackAside();
+  tick();
+  bar.hidden = false;
+  document.getElementById("feedback-recording-stop").focus();
+  feedbackStopRecording = halt;
+  recorder.addEventListener("error", halt);
+  stream.getVideoTracks()[0]?.addEventListener("ended", halt);
+  recorder.start(1000);
+  const ticker = setInterval(tick, 250);
+  const limit = setTimeout(halt, most * 1000);
+  try {
+    await stopped;
+  } finally {
+    clearInterval(ticker);
+    clearTimeout(limit);
+    feedbackStopRecording = null;
+    bar.hidden = true;
+  }
+  stopTracks(stream);
+  const type = recorder.mimeType || mimeType || "video/webm";
+  if (!chunks.length) throw new Error("The recording was empty");
+  return { blob: new Blob(chunks, { type }), name: `recording-${stamp()}.${type.includes("mp4") ? "mp4" : "webm"}`, source: "recording",
+    seconds: Math.round(elapsed() * 10) / 10 };
+}
+
+async function captureFeedbackScreen(recording) {
+  if (feedbackCapturing) return;
+  if (!navigator.mediaDevices?.getDisplayMedia || (recording && !window.MediaRecorder)) return sayEvidence("caution", FEEDBACK_NO_CAPTURE);
+  feedbackCapturing = true;
+  const asked = navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+  let stream = null;
+  let focus = null;
+  try {
+    stream = await asked;
+    if (!recording) stepFeedbackAside();
+    const file = await (recording ? recordStream(stream) : framePng(stream));
+    queueFeedbackFiles([file]);
+  } catch (e) {
+    focus = feedbackBox("attach");
+    sayEvidence("caution", e.name === "NotAllowedError" ? "Nothing was captured. You can attach a file instead."
+      : `The screen could not be captured (${e.name === "Error" ? e.message : e.name}). Nothing was captured, and you can attach a file instead.`);
+  } finally {
+    stopTracks(stream);
+    feedbackCapturing = false;
+    if (feedbackAside) returnToFeedback(focus);
+    else focus?.focus();
+  }
+}
+
 async function captureFeedbackContext() {
   clearTimeout(feedbackTimer);
   feedbackTimer = 0;
@@ -199,7 +515,7 @@ async function captureFeedbackContext() {
     await sendFeedbackFields();
     try {
       const answered = await call("/api/capture/context", { view: route.view, detail: route.detail });
-      drawFeedbackContext(answered.draft);
+      drawFeedbackDraft(answered.draft);
       sayFeedback("ok", `Captured the app state at ${clock(new Date())}.`);
     } catch (e) {
       if (feedbackBox("context").hidden) feedbackBox("include").checked = false;
@@ -211,7 +527,7 @@ async function captureFeedbackContext() {
 async function dropFeedbackContext() {
   await inFeedbackTurn(async () => {
     try {
-      drawFeedbackContext((await call("/api/capture/context/drop", {})).draft);
+      drawFeedbackDraft((await call("/api/capture/context/drop", {})).draft);
       sayFeedback("ok", "Removed the app state.");
     } catch (e) {
       feedbackBox("include").checked = !feedbackBox("context").hidden;
@@ -227,6 +543,9 @@ async function discardFeedback() {
   clearTimeout(feedbackTimer);
   feedbackTimer = 0;
   const clicked = feedbackFields();
+  feedbackPending = [];
+  drawFeedbackList();
+  await feedbackUploads;
   await inFeedbackTurn(async () => {
     let failed = null;
     try {
@@ -245,8 +564,8 @@ async function discardFeedback() {
     putFeedback(since);
     feedbackBase = { ...FEEDBACK_EMPTY };
     feedbackRead = true;
-    drawFeedbackContext(null);
-    feedbackDirty = JSON.stringify(since) !== JSON.stringify(FEEDBACK_EMPTY);
+    drawFeedbackDraft(null);
+    feedbackDirty =JSON.stringify(since) !== JSON.stringify(FEEDBACK_EMPTY);
     if (!feedbackDirty) {
       forgetFeedbackHere();
       sayFeedback("ok", "Discarded the draft.");
@@ -260,7 +579,7 @@ async function discardFeedback() {
 
 function openFeedback() {
   const dialog = document.getElementById("feedback");
-  if (dialog.open) return;
+  if (dialog.open || feedbackAside) return;
   trackAction("feedback-open");
   feedbackReturn = focusMark(document.activeElement);
   dialog.showModal();
@@ -278,8 +597,23 @@ function wireFeedback() {
   feedbackBox("context-again").addEventListener("click", captureFeedbackContext);
   feedbackBox("context-drop").addEventListener("click", dropFeedbackContext);
   document.getElementById("feedback-discard").addEventListener("click", discardFeedback);
+  document.getElementById("feedback-shot").addEventListener("click", () => {
+    trackAction("feedback-screenshot");
+    captureFeedbackScreen(false);
+  });
+  document.getElementById("feedback-record").addEventListener("click", () => {
+    trackAction("feedback-record");
+    captureFeedbackScreen(true);
+  });
+  feedbackBox("attach").addEventListener("click", () => {
+    trackAction("feedback-attach");
+    feedbackBox("file").click();
+  });
+  feedbackBox("file").addEventListener("change", (event) => attachFeedbackFiles(event.currentTarget));
+  document.getElementById("feedback-recording-stop").addEventListener("click", () => feedbackStopRecording?.());
   dialog.addEventListener("close", () => {
     if (feedbackDirty) saveFeedback();
+    if (feedbackAside) return;
     refocus(feedbackReturn);
     feedbackReturn = null;
   });
