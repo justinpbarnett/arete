@@ -10,9 +10,12 @@
 .hint .cap + .cap { margin-left: -2px; }
 .echo { margin-left: auto; min-width: 12px; color: var(--accent); }
 .echo:empty { visibility: hidden; }
-.notice { position: absolute; left: 50%; bottom: 100%; transform: translateX(-50%); max-width: 60%; padding: 4px 10px; background: var(--raised); border: 1px solid var(--rule-strong); color: var(--ink); pointer-events: none; }
+.notice { flex: none; max-width: 65%; overflow: hidden; text-overflow: ellipsis; color: var(--ink); }
 .notice:empty { display: none; }
 .help { padding: 0; border: 0; background: none; cursor: pointer; }
+.reason-box { position: fixed; bottom: var(--row); left: var(--sidebar-width); right: 0; z-index: 5; display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: var(--panel); border-top: 1px solid var(--rule-strong); }
+.reason-box input { flex: 1; min-width: 0; background: var(--canvas); color: var(--ink); border: 1px solid var(--rule-strong); padding: 6px; }
+.reason-box span { color: var(--muted); font-size: var(--text-s); }
 .sheet-scrim { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; background: rgba(11, 12, 14, .72); }
 .key-sheet { width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 14px 16px 12px; background: var(--panel); border: 1px solid var(--rule-strong); color: var(--ink); font-size: var(--text-s); outline: 0; }
 .sheet-head { display: flex; align-items: center; gap: 12px; }

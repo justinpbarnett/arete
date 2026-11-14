@@ -1,3 +1,5 @@
+import { prepareWrite, sendWrite } from "./ui-write.js";
+
 const endpoints = { sidebar: "/api/sidebar", live: "/api/live", usage: "/api/usage" };
 
 async function read(name) {
@@ -22,11 +24,7 @@ export async function shell() {
 }
 
 export function visit(row) {
-  return fetch(endpoints.usage, {
-    method: "POST", keepalive: true,
-    headers: { "Content-Type": "application/json", "X-Arete": "1" },
-    body: JSON.stringify({ kind: "visit", ...row }),
-  }).catch(() => null);
+  return sendWrite(prepareWrite(endpoints.usage, { kind: "visit", ...row }, null, { keepalive: true })).catch(() => null);
 }
 
 export function floor() { return { title: "Floor", subtitle: "The work in flight", queue: "Lines", focus: "Focus" }; }

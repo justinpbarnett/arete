@@ -2,6 +2,10 @@ import { signal, batch } from "./vendor-signals.js";
 import { parse } from "./ui-router.js";
 import { dismissMenu } from "./ui-menu.js";
 import { paletteKey, paletteRouteChanged } from "./ui-palette.js";
+import { notice } from "./ui-notice.js";
+import { actions, perform, repeat, reasonBox, cancelReason, confirmReason } from "./ui-actions.js";
+import { undo } from "./ui-undo.js";
+export { notice };
 
 export const screenKeys = [
   ["f", "floor", "Floor", "#floor"],
@@ -51,9 +55,9 @@ export const mode = signal("NORMAL");
 export const pane = signal("queue");
 export const pending = signal("");
 export const sheet = signal(false);
-export const notice = signal("");
 
 const cursors = new Map();
+export const selectedItem = (id) => cursors.get(id);
 let listId = "";
 let searched = null;
 let lastTab = null;
@@ -81,6 +85,25 @@ function paneOf(target) {
 function focusedList() {
   const found = lists(pane.value);
   return found.find((el) => el.dataset.list === listId) ?? found[0] ?? null;
+}
+
+export function selectItem(id, item, name = "queue") {
+  listId = id;
+  if (item == null) cursors.delete(id);
+  else cursors.set(id, item);
+  pane.value = name;
+  marks();
+}
+
+export function actionContext() {
+  const list = focusedList();
+  const row = list && cursorRow(list);
+  return list?.uiContext?.(row && itemId(row));
+}
+
+function destructive() {
+  const context = actionContext();
+  if (context?.item) perform(actions[context.item.verb ?? "remove"], context);
 }
 
 function cursorRow(list) {
@@ -232,7 +255,8 @@ function chord(key) {
   if (prefix === "g" && key === "t") { tab(1); return true; }
   if (prefix === "g" && key === "T") { tab(-1); return true; }
   if (prefix === "g" && key === "x") return true;
-  return (prefix === "d" && key === "d") || (prefix === "z" && key === "z");
+  if (prefix === "d" && key === "d") { destructive(); return true; }
+  return prefix === "z" && key === "z";
 }
 
 function normal(event) {
@@ -244,6 +268,13 @@ function normal(event) {
   if (key === "Escape") { escape(); return true; }
   if (pending.value && chord(key)) return true;
   if (key === "?") { toggleSheet(); return true; }
+  if (key === "u") { undo(); return true; }
+  if (key === ".") { repeat(actionContext()); return true; }
+  if (["s", "S", "R"].includes(key)) {
+    const context = actionContext();
+    const action = context?.item && (context.setAside ?? actions[key === "s" ? "snooze" : key === "S" ? "shelve" : "repair"]);
+    if (action) { perform(action, context); return true; }
+  }
   if (key === "c" && focusedList()?.uiCreate) { focusedList().uiCreate(); return true; }
   if (key === "g" || key === "d" || key === "z") { pending.value = key; return true; }
   const screen = screenKeys.find(([letter]) => letter === key);
@@ -279,7 +310,19 @@ function editing(event) {
 function onKey(event) {
   if (event.isComposing || event.keyCode === 229) return;
   if (paletteKey(event, writable(event.target))) return;
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) { event.preventDefault(); return; }
+  if (reasonBox.peek()) {
+    if (event.key === "Escape") { cancelReason(); event.target.blur?.(); mode.value = "NORMAL"; event.preventDefault(); }
+    else if (event.key === "Enter") {
+      if (event.metaKey || event.ctrlKey) confirmReason().then(() => { if (!reasonBox.peek()) mode.value = "NORMAL"; });
+      event.preventDefault();
+    }
+    return;
+  }
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    const context = actionContext();
+    if (context?.primary) perform(context.primary, context);
+    event.preventDefault(); return;
+  }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.key === "Escape" && !sheet.value && (dismissMenu() || focusedList()?.uiDismiss?.())) {
     if (writable(event.target)) event.target.blur();
@@ -327,5 +370,6 @@ export function hints() {
   if (row && [...row.querySelectorAll("textarea, input, [contenteditable]")].some(writable)) found.push([["i"], "type"]);
   if (document.querySelector("[data-search]")) found.push([["/"], "search"]);
   if (document.querySelector(tabSelector)) found.push([["gt", "gT"], "tab"]);
+  if (list?.uiContext) found.push([["dd"], "act"], [["u"], "undo"], [["."], "repeat"]);
   return found;
 }

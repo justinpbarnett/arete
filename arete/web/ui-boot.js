@@ -4,7 +4,8 @@ import { Shell } from "./ui-shell.js";
 import { current, listen } from "./ui-router.js";
 import { shell, visit } from "./ui-data.js";
 import { startKeys, marks, screenKeys, pending, sheet, mode } from "./ui-keys.js";
-import { configurePalette } from "./ui-palette.js";
+import { configurePalette, globalCommands } from "./ui-palette.js";
+import { actions, dispatch } from "./ui-actions.js";
 import { dismissMenu } from "./ui-menu.js";
 import { startHooks } from "./ui-hooks.js";
 import { normalizePrimary } from "./ui-list.js";
@@ -74,4 +75,5 @@ configurePalette(screenKeys.map(([key, id, title, href], index) => ({ key, id, t
   dismissMenu();
 }, () => { mode.value = "NORMAL"; });
 startKeys();
+globalCommands([{ id: "run-checks", title: "Run checks now", run: () => dispatch(actions.checks) }]);
 startHooks();

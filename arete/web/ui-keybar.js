@@ -1,12 +1,25 @@
-import { h } from "./vendor-preact.js";
+import { h, Component } from "./vendor-preact.js";
+import { effect } from "./vendor-signals.js";
 import htm from "./vendor-htm.js";
-import { mode, pending, sheet, notice, hints, sheetGroups, toggleSheet } from "./ui-keys.js";
+import { mode, pane, pending, sheet, notice, hints, sheetGroups, toggleSheet } from "./ui-keys.js";
 
 const html = htm.bind(h);
 
 const caps = (keys) => keys.map((key) => html`<kbd class="cap" key=${key}>${key}</kbd>`);
 
-export function KeyBar() {
+export class KeyBar extends Component {
+  state = { revision: 0 };
+  componentDidMount() {
+    this.unsubscribe = effect(() => {
+      mode.value; pane.value; pending.value; sheet.value; notice.value;
+      this.setState({ revision: this.state.revision + 1 });
+    });
+  }
+  componentWillUnmount() { this.unsubscribe(); }
+  render() { return keyBar(); }
+}
+
+function keyBar() {
   const insert = mode.value === "INSERT";
   return html`<footer class="key-bar" aria-label="Key bar">
     <span class=${`mode${insert ? " insert" : ""}`} data-mode=${mode.value}>${mode.value}</span>
