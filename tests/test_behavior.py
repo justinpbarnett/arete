@@ -187,6 +187,23 @@ if scenario == "failed-check":
     layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "exit 7"))
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
+elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault"):
+    cause = "change" if scenario == "verify-change-fault" else "environment"
+    answers = root / "sample/replay"
+    failing = json.loads((answers / "verify.json").read_text())
+    failing["structured"] = {"verdict": "pass" if scenario.endswith("-pass") else "fail", "summary": "The check could not run.", "checks": [
+        {"what": "notes.txt holds kumquat", "how": "browser", "saw": "Target page, context or browser has been closed",
+         "passed": False, "cause": cause}]}
+    (answers / "verify2.json").write_text((answers / "verify.json").read_text())
+    (answers / "verify.json").write_text(json.dumps(failing))
+    (answers / "verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+elif scenario in ("verify-start-denied", "verify-start-crash"):
+    urllib.request.urlopen = mock.Mock(side_effect=OSError("refused"))
+    layer = root / "sample/layer/config.toml"
+    denied = ("echo '/bin/bash: sandbox: Operation not permitted'; exit 126" if scenario == "verify-start-denied"
+              else "echo 'at usePermissions (src/hooks/usePermissions.ts:12:5)'; exit 1")
+    (root / "sample/replay/verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    layer.write_text(layer.read_text().replace("[verify]\n", "[verify]\nstart = " + json.dumps(denied) + "\n", 1))
 elif scenario in ("review-rejected", "edited-after-held-pr"):
     file = root / "sample/replay/review.json"
     data = json.loads(file.read_text())
@@ -1074,6 +1091,32 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["verified"], ["blocked"])
         self.assertEqual(result["status"], "done", result["summary"])
         self.assertIn("in use blocked", result["summary"])
+
+    def test_failed_check_caused_by_the_environment_is_blocked_without_a_repair(self):
+        result = self.workflow("verify-environment-fault")
+        self.assertEqual(result["verified"], ["blocked"])
+        self.assertNotIn("verify_fix", result["steps"])
+        self.assertIn("blocked", result["summary"])
+
+    def test_passing_verdict_with_an_environment_failed_check_is_blocked_without_a_repair(self):
+        result = self.workflow("verify-environment-fault-pass")
+        self.assertEqual(result["verified"], ["blocked"])
+        self.assertNotIn("verify_fix", result["steps"])
+
+    def test_app_start_crash_naming_a_permissions_identifier_still_runs_the_repair(self):
+        result = self.workflow("verify-start-crash")
+        self.assertIn("verify_fix", result["steps"])
+
+    def test_failed_check_caused_by_the_change_still_runs_the_repair(self):
+        result = self.workflow("verify-change-fault")
+        self.assertIn("verify_fix", result["steps"])
+        self.assertEqual(result["verified"], ["pass"])
+
+    def test_app_start_denied_by_the_sandbox_is_blocked_without_a_repair(self):
+        result = self.workflow("verify-start-denied")
+        self.assertEqual(result["verified"], ["blocked"])
+        self.assertIn("blocked", result["summary"])
+        self.assertNotIn("verify_fix", result["steps"])
 
     def test_substantive_review_failure_cannot_become_done(self):
         result = self.workflow("review-rejected")
