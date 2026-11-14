@@ -10,14 +10,21 @@ EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS, "codex": codex.EF
            runner.REPLAY: tuple(dict.fromkeys([*claude.EFFORTS, *pi.THINKING_LEVELS, *codex.EFFORTS]))}
 CODEX_INSTRUCTIONS = ("repo",)
 DEFAULTS = {"tools": tuple(runner.READ_TOOLS), "mcp": (), "session": "fresh"}
-BUILT_IN = {"build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
+BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
             "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
             "research_plan": {"timeout_minutes": 10, "tries": 2},
+            "research_search": {"timeout_minutes": 10, "tries": 2, "tools": runner.WEB_TOOLS},
+            "research_synthesis": {"timeout_minutes": 10, "tries": 2},
+            "research_audit": {"timeout_minutes": 10, "tries": 2, "tools": (*runner.READ_TOOLS, "WebFetch")},
             "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
-KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "document")
-READ_ONLY = ("research_plan", "document")
+KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "research_search", "research_synthesis",
+                    "research_audit", "document")
+READ_ONLY = ("research_plan", "research_search", "research_synthesis", "research_audit", "document")
+SEARCHES = ("research_search",)
+FETCHES = ("research_audit",)
+NO_WEB = ("research_synthesis",)
 
 
 @dataclass(frozen=True)
@@ -151,17 +158,24 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
 
 def check_reach(where: str, cfg: config.Config, role: str, which: str, found: dict, instructions: tuple) -> None:
     tools, mcp = found["tools"], found["mcp"]
+    web = runner.WEB_TOOLS if role in SEARCHES else ("WebFetch",) if role in FETCHES else ()
+    if role in FETCHES and "WebSearch" in tools:
+        raise ValueError(f"{where}: tools WebSearch cannot load on {role}, which may only fetch again the sources "
+                         "it audits")
+    if role in NO_WEB and (found_web := [t for t in tools if t in runner.WEB_TOOLS]):
+        raise ValueError(f"{where}: tools {', '.join(found_web)} cannot load on {role}, which writes only from the "
+                         "evidence it is given")
     if role in READ_ONLY:
-        if acting := [t for t in tools if t not in runner.READ_ONLY_TOOLS]:
+        if acting := [t for t in tools if t not in runner.READ_ONLY_TOOLS and t not in web]:
             raise ValueError(f"{where}: tools {', '.join(acting)} would let {role} change files; it is read only, "
                              "so use Read, Glob, Grep and LS")
         if mcp:
             raise ValueError(f"{where}: mcp {', '.join(mcp)} cannot load on {role}, which is read only and takes "
                              "no servers")
-    if bad := [t for t in tools if t not in STEP_TOOLS]:
+    if bad := [t for t in tools if t not in STEP_TOOLS and t not in web]:
         raise ValueError(f"{where}: tools {', '.join(bad)} is not a built in tool a step takes; use "
                          f"{', '.join(STEP_TOOLS)}, since shell rules come from the layer and servers from mcp")
-    if which in ("pi", "codex") and (missing := [t for t in runner.READ_TOOLS if t not in tools]):
+    if which in ("pi", "codex") and role not in SEARCHES and (missing := [t for t in runner.READ_TOOLS if t not in tools]):
         raise ValueError(f"{where}: tools {', '.join(tools) or '[]'} leaves out {', '.join(missing)}, which {which} always "
                          "grants; list them")
     if which == "pi" and mcp:
@@ -236,7 +250,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     requires = routing.Requirements(
         modalities=tuple(found.get("modalities", ())), min_context=found.get("min_context", 0),
         structured_output=found.get("structured_output", False), data_handling=tuple(found.get("data_handling", ())),
-        floor=floor, approved=floors.get(floor, ()))
+        floor=floor, approved=floors.get(floor, ()), directory_cleanup=found.get("directory_cleanup", False))
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
                     mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,

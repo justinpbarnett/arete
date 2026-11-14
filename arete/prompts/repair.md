@@ -1,5 +1,5 @@
 You are the builder in an unattended build pipeline. Arete's own final review of the open PR for this issue still
-requested changes. Nobody will answer questions while you work.
+requested changes. $owner
 
 Repository: $repo. $workspace
 
@@ -27,7 +27,7 @@ $expertise
 
 - The branch already holds the PR's work. Read what it changes with `git log` and `git diff` against the PR base
   before you edit.
-- Fix every finding, minor ones too. Where a finding and the plan disagree, the finding wins.
+- Fix every finding listed: each is a blocker from the last review. Where a finding and the plan disagree, the finding wins.
 - Keep the change to what the findings ask. No scope growth, no drive by refactors, no formatting churn.
 - Add or change tests only where the repo's own docs ask for them.
 - Run the checks yourself before you finish: $checks

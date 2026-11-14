@@ -1,4 +1,4 @@
-You are the grader for an eval of an unattended build pipeline. Nobody will answer questions while you work.
+You are the grader for an eval of an unattended build pipeline. $owner
 
 Repository: $repo. $workspace
 
@@ -42,6 +42,9 @@ $scratch
   - `how`: the exact command, request, or clicks.
   - `saw`: what came back. Quote the output, the status and body, or what the page showed.
   - `passed`: true only when what you saw is the result the step expects.
+  - `cause`: on a step with `passed` false, `environment` when your own tools or sandbox could not run the step, such as a
+    denied command; `change` when the product misbehaved. A missing command, page, route or field that the step needs is
+    `change`.
   - `screenshot`: the file name of the screenshot for a browser step, else leave it out.
 - `verdict`: `pass` when every step gave its expected result. `fail` when one or more did not. `blocked` when you
   could not do a step for a cause outside the code; say what in `blocked_by`.

@@ -66,6 +66,16 @@ def save(values: dict) -> dict:
 
 
 def replace_config(text: str, wanted_limits: dict[str, int], wanted_models: dict[str, str]) -> None:
+    def refusal(cfg: config.Config) -> str:
+        if any(getattr(cfg, key) != limit for key, limit in wanted_limits.items()) or any(
+                cfg.models.get(role, "") != model for role, model in wanted_models.items()):
+            return "The new config read back other values than the ones saved, so config.toml is unchanged."
+        return ""
+
+    write_checked(text, refusal)
+
+
+def write_checked(text: str, refusal) -> None:
     draft = paths.CONFIG_FILE.with_suffix(".toml.tmp")
     mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
     draft.touch(mode=mode)
@@ -76,10 +86,9 @@ def replace_config(text: str, wanted_limits: dict[str, int], wanted_models: dict
     except Exception as e:
         draft.unlink()
         raise Refused(f"The new config would not load ({util.first_line(str(e), 120)}), so config.toml is unchanged.") from e
-    if any(getattr(cfg, key) != limit for key, limit in wanted_limits.items()) or any(
-            cfg.models.get(role, "") != model for role, model in wanted_models.items()):
+    if why := refusal(cfg):
         draft.unlink()
-        raise Refused("The new config read back other values than the ones saved, so config.toml is unchanged.")
+        raise Refused(why)
     draft.replace(paths.CONFIG_FILE)
 
 

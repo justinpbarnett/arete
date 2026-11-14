@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import base64
 import functools
 import itertools
 import json
+import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from . import outbound, paths, util
+from . import config, outbound, paths, util
 
 ARETE_MARK = "<!-- arete -->"
+GITHUB_API = "https://api.github.com"
+CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
 
 
@@ -33,7 +39,32 @@ def auth_token() -> str:
     return res.stdout.strip() if res.returncode == 0 else ""
 
 
+class Outgoing(str):
+    pass
+
+
+TEXT_FLAGS = ("--body", "-b", "--comment", "-c", "--field", "-f", "--raw-field", "-F")
+JOINED_TEXT_FLAGS = ("--body=", "--comment=", "--body-file=", "--field=", "--raw-field=", "--input=")
+STDIN_ONLY_FLAGS = ("--body-file", "--input")
+ATTACHED_SHORT_FLAGS = ("-b", "-c", "-f", "-F")
+
+
+def joined_text_flag(arg: str) -> bool:
+    return arg.startswith(JOINED_TEXT_FLAGS) or (len(arg) > 2 and arg.startswith(ATTACHED_SHORT_FLAGS))
+
+
+def unscreened_text(args: list[str], input: str | None) -> bool:
+    if input is not None and not isinstance(input, Outgoing):
+        return True
+    if any(joined_text_flag(str(arg)) for arg in args):
+        return True
+    return any((flag in TEXT_FLAGS and not isinstance(value, Outgoing)) or (flag in STDIN_ONLY_FLAGS and value != "-")
+               for flag, value in itertools.pairwise(args))
+
+
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
+    if unscreened_text(args, input):
+        raise TypeError("text sent to GitHub must come from gh.outgoing")
     res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input)
     if res.returncode != 0:
         command = " ".join(itertools.takewhile(lambda arg: not arg.startswith("-"), args))
@@ -73,11 +104,25 @@ def issue(repo: str, number: int) -> dict:
     )
 
 
+def outgoing(text: str, link: str = "", mark: bool = False) -> Outgoing:
+    text = outbound.inert(outbound.screen(text))
+    if link:
+        text = f"{outbound.screen(link)}\n\n{text}"
+    return Outgoing(marked(text) if mark else text)
+
+
+def split_link(body: str, links) -> tuple[str, str]:
+    first, _, rest = body.partition("\n")
+    if first and first in links:
+        return first, rest.lstrip("\n")
+    return "", body
+
+
 def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
-    url = gh(args, input=outbound.screen(body)).strip().splitlines()[-1]
+    url = gh(args, input=outgoing(body)).strip().splitlines()[-1]
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
@@ -86,13 +131,13 @@ def issue_url(repo: str, number: int | str) -> str:
 
 
 def issue_comment(repo: str, number: int, body: str) -> None:
-    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=outbound.screen(body))
+    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
 def issue_close(repo: str, number: int, comment: str = "") -> None:
     args = ["issue", "close", str(number), "--repo", repo]
     if comment:
-        args += ["--comment", outbound.screen(comment)]
+        args += ["--comment", outgoing(comment)]
     gh(args)
 
 
@@ -116,7 +161,7 @@ def issue_state(repo: str, number: int) -> str:
 
 
 def issue_edit_body(repo: str, number: int, body: str) -> None:
-    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outbound.screen(body))
+    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
 def issue_reopen(repo: str, number: int) -> None:
@@ -124,14 +169,14 @@ def issue_reopen(repo: str, number: int) -> None:
 
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
-              draft: bool = False, cwd=None) -> str:
+              draft: bool = False, cwd=None, link: str = "") -> str:
     args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outbound.screen(title),
             "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
     if draft:
         args.append("--draft")
-    return gh(args, cwd=cwd, input=outbound.screen(body)).strip().splitlines()[-1]
+    return gh(args, cwd=cwd, input=outgoing(body, link)).strip().splitlines()[-1]
 
 
 def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> list[dict]:
@@ -161,17 +206,17 @@ def pr_diff(url: str) -> str:
     return gh(["pr", "diff", url])
 
 
-def pr_edit_body(url: str, body: str) -> None:
-    gh(["pr", "edit", url, "--body-file", "-"], input=outbound.screen(body))
+def pr_edit_body(url: str, body: str, link: str = "") -> None:
+    gh(["pr", "edit", url, "--body-file", "-"], input=outgoing(body, link))
 
 
 def pr_comment(url: str, body: str) -> None:
-    gh(["pr", "comment", url, "--body-file", "-"], input=marked(outbound.screen(body)))
+    gh(["pr", "comment", url, "--body-file", "-"], input=outgoing(body, mark=True))
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
     gh(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
-        "--input", "-"], input=json.dumps({"body": marked(outbound.screen(body))}))
+        "--input", "-"], input=Outgoing(json.dumps({"body": outgoing(body, mark=True)})))
 
 
 def api_list(path: str) -> list[dict]:
@@ -246,6 +291,11 @@ def pr_set_draft(url: str, draft: bool) -> None:
     gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
+def pr_draft_and_head(url: str) -> tuple[bool, str]:
+    row = gh_json(["pr", "view", url, "--json", "isDraft,headRefOid"]) or {}
+    return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
+
+
 MERGE_NOW = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 MERGE_LATER = {"BLOCKED", "BEHIND"}
 MERGE_WAIT_SECONDS = 120
@@ -282,6 +332,11 @@ def pr_merge_state(repo: str, number: int) -> tuple[str, str]:
     return (row.get("mergeStateStatus") or "UNKNOWN").upper(), (row.get("mergeable") or "UNKNOWN").upper()
 
 
+def squash_subject(repo: str, number: int) -> list[str]:
+    title = ((gh_json(["pr", "view", str(number), "--repo", repo, "--json", "title"]) or {}).get("title") or "").strip()
+    return ["--subject", f"{title} (#{number})"] if title else []
+
+
 def repo_allows_auto_merge(repo: str) -> bool:
     return bool((gh_json(["api", f"repos/{repo}"]) or {}).get("allow_auto_merge"))
 
@@ -297,10 +352,11 @@ def pr_merge_auto(repo: str, number: int, wait: float = MERGE_WAIT_SECONDS,
             break
         time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
     if action == "merge":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--delete-branch"])
+        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--delete-branch", *squash_subject(repo, number)])
         return "merged", ""
     if action == "auto":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch"])
+        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch",
+            *squash_subject(repo, number)])
         return "auto", ""
     if action == "wait":
         return "left", f"GitHub still reported the merge state as unknown after {wait:g} seconds"
@@ -312,6 +368,89 @@ def default_branch(repo: str) -> str:
         return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
     except (GhError, KeyError, TypeError):
         return "main"
+
+
+def base64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def key_signature(app: config.GithubApp, signing_input: bytes) -> bytes:
+    failed = f"openssl could not sign with [github_app] private_key {paths.short_path(app.private_key)}"
+    if paths.ISOLATED and paths.confined(app.private_key) is None:
+        raise GhError("isolated arete uses no key of this machine; put the [github_app] private_key in the scratch folder")
+    try:
+        res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(app.private_key)], input=signing_input,
+                             capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise GhError(f"{failed}: {e}") from None
+    if res.returncode != 0:
+        raise GhError(f"{failed}: {util.first_line(res.stderr.decode(errors='replace')) or f'exit {res.returncode}'}")
+    return res.stdout
+
+
+def app_jwt(app: config.GithubApp) -> str:
+    now = int(time.time())
+    signed = ".".join(base64url(json.dumps(part, separators=(",", ":")).encode()) for part in (
+        {"alg": "RS256", "typ": "JWT"}, {"iat": now - 60, "exp": now + 540, "iss": app.app_id}))
+    return f"{signed}.{base64url(key_signature(app, signed.encode()))}"
+
+
+def clone_token(app: config.GithubApp, repo: str) -> str:
+    where = f"for {repo} from [github_app] installation {app.installation_id}"
+    try:
+        reply = token_reply(app, repo, retry=True)
+    except urllib.error.HTTPError as e:
+        raise GhError(f"GitHub gave no token {where}: HTTP {e.code}: {http_message(e)}") from None
+    except OSError as e:
+        raise GhError(f"GitHub gave no token {where}: {getattr(e, 'reason', None) or e}") from None
+    if not (token := reply.get("token")):
+        raise GhError(f"GitHub gave no token {where}: its reply held none")
+    if problem := token_overreach(reply, repo):
+        raise GhError(f"GitHub gave a token {where} that is not read only on that one repository, so arete "
+                      f"discarded it: {problem}")
+    return token
+
+
+def token_overreach(reply: dict, repo: str) -> str:
+    permissions = reply.get("permissions")
+    if not isinstance(permissions, dict) or not permissions:
+        return "its reply named no permissions"
+    if wider := sorted(name for name, level in permissions.items() if level != "read"):
+        return f"it grants more than read on {', '.join(wider)}"
+    if reply.get("repository_selection") == "all":
+        return "it reaches every repository of the installation"
+    listed = reply.get("repositories")
+    if listed is not None and (not isinstance(listed, list) or
+                               [str(r.get("full_name", "")).lower() for r in listed if isinstance(r, dict)] != [repo.lower()]):
+        return "it reaches repositories other than this one"
+    return ""
+
+
+def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
+    body = {"repositories": [repo.rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
+    request = urllib.request.Request(
+        f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
+        method="POST", headers={"Authorization": f"Bearer {app_jwt(app)}", "Accept": "application/vnd.github+json",
+                                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as res:
+            reply = json.loads(res.read())
+    except urllib.error.HTTPError:
+        raise
+    except OSError:
+        if not (retry and util.wait_for_network()):
+            raise
+        return token_reply(app, repo, retry=False)
+    except ValueError:
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+def http_message(e: urllib.error.HTTPError) -> str:
+    try:
+        return str(json.loads(e.read()).get("message") or e.reason)
+    except (ValueError, OSError, AttributeError):
+        return str(e.reason)
 
 
 def repo_exists(repo: str) -> bool:

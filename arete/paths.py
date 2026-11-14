@@ -15,6 +15,7 @@ ON_MAC = sys.platform == "darwin"
 SCRATCH_PREFIX = ".arete-scratch-"
 SCRATCH_ENV = "ARETE_VERIFY_SCRATCH"
 SCRATCH_TOKEN = re.compile(r"[0-9a-f]{16}")
+SEARCH_ONLY = getattr(os, "O_SEARCH", 0)
 NOWHERE = Path("/var/empty/arete-isolated")
 CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|^access$|^refresh$", re.IGNORECASE)
 ISOLATED_LOGINS = "scratch config and state never use this machine's logins, keys or price lookups"
@@ -70,6 +71,16 @@ def confined(p: Path) -> Path | None:
     return real if real == root or root in real.parents else None
 
 
+def open_directory(part: str, parent: int, above_target: bool) -> int:
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW
+    if above_target and SEARCH_ONLY:
+        try:
+            return os.open(part, SEARCH_ONLY | flags, dir_fd=parent)
+        except PermissionError:
+            pass
+    return os.open(part, os.O_RDONLY | flags, dir_fd=parent)
+
+
 @contextmanager
 def directory_fd(p: Path, parent: int | None = None, create: bool = False):
     parts = p.parts
@@ -77,13 +88,14 @@ def directory_fd(p: Path, parent: int | None = None, create: bool = False):
         raise PermissionError("directory traversal refused")
     fd = os.dup(parent) if parent is not None else os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in parts if parent is not None else p.absolute().parts[1:]:
+        walked = parts if parent is not None else p.absolute().parts[1:]
+        for index, part in enumerate(walked):
             if create:
                 try:
                     os.mkdir(part, 0o700, dir_fd=fd)
                 except FileExistsError:
                     pass
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            next_fd = open_directory(part, fd, index < len(walked) - 1)
             os.close(fd)
             fd = next_fd
         yield fd

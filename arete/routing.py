@@ -50,10 +50,12 @@ class Requirements:
     data_handling: tuple[str, ...] = ()
     floor: str = ""
     approved: tuple[str, ...] = ()
+    directory_cleanup: bool = False
 
     @property
     def declared(self) -> bool:
-        return bool(self.modalities or self.min_context or self.structured_output or self.data_handling or self.floor)
+        return bool(self.modalities or self.min_context or self.structured_output or self.data_handling or self.floor
+                    or self.directory_cleanup)
 
 
 @dataclass(frozen=True)
@@ -521,6 +523,12 @@ class Discovery:
                 reasons.append("data handling is not declared for this route")
             elif offered not in need.data_handling:
                 reasons.append(f"data handling is '{offered}'; the step allows {', '.join(need.data_handling)}")
+        if need.directory_cleanup and way.runner == "codex":
+            found = self.remembered("codex_cleanup", codex.cleanup)
+            if found.status == "denied":
+                reasons.append(found.detail)
+            elif found.status != "able":
+                reasons.append(f"directory cleanup could not be confirmed on codex: {found.detail}")
         return "; ".join(reasons)
 
     def policy_refusal(self, credential: str, auth_mode: str = "") -> str:
@@ -682,7 +690,7 @@ def described_selection(selection: Selection, settings, request_tokens: int) -> 
                          "reason": c.detail} for c in selection.skipped],
             "requires": {"modalities": list(need.modalities), "min_context": need.min_context,
                          "structured_output": need.structured_output, "data_handling": list(need.data_handling),
-                         "floor": need.floor},
+                         "floor": need.floor, "directory_cleanup": need.directory_cleanup},
             "request_tokens": request_tokens, "error": selection.error}
 
 

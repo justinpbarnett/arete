@@ -57,7 +57,7 @@ When the server restarts on new code, `just adw-wait` connects again by itself a
 | `just adw-status [id]` | every live run, or one run's steps and its report |
 | `just adw-wait <id>` | follows the run until it ends or asks a question |
 | `just adw-logs <id> [step]` | all of the run's lines, or one step's lines |
-| `just adw-answer <id> "<text>"` | answers a question and starts the next run |
+| `just adw-answer <id> "<text>"` | answers a text question and continues the asking run, which keeps its folder and session |
 | `just adw-resume <id> [step]` | continues at the first unfinished step, or from a named one |
 | `just adw-repair <id>` | repairs the open held PR of a run from its saved review findings, with no new plan; prints the repair run |
 | `just adw-step <id> <step> [key=value ...]` | runs one step alone, with overrides such as `model=opus` or `effort=high` |
@@ -96,13 +96,12 @@ just adw-answer RUN1 "On a new last line."
 {"task": "t-1a2b", "repo": "replay-sample", "run": "RUN2", "state": "running", "why": "started"}
 ```
 
-The answer started a new run, `RUN2`. Wait on that id:
+The answer continued the run as a new run, `RUN2`, which takes `prepare` from the stored outcomes and starts at `plan`. Wait on that id:
 
 ```sh
 just adw-wait RUN2
 ```
 ```json
-{"run": "RUN2", "event": "step_end", "step": "prepare", "result": "pass", …}
 {"run": "RUN2", "event": "step_end", "step": "plan", "result": "pass", …}
 …
 {"run": "RUN2", "event": "step_end", "step": "respond", "result": "pass", …}
@@ -118,13 +117,14 @@ just adw-wait RUN2
 | event | means |
 |---|---|
 | `task` | the run started; names the ticket, kind, repo, title and script |
-| `answer` | this run carries the answer to an earlier run's question: `asked_in`, `question`, `text` |
+| `answer` | this run carries the answer to an earlier run's question: `asked_in`, `question`, `text`; a run that continues a parked ask writes one per ask with `asked_in`, `ask_id`, `step` and `answers` |
 | `step_start` | a step began; names its model, runner, credential, effort and `skipped` routes when it calls an agent, once per launch if a limit moves the call to another route, and in `env` the names of the variables that agent starts with, never their values |
 | `heartbeat` | the step is still working; every 30 seconds |
 | `step_end` | a step ended: `result` is `pass`, `fail`, `ask` or `stop`, with `error`, `cost_usd` and `seconds` |
-| `route` | the run continues an earlier one and took its finished steps; it comes twice, once when the run starts and once with `after` and `skipped` when it runs its first step |
+| `route` | the run continues an earlier one and took its finished steps; it comes twice, once when the run starts and once with `after` and `skipped` when it runs its first step; a run preparing again after a failed `prepare` writes it once more before that `prepare` |
 | `wait` | the run waited on a usage limit, CI, a run slot or a person, with `minutes` |
-| `question` | the run asks the person: `summary` is the question in short, `question` the whole comment |
+| `question` | the run asks the person: `summary` is the question in short, `question` the whole comment; an ask from an agent step also has `ask_id`, `step` and `questions`, and a turn with several asks writes one line per ask with the same `summary` and `question` |
+| `ask_settled` | an agent step's ask of choice questions was settled without the person (one line per ask of the turn): `ask_id`, `step`, `choices` and `p`; the choices show in the report's `assumptions` |
 | `error` | something failed: `step` and `message` |
 | `step` | a row of `just adw-status <id>`, not a run line: one step's `state`, `try`, `seconds`, `cost_usd`, `model`, `runner` and `error` |
 | `report` | the last line: `status`, `prs`, `summary`, `requirements`, `assumptions`, `left_for_a_person`, `review`, `question`, `steps`, `minutes`, `cost_usd` |
@@ -147,7 +147,7 @@ just adw-wait RUN2
 
 Read `summary` and `question`. Answer only from what the person or the task already settled. When neither did, ask the person and pass their words on with `just adw-answer`. Never guess a requirement.
 
-Then wait on the run the answer starts: its id is in the `run` field of the answer's line. A `409` means the answer was not stored, because a run of the task is going or no slot is free; try again once that run ends.
+Then wait on the run the answer starts: its id is in the `run` field of the answer's line. A `409` means the answer was not stored, because a run of the task is going; try again once that run ends. An answer waits for a run slot ahead of new runs instead of being refused. When the question is a choice, a secret or a `done`, answer with `uv run arete answer <id> --json '{"answers": [...]}'` or `{"recommended": true}`.
 
 ## Waiting on another task
 
