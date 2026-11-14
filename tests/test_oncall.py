@@ -1620,6 +1620,10 @@ def start(repo, prompt="", title="", ticket=""):
     log("start", repo, tid, run, prompt, ticket)
     return {"task": tid, "repo": repo, "run": run, "state": "running", "why": "started"}
 
+def stop(run_id):
+    log("stop", run_id)
+    return {"id": run_id, "stopped": True}
+
 def routes(cfg, repo, setting):
     detail = {"policy": "[routing] payment_modes allows subscription; this route is api_key",
               "held": "claude usage limit reached, held until cleared"}.get(MODE, "")
@@ -1636,7 +1640,8 @@ def cleared(cfg, key):
     log("clear", key)
     return True
 
-oncall.start_task, oncall.route_outlook, oncall.run_check, oncall.clear_alert = start, routes, check, cleared
+oncall.start_task, oncall.route_outlook, oncall.stop_run = start, routes, stop
+oncall.run_check, oncall.clear_alert = check, cleared
 oncall.raise_alert = lambda cfg, key, title, line: log("alert", key, title, line)
 """
 SCAN = "print(json.dumps(oncall.scan(config.load())))\n"
@@ -1815,6 +1820,158 @@ class Repairs(Scratch):
         self.assertEqual(len(self.seam("start")), 1)
         self.assertEqual(self.phase(2)[:2], ("open", "waiting"))
         self.assertIn("already running", self.phase(2)[2])
+
+    def steer(self, call):
+        return self.scanned(tail=f"print(json.dumps(oncall.{call}))\n")
+
+    def picked(self):
+        code = ("import json\nfrom arete import config, pipeline, tracker\nrepo = config.load().repo('demo')\n"
+                "print(json.dumps(pipeline.next_pick(repo, tracker.LocalTracker(repo), pipeline.SkipLog({}), set())))")
+        res = self.py(code)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return json.loads(res.stdout.splitlines()[-1])
+
+    def set_run(self, status, run=None):
+        self.sql("UPDATE runs SET status = ?" + (" WHERE id = ?" if run else ""), status, *([run] if run else []))
+
+    def test_cancel_stops_the_run_once_and_nothing_restarts_inside_the_cooldown(self):
+        self.bounds("max_attempts = 2\ncooldown_minutes = 30\n")
+        self.failing()
+        (start,) = self.seam("start")
+        done = self.steer("cancel(1)")
+        self.assertEqual(done["stopped"], start[3])
+        self.scanned()
+        self.scanned()
+        self.assertEqual(self.seam("stop"), [["stop", start[3]]])
+        self.assertEqual(len(self.seam("start")), 1)
+        self.assertIn("cooling down until", self.phase()[2])
+        self.assertEqual(self.sql("SELECT state FROM tasks"), [("closed",)])
+        self.assertIn("cancelled by the owner", self.arete("show", "1").stdout)
+        self.set_run("interrupted")
+        self.assertIsNone(self.picked())
+
+    def test_unknown_incidents_and_a_repair_that_is_not_running_are_refused(self):
+        for action in ("cancel", "dismiss", "retry"):
+            res = self.arete(action, "999")
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("no incident 999", res.stderr)
+        code = ("from arete import control\nfor f in (oncall.cancel, oncall.dismiss, oncall.retry):\n"
+                "    try: f(999)\n    except control.NotFound as e: print('NotFound', e)\n"
+                "try: oncall.cancel(1)\nexcept control.Refused as e: print('Refused', e)\n")
+        self.failing()
+        self.end()
+        out = self.py(f"RULES = {{}}\nCALLS = {str(self.calls_file)!r}\nSEAM_LOG = {str(self.seam_file)!r}\n"
+                      f"MODE = 'ready'\n{HEAD}{SEAMS}{code}").stdout
+        self.assertEqual(out.count("NotFound no incident 999"), 3)
+        self.assertIn("Refused incident 1 has no repair running", out)
+
+    def test_dismiss_and_retry_need_the_repair_cancelled_first(self):
+        self.failing()
+        for action in ("dismiss", "retry"):
+            res = self.arete(action, "1")
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("cancel it first", res.stderr)
+
+    def test_retry_re_arms_a_blocked_incident_and_dismiss_closes_it(self):
+        self.failing()
+        self.end()
+        self.scanned()
+        self.end()
+        self.scanned()
+        self.assertEqual(self.phase()[1], "blocked")
+        self.assertEqual(self.arete("retry", "1").returncode, 0)
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 3)
+        self.assertEqual(self.phase()[1], "repairing")
+        self.assertIn("re-armed by the owner", self.arete("show", "1").stdout)
+        self.end()
+        self.assertEqual(self.arete("dismiss", "1").returncode, 0)
+        self.assertEqual(self.phase()[:2], ("dismissed", ""))
+        self.assertIn("dismissed by the owner", self.arete("show", "1").stdout)
+        self.assertEqual(self.arete("dismiss", "1").returncode, 1)
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 3)
+
+    def test_the_switch_stops_wakes_until_it_is_turned_on(self):
+        self.scanned()
+        self.assertIn("are off", self.arete("off").stdout)
+        self.append(self.error(1))
+        found = self.scanned()
+        self.assertEqual(found["repairs"], {})
+        self.assertEqual(self.seam("start"), [])
+        self.assertIn("wakes and rechecks are off", self.arete().stdout)
+        self.arete("on")
+        self.assertEqual(self.scanned()["repairs"], {"woken": 1})
+        self.assertEqual(len(self.seam("start")), 1)
+        self.assertIn("switched on by the owner", self.arete("show", "1").stdout)
+
+    def test_the_poller_skips_incident_tasks_while_wakes_are_off_but_not_ordinary_ones(self):
+        self.failing()
+        task = self.seam("start")[0][2]
+        self.set_run("interrupted")
+        self.assertEqual(self.picked()[0], task)
+        self.arete("off")
+        self.assertIsNone(self.picked())
+        plain = self.py("from arete import state\nprint(state.task_add('demo', 'plain work', 'plain', 'feat'))"
+                        ).stdout.strip()
+        self.assertEqual(self.picked()[0], plain)
+        self.sql("UPDATE tasks SET state = 'closed' WHERE id = ?", plain)
+        self.arete("on")
+        self.assertEqual(self.picked()[0], task)
+        self.set_run("failed")
+        self.assertEqual(self.picked()[0], task)
+        self.arete("off")
+        self.assertIsNone(self.picked())
+
+    def test_the_poller_spawns_only_after_rechecking_the_switch_under_the_oncall_lock(self):
+        self.failing()
+        task = self.seam("start")[0][2]
+        self.set_run("failed")
+        code = ("import json\nfrom arete import oncall, pipeline, util\nspawned = []\n"
+                "pipeline.spawn_run = lambda repo, tid: spawned.append(tid)\n"
+                f"task = {task!r}\nout = []\n"
+                "with util.lock('oncall') as held:\n    out.append(pipeline.spawn_unparked('demo', task))\n"
+                "out.append(pipeline.spawn_unparked('demo', task))\noncall.switch(False)\n"
+                "out.append(pipeline.spawn_unparked('demo', task))\nprint(json.dumps([out, spawned]))")
+        res = self.py(code)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout.splitlines()[-1]), [[False, True, False], [task]])
+
+    def test_an_interrupted_repair_with_an_attempt_left_restarts_the_same_task_once(self):
+        self.failing()
+        task = self.seam("start")[0][2]
+        self.set_run("interrupted")
+        self.arete("off")
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 1)
+        self.arete("on")
+        self.assertEqual(self.scanned()["repairs"], {"restarted": 1})
+        starts = self.seam("start")
+        self.assertEqual((starts[1][2], starts[1][5]), (task, task))
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM tasks"), [(1,)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM incident_repairs WHERE ended = ''"), [(1,)])
+        self.assertEqual(self.phase()[1], "repairing")
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 2)
+
+    def test_an_interrupted_repair_with_nothing_left_is_blocked_and_not_restarted(self):
+        for bound, text in (("max_attempts = 1\ncooldown_minutes = 0\n", "1 of 1 attempts used"),
+                            ("max_attempts = 3\ncooldown_minutes = 0\nincident_budget_usd = 1.0\n", "USD")):
+            with self.subTest(bound=bound):
+                self.setUp()
+                self.bounds(bound)
+                self.failing()
+                run = self.seam("start")[0][3]
+                self.sql("INSERT INTO steps (run_id, step, runner, model, provider, auth_mode, cost_usd) "
+                         "VALUES (?, 'build', 'pi', 'm', 'openai', 'api_key', 2.0)", run)
+                self.set_run("interrupted")
+                self.assertIsNone(self.picked())
+                self.scanned()
+                self.assertEqual(len(self.seam("start")), 1)
+                self.assertEqual(self.phase()[1], "blocked")
+                self.assertIn(text, self.phase()[2])
+                self.assertIn("blocked", self.arete().stdout)
+                self.assertIsNone(self.picked())
 
     def test_a_merged_repair_resolves_only_when_the_check_passes_and_clears_its_alert(self):
         self.failing()

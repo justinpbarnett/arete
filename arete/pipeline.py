@@ -3971,6 +3971,9 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
 
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset()) -> tuple[str, str] | None:
+    from . import oncall
+
+    excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded)
     for tid in state.interrupted_tickets(repo.name):
         if str(tid) not in excluded and not state.issue_running(repo.name, tid):
@@ -4036,6 +4039,16 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
         for a in waiting:
             state.ask_close(a["id"], "answered", asks.text_answers(a, text))
     return ""
+
+
+def spawn_unparked(repo_name: str, tid: str | int) -> bool:
+    from . import oncall
+
+    with util.lock("oncall") as got:
+        if not got or str(tid) in oncall.parked(repo_name):
+            return False
+        spawn_run(repo_name, tid)
+        return True
 
 
 def poll(dry_run: bool = False) -> int:
@@ -4124,7 +4137,9 @@ def poll(dry_run: bool = False) -> int:
                     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
                     if not dry_run:
                         state.drop_passed_over(repo.name, keep=str(tid))
-                        spawn_run(repo.name, tid)
+                        if not spawn_unparked(repo.name, tid):
+                            exhausted.add(repo.name)
+                            continue
                     slots -= 1
                     going[repo.name] += 1
                 except Exception as e:

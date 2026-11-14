@@ -163,7 +163,7 @@ So planning, the isolated worktree, checks, verify, review, the PR, automerge an
 The task prompt is `arete/prompts/oncall_repair.md`: diagnose and reproduce first, then make the smallest repair; the redacted evidence is a fenced block marked as untrusted data.
 Before a wake, Arete resolves the plan, build, verify, review and repair steps of that repo with `steps.resolve` and checks each with `routing.fit_refusal`, `routing.modes_for` and `routing.outlook`.
 A hold, a spent budget or a payment mode refusal leaves the incident `waiting` with that reason; with `payment_modes = ["subscription"]` no paid route is used, and no hold is bypassed.
-Task start, the route lookup, the check run and the alerts go through `oncall.start_task`, `oncall.route_outlook`, `oncall.run_check`, `oncall.raise_alert` and `oncall.clear_alert`, which a harness can replace.
+Task start, run stop, the route lookup, the check run and the alerts go through `oncall.start_task`, `oncall.stop_run`, `oncall.route_outlook`, `oncall.run_check`, `oncall.raise_alert` and `oncall.clear_alert`, which a harness can replace.
 
 | `[oncall]` key | Default | Bound |
 | --- | --- | --- |
@@ -173,6 +173,11 @@ Task start, the route lookup, the check run and the alerts go through `oncall.st
 | `incident_budget_usd` | 5.0 | paid spend on one incident's repairs, counted like `state.paid_by_run`; past it the incident is `blocked` |
 | `daily_budget_usd` | 10.0 | paid spend of all repairs started in the last 24 hours; past it incidents wait |
 | `cooldown_minutes` | 30 | pause after each ended attempt |
+
+**Steering.** `cancel` stops the incident's running repair through `control.stop_run` and starts the cooldown; `dismiss` closes an open incident; `retry` re-arms one, so its attempts, spend and cooldown count from that point; `off` and `on` flip a runtime switch (the cursor `oncall:switch`, not config).
+Each action writes a note on the incident, and a refused one (an unknown id, a repair still running) exits 1 with one line.
+While the switch is off no wake, recheck or restart happens, and the pipeline poller starts no task linked to an incident; it never picks the task of an attempt that has ended; ordinary tasks are polled as before.
+An interrupted repair restarts (same task, same attempt) only while the incident has an attempt and budget left; otherwise it is `blocked`.
 
 **No storms.** Lines a repair's run writes (run rows, `[repo task]` lines and a stalled run of its task) never open or wake an incident; each is counted in a note on the incident being repaired.
 A failure of a ticket with a live run counts as owned.
@@ -196,6 +201,11 @@ The alert clears when the incident resolves or is dismissed.
 arete oncall             # incidents, newest first, each with its decision, repair state, then the watcher's state
 arete oncall show ID     # one incident with its decision, answers, repair attempts, evidence and notes
 arete oncall scan        # one scan now
+arete oncall cancel ID   # stop the incident's running repair and start the cooldown
+arete oncall dismiss ID  # close an open incident that has no repair running
+arete oncall retry ID    # re-arm an incident: attempts, spend and the cooldown count from here
+arete oncall off         # stop every wake, recheck and restart until `on`
+arete oncall on
 ```
 
 `--json` prints one JSON line per incident (`scan --json` prints the summary).

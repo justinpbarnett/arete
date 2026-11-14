@@ -469,6 +469,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     policies TEXT,
     phase TEXT DEFAULT '',
     waiting TEXT DEFAULT '',
+    rearmed INTEGER DEFAULT 0,
     landed TEXT DEFAULT '',
     recovery TEXT DEFAULT '',
     alerted INTEGER DEFAULT 0
@@ -577,6 +578,7 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                   ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
                   ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"),
                   ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"),
+                  ("rearmed", "INTEGER DEFAULT 0"),
                   ("landed", "TEXT DEFAULT ''"), ("recovery", "TEXT DEFAULT ''"), ("alerted", "INTEGER DEFAULT 0"))]]
 
 

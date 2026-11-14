@@ -300,7 +300,7 @@ def cmd_heartbeat(args) -> int:
 
 
 def cmd_oncall(args) -> int:
-    from . import oncall, state
+    from . import control, oncall, state
 
     cfg = config.load()
     if args.action == "scan":
@@ -311,6 +311,27 @@ def cmd_oncall(args) -> int:
             print(summary["skipped"])
         else:
             print(json.dumps(summary) if args.json else f"on-call: {oncall.said(summary)}")
+        return 0
+    if args.action in ("off", "on"):
+        oncall.switch(args.action == "on")
+        print(f"on-call wakes and rechecks are {args.action}")
+        return 0
+    if args.action in ("cancel", "dismiss", "retry"):
+        if not args.id.isdigit():
+            print(f"no incident {args.id}" if args.id else f"{args.action} needs an incident number", file=sys.stderr)
+            return 1
+        number = int(args.id)
+        try:
+            done = getattr(oncall, args.action)(number)
+        except (control.NotFound, control.Refused) as e:
+            return refused(e)
+        if args.action == "cancel":
+            stopped = f"stopped run {done['stopped']}" if done["stopped"] else "no run was live"
+            print(f"cancelled incident {number}: {stopped}; cooling down until {done['cooldown_until'] or '-'}")
+        elif args.action == "dismiss":
+            print(f"dismissed incident {number}")
+        else:
+            print(f"incident {number} is re-armed; the next scan may start a repair")
         return 0
     if args.action == "show":
         found = state.incident(int(args.id)) if args.id.isdigit() else None
@@ -353,6 +374,8 @@ def cmd_oncall(args) -> int:
         if now["last_scan"]:
             last = f"last scan {when(now['last_scan'])}" + ("" if now["ok"] else f" failed: {now['detail']}")
         print(f"on-call is on; {last}; {now['expected']} expected events counted")
+    if now["wakes"] == "off":
+        print("wakes and rechecks are off; `arete oncall on` turns them on")
     return 0
 
 
@@ -1642,8 +1665,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_heartbeat)
 
     p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
-    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan"))
-    p.add_argument("id", nargs="?", default="", help="with show: the incident number")
+    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan", "cancel", "dismiss", "retry", "off", "on"))
+    p.add_argument("id", nargs="?", default="", help="with show, cancel, dismiss or retry: the incident number")
     p.add_argument("--json", action="store_true", help="one JSON line per incident")
     p.set_defaults(fn=cmd_oncall)
 
