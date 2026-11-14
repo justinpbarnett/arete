@@ -714,6 +714,8 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     kw.pop("verification_attempt", None)
     if trip.scratch:
         original = kw.get("mcp_config", "")
+        if which != "claude" or target.remote:
+            verification_scratch.stop_served(trip.scratch)
         if which == "codex" and not target.remote:
             try:
                 kw["mcp_config"] = verification_scratch.browser_config(trip.scratch, original, kw.get("add_dirs", ()))
@@ -734,6 +736,19 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
                 kw["mcp_config"] = original
             say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
             kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
+        if which == "claude" and not target.remote:
+            try:
+                config_json, reason = verification_scratch.serve_browser(trip.scratch, original, kw.get("add_dirs", ()))
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                config_json = verification_scratch.without_browser(original)
+                reason = str(error) or type(error).__name__
+            if reason:
+                kw["allowed_tools"] = [t for t in kw.get("allowed_tools") or [] if not t.startswith("mcp__playwright")]
+                kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""),
+                                                         verification_scratch.browser_blocked_note(reason)]))
+                say(f"the confined browser is unavailable for this verify: {reason}")
+            if "mcp_config" in kw:
+                kw["mcp_config"] = config_json
         kw["verification_attempt"] = trip.scratch
     if asking and hook:
         kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.WITHHELD]))
@@ -788,6 +803,23 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
     return res
 
 
+def described_servers(mcp_config: str) -> dict:
+    try:
+        servers = json.loads(mcp_config or "{}").get("mcpServers") or {}
+    except (ValueError, AttributeError):
+        return {}
+    found = {}
+    for name, server in servers.items():
+        if not isinstance(server, dict):
+            continue
+        if server.get("url"):
+            found[name] = {"type": server.get("type") or "http", "url": server["url"]}
+        else:
+            words = str(server.get("command") or "").split()
+            found[name] = {"type": "stdio", "command": words[0] if words else ""}
+    return found
+
+
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
@@ -805,6 +837,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
               "allowed_tools": kw.get("allowed_tools"), "disallowed_tools": kw.get("disallowed_tools"),
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
+              "mcp_servers": described_servers(kw.get("mcp_config", "")),
               "budget_tokens": kw.get("max_tokens"), "refused": kw.get("budget_error", ""),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}

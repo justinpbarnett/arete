@@ -9,15 +9,18 @@ import ipaddress
 import json
 import os
 import pwd
+import re
 import secrets
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
 import sys
 import time
 import unicodedata
-from contextlib import contextmanager
+import urllib.request
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -68,6 +71,10 @@ BROWSER_HIDDEN = ("Library/Application Support/Google/Chrome", "Library/Keychain
                   ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc", ".bash_profile", ".bash_login", ".profile",
                   ".config/fish")
 BROWSER_GRACE_SECONDS = 3
+BROWSER_PREFLIGHT_SECONDS = 30
+BROWSER_SERVE_SECONDS = 60
+BROWSER_STOP_SECONDS = 10
+CHROME_ERROR = re.compile(r"error|fatal|fail|denied|not permitted|abort", re.IGNORECASE)
 
 
 def identity(st: os.stat_result) -> list[int]:
@@ -435,14 +442,15 @@ def hidden_folders(with_state: bool = True) -> tuple[Path, ...]:
                  if with_state or p != state)
 
 
-def service_command(a: Attempt, command: str) -> list[str]:
+def service_command(a: Attempt, command: str, browser_port: int | None = None) -> list[str]:
     from . import pi
 
     if (not pi.can_confine(False) or Path(a.workspace) == paths.WORKTREES_DIR.resolve()
             or not Path(a.workspace).is_relative_to(paths.WORKTREES_DIR.resolve())):
         raise ConfinementUnavailable("service confinement cannot isolate trusted scratch in this workspace")
     return pi.write_confinement(Path(a.workspace), [], hidden=hidden_folders(), agent_roots=False,
-                                peers=paths.WORKTREES_DIR, secrets_denied=True, unix_confined=True) + ["/bin/sh", "-c", command]
+                                peers=paths.WORKTREES_DIR, secrets_denied=True, unix_confined=True,
+                                denied_ports=(browser_port,) if browser_port else ()) + ["/bin/sh", "-c", command]
 
 
 DATA_VOLUME = Path("/System/Volumes/Data")
@@ -469,7 +477,7 @@ def browser_folder(a: Attempt) -> Path:
     return folder
 
 
-def browser_profile(a: Attempt, port: int, folder: Path) -> list[str]:
+def browser_profile(a: Attempt, port: int, folder: Path, listen: int | None = None) -> list[str]:
     from . import browser, pi
 
     state_default = home_dir() / ".local/share/arete"
@@ -479,7 +487,7 @@ def browser_profile(a: Attempt, port: int, folder: Path) -> list[str]:
     return pi.write_confinement(folder, [evidence], hidden=hidden, agent_roots=False, peers=paths.WORKTREES_DIR,
                                 secrets_denied=True, temp_writes=False,
                                 state=(paths.STATE_DIR, (evidence, folder, browser.server_folder())),
-                                mach=(BROWSER_MACH, BROWSER_MACH_PATTERN), tcp_port=port)
+                                mach=(BROWSER_MACH, BROWSER_MACH_PATTERN), tcp_port=port, listen_port=listen)
 
 
 def temp_grants() -> tuple[Path, ...]:
@@ -608,7 +616,7 @@ def update_browser(a: Attempt, **fields) -> None:
         store(fd, key, data)
 
 
-def app_port(a: Attempt, url: str) -> None:
+def app_port(a: Attempt, url: str) -> int:
     parts = urlsplit(url)
     try:
         port = parts.port or (443 if parts.scheme == "https" else 80)
@@ -619,13 +627,20 @@ def app_port(a: Attempt, url: str) -> None:
     except ValueError:
         loopback = False
     update_browser(a, port=port, loopback=loopback)
+    return port
 
 
 def browser_digest(argv: list[str]) -> str:
     return hashlib.sha256(encoded(list(argv))).hexdigest()
 
 
-def browser_command(a: Attempt, words: list[str]) -> list[str]:
+def browser_env(folder: Path, debug: bool = False) -> list[str]:
+    return ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", f"HOME={folder}/home", f"PLAYWRIGHT_SOCKETS_DIR={BROWSER_SOCKETS}",
+            f"CFFIXED_USER_HOME={folder}/home", f"TMPDIR={folder}/tmp", f"MAC_CHROMIUM_TMPDIR={folder}/tmp",
+            *(["DEBUG=pw:browser*"] if debug else [])]
+
+
+def browser_command(a: Attempt, words: list[str], listen: int | None = None) -> list[str]:
     from . import browser, pi
 
     workspace, worktrees = Path(a.workspace), paths.WORKTREES_DIR.resolve()
@@ -639,9 +654,7 @@ def browser_command(a: Attempt, words: list[str]) -> list[str]:
     browser_exposure(a, Path(node))
     folder = browser_folder(a)
     return [str(Path(sys.executable).resolve()), "-I", "-c", BROWSER_EXEC, a.selector,
-            *browser_profile(a, port, folder), "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", f"HOME={folder}/home",
-            f"PLAYWRIGHT_SOCKETS_DIR={BROWSER_SOCKETS}",
-            f"CFFIXED_USER_HOME={folder}/home", f"TMPDIR={folder}/tmp", f"MAC_CHROMIUM_TMPDIR={folder}/tmp", node, cli,
+            *browser_profile(a, port, folder, listen), *browser_env(folder, listen is not None), node, cli,
             *words, "--no-sandbox"]
 
 
@@ -753,6 +766,206 @@ def stop_browser(data: dict) -> None:
         deadline = time.monotonic() + BROWSER_GRACE_SECONDS
         while time.monotonic() < deadline and writers():
             time.sleep(0.1)
+
+
+@dataclass
+class Served:
+    proc: subprocess.Popen | None
+    entry: dict
+    reason: str
+
+
+SERVED: dict[str, Served] = {}
+BROWSER_ENV = {"PATH": "/usr/bin:/bin"}
+
+
+def browser_log(a: Attempt) -> Path:
+    return Path(a.run_dir) / f"{a.step}-browser.log"
+
+
+def log_since(log: Path, offset: int) -> str:
+    try:
+        with open(log, "rb") as f:
+            f.seek(offset)
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def add_browser_group(a: Attempt, pid: int) -> None:
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load(fd, key, a.selector)
+        if data["attempt"] != asdict(a):
+            raise PermissionError("verification attempt authority revoked")
+        data["browser"] = {**(data.get("browser") or {}),
+                           "groups": [*(data.get("browser") or {}).get("groups", []), pid]}
+        store(fd, key, data)
+
+
+def chrome_error(text: str, code: int | None) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    found = next((line for line in lines if CHROME_ERROR.search(line)), lines[0] if lines else
+                 f"headless Chrome exited {code} and printed nothing")
+    return found[:300]
+
+
+def group_gone(proc: subprocess.Popen) -> bool:
+    proc.poll()
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return True
+    return False
+
+
+def stop_group(proc: subprocess.Popen) -> None:
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            break
+        deadline = time.monotonic() + BROWSER_STOP_SECONDS
+        while not group_gone(proc) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if group_gone(proc):
+            break
+    proc.wait()
+
+
+def browser_preflight(a: Attempt, port: int, listen: int, folder: Path, log: Path) -> str:
+    from . import browser
+
+    scratch_profile = folder / "tmp" / f"preflight-{secrets.token_hex(8)}"
+    argv = [*browser_profile(a, port, folder, listen), *browser_env(folder), str(browser.chrome()), "--headless",
+            "--no-sandbox", f"--user-data-dir={scratch_profile}", "--dump-dom", "about:blank"]
+    offset = log.stat().st_size if log.exists() else 0
+    with open(log, "ab") as out, producing(a):
+        proc = spawn(argv, actor_confined=True, cwd=folder, stdin=subprocess.DEVNULL, stdout=out,
+                     stderr=subprocess.STDOUT, env=BROWSER_ENV)
+    try:
+        add_browser_group(a, proc.pid)
+        try:
+            proc.wait(BROWSER_PREFLIGHT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return f"headless Chrome did not dump about:blank within {BROWSER_PREFLIGHT_SECONDS} seconds"
+        output = log_since(log, offset)
+        return "" if proc.returncode == 0 and "<html" in output else chrome_error(output, proc.returncode)
+    finally:
+        with suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        shutil.rmtree(scratch_profile, ignore_errors=True)
+
+
+def browser_answers(proc: subprocess.Popen, listen: int, log: Path, offset: int) -> str:
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                                  "clientInfo": {"name": "arete", "version": "1"}}}).encode()
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + BROWSER_SERVE_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return f"the browser server exited {proc.returncode}: {chrome_error(log_since(log, offset), proc.returncode)}"
+        try:
+            request = urllib.request.Request(f"http://127.0.0.1:{listen}/mcp", body, headers)
+            with opener.open(request, timeout=5) as reply:
+                if reply.status == 200 and proc.poll() is None:
+                    return ""
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.2)
+    return f"the browser server did not answer on 127.0.0.1:{listen} within {BROWSER_SERVE_SECONDS} seconds"
+
+
+def failed_server(a: Attempt, proc: subprocess.Popen | None, reason: str) -> Served:
+    if proc is not None:
+        stop_group(proc)
+    with suppress(OSError), open(browser_log(a), "ab") as out:
+        out.write(f"\n{reason}\n".encode())
+    return Served(None, {}, reason)
+
+
+def start_served(a: Attempt, words: list[str]) -> Served:
+    from . import browser
+
+    proc = None
+    try:
+        record = browser_record(a)
+        listen = record.get("listen")
+        if record.get("loopback") is not True:
+            raise ConfinementUnavailable("the verify URL is not a loopback address, so the confined browser cannot reach it")
+        if not isinstance(listen, int) or not 0 < listen < 65536:
+            raise ConfinementUnavailable("no browser port is recorded for the confined browser")
+        browser_exposure(a)
+        browser.resolved()
+        argv = browser_command(a, [*words, "--host", "127.0.0.1", "--port", str(listen)], listen)[5:]
+        folder, log = browser_folder(a), browser_log(a)
+        reason = browser_preflight(a, record["port"], listen, folder, log)
+        if not reason:
+            offset = log.stat().st_size
+            with open(log, "ab") as out, producing(a):
+                proc = spawn(argv, actor_confined=True, cwd=browser_path(a.run_dir), stdin=subprocess.DEVNULL,
+                             stdout=out, stderr=subprocess.STDOUT, env=BROWSER_ENV)
+            add_browser_group(a, proc.pid)
+            reason = browser_answers(proc, listen, log, offset)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        reason = str(error) or type(error).__name__
+    if reason:
+        return failed_server(a, proc, reason)
+    return Served(proc, {"type": "http", "url": f"http://127.0.0.1:{listen}/mcp"}, "")
+
+
+def without_browser(mcp_config: str) -> str:
+    try:
+        others = {k: v for k, v in json.loads(mcp_config or "{}").get("mcpServers", {}).items() if k != "playwright"}
+    except (ValueError, AttributeError):
+        return ""
+    return json.dumps({"mcpServers": others}) if others else ""
+
+
+def serve_browser(a: Attempt, mcp_config: str, add_dirs) -> tuple[str, str]:
+    from . import verify
+
+    try:
+        servers = json.loads(mcp_config or "{}").get("mcpServers") or {}
+        words = servers["playwright"]["args"][2:]
+        output = Path(words[words.index("--output-dir") + 1])
+        own = json.loads(verify.mcp_config(output))["mcpServers"]["playwright"]
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+        return mcp_config, ""
+    if servers["playwright"] != own or output.resolve() != evidence_path(a.run_dir).resolve():
+        return mcp_config, ""
+    served = SERVED.get(a.selector)
+    if served is None:
+        served = SERVED[a.selector] = start_served(a, words)
+    elif served.proc is not None and served.proc.poll() is not None:
+        code = served.proc.returncode
+        reason = f"the browser server exited {code}: {chrome_error(log_since(browser_log(a), 0), code)}"
+        served = SERVED[a.selector] = failed_server(a, served.proc, reason)
+    if served.reason:
+        return without_browser(mcp_config), served.reason
+    others = {k: v for k, v in servers.items() if k != "playwright"}
+    return json.dumps({"mcpServers": {"playwright": served.entry, **others}}), ""
+
+
+def stop_served(a: Attempt) -> None:
+    served = SERVED.pop(a.selector, None)
+    if served is not None and served.proc is not None:
+        stop_group(served.proc)
+
+
+def browser_blocked_note(reason: str) -> str:
+    return ("## Browser unavailable\n\n"
+            "Arete could not start the confined browser for this verify. Its reason:\n\n"
+            f"> {reason}\n\n"
+            "No `mcp__playwright__` tool is loaded, and none may be called or searched for. This replaces the browser "
+            "instructions above. Record each browser check as not passed, with `saw` starting `blocked: "
+            f"{reason}`. Every other check (curl, CLI) still runs. The verdict is `blocked`, with that line in "
+            "`blocked_by`, unless another check fails.")
 
 
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
@@ -1303,6 +1516,7 @@ def cleanup(a: Attempt, data: dict, fd: int, key: bytes) -> list[str]:
 
 def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
     archived, saved, kept, matched = "", [], [a.root], False
+    stop_served(a)
     try:
         with registry() as (fd, key):
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1381,6 +1595,7 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
 
 
 def retain(a: Attempt) -> None:
+    stop_served(a)
     with registry() as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
         data = load(fd, key, a.selector)

@@ -568,7 +568,8 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                       agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False,
                       keeps: tuple[str, ...] = (), unix_confined: bool = False, temp_writes: bool = True,
                       state: tuple[Path, tuple[Path, ...]] | None = None,
-                      mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None) -> list[str]:
+                      mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None,
+                      denied_ports: tuple[int, ...] = (), listen_port: int | None = None) -> list[str]:
     hidden = tuple(dict.fromkeys((*hidden, scratch.AUTHORITY)))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
@@ -622,6 +623,9 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
         params += ["-D", f"UNIX={real_path(cwd)}"]
         profile += (f'(deny network-outbound)(allow network-outbound (remote tcp "localhost:{int(tcp_port)}") '
                     '(subpath (param "UNIX")))')
+    if listen_port is not None:
+        profile += ('(deny network-bind network-inbound (local tcp "*:*"))'
+                    f'(allow network-bind network-inbound (local tcp "localhost:{int(listen_port)}"))')
     if unix_confined:
         params += ["-D", f"UNIX={real_path(cwd)}"]
         profile += ('(deny network-outbound (subpath "/"))(allow network-outbound (subpath (param "UNIX")) '
@@ -633,7 +637,7 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     for i, sock in enumerate(sockets):
         params += ["-D", f"SL{i}={sock}"]
         profile += f'(deny network-outbound (literal (param "SL{i}")))'
-    for port in sorted(scratch.dashboard_ports()):
+    for port in sorted({*scratch.dashboard_ports(), *denied_ports}):
         profile += f'(deny network-outbound (remote tcp "*:{int(port)}"))'
     return ["/usr/bin/sandbox-exec", *params, "-p", profile]
 

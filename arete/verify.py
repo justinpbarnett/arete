@@ -128,9 +128,12 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         yield ""
         return
     url = v.url.rstrip("/")
+    listen = None
     if attempt:
-        scratch.app_port(attempt, url)
-    command = scratch.service_command(attempt, v.start) if attempt else v.start
+        app = scratch.app_port(attempt, url)
+        listen = free_port(scratch.dashboard_ports() | {app})
+        scratch.update_browser(attempt, listen=listen)
+    command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
     env = environment.commands(cfg or config.load(), repo, sets)
     if attempt:
         env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k)}

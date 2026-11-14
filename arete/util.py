@@ -300,7 +300,10 @@ def end_session(pid) -> None:
     if not pid:
         return
     groups = {int(pid)}
-    listed = sh(["ps", "-A", "-o", "pid=,pgid="], timeout=10).stdout
+    try:
+        listed = sh(["ps", "-A", "-o", "pid=,pgid="], timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        listed = ""
     for member, group in (map(int, line.split()) for line in listed.splitlines()):
         try:
             if os.getsid(member) == int(pid):
