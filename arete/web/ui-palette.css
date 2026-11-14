@@ -1,0 +1,20 @@
+.sidebar button.search { width: calc(100% - 16px); text-align: left; cursor: pointer; }
+.ui-palette-scrim { position: fixed; inset: 0; z-index: 100; background: #0009; display: flex; align-items: flex-start; justify-content: center; padding: 72px 12px 12px; }
+.ui-palette { width: 600px; max-width: 100%; max-height: calc(100dvh - 84px); background: var(--raised); border: 1px solid var(--rule-strong); box-shadow: 0 24px 80px #0009; display: flex; flex-direction: column; }
+.ui-palette-head { display: flex; align-items: center; gap: 12px; height: 44px; min-height: 44px; padding: 0 14px; border-bottom: 1px solid var(--rule); }
+.ui-palette-head > span { color: var(--muted); font-family: var(--font-data); }
+.ui-palette-head input { min-width: 0; flex: 1; background: transparent; border: 0; outline: none; height: 100%; font-size: var(--text-l); }
+.ui-palette-head input::placeholder { color: var(--faint); }
+.ui-palette kbd { color: var(--muted); border: 1px solid var(--rule); padding: 0 4px; white-space: nowrap; }
+.ui-palette-results { overflow: auto; max-height: 420px; min-height: 0; padding: 4px 0; }
+.ui-palette-group { display: flex; gap: 8px; padding: 8px 14px 4px; color: var(--muted); font-size: var(--text-micro); text-transform: uppercase; letter-spacing: .06em; position: sticky; top: 0; background: var(--raised); z-index: 1; }
+.ui-palette-group span { color: var(--faint); font-family: var(--font-data); }
+.ui-palette-row { display: flex; gap: 10px; align-items: center; min-height: 32px; padding: 4px 14px; cursor: pointer; }
+.ui-palette-row[aria-selected="true"] { background: var(--selected); }
+.ui-palette-glyph { color: var(--muted); width: 16px; flex-shrink: 0; }
+.ui-palette-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 1; }
+.ui-palette-description { color: var(--muted); font-size: var(--text-s); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.ui-palette-empty { padding: 24px 14px; color: var(--muted); }
+.ui-palette-foot { border-top: 1px solid var(--rule); padding: 8px 12px; display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: var(--text-s); flex-wrap: wrap; }
+.ui-palette-foot kbd:not(:first-child) { margin-left: 8px; }
+.ui-palette-open { margin-left: auto; }

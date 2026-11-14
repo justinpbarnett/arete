@@ -4,6 +4,7 @@ import * as data from "./ui-data.js";
 import { screenKeys } from "./ui-keys.js";
 import { KeyBar, KeySheet } from "./ui-keybar.js";
 import { List, demoQueue, demoFocus } from "./ui-list.js";
+import { Palette, openPalette } from "./ui-palette.js";
 
 const html = htm.bind(h);
 const glyphs = { floor: "▦", triage: "!", "my-work": "○", board: "▤", runs: "▷", intake: "↓", outbox: "↑", prompts: "≡", adws: "◇", insights: "▥", settings: "⚙" };
@@ -24,7 +25,7 @@ function Sidebar({ route, snapshot, now }) {
     ? duration(serve.age_seconds + Math.max(0, now - snapshot.received) / 1000) : "";
   return html`<aside class="sidebar frame" data-pane="sidebar" aria-label="Sidebar">
     <div class="side-top"><span class="mark">A</span><span class="wordmark">arete</span><span class="version" aria-label="Server version"></span></div>
-    <div class="search" role="search"><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></div>
+    <button type="button" class="search" data-act="palette" onClick=${() => openPalette()}><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></button>
     <nav class="side-nav" aria-label="Screens" data-list="screens">${navigation.map(([id, label, key, glyph, href]) => {
       const count = id === "triage" ? snapshot.needsYou : id === "runs" ? snapshot.running : null;
       return html`<a key=${id} data-row data-item=${id} data-act=${`go-${id}`} class=${`nav-row${route.active === id ? " selected" : ""}`} href=${href}
@@ -71,5 +72,6 @@ export function Shell({ route, snapshot, now }) {
       <${KeyBar} />
     </main>
     <${KeySheet} />
+    <${Palette} />
   </div>`;
 }

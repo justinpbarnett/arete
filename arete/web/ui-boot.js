@@ -3,7 +3,9 @@ import { signal, effect } from "./vendor-signals.js";
 import { Shell } from "./ui-shell.js";
 import { current, listen } from "./ui-router.js";
 import { shell, visit } from "./ui-data.js";
-import { startKeys, marks } from "./ui-keys.js";
+import { startKeys, marks, screenKeys, pending, sheet, mode } from "./ui-keys.js";
+import { configurePalette } from "./ui-palette.js";
+import { dismissMenu } from "./ui-menu.js";
 import { startHooks } from "./ui-hooks.js";
 import { normalizePrimary } from "./ui-list.js";
 
@@ -60,5 +62,16 @@ async function refresh() {
 setInterval(() => { now.value = Date.now(); }, 1000);
 start("open");
 refresh();
+const destinations = [
+  ["▦", "lines, timeline, health"], ["!", "needs you"], ["○", "open work owned by you"], ["▤", "open work by state"],
+  ["▷", "running work"], ["↓", "incoming items"], ["↑", "drafts and sends"], ["≡", "prompt files"],
+  ["◇", "workflows"], ["▥", "charts"], ["⚙", "bridges, devices, rules"],
+];
+configurePalette(screenKeys.map(([key, id, title, href], index) => ({ key, id, title, href,
+  glyph: destinations[index][0], description: destinations[index][1] })), () => {
+  pending.value = "";
+  sheet.value = false;
+  dismissMenu();
+}, () => { mode.value = "NORMAL"; });
 startKeys();
 startHooks();
