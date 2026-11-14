@@ -627,6 +627,28 @@ Only the `record/` folder of a run is removed; `run.log`, `run.jsonl` and the ot
 `arete status` shows a `records:` line with the size of the store, its oldest record and the number of pins.
 When every record left is kept and the store is still over `max_gb`, the serve log says so on that hour's prune.
 
+## Backups
+
+`arete serve` takes a snapshot of `arete.db` before every prune (the first tick after each restart, then hourly) with `VACUUM INTO`, flushes it, checks it with `PRAGMA quick_check` and keeps it in `backups/` beside the database as `arete-<UTC stamp>-<reason>.db`, with the outcome in `backups/last.json`.
+When a snapshot cannot be taken or fails its check, serve says why and prunes nothing.
+The newest 24 snapshots and the newest of each of the last 14 UTC days are kept.
+A plain file copy of the live database is not a backup, because it can hold a half written transaction.
+
+`arete backup` takes a snapshot now. `arete backup --check` checks the newest snapshot and prints its row count per table beside the live file's; it exits 1 when the check fails.
+`arete backup --restore FILE` replaces `arete.db` with a snapshot. It refuses while `arete serve` is alive or a run is running, so stop serve first.
+It keeps the replaced file, and its rollback journal under a matching name, as `arete.db.before-restore-<stamp>`, and raises every `sqlite_sequence` value to at least its current value so no id is reused.
+While `arete.db` is missing or empty and a snapshot exists, Arete refuses to start a new empty file and names the newest snapshot instead.
+
+After the first snapshot of each UTC day Arete builds `config-<day>.tar.gz` in `backups/` from `config.toml`, `loop-switches.json`, `loops/` and a `git bundle` of `layers/`; links, `pi.env`, `*.env` files and `verification-authority/` are left out.
+Set the destination to copy the day's snapshot and archive with `rsync -t`:
+
+```toml
+[backup]
+copy_to = "host:/backups/arete/"
+```
+
+A failed copy is tried again at the next snapshot until one succeeds that day. **Until the owner sets `copy_to`, no copy of the database or config leaves this machine**, and `arete heartbeat` shows `backup:offsite` as a warning that says so. `backup:db` fails when serve is installed and the newest snapshot is over 3 awake hours old or fails its check, and `backup:offsite` fails when the last good copy is over 48 awake hours old.
+
 ## Run lines
 
 Each pipeline run also tells its story as JSON lines in `runs/<run_id>/run.jsonl` under the state folder, one object per line, so one file can be followed while the run works or read after it died.

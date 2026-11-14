@@ -5242,5 +5242,590 @@ class NoLiveStateTests(unittest.TestCase):
             self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
+BACKUP_PRELUDE = r'''
+import contextlib, dataclasses, fcntl, io, json, os, sqlite3, stat, subprocess, sys, tarfile, time
+from datetime import timedelta
+from pathlib import Path
+from unittest import mock
+from arete import backup, cli, config, control, heartbeat, install, optimize, paths, serve, settings, state, util
+root = Path(sys.argv[1])
+util.last_wake = lambda: 0.0
+out = {}
+def ago(days):
+    return util.iso(util.now() - timedelta(days=days))
+def counts(p=None):
+    c = sqlite3.connect(p or paths.DB_FILE)
+    try:
+        names = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()]
+        return {n: c.execute(f"SELECT count(*) FROM {n}").fetchone()[0] for n in names}
+    finally:
+        c.close()
+def column(sql, p=None):
+    c = sqlite3.connect(p or paths.DB_FILE)
+    try:
+        return [r[0] for r in c.execute(sql).fetchall()]
+    finally:
+        c.close()
+def incident(fp, days, closed=None):
+    with state.db() as c:
+        i = c.execute("INSERT INTO incidents (fingerprint, class, source, state, first_seen, last_seen, closed) "
+                      "VALUES (?, 'k', 's', ?, ?, ?, ?)", (fp, "dismissed" if closed else "open", ago(days + 1), ago(days),
+                                                           ago(closed) if closed else "")).lastrowid
+        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?, ?, ?)", (i, ago(days), "note " + fp))
+        c.execute("INSERT INTO incident_aliases (fingerprint, incident, ts) VALUES (?, ?, ?)", (fp + "-alias", i, ago(days)))
+        c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (?, 'r', ?)", (i, ago(days)))
+    return i
+def seed():
+    with state.db() as c:
+        for rid, kind, loop_kind, days, cost in (
+                ("pipe-old", "pipeline", "", 30, 0), ("pipe-new", "pipeline", "", 1, 0),
+                ("loop-old", "loop", "agent", 30, 0), ("loop-new", "loop", "agent", 1, 0),
+                ("paid-old", "loop", "command", 30, 0.5), ("free-old", "loop", "command", 30, 0),
+                ("free-new", "loop", "command", 1, 0)):
+            c.execute("INSERT INTO runs (id, kind, loop_kind, status, started, cost_usd) VALUES (?, ?, ?, 'done', ?, ?)",
+                      (rid, kind, loop_kind, ago(days), cost))
+            c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?, ?, 'note', ?)", (rid, ago(days), rid))
+        for name, days, run in (("q-old", 30, "x"), ("q-new", 1, "x"), ("q-null", 30, None)):
+            c.execute("INSERT INTO queue (loop, queue, enqueued, run_id) VALUES (?, 'q', ?, ?)", (name, ago(days), run))
+        for name, days in (("e-old", 60), ("e-new", 1)):
+            c.execute("INSERT INTO events (loop, type, ts) VALUES (?, ?, ?)", (name, name, ago(days)))
+    incident("open-old", 60)
+    new = incident("open-new", 1)
+    incident("closed-old", 60, 40)
+    incident("closed-recent", 60, 5)
+    with state.db() as c:
+        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?, ?, 'seen again: x')", (new, ago(30)))
+def server():
+    s = serve.Server()
+    s.said = []
+    s.say = s.said.append
+    return s
+def settle():
+    while backup.COPYING:
+        time.sleep(0.02)
+def prune(s=None):
+    s = s or server()
+    s.prune()
+    settle()
+    return s
+def tree():
+    return {p.name: p.read_bytes() for p in paths.STATE_DIR.iterdir() if p.is_file()}
+def run_cli(*argv):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            rc = cli.main(list(argv))
+        except SystemExit as e:
+            rc = e.code
+    return rc, buf.getvalue()
+def dead():
+    return mock.patch.object(control, "serve_beat", return_value={"alive": False})
+real_sh = util.sh
+def rsync_only(fake):
+    def sh(cmd, *a, **k):
+        return fake(cmd) if cmd[0] == "rsync" else real_sh(cmd, *a, **k)
+    util.sh = sh
+'''
+
+BACKUP_SCRIPTS = {
+"prune-keeps": r'''
+seed()
+s = server()
+before = counts()
+prune(s)
+snaps = sorted(paths.backups_dir().glob("arete-*.db"))
+found = backup.inspect(snaps[0])
+out |= {"snapshots": len(snaps), "quick_check": found["quick_check"], "snap_runs": found["counts"]["runs"],
+        "before_runs": before["runs"], "snap_counts_match": found["counts"] == before,
+        "runs": column("SELECT id FROM runs ORDER BY id"), "feed": column("SELECT DISTINCT run_id FROM feed ORDER BY 1"),
+        "queue": column("SELECT loop FROM queue ORDER BY id"), "events": column("SELECT loop FROM events"),
+        "incidents": column("SELECT fingerprint FROM incidents ORDER BY id"),
+        "notes": column("SELECT note FROM incident_notes ORDER BY id"),
+        "aliases": column("SELECT fingerprint FROM incident_aliases ORDER BY 1"),
+        "repairs": column("SELECT count(*) FROM incident_repairs"),
+        "last": json.loads((paths.backups_dir() / "last.json").read_text())["quick_check"]}
+''',
+"widened-restore": r'''
+seed()
+s = server()
+pre = counts()
+with mock.patch.object(state, "FIRINGS", "(1 = 1)"):
+    prune(s)
+snap = max(paths.backups_dir().glob("arete-*.db"))
+out["deleted"] = "pipe-old" not in column("SELECT id FROM runs")
+with state.db() as c:
+    for n in range(5):
+        c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES ('later', ?, 'note', 'later')", (ago(0),))
+seq = dict(sqlite3.connect(paths.DB_FILE).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
+def untouched(rc, patch):
+    held = tree()
+    with patch:
+        got = run_cli("backup", "--restore", str(snap))
+    return [got[0], tree() == held, "stop" in got[1]]
+out["alive"] = untouched(0, mock.patch.object(control, "serve_beat", return_value={"alive": True}))
+with state.db() as c:
+    c.execute("INSERT INTO runs (id, kind, status, started, pid) VALUES ('live', 'pipeline', 'running', ?, ?)", (ago(0), os.getpid()))
+out["running"] = untouched(0, dead())
+with state.db() as c:
+    c.execute("DELETE FROM runs WHERE id = 'live'")
+with dead():
+    out["missing"] = run_cli("backup", "--restore", str(root / "nope.db"))[0]
+    (root / "bad.db").write_bytes(b"not a database" * 100)
+    out["corrupt"] = run_cli("backup", "--restore", str(root / "bad.db"))[0]
+    out["rc"] = run_cli("backup", "--restore", str(snap))[0]
+out["restored"] = counts() == pre
+after = dict(sqlite3.connect(paths.DB_FILE).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
+out["seq_kept"] = all(after.get(name, 0) >= value for name, value in seq.items())
+out["kept_file"] = len(list(paths.STATE_DIR.glob("arete.db.before-restore-*")))
+snap_seq = dict(sqlite3.connect(snap).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
+paths.DB_FILE.write_bytes(b"garbage" * 500)
+with dead():
+    out["rc_corrupt_current"] = run_cli("backup", "--restore", str(snap))[0]
+after = dict(sqlite3.connect(paths.DB_FILE).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
+out["gap"] = all(after[name] == value + 10000 for name, value in snap_seq.items())
+''',
+"hot-journal": r'''
+seed()
+with state.db() as c:
+    c.executemany("INSERT INTO feed (run_id, ts, kind, text) VALUES ('bulk', ?, 'note', 'original')", [(ago(0),)] * 20000)
+snap = backup.snapshot("hand")
+with state.db() as c:
+    c.execute("INSERT INTO runs (id, kind, status, started, pid) VALUES ('live', 'pipeline', 'running', ?, ?)", (ago(0), os.getpid()))
+CHILD = """
+import os, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("PRAGMA cache_size = 10")
+c.execute("UPDATE feed SET text = 'UNCOMMITTED'")
+os._exit(0)
+"""
+subprocess.run([sys.executable, "-I", "-c", CHILD, str(paths.DB_FILE)], check=True)
+journal = Path(str(paths.DB_FILE) + "-journal")
+out["hot"] = journal.exists()
+with dead():
+    out["refused"] = run_cli("backup", "--restore", str(snap))[0]
+with state.db() as c:
+    c.execute("DELETE FROM runs WHERE id = 'live'")
+with dead():
+    out["rc"] = run_cli("backup", "--restore", str(snap))[0]
+def archived():
+    return [p for p in paths.STATE_DIR.glob("arete.db.before-restore-*") if not p.name.endswith("-journal")]
+out["uncommitted"] = column("SELECT count(*) FROM feed WHERE text = 'UNCOMMITTED'", archived()[0])[0]
+out["quick_check"] = column("PRAGMA quick_check")
+out["live_journal"] = journal.exists()
+journal.write_bytes(b"\0" * 512)
+with dead():
+    out["rc2"] = run_cli("backup", "--restore", str(snap))[0]
+pairs = [p.name for p in paths.STATE_DIR.glob("arete.db.before-restore-*-journal")]
+out["pairs"] = [name.removesuffix("-journal") in [p.name for p in archived()] for name in pairs]
+out["live_journal2"] = journal.exists()
+''',
+"no-copy-no-delete": r'''
+seed()
+before = counts()
+def boom(reason):
+    raise RuntimeError("distinctive-boom-17")
+s = server()
+with mock.patch.object(backup, "snapshot", boom), mock.patch.object(state, "prune") as pruned, \
+        mock.patch.object(serve.record, "prune") as records:
+    s.prune()
+out |= {"said": s.said, "state_pruned": pruned.called, "records_pruned": records.called, "same": counts() == before}
+''',
+"follows-paths": r'''
+seed()
+a = paths.STATE_DIR
+planted = backup.snapshot("hand")
+listing = lambda d: sorted(p.name for p in (d / "backups").iterdir())
+held = listing(a)
+b = root / "other"
+with contextlib.ExitStack() as stack:
+    for name, value in {"STATE_DIR": b, "RUNS_DIR": b / "runs", "DB_FILE": b / "arete.db", "LOCKS_DIR": b / "locks",
+                        "WORKTREES_DIR": b / "worktrees", "EVENTS_FILE": b / "events.jsonl"}.items():
+        stack.enter_context(mock.patch.object(paths, name, value))
+    state.ensure_schema()
+    out["b_db"] = (b / "arete.db").exists()
+    prune()
+    out["b_files"] = listing(b)
+out["a_same"] = listing(a) == held
+''',
+"concurrent-write": r'''
+seed()
+with state.db() as c:
+    c.executemany("INSERT INTO feed (run_id, ts, kind, text) VALUES ('bulk', ?, 'note', 'original')", [(ago(0),)] * 20000)
+CHILD = """
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1], timeout=30)
+c.execute("PRAGMA cache_size = 10")
+c.execute("UPDATE feed SET text = 'ROLLEDBACK' WHERE run_id = 'bulk'")
+print("ready", flush=True)
+time.sleep(1)
+c.rollback()
+"""
+writer = subprocess.Popen([sys.executable, "-I", "-c", CHILD, str(paths.DB_FILE)], stdout=subprocess.PIPE, text=True)
+assert writer.stdout.readline().strip() == "ready"
+snap = backup.snapshot("hand")
+writer.wait(timeout=60)
+out |= {"writer": writer.returncode, "quick_check": backup.inspect(snap)["quick_check"],
+        "rows": column("SELECT count(*) FROM feed WHERE run_id = 'bulk'", snap)[0],
+        "leaked": column("SELECT count(*) FROM feed WHERE text = 'ROLLEDBACK'", snap)[0],
+        "live_leaked": column("SELECT count(*) FROM feed WHERE text = 'ROLLEDBACK'")[0]}
+''',
+"missing-file": r'''
+seed()
+snap = backup.snapshot("hand")
+def attempt():
+    try:
+        state.ensure_schema()
+    except RuntimeError as e:
+        return str(e)
+    return ""
+paths.DB_FILE.unlink()
+out |= {"error": attempt(), "exists": paths.DB_FILE.exists(), "snap": snap.name}
+paths.DB_FILE.write_bytes(b"")
+out |= {"empty_error": attempt(), "size": paths.DB_FILE.stat().st_size}
+try:
+    backup.snapshot("hand")
+    out["empty_snapshot"] = ""
+except RuntimeError as e:
+    out["empty_snapshot"] = str(e)
+out["snaps"] = len(backup.snapshots())
+''',
+"fresh": r'''
+out["none"] = backup.snapshot("hand")
+state.ensure_schema()
+out["created"] = paths.DB_FILE.exists()
+with mock.patch.object(paths, "ISOLATED", True):
+    out["isolated"] = backup.snapshot("hand")
+out["no_folder"] = not paths.backups_dir().exists()
+out["taken"] = backup.snapshot("hand").name
+''',
+"retention": r'''
+seed()
+folder = paths.backups_dir()
+folder.mkdir(parents=True)
+today = util.now().date()
+planted = []
+for d in range(1, 21):
+    for hour in (6, 18):
+        planted.append(f"arete-{today - timedelta(days=d):%Y%m%d}T{hour:02d}0000Z-hand.db")
+        (folder / planted[-1]).write_bytes(b"x")
+(folder / "arete.db.before-restore-1").write_bytes(b"x")
+new = backup.snapshot("prune")
+everyone = sorted(planted + [new.name], key=lambda n: (n[6:21], n))
+by_day = {}
+for n in everyone:
+    by_day[n[6:14]] = n
+first = f"{today - timedelta(days=13):%Y%m%d}"
+expected = sorted(set(everyone[-24:]) | {n for day, n in by_day.items() if day >= first})
+out |= {"left": sorted(p.name for p in folder.glob("arete-*.db")), "expected": expected,
+        "other": (folder / "arete.db.before-restore-1").exists()}
+''',
+"copy": r'''
+seed()
+cdir = paths.CONFIG_DIR
+(cdir / "loop-switches.json").write_text("{}")
+(cdir / "pi.env").write_text("PI_KEY=1")
+(cdir / "loops/nested").mkdir(parents=True)
+(cdir / "loops/a.toml").write_text("name = 1")
+(cdir / "loops/nested/ok.toml").write_text("ok = 1")
+(cdir / "loops/secret.env").write_text("S=1")
+(cdir / "loops/nested/x.env").write_text("S=1")
+(cdir / "loops/verification-authority").mkdir()
+(cdir / "loops/verification-authority/token").write_text("T")
+(root / "outside.txt").write_text("OUTSIDE-CONTENT")
+(cdir / "loops/link.txt").symlink_to(root / "outside.txt")
+layers = cdir / "layers"
+layers.mkdir()
+git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false", *a],
+                                cwd=layers, check=True, capture_output=True)
+git("init", "-q", "-b", "main")
+(layers / "a.txt").write_text("x")
+git("add", ".")
+git("commit", "-q", "-m", "fixture")
+calls, codes = [], [1, 0, 1, 0]
+def fake_rsync(cmd):
+    calls.append({"argv": list(cmd), "closed": all(Path(x).is_file() for x in cmd[2:4])})
+    return subprocess.CompletedProcess(cmd, codes.pop(0) if codes else 0, "", "refused")
+rsync_only(fake_rsync)
+last = lambda: json.loads((paths.backups_dir() / "last.json").read_text())
+first_day = util.now().strftime("%Y-%m-%d")
+steps = []
+s = prune()
+steps += [len(calls), last().get("copy_exit"), "copied_at" in last()]
+prune(s)
+stamp = last()["copied_at"]
+steps += [len(calls), last()["copy_exit"], "copied_at" in last()]
+prune(s)
+prune()
+steps += [len(calls), last()["copied_at"] == stamp]
+real_now = util.now
+util.now = lambda: real_now() + timedelta(days=1)
+prune()
+steps += [len(calls), last()["copied_at"] == stamp]
+prune()
+steps += [len(calls), last()["copied_at"] != stamp]
+out["steps"] = steps
+out["argv0"] = calls[0]["argv"]
+out["closed"] = all(c["closed"] for c in calls)
+out["days"] = sorted(p.name for p in paths.backups_dir().glob("config-*.tar.gz"))
+out["first_day"] = first_day
+archive = paths.backups_dir() / f"config-{first_day}.tar.gz"
+with tarfile.open(archive) as tar:
+    out["members"] = tar.getnames()
+    (root / "layers.bundle").write_bytes(tar.extractfile("layers.bundle").read())
+out["verify"] = subprocess.run(["git", "bundle", "verify", str(root / "layers.bundle")], cwd=layers, capture_output=True).returncode
+out["heads"] = subprocess.run(["git", "bundle", "list-heads", str(root / "layers.bundle")], cwd=layers,
+                              capture_output=True, text=True).stdout
+def bundling():
+    try:
+        backup.layers_bundle()
+    except RuntimeError as e:
+        return str(e)
+    return ""
+(layers / "sub").mkdir()
+(layers / "sub/pi.env").write_text("K=1")
+git("add", "-f", ".")
+git("commit", "-q", "-m", "secret")
+git("rm", "-q", "-r", "sub")
+git("commit", "-q", "-m", "removed")
+out["history"] = bundling()
+layers.rename(root / "real-layers")
+layers.symlink_to(root / "real-layers")
+out["linked"] = bundling()
+''',
+"no-destination": r'''
+seed()
+calls = []
+rsync_only(lambda cmd: calls.append(cmd))
+prune()
+prune()
+out |= {"calls": calls, "archives": len(list(paths.backups_dir().glob("config-*.tar.gz"))),
+        "copied": "copied_at" in json.loads((paths.backups_dir() / "last.json").read_text())}
+''',
+"heartbeat": r'''
+seed()
+install.serve_installed = lambda: True
+cfg = config.load()
+keyed = lambda c: {x.key: x for x in heartbeat.check_backups(c)}
+snap = backup.snapshot("hand")
+out["fresh"] = keyed(cfg)["backup:db"].ok
+old = time.time() - 4 * 3600
+os.utime(snap, (old, old))
+out["stale"] = keyed(cfg)["backup:db"].ok
+snap = backup.snapshot("hand")
+os.truncate(snap, snap.stat().st_size // 2)
+out["truncated"] = keyed(cfg)["backup:db"].ok
+snap = backup.snapshot("hand")
+backup.update_last(quick_check="row 1 missing from index")
+out["recorded"] = keyed(cfg)["backup:db"].ok
+empty = keyed(cfg)["backup:offsite"]
+out["empty"] = [empty.ok, empty.severity, empty.detail]
+away = dataclasses.replace(cfg, backup=config.BackupConfig("h:/x"))
+out["never"] = keyed(away)["backup:offsite"].ok
+backup.update_last(copied_at=util.iso(util.now() - timedelta(hours=49)))
+out["old"] = keyed(away)["backup:offsite"].ok
+backup.update_last(copied_at=util.iso())
+out["recent"] = keyed(away)["backup:offsite"].ok
+''',
+"cli": r'''
+seed()
+rc, text = run_cli("backup")
+out["plain"] = [rc, text]
+rc, text = run_cli("backup", "--check")
+out["check"] = [rc, text]
+out["both"] = run_cli("backup", "--check", "--restore", "x.db")[0]
+held = paths.DB_FILE.read_bytes()
+newest = backup.newest_snapshot()
+os.truncate(newest, newest.stat().st_size // 2)
+rc, text = run_cli("backup", "--check")
+out["truncated"] = [rc, text, paths.DB_FILE.read_bytes() == held]
+''',
+"durable-config": r'''
+paths.CONFIG_FILE.write_text("max_parallel = 1\n")
+os.chmod(paths.CONFIG_FILE, 0o640)
+events = []
+real = {"fcntl": fcntl.fcntl, "fsync": os.fsync, "replace": os.replace}
+kind = lambda fd: "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+def spy_fcntl(fd, op, *a):
+    if op == getattr(fcntl, "F_FULLFSYNC", None):
+        events.append(("flush", kind(fd)))
+    return real["fcntl"](fd, op, *a)
+def spy_fsync(fd):
+    events.append(("flush", kind(fd)))
+    return real["fsync"](fd)
+def spy_replace(a, b):
+    events.append(("replace", ""))
+    return real["replace"](a, b)
+with mock.patch.object(fcntl, "fcntl", spy_fcntl), mock.patch.object(os, "fsync", spy_fsync), mock.patch.object(os, "replace", spy_replace):
+    settings.write_checked('max_parallel = 2\n[backup]\ncopy_to = "h:/x"\n', lambda cfg: "")
+    out["checked"] = list(events)
+    events.clear()
+    optimize.put(b"max_parallel = 3\n")
+    out["put"] = list(events)
+    events.clear()
+    out["loaded"] = config.load().max_parallel
+    kept = paths.CONFIG_FILE.read_bytes()
+    refused = []
+    for text, why in (("max_parallel = 9\n", "no thanks"), ("this is [not toml", "")):
+        try:
+            settings.write_checked(text, lambda cfg: why)
+        except settings.Refused as e:
+            refused.append(str(e))
+    out |= {"refused": len(refused), "unchanged": paths.CONFIG_FILE.read_bytes() == kept, "events": list(events),
+            "mode": stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode), "left": sorted(p.name for p in paths.CONFIG_DIR.iterdir())}
+settings.write_checked('[backup]\ncopy_to = "h:/x"\n', lambda cfg: "")
+out["copy_to"] = config.load().backup.copy_to
+bad = []
+for table in ({"copy_to": 5}, {"other": 1}, ["x"], {"copy_to": " h:/x"}):
+    try:
+        config.backup_table(table)
+    except (ValueError, TypeError):
+        bad.append(table)
+out |= {"bad": len(bad), "default": config.backup_table({}).copy_to}
+''',
+}
+
+
+class BackupTests(unittest.TestCase):
+    def script(self, name, config_text=""):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
+                (root / folder).mkdir()
+            if config_text:
+                (root / "config/config.toml").write_text(config_text)
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            code = (f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + BACKUP_PRELUDE + BACKUP_SCRIPTS[name]
+                    + "\nprint('BACKUP_RESULT=' + json.dumps(out, default=str))")
+            result = subprocess.run([sys.executable, "-I", "-c", code, str(root)], cwd=root, env=env, text=True,
+                                    capture_output=True, timeout=240)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            line = next((x for x in result.stdout.splitlines() if x.startswith("BACKUP_RESULT=")), None)
+            self.assertIsNotNone(line, result.stdout + result.stderr)
+            return json.loads(line.removeprefix("BACKUP_RESULT="))
+
+    def test_prune_keeps_what_it_should_and_snapshots_first(self):
+        r = self.script("prune-keeps")
+        self.assertEqual(r["runs"], ["free-new", "loop-new", "loop-old", "paid-old", "pipe-new", "pipe-old"])
+        self.assertEqual(r["feed"], r["runs"])
+        self.assertEqual(r["queue"], ["q-new", "q-null"])
+        self.assertEqual(r["events"], ["e-new"])
+        self.assertEqual(r["incidents"], ["open-new", "closed-recent"])
+        self.assertEqual(r["notes"], ["note open-new", "note closed-recent"])
+        self.assertEqual(r["aliases"], ["closed-recent-alias", "open-new-alias"])
+        self.assertEqual(r["repairs"], [2])
+        self.assertEqual((r["snapshots"], r["quick_check"], r["last"]), (1, "ok", "ok"))
+        self.assertEqual(r["snap_runs"], r["before_runs"])
+        self.assertTrue(r["snap_counts_match"])
+
+    def test_a_widened_prune_is_undone_by_restore(self):
+        r = self.script("widened-restore")
+        self.assertTrue(r["deleted"])
+        self.assertEqual(r["alive"], [1, True, True])
+        self.assertEqual(r["running"], [1, True, True])
+        self.assertEqual((r["missing"], r["corrupt"], r["rc"]), (1, 1, 0))
+        self.assertTrue(r["restored"])
+        self.assertTrue(r["seq_kept"])
+        self.assertEqual(r["kept_file"], 1)
+        self.assertEqual(r["rc_corrupt_current"], 0)
+        self.assertTrue(r["gap"])
+
+    def test_restore_keeps_the_replaced_file_and_its_journal_paired(self):
+        r = self.script("hot-journal")
+        self.assertTrue(r["hot"])
+        self.assertEqual((r["refused"], r["rc"], r["rc2"]), (1, 0, 0))
+        self.assertEqual(r["uncommitted"], 0)
+        self.assertEqual(r["quick_check"], ["ok"])
+        self.assertFalse(r["live_journal"] or r["live_journal2"])
+        self.assertTrue(r["pairs"] and all(r["pairs"]))
+
+    def test_no_copy_no_delete(self):
+        r = self.script("no-copy-no-delete")
+        self.assertFalse(r["state_pruned"] or r["records_pruned"])
+        self.assertTrue(r["same"])
+        self.assertIn("distinctive-boom-17", " ".join(r["said"]))
+
+    def test_the_backups_folder_follows_the_patched_database(self):
+        r = self.script("follows-paths")
+        self.assertTrue(r["b_db"])
+        self.assertTrue(r["a_same"])
+        self.assertEqual(sum(n.startswith("arete-") for n in r["b_files"]), 1)
+        self.assertIn("last.json", r["b_files"])
+
+    def test_a_snapshot_during_a_write_holds_none_of_it(self):
+        r = self.script("concurrent-write")
+        self.assertEqual((r["writer"], r["quick_check"], r["rows"], r["leaked"], r["live_leaked"]), (0, "ok", 20000, 0, 0))
+
+    def test_a_missing_or_empty_file_is_not_replaced_while_a_snapshot_exists(self):
+        r = self.script("missing-file")
+        self.assertIn("arete backup --restore", r["error"])
+        self.assertIn(r["snap"], r["error"])
+        self.assertFalse(r["exists"])
+        self.assertIn(r["snap"], r["empty_error"])
+        self.assertEqual(r["size"], 0)
+        self.assertIn("empty", r["empty_snapshot"])
+        self.assertEqual(r["snaps"], 1)
+
+    def test_a_fresh_install_and_isolated_state_behave_as_before(self):
+        r = self.script("fresh")
+        self.assertEqual((r["none"], r["created"], r["isolated"], r["no_folder"]), (None, True, None, True))
+        self.assertTrue(r["taken"].startswith("arete-"))
+
+    def test_retention_keeps_the_newest_and_one_per_day(self):
+        r = self.script("retention")
+        self.assertEqual(r["left"], r["expected"])
+        self.assertTrue(r["other"])
+
+    def test_daily_copy_retries_until_it_succeeds_and_holds_only_allowed_files(self):
+        r = self.script("copy", '[backup]\ncopy_to = "host:/backups/arete/"\n')
+        self.assertEqual(r["steps"], [1, 1, False, 2, 0, True, 2, True, 3, True, 4, True])
+        host = r["argv0"]
+        self.assertEqual((host[:2], host[-1]), (["rsync", "-t"], "host:/backups/arete/"))
+        self.assertTrue(host[2].endswith("-prune.db") and host[3].endswith(f"config-{r['first_day']}.tar.gz"))
+        self.assertTrue(r["closed"])
+        self.assertEqual(len(r["days"]), 2)
+        files = {m for m in r["members"]}
+        self.assertTrue({"config.toml", "loop-switches.json", "loops/a.toml", "loops/nested/ok.toml", "layers.bundle"} <= files)
+        self.assertFalse([m for m in r["members"] if m.endswith(".env") or "verification-authority" in m or "link" in m])
+        self.assertEqual(r["verify"], 0)
+        self.assertIn("pi.env", r["history"])
+        self.assertIn("linked", r["linked"])
+        self.assertIn("refs/heads/main", r["heads"])
+
+    def test_no_destination_means_no_copy(self):
+        r = self.script("no-destination")
+        self.assertEqual((r["calls"], r["archives"], r["copied"]), ([], 1, False))
+
+    def test_heartbeat_reports_stale_damaged_and_missing_copies(self):
+        r = self.script("heartbeat")
+        self.assertEqual([r["fresh"], r["stale"], r["truncated"], r["recorded"]], [True, False, False, False])
+        self.assertEqual(r["empty"][:2], [False, "warn"])
+        self.assertIn("until the owner sets", r["empty"][2])
+        self.assertEqual([r["never"], r["old"], r["recent"]], [False, False, True])
+
+    def test_backup_command_prints_checks_and_refuses_a_damaged_snapshot(self):
+        r = self.script("cli")
+        self.assertEqual(r["plain"][0], 0)
+        self.assertIn("bytes", r["plain"][1])
+        self.assertIn("quick_check ok", r["plain"][1])
+        self.assertEqual(r["check"][0], 0)
+        self.assertRegex(r["check"][1], r"runs\s+7\s+7")
+        self.assertEqual(r["both"], 2)
+        self.assertEqual(r["truncated"][0], 1)
+        self.assertTrue(r["truncated"][2])
+
+    def test_config_writes_are_flushed_before_and_after_the_replace(self):
+        r = self.script("durable-config")
+        expected = [["flush", "file"], ["replace", ""], ["flush", "dir"]]
+        self.assertEqual((r["checked"], r["put"]), (expected, expected))
+        self.assertEqual((r["loaded"], r["refused"], r["unchanged"], r["events"]), (3, 2, True, []))
+        self.assertEqual((r["mode"], r["left"], r["copy_to"]), (0o640, ["config.toml"], "h:/x"))
+        self.assertEqual((r["bad"], r["default"]), (4, ""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import accounts, alerts, codex, config, devices, install, paths, pi, runner, state, steps, util
+from . import accounts, alerts, backup, codex, config, devices, install, paths, pi, runner, state, steps, util
 
 
 @dataclass
@@ -271,6 +271,45 @@ def check_serve() -> list[Check]:
     return out
 
 
+BACKUP_STALE_HOURS = 3
+OFFSITE_STALE_HOURS = 48
+
+
+def check_backups(cfg: config.Config) -> list[Check]:
+    return [check_backup_db(), check_backup_offsite(cfg)]
+
+
+def check_backup_db() -> Check:
+    newest = backup.newest_snapshot()
+    installed = install.serve_installed()
+    if newest is None:
+        return Check("backup:db", not installed, "no snapshot of arete.db yet" if installed
+                     else "no snapshot yet; serve is not installed")
+    found = backup.inspect(newest)
+    recorded = backup.read_last().get("quick_check", "ok")
+    if found["quick_check"] != "ok":
+        return Check("backup:db", False, f"{newest.name} failed its check: {found['quick_check']}")
+    if recorded != "ok":
+        return Check("backup:db", False, f"the last snapshot failed its check: {recorded}")
+    hours = util.hours_awake_since(newest.stat().st_mtime)
+    if installed and hours > BACKUP_STALE_HOURS:
+        return Check("backup:db", False, f"newest snapshot {newest.name} is {hours:.1f} awake hours old")
+    return Check("backup:db", True, f"{newest.name}, {hours:.1f} awake hours old")
+
+
+def check_backup_offsite(cfg: config.Config) -> Check:
+    if not cfg.backup.copy_to:
+        return Check("backup:offsite", False, "no copy leaves the machine until the owner sets [backup] copy_to "
+                     "in config.toml", "warn")
+    copied = backup.read_last().get("copied_at", "")
+    if not copied:
+        return Check("backup:offsite", False, f"no copy to {cfg.backup.copy_to} has succeeded yet")
+    hours = util.hours_awake_since(util.parse_iso(copied).timestamp())
+    if hours > OFFSITE_STALE_HOURS:
+        return Check("backup:offsite", False, f"the last good copy is {hours:.0f} awake hours old")
+    return Check("backup:offsite", True, f"last good copy {hours:.1f} awake hours ago")
+
+
 def check_loops(cfg: config.Config) -> list[Check]:
     from . import loops
 
@@ -334,6 +373,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_hook,),
         (check_disk,),
         (check_serve,),
+        (check_backups, cfg),
         (check_loops, cfg),
         (check_oncall, cfg),
         (check_workspaces,),

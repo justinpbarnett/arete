@@ -1030,6 +1030,8 @@ class RecordRetentionTests(Isolated):
             server.prune()
         pruned.assert_called_once_with(keep_days=server.cfg.oncall.keep_days)
         self.assertFalse(old.exists())
+        self.assertEqual(len(list((paths.DB_FILE.parent / "backups").glob("arete-*.db"))), 1)
+        self.assertTrue((paths.DB_FILE.parent / "backups" / "last.json").exists())
 
     def test_store_reports_size_oldest_and_pins(self):
         self.written("pip-a", 5, 1000)
