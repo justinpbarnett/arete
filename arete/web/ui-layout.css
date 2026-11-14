@@ -50,6 +50,10 @@ html, body, #app { height: 100%; }
 [data-screen="adws"] .pane-grid { grid-template-columns: clamp(232px, 17vw, 260px) minmax(0, 1fr) 300px; }
 [data-screen="insights"] .pane-grid { grid-template-columns: clamp(220px, 17vw, 260px) minmax(0, 1fr); }
 [data-screen="settings"] .pane-grid { grid-template-columns: clamp(220px, 18vw, 260px) minmax(0, 1fr); }
+[data-health-demo] .pane-grid { grid-template-columns: clamp(380px, calc(30vw + 40px), 480px) minmax(0, 1fr); }
+[data-health-demo] .pane { overflow: visible; display: flex; flex-direction: column; }
+[data-health-demo] .pane-label { flex: none; }
+[data-health-demo] .ui-list { flex: 1; height: auto; }
 @media (width < 1440px) {
   [data-screen="board"] .pane-grid { grid-template-columns: minmax(0, 1fr) 272px; }
   .run-focus { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
