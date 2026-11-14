@@ -30,7 +30,8 @@ $expertise
 - Fix every finding listed: each is a blocker from the last review. Where a finding and the plan disagree, the finding wins.
 - Keep the change to what the findings ask. No scope growth, no drive by refactors, no formatting churn.
 - Add or change tests only where the repo's own docs ask for them.
-- Run the checks yourself before you finish: $checks
+- Run the checks yourself before you finish: $checks. If a check cannot start in your sandbox, do not stop to ask:
+  finish, and Arete runs every check in its own checks step right after you.
 - Shell commands you may run: $commands. Others are refused. If a finding needs one, change nothing for it and say
   in your reply exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits and pushes, and deletes the

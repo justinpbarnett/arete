@@ -26,7 +26,8 @@ $expertise
 - Change the code so it does what the feedback asks. Where the feedback and the issue disagree, the feedback wins.
 - A comment that asks a question, or that needs no code change, gets an answer in your reply, not an edit.
 - Add or change tests only where the repo's own docs ask for them.
-- Run the checks yourself before you finish: $checks
+- Run the checks yourself before you finish: $checks. If a check cannot start in your sandbox, do not stop to ask:
+  finish, and Arete runs every check in its own checks step right after you.
 - Shell commands you may run: $commands. Others are refused. If the feedback needs one, change nothing for that
   comment and say in your reply exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits, pushes and posts your replies,
