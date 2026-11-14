@@ -25,15 +25,30 @@ from arete import (
     gh,
     lines,
     paths,
+    pi,
     pipeline,
     record,
     runlimits,
+    scratch,
     serve,
     state,
     tracker,
     util,
 )
 from arete.agent import Result
+
+
+def setUpModule():
+    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
+    unittest.addModuleCleanup(folder.cleanup)
+    root = Path(folder.name).resolve()
+    for pointer in (patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+                    patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
+                    patch.object(paths, "PI_KEYS_FILE", root / "config" / "pi.env"),
+                    *(patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                      for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
+        pointer.start()
+        unittest.addModuleCleanup(pointer.stop)
 
 
 class Isolated(unittest.TestCase):
@@ -1022,6 +1037,14 @@ class RecordRetentionTests(Isolated):
         self.assertEqual((found["bytes"], found["records"], found["pins"]), (1500, 2, 1))
         self.assertEqual(found["oldest"]["run_id"], "pip-a")
         self.assertEqual(record.size_text(1500), "1.5 KB")
+
+
+class NoLiveStateTests(unittest.TestCase):
+    def test_no_test_here_points_at_the_live_authority_or_state(self):
+        live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
+        for path in (scratch.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR,
+                     pi.SESSIONS_DIR):
+            self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
 if __name__ == "__main__":
