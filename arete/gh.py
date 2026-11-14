@@ -293,6 +293,11 @@ def pr_merge_state(repo: str, number: int) -> tuple[str, str]:
     return (row.get("mergeStateStatus") or "UNKNOWN").upper(), (row.get("mergeable") or "UNKNOWN").upper()
 
 
+def squash_subject(repo: str, number: int) -> list[str]:
+    title = ((gh_json(["pr", "view", str(number), "--repo", repo, "--json", "title"]) or {}).get("title") or "").strip()
+    return ["--subject", f"{title} (#{number})"] if title else []
+
+
 def repo_allows_auto_merge(repo: str) -> bool:
     return bool((gh_json(["api", f"repos/{repo}"]) or {}).get("allow_auto_merge"))
 
@@ -308,10 +313,11 @@ def pr_merge_auto(repo: str, number: int, wait: float = MERGE_WAIT_SECONDS,
             break
         time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
     if action == "merge":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--delete-branch"])
+        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--delete-branch", *squash_subject(repo, number)])
         return "merged", ""
     if action == "auto":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch"])
+        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch",
+            *squash_subject(repo, number)])
         return "auto", ""
     if action == "wait":
         return "left", f"GitHub still reported the merge state as unknown after {wait:g} seconds"
