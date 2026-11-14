@@ -980,9 +980,13 @@ def cmd_session(args) -> int:
         if args.action == "start":
             tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
             s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
-                                tools=tools, repo=args.repo, budget_usd=args.budget)
+                                tools=tools, repo=args.repo, budget_usd=args.budget, task=args.task,
+                                draft_pr=args.draft_pr)
             print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
                   + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
+            if s["task"] and not args.attach:
+                print(f"`arete session report {s['id']}` prints its report when it ends")
+                return 0
             if not args.attach:
                 print(f"`arete session attach {s['id']}` follows it and sends what you type")
                 return 0
@@ -1008,6 +1012,9 @@ def cmd_session(args) -> int:
                 follow(args.id, send=send_typed)
             except KeyboardInterrupt:
                 print(f"\ndetached; the session keeps running. `arete session stop {args.id}` ends it")
+            return 0
+        if args.action == "report":
+            print(json.dumps(control.session_report(args.id)))
             return 0
         if args.action == "send":
             print(json.dumps(sessions.send(args.id, " ".join(args.words))))
@@ -1455,7 +1462,7 @@ def cmd_devices_args(args) -> int:
 
 def cmd_session_args(args) -> int:
     words = list(args.words)
-    if args.action in ("attach", "send", "stop", "exec"):
+    if args.action in ("attach", "send", "stop", "exec", "report"):
         if not words:
             print(f"arete session {args.action} needs a session id", file=sys.stderr)
             return 2
@@ -1601,7 +1608,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_devices_args)
 
     p = sub.add_parser("session", help="start, follow, message and stop agent sessions on any device")
-    p.add_argument("action", choices=("start", "attach", "send", "list", "stop", "exec"))
+    p.add_argument("action", choices=("start", "attach", "send", "list", "stop", "exec", "report"))
     p.add_argument("words", nargs="*", help="start: the first message; others: the session id, then send: the text")
     p.add_argument("--device", default="local")
     p.add_argument("--model", default="")
@@ -1611,6 +1618,10 @@ def main(argv: list[str] | None = None) -> int:
                                               "fresh clone whose work arete fetches back and pushes")
     p.add_argument("--budget", type=float, default=None, help="USD for the whole session")
     p.add_argument("--attach", action="store_true", help="start: follow it at once")
+    p.add_argument("--task", action="store_true", help="start: run the prompt to the end, save a report, close and release "
+                                                       "the device")
+    p.add_argument("--draft-pr", action="store_true", help="start, with --task and --repo: open a draft PR for the pushed "
+                                                           "branch")
     p.set_defaults(fn=cmd_session_args)
 
     p = sub.add_parser("approve", help="list emits waiting for approval, or approve one by id; "
