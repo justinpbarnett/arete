@@ -7,6 +7,7 @@ import { startKeys, marks, screenKeys, pending, sheet, mode } from "./ui-keys.js
 import { configurePalette } from "./ui-palette.js";
 import { dismissMenu } from "./ui-menu.js";
 import { startHooks } from "./ui-hooks.js";
+import { feedbackCommand, startFeedback } from "./ui-feedback.js";
 import { normalizePrimary } from "./ui-list.js";
 
 const route = signal(current());
@@ -72,6 +73,7 @@ configurePalette(screenKeys.map(([key, id, title, href], index) => ({ key, id, t
   pending.value = "";
   sheet.value = false;
   dismissMenu();
-}, () => { mode.value = "NORMAL"; });
+}, () => { mode.value = "NORMAL"; }, [feedbackCommand]);
+startFeedback();
 startKeys();
 startHooks();

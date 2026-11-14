@@ -2,7 +2,14 @@ import { h } from "./vendor-preact.js";
 import htm from "./vendor-htm.js";
 import { mode, pending, sheet, notice, hints, sheetGroups, toggleSheet } from "./ui-keys.js";
 
+import { openFeedback } from "./ui-feedback.js";
+
 const html = htm.bind(h);
+
+function sendFeedback() {
+  toggleSheet();
+  openFeedback();
+}
 
 const caps = (keys) => keys.map((key) => html`<kbd class="cap" key=${key}>${key}</kbd>`);
 
@@ -30,6 +37,10 @@ export function KeySheet() {
         <div class="sheet-grid">${entries.map(([keys, label]) => html`<div class="sheet-entry" key=${keys.join(" ")}>
           <span class="sheet-caps">${caps(keys)}</span><span>${label}</span></div>`)}</div>
       </section>`)}
+      <section class="sheet-group">
+        <h3>Feedback</h3>
+        <button type="button" class="sheet-action" data-act="send-feedback" onClick=${sendFeedback}>Send feedback</button>
+      </section>
     </div>
   </div>`;
 }

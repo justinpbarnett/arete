@@ -6880,6 +6880,46 @@ class NewUIShellTests(unittest.TestCase):
             for banned in ("innerHTML", "insertAdjacentHTML", "eval"):
                 self.assertNotIn(banned, source)
 
+    def test_feedback_dialog_source_contract(self):
+        from arete import dashboard
+        web = SOURCE / "arete" / "web"
+        source = (web / "ui-feedback.js").read_text()
+        _, served = dashboard.web_snapshot()
+        self.assertEqual(served["/ui-feedback.js"][0], source.encode())
+        self.assertTrue(served["/ui-feedback.js"][1].startswith("text/javascript"))
+        self.assertEqual(served["/ui-feedback.css"][0], (web / "ui-feedback.css").read_bytes())
+        for name in ("/api/capture", "/api/capture/submit", "/api/capture/evidence", "Send feedback"):
+            self.assertIn(name, source)
+        self.assertIsNone(re.search(r"style\s*=", source))
+        self.assertNotIn("innerHTML", source)
+
+    def test_context_carries_screen_and_keeps_the_legacy_shape(self):
+        from arete import capture
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(paths, "STATE_DIR", Path(folder)), \
+                mock.patch.object(paths, "DB_FILE", Path(folder) / "arete.db"), \
+                mock.patch.object(util, "iso", return_value="2026-01-02T03:04:05Z"):
+            state.ensure_schema()
+
+            def stored(body):
+                capture.add_context(body, "code123")
+                return state.capture_draft()["context"]
+
+            legacy = {"captured": "2026-01-02T03:04:05Z", "app": {"version": arete.__version__, "code": "code123"}, "view": "live"}
+            self.assertEqual(stored({"view": "live"}), json.dumps(legacy, indent=2, ensure_ascii=False))
+            with_screen = json.loads(stored({"screen": "#settings/health"}))
+            self.assertEqual(with_screen["screen"], "#settings/health")
+            self.assertEqual(with_screen["app"]["code"], "code123")
+            self.assertNotIn("view", with_screen)
+            longest = "#" + "a " * 99 + "a"
+            self.assertEqual(len(longest), 200)
+            self.assertEqual(json.loads(stored({"screen": longest}))["screen"], longest)
+            before = state.capture_draft()["context"]
+            for body in ({"screen": "settings"}, {"screen": None}, {"screen": 4}, {"screen": longest + "a"},
+                         {"screen": "#floor", "view": "floor"}, {"screen": "#floor", "view": None}):
+                with self.assertRaises(capture.Refused, msg=str(body)):
+                    capture.add_context(body, "code123")
+            self.assertEqual(state.capture_draft()["context"], before)
+
     def test_palette_offline_behavior(self):
         script = r'''
 import assert from 'node:assert/strict';
@@ -7274,9 +7314,9 @@ try:
     assets.feed(page)
     check.assertEqual(assets.scripts, {
         "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js", "/ui-keys.js", "/ui-keybar.js", "/ui-hooks.js", "/ui-list.js", "/ui-menu.js",
-        "/ui-palette.js", "/ui-fuzzy.js",
+        "/ui-palette.js", "/ui-fuzzy.js", "/ui-feedback.js",
         "/vendor-preact.js", "/vendor-htm.js", "/vendor-signals.js"})
-    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css"})
+    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css", "/ui-feedback.css"})
     check.assertIn("/icon-192.png", assets.declared)
     for path in sorted(assets.declared):
         with opener.open(base + path, timeout=5) as response:
