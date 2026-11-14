@@ -38,6 +38,7 @@ from . import (
     jira,
     lines,
     loops,
+    oncall,
     paths,
     pipeline,
     record,
@@ -75,6 +76,8 @@ MAX_BODY = 64 * 1024
 TLS_HANDSHAKE = b"\x16\x03"
 LOG_PATH = "/api/log/"
 LOOP_PATH = "/api/loops/"
+INCIDENT_PATH = "/api/incidents/"
+STEERING = ("dismiss", "retry", "cancel")
 FEED_PATH = "/api/feed/"
 RUN_PATH = "/api/runs/"
 APPROVAL_PATH = "/api/approvals/"
@@ -510,6 +513,10 @@ class Handler(BaseHTTPRequestHandler):
                         "draft": draft_choices()}
             if path.startswith(LOOP_PATH):
                 return control.loop_detail(unquote(path[len(LOOP_PATH):]), connect=state.reader)
+            if path == "/api/incidents":
+                return board.incidents_board()
+            if path.startswith(INCIDENT_PATH):
+                return board.incident_board(unquote(path[len(INCIDENT_PATH):]))
             if path.startswith(FEED_PATH):
                 return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
             if path == "/api/sessions":
@@ -548,6 +555,15 @@ class Handler(BaseHTTPRequestHandler):
                     return chat.file_draft(whole_number(chat_id))
                 if action == "drop":
                     return chat.drop_draft(whole_number(chat_id))
+            if path == "/api/incidents/switch":
+                on = self.body().get("on")
+                if type(on) is not bool:
+                    raise control.Refused('switch takes {"on": true} or {"on": false}')
+                return oncall.switch(on)
+            if path.startswith(INCIDENT_PATH):
+                incident_id, action = last_part(path, INCIDENT_PATH)
+                if action in STEERING:
+                    return getattr(oncall, action)(board.incident_number(incident_id))
             if path == "/api/loops/new":
                 return self.draft_loop()
             if path.startswith(LOOP_PATH):

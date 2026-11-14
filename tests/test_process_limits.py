@@ -1026,7 +1026,7 @@ class RecordRetentionTests(Isolated):
         server = serve.Server()
         with patch.object(state, "prune") as pruned:
             server.prune()
-        pruned.assert_called_once_with()
+        pruned.assert_called_once_with(keep_days=server.cfg.oncall.keep_days)
         self.assertFalse(old.exists())
 
     def test_store_reports_size_oldest_and_pins(self):

@@ -57,7 +57,7 @@ A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete we
 
 The watcher notices operational failures on its own and keeps one durable incident for each underlying symptom.
 JEV decides whether an incident may wake a repair; a wake starts one bounded repair, and the incident is resolved only when the original failure is seen to be gone.
-Steering commands and an off switch come in a later part.
+The dashboard's Incidents view lists the incidents and steers them; see [Dashboard](#dashboard).
 
 ```toml
 [oncall]
@@ -72,6 +72,7 @@ max_attempts = 2
 incident_budget_usd = 5.0
 daily_budget_usd = 10.0
 cooldown_minutes = 30
+keep_days = 30
 
 [[oncall.source]]
 path = "~/Library/Logs/myapp/*.log"
@@ -173,6 +174,7 @@ Task start, run stop, the route lookup, the check run and the alerts go through 
 | `incident_budget_usd` | 5.0 | paid spend on one incident's repairs, counted like `state.paid_by_run`; past it the incident is `blocked` |
 | `daily_budget_usd` | 10.0 | paid spend of all repairs started in the last 24 hours; past it incidents wait |
 | `cooldown_minutes` | 30 | pause after each ended attempt |
+| `keep_days` | 30 | days a closed incident keeps its notes and evidence; 0 or more, fractions allowed |
 
 **Steering.** `cancel` stops the incident's running repair through `control.stop_run` and starts the cooldown; `dismiss` closes an open incident; `retry` re-arms one, so its attempts, spend and cooldown count from that point; `off` and `on` flip a runtime switch (the cursor `oncall:switch`, not config).
 Each action writes a note on the incident, and a refused one (an unknown id, a repair still running) exits 1 with one line.
@@ -196,6 +198,11 @@ A failing recheck or a recurrence is a failed attempt.
 **Escalation.** A run that asks, a held PR or a branch with no PR, a route policy refusal, and attempts or budget used up raise one alert through `alerts.raise_alert`, with one sanitized line of Arete's own words.
 Evidence and log text are never sent.
 The alert clears when the incident resolves or is dismissed.
+
+**Audit and retention.** Every decision, wake, recheck, escalation, dismiss, retry, cancel and switch is a note on the incident with its time.
+Notes and evidence of a closed incident (resolved or dismissed) stay `keep_days` days after it closes and are then removed by the hourly prune, which keeps the incident row.
+Repeat `seen again` notes older than 14 days are dropped, and an open incident unseen for 56 days is removed.
+Nothing in an incident goes to GitHub, Jira or a notification beyond the one sanitized escalation line.
 
 ```
 arete oncall             # incidents, newest first, each with its decision, repair state, then the watcher's state
@@ -770,7 +777,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
-| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
+| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes, and `keep_days` how long a closed incident keeps its notes and evidence; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796), `owner`, the tailnet login the page opens for (default: the login that owns this machine), and `https` (default `false`; `true` fetches a tailscale certificate that lists the machine and tailnet name in public certificate transparency logs, and plain HTTP then gets a 308). See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
@@ -1789,7 +1796,7 @@ Turning HTTPS off again releases a `tailscale serve` mapping that an earlier run
 
 Notifications: Settings has an Allow notifications button, a list of subscribed devices with a Remove control, and Send a test. On an iPhone the app must be added to the Home Screen first and opened from there, and the permission is asked only after a tap. An ask that goes to the owner sends one Web Push to every subscribed device, and one reminder follows after `[ask] remind_hours` if it is still open; an ask that JEV settles sends none. The push service receives an empty POST and a signed VAPID token naming the push service's origin and the contact (`[ask] push_contact`, else the owner's login when it is an email), never question text. The service worker then reads `/api/asks` from arete itself and shows the repo, the ticket and the first question's header, or "Arete is waiting on you" when that fails; the notification's tag is the ask id, so a reminder replaces the earlier one, and a tap opens `/#ask/ID`. The signing key pair is made once with the `openssl` CLI and kept in the state folder as `webpush.key` with mode 0600. A 404 or 410 from a push service removes that device. The desktop notification still fires.
 
-A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find, Console and Feedback.
+A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health, Incidents) and Settings (Settings, Usage), then Find, Console and Feedback.
 It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
 Below 1040 px the sidebar wraps into a block above the page.
 A "Waiting on you" panel above every view lists the open asks, oldest first, and hides when none wait. Its count shows in the tab title and on the app badge.
@@ -1797,7 +1804,7 @@ Each card shows the repo, ticket, run, step, time waiting, why and what was trie
 Submit sends the answers, Go with the recommendations takes each choice's first option, and Stop the run asks first and then ends the run stopped.
 A refusal shows on the card and keeps what you typed; a secret is never kept in page storage and is cleared after every submit.
 `#ask/ID` scrolls to that card, also when a notification opens the page.
-Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME`, `#ticket/REF` and `#ask/ID`, so reload, Back and Forward put you where you were.
+Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME`, `#ticket/REF`, `#incident/ID` and `#ask/ID`, so reload, Back and Forward put you where you were.
 An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find, the key list or the feedback composer open, feedback text not yet saved, text selected, a screen capture or an upload still going, or an action still going.
 Then the status line says what the new version waits for.
 Close or Escape on an open item goes back to where you opened it, with focus on its row.
@@ -1824,6 +1831,12 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.
 - Outcomes: for the last 30 days, the pipeline runs that shipped (a pull request, or a branch the adw flow pushed) and failed each day, the decisions that went without you against the ones you made, what you paid by day, model, runner and loop, the runs by repo, and the eval pass rate by repo.
 - Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, the loops that report on their own, and the held workspaces with their size, age and reason.
+- Incidents: the on-call incidents, open first, each with its state, occurrences, decision and repair, above a line that says whether the watcher is on.
+  With `[oncall]` absent or `enabled = false` the view says the watcher is off and that `enabled = true` under `[oncall]` turns it on; with wakes switched off it says since when and offers Turn wakes on, and the same button turns them off.
+  An incident's page shows its state, class, source, first and last occurrence, count, redacted evidence, JEV's decision with confidence and reason, the repair runs it started (each linking to its run page) with their status and paid cost, the recovery result and the timed notes.
+  Dismiss, Retry and Cancel call the same functions as `arete oncall dismiss`, `retry` and `cancel` and say in place what happened.
+  Evidence and notes are drawn as text, never as HTML.
+  Health lists a blocked incident among its failures, and the sidebar's health word turns to caution while one is blocked.
 - Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`.
   A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use.
   An empty model removes its line, so the role goes back to its default.
@@ -1920,6 +1933,8 @@ It answers `{"task", "repo", "run", "state", "why"}`. `state` is `running` with 
 These routes steer a ticket's run. The first four answer `{"task", "repo", "run", "state", "why"}` as `POST /api/tasks` does, with the run they started:
 
 - `POST /api/runs/RUN_ID/answer` with `{"text": "..."}` answers the question of a run that ended `needs-info`. It stores the answer on the ticket, as the owner's reply on a local task, a comment on a GitHub issue, which then loses its `needs-info` label, or a comment on a Jira ticket, and keeps it in the run's folder as `answer.md`. Then it starts the ticket's next run, whose `answer` line carries the `text`. A run of the ticket going on, or no free slot, refuses with 409 before the answer is stored. A label GitHub would not remove is named in `why`, and the run starts anyway.
+- `GET /api/incidents` returns `watcher` (`state` is `on`, `switched_off` or `disabled`; `config`, `last_scan`, `ok`, `detail`, `expected`, `switched`) and `incidents`, open first and then the newest, each with its state, phase, class, source, signature, `first_seen`, `last_seen`, `count`, decision, confidence, reason, `recovery`, `closed` and the `decision_line` and `repair_line`, never its evidence. `GET /api/incidents/ID` returns one as `incident` with the redacted `evidence`, `answers`, the newest 500 `notes` (`ts`, `note`) and `notes_total`, its `repairs` (each with its `runs`: `id`, `status`, `started`, `finished`, `pr_url`, `paid`), the total `paid`, and `can` (`dismiss`, `retry`, `cancel`). An unknown or non-numeric id answers 404.
+- `POST /api/incidents/ID/dismiss`, `/retry` and `/cancel` do what `arete oncall dismiss`, `retry` and `cancel` do and answer as they print. `POST /api/incidents/switch` takes `{"on": true}` or `{"on": false}` and answers `{"wakes": "on"}` or `{"wakes": "off"}`. An unknown id answers 404, a refused action or a body without a boolean 400, and a missing `X-Arete` header 403. `GET /api/health` also carries `incidents`, the blocked incidents.
 - `GET /api/asks` lists the open asks, oldest first, each with `id`, `repo`, `ticket`, `run`, `step`, `asked`, `why`, `tried`, `questions` and `reminded` (empty until the reminder push). Asks of a run that is not the ticket's latest are left out.
 - `GET /api/push` returns the public `key` and the subscribed `devices` (`id`, `label`, `created`, `last_success`; never an endpoint or key). `POST /api/push/subscribe` takes `{"endpoint", "keys": {"p256dh", "auth"}, "label"}`, `POST /api/push/remove` takes `{"id"}`, and `POST /api/push/test` pushes to every device and returns `sent`, `removed` and `failed`; each returns the device list.
 - `POST /api/asks/ASK_ID/answer` answers a parked ask with `{"answers": [...]}`, one entry per question (`{"choice": "label" or number or list"}`, `{"text": "..."}`, `{"done": true}` or `{"declined": true}`; `null` takes the first option of a choice when `"recommended": true` is set), with `{"recommended": true}` alone for an ask of choices only, or with `{"stop": true}`. A secret question takes `{"secret": "VALUE"}` or `{"declined": true}`; the value is stored for the repo and never logged or echoed in an error, and a refused answer stores nothing. An answer, once the run's last open ask has one, continues the run and prints the new run; 404 for no such ask, 400 for a closed ask, a run that is not the ticket's latest, or bad input, 409 while a run of the ticket is going.
