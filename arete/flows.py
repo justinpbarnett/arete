@@ -75,13 +75,16 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
     renew = ""
     if refusal:
         job.note_task()
-    elif (continues and not only and not run.answers_due and kept_pending(job, continues)
-          and (moved := base_moved(continues))):
-        run.log(f"{moved} since run {continues} prepared, so this run prepares again, keeps the plan and the build "
-                "when the worktree still holds that run's edits, and runs every later step again")
-        renew = "prepare"
+    elif continues and not only and kept_pending(job, continues) and (moved := base_moved(continues)):
+        if run.answers_due:
+            job.moved_base = moved
+        else:
+            run.log(f"{moved} since run {continues} prepared, so this run prepares again, keeps the plan and the "
+                    "build when the worktree still holds that run's edits, and runs every later step again")
+            renew = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
                         restore=lambda line: restore(job, line, only), refusal=refusal, hold=job.hold, renew=renew,
+                        entering=job.merge_moved_base,
                         step_runs=list(step_runs(continues).values()) if continues else [],
                         keeps=lambda name, kw: any(c.onto for c in job.checkouts) and (
                             name in ("plan", "revise", "repair") or name == "implement" and kw.get("round") == BUILD))
@@ -303,6 +306,7 @@ class Job:
     build_summary: str = ""
     verified: Verified = field(default_factory=lambda: Verified("unverified"))
     review: dict = field(default_factory=dict)
+    fix_reply: str = ""
     reviews: int = 0
     built: pipeline.Build | None = None
     slot: pipeline.RunSlot | None = None
@@ -329,6 +333,21 @@ class Job:
     pending: list[str] = field(default_factory=list)
     only: str = ""
     noted: bool = False
+    moved_base: str = ""
+
+    def merge_moved_base(self, name: str) -> None:
+        moved, self.moved_base = self.moved_base, ""
+        held = [c for c in self.checkouts if c.onto]
+        if not moved or not held:
+            return
+        self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits that "
+                     f"run kept before {name} runs with the answers")
+        merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket)
+        if merged:
+            self.run.base_note = pipeline.base_merge_note(merged)
+            if self.built is not None:
+                self.built.workspace = self.workspace
+            pipeline.note_made(self.ws, self.checkouts)
 
     @property
     def with_prs(self) -> list[pipeline.Checkout]:
@@ -360,7 +379,7 @@ class Job:
                 cfg=self.cfg, run=self.run, ticket=self.ticket, ws=self.ws, checkouts=self.checkouts, layer=self.layer,
                 timeout=self.layer.timeout_minutes * 60, workspace=self.workspace, attachments=self.attachments,
                 tools=pipeline.bash_rules(self.builder_bash), deny=diffguard.denied_paths(self.layer),
-                expertise=self.expertise, left_for_a_person=self.left_for_a_person, check_commands=self.checks,
+                left_for_a_person=self.left_for_a_person, check_commands=self.checks,
                 from_base=self.run.alone or bool(self.run.repairs) or self.carried, plan_text=self.plan_text, build_summary=self.build_summary)
         return self.built
 
@@ -404,6 +423,8 @@ class Job:
                 run.sessions[BUILD] = outcome.session
         elif name == "implement":
             self.build_summary = data.get("summary", self.build_summary)
+            if str(data.get("round") or "").startswith(REVIEW_FIX):
+                self.fix_reply = str(data.get("reply") or "")
             if outcome.session.id:
                 run.sessions[BUILD] = outcome.session
         elif name == "checks" and "report" in data:
@@ -755,13 +776,14 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
                        data={"round": round, "failures": feedback, "verdicts": res.structured, "said": res.text},
                        session=run.sessions.get(BUILD, NO_SESSION))
     if round.startswith(REVIEW_FIX):
-        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback), role=atom)
+        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback, notes=pipeline.notes_text(job.review)),
+                           role=atom)
     elif round != BUILD:
         res = job.b.resume(round, pipeline.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
                                                   checks=job.b.check_commands), role=atom)
     else:
         return build(job)
-    return Outcome("pass" if res.ok else "fail", data={"round": round},
+    return Outcome("pass" if res.ok else "fail", data={"round": round, "reply": res.text},
                    session=run.sessions.get(BUILD, NO_SESSION))
 
 
@@ -820,7 +842,8 @@ def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: in
     run = job.run
     attempt = 2 if second else attempt
     said = pipeline._review(job.staged(), job.with_left(job.plan_text), job.verified,
-                            pipeline.round_name("review", attempt))
+                            pipeline.round_name("review", attempt), job.review if attempt > 1 else None,
+                            job.fix_reply)
     data = {"review": said, "attempt": attempt, "story": run.story}
     if said.get("verdict") != "request_changes":
         return Outcome("pass", data=data)
@@ -834,8 +857,8 @@ def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: in
 @factory.step("learn")
 def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
     job: Job = flow.ctx
-    pipeline._learn(job.run, job.ws, job.layer.expertise_file, job.ticket.title, job.expertise, apply=apply)
-    return Outcome("pass", data={"applied": apply})
+    commit = pipeline._learn(job.run, job.ws, job.layer.expertise_file, job.ticket.title, apply=apply)
+    return Outcome("pass", data={"applied": apply, "commit": commit})
 
 
 def documents(job: Job) -> bool:
@@ -1067,7 +1090,7 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
 
 def done_comment(job: Job, summary: str) -> str:
     said = job.review
-    problems = "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in said.get("problems", []))
+    problems = pipeline.review_lists(said)
     return (f"Done: {summary}.\n\n## Summary\n\n{job.document or pipeline.summary_of(said, job.build_summary)}\n\n"
             f"{pipeline.assumed_block(job.run)}"
             f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown()}\n\n"

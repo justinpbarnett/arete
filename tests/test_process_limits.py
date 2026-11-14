@@ -279,6 +279,55 @@ class BudgetTests(Isolated):
             with second.budget.watching():
                 self.fail("an exhausted chain must not run")
 
+    def test_idle_waits_move_the_deadline_and_other_waits_do_not(self):
+        for cause in ("limit", "slot"):
+            with self.subTest(cause=cause):
+                run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
+                started = time.monotonic()
+                with self.assertRaisesRegex(runlimits.Parked, "run chain"):
+                    with run.budget.watching():
+                        with run.waiting(cause):
+                            time.sleep(.9)
+                        self.assertGreater(run.budget.deadline - time.monotonic(), 0)
+                        time.sleep(6)
+                self.assertLess(time.monotonic() - started, 3 + .9 + 1)
+                self.assertGreater(runlimits.metadata(run.id, "budget.json")["wait_minutes_left_out"][cause], 0)
+        run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
+        with self.assertRaisesRegex(runlimits.Parked, "run chain"):
+            with run.budget.watching(), run.waiting("ci"):
+                time.sleep(6)
+
+    def chained_after(self, *waits):
+        first = self.made_run()
+        record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
+        for cause, since, until in waits:
+            if until is None:
+                lines.wait_start(first.id, cause, util.iso(util.now() - timedelta(minutes=since)))
+            else:
+                lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
+                             util.iso(util.now() - timedelta(minutes=until)))
+        record.settle(first.id, "interrupted")
+        return first, self.made_run(first.id)
+
+    def test_limit_wait_of_an_earlier_run_is_left_out_of_prior_seconds(self):
+        for waits in ([("limit", 50, 10)], [("limit", 50, None)]):
+            with self.subTest(waits=waits):
+                first, second = self.chained_after(*waits)
+                self.assertLess(second.budget.prior_seconds, 25 * 60)
+                self.assertGreater(second.budget.earlier_idle["limit"], 35 * 60)
+                with second.budget.watching():
+                    pass
+                self.assertGreater(
+                    runlimits.metadata(second.id, "budget.json")["earlier_wait_minutes_left_out"]["limit"], 35)
+
+    def test_ci_waits_and_waits_before_the_run_started_still_count(self):
+        for waits in ([("ci", 50, 10)], [("slot", 90, 70)]):
+            with self.subTest(waits=waits):
+                first, second = self.chained_after(*waits)
+                with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
+                    with second.budget.watching():
+                        self.fail("an exhausted chain must not run")
+
     def test_verification_deadline_interrupts_and_is_accounted(self):
         run = self.made_run(policy=runlimits.Policy(max_verify_minutes=.001))
         started = time.monotonic()
