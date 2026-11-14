@@ -17,7 +17,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from string import Template
 from typing import NamedTuple, TextIO
@@ -735,12 +735,10 @@ def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
     if scratch_left(ws, checkouts):
         return False
     made = made_before(ws)
-    salt = str(made.get(SALT_KEY) or "")
 
     def unknown_outside(examined: set[Path]) -> bool:
         try:
-            return any(not (salt and made.get(n) == fingerprint(ws / n, salt))
-                       for n in unexamined(ws, examined))
+            return any(not recorded(made, ws, n) for n in unexamined(ws, examined))
         except OSError:
             return True
 
@@ -752,7 +750,7 @@ def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
                 return False
             if (c.wt / ".git").exists():
                 try:
-                    if any(not (salt and made.get(c.prefix + n) == fingerprint(c.wt / n, salt))
+                    if any(not recorded(made, c.wt, n, c.prefix)
                            for n in [*ignored_files(c.wt), *untracked_files(c.wt)]):
                         return False
                 except (OSError, RuntimeError):
@@ -768,6 +766,29 @@ def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
         with util.repo_lock(c.src):
             git(["worktree", "prune"], c.src, check=False)
     return True
+
+
+def recorded(made: dict, base: Path, name: str, prefix: str = "") -> bool:
+    salt = str(made.get(SALT_KEY) or "")
+    return bool(salt) and made.get(prefix + name) == fingerprint(base / name, salt)
+
+
+def blocked_by(ws: Path, checkouts: list[Checkout], edits: bool = False) -> list[str]:
+    try:
+        if left := scratch_left(ws, checkouts):
+            return list(dict.fromkeys(str(p) for p in left))
+        made = made_before(ws)
+        examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
+        names = [n for n in unexamined(ws, examined) if not recorded(made, ws, n)]
+        for c in checkouts:
+            if (c.wt / ".git").exists():
+                found = ([*uncommitted(c.wt), *ignored_files(c.wt)] if edits
+                         else [*ignored_files(c.wt), *untracked_files(c.wt)])
+                names += [c.prefix + n for n in dict.fromkeys(found)
+                          if not recorded(made, c.wt, n, c.prefix)]
+        return names
+    except (OSError, RuntimeError) as e:
+        return [util.first_line(str(e), 200)]
 
 
 def made_copy(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
@@ -834,6 +855,7 @@ def head_key(c: Checkout) -> str:
 
 
 SALT_KEY = "\0salt"
+OWNER_KEY = "\0owner"
 RETAINED_KEY = "\0retained"
 
 
@@ -848,8 +870,28 @@ def onto_key(c: Checkout) -> str:
     return f"\0onto {c.prefix}"
 
 
-def note_made(ws: Path, checkouts: list[Checkout]) -> None:
+def workspace_owner(run: Run, ws: Path, checkouts: list[Checkout]) -> dict | None:
+    earlier = made_before(ws).get(OWNER_KEY)
+    if run.alone:
+        return earlier if isinstance(earlier, dict) else None
+    created = earlier.get("created") if isinstance(earlier, dict) else None
+    return {"run": run.id, "repo": run.repo.name, "ticket": str(run.tid), "created": created or util.iso(),
+            "checkouts": [{"dir": c.dir, "github": c.github, "src": str(c.src), "wt": str(c.wt)} for c in checkouts]}
+
+
+def release_workspace(run: Run, ws: Path, checkouts: list[Checkout]) -> bool:
+    note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
+    if remove_workspace(ws, checkouts):
+        return True
+    names = blocked_by(ws, checkouts)
+    shown = ", ".join(names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
+    run.log(f"workspace kept at {ws}: removal blocked by {shown or 'the folder could not be deleted'}")
+    return False
+
+
+def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None) -> None:
     try:
+        owner = owner or made_before(ws).get(OWNER_KEY)
         names, held = [], []
         if ws.is_dir():
             names, held = leftovers(ws, checkouts), scratch_left(ws, checkouts)
@@ -859,6 +901,8 @@ def note_made(ws: Path, checkouts: list[Checkout]) -> None:
         if names or heads:
             salt = os.urandom(16).hex()
             made = {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
+            if owner:
+                made[OWNER_KEY] = owner
             if held:
                 made[RETAINED_KEY] = retained(ws, checkouts, names, held)
             made_record(ws).parent.mkdir(parents=True, exist_ok=True)
@@ -1049,7 +1093,9 @@ def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: b
 
 
 def remove_worktree(repo: config.Repo, wt: Path) -> None:
-    remove_workspace(wt, [Checkout("", repo.github, repo.path, wt, "")])
+    checkouts = [Checkout("", repo.github, repo.path, wt, "")]
+    if not remove_workspace(wt, checkouts):
+        print(f"{util.iso()} worktree kept at {wt}: removal blocked by {', '.join(blocked_by(wt, checkouts)[:10])}")
 
 
 def stale_base_note(c: Checkout) -> str:
@@ -1622,7 +1668,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             if run.workspace:
                 keep_edits(run)
-                note_made(*run.workspace)
+                note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
         if restarting and status in ("skipped", "noop") and not run.feedback:
             run.enter("failed")
@@ -1746,7 +1792,7 @@ def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: s
     run.say(comment)
     run.enter("needs-info")
     if not any(c.onto for c in checkouts):
-        remove_workspace(ws, checkouts)
+        release_workspace(run, ws, checkouts)
     return "needs-info", summary[:300], ""
 
 
@@ -1846,6 +1892,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     run.cfg, run.layer, run.kind = cfg, layer, t.kind
     if why := furnish(cfg, run, layer, ws):
         return _fail(run, why)
+    note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
 
     expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
     checks = check_list(layer)
@@ -2042,7 +2089,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     automerge(cfg, run, layer, approval, draft_why, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
               f"{t.title}\n\n{build_summary.strip()[:3000]}")
     urls = record_prs(run, branch, with_prs)
-    remove_workspace(ws, checkouts)
+    release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
 
 
@@ -2127,7 +2174,7 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Chec
     why = f"the open PRs already cover {t.ref}" if with_prs else "the plan found no code change to make"
     run.log(f"build: nothing to build, since {why}")
     if run.dry_run:
-        remove_workspace(ws, checkouts)
+        release_workspace(run, ws, checkouts)
         return "dry-run", f"nothing to build: {why}", ""
     said = summary.strip()[:3000] + (f"\n\n{LEFT_HEADING}\n\n{left}" if left else "")
     if not with_prs:
@@ -2144,7 +2191,7 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Chec
     prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
     run.say(f"Nothing more to build, since the open PRs already cover this:\n\n{prs}\n\n{said}")
     urls = record_prs(run, branch, with_prs)
-    remove_workspace(ws, checkouts)
+    release_workspace(run, ws, checkouts)
     return "pr", f"nothing to build: {why}", urls
 
 
@@ -2791,14 +2838,14 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch
                            replies: list[dict]) -> tuple[str, str, str]:
     if run.dry_run:
         run.log("revise: no code changes; a dry run leaves the review unanswered")
-        remove_workspace(ws, checkouts)
+        release_workspace(run, ws, checkouts)
         return "dry-run", "no code changes for the review", ""
     run.log("revise: no code changes, answering the review")
     answer_feedback(run, replies, "No code change for this one; see the overall reply.")
     run.say(f"No code changes for your review.\n\n{summary.strip()[:3000]}")
     run.enter("pr")
     urls = record_prs(run, branch, [c for c in checkouts if c.pr])
-    remove_workspace(ws, checkouts)
+    release_workspace(run, ws, checkouts)
     return "pr", "answered the review without code changes", urls
 
 
@@ -3559,15 +3606,136 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
         remove_worktree(repo, wt)
 
 
-def cleanup_worktrees(days: float = 7) -> None:
+SWEPT = ("merged", "rejected", "done")
+WAITING = ("running", "pr", "needs-info")
+HELD_FILE = paths.STATE_DIR / "held-workspaces.json"
+
+
+def parts_of(repo: config.Repo) -> list[config.Part]:
+    return repo.parts or [config.Part("", repo.name)]
+
+
+def owner_of(d: Path, cfg: config.Config) -> dict | None:
+    owner = made_before(d).get(OWNER_KEY)
+    if isinstance(owner, dict) and owner.get("repo") and owner.get("checkouts"):
+        return owner
+    for repo in sorted(cfg.repos, key=lambda r: len(r.name), reverse=True) if made_record(d).is_file() else []:
+        tid = d.name.removeprefix(f"{repo.name}-")
+        if tid != d.name and state.ticket_runs(repo.name, tid, limit=1):
+            return {"run": "", "repo": repo.name, "ticket": tid, "created": "",
+                    "checkouts": [{"dir": p.dir, "github": p.github, "src": str(repo.path / p.dir),
+                                   "wt": str(d / p.dir)} for p in parts_of(repo)]}
+    return None
+
+
+def tree_bytes(d: Path) -> int:
+    total = 0
+    for root, dirs, files in os.walk(d):
+        for n in dirs + files:
+            try:
+                total += Path(root, n).lstat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def held_entry(d: Path, owner: dict, row: dict | None, blocked: bool, why: str, names: list[str] | None = None) -> dict:
+    row = row or {}
+    try:
+        modified = util.iso(datetime.fromtimestamp(d.stat().st_mtime, UTC))
+    except OSError:
+        modified = ""
+    return {"name": d.name, "path": str(d), "repo": owner["repo"], "ticket": owner["ticket"],
+            "run": row.get("id") or owner.get("run") or "", "status": row.get("status") or "",
+            "since": row.get("finished") or row.get("started") or owner.get("created") or modified,
+            "bytes": tree_bytes(d), "blocked": blocked, "why": why, "names": (names or [])[:10]}
+
+
+def ticket_closed(cfg: config.Config, repo: str, tid: str, status: str) -> bool:
+    if tracker.is_task_id(tid):
+        return tracker.task_state(tid) == "closed"
+    configured = next((r for r in cfg.repos if r.name == repo), None)
+    if configured is None or status == "pr":
+        return False
+    try:
+        return not tracker.for_repo(cfg, configured).get(tid).open
+    except Exception:
+        return False
+
+
+def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
+    repo, tid = owner["repo"], str(owner["ticket"])
+    lock_name = state.run_lock("pipeline", repo, tid)
+    if util.lock_is_held(lock_name) or state.issue_running(repo, tid):
+        return None
+    checkouts = [Checkout(c["dir"], c["github"], Path(c["src"]), Path(c["wt"]), "") for c in owner["checkouts"]]
+    row = ((state.run_get(owner["run"]) if owner.get("run") else None)
+           or next(iter(state.ticket_runs(repo, tid, limit=1, whole=True)), None))
+    status = (row or {}).get("status") or ""
+    run_id = (row or {}).get("id") or owner.get("run") or ""
+    closed = (status not in SWEPT and status not in WAITING and tracker.is_task_id(tid)
+              and ticket_closed(cfg, repo, tid, status))
+    if status not in SWEPT and not closed:
+        return held_entry(d, owner, row, False,
+                          f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket")
+    made = made_before(d)
+    if any(made.get(onto_key(c)) and (c.wt / ".git").exists() for c in checkouts):
+        return held_entry(d, owner, row, False, f"run {run_id} kept edits in the workspace, so it waits for a resume")
+    with util.lock(lock_name) as got:
+        if not got:
+            return None
+        try:
+            clear_workspace(d, checkouts, checkouts[0].src, [])
+        except RunFailed as e:
+            return held_entry(d, owner, row, True, e.why, blocked_by(d, checkouts, edits=True))
+        except (OSError, RuntimeError) as e:
+            return held_entry(d, owner, row, True, util.first_line(str(e), 300), blocked_by(d, checkouts, edits=True))
+    print(f"{util.iso()} removed the workspace {d}: "
+          + (f"run {run_id} is {status}" if status in SWEPT else f"task {tid} is closed"))
+    return None
+
+
+def sweep_unowned(d: Path, cutoff: float) -> None:
+    if d.stat().st_mtime < cutoff and not scratch_left(d, []) and not unexamined(d, set()):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def prune_repos(cfg: config.Config) -> None:
+    for repo in cfg.repos:
+        for src in [repo.path / p.dir for p in repo.parts] or [repo.path]:
+            try:
+                if (src / ".git").exists():
+                    with util.repo_lock(src):
+                        git(["worktree", "prune"], src, check=False)
+            except (OSError, RuntimeError):
+                pass
+
+
+def cleanup_worktrees(days: float = 7, cfg: config.Config | None = None) -> None:
+    cfg = cfg or config.load()
     cutoff = util.now().timestamp() - days * 86400
+    held = []
     for d in paths.WORKTREES_DIR.glob("*"):
         try:
-            if (d.is_dir() and not d.is_symlink() and d.stat().st_mtime < cutoff and not scratch_left(d, [])
-                    and not unexamined(d, set())):
-                shutil.rmtree(d, ignore_errors=True)
-        except OSError:
-            pass
+            if not d.is_dir() or d.is_symlink():
+                continue
+            owner = owner_of(d, cfg)
+            if owner is None:
+                sweep_unowned(d, cutoff)
+            elif entry := sweep_owned(d, owner, cfg):
+                held.append(entry)
+        except Exception as e:
+            print(f"{util.iso()} sweeping {d}: {type(e).__name__}: {e}")
+    prune_repos(cfg)
+    util.write_json(HELD_FILE, sorted(held, key=lambda h: h["since"]))
+
+
+def held_summary() -> dict:
+    rows = util.read_json(HELD_FILE, [])
+    rows = rows if isinstance(rows, list) else []
+    oldest = rows[0] if rows else {}
+    return {"count": len(rows), "bytes": sum(r.get("bytes") or 0 for r in rows), "oldest": oldest.get("since", ""),
+            "oldest_name": oldest.get("name", ""), "blocked": sum(1 for r in rows if r.get("blocked")), "rows": rows}
 
 
 class SkipLog:
@@ -3970,9 +4138,12 @@ def poll(dry_run: bool = False) -> int:
             try:
                 util.write_json(SKIPPED_FILE, skips.current)
                 sync_landings(cfg)
-                cleanup_worktrees()
             except Exception as e:
                 failed("poll", e)
+            try:
+                cleanup_worktrees(cfg=cfg)
+            except Exception as e:
+                failed("sweeping worktrees", e)
             mark_loop("poll", not errors, "; ".join(errors))
         return 1 if errors else 0
 

@@ -122,6 +122,10 @@ document.addEventListener("visibilitychange", () => {
 });
 
 document.addEventListener("DOMContentLoaded", () => {
+  if ("serviceWorker" in navigator && window.isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});
+});
+
+document.addEventListener("DOMContentLoaded", () => {
   history.scrollRestoration = "manual";
   makeNav();
   makePanes();
