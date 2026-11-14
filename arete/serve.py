@@ -11,7 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TextIO
 
 from . import (
     backup,
@@ -48,6 +48,8 @@ SWEEP_SECONDS = 300
 POLL_THREADS = 8
 IMPORT_CHECK = "from arete import codebase; codebase.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
+SERVE_LOCK = "serve"
+SERVE_LOCK_FD = "ARETE_SERVE_LOCK_FD"
 COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
            "!=": operator.ne}
 
@@ -70,6 +72,41 @@ APPROVAL_JOBS = (
                 model_for=hold_review.model_for, write=hold_review.review,
                 tools=tuple(hold_review.REVIEW_TOOLS), denied=tuple(hold_review.REVIEW_DENIED)),
 )
+
+
+def inherited_lock() -> TextIO | None:
+    value = os.environ.pop(SERVE_LOCK_FD, None)
+    if value is None:
+        return None
+    held = None
+    try:
+        held = os.fdopen(int(value), "a")
+        os.set_inheritable(held.fileno(), False)
+        inherited = os.fstat(held.fileno())
+        expected = (paths.LOCKS_DIR / f"{SERVE_LOCK}.lock").stat()
+        if (inherited.st_dev, inherited.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError("descriptor does not name the serve lock")
+    except (OSError, OverflowError, ValueError) as e:
+        if held is not None:
+            held.close()
+        print(f"cannot adopt {SERVE_LOCK_FD}={value!r}: {e}", file=sys.stderr)
+        raise SystemExit(1) from e
+    return held
+
+
+def take_serve_lock() -> TextIO:
+    if (held := inherited_lock()) is not None:
+        return held
+    held = util.lock_file(SERVE_LOCK)
+    try:
+        if util.take_lock(held, wait=False):
+            return held
+        holder = (paths.LOCKS_DIR / f"{SERVE_LOCK}.lock").read_text().strip()
+        print(f"arete serve {holder} already holds state folder {paths.STATE_DIR}", file=sys.stderr)
+        raise SystemExit(1)
+    except BaseException:
+        held.close()
+        raise
 
 
 def next_due(loop: Loop, after: datetime) -> str:
@@ -442,7 +479,15 @@ class Server:
         self.say(f"new code: serve {os.getpid()} restarts itself" + (
             f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
         os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
-        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+        fd = self.lock.fileno()
+        os.set_inheritable(fd, True)
+        os.environ[SERVE_LOCK_FD] = str(fd)
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+        except BaseException:
+            os.set_inheritable(fd, False)
+            os.environ.pop(SERVE_LOCK_FD, None)
+            raise
 
     def note_once(self, text: str) -> None:
         if self.code_note != text:
@@ -472,7 +517,13 @@ def start_notes(cfg: config.Config) -> list[str]:
 
 
 def run(with_dashboard: bool = True) -> NoReturn:
-    server = Server()
+    held = take_serve_lock()
+    try:
+        server = Server()
+        server.lock = held
+    except BaseException:
+        held.close()
+        raise
     server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
     for note in start_notes(server.cfg):
         server.say(note)

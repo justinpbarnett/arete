@@ -4560,6 +4560,76 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertTrue(out["check_f"][1].startswith("2 held"), out["check_f"])
 
 
+PROCESS_PRELUDE = r'''
+import atexit, os, signal, subprocess, threading
+from unittest import mock
+from arete import capture, cli, dashboard, serve, util
+
+children = []
+outputs = {}
+
+
+def stop(p):
+    if p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(10)
+
+
+def cleanup():
+    for p in reversed(children):
+        stop(p)
+
+
+atexit.register(cleanup)
+
+
+def child(body, env=None):
+    output = root / f"child-{len(children)}.txt"
+    code = f"import sys;sys.path.insert(0,{str(paths.PACKAGE_DIR.parent)!r});" + body
+    with output.open("w") as stream:
+        p = subprocess.Popen([sys.executable, "-I", "-u", "-c", code], env=env,
+                             stdout=stream, stderr=subprocess.STDOUT)
+    children.append(p)
+    outputs[p] = output
+    return p
+
+
+def wait_output(p, text):
+    deadline = time.monotonic() + 30
+    while True:
+        output = outputs[p].read_text()
+        if text in output:
+            return output
+        assert p.poll() is None and time.monotonic() < deadline, output
+        time.sleep(0.02)
+
+
+def dashboard_start():
+    p = child('from arete import cli, dashboard; '
+              'dashboard.Tailscale.node = lambda *a: None; cli.main(["dashboard"])')
+    try:
+        wait_output(p, "cannot listen yet")
+    finally:
+        stop(p)
+
+
+def refused():
+    built = root / "server-constructed"
+    p = child('from pathlib import Path; from arete import cli, serve; '
+              f'serve.Server = lambda: Path({str(built)!r}).write_text("constructed Server"); '
+              'cli.main(["serve", "--no-dashboard"])')
+    assert p.wait(30) == 1, outputs[p].read_text()
+    output = outputs[p].read_text()
+    assert not built.exists(), output
+    assert str(paths.STATE_DIR) in output, output
+    return output
+'''
+
+
 class ChatContextTests(unittest.TestCase):
     PRELUDE = r'''
 import json, sys, time
@@ -4617,7 +4687,7 @@ def result(**fields):
 
 state.ensure_schema()
 assert chat.new("")["id"] == 1
-'''
+''' + PROCESS_PRELUDE
 
     def scratch(self, body):
         with tempfile.TemporaryDirectory() as directory:
@@ -4641,6 +4711,157 @@ assert chat.new("")["id"] == 1
     FRUITS = r'''
 fruits = ["APRICOT" + " word" * 18, "PLUM" + " word" * 18, "PEAR" + " word" * 18, "And now?"]
 '''
+
+    def test_dashboard_leaves_a_live_replay_answer_busy(self):
+        self.scratch(r'''
+put("chat-1", reply("The answer survived."))
+put("chat-2", reply("Independent answer."))
+server = serve.Server()
+server.lock = serve.take_serve_lock()
+entered, release = threading.Event(), threading.Event()
+real_ask = chat.ask
+def waiting(chat_id, *args, **kw):
+    if chat_id == 1:
+        entered.set()
+        assert release.wait(60)
+    return real_ask(chat_id, *args, **kw)
+chat.ask = waiting
+try:
+    chat.send(1, "Hello")
+    assert entered.wait(30)
+    dashboard_start()
+    assert chat.view(1)["busy"] and chat.any_busy()
+    try:
+        chat.send(1, "Duplicate")
+        raise AssertionError("accepted another message")
+    except chat.Busy:
+        pass
+    assert len(chat.view(1)["messages"]) == 1
+    other = chat.new("")["id"]
+    assert take(other, "Another chat")["messages"][-1]["text"] == "Independent answer."
+    server.code = frozenset()
+    server.code_seen = frozenset({"changed"})
+    with mock.patch.object(serve, "code_stamp", return_value=server.code_seen), \
+         mock.patch.object(serve.os, "execv", side_effect=AssertionError("reloaded a live chat")):
+        server.load_new_code()
+    assert "a chat message is still running" in server.code_note
+finally:
+    release.set()
+deadline = time.monotonic() + 60
+while chat.view(1)["busy"]:
+    assert time.monotonic() < deadline
+    time.sleep(0.02)
+chat.recover()
+messages = chat.view(1)["messages"]
+assert [(m["sender"], m["text"]) for m in messages] == [("you", "Hello"), ("arete", "The answer survived.")]
+server.lock.close()
+result(ok=True)
+''')
+
+    def test_dashboard_recovers_feedback_only_without_a_serve_owner(self):
+        self.scratch(r'''
+capture.save({"text": "A feedback check"})
+def begin():
+    draft = state.capture_draft()
+    assert state.capture_move(draft["id"], draft["revision"], "draft", "checking")
+    assert state.capture_begin_checks(draft["id"], {"ready": "fingerprint"})
+begin()
+held = serve.take_serve_lock()
+try:
+    dashboard_start()
+    draft = state.capture_draft()
+    assert draft["status"] == "checking" and draft["delivery"] == ""
+    assert draft["checks"]["ready"]["result"] == "running"
+finally:
+    held.close()
+dashboard_start()
+draft = state.capture_draft()
+assert draft["status"] == "draft"
+assert draft["checks"]["ready"]["result"] == "interrupted"
+assert draft["checks"]["ready"]["reason"] == capture.INTERRUPTED
+assert state.capture_move(draft["id"], draft["revision"], "draft", "filing")
+with serve.take_serve_lock():
+    dashboard_start()
+    assert state.capture_draft()["delivery"] == ""
+dashboard_start()
+draft = state.capture_draft()
+assert draft["delivery"] == capture.RESTARTED
+assert state.capture_move(draft["id"], draft["revision"], "filing", "draft")
+begin()
+with serve.take_serve_lock(), \
+     mock.patch.object(dashboard.Tailscale, "node", return_value=None), \
+     mock.patch.object(dashboard.time, "sleep", side_effect=RuntimeError("stop dashboard")):
+    try:
+        dashboard.serve(inside_serve=True)
+    except RuntimeError as e:
+        assert str(e) == "stop dashboard"
+assert state.capture_draft()["status"] == "draft"
+result(ok=True)
+''')
+
+    def test_dead_and_execed_answerers_release_their_locks(self):
+        self.scratch(r'''
+for mode in ("kill", "exec"):
+    chat_id = 1 if mode == "kill" else chat.new("")["id"]
+    put(f"chat-{chat_id}", reply("Recovered reply."))
+    code = r"""
+import os, signal, sys, threading, time
+from pathlib import Path
+from arete import chat
+root = Path(ROOT)
+def waiting(*args, **kw):
+    print("ANSWER_READY", flush=True)
+    threading.Event().wait(120)
+chat.ask = waiting
+chat.send(CHAT_ID, "Interrupted")
+while not (root / "go-exec").exists():
+    time.sleep(0.02)
+os.execv(sys.executable, [sys.executable, "-I", "-u", "-c", ADOPT])
+"""
+    adopt = (f"import sys;sys.path.insert(0,{str(paths.PACKAGE_DIR.parent)!r});"
+             "from arete import chat; chat.recover(); chat.recover(); print('RECOVERED', flush=True)")
+    code = code.replace("ROOT", repr(str(root))).replace("CHAT_ID", str(chat_id)).replace("ADOPT", repr(adopt))
+    p = child(code)
+    wait_output(p, "ANSWER_READY")
+    assert chat.any_busy() and chat.view(chat_id)["busy"]
+    if mode == "kill":
+        p.kill()
+        p.wait(10)
+        assert not chat.any_busy()
+        assert chat.view(chat_id)["busy"]
+    else:
+        (root / "go-exec").touch()
+        wait_output(p, "RECOVERED")
+        assert p.wait(30) == 0
+        assert not chat.any_busy()
+    chat.recover()
+    chat.recover()
+    messages = chat.view(chat_id)["messages"]
+    assert [m["text"] for m in messages] == ["Interrupted", chat.RESTARTED]
+    assert take(chat_id, "Try again")["messages"][-1]["text"] == "Recovered reply."
+result(ok=True)
+''')
+
+    def test_failed_claim_and_thread_start_release_answer_lock(self):
+        self.scratch(r'''
+state.chat_claim(1, "Stale claim", "Stale claim")
+try:
+    chat.send(1, "Refused")
+    raise AssertionError("accepted busy claim")
+except chat.Busy:
+    pass
+assert not util.lock_is_held(chat.answer_lock(1))
+chat.recover()
+with mock.patch.object(chat.threading.Thread, "start", side_effect=RuntimeError("no thread")):
+    try:
+        chat.send(1, "No thread")
+    except RuntimeError:
+        pass
+assert not util.lock_is_held(chat.answer_lock(1))
+assert not chat.any_busy()
+chat.recover()
+result(ok=True)
+''')
 
     def test_each_turn_is_a_fresh_call_built_from_the_saved_messages(self):
         found = self.scratch(r'''
@@ -4749,6 +4970,163 @@ result(counts=counts, before=before, summary=last["summary"], prompt=prompt, las
         self.assertGreater(found["kept"], 0)
         self.assertLessEqual(found["size"], 100)
         self.assertEqual(found["last"], "Reply 6.")
+
+
+class ServeLockTests(unittest.TestCase):
+    scratch = ChatContextTests.scratch
+    PRELUDE = r'''
+import json, sys, time
+from pathlib import Path
+from arete import paths, state
+root = Path(sys.argv[1])
+state.ensure_schema()
+def result(**fields):
+    print("BEHAVIOR_RESULT=" + json.dumps(fields))
+''' + PROCESS_PRELUDE
+
+    def test_second_serve_exits_before_construction_and_names_owner(self):
+        self.scratch(r'''
+p = child('import os, time; from arete import serve; '
+          'held = serve.take_serve_lock(); print("HOLDER", os.getpid(), flush=True); time.sleep(120)')
+try:
+    wait_output(p, "HOLDER")
+    plain = child('from arete import cli; cli.main(["serve", "--no-dashboard"])')
+    assert plain.wait(30) == 1
+    assert str(p.pid) in outputs[plain].read_text()
+    assert str(paths.STATE_DIR) in outputs[plain].read_text()
+    assert str(p.pid) in refused()
+    other = child('from arete import serve; held = serve.take_serve_lock(); print("OTHER")',
+                  env={**os.environ, "ARETE_STATE_DIR": str(root / "other-state")})
+    assert other.wait(30) == 0
+    assert "OTHER" in outputs[other].read_text()
+finally:
+    stop(p)
+with serve.take_serve_lock():
+    pass
+result(ok=True)
+''')
+
+    def test_reload_adopts_same_lock_and_executed_children_do_not_keep_it(self):
+        self.scratch(r'''
+adopt = root / "adopt.py"
+adopt.write_text(f"import sys;sys.path.insert(0,{str(paths.PACKAGE_DIR.parent)!r});" + r"""
+import json, os, subprocess, time
+from arete import serve
+held = serve.take_serve_lock()
+st = os.fstat(held.fileno())
+sleeper = subprocess.Popen([sys.executable, "-I", "-c", "import time;time.sleep(120)"], close_fds=False)
+print("ADOPTED=" + json.dumps({"pid": os.getpid(), "inode": [st.st_dev, st.st_ino],
+      "inheritable": os.get_inheritable(held.fileno()), "env": serve.SERVE_LOCK_FD in os.environ,
+      "sleeper": sleeper.pid}), flush=True)
+time.sleep(120)
+""")
+code = r"""
+import json, os, sys
+from arete import serve
+s = serve.Server()
+s.lock = serve.take_serve_lock()
+st = os.fstat(s.lock.fileno())
+print("ORIGINAL=" + json.dumps({"pid": os.getpid(), "inode": [st.st_dev, st.st_ino]}), flush=True)
+serve.code_stamp = lambda: frozenset({"changed"})
+real_exec = os.execv
+serve.os.execv = lambda *a: real_exec(sys.executable, [sys.executable, "-I", ADOPT])
+s.load_new_code()
+s.load_new_code()
+""".replace("ADOPT", repr(str(adopt)))
+p = child(code)
+sleeper = None
+try:
+    output = wait_output(p, "ADOPTED=")
+    original = json.loads(next(line.split("=", 1)[1] for line in output.splitlines() if line.startswith("ORIGINAL=")))
+    adopted = json.loads(next(line.split("=", 1)[1] for line in output.splitlines() if line.startswith("ADOPTED=")))
+    sleeper = adopted["sleeper"]
+    assert original["pid"] == adopted["pid"] == p.pid
+    assert original["inode"] == adopted["inode"]
+    assert not adopted["inheritable"] and not adopted["env"]
+    assert str(p.pid) in refused()
+    p.kill()
+    p.wait(10)
+    os.kill(sleeper, 0)
+    with serve.take_serve_lock() as held:
+        assert os.fstat(held.fileno()).st_ino == adopted["inode"][1]
+finally:
+    stop(p)
+    if sleeper is not None:
+        try:
+            os.kill(sleeper, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+result(ok=True)
+''')
+
+    def test_bad_inherited_descriptors_fail_before_server_construction(self):
+        self.scratch(r'''
+for value in ("not-a-descriptor", "-1", "999999"):
+    p = child('from arete import cli, serve; '
+              'serve.Server = lambda: (_ for _ in ()).throw(AssertionError("constructed Server")); '
+              'cli.main(["serve", "--no-dashboard"])',
+              env={**os.environ, serve.SERVE_LOCK_FD: value})
+    assert p.wait(30) == 1
+    output = outputs[p].read_text()
+    assert "cannot adopt ARETE_SERVE_LOCK_FD" in output and "constructed Server" not in output, output
+with serve.take_serve_lock():
+    pass
+p = child(r"""
+import os
+from arete import serve, util
+wrong = util.lock_file("wrong")
+fd = wrong.fileno()
+os.environ[serve.SERVE_LOCK_FD] = str(fd)
+try:
+    serve.take_serve_lock()
+    raise AssertionError("adopted wrong inode")
+except SystemExit as e:
+    assert e.code == 1
+assert serve.SERVE_LOCK_FD not in os.environ
+try:
+    os.fstat(fd)
+    raise AssertionError("leaked rejected descriptor")
+except OSError:
+    pass
+print("REJECTED")
+""")
+assert p.wait(30) == 0, outputs[p].read_text()
+assert "REJECTED" in outputs[p].read_text()
+result(ok=True)
+''')
+
+    def test_failed_exec_and_failed_construction_release_resources(self):
+        self.scratch(r'''
+with mock.patch.object(serve, "Server", side_effect=RuntimeError("construction failed")):
+    try:
+        serve.run(False)
+    except RuntimeError:
+        pass
+assert not util.lock_is_held(serve.SERVE_LOCK)
+s = serve.Server()
+s.lock = serve.take_serve_lock()
+s.code = frozenset()
+s.code_seen = frozenset({"changed"})
+with mock.patch.object(serve, "code_stamp", return_value=s.code_seen), \
+     mock.patch.object(serve, "child_pids", return_value=set()), \
+     mock.patch.object(serve.os, "execv", side_effect=OSError("exec failed")):
+    try:
+        s.load_new_code()
+        raise AssertionError("exec did not fail")
+    except OSError:
+        pass
+assert not os.get_inheritable(s.lock.fileno())
+assert serve.SERVE_LOCK_FD not in os.environ
+assert str(os.getpid()) in refused()
+with mock.patch.object(serve, "code_stamp", return_value=s.code_seen), \
+     mock.patch.object(serve.util, "sh", return_value=subprocess.CompletedProcess([], 1, "", "bad import")), \
+     mock.patch.object(serve.os, "execv", side_effect=AssertionError("exec after failed import")):
+    s.load_new_code()
+assert "keeps the code it started with" in s.code_note
+assert str(os.getpid()) in refused()
+s.lock.close()
+result(ok=True)
+''')
 
 
 class ParallelSuiteTests(unittest.TestCase):

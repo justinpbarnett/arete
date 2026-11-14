@@ -8,7 +8,9 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 
 `arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted, and serve picks up its queues again when it starts.
 
-Serve restarts itself when its own code changes.
+Only one serve can hold a state folder on this machine. A second invocation exits naming the holder's PID and state folder. A separate `arete dashboard` beside serve leaves its live chats and feedback checks alone.
+
+Serve restarts itself when its own code changes, keeping ownership of the state folder across the restart.
 On each tick it looks at the `.py` files of the arete package and the dashboard's web files, and once a change has held still for one tick and serve has no source poll, dashboard request or chat message of its own in flight, it checks that the new code imports and then replaces itself with a fresh serve in the same process.
 Runs and sessions are processes of their own, so they keep going across the restart, and the fresh serve reaps each one when it ends.
 New code that does not import is named in the serve log, and serve keeps the code it started with.
