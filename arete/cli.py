@@ -323,6 +323,11 @@ def cmd_oncall(args) -> int:
         print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
               f"{found['first_seen']} to {found['last_seen']}")
         print(f"decision: {oncall.decision_line(found)}")
+        if line := oncall.repair_line(found):
+            print(f"repair: {line}")
+        for n, r in enumerate(found["repairs"], 1):
+            print(f"  attempt {n} of {cfg.oncall.max_attempts}: task {r['task'] or '-'}, run {oncall.last_run_id(r)}, "
+                  f"{r['started']}, {r['outcome'] or ('running' if r['task'] else 'starting')}")
         for name, a in found["answers"].items():
             print(f"  {name}: {'yes' if a['value'] else 'no'}, confidence {a['confidence']:.2f}")
         print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
@@ -335,9 +340,11 @@ def cmd_oncall(args) -> int:
             print(json.dumps(row))
         return 0
     for r in rows:
-        print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
-              f"x{r['count']:<4} {r['signature']}")
+        print(f"#{r['id']:<4} {r['phase'] or r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  "
+              f"{when(r['last_seen'])}  x{r['count']:<4} {r['signature']}")
         print(f"      {oncall.decision_line(r)}")
+        if line := oncall.repair_line(r):
+            print(f"      repair: {line}")
     now = oncall.status(cfg)
     if not now["enabled"]:
         print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
