@@ -30,6 +30,7 @@
 <script src="/asks.js" defer></script>
 <script src="/outcomes.js" defer></script>
 <script src="/health.js" defer></script>
+<script src="/incidents.js" defer></script>
 <script src="/settings.js" defer></script>
 <script src="/usage.js" defer></script>
 <script src="/tracking.js" defer></script>
@@ -179,6 +180,13 @@
 
 <section data-view="health" hidden>
   <div id="health-body"></div>
+</section>
+
+<section data-view="incidents" hidden>
+  <div class="split">
+    <div class="list" id="incidents-list"></div>
+    <div class="detail" id="incidents-detail" hidden></div>
+  </div>
 </section>
 
 <section data-view="settings" hidden>

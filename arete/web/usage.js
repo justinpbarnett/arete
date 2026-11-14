@@ -19,6 +19,8 @@ const ACTION_WORDS = {
   "chat-send": "Send in the console", "chat-new": "New chat", "draft-file": "File a drafted issue from the console",
   "draft-drop": "Drop a drafted issue from the console", find: "Find", "feedback-open": "Open feedback", "feedback-submit": "Submit feedback","feedback-screenshot": "Take a screenshot for feedback",
   "feedback-record": "Record a video for feedback", "feedback-attach": "Attach a file to feedback", "feedback-remove": "Remove feedback evidence", "go-key": "G then a letter",
+  "incident-dismiss": "Dismiss an incident", "incident-retry": "Retry an incident", "incident-cancel": "Cancel an incident's repair",
+  "incident-switch": "Switch on-call wakes on or off",
 };
 const USAGE_WINDOWS = ["7", "30", "90"];
 const DEFAULT_USAGE_WINDOW = "30";

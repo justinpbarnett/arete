@@ -317,8 +317,8 @@ def process_gone(row: dict) -> bool:
     return not util.lock_is_held(row["lock"]) if row.get("lock") else not util.pid_alive(row.get("pid"))
 
 
-def cursor_value(name: str):
-    row = state.cursor(name)
+def cursor_value(name: str, connect=state.db):
+    row = state.cursor(name, connect)
     return row, (json.loads(row["value"]) if row and row["value"] else None)
 
 
@@ -336,8 +336,8 @@ def stop_run(run_id: str) -> dict:
     return control.stop_run(run_id)
 
 
-def switched_off() -> bool:
-    return cursor_value(SWITCH)[1] == "off"
+def switched_off(connect=state.db) -> bool:
+    return cursor_value(SWITCH, connect)[1] == "off"
 
 
 def switch(on: bool) -> dict:
@@ -1372,8 +1372,10 @@ def health() -> tuple[bool, str]:
     return True, f"last scan {seconds}s ago"
 
 
-def status(cfg: config.Config) -> dict:
-    row, value = cursor_value(SCAN)
+def status(cfg: config.Config, connect=state.db) -> dict:
+    row, value = cursor_value(SCAN, connect)
+    switch_row = state.cursor(SWITCH, connect)
     return {"enabled": cfg.oncall.enabled, "last_scan": row["polled"] if row else "", "ok": bool(row and row["ok"]),
             "detail": row["detail"] if row else "", "expected": (value or {}).get("expected", 0),
-            "wakes": "off" if switched_off() else "on"}
+            "wakes": "off" if switched_off(connect) else "on",
+            "switched": switch_row["polled"] if switch_row else ""}
