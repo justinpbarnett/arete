@@ -3548,11 +3548,41 @@ gh.issue_create("fixture/repo", "Report", probe)
             ("`a\\` @someone `b`", "`a\\` <code>@someone</code> `b`"),
             ("<summary>ping `@someone`</summary>", "<summary>ping `<code>@someone</code>`</summary>"),
             ("<details>\n```\n@someone\n```\n</details>", "<details>\n```\n<code>@someone</code>\n```\n</details>"),
+            ("<pre>Fixes #12</pre>", "<pre>Fixes <code>#12</code></pre>"),
+            ("请@someone 看", "请<code>@someone</code> 看"),
+            ("bug-fixes #12", "bug-fixes <code>#12</code>"),
+            ("Fixes \\#12", "Fixes \\ <code>#12</code>"),
+            ("xhttps://a.b/@someone", "xhttps://a.b/<code>@someone</code>"),
+            ("http://a_b/@someone", "http://a_b/<code>@someone</code>"),
+            ("www.example.com/@someone", "www.example.com/<code>@someone</code>"),
+            ("https://x.y/fixes #12", "https://x.y/fixes <code>#12</code>"),
+            ("<code>see @someone</code>", "<code>see <code>@someone</code></code>"),
+            ("<div>https://a.b/@someone</div>", "<div>https://a.b/<code>@someone</code></div>"),
+            ("- <div>`@someone`</div>", "- <div>`<code>@someone</code>`</div>"),
+            ("x <b class=\"`\">@someone</b><i class=\"`\">",
+             "x <b class=\"`\"><code>@someone</code></b><i class=\"`\">"),
+            ("| `a | @someone` |", "| `a | <code>@someone</code>` |"),
+            ("`a\nb` @someone `c\nd`", "`a\nb` <code>@someone</code> `c\nd`"),
+            ("a `x\n2. y` @someone `z\nw`", "a `x\n2. y` <code>@someone</code> `z\nw`"),
+            ("- item\n  ```\n  code\n@someone\n\n```\nmore\n```",
+             "- item\n  ```\n  code\n<code>@someone</code>\n\n```\nmore\n```"),
+            (" ```\n@someone", " ```\n<code>@someone</code>"),
+            ("<pre>\n\n```\n@someone\n</pre>\n@other", "<pre>\n\n```\n<code>@someone</code>\n</pre>\n<code>@other</code>"),
+            ("[link](https://example.com/`a) @someone Fixes #12 `b",
+             "[link](https://example.com/`a) <code>@someone</code> Fixes <code>#12</code> `b"),
+            ("[ref]: https://example.com/`a\n\n@someone `b", "[ref]: https://example.com/`a\n\n<code>@someone</code> `b"),
+            ("[ref]: https://example.com/`a @someone `b", "[ref]: https://example.com/`a <code>@someone</code> `b"),
+            ("_@someone_", "_<code>@someone_</code>"),
+            ("__@org/team__", "__<code>@org/team__</code>"),
+            ("| URL | Person |\n| --- | --- |\n| https://example.com/|@someone |",
+             "| URL | Person |\n| --- | --- |\n| https://example.com/|<code>@someone</code> |"),
+            ("@someone see `@other`","<code>@someone</code> see `@other`"),
         ]
         unchanged = ["see #12", "prefixes #12", "a@b.co", "https://example.com/@someone/post",
                      "`@someone Fixes #12`", "```\n@someone\nFixes #12\n```", "~~~\n@someone\nFixes #12\n~~~",
-                     "<code>@someone</code>", "<pre>Fixes #12</pre>",
-                     "<details><summary>Plan</summary>\n\n```\n@someone\n```\n\n</details>"]
+                     "<code>@someone</code>",
+                     "<details><summary>Plan</summary>\n\n```\n@someone\n```\n\n</details>",
+                     "Use `<details>` and `@decorator`", "1. step\n   ```\n   @someone\n   ```", "```\n@someone"]
         table += [(text, text) for text in unchanged]
         for text, expected in table:
             with self.subTest(text=text):
@@ -3565,6 +3595,13 @@ gh.issue_create("fixture/repo", "Report", probe)
                 gh.gh(["issue", "comment", "5", "--body-file", "-"], input="@someone")
             with self.assertRaisesRegex(TypeError, "gh.outgoing"):
                 gh.gh(["issue", "close", "5", "--comment", "@someone"])
+            for args in (["issue", "comment", "5", "-b", "@someone"], ["api", "x", "-f", "body=@someone"],
+                         ["pr", "create", "--body=@someone"], ["pr", "create", "--body-file", "/tmp/x"],
+                         ["issue", "comment", "5", "-b@someone"], ["api", "x", "-fbody=@someone"],
+                         ["api", "repos/o/r/issues/5/comments", "--input", "/tmp/body.json"],
+                         ["api", "x", "--input=/tmp/body.json"]):
+                with self.subTest(args=args), self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                    gh.gh(args)
         self.assertTrue(gh.outgoing("x", "Closes #5").startswith("Closes #5\n\n"))
 
 

@@ -43,10 +43,22 @@ class Outgoing(str):
     pass
 
 
+TEXT_FLAGS = ("--body", "-b", "--comment", "-c", "--field", "-f", "--raw-field", "-F")
+JOINED_TEXT_FLAGS = ("--body=", "--comment=", "--body-file=", "--field=", "--raw-field=", "--input=")
+STDIN_ONLY_FLAGS = ("--body-file", "--input")
+ATTACHED_SHORT_FLAGS = ("-b", "-c", "-f", "-F")
+
+
+def joined_text_flag(arg: str) -> bool:
+    return arg.startswith(JOINED_TEXT_FLAGS) or (len(arg) > 2 and arg.startswith(ATTACHED_SHORT_FLAGS))
+
+
 def unscreened_text(args: list[str], input: str | None) -> bool:
     if input is not None and not isinstance(input, Outgoing):
         return True
-    return any(flag in ("--body", "--comment") and not isinstance(value, Outgoing)
+    if any(joined_text_flag(str(arg)) for arg in args):
+        return True
+    return any((flag in TEXT_FLAGS and not isinstance(value, Outgoing)) or (flag in STDIN_ONLY_FLAGS and value != "-")
                for flag, value in itertools.pairwise(args))
 
 
