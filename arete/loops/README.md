@@ -15,6 +15,10 @@ A folder that does not validate shows as broken in `arete loop list` and on the 
 
 ## Kinds
 
+Queued events survive a failed run or a requested stop as a dead item. A budget exceeded during execution also makes the input dead; a budget hold before execution leaves it waiting without using a retry. A killed run or a signal without a stop request returns its input to the queue once. A second interruption makes it dead, even across serve restarts. Done and ordinary skipped runs consume their input.
+
+`arete loop list` shows dead counts. `arete loop status NAME` lists each dead queue ID, run, event count, time and reason. `arete loop requeue ID` resets its retry count and returns the same events to the queue. Dead items expire after 56 days; waiting inputs and active claims do not expire. Empty schedule inputs are deleted on failure, stop or exhausted retries. Recovery coalesces an empty input with an already waiting fire of the same trigger.
+
 | Kind | What one run does |
 |---|---|
 | `command` | Runs `[run] command`. Exit 0 is done. Events arrive on stdin as JSON lines. A stdout line that is a JSON object with `title` and `fingerprint` is a finding; one with a number `value` is the metric value. |

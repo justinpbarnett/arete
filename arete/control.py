@@ -152,6 +152,7 @@ def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]
     states = state.loop_states(connect)
     running = {r["loop"]: r["id"] for r in state.runs_marked_running(connect) if r["kind"] == "loop"}
     waiting = Counter(item["loop"] for item in state.pending(connect))
+    dead = Counter(item["loop"] for item in state.dead_items(connect))
     spent: dict[str, float] = defaultdict(float)
     for s in state.steps_since(day_ago(), connect, paid_only=True):
         if billing_of(s, cfg) not in ("local", "replay"):
@@ -161,6 +162,7 @@ def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]
         last = next(iter(state.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=connect)), None)
         st = states.get(loop.name) or {}
         out.append({**loop.view(), "running": running.get(loop.name, ""), "pending": waiting[loop.name],
+                    "dead": dead[loop.name],
                     "next_due": st.get("next_due") if loop.enabled else None, "last_fire": st.get("last_fire"),
                     "spent_24h": round(spent[loop.name], 4),
                     "last": {k: last[k] for k in ("id", "status", "started", "finished", "summary", "cost_usd",
@@ -179,6 +181,8 @@ def loop_detail(name: str, connect=state.db) -> dict:
             "runs": [{**r, "paid": paid.get(r["id"], 0)} for r in runs],
             "findings": state.findings(loop.name, 40, connect),
             "waiting": [i for i in state.pending(connect) if i["loop"] == loop.name],
+            "dead": [{k: v for k, v in i.items() if k != "loop"}
+                     for i in state.dead_items(connect) if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
             "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "digests": digests(loop), "metrics": loop_metrics(loop, connect),

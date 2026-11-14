@@ -535,6 +535,9 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 """
 MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
+              ("queue", "attempts", "ALTER TABLE queue ADD COLUMN attempts INTEGER DEFAULT 0"),
+              ("queue", "dead_at", "ALTER TABLE queue ADD COLUMN dead_at TEXT"),
+              ("queue", "dead_reason", "ALTER TABLE queue ADD COLUMN dead_reason TEXT DEFAULT ''"),
 ("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
@@ -886,6 +889,7 @@ def cursors(connect=db) -> list[dict]:
 
 def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None) -> int:
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         if not payload and c.execute("SELECT 1 FROM queue WHERE loop = ? AND run_id IS NULL AND payload = '[]' "
                                      "AND trigger = ?", (loop, trigger)).fetchone():
             return 0
@@ -905,9 +909,10 @@ def queue_item(item_id: int) -> dict | None:
     return {**dict(r), "payload": json.loads(r["payload"] or "[]")} if r else None
 
 
-def take_queue_item(item_id: int, run_id: str | None) -> None:
+def take_queue_item(item_id: int, run_id: str) -> bool:
     with db() as c:
-        c.execute("UPDATE queue SET run_id = ? WHERE id = ?", (run_id, item_id))
+        return c.execute("UPDATE queue SET run_id = ? WHERE id = ? AND run_id IS NULL",
+                         (run_id, item_id)).rowcount == 1
 
 
 def drop_queue_item(item_id: int) -> None:
@@ -920,9 +925,57 @@ def release_claimed_items(run_id: str) -> None:
         c.execute("UPDATE queue SET run_id = NULL WHERE run_id = ?", (run_id,))
 
 
-def drop_claimed_items(run_id: str) -> None:
+def finish_claim(c, row: dict, how: str, summary: str) -> None:
+    if how == "retry":
+        duplicate = not json.loads(row["payload"] or "[]") and c.execute(
+            "SELECT 1 FROM queue WHERE loop = ? AND trigger = ? AND payload = '[]' AND run_id IS NULL",
+            (row["loop"], row["trigger"])).fetchone()
+        if duplicate:
+            how = "drop"
+        elif row["attempts"] + 1 < 2:
+            c.execute("UPDATE queue SET run_id = NULL, attempts = attempts + 1 WHERE id = ?", (row["id"],))
+            return
+        else:
+            how = "dead"
+    if how == "drop" or not json.loads(row["payload"] or "[]"):
+        c.execute("DELETE FROM queue WHERE id = ?", (row["id"],))
+    else:
+        c.execute("UPDATE queue SET dead_at = ?, dead_reason = ? WHERE id = ?",
+                  (util.iso(), summary, row["id"]))
+
+
+def end_claim(run_id: str, how: str, summary: str) -> None:
     with db() as c:
-        c.execute("DELETE FROM queue WHERE run_id = ?", (run_id,))
+        c.execute("BEGIN IMMEDIATE")
+        for row in c.execute("SELECT * FROM queue WHERE run_id = ? AND dead_at IS NULL", (run_id,)).fetchall():
+            finish_claim(c, dict(row), how, summary)
+
+
+def release_settled_claims() -> None:
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "
+                         "WHERE q.run_id IS NOT NULL AND q.dead_at IS NULL "
+                         "AND (r.status IS NULL OR r.status != 'running')").fetchall()
+        for row in rows:
+            finish_claim(c, dict(row), "dead" if row["status"] == "stopped" else "retry",
+                         row["summary"] or f"run {row['run_id']} {row['status'] or 'is missing'}")
+
+
+def dead_items(connect=db) -> list[dict]:
+    with connect() as c:
+        return [{**{k: row[k] for k in ("id", "loop", "run_id", "dead_reason", "dead_at")},
+                 "events": len(json.loads(row["payload"] or "[]"))}
+                for row in c.execute("SELECT * FROM queue WHERE dead_at IS NOT NULL ORDER BY id")]
+
+
+def requeue_item(item_id: int) -> None:
+    from . import control
+
+    with db() as c:
+        if not c.execute("UPDATE queue SET run_id = NULL, attempts = 0, dead_at = NULL, dead_reason = '' "
+                         "WHERE id = ? AND dead_at IS NOT NULL", (item_id,)).rowcount:
+            raise control.NotFound(f"no dead queue item {item_id}")
 
 
 SEEN_AGAIN = "seen again"
@@ -934,7 +987,7 @@ def prune(days: float = 14, keep_days: float = 30) -> None:
     with db() as c:
         c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
         c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
-        c.execute("DELETE FROM queue WHERE run_id IS NOT NULL AND enqueued < ?", (since,))
+        c.execute("DELETE FROM queue WHERE dead_at < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         old = util.iso(util.now() - timedelta(days=days * 4))
         kept = util.iso(util.now() - timedelta(days=keep_days))

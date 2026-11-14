@@ -278,12 +278,12 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
            detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
     cfg = cfg or config.load()
     loop = control.working_loop(name, cfg)
-    fire = state.queue_item(item) if item else None
-    if item and not fire:
-        raise control.NotFound(f"queue item {item} is gone")
     with util.lock_file(state.loop_lock(loop.name)) as held:
         if not util.take_lock(held, wait=False):
             raise control.Busy(loop.name)
+        fire = state.queue_item(item) if item is not None else None
+        if item is not None and (not fire or fire["run_id"] is not None):
+            raise control.NotFound(f"queue item {item} is gone or already claimed")
         for stale in state.runs_marked_running():
             if stale["kind"] == "loop" and stale["loop"] == loop.name:
                 record.interrupt(stale)
@@ -295,8 +295,10 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
                      device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
                      log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
                      runner=runner.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
-        if fire:
-            state.take_queue_item(item, run.id)
+        if fire and not state.take_queue_item(item, run.id):
+            why = f"queue item {item} was taken by another run"
+            settle(run, "skipped", why)
+            raise control.NotFound(why)
         if run.events:
             util.write_json(run.events_file, run.events)
         if not detach:
@@ -339,14 +341,18 @@ def carry(run: LoopRun) -> str:
         state.release_claimed_items(run.id)
         return settle(run, "skipped", f"budget: {spent} is spent, so its input waits in the queue")
     run.scratch.mkdir(parents=True, exist_ok=True)
+    how = "drop"
     try:
         signal.signal(signal.SIGTERM, stop_on_term)
         with devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device:
             status, summary = screened(run) or loops.KINDS[run.loop.kind].run(run)
     except OverBudget as e:
         status, summary = "skipped", f"budget: {e}"
+        how = "dead"
     except Stopped:
-        status, summary = "stopped", record.STOPPED if record.stop_asked(run.id) else "stopped by a signal"
+        asked = record.stop_asked(run.id)
+        status, summary = "stopped", record.STOPPED if asked else "stopped by a signal"
+        how = "dead" if asked else "retry"
     except devices.DeviceError as e:
         status, summary = "failed", util.one_line(str(e), 500)
     except Exception as e:
@@ -354,8 +360,9 @@ def carry(run: LoopRun) -> str:
         status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        state.drop_claimed_items(run.id)
-    return settle(run, status, devices.with_left_up(summary, run.id))
+    summary = devices.with_left_up(summary, run.id)
+    state.end_claim(run.id, "dead" if status == "failed" else how, summary)
+    return settle(run, status, summary)
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:
