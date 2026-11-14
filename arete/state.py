@@ -468,7 +468,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     shapes TEXT DEFAULT '',
     policies TEXT,
     phase TEXT DEFAULT '',
-    waiting TEXT DEFAULT ''
+    waiting TEXT DEFAULT '',
+    rearmed INTEGER DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -562,7 +563,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
                   ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
                   ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"),
-                  ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"))]]
+                  ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"),
+                  ("rearmed", "INTEGER DEFAULT 0"))]]
 
 
 @contextmanager
