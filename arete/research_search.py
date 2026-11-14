@@ -513,7 +513,35 @@ def render(e: dict, path: Path) -> str:
             lines += [f"    refused: {fault}" for fault in r["refused"]]
             lines += [f"    requested: {goal}" for goal in r["requests"]]
         lines.append("cited: " + (", ".join(synthesis["cited"]) or "none"))
+    if audit := e.get("audit"):
+        lines += audit_lines(audit, {source["id"]: source for source in e["sources"]})
     return "\n".join(lines)
+
+
+def audit_lines(audit: dict, sources: dict) -> list[str]:
+    def where(sid: str) -> str:
+        source = sources.get(sid, {})
+        return (f"{sid} {source.get('url', 'unknown')} (published {source.get('published') or 'not stated'}, "
+                f"event {source.get('event_date') or 'not stated'})")
+
+    lines = ["", f"audit {audit['status']} ({audit['runner']} {audit['model']}, {audit['at']})"
+             + (f": {audit['why']}" if audit["why"] else "")]
+    for call in audit["calls"]:
+        lines.append(f"  batch {call['batch']}: {util.count(call['tries'], 'try', 'tries')}, "
+                     f"{len(call['refused'])} refused, fetch allowed on {', '.join(call['fetch']) or 'none'}")
+        lines += [f"    refused: {fault}" for fault in call["refused"]]
+    for r in audit["claims"]:
+        kind = f"{r['kind']}, decision-critical" if r["critical"] else r["kind"]
+        if r["verdict"] == "not audited":
+            lines += [f"  {r['id']} {kind}: not audited: {r['why']}", f"    claim: {r['claim']}"]
+            continue
+        lines += [f"  {r['id']} {kind}: {r['verdict']}; {r['outcome']}", f"    claim: {r['claim']}",
+                  "    sources: " + ("; ".join(where(sid) for sid in r["sources"]) or "none")]
+        lines += [f"    quote ({r['quote_from']}): {r['quote']}"] if r["quote"] else []
+        lines += [f"    note: {r['note']}"] if r["note"] else []
+        lines += [f"    correction: {r['correction']}"] if r["correction"] else []
+    lines += [f"  disagreement: {d['issue']} ({', '.join(d['sources'])})" for d in audit["disagreements"]]
+    return lines
 
 
 def shown(ref: str) -> str | None:
