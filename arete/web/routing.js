@@ -1,6 +1,6 @@
 "use strict";
 
-const DETAIL_VIEW = { run: "runs", session: "sessions", loop: "loops", ticket: "triage" };
+const DETAIL_VIEW = { run: "runs", session: "sessions", loop: "loops", ticket: "triage", incident: "incidents" };
 const OLD_HASHES = { launch: "#sessions", fleet: "#health", trends: "#outcomes", chat: "#live" };
 const QUERY_RULES = {
   runs: {

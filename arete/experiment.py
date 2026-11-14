@@ -31,6 +31,8 @@ ALIVE_SECONDS = 10
 TASK_KEYS = ("base", "split")
 ACCEPT_KEYS = ("baseline", "split", "min_pairs", "min_difference", "confidence")
 LIMIT_KEYS = ("spend_usd", "minutes", "calls", "tokens")
+HEADROOM = "codex_headroom"
+HEADROOM_KEYS = ("tokens", "spend_usd")
 LIMIT_LABELS = {"spend_usd": "spend", "minutes": "time", "calls": "calls", "tokens": "tokens"}
 MIN_PAIRS = 6
 DEFAULT_CACHE_POLICY = "provider-default"
@@ -87,6 +89,7 @@ class Experiment:
     skip: frozenset = frozenset()
     make_run: Callable | None = None
     recovered: Callable | None = None
+    codex: list[str] = field(default_factory=list)
 
 
 def unknown(table: dict, allowed: tuple[str, ...], where: str) -> None:
@@ -235,13 +238,28 @@ def read_accept(table: dict, arms: dict, splits: dict[str, str]) -> dict:
             "confidence": confidence}
 
 
+def read_headroom(table) -> dict:
+    if not isinstance(table, dict) or not table:
+        raise Refused("limits.codex_headroom must be a table with tokens")
+    unknown(table, HEADROOM_KEYS, "limits.codex_headroom")
+    found = {"tokens": number(table, "tokens", "limits.codex_headroom.", whole=True)}
+    if "spend_usd" in table:
+        found["spend_usd"] = number(table, "spend_usd", "limits.codex_headroom.")
+    for key, value in found.items():
+        if value <= 0:
+            raise Refused(f"limits.codex_headroom.{key} must be above 0, not {value}")
+    return found
+
+
 def read_limits(table: dict) -> dict:
-    unknown(table, LIMIT_KEYS, "limits")
+    unknown(table, (*LIMIT_KEYS, HEADROOM), "limits")
     found = {}
     for key in LIMIT_KEYS:
         found[key] = number(table, key, "limits.", whole=key in ("calls", "tokens"))
         if found[key] <= 0:
             raise Refused(f"limits.{key} must be above 0, not {found[key]}")
+    if HEADROOM in table:
+        found[HEADROOM] = read_headroom(table[HEADROOM])
     return found
 
 
@@ -269,14 +287,35 @@ def effective(cfg: config.Config, s: steps.Settings) -> str:
     return sha(json.dumps(asdict(s), sort_keys=True, default=str), mcp_definitions(cfg, s))
 
 
-def unstoppable(cfg: config.Config, atom: str, arms: dict, frozen: dict, grader: steps.Settings) -> None:
+def codex_route(label: str, s: steps.Settings, limits: dict) -> list[str]:
+    which = runner.stands_for(s.model, s.runner)[0]
+    if which not in runner.CANNOT_STOP:
+        return []
+    if HEADROOM not in limits:
+        raise Refused(f"{label}: {runner.CANNOT_STOP[which]}")
+    return [f"{label} ({which} {s.model})"]
+
+
+def unstoppable(cfg: config.Config, atom: str, arms: dict, frozen: dict, grader: steps.Settings,
+                limits: dict) -> list[str]:
     held = {**{f"arm {n}": (s, atom) for n, s in arms.items()}, **{f"step {r}": (s, r) for r, s in frozen.items()},
             "the grader": (grader, "grade")}
+    routes = []
     for label, (s, role) in held.items():
+        routes += codex_route(label, s, limits)
         which = runner.chosen(s.model, s.runner, cfg)[0]
-        structured = role in ("plan", "grade")
-        if why := runner.CANNOT_STOP.get(which) or (runner.CANNOT_GATE.get(which) if structured else None):
+        if role in ("plan", "grade") and (why := runner.CANNOT_GATE.get(which)):
             raise Refused(f"{label}: {why}")
+    return routes
+
+
+def codex_lines(limits: dict, routes: list[str]) -> list[str]:
+    if HEADROOM not in limits:
+        return []
+    room = limits[HEADROOM]
+    words = f"{room['tokens']} tokens" + (f" and ${room['spend_usd']:g}" if "spend_usd" in room else "")
+    return [f"codex headroom: each codex launch needs at least {words} left",
+            *[f"codex route {r}: launched only with at least {words} left" for r in routes]]
 
 
 def followers(atom: str, follow: bool) -> list[str]:
@@ -334,9 +373,10 @@ def designed(data: dict, carried: Totals | None = None, follow: bool = False) ->
             if role != atom and role not in following}
     inherited = {n: {role: steps.resolve(cfg, layer, role, "", None, given[n]) for role in following}
                  for n in settings}
-    unstoppable(cfg, atom, settings,
-                {**held, **{f"{role} of arm {n}": s for n, roles in inherited.items() for role, s in roles.items()}},
-                grader)
+    routes = unstoppable(
+        cfg, atom, settings,
+        {**held, **{f"{role} of arm {n}": s for n, roles in inherited.items() for role, s in roles.items()}},
+        grader, limits)
     own = {n: fingerprints(repo, layer, Path(x.get("prompts", paths.PROMPTS_DIR)), x.get("context", ""))
            for n, x in extras.items()}
     design = {
@@ -355,10 +395,11 @@ def designed(data: dict, carried: Totals | None = None, follow: bool = False) ->
                    "settings": effective(cfg, grader), "verify": sha_json(asdict(layer.verify)) if layer.verify else "",
                    "prompt": sha((paths.PROMPTS_DIR / "grade.md").read_bytes())},
         "fingerprints": shared,
+        **({HEADROOM: limits[HEADROOM]} if HEADROOM in limits else {}),
     }
     digest = sha_json(design)[:12]
     return Experiment(name, cfg, repo, layer, atom, repeats, cache_policy, given, settings, tasks, splits, accept,
-                      limits, frozen, design, digest, extras, carried or Totals(), follow)
+                      limits, frozen, design, digest, extras, carried or Totals(), follow, codex=routes)
 
 
 def default_path(name: str) -> Path:
@@ -613,10 +654,12 @@ class TrialRun(evals.EvalRun):
         given = kw.get("timeout") or (self.settings(role).timeout_minutes * 60 if role else left)
         self.call_timeout = min(given, left)
         kw.update(timeout=self.call_timeout, wait_out_limits=False, remaining_budget=self.dollars_left,
-                  remaining_tokens=self.tokens_left)
+                  remaining_tokens=self.tokens_left, codex_headroom=self.limits.get(HEADROOM))
         res = super().agent(step, text, cwd, role, **kw)
         if not res.ok and res.error.startswith(runner.NO_ROUTE):
             self.stopped_by = self.stopped_by or res.error
+            if runner.out_of_headroom(res):
+                self.stop(self.stopped_by)
         elif why := reached(self.limits, self.used(), launching=False):
             self.stop(self.stopped_by or why)
         return res
@@ -695,6 +738,14 @@ def alive(path: Path, run_id: str, started: float):
         beater.join()
 
 
+def overrun(limits: dict, used: Totals) -> dict:
+    tokens = used.tokens - limits["tokens"]
+    spend = used.spend - limits["spend_usd"]
+    if tokens <= 0 and spend <= 0:
+        return {}
+    return {"overrun": {"tokens": max(0, tokens), "spend_usd": round(max(0.0, spend), 6)}}
+
+
 def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, used: Totals) -> str:
     found = events(path)
     attempt = 1 + max((e["attempt"] for e in found if e.get("event") == "start" and key_of(e) == (task, arm, repeat)),
@@ -736,7 +787,8 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                                     result["passed"] and not stopped_by, failures, result["repairs"],
                                     {"checks": result["checks"], "verify": result["verify"],
                                      "hidden_check": result["hidden"], "blocking_findings": result["blocking"],
-                                     **trial.outcomes()}))
+                                     **trial.outcomes(),
+                                     **(overrun(exp.limits, trial.used()) if stopped_by else {})}))
             return stopped_by
     finally:
         held.close()
@@ -811,6 +863,7 @@ def plan_lines(exp: Experiment, path: Path, label: str = "experiment") -> list[s
              f"{max(MIN_PAIRS, accept['min_pairs'])} pairs, a difference above {accept['min_difference']:g} at "
              f"{accept['confidence']:g} confidence"),
             "limits: " + ", ".join(f"{k} {exp.limits[k]:g}" for k in LIMIT_KEYS)]
+    out += codex_lines(exp.limits, exp.codex)
     return out
 
 

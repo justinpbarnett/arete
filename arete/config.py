@@ -215,6 +215,7 @@ class OncallConfig:
     incident_budget_usd: float = 5.0
     daily_budget_usd: float = 10.0
     cooldown_minutes: float = 30.0
+    keep_days: float = 30.0
 
 
 @dataclass
@@ -634,7 +635,8 @@ def oncall_source(entry, repos: list[Repo]) -> OncallSource:
 
 
 ONCALL_BOUNDS = {"max_repairs": (int, 0), "wakes_per_hour": (int, 0), "max_attempts": (int, 1),
-                 "incident_budget_usd": (float, 0), "daily_budget_usd": (float, 0), "cooldown_minutes": (float, 0)}
+                 "incident_budget_usd": (float, 0), "daily_budget_usd": (float, 0), "cooldown_minutes": (float, 0),
+                 "keep_days": (float, 0)}
 
 
 def oncall_bounds(table: dict) -> dict:

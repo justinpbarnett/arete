@@ -49,6 +49,7 @@ class Search:
     repo: str
     environment: str
     task_evidence: dict
+    codex: list[str]
 
 
 def sha(data: bytes) -> str:
@@ -111,7 +112,7 @@ def read_floor(table: dict) -> dict:
 
 
 def read_limits(table: dict) -> dict:
-    experiment.unknown(table, LIMIT_KEYS, "limits")
+    experiment.unknown(table, (*LIMIT_KEYS, experiment.HEADROOM), "limits")
     found = experiment.read_limits({k: v for k, v in table.items() if k != "rounds"})
     rounds = experiment.number(table, "rounds", "limits.", whole=True)
     if rounds < 1:
@@ -137,7 +138,7 @@ def manifest(fields: dict, tag: str, split: str, arms: dict, champion: str) -> d
             "repeats": fields["repeats"], "cache_policy": fields["cache_policy"], "arms": arms,
             "tasks": {n: t for n, t in fields["tasks"].items() if t.get("split") == split},
             "accept": {**fields["accept"], "baseline": champion, "split": split},
-            "limits": {k: fields["limits"][k] for k in experiment.LIMIT_KEYS}}
+            "limits": {k: v for k, v in fields["limits"].items() if k != "rounds"}}
 
 
 def snapshot(exp: experiment.Experiment) -> dict:
@@ -180,10 +181,12 @@ def load(path: Path) -> Search:
     evidence_of = {n: t for exp in (built[0], *others) for n, t in exp.design["tasks"].items()}
     env = environment(built[0])
     design = {**{k: v for k, v in fields.items() if k != "limits"}, "rounds": rounds, "baseline": base["settings"],
-              "inheritors": base["inheritors"], "environment": env, "task_evidence": evidence_of}
+              "inheritors": base["inheritors"], "environment": env, "task_evidence": evidence_of,
+              **({experiment.HEADROOM: fields["limits"][experiment.HEADROOM]}
+                 if experiment.HEADROOM in fields["limits"] else {})}
     previews = [{n: exp.settings[n] for n in r["candidates"]} for r, exp in zip(rounds, built, strict=True)]
     return Search(fields, rounds, previews, base, design, experiment.sha_json(design)[:12], built[0].repo.name,
-                  env, evidence_of)
+                  env, evidence_of, list(dict.fromkeys(r for e in (*built, *others) for r in e.codex)))
 
 
 def family(atom: str) -> set[str]:
@@ -237,6 +240,7 @@ def dry_run(s: Search, folder: Path) -> int:
             (f"floor: accept_rate {f['floor']['accept_rate']:g}, max_drop {f['floor']['max_drop']:g}, "
              f"min_saving {f['floor']['min_saving']:g}"),
             "limits: " + ", ".join(f"{k} {f['limits'][k]:g}" for k in LIMIT_KEYS),
+            *experiment.codex_lines(f["limits"], s.codex),
             f"at most {util.count(most_trials(s), 'trial')}, none started by this dry run"]
     print("\n".join(out))
     return 0

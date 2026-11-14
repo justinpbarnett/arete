@@ -12,6 +12,8 @@ from . import (
     control,
     delivery,
     loops,
+    oncall,
+    outbound,
     paths,
     pipeline,
     sessions,
@@ -32,6 +34,7 @@ OUTCOME_OF_STATUS = {"merged": "shipped", "pr": "shipped", "done": "shipped", "f
 STATE_OF_SEVERITY = {"fail": "fault", "warn": "caution"}
 STATUSES_OF_FILTER = {"running": ("running",), "failed": ("failed", "interrupted")}
 FEED_KINDS = ("loop", "session", "draft")
+INCIDENT_NOTES = 500
 MOST_RUNS_SHOWN = 500
 RUNS_TO_FIND = 40
 SESSIONS_TO_FIND = 30
@@ -245,16 +248,73 @@ def ready_in_one_click(v: dict) -> list[dict]:
 
 
 def checks_and_alerts() -> dict:
-    return {"checks": panel(checks), "alerts": panel(alerts)}
+    return {"checks": panel(checks), "alerts": panel(alerts),
+            "incidents": panel(lambda: state.blocked_incidents(connect=state.reader))}
 
 
 def health_word(beat: dict, found: dict) -> str:
     c, a = found["checks"].get("rows"), found["alerts"].get("rows")
     if c is None or a is None or not beat.get("alive") or a["alerts"] or any(x["state"] == "fault" for x in c["checks"]):
         return "fault"
-    if not c["heartbeat"] or beat.get("broken") or beat.get("poll_errors") or any(x["state"] != "ok" for x in c["checks"]):
+    blocked = "incidents" in found and (found["incidents"].get("rows") is None or bool(found["incidents"]["rows"]))
+    if (not c["heartbeat"] or beat.get("broken") or beat.get("poll_errors") or blocked
+            or any(x["state"] != "ok" for x in c["checks"])):
         return "caution"
     return "ok"
+
+
+def incident_number(text: str) -> int:
+    if not (text.isascii() and text.isdecimal() and len(text) <= 18):
+        raise control.NotFound(f"no incident {text}")
+    return int(text)
+
+
+def watcher(cfg: config.Config) -> dict:
+    now = oncall.status(cfg, connect=state.reader)
+    word = "disabled" if not now["enabled"] else "switched_off" if now["wakes"] == "off" else "on"
+    return {"state": word, "config": paths.short_path(paths.CONFIG_FILE), "last_scan": now["last_scan"],
+            "ok": now["ok"], "detail": now["detail"], "expected": now["expected"], "switched": now["switched"]}
+
+
+def incident_row(r: dict) -> dict:
+    keys = ("id", "state", "phase", "waiting", "class", "source", "repo", "signature", "first_seen", "last_seen",
+            "count", "decision", "confidence", "reason", "injection", "decided", "retry_at", "recovery", "closed",
+            "alerted")
+    return {**{k: r[k] for k in keys}, "decision_line": oncall.decision_line(r), "repair_line": oncall.repair_line(r)}
+
+
+def incidents_board() -> dict:
+    cfg = config.load()
+    rows = state.incidents(connect=state.reader, open_first=True)
+    return {"now": util.iso(), "watcher": watcher(cfg), "incidents": [incident_row(r) for r in rows]}
+
+
+def incident_repair(repair: dict, number: int, runs: list[dict], paid: dict[str, float]) -> dict:
+    listed = [{"id": r["id"], "status": r["status"], "started": r["started"], "finished": r["finished"],
+               "pr_url": r["pr_url"] or "", "paid": paid.get(r["id"], 0)} for r in runs]
+    return {"attempt": number, "repo": repair["repo"], "task": repair["task"], "started": repair["started"],
+            "ended": repair["ended"], "outcome": repair["outcome"], "runs": listed,
+            "paid": sum(r["paid"] for r in listed)}
+
+
+def incident_board(text: str) -> dict:
+    cfg = config.load()
+    r = state.incident(incident_number(text), connect=state.reader, last_notes=INCIDENT_NOTES)
+    if r is None:
+        raise control.NotFound(f"no incident {text}")
+    made = {x["id"]: [] if not x["task"] else state.ticket_runs(x["repo"], x["task"], limit=50, connect=state.reader)
+            for x in r["repairs"]}
+    ids = [run["id"] for runs in made.values() for run in runs]
+    paid = state.paid_by_run(ids, connect=state.reader, local_providers=cfg.local_providers)
+    numbers = {x["id"]: n for n, x in enumerate(oncall.attempts(r), 1)}
+    repairs = [incident_repair(x, numbers.get(x["id"], 0), made[x["id"]], paid) for x in r["repairs"]]
+    open_to_steer = r["state"] == "open" and not oncall.live_repair(r)
+    return {"now": util.iso(), "watcher": watcher(cfg), "incident": {
+        **incident_row(r), "evidence": outbound.redact(r["evidence"] or ""), "answers": r["answers"],
+        "notes": r["notes"], "notes_total": r["notes_total"], "max_attempts": cfg.oncall.max_attempts,
+        "repairs": repairs, "paid": sum(x["paid"] for x in repairs),
+        "can": {"dismiss": open_to_steer, "retry": open_to_steer and r["decision"] == "wake",
+                "cancel": oncall.live_repair(r) is not None}}}
 
 
 def health_board() -> dict:

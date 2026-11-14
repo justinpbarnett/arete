@@ -73,7 +73,25 @@ CANNOT_GATE = {"pi": "pi restates a structured answer in a second launch that ca
 NO_SERVER_ACCESS = {"codex": "codex runs with the network off, so it cannot reach the arete server",
                     "pi": "pi has no restricted Bash, so it cannot run the arete session commands"}
 CANNOT_STOP = {"codex": "codex reports usage only when its turn ends, so it cannot stop a call at a token or spend limit"}
+HEADROOM_STATE = "headroom"
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
+
+
+def short_of_headroom(headroom: dict, tokens_left: int, dollars_left: float | None) -> str:
+    if tokens_left < headroom["tokens"]:
+        return f"codex_headroom.tokens is {headroom['tokens']} and {tokens_left} tokens are left"
+    if "spend_usd" in headroom and dollars_left is not None and dollars_left < headroom["spend_usd"]:
+        return f"codex_headroom.spend_usd is ${headroom['spend_usd']:g} and ${dollars_left:.4f} is left"
+    return ""
+
+
+def codex_refusal(which: str, headroom: dict | None, tokens: Callable[[], int],
+                  budget: float | None) -> tuple[str, str]:
+    if which not in CANNOT_STOP:
+        return "", ""
+    if headroom is None:
+        return "ineligible", CANNOT_STOP[which]
+    return HEADROOM_STATE, short_of_headroom(headroom, tokens(), budget)
 
 
 def route(model: str, runner: str = "") -> tuple[str, str]:
@@ -288,7 +306,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
-        hard_cap: bool = False, needs_server: bool = False,
+        hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
         **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
@@ -307,6 +325,15 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if which == REPLAY and (cfg.replay.all or not (settings and settings.requires.declared)):
         if resume_only and not kept.id:
             return unresumable(which, name, resume)
+        if remaining_tokens:
+            stood = stands_for(model, run_with)[0]
+            verdict, why = codex_refusal(stood, codex_headroom, remaining_tokens,
+                                         remaining_budget() if remaining_budget else kw.get("max_budget_usd"))
+            if why:
+                skipped = [{"runner": stood, "model": name, "credential": "replay", "state": verdict, "detail": why,
+                            "until": ""}]
+                return Result(ok=False, runner=which, model=name, session=resume, skipped=skipped,
+                              error=" ".join(f"{NO_ROUTE}: {route_reasons(skipped)}".split()))
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
         text = fresh_prompt(which) if fresh_prompt and resume.id and not kept.id else prompt
@@ -322,7 +349,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
                 remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
                 tokens=remaining_tokens, structured=kw.get("json_schema") is not None,
-                hard_cap=hard_cap, needs_server=needs_server)
+                hard_cap=hard_cap, needs_server=needs_server, headroom=codex_headroom)
     from . import routing
 
     limited: list[Result] = []
@@ -428,6 +455,7 @@ class Trip:
     structured: bool = False
     hard_cap: bool = False
     needs_server: bool = False
+    headroom: dict | None = None
 
 
 @dataclass
@@ -601,8 +629,13 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
         if key in trip.barred:
             skipped.append(passed_over(candidate, "ineligible", trip.barred[key]))
             continue
-        if trip.tokens is not None and (why := CANNOT_STOP.get(candidate.runner)
-                                        or (CANNOT_GATE.get(candidate.runner) if trip.structured else None)):
+        if trip.tokens is not None:
+            verdict, why = codex_refusal(candidate.runner, trip.headroom, trip.tokens,
+                                         trip.budget() if trip.budget else trip.max_budget)
+            if why:
+                skipped.append(passed_over(candidate, verdict, why))
+                continue
+        if trip.tokens is not None and trip.structured and (why := CANNOT_GATE.get(candidate.runner)):
             skipped.append(passed_over(candidate, "ineligible", why))
             continue
         remaining = None
@@ -677,6 +710,11 @@ def exhausted(trip: Trip, skipped: list[dict], limited: list[Result], which: str
 def out_of_budget(res: Result) -> bool:
     return (not res.ok and res.error.startswith(NO_ROUTE)
             and any(s["state"] == "budget_spent" for s in res.skipped))
+
+
+def out_of_headroom(res: Result) -> bool:
+    return (not res.ok and res.error.startswith(NO_ROUTE)
+            and any(s["state"] == HEADROOM_STATE for s in res.skipped))
 
 
 def account_of(auth: accounts.Auth) -> str:

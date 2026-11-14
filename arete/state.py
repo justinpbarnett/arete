@@ -475,7 +475,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     rearmed INTEGER DEFAULT 0,
     landed TEXT DEFAULT '',
     recovery TEXT DEFAULT '',
-    alerted INTEGER DEFAULT 0
+    alerted INTEGER DEFAULT 0,
+    closed TEXT DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -584,7 +585,8 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                   ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"),
                   ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"),
                   ("rearmed", "INTEGER DEFAULT 0"),
-                  ("landed", "TEXT DEFAULT ''"), ("recovery", "TEXT DEFAULT ''"), ("alerted", "INTEGER DEFAULT 0"))]]
+                  ("landed", "TEXT DEFAULT ''"), ("recovery", "TEXT DEFAULT ''"), ("alerted", "INTEGER DEFAULT 0"),
+                  ("closed", "TEXT DEFAULT ''"))]]
 
 
 @contextmanager
@@ -827,8 +829,8 @@ def mark_seen(source: str, keys: list[str]) -> None:
                       [(source, str(k), util.iso()) for k in keys])
 
 
-def cursor(source: str) -> dict | None:
-    with db() as c:
+def cursor(source: str, connect=db) -> dict | None:
+    with connect() as c:
         r = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
         return dict(r) if r else None
 
@@ -897,7 +899,11 @@ def drop_claimed_items(run_id: str) -> None:
         c.execute("DELETE FROM queue WHERE run_id = ?", (run_id,))
 
 
-def prune(days: float = 14) -> None:
+SEEN_AGAIN = "seen again"
+CLOSED_AT = "COALESCE(NULLIF(closed, ''), last_seen)"
+
+
+def prune(days: float = 14, keep_days: float = 30) -> None:
     since = util.iso(util.now() - timedelta(days=days))
     with db() as c:
         c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
@@ -905,9 +911,13 @@ def prune(days: float = 14) -> None:
         c.execute("DELETE FROM queue WHERE run_id IS NOT NULL AND enqueued < ?", (since,))
         c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         old = util.iso(util.now() - timedelta(days=days * 4))
-        c.execute("DELETE FROM incident_notes WHERE ts < ?", (since,))
-        c.execute("DELETE FROM incident_notes WHERE incident IN (SELECT id FROM incidents WHERE last_seen < ?)", (old,))
-        c.execute("DELETE FROM incidents WHERE last_seen < ?", (old,))
+        kept = util.iso(util.now() - timedelta(days=keep_days))
+        done = f"SELECT id FROM incidents WHERE state != 'open' AND {CLOSED_AT} < ?"
+        c.execute("DELETE FROM incident_notes WHERE ts < ? AND note LIKE ?", (since, f"{SEEN_AGAIN}:%"))
+        c.execute(f"DELETE FROM incident_notes WHERE incident IN ({done})", (kept,))
+        c.execute(f"UPDATE incidents SET evidence = '' WHERE id IN ({done})", (kept,))
+        c.execute(f"DELETE FROM incidents WHERE last_seen < ? AND (state = 'open' OR {CLOSED_AT} < ?)", (old, kept))
+        c.execute("DELETE FROM incident_notes WHERE incident NOT IN (SELECT id FROM incidents)")
         c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
         c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
 
@@ -921,7 +931,7 @@ def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signa
     if row:
         c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ?, "
                   "policies = COALESCE(policies, ?) WHERE id = ?", (count, now, evidence, policies, row["id"]))
-        note = f"seen again: {count} more from {source}, {row['count'] + count} in all"
+        note = f"{SEEN_AGAIN}: {count} more from {source}, {row['count'] + count} in all"
         opened, incident_id = False, row["id"]
     else:
         incident_id = c.execute("INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, "
@@ -991,6 +1001,8 @@ def known_fingerprints() -> dict[str, dict]:
 
 
 def update_incident(incident_id: int, note: str = "", **fields) -> None:
+    if fields.get("state", "open") != "open" and "closed" not in fields:
+        fields["closed"] = util.iso()
     with db() as c:
         if fields:
             c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
@@ -1032,20 +1044,33 @@ def parsed(row: dict) -> dict:
     return {**row, "answers": json.loads(row["answers"] or "{}")}
 
 
-def incidents(connect=db, limit: int = 200) -> list[dict]:
+def incidents(connect=db, limit: int = 200, open_first: bool = False) -> list[dict]:
+    order = "state != 'open', " if open_first else ""
     with connect() as c:
-        return [parsed(dict(r)) for r in c.execute("SELECT * FROM incidents ORDER BY last_seen DESC, id DESC "
+        return [parsed(dict(r)) for r in c.execute(f"SELECT * FROM incidents ORDER BY {order}last_seen DESC, id DESC "
                                                    "LIMIT ?", (limit,))]
 
 
-def incident(incident_id: int, connect=db) -> dict | None:
+def blocked_incidents(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT id, class, source, signature, waiting, last_seen FROM incidents "
+                                           "WHERE state = 'open' AND phase = 'blocked' ORDER BY id")]
+
+
+def incident(incident_id: int, connect=db, last_notes: int = 0) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
         if not r:
             return None
-        notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
+        total = c.execute("SELECT COUNT(*) FROM incident_notes WHERE incident = ?", (incident_id,)).fetchone()[0]
+        if last_notes > 0:
+            notes = c.execute("SELECT ts, note FROM (SELECT id, ts, note FROM incident_notes WHERE incident = ? "
+                              "ORDER BY id DESC LIMIT ?) ORDER BY id", (incident_id, last_notes))
+        else:
+            notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
         repairs = c.execute("SELECT * FROM incident_repairs WHERE incident = ? ORDER BY id", (incident_id,))
-        return {**parsed(dict(r)), "notes": [dict(n) for n in notes], "repairs": [dict(x) for x in repairs]}
+        return {**parsed(dict(r)), "notes": [dict(n) for n in notes], "notes_total": total,
+                "repairs": [dict(x) for x in repairs]}
 
 
 def add_metric(name: str, value: float, loop: str = "", run_id: str = "") -> None:
