@@ -957,8 +957,14 @@ def wake(cfg: config.Config, row: dict) -> bool:
         started = start_task(name, repair_prompt(row, mine, limits.max_attempts), repair_title(row["id"]))
     except (control.Refused, control.NotFound) as e:
         made = next(r for r in state.incident(row["id"])["repairs"] if r["id"] == repair)
-        state.set_repair(repair, ended=util.iso(), outcome="not started", task=created_task(made))
-        moved(row, "waiting", f"the repair task would not start: {outbound.sanitize(str(e), 160)}")
+        why = outbound.sanitize(str(e), 160)
+        if task := created_task(made):
+            state.set_repair(repair, task=task)
+            moved(row, "repairing", note=f"woke repair attempt {len(mine) + 1} of {limits.max_attempts}: "
+                  f"task {task} in {name}; its first run did not start: {why}")
+            return True
+        state.set_repair(repair, ended=util.iso(), outcome="not started")
+        moved(row, "waiting", f"the repair task would not start: {why}")
         return False
     state.set_repair(repair, task=started["task"])
     moved(row, "repairing", note=f"woke repair attempt {len(mine) + 1} of {limits.max_attempts}: task "

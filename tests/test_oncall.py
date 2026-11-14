@@ -1737,8 +1737,10 @@ class Repairs(Scratch):
         self.append(self.error(1))
         self.scanned(tail=refusing + SCAN)
         (task,) = self.sql("SELECT id FROM tasks")
-        self.assertEqual(self.sql("SELECT task, outcome FROM incident_repairs"), [(task[0], "not started")])
+        self.assertEqual(self.sql("SELECT task, outcome FROM incident_repairs"), [(task[0], "")])
         self.assertIn("1 attempt", self.arete("show", "1").stdout)
+        self.scanned(tail=refusing + SCAN)
+        self.assertEqual(len(self.sql("SELECT id FROM tasks")), 1)
 
     def test_a_subscription_only_policy_with_only_a_paid_route_waits_with_the_policy_reason(self):
         self.bounds("max_attempts = 2\ncooldown_minutes = 0\n", '\n[routing]\npayment_modes = ["subscription"]\n')
