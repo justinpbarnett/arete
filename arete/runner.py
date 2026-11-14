@@ -925,10 +925,12 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     if selected:
         found.extend(selected.sensitive_files)
     hidden = list(record.secrets(*found, given=kw.pop("stored_values", ())))
+    escaped = set()
     if selected:
         hidden.extend(selected.hidden)
-        hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
+        hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden if v not in escaped},
                            key=len, reverse=True)
+        escaped.update(hidden)
         header["env"] = sorted({*pi.launch_env_names(selected), *(kw.get("extra_env") or {}),
                                 *(["ARETE_ASK_TOOL"] if kw.get("ask_owner") else [])})
         header["provider"] = selected.provider
@@ -941,8 +943,9 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             hidden.extend(v for path in selected.sensitive_files for v in record.file_secrets(path, every_value=True)
                           if len(v) >= 8 and v not in hidden)
         if selected:
-            hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},
+            hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden if v not in escaped},
                                key=len, reverse=True)
+            escaped.update(hidden)
     def safe_line(line):
         refresh_hidden()
         rec.line(line)
