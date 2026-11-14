@@ -38,7 +38,8 @@ WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
 TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
-ASK_KEYS = ("max_per_run", "settle")
+ASK_KEYS = ("max_per_run", "settle", "expire_days")
+MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb")
 CHAT_KEYS = ("context_tokens", "summary_model")
 FACTORY_PATHS = ("classic", "adw")
@@ -142,6 +143,7 @@ class ReplayConfig:
 class AskConfig:
     max_per_run: int = 3
     settle: bool = True
+    expire_days: float = 7
 
 
 @dataclass(frozen=True)
@@ -465,7 +467,10 @@ def ask_table(data) -> AskConfig:
         raise ValueError(f"[ask] max_per_run must be a whole number of at least 0, not {limit!r}")
     if type(settle) is not bool:
         raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
-    return AskConfig(max_per_run=limit, settle=settle)
+    days = table.get("expire_days", 7)
+    if type(days) not in (int, float) or not math.isfinite(days) or not 0 < days <= MAX_ASK_EXPIRE_DAYS:
+        raise ValueError(f"[ask] expire_days must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS}, not {days!r}")
+    return AskConfig(max_per_run=limit, settle=settle, expire_days=days)
 
 
 def retention_table(data) -> Retention:
