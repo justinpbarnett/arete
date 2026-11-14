@@ -416,7 +416,7 @@ class BrowserServerTests(unittest.TestCase):
     def launch(self, mcp_config, said=None, which="codex", allowed=None):
         picked = SimpleNamespace(candidate=SimpleNamespace(runner=which, effort="", instructions=()), selected=None)
         trip = SimpleNamespace(cfg=SimpleNamespace(jev=SimpleNamespace(guard=False)), repo=None, scratch=self.a,
-                               target=SimpleNamespace(remote=None), tokens=None)
+                               target=SimpleNamespace(remote=None), tokens=None, hard_cap=False)
         base = {"mcp_config": mcp_config, "add_dirs": [self.evidence], **({"allowed_tools": allowed} if allowed else {})}
         with mock.patch.dict(scratch.LEASES, {self.a.selector: 0}), \
                 mock.patch.object(runner.environment, "passed", return_value=[]):
