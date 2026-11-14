@@ -137,26 +137,28 @@ def pin_signature(key: bytes, packages: dict) -> str:
     return hmac.digest(key, scratch.encoded(packages), "sha256").hex()
 
 
+def store_pin(fd: int, key: bytes, packages: dict) -> None:
+    scratch.write_atomic(fd, PIN, scratch.encoded({"data": packages, "signature": pin_signature(key, packages)}))
+
+
+def load_pin(fd: int, key: bytes) -> dict:
+    source = os.open(PIN, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    with os.fdopen(source, "rb") as handle:
+        scratch.checked(os.fstat(source), scratch.identity(os.fstat(source)))
+        envelope = json.loads(handle.read(MAX_DOWNLOAD))
+    if not hmac.compare_digest(envelope["signature"], pin_signature(key, envelope["data"])):
+        raise refuse("the pin is not signed by this engine")
+    return envelope["data"]
+
+
 def write_pin(packages: dict) -> None:
     with scratch.registry(True) as (fd, key):
-        temporary = secrets.token_hex(16) + ".new"
-        out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
-        with os.fdopen(out, "wb") as target:
-            target.write(scratch.encoded({"data": packages, "signature": pin_signature(key, packages)}))
-            target.flush()
-            os.fsync(out)
-        os.rename(temporary, PIN, src_dir_fd=fd, dst_dir_fd=fd)
+        store_pin(fd, key, packages)
 
 
 def read_pin() -> dict:
     with scratch.registry() as (fd, key):
-        source = os.open(PIN, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-        with os.fdopen(source, "rb") as handle:
-            scratch.checked(os.fstat(source), scratch.identity(os.fstat(source)))
-            envelope = json.loads(handle.read(MAX_DOWNLOAD))
-    if not hmac.compare_digest(envelope["signature"], pin_signature(key, envelope["data"])):
-        raise refuse("the pin is not signed by this engine")
-    return envelope["data"]
+        return load_pin(fd, key)
 
 
 def resolved() -> Path:
