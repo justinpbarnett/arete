@@ -183,6 +183,8 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
             if gone and (done := interrupt(row)):
                 then(done)
                 settled.append(done)
+    if not tickets:
+        state.release_settled_claims()
     return settled
 
 
