@@ -146,6 +146,13 @@ def send(chat_id: int, text: str) -> dict:
 
 
 def answer(chat_id: int, text: str, message_id: int, project: str) -> None:
+    try:
+        reply_to(chat_id, text, message_id, project)
+    finally:
+        replying.pop(chat_id, None)
+
+
+def reply_to(chat_id: int, text: str, message_id: int, project: str) -> None:
     reply, cost, paid, draft, notes = "", 0.0, 0.0, None, []
     try:
         cfg = config.load()
@@ -170,7 +177,6 @@ def answer(chat_id: int, text: str, message_id: int, project: str) -> None:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
     state.chat_say(chat_id, "arete", reply, cost, paid_usd=paid, busy=0, before=[("tool", n) for n in notes],
                    **({"draft_title": draft["title"], "draft_body": draft["body"]} if draft else {}))
-    replying.pop(chat_id, None)
 
 
 def reserve_reply(chat_id: int, cfg: config.Config) -> float:

@@ -69,6 +69,8 @@ HOLD_CHECK_SECONDS = 60
 NO_ROUTE = "no route can run this call"
 CANNOT_GATE = {"pi": "pi restates a structured answer in a second launch that cannot be gated against the calls "
                      "and time limits"}
+NO_SERVER_ACCESS = {"codex": "codex runs with the network off, so it cannot reach the arete server",
+                    "pi": "pi has no restricted Bash, so it cannot run the arete session commands"}
 CANNOT_STOP = {"codex": "codex reports usage only when its turn ends, so it cannot stop a call at a token or spend limit"}
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
 
@@ -284,7 +286,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
-        scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None, hard_cap: bool = False, needs_server: bool = False,
+        scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
+        hard_cap: bool = False, needs_server: bool = False,
         **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
@@ -601,9 +604,8 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
             skipped.append(passed_over(candidate, "ineligible", why))
             continue
         remaining = None
-        if trip.needs_server and candidate.runner == "codex":
-            skipped.append(passed_over(candidate, "ineligible", "codex runs with the network off, so it cannot "
-                                                                "reach the arete server"))
+        if trip.needs_server and candidate.runner in NO_SERVER_ACCESS:
+            skipped.append(passed_over(candidate, "ineligible", NO_SERVER_ACCESS[candidate.runner]))
             continue
         if trip.hard_cap and candidate.billing == "paid" and candidate.runner == "codex":
             skipped.append(passed_over(candidate, "ineligible", "codex cannot stop a paid call at a dollar limit"))
