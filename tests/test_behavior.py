@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ import urllib.error
 from unittest import mock
 
 import arete
-from arete import config, control, devices, gh, paths, pi, pipeline, scratch, sessions, state, util, verify
+from arete import config, control, devices, gh, outbound, paths, pi, pipeline, scratch, sessions, state, util, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -182,6 +183,12 @@ lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
     "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
     ("2" if scenario == "edited-after-held-pr" or scenario in REVIEW_ROUNDS else "1") + "\n")
+marker = "arete117-marker-value-9f3k2"
+if scenario == "secret-in-patch":
+    from arete import vault
+    vault.put("replay-sample", "REPLAY_SECRET", marker)
+    (root / "sample/replay/build.patch").write_text(
+        "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1,2 @@\n A small file for replay checks.\n+kumquat " + marker + "\n")
 if scenario == "failed-check":
     with (root / "sample/layer/config.toml").open("a") as out:
         out.write('\n[steps.check_repair]\ntries=1\n')
@@ -568,6 +575,13 @@ if scenario.startswith("asked"):
     asking = {"questions": [{"header": "Spelling", "question": "How is it spelled?", "kind": "text"}],
               "why": "The task leaves it open.", "tried": "Read the task."}
     placing = {**asking, "questions": [{"header": "Place", "question": "Where does it go?", "kind": "text"}]}
+    if scenario == "asked-secret":
+        layer_file = root / "sample/layer/config.toml"
+        layer_file.write_text(layer_file.read_text().replace(
+            "[checks]\n", "[checks]\nsecret = \"test ${#REPLAY_SECRET} -eq " + str(len(marker)) + "\"\n"))
+    if scenario in ("asked-secret", "asked-declined"):
+        asking = {"questions": [{"header": "Token", "question": "What is the token?", "kind": "secret",
+                                 "name": "REPLAY_SECRET"}], "why": "The check needs it.", "tried": "Read the task."}
     calls = [asking, placing] if scenario == "asked-twice" else [asking]
     (answers / "build.json").write_text(json.dumps({"text": "Asked.", "ok": True,
                                                     "tool_calls": [{"name": "ask_owner", "input": a} for a in calls]}))
@@ -597,8 +611,38 @@ if scenario.startswith("asked"):
                 result[name] = call()
             except control.Refused as e:
                 result[name] = str(e)
-    for ask in waiting:
-        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
+    if scenario == "asked-secret":
+        from arete import control, environment, tasks, vault
+        other = config.Repo(name="replay-other", path=root / "sample/repo")
+        try:
+            tasks.reply_to_asks(cfg, cfg.repo("replay-sample"), parked, waiting, "a reply on the ticket")
+        except control.Refused as e:
+            result["reply"] = str(e)
+        try:
+            tasks.answer_ask(waiting[0]["id"], {"answers": [{"secret": "short"}]})
+        except control.Refused as e:
+            result["short"] = str(e)
+        result["reserved"] = runner.reserved("PATH")
+        result["stored_before"] = vault.read("replay-sample")
+        with mock.patch.object(tasks, "continue_asked", return_value={}):
+            tasks.answer_ask(waiting[0]["id"], {"answers": [{"secret": marker}]})
+        result["mode"] = oct(vault.file_of("replay-sample").stat().st_mode & 0o777)
+        result["names"] = sorted(vault.read("replay-sample"))
+        result["seen"] = "REPLAY_SECRET" in environment.commands(cfg, cfg.repo("replay-sample"))
+        result["unseen"] = "REPLAY_SECRET" in environment.commands(cfg, other)
+        result["reserved_names"] = [runner.reserved(n) for n in ("ARETE_RUN_ID", "CLAUDE_CODE_OAUTH_TOKEN", "REPLAY_SECRET")]
+        result["diff_refusal"] = vault.refusals(f"diff --git a/notes.txt b/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n+kumquat {marker}\n")
+        quoted = 'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"\n--- "a/caf\\303\\251.txt"\n+++ "b/caf\\303\\251.txt"\n@@ -1 +1 @@\n+' + marker + '\n'
+        result["quoted"] = sorted(vault.held(quoted))
+        from arete import record
+        result["escaped"] = "caf\\u00e9-token-123" in record.secrets(given=["café-token-123"])
+    elif scenario == "asked-declined":
+        from arete import tasks
+        with mock.patch.object(tasks, "continue_asked", return_value={}):
+            tasks.answer_ask(waiting[0]["id"], {"answers": [{"declined": True}]})
+    else:
+        for ask in waiting:
+            state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
     gone = scenario == "asked-gone"
     (answers / "build.json").write_text(json.dumps({"ok": False, "error": "No conversation found with session ID x"})
                                         if gone else passing)
@@ -686,7 +730,25 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
                "answered": "Spelled with a K, as in kumquat-7." in prompts,
                "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])],
                "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
-               "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text()}
+               "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
+               "heard": [w for w in ("`REPLAY_SECRET` is set for this repo", asks.DECLINED) if w in prompts]}
+    if scenario == "asked-declined":
+        from arete import vault
+        result["answer_lines"] = [e.get("answers") for e in events if e.get("event") == "answer"]
+        result["stored_after"] = sorted(vault.read("replay-sample"))
+    if scenario == "asked-secret":
+        import subprocess
+
+        def removing(cmd, **kw):
+            vault.remove("replay-sample", "REPLAY_SECRET")
+            return subprocess.CompletedProcess(cmd, 0, stdout=kw["env"]["REPLAY_SECRET"], stderr="")
+
+        with mock.patch.object(environment.util, "sh", side_effect=removing):
+            result["raced"] = environment.sh("true", cfg, cfg.repo("replay-sample")).stdout
+        result["after_removal"] = "REPLAY_SECRET" in environment.commands(cfg, cfg.repo("replay-sample"))
+        result["answer_lines"] = [e.get("answers") for e in events if e.get("event") == "answer"]
+        result["leaks"] = [str(p) for base in (paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR) for p in base.rglob("*")
+                           if p.is_file() and not p.is_symlink() and marker.encode() in p.read_bytes()]
     origin = root / "sample/origin.git"
     branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines()
                 if b != "refs/heads/main"]
@@ -785,6 +847,10 @@ verification = [e.get("data", {}).get("verified") for e in events
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
           "verified":[v["verdict"] for v in verification if v],
           "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git")}
+if scenario == "secret-in-patch":
+    result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+    result["leaks"] = [str(p) for base in (paths.STATE_DIR, paths.LOG_DIR) for p in base.rglob("*")
+                       if p.is_file() and not p.is_symlink() and marker.encode() in p.read_bytes()]
 if scenario == "verify-change-fault-timed":
     result["checks_in_verification"] = checks_in_verification
 if scenario == "edited-after-held-pr":
@@ -869,6 +935,43 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertTrue(result["same_session"])
         self.assertTrue(result["answered"])
         self.assertEqual(result["taken"], [True])
+
+    def test_secret_answer_reaches_the_check_by_name_and_is_stored_nowhere_else(self):
+        result = self.workflow("asked-secret")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertIn("kumquat", result["published"])
+        self.assertEqual((result["mode"], result["names"], result["stored_before"]), ("0o600", ["REPLAY_SECRET"], {}))
+        self.assertIn("nothing was stored", result["short"])
+        self.assertNotIn("short", result["short"].replace("shortest", ""))
+        self.assertIn("arete sets itself", result["reserved"])
+        self.assertEqual(result["leaks"], [])
+        self.assertEqual(result["answer_lines"], [[{"header": "Token", "kind": "secret", "name": "REPLAY_SECRET",
+                                                    "set": True}]])
+        self.assertEqual(result["diff_refusal"], ["notes.txt (holds the stored value of REPLAY_SECRET)"])
+        self.assertEqual((result["seen"], result["unseen"], result["after_removal"]), (True, False, False))
+        self.assertEqual(result["quoted"], ["café.txt"])
+        self.assertTrue(result["escaped"])
+        self.assertEqual(result["raced"], "[redacted]")
+        self.assertEqual([bool(r) for r in result["reserved_names"]], [True, True, False])
+        self.assertIn("`REPLAY_SECRET` is set for this repo", result["heard"])
+        self.assertIn("secret question", result["reply"])
+
+    def test_declined_secret_resumes_the_step_with_the_owner_declined(self):
+        result = self.workflow("asked-declined")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["heard"], ["the owner declined"])
+        self.assertEqual(result["answer_lines"], [[{"header": "Token", "kind": "secret", "name": "REPLAY_SECRET",
+                                                    "declined": True}]])
+        self.assertEqual(result["stored_after"], [])
+
+    def test_patch_holding_a_stored_value_fails_naming_the_variable_only(self):
+        result = self.workflow("secret-in-patch")
+        self.assertEqual(result["status"], "failed")
+        text = result["summary"] + result["log"]
+        self.assertIn("holds the stored value of REPLAY_SECRET", text)
+        self.assertNotIn("arete117-marker-value-9f3k2", text)
+        self.assertEqual(result["leaks"], [])
 
     def test_answered_run_stopped_while_waiting_for_a_slot_resumes_with_the_answers(self):
         result = self.workflow("asked-stopped-waiting")
@@ -1627,6 +1730,257 @@ print("RESULT" + json.dumps(out))
             config.research_table({"planner": True, "synthesis": True})
 
 
+class StagedResearchAuditTests(unittest.TestCase):
+    SCRIPT = r'''
+import json, os, sys, time
+from pathlib import Path
+from arete import config, paths, research, research_audit, runner, steps
+root = Path(sys.argv[1])
+replay = root / "replay"
+paths.ensure_dirs()
+calls = []
+real = runner.run
+def spy(*args, **kwargs):
+    calls.append([kwargs["trace"][1], list(kwargs.get("tools") or []), list(kwargs.get("allowed_tools") or [])])
+    return real(*args, **kwargs)
+runner.run = spy
+def put(name, structured, cost=0):
+    (replay / f"{name}.json").write_text(json.dumps({"structured": structured, "cost_usd": cost}))
+OLD = "As of March 2021 the limit is 10 requests per second."
+NEW = "The limit was raised to 20 requests per second in June 2025."
+BETA = "Customers reported occasional throttling during the beta."
+def src(url, published, passage):
+    return {"question": "What is the limit?", "url": url, "title": "Page", "published": published,
+            "event_date": "", "passage": passage, "uncertainty": "none"}
+def task(goal):
+    return {"goal": goal, "queries": ["general terms"], "max_sources": 3}
+def concl(claim, sid, critical=False):
+    return {"claim": claim, "sources": [sid], "critical": critical}
+def chk(c, verdict, sources, quote="", note="", correction=""):
+    return {"claim": c, "verdict": verdict, "sources": sources, "quote": quote, "fetched": [], "note": note,
+            "correction": correction}
+def batch1(c3_quote=BETA):
+    return {"checks": [
+        chk("C1", "contradicted", ["S1", "S2"], NEW, "The 2021 page is outdated and the June 2025 page states 20.",
+            "The limit was 10 requests per second as of March 2021, and a June 2025 page states 20 [S1] [S2]."),
+        chk("C2", "unverifiable", ["S3"], "", "The passage reports throttling during the beta and says nothing of a fix."),
+        chk("C3", "supported", ["S3"], c3_quote),
+        chk("C4", "inference", ["S2"], "", "The page states one raise and announces no further one."),
+        chk("C5", "supported", ["S2"], NEW)],
+        "disagreements": [{"issue": "The 2021 page states 10 requests per second and the 2025 page states 20.",
+                           "sources": ["S1", "S2"]}]}
+BATCH2 = {"checks": [chk("C6", "supported", ["S2"], NEW)], "disagreements": []}
+def seed(ref, synthesis=None):
+    put(f"research-{ref}-plan", {"needs_search": True, "covered_by": [], "questions": ["What is the limit?"],
+        "tasks": [task("one"), task("two"), task("three")], "source_criteria": ["primary"],
+        "claims": ["The limit is known"]})
+    put(f"research-{ref}-task-1-search", {"sources": [src("https://example.org/old", "2021-03-01", OLD),
+                                                      src("https://example.net/new", "2025-06-01", NEW)], "notes": ""})
+    put(f"research-{ref}-task-2-search", {"sources": [], "notes": ""})
+    put(f"research-{ref}-task-3-search", {"sources": [src("https://example.com/beta", "2024-11-05", BETA)], "notes": ""})
+    put(f"research-{ref}-synthesis", synthesis or {"summary": "The limit is 10 requests per second.", "name": "",
+        "answer": "The limit is 10 requests per second [S1].",
+        "conclusions": [concl("The limit is 10 requests per second.", "S1", True),
+                        concl("Throttling is fully resolved.", "S3", True),
+                        concl("Customers reported throttling during the beta.", "S3"),
+                        concl("The vendor will raise the limit again.", "S2"),
+                        concl("The limit was raised in June 2025.", "S2")],
+        "inferences": [{"claim": "Capacity planning should assume 20 requests per second.",
+                        "basis": "The newer page states 20.", "sources": ["S2"], "critical": False}],
+        "contradictions": [], "gaps": [], "searches": []})
+def drive(ref, cfg):
+    os.environ["ARETE_RUN_ID"] = f"run-{ref}"
+    values = {"ref": ref, "title": "Invented", "ticket": "Find the limit.", "related": "none", "repos": "none"}
+    start = len(calls)
+    res, paid = research.staged(cfg, ref, values, research.filing(None, ""), research.REPORTS_DIR, [], [],
+                                time.monotonic(), False)
+    evidence = research.research_search.evidence_file(ref)
+    return {"ok": res.ok, "error": res.error, "structured": res.structured, "calls": calls[start:],
+            "evidence": json.loads(evidence.read_text()) if evidence.exists() else {}}
+cfg = config.load()
+out = {}
+seed("A")
+put("research-A-batch-1-audit", batch1("Throttling was fully resolved during the beta."))
+put("research-A-batch-1-audit2", batch1())
+put("research-A-batch-2-audit", BATCH2)
+out["a"] = drive("A", cfg)
+seed("B")
+put("research-B-batch-1-audit", batch1(), 4.996)
+put("research-B-batch-2-audit", BATCH2)
+out["b"] = drive("B", cfg)
+seed("C")
+for name in ("research-C-batch-1-audit", "research-C-batch-1-audit2"):
+    put(name, {"checks": [{"claim": "C1", "verdict": "fine"}]})
+put("research-C-batch-2-audit", BATCH2)
+out["c"] = drive("C", cfg)
+seed("D")
+cfg.research_audit = False
+out["d"] = drive("D", cfg)
+cfg.research_audit = True
+seed("E", {"summary": "The limit was raised in June 2025 and the vendor guarantees 99.99 percent uptime.", "name": "",
+           "answer": "The vendor guarantees 99.99 percent uptime [S2].",
+           "conclusions": [concl("The limit was raised in June 2025.", "S2", True),
+                           concl("Customers reported throttling during the beta.", "S3")],
+           "inferences": [], "contradictions": [], "gaps": [], "searches": []})
+put("research-E-batch-1-audit", {"checks": [chk("C1", "supported", ["S2"], NEW), chk("C2", "supported", ["S3"], BETA)],
+                                 "disagreements": []})
+out["e"] = drive("E", cfg)
+config.CONFIG_FILE = paths.CONFIG_FILE
+s = steps.resolve(config.load(), None, "research_audit")
+known = {f"S{n}": {"url": u} for n, u in enumerate(
+    ("https://localhost/a", "https://example.org/b", "https://10.0.0.1/c", "https://exa_mple.org/d",
+     "https://foo.local/e"), 1)}
+out["hosts"] = research_audit.hosts(s, [{"cited": list(known)}], known)
+with paths.CONFIG_FILE.open("a") as f:
+    f.write('\n[steps.research_audit]\ntools = ["Read", "Glob", "Grep", "WebSearch"]\n')
+try:
+    steps.resolve(config.load(), None, "research_audit")
+    out["web"] = ""
+except ValueError as e:
+    out["web"] = str(e)
+print("RESULT" + json.dumps(out))
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        gh_state = SOURCE / ".local/state/gh"
+        had_gh_state = gh_state.exists()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay", "home"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text(
+                '[replay]\nall = true\n\n[research]\nplanner = true\nsearch = true\nsynthesis = true\naudit = true\n\n'
+                '[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
+                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
+                                  capture_output=True, text=True, timeout=120, check=False)
+            line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
+            if not line:
+                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
+            cls.out = json.loads(line[len("RESULT"):])
+        cls.wrote_gh_state = not had_gh_state and gh_state.exists()
+
+    def names(self, which):
+        return [c[0] for c in self.out[which]["calls"]]
+
+    def test_audit_corrects_qualifies_and_gaps_claims_and_writes_the_lead_from_audited_claims(self):
+        a = self.out["a"]
+        self.assertTrue(a["ok"], a["error"])
+        report = a["structured"]["report"]
+        self.assertEqual(self.names("a").count("research A batch 1 audit"), 2)
+        self.assertEqual(self.names("a").count("research A batch 2 audit"), 1)
+        self.assertEqual(self.names("a").count("research A revision"), 0)
+        self.assertIn("quote is not in a retained passage of S3", a["evidence"]["audit"]["calls"][0]["refused"][0])
+        self.assertTrue(report.startswith("**Audit note:**"))
+        lead = report[:report.index("## Supported conclusions")]
+        self.assertIn("The limit was 10 requests per second as of March 2021", lead)
+        self.assertIn("(https://example.org/old)", lead)
+        self.assertIn("(https://example.net/new)", lead)
+        self.assertIn("1 decision-critical claim did not pass the audit", lead)
+        self.assertNotIn("The limit is 10 requests per second [", lead)
+        conclusions = report[report.index("## Supported conclusions"):report.index("## Inference")]
+        self.assertRegex(conclusions, r"\*\*Decision-critical:\*\* \*\*Corrected by the audit:\*\* .*example\.org/old"
+                                      r".*example\.net/new")
+        self.assertNotIn("The limit is 10 requests per second.", conclusions)
+        self.assertNotIn("Throttling is fully resolved.", conclusions)
+        inference = report[report.index("## Inference"):report.index("## Unresolved contradictions")]
+        self.assertIn("**Qualified by the audit:** The vendor will raise the limit again.", inference)
+        contradictions = report[report.index("## Unresolved contradictions"):report.index("## Gaps")]
+        self.assertIn("(https://example.org/old)", contradictions)
+        self.assertIn("(https://example.net/new)", contradictions)
+        gaps = report[report.index("## Gaps"):report.index("## Audit")]
+        self.assertIn("Throttling is fully resolved.", gaps)
+        self.assertIn("unverifiable", gaps)
+        audit = report[report.index("## Audit"):report.index("## Sources")]
+        self.assertIn("Audit complete: 6 claims checked against their sources; 3 supported, 1 corrected, "
+                      "1 qualified as inference, 1 left as gaps.", audit)
+        self.assertEqual(audit.count("\n- **"), 6)
+        sources = report[report.index("## Sources"):]
+        self.assertIn("published 2021-03-01", sources)
+        self.assertIn("published 2025-06-01", sources)
+        summary = a["structured"]["summary"]
+        self.assertTrue(summary.startswith("The limit was 10 requests per second as of March 2021"))
+        self.assertNotIn("[", summary)
+        self.assertIn(" Audit complete:", summary)
+        self.assertEqual(a["evidence"]["audit"]["status"], "complete")
+        self.assertEqual(len(a["evidence"]["audit"]["claims"]), 6)
+
+    def test_auditor_fetches_only_the_hosts_of_cited_sources(self):
+        audits = [c for c in self.out["a"]["calls"] if "audit" in c[0]]
+        self.assertEqual(len(audits), 3)
+        for _, tools, allowed in audits:
+            self.assertEqual(tools, ["Read", "Glob", "Grep", "WebFetch"])
+            self.assertNotIn("WebFetch", allowed)
+            self.assertNotIn("WebSearch", allowed)
+        self.assertEqual(sorted(a for a in audits[0][2] if a.startswith("WebFetch")),
+                         ["WebFetch(domain:example.com)", "WebFetch(domain:example.net)", "WebFetch(domain:example.org)"])
+        self.assertEqual([a for a in audits[2][2] if a.startswith("WebFetch")], ["WebFetch(domain:example.net)"])
+        for _, tools, _ in (c for c in self.out["a"]["calls"] if "synthesis" in c[0]):
+            self.assertEqual(tools, ["Read", "Glob", "Grep"])
+        self.assertEqual(self.out["hosts"], {"example.org": ["S2"]})
+        self.assertIn("WebSearch cannot load on research_audit", self.out["web"])
+
+    def test_budget_limited_audit_is_incomplete_and_marks_unaudited_claims(self):
+        b = self.out["b"]
+        self.assertTrue(b["ok"], b["error"])
+        report = b["structured"]["report"]
+        self.assertEqual([n for n in self.names("b") if "audit" in n or "revision" in n], ["research B batch 1 audit"])
+        self.assertIn("Audit incomplete:", report)
+        self.assertIn("the research budget left no room for the audit", report)
+        self.assertIn("1 of 6 claims was not audited", report)
+        self.assertIn("**Not audited:** Capacity planning", report)
+        self.assertTrue(report.startswith("**Audit note:**"))
+        self.assertNotIn("The limit is 10 requests per second", b["structured"]["summary"])
+        self.assertNotIn("Audit complete", report)
+        self.assertTrue(b["structured"]["summary"].count("Audit incomplete:"))
+        self.assertNotIn("Audit complete", b["structured"]["summary"])
+        self.assertEqual(b["evidence"]["audit"]["status"], "incomplete")
+
+    def test_malformed_audit_is_a_failure_not_a_pass(self):
+        c = self.out["c"]
+        self.assertTrue(c["ok"], c["error"])
+        report = c["structured"]["report"]
+        self.assertEqual([n for n in self.names("c") if "audit" in n],
+                         ["research C batch 1 audit", "research C batch 1 audit", "research C batch 2 audit"])
+        self.assertIn("Audit failed:", report)
+        self.assertNotIn("Audit complete", report)
+        self.assertEqual(report.count("**Not audited:**"), 5)
+        self.assertIn("Audit failed:", c["structured"]["summary"])
+        self.assertEqual(c["evidence"]["audit"]["status"], "failed")
+
+    def test_audit_off_leaves_the_report_alone(self):
+        d = self.out["d"]
+        self.assertTrue(d["ok"], d["error"])
+        report = d["structured"]["report"]
+        self.assertFalse([n for n in self.names("d") if "audit" in n or "revision" in n])
+        self.assertNotIn("## Audit", report)
+        self.assertNotIn("Not audited", report)
+        self.assertNotIn("audit", d["evidence"])
+        self.assertIn("The limit is 10 requests per second.", report)
+
+    def test_a_claim_only_in_the_summary_or_lead_is_not_published(self):
+        e = self.out["e"]
+        self.assertTrue(e["ok"], e["error"])
+        report, summary = e["structured"]["report"], e["structured"]["summary"]
+        self.assertEqual(e["evidence"]["audit"]["status"], "complete")
+        self.assertIn("Audit complete: 2 claims checked", report)
+        self.assertNotIn("99.99", report)
+        self.assertNotIn("99.99", summary)
+        self.assertTrue(report.startswith("**Audit note:**"))
+        self.assertIn("The limit was raised in June 2025", report[:report.index("## Supported conclusions")])
+        self.assertIn("The limit was raised in June 2025", summary)
+        self.assertFalse([n for n in self.names("e") if "revision" in n])
+
+    def test_audit_needs_synthesis(self):
+        with self.assertRaisesRegex(ValueError, "audit needs synthesis = true"):
+            config.research_table({"planner": True, "search": True, "audit": True})
+        self.assertFalse(self.wrote_gh_state)
+
+
 class ScratchLookAlikeTests(unittest.TestCase):
     PRELUDE = r'''
 import json, os, secrets, subprocess, sys, time
@@ -1813,6 +2167,8 @@ PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
 
 
 class OptimizeTests(unittest.TestCase):
+    slow = True
+
     def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
         from arete import experiment, optimize
 
@@ -1887,9 +2243,9 @@ class OptimizeTests(unittest.TestCase):
                        TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
-import contextlib, importlib.util, io, json, os, sys
+import contextlib, importlib.util, io, json, os, shutil, sys
 from pathlib import Path
-from arete import cli, optimize, paths
+from arete import cli, experiment, optimize, paths
 root = Path(sys.argv[1])
 if importlib.util.find_spec("arete.scratch"):
     from arete import scratch
@@ -1903,6 +2259,14 @@ def call(*argv):
     return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
 paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
 plan, config_file = str(root / "sample/plan.toml"), paths.CONFIG_FILE
+experiment.MIN_PAIRS = 3
+smaller = Path(plan).read_text()
+for old, new in (("repeats = 6", "repeats = 3"), ("min_pairs = 6", "min_pairs = 3\nconfidence = 0.7")):
+    if smaller.count(old) != 1:
+        raise SystemExit(f"the sample plan no longer holds {old!r} once")
+    smaller = smaller.replace(old, new)
+Path(plan).write_text(smaller)
+shutil.rmtree(root / "sample/replay/cheap/word-validation/3")
 before = config_file.read_bytes()
 folder = paths.STATE_DIR / "experiments" / "sample-search"
 trail = lambda: [json.loads(line) for line in (folder / "trail.jsonl").read_text().splitlines()]
@@ -1945,13 +2309,13 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
         self.assertIn("candidate twin", r["dry"]["out"])
         self.assertEqual(r["search"]["code"], 0, shown)
         out = r["search"]["out"]
-        self.assertIn("stronger: train fixed 6, broke 0: proposed", out)
+        self.assertIn("stronger: train fixed 3, broke 0: proposed", out)
         self.assertIn("promoted: stronger", out)
-        self.assertIn("validation accepted 3 of 6 against 6 of 6: no promotion: under the quality floor", out)
-        self.assertIn("validation accepted 6 of 6 against 6 of 6: no promotion: noisy tie", out)
+        self.assertIn("validation accepted 1 of 3 against 3 of 3: no promotion: under the quality floor", out)
+        self.assertIn("validation accepted 3 of 3 against 3 of 3: no promotion: noisy tie", out)
         self.assertIn("promoted: none", out)
         self.assertIn("result: promote stronger over baseline", out)
-        self.assertEqual((r["holdout"], r["holdout_again"]), (12, 12), shown)
+        self.assertEqual((r["holdout"], r["holdout_again"]), (6, 6), shown)
         self.assertEqual(r["again"]["code"], 0, shown)
         self.assertIn("-model = \"scratch-a\"", r["preview"]["out"])
         self.assertIn("+model = \"scratch-b\"", r["preview"]["out"])
@@ -1996,6 +2360,7 @@ def call(*argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = cli.main(list(argv))
     return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+experiment.MIN_PAIRS = 3
 paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
 sample = root / "sample"
 call("prices", "import", str(sample / "prices.json"))
@@ -2008,7 +2373,11 @@ rounds = ('[[rounds]]\nvary = "effort"\n[rounds.candidates.cheap]\neffort = "low
           f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned]\nprompts = "{root / "tuned"}"\n\n'
           f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned2]\nprompts = "{root / "tuned2"}"\n\n')
 plan = sample / "plan.toml"
-plan.write_text(head + rounds + tail.replace("rounds = 2", "rounds = 3"))
+smaller = (head.replace("repeats = 6", "repeats = 3") + rounds
+           + tail.replace("rounds = 2", "rounds = 3").replace("min_pairs = 6", "min_pairs = 3\nconfidence = 0.7"))
+if "repeats = 3" not in smaller or "confidence = 0.7" not in smaller:
+    raise SystemExit("the sample plan no longer holds repeats = 6 and min_pairs = 6")
+plan.write_text(smaller)
 s = optimize.load(plan)
 folder = paths.STATE_DIR / "experiments" / "sample-search"
 folder.mkdir(parents=True)
@@ -3299,7 +3668,7 @@ class PushedPrDraftTests(unittest.TestCase):
                                     from_base=False, committed_lines=0, staged=pipeline.Staged(),
                                     push=lambda branch, message: None)
         with mock.patch.multiple(pipeline, evidence_images=lambda *a, **k: {}, report_body=lambda *a, **k: "report",
-                                 synced_pr_body=lambda run, url, body, t, left: body,
+                                 synced_pr_body=lambda run, url, body, t, left: ("", body),
                                  answer_feedback=lambda *a, **k: None):
             out = flows.pr(SimpleNamespace(ctx=job), str(wt))
             stored = {k: v for k, v in out.data.items() if k not in ("found", "drafted", "ci_stopped")}
@@ -4059,6 +4428,370 @@ result(counts=counts, before=before, summary=last["summary"], prompt=prompt, las
         self.assertGreater(found["kept"], 0)
         self.assertLessEqual(found["size"], 100)
         self.assertEqual(found["last"], "Reply 6.")
+
+
+class ParallelSuiteTests(unittest.TestCase):
+    HANGS = (
+        "import os, time, unittest\n"
+        "from pathlib import Path\n"
+        "class Hanging(unittest.TestCase):\n"
+        "    def hang(self):\n"
+        "        Path(__file__).with_name('pid-' + self._testMethodName).write_text(str(os.getpid()))\n"
+        "        time.sleep(60)\n"
+        "    def test_a(self): self.hang()\n"
+        "    def test_b(self): self.hang()\n"
+        "    def test_c(self): self.hang()\n"
+    )
+
+    def sample_folder(self, source: str):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        scratch_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch_temp.cleanup)
+        Path(folder.name, "test_sample.py").write_text(source)
+        return folder.name, {**os.environ, "TMPDIR": scratch_temp.name}
+
+    def command(self, folder: str, *extra: str):
+        return [sys.executable, "-m", "tests.parallel", "-s", folder, *extra]
+
+    def run_sample(self, source: str, *extra: str):
+        folder, env = self.sample_folder(source)
+        command = self.command(folder, "-j", "2", "--timeout", "2", "-v", *extra)
+        done = subprocess.run(command, cwd=SOURCE, capture_output=True, text=True, timeout=120, env=env,
+                              check=False)
+        return folder, done, done.stdout.strip().splitlines()
+
+    def start_sample(self, source: str, *extra: str):
+        folder, env = self.sample_folder(source)
+        proc = subprocess.Popen(self.command(folder, *extra), cwd=SOURCE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env)
+        self.addCleanup(proc.kill)
+        return folder, proc
+
+    def pids_in(self, folder: str):
+        return {path.name: int(path.read_text()) for path in Path(folder).glob("pid-*") if path.read_text().strip()}
+
+    def wait_for_pids(self, folder: str, count: int):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            found = self.pids_in(folder)
+            if len(found) >= count:
+                return found
+            time.sleep(0.1)
+        self.fail(f"fewer than {count} workers started in {folder}")
+
+    def gone(self, pid: int):
+        self.addCleanup(self.kill_quietly, pid)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def kill_quietly(self, pid: int):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def test_hung_test_leaves_no_process(self):
+        folder, done, _ = self.run_sample(
+            "import os, subprocess, sys, time, unittest\n"
+            "from pathlib import Path\n"
+            "class Hanging(unittest.TestCase):\n"
+            "    def test_stuck(self):\n"
+            "        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "        Path(__file__).with_name('pid-stuck').write_text(str(os.getpid()))\n"
+            "        Path(__file__).with_name('pid-child').write_text(str(child.pid))\n"
+            "        time.sleep(60)\n"
+        )
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("ERROR: test_stuck (test_sample.Hanging.test_stuck)", done.stdout)
+        found = self.pids_in(folder)
+        self.assertEqual(set(found), {"pid-stuck", "pid-child"})
+        for pid in found.values():
+            self.assertTrue(self.gone(pid), pid)
+
+    def test_interrupt_ends_every_worker(self):
+        for number in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=number.name):
+                folder, proc = self.start_sample(self.HANGS, "-j", "2", "--timeout", "60")
+                found = self.wait_for_pids(folder, 2)
+                proc.send_signal(number)
+                output, _ = proc.communicate(timeout=30)
+                self.assertEqual(proc.returncode, 130, output)
+                self.assertIn("interrupted; tests in flight:", output)
+                for name in found:
+                    self.assertIn(f"test_{name[-1]} (test_sample.Hanging.test_{name[-1]})", output)
+                self.assertEqual(set(self.pids_in(folder)), set(found))
+                self.assertEqual(len(found), 2)
+                self.assertNotIn("Ran ", output)
+                for pid in found.values():
+                    self.assertTrue(self.gone(pid), pid)
+
+    def test_killed_runner_takes_its_workers_along(self):
+        folder, proc = self.start_sample(self.HANGS, "-j", "2", "--timeout", "60")
+        found = self.wait_for_pids(folder, 2)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=30)
+        proc.stdout.close()
+        for pid in found.values():
+            self.assertTrue(self.gone(pid), pid)
+
+    def test_failing_hanging_and_serial_tests_are_reported(self):
+        _, done, lines = self.run_sample(
+            "import time, unittest\n"
+            "class Passing(unittest.TestCase):\n"
+            "    def test_ok(self): pass\n"
+            "class Failing(unittest.TestCase):\n"
+            "    def test_bad(self): self.fail('deliberate')\n"
+            "class Hanging(unittest.TestCase):\n"
+            "    def test_stuck(self): time.sleep(60)\n"
+            "class Alone(unittest.TestCase):\n"
+            "    serial = True\n"
+            "    def test_one(self): pass\n"
+            "    def test_two(self): pass\n"
+        )
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("FAIL: test_bad (test_sample.Failing.test_bad)", done.stdout)
+        self.assertIn("deliberate", done.stdout)
+        self.assertIn("ERROR: test_stuck (test_sample.Hanging.test_stuck)", done.stdout)
+        self.assertIn("killed after 2 seconds", done.stdout)
+        self.assertTrue(lines[-1].startswith("Ran 5 tests in "), lines[-1])
+        self.assertTrue(lines[-1].endswith("FAILED (failures=1, errors=1)"), lines[-1])
+        verbose = [index for index, line in enumerate(lines) if " ... " in line]
+        alone = [index for index in verbose if "Alone" in lines[index]]
+        others = [index for index in verbose if "Alone" not in lines[index]]
+        self.assertEqual(len(alone), 2)
+        self.assertGreater(min(alone), max(others))
+
+    def test_passing_sample_counts_match_discovery(self):
+        folder, done, lines = self.run_sample(
+            "import unittest\n"
+            "class Passing(unittest.TestCase):\n"
+            "    def test_one(self): pass\n"
+            "    def test_two(self): pass\n"
+            "    @unittest.skip('not now')\n"
+            "    def test_skipped(self): pass\n",
+            "--slowest", "1",
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("Slowest classes:", lines)
+        self.assertTrue(any("test_sample.Passing" in line for line in lines[lines.index("Slowest classes:") + 1:]))
+        total = unittest.TestLoader().discover(folder).countTestCases()
+        self.assertTrue(lines[-1].startswith(f"Ran {total} tests in "), lines[-1])
+        self.assertTrue(lines[-1].endswith("OK (skipped=1)"), lines[-1])
+        self.assertEqual(len([line for line in lines if " ... " in line]), total)
+
+
+FAKE_GH ='''#!{python}
+import json, os, sys
+argv = sys.argv[1:]
+stdin = ""
+if any(a in ("--body-file", "--input") and i + 1 < len(argv) and argv[i + 1] == "-" for i, a in enumerate(argv)):
+    stdin = sys.stdin.read()
+with open(os.environ["GH_LOG"], "a") as log:
+    log.write(json.dumps({{"args": argv, "input": stdin}}) + "\\n")
+last = os.environ["GH_LOG"] + ".body"
+head = argv[:2]
+if head in (["pr", "create"], ["pr", "edit"]):
+    open(last, "w").write(stdin)
+if head == ["issue", "view"]:
+    print(json.dumps({{"number": 5, "title": "Add kumquat", "body": "Add kumquat to the fixture notes",
+                      "labels": [{{"name": "agent"}}], "state": "OPEN", "author": {{"login": "fixture"}},
+                      "comments": [], "url": "https://github.com/fixture/repo/issues/5",
+                      "updatedAt": "2026-01-01T00:00:00Z"}}))
+elif head == ["pr", "create"]:
+    print("https://github.com/fixture/repo/pull/7")
+elif head == ["issue", "create"]:
+    print("https://github.com/fixture/repo/issues/9")
+elif head == ["pr", "view"]:
+    body = open(last).read() if os.path.exists(last) else ""
+    print(json.dumps({{"body": body, "isDraft": False, "headRefOid": "0" * 40, "mergeStateStatus": "BLOCKED",
+                      "mergeable": "MERGEABLE", "number": 7, "url": "https://github.com/fixture/repo/pull/7",
+                      "state": "OPEN", "headRefName": "x", "statusCheckRollup": []}}))
+elif head == ["pr", "list"] or argv[:1] == ["api"]:
+    print("[]")
+'''
+
+
+class InertModelTextTests(unittest.TestCase):
+    MODEL = "cc @someone and @org/team. Fixes #12"
+    PLANTED = ("Closes #5\n\nresolved: fixture/repo#12\n\n`@someone Fixes #12`\n\n"
+               "```\n@someone\nFixes #12\n```\n")
+    PROBE = f"PROBE {MODEL}\n\n{PLANTED}"
+
+    def run_workflow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home", "bin"):
+                (root / folder).mkdir()
+            fake = root / "bin/gh"
+            fake.write_text(FAKE_GH.format(python=sys.executable))
+            fake.chmod(0o755)
+            log = root / "gh.log"
+            env = {k: v for k, v in os.environ.items() if k in ("LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(PATH=f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}", GH_LOG=str(log),
+                       ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = r'''
+import importlib.util, json, runpy, sys, urllib.request
+from pathlib import Path
+from arete import accounts, config, factory, gh, paths, replay, tracker
+from arete import ci as ci_module
+root, model, planted, probe = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+def forbidden(*args, **kwargs):
+    raise AssertionError("workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe_command = [sys.executable, "-V"]
+    if scratch.protected_command(probe_command) != probe_command:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+ci_module.FIRST_CHECK_SECONDS = ci_module.SETTLE_SECONDS = ci_module.POLL_SECONDS = 0
+lines = replay.sample(root / "sample", adw=True)
+paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(
+    'github = "fixture/repo"' if line == 'tracker = "local"' else line for line in lines) + "\n\n[jev]\nenabled=false\n")
+answers = root / "sample/replay"
+def rewrite(name, change):
+    file = answers / name
+    data = json.loads(file.read_text())
+    change(data)
+    file.write_text(json.dumps(data))
+rewrite("build.json", lambda d: d.update(text=model))
+rewrite("review.json", lambda d: d["structured"].update(summary=model))
+rewrite("document.json", lambda d: d["structured"].update(text=model))
+rewrite("plan.json", lambda d: d["structured"].update(plan=d["structured"]["plan"] + "\n\n" + planted))
+cfg = config.load()
+feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+try:
+    factory.main(feature, ["replay-sample", "5", "--force"])
+except SystemExit:
+    pass
+gh.pr_comment("https://github.com/fixture/repo/pull/7", probe)
+tracker.for_repo(cfg, cfg.repo("replay-sample")).comment("5", probe)
+gh.issue_create("fixture/repo", "Report", probe)
+'''
+            done = subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script,
+                                   str(root), self.MODEL, self.PLANTED, self.PROBE],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=300, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertTrue(log.exists(), done.stderr + done.stdout)
+            return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def assert_inert(self, body):
+        outside = re.sub(r"```.*?```|`[^`\n]*`|<code>.*?</code>", "", body, flags=re.DOTALL)
+        self.assertIn("<code>@someone</code>", body)
+        self.assertIn("<code>@org/team</code>", body)
+        self.assertIn("Fixes <code>#12</code>", body)
+        self.assertNotIn("@someone", outside, body)
+        self.assertNotIn("@org/team", outside, body)
+        self.assertIsNone(re.search(r"(?i)\b(fixes|closes|resolved):?\s*(#\d|fixture/repo#)", outside), body)
+        self.assertIn("Closes <code>#5</code>", body)
+        self.assertIn("resolved: <code>fixture/repo#12</code>", body)
+        self.assertIn("`@someone Fixes #12`", body)
+        self.assertIn("```\n@someone\nFixes #12\n```", body)
+
+    def test_model_text_is_inert_in_every_github_write(self):
+        calls = self.run_workflow()
+
+        def kind(*head):
+            return [c["input"] for c in calls if c["args"][:len(head)] == list(head)]
+
+        created = kind("pr", "create")
+        self.assertEqual(len(created), 1, calls)
+        self.assertEqual(created[0].split("\n")[0], "Closes #5")
+        self.assertEqual(created[0].count("Closes #5"), 1)
+        self.assert_inert(created[0].split("\n", 1)[1])
+        comment = next(b for b in kind("pr", "comment") if "PROBE" in b)
+        self.assert_inert(comment)
+        self.assertTrue(comment.endswith("<!-- arete -->"))
+        self.assert_inert(next(b for b in kind("issue", "comment") if "PROBE" in b))
+        self.assert_inert(next(b for b in kind("issue", "create") if "PROBE" in b))
+        self.assertTrue(any("PRs for this ticket" in b and "@" not in b for b in kind("issue", "comment")), calls)
+        for edited in kind("pr", "edit"):
+            self.assertEqual(edited.split("\n")[0], "Closes #5")
+            self.assertNotIn("<code><code>", edited)
+
+    def test_inert_table(self):
+        table = [
+            ("cc @someone and @org/team.", "cc <code>@someone</code> and <code>@org/team</code>."),
+            ("Fixes #12", "Fixes <code>#12</code>"),
+            ("fixes: #12", "fixes: <code>#12</code>"),
+            ("CLOSED fixture/repo#12", "CLOSED <code>fixture/repo#12</code>"),
+            ("Resolve https://github.com/o/r/issues/12", "Resolve <code>https://github.com/o/r/issues/12</code>"),
+            ("**Fixes** #12", "**Fixes** <code>#12</code>"),
+            ("resolved GH-12", "resolved <code>GH-12</code>"),
+            ("example.com/@someone", "example.com/<code>@someone</code>"),
+            ("\\@someone", "\\ <code>@someone</code>"),
+            ("a ` stray\n\n@someone", "a ` stray\n\n<code>@someone</code>"),
+            ("- one ` tick\n- @someone ` end", "- one ` tick\n- <code>@someone</code> ` end"),
+            ("`a\\` @someone `b`", "`a\\` <code>@someone</code> `b`"),
+            ("<summary>ping `@someone`</summary>", "<summary>ping `<code>@someone</code>`</summary>"),
+            ("<details>\n```\n@someone\n```\n</details>", "<details>\n```\n<code>@someone</code>\n```\n</details>"),
+            ("<pre>Fixes #12</pre>", "<pre>Fixes <code>#12</code></pre>"),
+            ("请@someone 看", "请<code>@someone</code> 看"),
+            ("bug-fixes #12", "bug-fixes <code>#12</code>"),
+            ("Fixes \\#12", "Fixes \\ <code>#12</code>"),
+            ("xhttps://a.b/@someone", "xhttps://a.b/<code>@someone</code>"),
+            ("http://a_b/@someone", "http://a_b/<code>@someone</code>"),
+            ("www.example.com/@someone", "www.example.com/<code>@someone</code>"),
+            ("https://x.y/fixes #12", "https://x.y/fixes <code>#12</code>"),
+            ("<code>see @someone</code>", "<code>see <code>@someone</code></code>"),
+            ("<div>https://a.b/@someone</div>", "<div>https://a.b/<code>@someone</code></div>"),
+            ("- <div>`@someone`</div>", "- <div>`<code>@someone</code>`</div>"),
+            ("x <b class=\"`\">@someone</b><i class=\"`\">",
+             "x <b class=\"`\"><code>@someone</code></b><i class=\"`\">"),
+            ("| `a | @someone` |", "| `a | <code>@someone</code>` |"),
+            ("`a\nb` @someone `c\nd`", "`a\nb` <code>@someone</code> `c\nd`"),
+            ("a `x\n2. y` @someone `z\nw`", "a `x\n2. y` <code>@someone</code> `z\nw`"),
+            ("- item\n  ```\n  code\n@someone\n\n```\nmore\n```",
+             "- item\n  ```\n  code\n<code>@someone</code>\n\n```\nmore\n```"),
+            (" ```\n@someone", " ```\n<code>@someone</code>"),
+            ("<pre>\n\n```\n@someone\n</pre>\n@other", "<pre>\n\n```\n<code>@someone</code>\n</pre>\n<code>@other</code>"),
+            ("[link](https://example.com/`a) @someone Fixes #12 `b",
+             "[link](https://example.com/`a) <code>@someone</code> Fixes <code>#12</code> `b"),
+            ("[ref]: https://example.com/`a\n\n@someone `b", "[ref]: https://example.com/`a\n\n<code>@someone</code> `b"),
+            ("[ref]: https://example.com/`a @someone `b", "[ref]: https://example.com/`a <code>@someone</code> `b"),
+            ("_@someone_", "_<code>@someone</code>_"),
+            ("__@org/team__", "__<code>@org/team</code>__"),
+            ("@some_one_ ok", "<code>@some_one</code>_ ok"),
+            ("| URL | Person |\n| --- | --- |\n| https://example.com/|@someone |",
+             "| URL | Person |\n| --- | --- |\n| https://example.com/|<code>@someone</code> |"),
+            ("@someone see `@other`","<code>@someone</code> see `@other`"),
+        ]
+        unchanged = ["see #12", "prefixes #12", "a@b.co", "https://example.com/@someone/post",
+                     "`@someone Fixes #12`", "```\n@someone\nFixes #12\n```", "~~~\n@someone\nFixes #12\n~~~",
+                     "<code>@someone</code>",
+                     "<details><summary>Plan</summary>\n\n```\n@someone\n```\n\n</details>",
+                     "Use `<details>` and `@decorator`", "1. step\n   ```\n   @someone\n   ```", "```\n@someone"]
+        table += [(text, text) for text in unchanged]
+        for text, expected in table:
+            with self.subTest(text=text):
+                self.assertEqual(outbound.inert(text), expected)
+                self.assertEqual(outbound.inert(expected), expected)
+
+    def test_gh_refuses_text_that_skipped_outgoing(self):
+        with mock.patch.object(util, "sh_with_network", side_effect=AssertionError("reached")):
+            with self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                gh.gh(["issue", "comment", "5", "--body-file", "-"], input="@someone")
+            with self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                gh.gh(["issue", "close", "5", "--comment", "@someone"])
+            for args in (["issue", "comment", "5", "-b", "@someone"], ["api", "x", "-f", "body=@someone"],
+                         ["pr", "create", "--body=@someone"], ["pr", "create", "--body-file", "/tmp/x"],
+                         ["issue", "comment", "5", "-b@someone"], ["api", "x", "-fbody=@someone"],
+                         ["api", "repos/o/r/issues/5/comments", "--input", "/tmp/body.json"],
+                         ["api", "x", "--input=/tmp/body.json"]):
+                with self.subTest(args=args), self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                    gh.gh(args)
+        self.assertTrue(gh.outgoing("x", "Closes #5").startswith("Closes #5\n\n"))
 
 
 class NoLiveStateTests(unittest.TestCase):

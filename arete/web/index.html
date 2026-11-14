@@ -20,12 +20,14 @@
 <script src="/sessions.js" defer></script>
 <script src="/loops.js" defer></script>
 <script src="/triage.js" defer></script>
+<script src="/asks.js" defer></script>
 <script src="/outcomes.js" defer></script>
 <script src="/health.js" defer></script>
 <script src="/settings.js" defer></script>
 <script src="/usage.js" defer></script>
 <script src="/tracking.js" defer></script>
 <script src="/console.js" defer></script>
+<script src="/feedback.js" defer></script>
 <script src="/find.js" defer></script>
 <script src="/keys.js" defer></script>
 <script src="/loaders.js" defer></script>
@@ -34,11 +36,14 @@
 <body>
 <button type="button" class="skip" id="skip">Skip to the content</button>
 <div class="wrap sidebar-page">
+<section id="waiting" class="waiting" aria-labelledby="waiting-title" hidden><h2 id="waiting-title">Waiting on you <span class="digits" id="waiting-count"></span></h2><div id="waiting-list"></div></section>
+<p id="waiting-result" class="said" aria-live="polite" tabindex="-1" hidden></p>
 
 <nav class="side" aria-label="Views">
   <div class="group tools">
     <button type="button" id="find-open" aria-haspopup="dialog">Find</button>
     <button type="button" id="console-open" aria-expanded="false" aria-controls="console"><span>Console</span><span class="count" id="count-console"></span></button>
+    <button type="button" id="feedback-open" aria-haspopup="dialog">Feedback</button>
   </div>
   <p class="side-foot" id="serve-line"></p>
   <p class="side-foot hints">Ctrl or Cmd K to find<br>? for the keys</p>
@@ -213,12 +218,17 @@
     <button type="button" id="console-close">Close</button>
   </div>
   <div class="console-body" id="console-body">
-    <p class="muted">Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here or from Live. A chat on a project works in that repo's folder and knows its checks and what arete's agents learned there.</p>
+    <p class="muted">The chat is arete's orchestrator. Ask about runs, health, cost, settings, or arete's own code, and ask it for work: it starts task sessions in sandboxes, watches them, and shows each report here when the session ends. It never edits a file or pushes itself. A change to arete goes through a drafted issue, which you file here or from Live. A chat on a project starts its sessions on that repo and knows its checks and what arete's agents learned there.</p>
     <div class="field">
       <label for="chat-pick">Chat</label>
       <select id="chat-pick"></select>
     </div>
     <p id="chat-about" class="muted" hidden></p>
+    <div id="chat-sessions" class="chat-sessions" hidden>
+      <h3>Sessions of this chat</h3>
+      <ul id="chat-sessions-list"></ul>
+      <p id="chat-sessions-result" aria-live="polite" tabindex="-1" hidden></p>
+    </div>
     <div id="messages" aria-live="polite"></div>
     <p id="working" class="muted" hidden></p>
     <div id="draft" class="draft" hidden>
@@ -273,10 +283,78 @@
     <dt><kbd>Ctrl</kbd> or <kbd>Cmd</kbd> <kbd>K</kbd></dt><dd>Find a view, loop, run, session, ticket or action</dd>
     <dt><kbd>/</kbd></dt><dd>Find, outside a field</dd>
     <dt id="keys-console"><kbd>C</kbd></dt><dd>Open or close the console</dd>
+    <dt><kbd>F</kbd></dt><dd>Write feedback: an idea, an adjustment or a bug</dd>
     <dt><kbd>Esc</kbd></dt><dd>Close the open item, then the console</dd>
     <dt><kbd>?</kbd></dt><dd>This list</dd>
   </dl>
   <div class="actions"><button type="button" id="keys-close">Close</button></div>
 </dialog>
+
+<dialog id="feedback" aria-labelledby="feedback-title">
+  <h2 id="feedback-title" tabindex="-1">Feedback</h2>
+  <p class="muted">The draft is kept as you type, on arete and on this device. Nothing is filed from here yet.</p>
+  <fieldset>
+    <legend>Kind</legend>
+    <label class="check"><input type="radio" name="feedback-kind" value="idea" checked>Idea</label>
+    <label class="check"><input type="radio" name="feedback-kind" value="adjustment">Adjustment</label>
+    <label class="check"><input type="radio" name="feedback-kind" value="bug">Bug</label>
+  </fieldset>
+  <div class="field">
+    <label for="feedback-text">Request</label>
+    <textarea id="feedback-text" rows="5" maxlength="4000" aria-required="true" aria-describedby="feedback-text-limit"></textarea>
+    <p class="muted limit" id="feedback-text-limit">Required · up to 4,000 characters</p>
+  </div>
+  <div id="feedback-bug" hidden>
+    <div class="field">
+      <label for="feedback-expected">Expected</label>
+      <textarea id="feedback-expected" rows="3" maxlength="2000" aria-describedby="feedback-expected-limit"></textarea>
+      <p class="muted limit" id="feedback-expected-limit">Optional · up to 2,000 characters</p>
+    </div>
+    <div class="field">
+      <label for="feedback-actual">Actual</label>
+      <textarea id="feedback-actual" rows="3" maxlength="2000" aria-describedby="feedback-actual-limit"></textarea>
+      <p class="muted limit" id="feedback-actual-limit">Optional · up to 2,000 characters</p>
+    </div>
+    <div class="field">
+      <label for="feedback-steps">Steps</label>
+      <textarea id="feedback-steps" rows="3" maxlength="2000" aria-describedby="feedback-steps-limit"></textarea>
+      <p class="muted limit" id="feedback-steps-limit">Optional · up to 2,000 characters</p>
+    </div>
+  </div>
+  <label class="check"><input type="checkbox" id="feedback-include">Include app state</label>
+  <p class="muted limit">arete adds its version, this view, the open item's id and, for a run, its kind, status, last step, times and the first line of its error. It never adds page content, config, logs or transcripts. Up to 8 KB.</p>
+  <div id="feedback-context" hidden>
+    <pre id="feedback-context-json" tabindex="0"></pre>
+    <div class="actions"><button type="button" id="feedback-context-again">Capture again</button><button type="button" id="feedback-context-drop">Remove</button></div>
+  </div>
+  <div class="actions">
+    <button type="button" id="feedback-shot">Take a screenshot</button>
+    <button type="button" id="feedback-record">Record a video</button>
+    <button type="button" id="feedback-attach">Attach a file</button>
+    <input type="file" id="feedback-file" accept="image/png,image/jpeg,image/webp,video/webm,video/mp4" multiple hidden>
+  </div>
+  <p class="muted limit">PNG, JPEG or WebP images up to 5 MB and WebM or MP4 videos up to 25 MB and 30 seconds. A draft holds six items and 40 MB. Nothing is captured until you press a button, and staged files stay on this machine until Submit files the request.</p>
+  <p id="feedback-evidence-said" aria-live="polite" tabindex="-1" hidden></p>
+  <h3>What will be sent</h3>
+  <div id="feedback-sending">
+    <p><strong id="feedback-sending-title"></strong></p>
+    <pre id="feedback-sending-text"></pre>
+    <p class="muted" id="feedback-sending-source"></p>
+    <p id="feedback-sending-context"></p>
+    <ul id="feedback-evidence"></ul>
+    <p class="muted" id="feedback-evidence-total"></p>
+  </div>
+  <h3>Checks</h3>
+  <ul id="feedback-checks"></ul>
+  <p class="muted" id="feedback-checks-cost"></p>
+  <p id="feedback-ready" aria-live="polite"></p>
+  <p id="feedback-result" aria-live="polite" tabindex="-1" hidden></p>
+  <p id="feedback-filed" tabindex="-1" hidden></p>
+  <div class="actions"><button type="button" id="feedback-submit">Submit</button><button type="button" id="feedback-close">Close</button><button type="button" id="feedback-discard">Discard</button><span class="muted keys">Esc closes · the draft is kept</span></div>
+</dialog>
+<div id="feedback-recording" hidden role="status">
+  <span id="feedback-recording-time">Recording 0:00 of 0:30</span>
+  <button type="button" id="feedback-recording-stop">Stop</button>
+</div>
 </body>
 </html>

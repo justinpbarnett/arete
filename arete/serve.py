@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import NoReturn
 
 from . import (
+    capture,
     chat,
     config,
     control,
@@ -28,6 +29,7 @@ from . import (
     paths,
     record,
     runner,
+    sessions,
     sources,
     state,
     tasks,
@@ -137,6 +139,7 @@ class Server:
         for row in record.reap(tickets=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
             self.swept = 0.0
+        sessions.tell_chats()
         states = state.loop_states()
         now = util.now()
         for loop in live:
@@ -388,6 +391,8 @@ class Server:
             return "the dashboard is still answering a request"
         if chat.any_busy():
             return "a chat message is still running"
+        if capture.checking():
+            return "a feedback request is still being checked or filed"
         return ""
 
     def load_new_code(self) -> None:

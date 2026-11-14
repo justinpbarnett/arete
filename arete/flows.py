@@ -13,7 +13,6 @@ from . import (
     factory,
     gh,
     lines,
-    outbound,
     paths,
     pipeline,
     record,
@@ -122,6 +121,9 @@ def guard(job: Job, continues: str) -> str:
     try:
         checkouts = [pipeline.Checkout(**{**e, "src": Path(e["src"]), "wt": Path(e["wt"])}) for e in listed]
         layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
+        if held := pipeline.scratch_held(job.ws, checkouts):
+            return (f"arete started no step and made no tracker call: verification scratch at {held[0]} is still "
+                    "held; poll finalizes it once its holders end, then run again")
         if why := pipeline.kept_work(job.ws, checkouts, job.run.repo.path, layer.copy, commits=False):
             return f"arete started no step and made no tracker call: {why}"
     except (pipeline.RunFailed, RuntimeError, OSError, KeyError, TypeError) as e:
@@ -534,6 +536,9 @@ class Job:
         run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored and not run.workspace:
+            if held := pipeline.scratch_held(self.ws, self.checkouts):
+                raise pipeline.RunFailed(f"verification scratch at {held[0]} is still held; poll finalizes it once "
+                                         "its holders end, then run again")
             kept = pipeline.kept_onto(self.ws, self.checkouts, self.branch)
             if why := pipeline.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
                 raise pipeline.RunFailed(why)
@@ -964,10 +969,10 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
     stops = {c.github: pipeline.ci.stopped_section(gh.pr_body(c.pr)) for c in found}
     for c in staged.changed:
         if c in opened:
-            gh.pr_edit_body(c.pr, with_stop(f"{link}\n\n{report_body}", stops.get(c.github, "")))
+            gh.pr_edit_body(c.pr, with_stop(report_body, stops.get(c.github, "")), link=link)
         elif not c.pr:
-            c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), f"{link}\n\n{report_body}",
-                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
+            c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), report_body,
+                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
             opened.append(c)
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
@@ -980,16 +985,16 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
         others = pipeline.sibling_section(t.ref, c, with_prs)
         if c in opened:
             if others:
-                gh.pr_edit_body(c.pr, with_stop(f"{link}\n\n{report_body}{others}", stops.get(c.github, "")))
+                gh.pr_edit_body(c.pr, with_stop(f"{report_body}{others}", stops.get(c.github, "")), link=link)
             continue
         body = gh.pr_body(c.pr)
         if c in standing and pipeline.ci.stopped(body):
             ci_stopped.append(c)
-        new_body = pipeline.synced_pr_body(run, c.pr, body, t, left)
+        kept, text = pipeline.synced_pr_body(run, c.pr, body, t, left)
         if opened:
-            new_body = pipeline.with_siblings(new_body, others)
-        if new_body != body:
-            gh.pr_edit_body(c.pr, new_body)
+            text = pipeline.with_siblings(text, others)
+        if gh.outgoing(text, kept) != body:
+            gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report_body}")
         elif not committed and c in staged.changed and c.pr not in run.feedback_prs:
@@ -1120,7 +1125,7 @@ def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
     job = flow.ctx
     staged, size, outcome_text = change(job)
     job.run.save("diff.patch", staged.patch)
-    job.run.save("pr_body.md", outbound.screen(pipeline.report_body(
+    job.run.save("pr_body.md", gh.outgoing(pipeline.report_body(
         job.run, summary=job.build_summary, review=job.review, verified=job.verified,
         left=job.left_for_a_person, images={}, approval=job.approval, attempts=job.attempts,
         checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size,

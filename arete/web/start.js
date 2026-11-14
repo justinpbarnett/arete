@@ -128,6 +128,7 @@ document.addEventListener("DOMContentLoaded", () => {
   wireForms();
   wireConsole();
   wireDialogs();
+  wireFeedback();
   document.addEventListener("keydown", onKey);
   document.addEventListener("click", onClick);
   const noteMouseAt = (e) => {
@@ -153,5 +154,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
   resumeCarried();
+  openAskLink(asked);
   applyRoute(first, CARRIED ? "return" : "start");
 });

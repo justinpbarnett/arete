@@ -39,7 +39,32 @@ def auth_token() -> str:
     return res.stdout.strip() if res.returncode == 0 else ""
 
 
+class Outgoing(str):
+    pass
+
+
+TEXT_FLAGS = ("--body", "-b", "--comment", "-c", "--field", "-f", "--raw-field", "-F")
+JOINED_TEXT_FLAGS = ("--body=", "--comment=", "--body-file=", "--field=", "--raw-field=", "--input=")
+STDIN_ONLY_FLAGS = ("--body-file", "--input")
+ATTACHED_SHORT_FLAGS = ("-b", "-c", "-f", "-F")
+
+
+def joined_text_flag(arg: str) -> bool:
+    return arg.startswith(JOINED_TEXT_FLAGS) or (len(arg) > 2 and arg.startswith(ATTACHED_SHORT_FLAGS))
+
+
+def unscreened_text(args: list[str], input: str | None) -> bool:
+    if input is not None and not isinstance(input, Outgoing):
+        return True
+    if any(joined_text_flag(str(arg)) for arg in args):
+        return True
+    return any((flag in TEXT_FLAGS and not isinstance(value, Outgoing)) or (flag in STDIN_ONLY_FLAGS and value != "-")
+               for flag, value in itertools.pairwise(args))
+
+
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
+    if unscreened_text(args, input):
+        raise TypeError("text sent to GitHub must come from gh.outgoing")
     res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input)
     if res.returncode != 0:
         command = " ".join(itertools.takewhile(lambda arg: not arg.startswith("-"), args))
@@ -79,12 +104,31 @@ def issue(repo: str, number: int) -> dict:
     )
 
 
+def outgoing(text: str, link: str = "", mark: bool = False) -> Outgoing:
+    text = outbound.inert(outbound.screen(text))
+    if link:
+        text = f"{outbound.screen(link)}\n\n{text}"
+    return Outgoing(marked(text) if mark else text)
+
+
+def split_link(body: str, links) -> tuple[str, str]:
+    first, _, rest = body.partition("\n")
+    if first and first in links:
+        return first, rest.lstrip("\n")
+    return "", body
+
+
 def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
-    url = gh(args, input=outbound.screen(body)).strip().splitlines()[-1]
+    url = gh(args, input=outgoing(body)).strip().splitlines()[-1]
     return int(url.rstrip("/").rsplit("/", 1)[-1])
+
+
+def recent_issues(repo: str, limit: int = 100) -> list[dict]:
+    return gh_json(["issue", "list", "--repo", repo, "--state", "all", "--limit", str(limit), "--search",
+                    "sort:updated-desc", "--json", "number,title,body,state,stateReason,updatedAt"]) or []
 
 
 def issue_url(repo: str, number: int | str) -> str:
@@ -92,13 +136,13 @@ def issue_url(repo: str, number: int | str) -> str:
 
 
 def issue_comment(repo: str, number: int, body: str) -> None:
-    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=outbound.screen(body))
+    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
 def issue_close(repo: str, number: int, comment: str = "") -> None:
     args = ["issue", "close", str(number), "--repo", repo]
     if comment:
-        args += ["--comment", outbound.screen(comment)]
+        args += ["--comment", outgoing(comment)]
     gh(args)
 
 
@@ -122,7 +166,7 @@ def issue_state(repo: str, number: int) -> str:
 
 
 def issue_edit_body(repo: str, number: int, body: str) -> None:
-    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outbound.screen(body))
+    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
 def issue_reopen(repo: str, number: int) -> None:
@@ -130,14 +174,14 @@ def issue_reopen(repo: str, number: int) -> None:
 
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
-              draft: bool = False, cwd=None) -> str:
+              draft: bool = False, cwd=None, link: str = "") -> str:
     args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outbound.screen(title),
             "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
     if draft:
         args.append("--draft")
-    return gh(args, cwd=cwd, input=outbound.screen(body)).strip().splitlines()[-1]
+    return gh(args, cwd=cwd, input=outgoing(body, link)).strip().splitlines()[-1]
 
 
 def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> list[dict]:
@@ -167,17 +211,54 @@ def pr_diff(url: str) -> str:
     return gh(["pr", "diff", url])
 
 
-def pr_edit_body(url: str, body: str) -> None:
-    gh(["pr", "edit", url, "--body-file", "-"], input=outbound.screen(body))
+def pr_edit_body(url: str, body: str, link: str = "") -> None:
+    gh(["pr", "edit", url, "--body-file", "-"], input=outgoing(body, link))
 
 
 def pr_comment(url: str, body: str) -> None:
-    gh(["pr", "comment", url, "--body-file", "-"], input=marked(outbound.screen(body)))
+    gh(["pr", "comment", url, "--body-file", "-"], input=outgoing(body, mark=True))
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
     gh(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
-        "--input", "-"], input=json.dumps({"body": marked(outbound.screen(body))}))
+        "--input", "-"], input=Outgoing(json.dumps({"body": outgoing(body, mark=True)})))
+
+
+def ensure_branch(repo: str, branch: str) -> None:
+    try:
+        gh(["api", f"repos/{repo}/git/ref/heads/{branch}", "--jq", ".object.sha"])
+        return
+    except GhError as e:
+        if "HTTP 404" not in str(e):
+            raise
+    sha = branch_sha(repo, default_branch(repo))
+    try:
+        gh(["api", "-X", "POST", f"repos/{repo}/git/refs", "--input", "-"],
+           input=Outgoing(json.dumps({"ref": f"refs/heads/{branch}", "sha": sha})))
+    except GhError as e:
+        if "Reference already exists" not in str(e):
+            raise
+
+
+def file_sha(repo: str, path: str, ref: str) -> str:
+    try:
+        return gh(["api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".sha"]).strip()
+    except GhError as e:
+        if "HTTP 404" in str(e):
+            return ""
+        raise
+
+
+def put_file(repo: str, path: str, data: bytes, branch: str, message: str, replaces: str = "") -> str:
+    payload = {"message": message, "content": base64.b64encode(data).decode(), "branch": branch,
+               **({"sha": replaces} if replaces else {})}
+    out = gh(["api", "-X", "PUT", f"repos/{repo}/contents/{path}", "--input", "-"],
+             input=Outgoing(json.dumps(payload)), timeout=600)
+    return json.loads(out)["commit"]["sha"]
+
+
+def blob_url(repo: str, commit: str, path: str) -> str:
+    return f"https://github.com/{repo}/blob/{commit}/{path}"
 
 
 def api_list(path: str) -> list[dict]:

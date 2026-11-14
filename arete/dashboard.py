@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import (
     board,
+    capture,
     chat,
     config,
     control,
@@ -71,6 +72,12 @@ CHAT_PATH = "/api/chats/"
 TASK_PATH = "/api/tasks/"
 EVENTS_PATH = re.compile(r"/api/runs/([^/]+)/events")
 EVENTS_TYPE = "application/x-ndjson"
+EVIDENCE_PATH = "/api/capture/evidence"
+EVIDENCE_ITEM = re.compile(r"/api/capture/evidence/(\d+)")
+EVIDENCE_DROP = re.compile(r"/api/capture/evidence/(\d+)/drop")
+EVIDENCE_RANGE = re.compile(r"bytes=(\d*)-(\d*)")
+SKIP_CHUNK = 1024 * 1024
+MOST_SKIPPED = 64 * 1024 * 1024
 RUN_ID = re.compile(r"\w[\w.-]*")
 END_GRACE_SECONDS = 5
 INSTALL_SECONDS = 120
@@ -190,7 +197,7 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
+STATUS_OF_REFUSAL = {capture.TooLarge: 413, capture.Refused: 400, capture.NotStaged: 404, capture.Conflict: 409,board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
                      chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
@@ -247,14 +254,19 @@ class Handler(BaseHTTPRequestHandler):
                 got = hooks.receive(unquote(path[len(hooks.HOOK_PATH):]), self.headers, self.raw_body())
                 return self.send_json(202 if got["queued"] else 200, got)
             query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
+            if method == "POST" and path == EVIDENCE_PATH:
+                return self.send_json(200, self.stage_evidence(query))
+            if method == "GET" and (item := EVIDENCE_ITEM.fullmatch(path)):
+                return self.send_evidence(int(item[1]))
             if method == "GET" and (events := EVENTS_PATH.fullmatch(path)):
                 return self.send_events(unquote(events[1]), query)
             self.send_json(200, self.api(method, path, query))
         except Exception as e:
             if status := refusal_status(e):
                 return self.send_json(status, refusal_answer(e))
-            self.log_error("%s", f"{type(e).__name__}: {e}")
-            self.send_json(500, {"error": as_sentence(util.first_line(f"{type(e).__name__}: {e}", 300))})
+            said = type(e).__name__ if self.path.startswith(ASK_PATH) else f"{type(e).__name__}: {e}"
+            self.log_error("%s", said)
+            self.send_json(500, {"error": as_sentence(util.first_line(said, 300))})
 
     def admit(self, method: str, path: str) -> None:
         node: Node = self.server.node
@@ -295,8 +307,16 @@ class Handler(BaseHTTPRequestHandler):
                 return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))))
             if path == "/api/settings":
                 return settings.current()
+            if path == "/api/capture":
+                return capture.view(connect=state.reader)
             if path == "/api/chats":
                 return chat.listing()
+            if path.startswith(CHAT_PATH) and "/sessions" in path:
+                parts = unquote(path[len(CHAT_PATH):]).split("/")
+                if len(parts) == 2 and parts[1] == "sessions":
+                    return chat.sessions_of(whole_number(parts[0]))
+                if len(parts) == 4 and parts[1] == "sessions" and parts[3] == "report":
+                    return chat.session_report(whole_number(parts[0]), parts[2])
             if path.startswith(CHAT_PATH):
                 return chat.view(whole_number(unquote(path[len(CHAT_PATH):])))
             if path.startswith(LOG_PATH):
@@ -315,10 +335,28 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/usage":
                 state.add_usage(self.usage_row(), board.KEEP_USAGE_DAYS)
                 return {}
+            if path == "/api/capture":
+                return capture.save(self.body())
+            if path == "/api/capture/context":
+                return capture.add_context(self.body(), WEB_CODE)
+            if path == "/api/capture/submit":
+                return capture.submit(self.body())
+            if path == "/api/capture/context/drop":
+                return capture.drop_context()
+            if path == "/api/capture/discard":
+                return capture.discard()
+            if drop := EVIDENCE_DROP.fullmatch(path):
+                return capture.drop_evidence(int(drop[1]))
             if path == "/api/settings":
                 return settings.save(self.body())
             if path == "/api/chats/new":
                 return chat.new(str(self.body().get("project") or ""))
+            if path.startswith(CHAT_PATH) and "/sessions" in path:
+                parts = unquote(path[len(CHAT_PATH):]).split("/")
+                if len(parts) == 2 and parts[1] == "sessions":
+                    return self.start_chat_session(whole_number(parts[0]))
+                if len(parts) == 4 and parts[1] == "sessions" and parts[3] == "stop":
+                    return chat.stop_session(whole_number(parts[0]), parts[2])
             if path.startswith(CHAT_PATH):
                 chat_id, action = last_part(path, CHAT_PATH)
                 if action == "send":
@@ -419,6 +457,17 @@ class Handler(BaseHTTPRequestHandler):
                                repo=str(b.get("repo") or ""),
                                budget_usd=None if budget in (None, "") else float(budget))
 
+    def start_chat_session(self, chat_id: int) -> dict:
+        b = self.body()
+        budget = b.get("budget_usd")
+        if budget not in (None, "") and (isinstance(budget, bool) or not isinstance(budget, int | float)):
+            raise Refusal(400, "budget_usd is a number of dollars.")
+        repo = b.get("repo")
+        return chat.start_session(chat_id, str(b.get("prompt", "")), repo=None if repo is None else str(repo),
+                                  device=str(b.get("device") or ""), model=str(b.get("model") or ""),
+                                  runner=str(b.get("runner") or ""),
+                                  budget_usd=None if budget in (None, "") else float(budget))
+
     def send_ticket(self, ref: str) -> dict:
         b = self.body()
         questions, answers = b.get("questions"), b.get("answers")
@@ -452,11 +501,57 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(400, "Write a message first.")
         return text
 
-    def raw_body(self, limit: int = hooks.MAX_HOOK_BODY) -> bytes:
+    def body_size(self) -> int:
         length = (self.headers.get("Content-Length") or "0").strip()
         if not length.isdigit():
             raise Refusal(400, "Content-Length takes a whole number of bytes.")
-        size = int(length)
+        return int(length)
+
+    def stage_evidence(self, query: dict) -> dict:
+        size = self.body_size()
+        if size > capture.MOST_VIDEO_BYTES:
+            if size <= MOST_SKIPPED:
+                left = size
+                while left > 0 and (chunk := self.rfile.read(min(SKIP_CHUNK, left))):
+                    left -= len(chunk)
+            else:
+                self.close_connection = True
+            raise capture.TooLarge(f"An upload is limited to {capture.MOST_VIDEO_BYTES // capture.MB} MB for a video and "
+                                   f"{capture.MOST_IMAGE_BYTES // capture.MB} MB for an image, and this one has "
+                                   f"{capture.megabytes(size)}.")
+        return capture.stage(self.raw_body(capture.MOST_VIDEO_BYTES), query.get("name", ""), query.get("source", ""),
+                             query.get("seconds", ""))
+
+    def send_evidence(self, evidence_id: int) -> None:
+        path, row = capture.staged_file(evidence_id)
+        total = path.stat().st_size
+        first, last, status = 0, total - 1, 200
+        wanted = EVIDENCE_RANGE.fullmatch((self.headers.get("Range") or "").strip())
+        if wanted and (wanted[1] or wanted[2]):
+            if wanted[1]:
+                start, end = int(wanted[1]), int(wanted[2] or total - 1)
+            else:
+                start, end = max(total - int(wanted[2]), 0), total - 1
+            end = min(end, total - 1)
+            if 0 <= start <= end:
+                first, last, status = start, end, 206
+        self.head(status, row["type"], "no-store", last - first + 1)
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {first}-{last}/{total}")
+        try:
+            self.end_headers()
+            with path.open("rb") as f:
+                f.seek(first)
+                left = last - first + 1
+                while left > 0 and (chunk := f.read(min(SKIP_CHUNK, left))):
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def raw_body(self, limit: int = hooks.MAX_HOOK_BODY) -> bytes:
+        size = self.body_size()
         if size > limit:
             raise Refusal(413, f"A request body holds at most {limit // 1024} KB.")
         return self.rfile.read(size)
@@ -629,6 +724,7 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     port = port or cfg.dashboard_port
     state.ensure_schema()
     chat.recover()
+    capture.recover()
     logins = Logins()
     waiting_for = ""
     atexit.register(forget_server)

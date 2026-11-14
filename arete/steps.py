@@ -15,13 +15,18 @@ BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(runn
             "research_plan": {"timeout_minutes": 10, "tries": 2},
             "research_search": {"timeout_minutes": 10, "tries": 2, "tools": runner.WEB_TOOLS},
             "research_synthesis": {"timeout_minutes": 10, "tries": 2},
-            "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()}}
+            "research_audit": {"timeout_minutes": 10, "tries": 2, "tools": (*runner.READ_TOOLS, "WebFetch")},
+            "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()},
+            "capture_evidence": {"timeout_minutes": 3, "tries": 1, "tools": ("Read",), "instructions": (),
+                                 "modalities": ("image",), "structured_output": True, "budget_usd": 0.25}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
 KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "research_search", "research_synthesis",
-                    "document")
-READ_ONLY = ("research_plan", "research_search", "research_synthesis", "document")
+                    "research_audit", "document", "capture_evidence")
+READ_ONLY = ("research_plan", "research_search", "research_synthesis", "research_audit", "document",
+             "capture_evidence")
 SEARCHES = ("research_search",)
+FETCHES = ("research_audit",)
 NO_WEB = ("research_synthesis",)
 
 
@@ -156,7 +161,10 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
 
 def check_reach(where: str, cfg: config.Config, role: str, which: str, found: dict, instructions: tuple) -> None:
     tools, mcp = found["tools"], found["mcp"]
-    web = runner.WEB_TOOLS if role in SEARCHES else ()
+    web = runner.WEB_TOOLS if role in SEARCHES else ("WebFetch",) if role in FETCHES else ()
+    if role in FETCHES and "WebSearch" in tools:
+        raise ValueError(f"{where}: tools WebSearch cannot load on {role}, which may only fetch again the sources "
+                         "it audits")
     if role in NO_WEB and (found_web := [t for t in tools if t in runner.WEB_TOOLS]):
         raise ValueError(f"{where}: tools {', '.join(found_web)} cannot load on {role}, which writes only from the "
                          "evidence it is given")

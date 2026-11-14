@@ -66,11 +66,13 @@ function parseRoute(hash) {
 }
 
 function knownRoute(hash) {
+  if (route && askIdIn((hash || "").replace(/^#/, ""))) return route;
   const old = OLD_HASHES[(hash || "").replace(/^#/, "")];
   return parseRoute(old ?? hash) ?? parseRoute("#live");
 }
 
 function go(hash, way, { replace = false } = {}) {
+  if (openAskLink((hash || "").replace(/^#/, ""))) return;
   const next = parseRoute(hash);
   if (!next) return;
   if (next.hash === route.hash) {
@@ -89,6 +91,7 @@ function onHistory(event) {
   const next = knownRoute(location.hash);
   if (next.hash !== location.hash) history.replaceState(state ?? { from: "" }, "", next.hash);
   if (asked === "chat") setConsole(true, { focus: true });
+  openAskLink(asked);
   const way = pendingWay || (state ? "back" : "link");
   pendingWay = "";
   if (next.hash === route.hash) return;
@@ -120,7 +123,7 @@ function currentPane() {
 function show(viewChanged, way) {
   const { view, detail } = route;
   const meta = VIEWS[view];
-  document.title = detail ? `Arete · ${ITEM_LABELS[detail.kind]} ${detail.id}` : `Arete · ${meta.label}`;
+  document.title = withWaitingCount(detail ? `Arete · ${ITEM_LABELS[detail.kind]} ${detail.id}` : `Arete · ${meta.label}`);
   document.getElementById("title").textContent = meta.label;
   document.getElementById("sub").textContent = meta.sub;
   for (const a of document.querySelectorAll("nav.side a[data-view]")) {

@@ -48,6 +48,7 @@ from . import (
     steps,
     tracker,
     util,
+    vault,
     verdicts,
     verify,
 )
@@ -691,6 +692,45 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     return found + [p for p in unproven if scratch_named(late, p.name)]
 
 
+def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
+    if held := scratch_left(ws, checkouts):
+        finalize_scratch()
+        held = scratch_left(ws, checkouts)
+    return held
+
+
+def finalize_scratch() -> list[str]:
+    done = scratch.recover_pending()
+    for root in done:
+        refresh_released(Path(root).parent, Path(root).name)
+    return done
+
+
+def refresh_released(ws: Path, root: str) -> None:
+    made = made_before(ws)
+    held, salt = made.get(RETAINED_KEY), str(made.get(SALT_KEY) or "")
+    if not isinstance(held, dict) or not isinstance(held.get("roots"), list) or root not in held["roots"]:
+        return
+    del made[RETAINED_KEY]
+    names = [n for n in held.get("names") or [] if isinstance(n, str) and n in made]
+    try:
+        made |= {n: fingerprint(ws / n, salt) for n in names}
+    except OSError:
+        pass
+    try:
+        made_record(ws).write_text(json.dumps(made))
+    except OSError:
+        pass
+
+
+def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[Path]) -> dict:
+    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
+    loose = {c.prefix + n for c in checkouts if c.wt in examined for n in ignored_files(c.wt)}
+    loose |= set(unexamined(ws, examined))
+    return {"roots": sorted({p.name for p in held if p.name.startswith(paths.SCRATCH_PREFIX)}),
+            "names": [n for n in names if n in loose]}
+
+
 def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
     if scratch_left(ws, checkouts):
         return False
@@ -816,6 +856,7 @@ def head_key(c: Checkout) -> str:
 
 SALT_KEY = "\0salt"
 OWNER_KEY = "\0owner"
+RETAINED_KEY = "\0retained"
 
 
 def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
@@ -851,7 +892,10 @@ def release_workspace(run: Run, ws: Path, checkouts: list[Checkout]) -> bool:
 def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None) -> None:
     try:
         owner = owner or made_before(ws).get(OWNER_KEY)
-        names = outside_scratch(ws, leftovers(ws, checkouts), scratch_left(ws, checkouts)) if ws.is_dir() else []
+        names, held = [], []
+        if ws.is_dir():
+            names, held = leftovers(ws, checkouts), scratch_left(ws, checkouts)
+            names = outside_scratch(ws, names, held)
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         heads |= {onto_key(c): c.onto for c in checkouts if c.onto and (c.wt / ".git").exists()}
         if names or heads:
@@ -859,8 +903,13 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None) ->
             made = {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
             if owner:
                 made[OWNER_KEY] = owner
+            if held:
+                made[RETAINED_KEY] = retained(ws, checkouts, names, held)
             made_record(ws).parent.mkdir(parents=True, exist_ok=True)
             made_record(ws).write_text(json.dumps(made))
+            if held and not scratch_left(ws, checkouts):
+                for root in made[RETAINED_KEY]["roots"]:
+                    refresh_released(ws, root)
             return
     except (OSError, RuntimeError):
         pass
@@ -904,7 +953,7 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
 
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
-    if left := scratch_left(ws, checkouts):
+    if left := scratch_held(ws, checkouts):
         held = ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
         raise RunFailed(f"unresolved or unknown scratch resources keep the existing workspace retained ({held})")
     if why := kept_work(ws, checkouts, source, copies):
@@ -918,8 +967,10 @@ def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> Non
     drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
+    holding = vault.held(git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"],
+                             c.wt)) if vault.every() else {}
     if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
-                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny)]:
+                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny) or n in holding]:
         git(["reset", "-q", "--", *denied], c.wt)
     if git(["diff", "--cached", "--name-only"], c.wt).strip():
         message = f"wip: edits of arete run {run_id}, kept when it ended before pushing\n\nArete-Run: {run_id}"
@@ -982,7 +1033,7 @@ def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str
 
 def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
                     branch: str) -> dict[str, str]:
-    if scratch_left(ws, checkouts):
+    if scratch_held(ws, checkouts):
         raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
     kept = kept_onto(ws, checkouts, branch)
     if not kept:
@@ -1094,13 +1145,22 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
             out.merged.append(c)
         elif not diff.counts:
             continue
+        shown = checkout_patch(c, diff.locks, "--cached", against)
+        resolving = bool(merged and c.resolved and not from_base)
+        resolved = resolved_patch(c) if resolving else ""
+        if vault.every():
+            whole = checkout_patch(c, [], *vault.SCAN, "--cached", against)
+            diff.denied += vault.refusals(whole + (resolved_patch(c, *vault.SCAN) if resolving else ""))
         out += diff
         out.changed.append(c)
-        out.patch += checkout_patch(c, diff.locks, "--cached", against)
-        if merged and c.resolved and not from_base:
-            out.patch += git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
-                              c.base_commit, "HEAD", "--", *c.resolved], c.wt)
+        out.patch += shown + resolved
+    out.patch = vault.hidden(out.patch)
     return out
+
+
+def resolved_patch(c: Checkout, *flags: str) -> str:
+    return git(["diff", "--no-renames", *flags, f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
+                c.base_commit, "HEAD", "--", *c.resolved], c.wt)
 
 
 def pending_merge(c: Checkout) -> bool:
@@ -1962,7 +2022,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
 
     if run.dry_run:
         run.save("diff.patch", staged.patch)
-        run.save("pr_body.md", outbound.screen(report_body(
+        run.save("pr_body.md", gh.outgoing(report_body(
             run, summary=build_summary, review=review, verified=verified, left=left_for_a_person, images={},
             approval=approval, attempts=attempts, checks=checks, plan_text=plan_text, size=size, held=draft_why,
             written=written)))
@@ -1981,8 +2041,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     opened: list[Checkout] = []
     for c in staged.changed:
         if not c.pr:
-            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{link}\n\n{pr_report}",
-                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
+            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), pr_report,
+                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
             opened.append(c)
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
@@ -1994,16 +2054,16 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
             if others:
-                gh.pr_edit_body(c.pr, f"{link}\n\n{pr_report}{others}")
+                gh.pr_edit_body(c.pr, f"{pr_report}{others}", link=link)
             continue
         body = gh.pr_body(c.pr)
         if c in pushed and ci.stopped(body):
             ci_stopped.append(c)
-        new_body = synced_pr_body(run, c.pr, body, t, left_for_a_person)
+        kept, text = synced_pr_body(run, c.pr, body, t, left_for_a_person)
         if opened:
-            new_body = with_siblings(new_body, others)
-        if new_body != body:
-            gh.pr_edit_body(c.pr, new_body)
+            text = with_siblings(text, others)
+        if gh.outgoing(text, kept) != body:
+            gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{pr_report}")
     drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
@@ -2081,7 +2141,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
         run.log("automerge left off: triage approved the ticket, so a person merges it")
         return
     try:
-        risk = jev.risk(patch_from_base(opened), about, cfg,
+        risk = jev.risk(vault.hidden(patch_from_base(opened)), about, cfg,
                         trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
         hold = risk.hold if risk else ""
     except jev.Unjudged as e:
@@ -2124,8 +2184,9 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Chec
                     "pick it up.", f"nothing to build: {why}")
     for c in with_prs:
         body = gh.pr_body(c.pr)
-        if (new_body := synced_pr_body(run, c.pr, body, t, left)) != body:
-            gh.pr_edit_body(c.pr, new_body)
+        kept, text = synced_pr_body(run, c.pr, body, t, left)
+        if gh.outgoing(text, kept) != body:
+            gh.pr_edit_body(c.pr, text, link=kept)
     run.enter("pr")
     prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
     run.say(f"Nothing more to build, since the open PRs already cover this:\n\n{prs}\n\n{said}")
@@ -2134,21 +2195,21 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Chec
     return "pr", f"nothing to build: {why}", urls
 
 
-def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> str:
-    link = run.tracker.pr_link(t, whole=not left)
-    relinked_body = relinked(body, link, run.tracker.pr_link(t, whole=bool(left)))
-    if relinked_body != body:
-        run.log(f"{pr} now links the ticket with: {link}")
-    left_synced = with_left_section(relinked_body, left)
-    if left_synced != relinked_body:
+def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> tuple[str, str]:
+    wanted = run.tracker.pr_link(t, whole=not left)
+    had, text = gh.split_link(body, (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False)))
+    if had and had != wanted:
+        run.log(f"{pr} now links the ticket with: {wanted}")
+    left_synced = with_left_section(text, left)
+    if left_synced != text:
         run.log(f"{pr}: {'wrote' if left else 'removed'} the {LEFT_TITLE} section")
-    return public_text(run, left_synced)
+    return (wanted if had else ""), public_text(run, left_synced)
 
 
 def left_section(run: Run, text: str) -> str:
     if len(text) <= MAX_LEFT_FOR_A_PERSON_CHARS:
-        return outbound.screen(text)
-    return outbound.screen(
+        return gh.outgoing(text)
+    return gh.outgoing(
         f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
         f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
 
@@ -2181,11 +2242,6 @@ def left_on_prs(urls: list[str]) -> str:
         if found := LEFT_FOR_A_PERSON.search(gh.pr_body(url)):
             return found.group(1)
     return ""
-
-
-def relinked(body: str, link: str, other_link: str) -> str:
-    first, newline, rest = body.partition("\n")
-    return f"{link}{newline}{rest}" if first == other_link else body
 
 
 def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
@@ -2233,14 +2289,14 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
     try:
         for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
-            publish_ci(run, pushed, ci.section(rounds, max_rounds))
+            publish_ci(run, b.ticket, pushed, ci.section(rounds, max_rounds))
     except asks.Asked:
         raise
     except Exception as e:
         failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
         drafted = [c for c in with_prs if set_draft(run, c, True)]
         ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, with_prs)}"
-        publish_ci(run, with_prs, ci.section(rounds, max_rounds, ending))
+        publish_ci(run, b.ticket, with_prs, ci.section(rounds, max_rounds, ending))
         if failed is e:
             raise
         raise failed from e
@@ -2251,7 +2307,7 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
     elif stopped_before:
         why = draft_why or "arete could not read every check"
         ending = f"{ci.STOPPED} an earlier CI watch made this PR a draft. It stays a draft, since in this run {why}."
-        publish_ci(run, stopped_before, ci.section(rounds, max_rounds, ending))
+        publish_ci(run, b.ticket, stopped_before, ci.section(rounds, max_rounds, ending))
     return last.summary()
 
 
@@ -2699,10 +2755,12 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
 
-def publish_ci(run: AgentRun, pushed: list[Checkout], ci_section: str) -> None:
+def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[Checkout], ci_section: str) -> None:
+    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
     for c in pushed:
         try:
-            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(gh.pr_body(c.pr), ci_section)))
+            kept, text = gh.split_link(gh.pr_body(c.pr), links)
+            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
         except gh.GhError as e:
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
@@ -2890,7 +2948,7 @@ def fixed_since(b: Build, trees: dict[str, str]) -> str:
                                         trees[c.prefix]))
         except RuntimeError:
             continue
-    return util.tail("".join(parts), MAX_FIX_DIFF_IN_PROMPT)
+    return util.tail(vault.hidden("".join(parts)), MAX_FIX_DIFF_IN_PROMPT)
 
 
 def review_problems(listed) -> list[dict]:
@@ -3711,7 +3769,7 @@ def retained_line(step: str, attempt: scratch.Attempt) -> str:
 
 
 def retry_scratch() -> None:
-    for root in scratch.recover_pending():
+    for root in finalize_scratch():
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
         if data["state"] in ("pending", "retained", "preserved") and data["diagnostic"]:
@@ -3752,8 +3810,16 @@ def live_pipeline_runs() -> list[dict]:
     return holding(state.runs_marked_running(), "pipeline")
 
 
-def runs_in_slots() -> list[dict]:
-    return holding(state.runs_marked_running(), "slot", SLOT_KINDS)
+def chat_sessions_going(running: list[dict]) -> list[dict]:
+    linked = {link["run_id"] for link in state.chat_sessions()}
+    return [r for r in running if r["kind"] == "session" and r["id"] in linked
+            and ((util.now() - util.parse_iso(r["started"])).total_seconds() < record.SETTLE_GRACE_SECONDS
+                 or (r["lock"] and util.lock_is_held(r["lock"])))]
+
+
+def runs_in_slots(running: list[dict] | None = None) -> list[dict]:
+    running = state.runs_marked_running() if running is None else running
+    return [*holding(running, "slot", SLOT_KINDS), *chat_sessions_going(running)]
 
 
 def runs_waiting_for_a_slot() -> list[dict]:
