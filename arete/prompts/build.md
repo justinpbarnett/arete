@@ -23,8 +23,9 @@ $expertise
 - Make the change the plan describes. Add or change tests only where the repo's own docs ask for them.
 - Write self-documenting code: no docstrings, and a comment only for what the code cannot show, such as a line that looks wrong and is right. Follow the repo's own docs where they ask for more.
 - Run the checks yourself before you finish: $checks
-- Shell commands you may run: $commands. Others are refused. If the plan needs one, stop without
-  editing and say exactly what a human must run.
+- Shell commands you may run: $commands. Others are refused. If a command is refused, do not get the same result
+  another way (another interpreter, sed, perl, cp, or a heredoc that writes the file). Stop without editing for that
+  part and say exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits and opens the PR after you finish,
   and deletes the `__pycache__` your commands leave, so do not mention it.
 - Stay under $max_lines changed lines, lockfiles not counted; the planner estimated $estimate. Arete rejects a
