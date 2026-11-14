@@ -4,11 +4,14 @@ import base64
 import json
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
+from http.client import RemoteDisconnected
 from pathlib import Path
 
 from . import outbound, paths, util
@@ -24,6 +27,10 @@ class JiraError(RuntimeError):
     def __init__(self, message: str, status: int = 0):
         super().__init__(message)
         self.status = status
+
+
+class JiraUnsure(JiraError):
+    pass
 
 
 def credentials(env_file: Path | None) -> tuple[str, str, str]:
@@ -95,12 +102,18 @@ class Client:
                     return r.read()
             except urllib.error.HTTPError as e:
                 wait = _retry_after(e, attempt)
+                if method == "POST" and e.code >= 500:
+                    raise JiraUnsure(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}", e.code) from None
                 if (e.code == 429 or e.code >= 500) and attempt < RETRIES and wait <= MAX_RETRY_WAIT:
                     time.sleep(wait)
                     continue
                 later = f" (retry after {wait:.0f} s)" if wait > MAX_RETRY_WAIT else ""
                 raise JiraError(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}{later}".rstrip(), e.code) from None
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+            except (urllib.error.URLError, TimeoutError, OSError, RemoteDisconnected) as e:
+                never_sent = isinstance(e, urllib.error.URLError) and isinstance(
+                    e.reason, (socket.gaierror, ConnectionRefusedError))
+                if method == "POST" and not never_sent:
+                    raise JiraUnsure(f"jira {method} {path}: {e}") from None
                 if attempt < RETRIES:
                     if not util.online():
                         util.wait_for_network()
@@ -156,7 +169,39 @@ class Client:
         return self._paged(f"/rest/api/2/issue/{_path_segment(key)}/comment", key="comments", orderBy="created")
 
     def comment(self, key: str, markdown: str) -> None:
-        self.request("POST", f"/rest/api/3/issue/{_path_segment(key)}/comment", body={"body": adf(outbound.screen(markdown))})
+        token, start = uuid.uuid4().hex, util.now()
+        path = f"/rest/api/3/issue/{_path_segment(key)}/comment"
+        body = {"body": adf(outbound.screen(markdown)), "properties": [{"key": "arete", "value": {"key": token}}]}
+        try:
+            self.request("POST", path, body=body)
+        except JiraUnsure:
+            try:
+                if not util.wait_for_network():
+                    raise JiraUnsure("network unavailable")
+                if not (account := self.me().get("accountId")):
+                    raise JiraUnsure("could not identify the comment author")
+                recent = self.get(path, orderBy="-created", maxResults=10)
+                if not isinstance(recent, dict) or not isinstance(recent.get("comments"), list):
+                    raise JiraUnsure("comment lookup returned no list")
+                for row in recent["comments"]:
+                    if (row.get("author") or {}).get("accountId") != account:
+                        continue
+                    if parse_time(row["created"]) < start - timedelta(seconds=60):
+                        continue
+                    try:
+                        prop = self.get(f"/rest/api/3/comment/{_path_segment(str(row['id']))}/properties/arete")
+                    except JiraError as e:
+                        if e.status == 404:
+                            continue
+                        raise
+                    if not isinstance(prop, dict) or not isinstance(prop.get("value"), dict):
+                        raise JiraUnsure("comment property lookup returned no value")
+                    if prop["value"].get("key") == token:
+                        return
+                self.request("POST", path, body=body)
+            except (JiraError, ValueError, TypeError, KeyError, AttributeError) as e:
+                raise JiraUnsure(f"Jira comment reply was lost; check the ticket before sending again: {e}",
+                                 getattr(e, "status", 0)) from e
 
     def edit_labels(self, key: str, add: list[str] = (), remove: list[str] = ()) -> None:
         ops = [{"add": a} for a in add] + [{"remove": r} for r in remove]
@@ -171,7 +216,15 @@ class Client:
             pick = next((t for t in found if t.get("name", "").lower() == want), None)
         if pick is None:
             return False
-        self.request("POST", f"/rest/api/2/issue/{_path_segment(key)}/transitions", body={"transition": {"id": pick["id"]}})
+        try:
+            self.request("POST", f"/rest/api/2/issue/{_path_segment(key)}/transitions", body={"transition": {"id": pick["id"]}})
+        except JiraUnsure as e:
+            try:
+                status = ((self.issue(key, ["status"]).get("fields") or {}).get("status") or {}).get("name")
+            except (JiraError, ValueError, TypeError, KeyError) as lookup:
+                raise JiraUnsure(f"{e}; status lookup failed: {lookup}") from lookup
+            if not status or status != (pick.get("to") or {}).get("name"):
+                raise
         return True
 
 

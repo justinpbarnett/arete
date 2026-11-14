@@ -4,12 +4,16 @@ import base64
 import functools
 import itertools
 import json
+import re
 import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import timedelta
+from urllib.parse import urlencode
 
 from . import config, outbound, paths, util
 
@@ -20,6 +24,10 @@ NO_ISSUE = "Could not resolve to an issue"
 
 
 class GhError(RuntimeError):
+    pass
+
+
+class GhUnsure(GhError):
     pass
 
 
@@ -62,13 +70,18 @@ def unscreened_text(args: list[str], input: str | None) -> bool:
                for flag, value in itertools.pairwise(args))
 
 
-def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
+def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None, write: bool = False) -> str:
     if unscreened_text(args, input):
         raise TypeError("text sent to GitHub must come from gh.outgoing")
-    res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input)
+    res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input,
+                               rerun=util.NEVER_SENT if write else util.NETWORK_ERROR)
     if res.returncode != 0:
         command = " ".join(itertools.takewhile(lambda arg: not arg.startswith("-"), args))
-        raise GhError(f"gh {command}: {util.first_line(res.stderr or res.stdout, 300)}")
+        output = res.stdout + res.stderr
+        unsure = write and (util.NETWORK_ERROR.search(output) or res.returncode == util.TIMED_OUT or
+                            re.search(r"HTTP 5\d\d|Something went wrong while executing your query", output, re.IGNORECASE))
+        error = GhUnsure if unsure else GhError
+        raise error(f"gh {command}: {util.first_line(res.stderr or res.stdout, 300)}")
     return res.stdout
 
 
@@ -104,11 +117,45 @@ def issue(repo: str, number: int) -> dict:
     )
 
 
-def outgoing(text: str, link: str = "", mark: bool = False) -> Outgoing:
+def outgoing(text: str, link: str = "", mark: bool = False, key: str = "") -> Outgoing:
     text = outbound.inert(outbound.screen(text))
     if link:
         text = f"{outbound.screen(link)}\n\n{text}"
-    return Outgoing(marked(text) if mark else text)
+    text = marked(text) if mark else text
+    return Outgoing(f"{text.rstrip()}\n\n{key_mark(key)}" if key else text)
+
+
+def key_mark(key: str) -> str:
+    return f"<!-- arete:key={key} -->"
+
+
+def recovery_lookup(lookup):
+    try:
+        if not util.wait_for_network():
+            raise GhUnsure("GitHub reply was lost and the network is unavailable")
+        return lookup()
+    except (GhError, ValueError, TypeError, KeyError, AttributeError) as e:
+        raise GhUnsure(f"GitHub reply was lost; could not reconcile the write: {e}") from e
+
+
+def comment_key(path: str, key: str, start) -> bool:
+    query = urlencode({"since": util.iso(start - timedelta(seconds=60)), "per_page": 100})
+    pages = gh_json(["api", f"{path}?{query}", "--paginate", "--slurp"])
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise GhUnsure("GitHub comment lookup returned no list")
+    return any(key_mark(key) in (row.get("body") or "") for page in pages for row in page)
+
+
+def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False) -> None:
+    key, start = uuid.uuid4().hex, util.now()
+    payload = outgoing(body, mark=mark, key=key)
+    if envelope:
+        payload = Outgoing(json.dumps({"body": payload}))
+    try:
+        gh(args, input=payload, write=True)
+    except GhUnsure:
+        if not recovery_lookup(lambda: comment_key(path, key, start)):
+            gh(args, input=payload, write=True)
 
 
 def split_link(body: str, links) -> tuple[str, str]:
@@ -119,10 +166,23 @@ def split_link(body: str, links) -> tuple[str, str]:
 
 
 def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
+    key = uuid.uuid4().hex
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
-    url = gh(args, input=outgoing(body)).strip().splitlines()[-1]
+    payload = outgoing(body, key=key)
+    try:
+        reply = gh(args, input=payload, write=True)
+    except GhUnsure:
+        def find():
+            rows = gh_json(["issue", "list", "--repo", repo, "--state", "all", "--limit", "20", "--json", "number,body"])
+            if not isinstance(rows, list):
+                raise GhUnsure("GitHub issue lookup returned no list")
+            return next((r["number"] for r in rows if key_mark(key) in (r.get("body") or "")), None)
+        if number := recovery_lookup(find):
+            return int(number)
+        reply = gh(args, input=payload, write=True)
+    url = reply.strip().splitlines()[-1]
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
@@ -136,14 +196,29 @@ def issue_url(repo: str, number: int | str) -> str:
 
 
 def issue_comment(repo: str, number: int, body: str) -> None:
-    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
+    keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
+                  f"repos/{repo}/issues/{number}/comments")
 
 
 def issue_close(repo: str, number: int, comment: str = "") -> None:
+    key, start = uuid.uuid4().hex, util.now()
     args = ["issue", "close", str(number), "--repo", repo]
     if comment:
-        args += ["--comment", outgoing(comment)]
-    gh(args)
+        args += ["--comment", outgoing(comment, key=key)]
+    try:
+        gh(args, write=True)
+    except GhUnsure:
+        def reconcile():
+            status = issue_state(repo, number)
+            if status == "CLOSED":
+                return None
+            if status != "OPEN":
+                raise GhUnsure(f"GitHub issue state is {status!r}")
+            found = comment and comment_key(f"repos/{repo}/issues/{number}/comments", key, start)
+            return args[:5] if found else args
+        retry = recovery_lookup(reconcile)
+        if retry is not None:
+            gh(retry, write=True)
 
 
 def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = ()) -> None:
@@ -181,7 +256,15 @@ def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Se
         args += ["--label", lb]
     if draft:
         args.append("--draft")
-    return gh(args, cwd=cwd, input=outgoing(body, link)).strip().splitlines()[-1]
+    try:
+        return gh(args, cwd=cwd, input=outgoing(body, link), write=True).strip().splitlines()[-1]
+    except GhError as e:
+        if not isinstance(e, GhUnsure) and "already exists" not in str(e).lower():
+            raise
+        url = recovery_lookup(lambda: open_pr_url(repo, head)) if isinstance(e, GhUnsure) else open_pr_url(repo, head)
+        if url:
+            return url
+        raise
 
 
 def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> list[dict]:
@@ -216,12 +299,14 @@ def pr_edit_body(url: str, body: str, link: str = "") -> None:
 
 
 def pr_comment(url: str, body: str) -> None:
-    gh(["pr", "comment", url, "--body-file", "-"], input=outgoing(body, mark=True))
+    keyed_comment(["pr", "comment", url, "--body-file", "-"], body,
+                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True)
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
-    gh(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
-        "--input", "-"], input=Outgoing(json.dumps({"body": outgoing(body, mark=True)})))
+    keyed_comment(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
+                   "--input", "-"], body, f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments",
+                  mark=True, envelope=True)
 
 
 def ensure_branch(repo: str, branch: str) -> None:
