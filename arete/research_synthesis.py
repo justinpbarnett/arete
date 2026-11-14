@@ -237,12 +237,14 @@ def ids_in(answer: dict) -> list[str]:
     return sorted(dict.fromkeys(found), key=lambda sid: int(sid[1:]))
 
 
-def report(answer: dict, urls: dict[str, str], extra: list[tuple[str, str]], sources: dict) -> tuple[str, list[str]]:
+def report(answer: dict, urls: dict[str, str], extra: list[tuple[str, str]], sources: dict,
+           audit: tuple[list[str], list[str]] | None = None) -> tuple[str, list[str]]:
     def linked(item: dict) -> str:
         return ", ".join(source_link(sid, urls) for sid in item["sources"] if sid in urls)
 
     def marked(item: dict, text: str) -> str:
-        return ("**Decision-critical:** " if item.get("critical") else "") + link_ids(text, urls)
+        return (("**Decision-critical:** " if item.get("critical") else "")
+                + (f"**{item['mark']}:** " if item.get("mark") else "") + link_ids(text, urls))
 
     conclusions = [f"- {marked(c, c['claim'])} ({linked(c)})" for c in answer["conclusions"]]
     inferences = [f"- {marked(i, i['claim'])} Basis: {link_ids(i['basis'], urls)}"
@@ -251,16 +253,100 @@ def report(answer: dict, urls: dict[str, str], extra: list[tuple[str, str]], sou
     gaps = [f"- {link_ids(g['question'], urls)}: {link_ids(g['why'], urls)}" for g in answer["gaps"]]
     gaps += [f"- {link_ids(question, urls)}: {inert_text(why)}" for question, why in extra]
     used = [sid for sid in ids_in(answer) if sid in urls]
+    if audit:
+        used = sorted({*used, *(sid for sid in audit[1] if sid in urls)}, key=lambda sid: int(sid[1:]))
     cited_sources = [source_line(sid, urls, sources.get(sid, {})) for sid in used]
+    sections = list(zip(SECTIONS, (conclusions, inferences, contradictions, gaps, cited_sources)))
+    if audit:
+        sections.insert(SECTIONS.index("Sources"), ("Audit", audit[0]))
     parts = [link_ids(answer["answer"].strip(), urls)]
-    for title, lines in zip(SECTIONS, (conclusions, inferences, contradictions, gaps, cited_sources)):
+    for title, lines in sections:
         parts.append(f"## {title}\n\n" + ("\n".join(lines) or "None."))
     return "\n\n".join(parts), used
 
 
-def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]]) -> tuple[str, list[str]]:
+def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]],
+             audit: tuple[list[str], list[str]] | None = None) -> tuple[str, list[str]]:
     sources = {source["id"]: source for source in evidence["sources"]}
-    return report(answer, {sid: written(source["url"]) for sid, source in sources.items()}, extra, sources)
+    return report(answer, {sid: written(source["url"]) for sid, source in sources.items()}, extra, sources, audit)
+
+
+REVISION_SCHEMA = shape(summary=TEXT, answer=TEXT)
+LEAD_NOT_REVISED = ("**Audit note:** this lead was written before the audit and was not revised; the sections below "
+                    "carry the audited claims.")
+
+
+def revision_faults(answer, known) -> list[str]:
+    if not isinstance(answer, dict):
+        return ["the answer is not an object"]
+    found = [f"{key} must not be empty" for key in ("summary", "answer") if not present(answer.get(key))]
+    for key in ("summary", "answer"):
+        text = answer.get(key)
+        if not isinstance(text, str):
+            continue
+        found += [f"[{sid}] was not supplied" for sid in dict.fromkeys(CITE.findall(text)) if sid not in known]
+        if hits := unsafe(text, () if key == "summary" else known):
+            found.append(f"{key} holds {', '.join(map(repr, hits[:5]))}; {PLAIN}")
+    return list(dict.fromkeys(found))
+
+
+def revise(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, tools: list[str], last: dict,
+           audit, known: dict, ref: str, where: dict, cwd, add_dirs: list) -> dict | None:
+    findings = json.dumps([{k: r[k] for k in ("claim", "verdict", "outcome", "note", "correction")}
+                           for r in audit.records if r["outcome"] in ("corrected", "qualified", "gap")], indent=2)
+    text = prompt("research_revision", summary=last["summary"], answer=last["answer"], findings=findings,
+                  shape=where["shape"])
+    feedback = ""
+    for n in range(1, s.tries + 1):
+        usd, seconds = budget.final()
+        seconds = min(seconds, s.timeout_minutes * 60)
+        if budget.short(usd, seconds):
+            research_search.say(ref, "revision skipped: the research budget left no room")
+            return None
+        res = budget.call(text + feedback, cwd, usd, seconds, model=s.model, runner=s.runner,
+                          effort=s.call["effort"], tools=tools, allowed_tools=tools, instructions=list(s.instructions),
+                          json_schema=REVISION_SCHEMA, add_dirs=add_dirs, tier=s.tier,
+                          trace=("", f"research {ref} revision"), cfg=cfg, settings=s)
+        if budget.error:
+            return None
+        found = revision_faults(res.structured, known) if res.ok else [
+            util.first_line(res.error or "the collator gave no revision")]
+        if not found:
+            return res.structured
+        research_search.say(ref, f"revision try {n} refused: {'; '.join(found)[:300]}")
+        if res.usage_limit:
+            break
+        feedback = refusal(found)
+    return None
+
+
+def audited(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, tools: list[str], last: dict,
+            current: dict, extra: list, ref: str, judged: bool, where: dict, cwd, add_dirs: list) -> Result:
+    from . import research_audit
+
+    audit = research_audit.run(cfg, budget, last, current, ref, judged)
+    if audit.error:
+        return Result(ok=False, error=audit.error + research_search.NO_REPORT)
+    revised = research_audit.applied(last, audit)
+    summary, lead_revised = last["summary"], False
+    if research_audit.changed(audit):
+        known = {source["id"]: source["url"] for source in research_search.supplied(current)["sources"]}
+        lead = revise(cfg, budget, s, tools, last, audit, known, ref, where, cwd, add_dirs)
+        if budget.error:
+            return Result(ok=False, error=budget.error + research_search.NO_REPORT)
+        if lead:
+            revised["answer"], summary, lead_revised = lead["answer"], lead["summary"], True
+        else:
+            revised["answer"] = revised["answer"].rstrip() + "\n\n" + LEAD_NOT_REVISED
+    urls = {source["id"]: written(source["url"]) for source in current["sources"]}
+    text, used = assemble(revised, current, extra, research_audit.section(audit, urls))
+    a = steps.resolve(cfg, None, "research_audit")
+    current["audit"] = {"at": util.iso(), "runner": a.runner, "model": a.model, "tools": list(a.tools),
+                        "status": audit.status, "why": audit.why, "paid_usd": audit.paid_usd, "calls": audit.calls,
+                        "claims": audit.records, "disagreements": audit.disagreements, "revised": lead_revised}
+    current["synthesis"]["cited"] = used
+    summary = f"{summary} {research_audit.summary_words(audit, lead_revised)}"
+    return Result(ok=True, structured={"summary": summary, "report": text, "name": last["name"]})
 
 
 def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, evidence: dict, ref: str, judged: bool,
@@ -302,8 +388,14 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, evidence: 
                                  f"{len(got.refused)} refused, {util.count(len(entry['requests']), 'request')}; "
                                  f"{entry['outcome']}")
         break
-    report, used = assemble(last, current, extra)
     current["synthesis"] = {"at": util.iso(), "runner": s.runner, "model": s.model, "tools": tools, "rounds": rounds,
-                            "cited": used}
+                            "cited": []}
+    if cfg.research_audit:
+        res = audited(cfg, budget, s, tools, last, current, extra, ref, judged, where, cwd, add_dirs)
+        if not res.ok:
+            return res
+    else:
+        report, current["synthesis"]["cited"] = assemble(last, current, extra)
+        res = Result(ok=True, structured={"summary": last["summary"], "report": report, "name": last["name"]})
     util.write_json(research_search.evidence_file(ref), current)
-    return Result(ok=True, structured={"summary": last["summary"], "report": report, "name": last["name"]})
+    return res

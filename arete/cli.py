@@ -1144,7 +1144,7 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import research_search, routing, runner, steps
+    from . import research_audit, research_search, routing, runner, steps
 
     where = ""
     try:
@@ -1162,6 +1162,8 @@ def cmd_steps(args) -> int:
     for s in sheet:
         notes = list(s.notes)
         if s.step in steps.SEARCHES and (why := research_search.unavailable(s)):
+            notes.append(why)
+        if s.step in steps.FETCHES and (why := research_audit.fetch_note(s)):
             notes.append(why)
         if s.runner == "pi" and not cfg.replay.all:
             selected = runner.pi_route(s.model, cfg, repo)
