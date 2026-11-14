@@ -186,6 +186,7 @@ A failing recheck or a recurrence is a failed attempt, so repairs that never fix
 The alert clears when the incident resolves or is dismissed, or when you `retry` it.
 
 **Switch and steering.** `arete oncall off` stops every wake and recheck until `arete oncall on`, without editing the config; both are noted on the woken incidents.
+While wakes are off the pipeline poller starts no task linked to an incident, queued or interrupted. It never restarts the task of a repair attempt that has ended (cancelled, not started, restart refused); `arete oncall retry ID` or starting the task by hand continues it.
 Task start, run stop, check run, alert and route lookup go through `oncall.start_task`, `stop_run`, `run_check`, `raise_alert`, `clear_alert` and `route_outlook`, which a test harness can replace.
 
 ```

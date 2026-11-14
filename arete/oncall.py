@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import glob
 import hashlib
 import json
@@ -871,9 +872,15 @@ def switched_off() -> bool:
 
 
 def parked(repo: str) -> set[str]:
-    if not switched_off():
-        return set()
-    return {str(r["task"]) for r in state.incident_repairs() if r["task"] and not r["ended"] and r["repo"] == repo}
+    off = switched_off()
+    return {str(r["task"]) for r in state.incident_repairs()
+            if r["task"] and r["repo"] == repo and (off or r["ended"] or over_budget(r))}
+
+
+def over_budget(repair: dict) -> bool:
+    row = state.incident(repair["incident"])
+    cfg = config.load()
+    return bool(row) and spent(cfg, attempts(row)) >= cfg.oncall.incident_budget_usd
 
 
 def alert_key(incident_id: int) -> str:
@@ -955,7 +962,9 @@ def spent(cfg: config.Config, repairs: list[dict]) -> float:
 def check_for(cfg: config.Config, policies: Policies, row: dict) -> tuple[str, Path] | None:
     if row["class"] in (HEARTBEAT, STALLED) or row["source"] in OWN_SOURCES:
         return None
-    for entry in policies.entries.get(policies.key(row["source"], False), []):
+    found = policies.entries.get(policies.key(row["source"], False), []) or [
+        e for e in cfg.oncall.sources if fnmatch.fnmatchcase(row["source"], str(paths.expand(e.path)))]
+    for entry in found:
         if entry.check:
             return entry.check, Path(cfg.repo(entry.repo).path if entry.repo else Path(row["source"]).parent)
     return None
@@ -1110,6 +1119,16 @@ def resume(cfg: config.Config, row: dict, repair: dict, run_id: str) -> None:
     if switched_off():
         hold(cfg, row, f"run {run_id} was interrupted; wakes are off")
         return
+    limits = cfg.oncall
+    if (money := spent(cfg, attempts(row))) >= limits.incident_budget_usd:
+        end_repair(repair, "interrupted")
+        return block(cfg, row, f"{money:.2f} of {limits.incident_budget_usd:.2f} USD spent on it", "budget",
+                     cooldown_until=cooldown(cfg))
+    day = [r for r in state.incident_repairs() if r["started"] >= util.iso(util.now() - timedelta(days=1))]
+    if (money := spent(cfg, day)) >= limits.daily_budget_usd:
+        end_repair(repair, "interrupted")
+        return moved(row, "waiting", f"{money:.2f} of {limits.daily_budget_usd:.2f} USD spent on repairs today",
+                     cooldown_until=cooldown(cfg))
     try:
         started = start_task(repair["repo"], ticket=repair["task"])
     except (control.Refused, control.NotFound) as e:
@@ -1144,7 +1163,8 @@ def follow(cfg: config.Config, row: dict, repair: dict) -> None:
         hold(cfg, row, f"run {run['id']} asked a question and waits for the owner")
         escalate(cfg, row, "asks", run["id"])
     elif status == "pr" or (status == "failed" and run.get("pr_url")):
-        if tasks.last_report(run["id"]).get("held") or trust_of(cfg, repair["repo"]) != "automerge":
+        report = tasks.last_report(run["id"])
+        if report.get("held") or report.get("merge_held") or trust_of(cfg, repair["repo"]) != "automerge":
             hold(cfg, row, f"run {run['id']}'s pull request is held for the owner")
             escalate(cfg, row, "held", run["id"])
         else:

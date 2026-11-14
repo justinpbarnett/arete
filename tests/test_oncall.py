@@ -1792,6 +1792,48 @@ class Repairs(Scratch):
         self.arete("on")
         self.assertEqual(self.picked()[0], task)
 
+    def polled(self):
+        code = ("from arete import pipeline\n"
+                "pipeline.runnable = lambda repo: True\n"
+                "pipeline.route_blocker = lambda *a: ''\n"
+                "pipeline.poll(dry_run=True)")
+        res = self.py(code)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    def test_poll_starts_no_repair_task_while_wakes_are_off(self):
+        conf = self.config / "config.toml"
+        conf.write_text(conf.read_text().replace('name = "demo"\n', 'name = "demo"\npipeline = true\ntracker = "local"\n'))
+        self.failing()
+        task, run = self.seam("start")[0][2:4]
+        self.end(run, "interrupted")
+        self.assertRegex(self.polled(), rf"{task}.*\(dry run, not started\)")
+        self.arete("off")
+        self.assertNotIn(task, self.polled())
+        self.arete("on")
+        self.sql("DELETE FROM runs")
+        self.assertIn(task, self.polled())
+        self.arete("off")
+        self.assertNotIn(task, self.polled())
+        self.arete("on")
+        self.assertIn(task, self.polled())
+
+    def test_a_cancelled_repair_with_an_interrupted_run_is_not_restarted_by_the_poller(self):
+        self.failing()
+        task, run = self.seam("start")[0][2:4]
+        self.end(run, "interrupted")
+        self.scanned(tail="print(json.dumps(oncall.cancel(1)))\n")
+        self.assertEqual(self.seam("stop"), [])
+        self.assertIn("cancelled", self.arete("show", "1").stdout)
+        self.assertIsNone(self.picked())
+
+    def test_an_ordinary_task_is_still_picked_while_wakes_are_off(self):
+        self.failing()
+        self.arete("off")
+        made = self.py("from arete import state\nprint(state.task_add('demo', 'plain work', 'plain', 'feat'))")
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual(self.picked()[0], made.stdout.strip())
+
     def test_heartbeat_recovery_needs_the_whole_check_key_to_pass(self):
         code = ("import json\nfrom arete import config, oncall, paths\n"
                 "cfg = config.load()\n"
@@ -1928,6 +1970,44 @@ class Repairs(Scratch):
         self.assertEqual(self.phase()[:2], ("open", "blocked"))
         self.assertIn("USD", self.phase()[2])
         self.assertEqual(len(self.seam("start")), 1)
+        self.assertEqual(len(self.seam("alert")), 1)
+
+    def test_an_interrupted_repair_past_the_incident_budget_is_not_restarted_and_is_escalated(self):
+        self.bounds("max_attempts = 3\ncooldown_minutes = 0\nincident_budget_usd = 1.0\n")
+        self.failing()
+        task, run = self.seam("start")[0][2:4]
+        self.sql("INSERT INTO steps (run_id, step, runner, model, provider, auth_mode, cost_usd) "
+                 "VALUES (?, 'build', 'pi', 'm', 'openai', 'api_key', 2.0)", run)
+        self.end(run, "interrupted")
+        self.assertIsNone(self.picked())
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 1)
+        self.assertEqual(self.phase()[:2], ("open", "blocked"))
+        self.assertEqual(len(self.seam("alert")), 1)
+        self.assertIsNone(self.picked())
+
+    def test_a_repair_is_not_resolved_without_its_source_check_after_the_log_is_gone(self):
+        self.failing()
+        self.end(self.seam("start")[0][3], "merged")
+        self.scanned()
+        self.assertEqual(self.phase()[1], "verifying")
+        self.log.unlink()
+        self.scanned()
+        self.assertEqual([r[1] for r in self.seam("check")], ["make check"])
+        self.assertNotEqual(self.phase()[0], "resolved")
+
+    def test_a_pull_request_held_by_the_automerge_decision_escalates_once(self):
+        agents = self.app / ".agents"
+        agents.mkdir()
+        (agents / "config.toml").write_text('[trust]\nlevel = "automerge"\n')
+        self.failing()
+        run = self.seam("start")[0][3]
+        self.sql("UPDATE runs SET status = 'pr' WHERE id = ?", run)
+        tail = (f"from arete import lines\nlines.write({run!r}, 'report', merge_held='JEV could not judge the diff')\n"
+                f"{SCAN}")
+        self.scanned(tail=tail)
+        self.scanned()
+        self.assertIn("held for the owner", self.phase()[2])
         self.assertEqual(len(self.seam("alert")), 1)
 
     def test_a_second_incident_waits_while_a_repair_is_running(self):
