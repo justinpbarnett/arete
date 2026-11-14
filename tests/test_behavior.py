@@ -3163,7 +3163,7 @@ def session(name, cwd):
     (folder / f"{name}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 session("s1", "/tmp/x")
 session("s2", str(paths.WORKTREES_DIR / "repo-1"))
-result(sessions=[d["session"] for d in miner.collect(2)])
+result(sessions=[d["session"] for d in miner.collect(util.now() - timedelta(hours=2), util.now())])
 ''')
         self.assertEqual(found["sessions"], ["s1"])
 
@@ -4161,8 +4161,294 @@ class TokenHelperTests(unittest.TestCase):
                 self.assertNotIn("x-access-token", bare.stdout)
 
 
+class MinerWindowTests(unittest.TestCase):
+    PRELUDE = MinerRecordedRunTests.PRELUDE + r'''
+import dataclasses, os, re
+from datetime import UTC, datetime
+T0 = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+GOOD = {"ok": True, "structured": {"proposals": []}}
+BAD = {"ok": False, "error": "model call failed"}
+def at(h):
+    return T0 + timedelta(hours=h)
+def mark(h):
+    return util.iso(at(h) - timedelta(minutes=2))
+def reply(answer):
+    (root / "sample/replay/mine.json").write_text(json.dumps(answer))
+reply(GOOD)
+def correction(when, label):
+    folder = paths.CLAUDE_PROJECTS_DIR / "proj"
+    folder.mkdir(parents=True, exist_ok=True)
+    rows = [{"type": "user", "timestamp": util.iso(when - timedelta(minutes=1)), "cwd": "/tmp/x",
+             "message": {"content": "Fix the header"}},
+            {"type": "user", "timestamp": util.iso(when), "cwd": "/tmp/x",
+             "message": {"content": f"No, I told you never to touch the footer [tag:{label}]"}}]
+    f = folder / f"s{label}.jsonl"
+    f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    os.utime(f, (when.timestamp(), when.timestamp()))
+def event(when):
+    paths.EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with paths.EVENTS_FILE.open("a") as f:
+        f.write(json.dumps({"ts": util.iso(when), "kind": "tool", "cls": "error", "tool": "Bash", "detail": "x"}) + "\n")
+def both(h):
+    correction(at(h), f"{h:g}")
+    event(at(h))
+def failed_run(when, tag):
+    with mock.patch.object(util, "now", return_value=when):
+        rid = record.start("pipeline", tag=tag, repo="replay-sample", issue=tag)
+        call(rid, "build", ok=False, error="nope")
+        record.settle(rid, "failed", summary=tag)
+    return rid
+def mine(h, hours=None, dry_run=False, apply=False):
+    out = io.StringIO()
+    with mock.patch.object(util, "now", return_value=at(h)), contextlib.redirect_stdout(out):
+        code = miner.run(hours=hours, dry_run=dry_run, apply=apply)
+    text = out.getvalue()
+    found = re.search(r"miner ([^\s:]+): \d+ sessions", text)
+    prompt = (paths.RUNS_DIR / found.group(1) / "prompt.md").read_text() if found else ""
+    row = {} if dry_run else next(iter(state.runs(kind="miner", limit=1)), {})
+    return {"code": code, "out": text, "prompt": prompt, "status": row.get("status"),
+            "mined_until": row.get("mined_until"), "summary": row.get("summary"),
+            "heard": sorted(re.findall(r"\[tag:([^\]]+)\]", prompt)),
+            "events": sum(int(n) for n in re.findall(r"^- (\d+) x none tool/error", prompt, re.M))}
+def nums(m):
+    return sorted(float(x) for x in m["heard"])
+def slim(m):
+    return {k: v for k, v in m.items() if k != "prompt"}
+'''
+    scratch = MinerRecordedRunTests.scratch
+
+    def test_a_failed_mine_leaves_its_window_to_the_next_one(self):
+        found = self.scratch(r'''
+base = mine(0)
+for h in (3, 10, 20):
+    both(h)
+reply(BAD)
+failed = mine(24)
+for h in (26, 30, 40):
+    both(h)
+reply(GOOD)
+last = mine(48)
+result(base=slim(base), failed=slim(failed), last=slim(last), heard=nums(last), expect=mark(48))
+''')
+        self.assertEqual(found["failed"]["status"], "failed", found)
+        self.assertEqual(found["failed"]["code"], 1)
+        self.assertIsNone(found["failed"]["mined_until"], found)
+        self.assertEqual(found["heard"], [3, 10, 20, 26, 30, 40], found)
+        self.assertEqual(found["last"]["events"], 6, found)
+        self.assertEqual(found["last"]["mined_until"], found["expect"], found)
+
+    def test_a_late_fire_loses_no_hours_and_its_successor_repeats_none(self):
+        found = self.scratch(r'''
+mine(0)
+for h in (3, 10, 20, 26, 30, 40):
+    both(h)
+late = mine(31)
+after = mine(48)
+result(late=nums(late), after=nums(after), late_events=late["events"], after_events=after["events"])
+''')
+        self.assertEqual(found["late"], [3, 10, 20, 26, 30], found)
+        self.assertEqual(found["after"], [40], found)
+        self.assertEqual(found["after_events"], 1, found)
+
+    def test_a_manual_window_never_moves_the_checkpoint(self):
+        found = self.scratch(r'''
+mine(0)
+for h in (3, 10, 20):
+    both(h)
+manual = mine(21, hours=2)
+nightly = mine(24)
+result(manual=nums(manual), row=manual["mined_until"], nightly=nums(nightly))
+''')
+        self.assertEqual(found["manual"], [20], found)
+        self.assertIsNone(found["row"], found)
+        self.assertEqual(found["nightly"], [3, 10, 20], found)
+
+    def test_a_manual_window_before_any_checkpoint_is_not_the_legacy_start(self):
+        found = self.scratch(r'''
+for h in (3, 10, 20):
+    both(h)
+manual = mine(21, hours=2)
+nightly = mine(24)
+result(manual=nums(manual), nightly=nums(nightly), row=manual["mined_until"])
+''')
+        self.assertEqual(found["manual"], [20], found)
+        self.assertIsNone(found["row"], found)
+        self.assertEqual(found["nightly"], [3, 10, 20], found)
+
+    def test_a_mine_from_before_this_change_starts_where_it_started(self):
+        found = self.scratch(r'''
+with mock.patch.object(util, "now", return_value=at(2)):
+    old = record.start("miner")
+    record.settle(old, "noop", summary="old")
+both(1)
+both(3)
+m = mine(24)
+result(heard=nums(m))
+''')
+        self.assertEqual(found["heard"], [3], found)
+
+    def test_a_comment_stored_after_a_mine_reaches_the_next_one_only(self):
+        found = self.scratch(r'''
+mine(0)
+with mock.patch.object(util, "now", return_value=at(1)):
+    state.add_feedback([{"pr_url": "https://github.com/example/arete/pull/1", "kind": "comment", "gh_id": 1,
+                         "repo": "arete", "issue": "1", "body": "late-comment", "created": util.iso(at(-5)),
+                         "pr_state": "OPEN", "status": "new"}])
+first = mine(24)
+second = mine(48)
+result(first="late-comment" in first["prompt"], second="late-comment" in second["prompt"])
+''')
+        self.assertTrue(found["first"], found)
+        self.assertFalse(found["second"], found)
+
+    def test_feedback_keeps_its_first_recorded_time_and_old_rows_fall_back_to_created(self):
+        found = self.scratch(r'''
+row = {"pr_url": "https://github.com/example/arete/pull/1", "kind": "comment", "gh_id": 1, "repo": "arete",
+       "issue": "1", "body": "again", "created": util.iso(at(-5)), "pr_state": "OPEN", "status": "new"}
+for h in (1, 5):
+    with mock.patch.object(util, "now", return_value=at(h)):
+        state.add_feedback([row])
+with state.db() as c:
+    c.execute("INSERT INTO feedback (pr_url, kind, gh_id, repo, issue, body, created, pr_state, status) "
+              "VALUES ('https://github.com/example/arete/pull/2', 'comment', 2, 'arete', '2', 'legacy-comment', ?, "
+              "'OPEN', 'new')", (util.iso(at(3)),))
+    stored = [dict(r) for r in c.execute("SELECT gh_id, created, recorded FROM feedback ORDER BY gh_id")]
+m = mine(24)
+result(stored=stored, created=util.iso(at(-5)), recorded=util.iso(at(1)),
+       again="again" in m["prompt"], legacy="legacy-comment" in m["prompt"])
+''')
+        self.assertEqual(found["stored"][0], {"gh_id": 1, "created": found["created"], "recorded": found["recorded"]})
+        self.assertIsNone(found["stored"][1]["recorded"])
+        self.assertTrue(found["again"] and found["legacy"], found)
+
+    def test_a_mine_after_a_long_gap_reads_only_the_last_seven_days_and_says_so(self):
+        found = self.scratch(r'''
+mine(0)
+for h in (48, 72, 216):
+    both(h)
+m = mine(240)
+result(heard=nums(m), summary=m["summary"], out=m["out"], mined=m["mined_until"], expect=mark(240))
+''')
+        self.assertEqual(found["heard"], [72, 216], found)
+        self.assertIn("window capped at 7 days", found["summary"])
+        self.assertIn("window capped at 7 days", found["out"])
+        self.assertEqual(found["mined"], found["expect"])
+
+    def test_proposals_done_before_and_skipped_before_are_listed_apart(self):
+        found = self.scratch(r'''
+for status in ("memory", "filed", "merged", "skipped"):
+    state.add_proposal("seed", {"layer": "repo", "repo": "arete", "file": "a.md", "change": f"fact-{status}",
+                                "why": "w"}, status)
+both(3)
+m = mine(24)
+done = m["prompt"].partition("## Done before (do not propose again)")[2].partition("## Rejected or skipped before")[0]
+rejected = m["prompt"].partition("## Rejected or skipped before")[2].partition("## Rules")[0]
+result(done=done, rejected=rejected)
+''')
+        for status in ("memory", "filed", "merged"):
+            self.assertIn(f"fact-{status}", found["done"])
+            self.assertNotIn(f"fact-{status}", found["rejected"])
+        self.assertIn("fact-skipped", found["rejected"])
+        self.assertNotIn("fact-skipped", found["done"])
+
+    def test_every_source_cuts_its_window_at_the_same_half_open_bounds_and_lags_two_minutes(self):
+        found = self.scratch(r'''
+mine(0)
+since, until = at(0) - timedelta(minutes=2), at(24) - timedelta(minutes=2)
+edges = {"lo": since, "before": since - timedelta(seconds=1), "in": until - timedelta(seconds=1),
+         "hi": until, "lag": until + timedelta(seconds=60)}
+for label, when in edges.items():
+    correction(when, label)
+    event(when)
+runs = {tag: failed_run(when, tag) for tag, when in
+        (("rlo", since), ("rin", until - timedelta(seconds=1)), ("rat", until), ("raf", until + timedelta(seconds=1)))}
+first = mine(24)
+second = mine(48)
+result(first=first["heard"], second=second["heard"], first_events=first["events"], second_events=second["events"],
+       first_runs=sorted(t for t, r in runs.items() if r in first["prompt"]),
+       second_runs=sorted(t for t, r in runs.items() if r in second["prompt"]))
+''')
+        self.assertEqual(found["first"], ["in", "lo"], found)
+        self.assertEqual(found["second"], ["hi", "lag"], found)
+        self.assertEqual((found["first_events"], found["second_events"]), (2, 2), found)
+        self.assertEqual(found["first_runs"], ["rin", "rlo"], found)
+        self.assertEqual(found["second_runs"], ["raf", "rat"], found)
+
+    def test_only_a_good_automatic_mine_with_a_repo_moves_the_checkpoint(self):
+        found = self.scratch(r'''
+base = mine(0)
+both(3)
+with mock.patch.object(miner, "collect", side_effect=RuntimeError("boom")):
+    crashed = mine(24)
+original = config.load
+with mock.patch.object(config, "load", side_effect=lambda: dataclasses.replace(original(), repos=[])):
+    norepo = mine(30)
+rows = len(state.runs(kind="miner", limit=50))
+dry = mine(36, dry_run=True)
+dry_rows = [rows, len(state.runs(kind="miner", limit=50))]
+reply({"ok": True, "structured": {"proposals": [{"layer": "repo", "repo": "arete", "file": "notes.md",
+                                                  "change": "c", "why": "w", "evidence": [], "confidence": 0.9}]}})
+with mock.patch.object(miner, "allowed", return_value=(True, "")), \
+        mock.patch.object(miner, "apply_repo", side_effect=RuntimeError("push refused")):
+    applying = mine(42, apply=True)
+reply(GOOD)
+last = mine(48)
+result(base=base["mined_until"], base_expect=mark(0), crashed=slim(crashed), norepo=slim(norepo), dry=slim(dry),
+       dry_rows=dry_rows, applying=slim(applying), heard=nums(last),
+       last=last["mined_until"], last_expect=mark(48))
+''')
+        self.assertEqual(found["base"], found["base_expect"], found)
+        self.assertEqual((found["crashed"]["status"], found["crashed"]["code"]), ("failed", 1), found)
+        self.assertEqual(found["norepo"]["status"], "noop", found)
+        self.assertEqual(found["dry"]["code"], 0, found)
+        self.assertEqual(found["dry_rows"][0], found["dry_rows"][1], found)
+        self.assertEqual((found["applying"]["status"], found["applying"]["code"]), ("failed", 1), found)
+        for name in ("crashed", "norepo", "dry", "applying"):
+            self.assertIsNone(found[name]["mined_until"], found)
+        self.assertEqual(found["heard"], [3], found)
+        self.assertEqual(found["last"], found["last_expect"], found)
+
+    def test_a_failed_apply_model_call_keeps_the_checkpoint(self):
+        found = self.scratch(r'''
+from types import SimpleNamespace
+mine(0)
+both(3)
+reply({"ok": True, "structured": {"proposals": [{"layer": "repo", "repo": "arete", "file": "notes.md",
+                                                  "change": "c", "why": "w", "evidence": [], "confidence": 0.9}]}})
+failed = SimpleNamespace(ok=False, error="apply broke", text="")
+with mock.patch.object(miner, "allowed", return_value=(True, "")), \
+        mock.patch.object(miner.gh, "default_branch", return_value="main"), \
+        mock.patch.object(miner.gh, "open_pr_url", return_value=""), \
+        mock.patch.object(miner, "make_worktree", return_value=root), \
+        mock.patch.object(miner, "remove_worktree"), \
+        mock.patch.object(miner, "apply_in", return_value=failed):
+    applying = mine(24, apply=True)
+reply(GOOD)
+last = mine(48)
+result(applying=slim(applying), heard=nums(last))
+''')
+        self.assertEqual((found["applying"]["status"], found["applying"]["code"]), ("failed", 1), found)
+        self.assertIsNone(found["applying"]["mined_until"], found)
+        self.assertEqual(found["heard"], [3], found)
+
+    def test_a_window_reads_events_across_a_month_archive_once(self):
+        found = self.scratch(r'''
+from arete import hook
+folder = paths.EVENTS_FILE.parent
+folder.mkdir(parents=True, exist_ok=True)
+def line(ts):
+    return json.dumps({"ts": ts, "kind": "tool", "cls": "error", "detail": ts}) + "\n"
+(folder / "events-202605.jsonl").write_text(line("2026-05-31T23:00:00Z") + line("2026-05-31T23:59:59Z"))
+paths.EVENTS_FILE.write_text(line("2026-06-01T00:00:00Z") + line("2026-06-01T00:30:00Z"))
+since = datetime(2026, 5, 31, 23, 30, tzinfo=UTC).timestamp()
+until = datetime(2026, 6, 1, 0, 30, tzinfo=UTC).timestamp()
+result(details=[e["detail"] for e in hook.read_events(since_ts=since, until_ts=until)])
+''')
+        self.assertEqual(found["details"], ["2026-05-31T23:59:59Z", "2026-06-01T00:00:00Z"])
+
+
 class PushedPrDraftTests(unittest.TestCase):
-    URL = "https://github.com/fixture/repo/pull/7"
+    URL ="https://github.com/fixture/repo/pull/7"
 
     def setUp(self):
         from arete import gh, jev

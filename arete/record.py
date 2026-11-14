@@ -587,10 +587,11 @@ def numbered_events(path: Path) -> Iterator[dict]:
         yield {**event, "line": number}
 
 
-def runs_since(since: str) -> list[dict]:
+def runs_since(since: str, until: str = "9999") -> list[dict]:
     with state.db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status != 'running' "
-                                           "AND COALESCE(finished, started) >= ? ORDER BY started", (since,))]
+                                           "AND COALESCE(finished, started) >= ? AND COALESCE(finished, started) < ? "
+                                           "ORDER BY started", (since, until))]
 
 
 def read_run(run_id: str) -> dict | None:

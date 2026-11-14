@@ -2034,7 +2034,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("mine", help="loop 1: mine transcripts and recorded runs into harness PRs")
     p.add_argument("--hours", type=float, default=None,
-                   help="window for both sources; without it recorded runs are read since the last mine")
+                   help="window for every input, never moves the checkpoint; without it every input is read since the last good mine")
     p.add_argument("--dry-run", action="store_true", help="print proposals, change nothing")
     p.add_argument("--no-apply", action="store_true", help="record proposals but open no PRs")
     p.set_defaults(fn=cmd_mine)
