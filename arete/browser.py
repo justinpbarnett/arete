@@ -47,6 +47,13 @@ def server_folder() -> Path:
     return paths.STATE_DIR / "browser-server" / pinned()[1]
 
 
+def engine_node() -> Path:
+    found = shutil.which("node")
+    if not found:
+        raise refuse("no node in the engine's environment")
+    return scratch.canonical(Path(found))
+
+
 def tarball_name(name: str, version: str) -> str:
     return f"{name.replace('/', '__')}-{version}.tgz"
 
@@ -243,11 +250,10 @@ def checked() -> tuple[str, str]:
         relative = PurePosixPath(f"{name}/{cli}")
         if not cli or ".." in relative.parts or str(relative) not in want_files:
             raise refuse("the package has no single command")
-        found = shutil.which("node")
-        node = str(Path(found).resolve()) if found else ""
-        if not node or not os.access(node, os.X_OK) or Path(node).is_relative_to(paths.WORKTREES_DIR.resolve()):
+        found = engine_node()
+        if not os.access(found, os.X_OK) or scratch.exposure(found, (paths.WORKTREES_DIR,)) is not None:
             raise refuse("no trusted node in the engine's environment")
-        return node, str(folder / "node_modules" / relative)
+        return str(found), str(folder / "node_modules" / relative)
     except scratch.ConfinementUnavailable:
         raise
     except FAILURES as error:

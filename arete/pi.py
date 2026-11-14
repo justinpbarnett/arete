@@ -581,14 +581,14 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
         profile += f'(deny file-write* (subpath "/"))(allow file-write* {allow})'
     if auth_path is not None:
         profile += '(allow file-write* (literal (param "AUTH")) (literal (param "LOCK")))'
-    params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={Path(root).resolve()}")]
+    params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={real_path(root)}")]
     if auth_path is not None:
-        params += ["-D", f"AUTH={auth_path.resolve()}", "-D", f"LOCK={auth_path.resolve()}.lock"]
+        params += ["-D", f"AUTH={real_path(auth_path)}", "-D", f"LOCK={real_path(auth_path)}.lock"]
     for i, path in enumerate(hidden):
-        params += ["-D", f"H{i}={path.resolve()}"]
+        params += ["-D", f"H{i}={real_path(path)}"]
         profile += f'(deny file-read* file-write* file-link (subpath (param "H{i}")))'
     if peers:
-        params += ["-D", f"PEERS={peers.resolve()}", "-D", f"WORK={cwd.resolve()}"]
+        params += ["-D", f"PEERS={real_path(peers)}", "-D", f"WORK={real_path(cwd)}"]
         profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
                     '(require-not (literal (param "PEERS"))) (require-not (subpath (param "WORK")))))'
                     '(deny file-read-data file-write* (literal (param "PEERS")))')
@@ -605,9 +605,9 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                    "-D", "DIRS=" + pattern(guard.SECRET_DIRS, True)]
         profile += ('(deny file-read* file-write* (require-all (regex (param "NAMES")) '
                     '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
-    params += ["-D", f"ENGINE={paths.PACKAGE_DIR.resolve()}", "-D", f"RUNTIME={Path(sys.prefix).resolve()}"]
+    params += ["-D", f"ENGINE={real_path(paths.PACKAGE_DIR)}", "-D", f"RUNTIME={real_path(sys.prefix)}"]
     profile += '(deny file-write* (subpath (param "ENGINE")) (subpath (param "RUNTIME")))'
-    ancestors = {p for root in (*hidden, paths.PACKAGE_DIR, Path(sys.prefix)) for p in Path(root).resolve().parents}
+    ancestors = {p for root in (*hidden, paths.PACKAGE_DIR, Path(sys.prefix)) for p in real_path(root).parents}
     for i, path in enumerate(sorted(ancestors)):
         params += ["-D", f"A{i}={path}"]
         profile += f'(deny file-write* (literal (param "A{i}")))'
@@ -619,11 +619,11 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
         profile += ("(deny mach-lookup)(allow mach-lookup " + "".join(f'(global-name "{n}")' for n in names)
                     + '(global-name-regex (param "MACHRE")))')
     if tcp_port is not None:
-        params += ["-D", f"UNIX={cwd.resolve()}"]
+        params += ["-D", f"UNIX={real_path(cwd)}"]
         profile += (f'(deny network-outbound)(allow network-outbound (remote tcp "localhost:{int(tcp_port)}") '
                     '(subpath (param "UNIX")))')
     if unix_confined:
-        params += ["-D", f"UNIX={cwd.resolve()}"]
+        params += ["-D", f"UNIX={real_path(cwd)}"]
         profile += ('(deny network-outbound (subpath "/"))(allow network-outbound (subpath (param "UNIX")) '
                     '(subpath "/private/tmp") (subpath "/private/var/folders"))')
     folders, sockets = command_sockets(keeps)
@@ -638,9 +638,16 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     return ["/usr/bin/sandbox-exec", *params, "-p", profile]
 
 
+def real_path(path) -> Path:
+    try:
+        return scratch.canonical(Path(path))
+    except scratch.ConfinementUnavailable:
+        return Path(path).resolve()
+
+
 def state_denials(params: list[str], folder: Path, opened: tuple[Path, ...]) -> str:
-    folder = folder.resolve()
-    kept = [Path(p).resolve() for p in opened]
+    folder = scratch.canonical(folder)
+    kept = [scratch.canonical(Path(p)) for p in opened]
     between = sorted({folder, *(q for p in kept for q in p.parents if q.is_relative_to(folder))})
     params += ["-D", f"STATE={folder}"]
     exempt = ""

@@ -19,10 +19,23 @@ import urllib.error
 from unittest import mock
 
 import arete
-from arete import config, control, devices, gh, paths, pipeline, sessions, state, util, verify
+from arete import config, control, devices, gh, paths, pi, pipeline, scratch, sessions, state, util, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
+
+
+def setUpModule():
+    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
+    unittest.addModuleCleanup(folder.cleanup)
+    root = Path(folder.name).resolve()
+    for patch in (mock.patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+                  mock.patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
+                  mock.patch.object(paths, "RUNS_DIR", root / "state" / "runs"),
+                  *(mock.patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                    for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
+        patch.start()
+        unittest.addModuleCleanup(patch.stop)
 
 
 class VerificationPreflightTests(unittest.TestCase):
@@ -2976,6 +2989,14 @@ result(counts=counts, before=before, summary=last["summary"], prompt=prompt, las
         self.assertGreater(found["kept"], 0)
         self.assertLessEqual(found["size"], 100)
         self.assertEqual(found["last"], "Reply 6.")
+
+
+class NoLiveStateTests(unittest.TestCase):
+    def test_no_test_here_points_at_the_live_authority_or_state(self):
+        live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
+        for path in (scratch.AUTHORITY, paths.SERVER_FILE, paths.RUNS_DIR, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR,
+                     pi.SESSIONS_DIR):
+            self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
 if __name__ == "__main__":

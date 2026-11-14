@@ -35,6 +35,18 @@ GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
 GRANTS = pi.WRITABLE_ALWAYS
 
 
+def setUpModule():
+    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
+    unittest.addModuleCleanup(folder.cleanup)
+    root = Path(folder.name).resolve()
+    for patch in (mock.patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+                  mock.patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
+                  *(mock.patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                    for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
+        patch.start()
+        unittest.addModuleCleanup(patch.stop)
+
+
 def attempt_for(ws: Path) -> scratch.Attempt:
     return scratch.Attempt("s", "t", "r", "verify", str(ws), str(ws / ".arete-scratch-0123456789abcdef"),
                            str(ws), {}, {})
@@ -261,6 +273,28 @@ class BrowserServerTests(unittest.TestCase):
         self.assertIn("browser_start", argv[3])
         self.assertEqual(argv[argv.index(str(self.node)) + 1].rpartition("/")[2], "cli.js")
 
+    def test_the_playwright_socket_path_fits_whatever_the_run_folder_length(self):
+        short = tempfile.TemporaryDirectory(dir="/private/var/tmp", prefix="r")
+        self.addCleanup(short.cleanup)
+        runs = Path(short.name).resolve()
+        for length in (80, 88, 130, 200):
+            with self.subTest(length):
+                self.run_dir = runs / ("r" * (length - len(str(runs)) - len("//browser")))
+                (self.run_dir / "evidence").mkdir(parents=True)
+                self.a = scratch.Attempt(f"{length:064d}", "t", "r", "verify", str(self.ws),
+                                         str(self.ws / ".arete-scratch-0123456789abcdef"), str(self.run_dir), {}, {})
+                with scratch.registry(True) as (fd, key):
+                    scratch.store(fd, key, {**scratch.load(fd, key, "a" * 64), "attempt": asdict(self.a)})
+                scratch.app_port(self.a, "http://127.0.0.1:43210")
+                argv = self.build()
+                folder = self.run_dir / "browser"
+                self.assertEqual(len(str(folder)), length)
+                sockets = next(w.partition("=")[2] for w in argv if w.startswith("PLAYWRIGHT_SOCKETS_DIR="))
+                socket_path = f"{sockets}/browser/browser@012345.sock"
+                self.assertLess(len(socket_path), 104)
+                self.assertTrue((folder / socket_path).resolve().is_relative_to(folder))
+                self.assertEqual(scratch.browser_table(self.a, argv)["cwd"], str(folder))
+
     def test_browser_command_refuses_a_sandboxed_engine_and_a_missing_port(self):
         self.prepare()
         with mock.patch.object(scratch, "sandboxed", return_value=True), self.assertRaises(scratch.ConfinementUnavailable):
@@ -320,20 +354,26 @@ class BrowserServerTests(unittest.TestCase):
         self.addCleanup(app.shutdown)
         return app.server_address[1]
 
-    def test_the_default_localhost_verify_url_reaches_the_browser_as_the_loopback_literal_that_answers(self):
+    def test_the_default_localhost_verify_url_keeps_its_origin_and_engages_the_browser(self):
         self.install()
         idle = lambda *args, **kwargs: subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
-        for family, host, literal in ((socket.AF_INET, "127.0.0.1", "127.0.0.1"), (socket.AF_INET6, "::1", "[::1]")):
+        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
             with self.subTest(host):
                 port = self.answering(family, host)
+                foreign = socket.socket()
+                self.addCleanup(foreign.close)
+                if family == socket.AF_INET6:
+                    foreign.bind(("127.0.0.1", port))
+                    foreign.listen(1)
                 scratch.update_browser(self.a, port=0, loopback=False)
                 v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
                 with mock.patch.object(scratch, "service_command", side_effect=lambda a, command: command), \
                         mock.patch.object(scratch, "spawn", side_effect=idle), \
                         mock.patch.object(verify.environment, "commands", return_value={}), \
                         verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a) as url:
-                    self.assertEqual(url, f"http://{literal}:{port}")
+                    self.assertEqual(url, f"http://localhost:{port}")
                     self.assertEqual(scratch.browser_record(self.a)["port"], port)
+                    self.assertIs(scratch.browser_record(self.a)["loopback"], True)
                     built = scratch.browser_config(self.a, self.config, [self.evidence])
                 self.assertEqual(json.loads(built)["mcpServers"]["playwright"], scratch.browser_server(self.a))
 
@@ -419,6 +459,29 @@ class BrowserServerTests(unittest.TestCase):
             authority = Path(str(shared).replace("/private/tmp", spelling)) / "verification-authority"
             with self.subTest(spelling), mock.patch.object(scratch, "AUTHORITY", authority):
                 self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
+        for temp in ("..", "../..", "scratchtmp", ""):
+            with self.subTest(f"relative TMPDIR {temp!r}"), mock.patch.dict(os.environ, {"TMPDIR": temp}):
+                self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
+                with self.assertRaisesRegex(scratch.ConfinementUnavailable, "TMPDIR"):
+                    scratch.browser_exposure(self.a)
+
+    def test_an_odd_spelling_or_a_removed_cwd_never_escapes_as_a_raw_error(self):
+        nowhere = (Path("/private/var/empty"),)
+        spelled = Path("/.resolve/1" + str(self.ws))
+        if spelled.is_dir():
+            with self.assertRaises(scratch.ConfinementUnavailable):
+                scratch.exposure(spelled, nowhere)
+            self.assertFalse(scratch.apart(spelled, nowhere))
+        gone = self.root / "gone"
+        gone.mkdir()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(gone)
+        gone.rmdir()
+        self.assertIsNone(scratch.exposure(self.ws, nowhere))
+        self.assertEqual(scratch.canonical(self.ws), self.ws)
+        with self.assertRaises(scratch.ConfinementUnavailable):
+            scratch.exposure(Path("relative"), nowhere)
+        self.assertFalse(scratch.apart(Path("relative"), nowhere))
 
     def reactivate(self):
         with scratch.registry() as (fd, key):
@@ -501,7 +564,8 @@ class BrowserServerTests(unittest.TestCase):
 
     def test_browser_start_refuses_unregistered_argv_and_a_sandbox(self):
         self.prepare()
-        with mock.patch.object(scratch.os, "setsid"), mock.patch.object(scratch.os, "execv") as execv:
+        with mock.patch.object(scratch.os, "setsid"), mock.patch.object(scratch.os, "execv") as execv, \
+                mock.patch.object(scratch.os, "chdir") as chdir:
             with self.assertRaises(SystemExit):
                 scratch.browser_start([self.a.selector, "/usr/bin/sandbox-exec", "-p", "x"])
             with mock.patch.object(scratch, "sandboxed", return_value=True), self.assertRaises(SystemExit):
@@ -511,6 +575,7 @@ class BrowserServerTests(unittest.TestCase):
             scratch.update_browser(self.a, argv=scratch.browser_digest(argv[5:]))
             scratch.browser_start([self.a.selector, *argv[5:]])
             execv.assert_called_once()
+            chdir.assert_called_once_with(self.run_dir / "browser")
         self.assertEqual(scratch.records()[0]["browser"]["groups"], [os.getpid()])
 
     def relink(self, path):
@@ -542,14 +607,27 @@ class BrowserServerTests(unittest.TestCase):
                 with self.assertRaises(scratch.ConfinementUnavailable):
                     browser.checked()
 
-    def test_a_node_under_the_worktrees_is_refused(self):
-        self.install()
-        planted = self.ws / "node"
-        planted.write_text("#!/bin/sh\n")
-        planted.chmod(0o755)
-        with mock.patch.object(browser.shutil, "which", return_value=str(planted)), \
-                self.assertRaises(scratch.ConfinementUnavailable):
-            browser.checked()
+    def test_a_node_any_actor_can_write_is_refused(self):
+        self.prepare()
+        temp, service = self.root / "agent-temp", self.root / "service"
+        layouts = {"worktree": self.ws / "node", "agent temp grant": temp / "node",
+                   "agent temp grant spelled in capitals": Path(str(temp / "node").upper()),
+                   "service grant": service / "node", "browser folder": self.run_dir / "browser" / "node"}
+        for name, planted in layouts.items():
+            with self.subTest(name):
+                real = scratch.canonical(planted)
+                real.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                real.write_text("#!/bin/sh\n")
+                real.chmod(0o755)
+                with mock.patch.object(browser.shutil, "which", return_value=str(planted)), \
+                        mock.patch.dict(os.environ, {"TMPDIR": str(temp)}), \
+                        mock.patch.object(pi, "WRITABLE_ALWAYS", ("/private/tmp", "/dev", str(service))), \
+                        self.assertRaisesRegex(scratch.ConfinementUnavailable, "node"):
+                    scratch.browser_command(self.a, json.loads(self.config)["mcpServers"]["playwright"]["args"][2:])
+                if name == "worktree":
+                    with mock.patch.object(browser.shutil, "which", return_value=str(planted)), \
+                            self.assertRaises(scratch.ConfinementUnavailable):
+                        browser.checked()
 
     def test_the_registry_is_not_trusted_blindly(self):
         for name, kwargs in (("range", {"dependencies": {"dep": "^1.0.0"}}),
@@ -653,7 +731,7 @@ class EscapeTests(unittest.TestCase):
                 "agent": lambda cmd: pi.write_confinement(self.ws, []) + list(cmd)}
 
     def browser_attempt(self):
-        run_dir = self.root / "state" / "runs" / "r"
+        run_dir = paths.STATE_DIR / "runs" / "r"
         (run_dir / "evidence").mkdir(parents=True, exist_ok=True)
         folder = run_dir / "browser"
         folder.mkdir(mode=0o700, exist_ok=True)
@@ -815,15 +893,19 @@ class EscapeTests(unittest.TestCase):
             self.assertEqual(target.exists(), allowed, str(target))
 
     def test_browser_profile_hides_the_state_folder_but_for_its_own_evidence(self):
-        run, (attempt, _) = self.browser_profile(), self.browser_attempt()
-        (self.root / "state" / "other.txt").write_text("state-secret")
-        (Path(attempt.run_dir) / "evidence" / "shot").write_text("shot")
-        inside = subprocess.run(run(["/bin/cat", str(self.root / "state" / "other.txt")]), cwd=self.ws,
-                                capture_output=True, text=True, check=False)
-        self.assertNotIn("state-secret", inside.stdout)
-        seen = subprocess.run(run(["/bin/cat", str(Path(attempt.run_dir) / "evidence" / "shot")]), cwd=self.ws,
-                              capture_output=True, text=True, check=False)
-        self.assertEqual(seen.stdout, "shot", seen.stderr)
+        state = self.root / "state"
+        for name, spelled in (("as created", state), ("firmlink", Path("/System/Volumes/Data" + str(state))),
+                              ("capitals", Path(str(state).upper()))):
+            with self.subTest(name), mock.patch.object(paths, "STATE_DIR", spelled):
+                run, (attempt, _) = self.browser_profile(), self.browser_attempt()
+                (state / "other.txt").write_text("state-secret")
+                (Path(attempt.run_dir) / "evidence" / "shot").write_text("shot")
+                inside = subprocess.run(run(["/bin/cat", str(state / "other.txt")]), cwd=self.ws,
+                                        capture_output=True, text=True, check=False)
+                self.assertNotIn("state-secret", inside.stdout)
+                seen = subprocess.run(run(["/bin/cat", str(state / "runs" / "r" / "evidence" / "shot")]), cwd=self.ws,
+                                      capture_output=True, text=True, check=False)
+                self.assertEqual(seen.stdout, "shot", seen.stderr)
 
     def test_git_in_a_linked_worktree_works_inside(self):
         main = self.ws / "main"
@@ -913,65 +995,106 @@ class EscapeTests(unittest.TestCase):
 
 
 CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+NPX_CACHE = Path.home() / ".npm" / "_npx"
+
+
+@functools.cache
+def cached_registry() -> dict[str, bytes]:
+    name, version = browser.pinned()
+    modules = next((m for m in sorted(NPX_CACHE.glob("*/node_modules"))
+                    if util.read_json(m / name / "package.json", {}).get("version") == version), None)
+    served, queue = {}, [name] if modules else []
+    while queue:
+        package = queue.pop()
+        manifest = json.loads((modules / package / "package.json").read_text())
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w:gz") as tar:
+            for f in sorted((modules / package).rglob("*")):
+                if f.is_file() and not f.is_symlink():
+                    tar.add(f, "package/" + str(f.relative_to(modules / package)), recursive=False)
+        url = browser.REGISTRY + package.replace("/", "-") + ".tgz"
+        meta = {"name": package, "version": manifest["version"], "dependencies": manifest.get("dependencies") or {},
+                "dist": {"tarball": url, "integrity": browser.integrity_of(out.getvalue())}}
+        served[browser.REGISTRY + browser.quote(package, safe="@") + "/" + manifest["version"]] = json.dumps(meta).encode()
+        served[url] = out.getvalue()
+        queue += [d for d in meta["dependencies"] if browser.REGISTRY + d.replace("/", "-") + ".tgz" not in served]
+    return served
 
 
 class BrowserRunTests(unittest.TestCase):
+    FOLDER_LENGTH = 130
+
     def setUp(self):
         if scratch.sandboxed() or sys.platform != "darwin":
             self.skipTest("the gate runs under inherited confinement")
-        if not shutil.which("node"):
-            self.skipTest("node is not installed")
-        try:
-            browser.checked()
-        except scratch.ConfinementUnavailable as error:
-            self.skipTest(f"the verified pinned server is not installed: {error}")
+        if not shutil.which("node") or not CHROME.exists():
+            self.skipTest("node or Google Chrome is not installed")
+        if not cached_registry():
+            self.skipTest(f"no npx cache of {verify.PLAYWRIGHT_MCP} to install the pinned server offline")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.ws = self.root / "worktrees" / "ws"
-        self.run_dir = self.root / "runs" / "r"
+        runs = self.root / "state" / "runs"
+        self.run_dir = runs / ("r" * max(1, self.FOLDER_LENGTH - len(str(runs)) - len("//browser")))
         self.evidence = self.run_dir / "evidence"
         self.evidence.mkdir(parents=True)
         self.ws.mkdir(parents=True)
-        site = self.root / "site"
-        site.mkdir()
-        (site / "index.html").write_text("<html><body><h1>hello from the app</h1></body></html>")
-
-        class Quiet(http.server.SimpleHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-        handler = functools.partial(Quiet, directory=str(site))
-        self.app = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=self.app.serve_forever, daemon=True).start()
-        self.addCleanup(self.app.server_close)
-        self.addCleanup(self.app.shutdown)
+        (self.root / "authority").mkdir()
+        self.site = self.root / "site"
+        self.site.mkdir()
+        (self.site / "index.html").write_text("<html><body><h1>hello from the app</h1></body></html>")
         for patch in (mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees"),
+                      mock.patch.object(paths, "STATE_DIR", self.root / "state"),
+                      mock.patch.object(paths, "SERVER_FILE", self.root / "server.json"),
+                      mock.patch.object(paths, "CONFIG_FILE", self.root / "config.toml"),
+                      mock.patch.object(scratch, "AUTHORITY", self.root / "authority" / "verification-authority"),
+                      mock.patch.object(browser, "fetch", side_effect=lambda url: cached_registry()[url]),
                       mock.patch.object(pi, "WRITABLE_ALWAYS", ("/private/tmp", "/dev")),
                       mock.patch.dict(os.environ, {"TMPDIR": "/private/var/empty"})):
             patch.start()
             self.addCleanup(patch.stop)
-        selector = os.urandom(32).hex()
-        self.a = scratch.Attempt(selector, "t", "r", "verify", str(self.ws), str(self.ws / ".arete-scratch-0123456789abcdef"),
-                                 str(self.run_dir), {}, {})
+        self.assert_probe_local()
+        self.a = scratch.Attempt(os.urandom(32).hex(), "t", "r", "verify", str(self.ws),
+                                 str(self.ws / ".arete-scratch-0123456789abcdef"), str(self.run_dir), {}, {})
         data = {"version": 2, "engine": "e", "attempt": asdict(self.a), "run": [], "evidence": [], "state": "active",
                 "diagnostic": "", "archives": [], "producers": {}, "before": [], "source_mutations": False,
                 "cleanup_version": 3}
         with scratch.registry(True) as (fd, key):
             scratch.store(fd, key, data)
-        self.addCleanup(self.forget, selector)
-        scratch.app_port(self.a, f"http://127.0.0.1:{self.app.server_address[1]}")
+        browser.resolved()
+        browser.checked()
+        self.port = self.serve("127.0.0.1")
+        scratch.app_port(self.a, f"http://127.0.0.1:{self.port}")
 
-    def forget(self, selector):
-        with scratch.registry() as (fd, _key):
-            os.unlink(selector + ".json", dir_fd=fd)
+    def assert_probe_local(self):
+        for path in (scratch.AUTHORITY, paths.STATE_DIR, paths.SERVER_FILE, paths.CONFIG_FILE, browser.server_folder()):
+            self.assertTrue(path.is_relative_to(self.root), path)
+
+    def serve(self, host, port=0):
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        class Server(http.server.ThreadingHTTPServer):
+            address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+        app = Server((host, port), functools.partial(Quiet, directory=str(self.site)))
+        threading.Thread(target=app.serve_forever, daemon=True).start()
+        self.addCleanup(app.server_close)
+        self.addCleanup(app.shutdown)
+        return app.server_address[1]
 
     def start(self):
         words = json.loads(verify.mcp_config(self.evidence))["mcpServers"]["playwright"]["args"][2:]
         argv = scratch.browser_command(self.a, words)
-        scratch.update_browser(self.a, words=words, argv=scratch.browser_digest(argv[5:]))
-        proc = subprocess.Popen(argv, cwd=self.run_dir / "browser", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=0, env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)})
+        rest = argv[5:]
+        self.assertEqual(rest[0], "/usr/bin/sandbox-exec")
+        scratch.update_browser(self.a, words=words, argv=scratch.browser_digest(rest))
+        self.assert_probe_local()
+        proc = subprocess.Popen(rest, cwd=scratch.browser_path(self.a.run_dir), stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True,
+                                env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)})
         self.addCleanup(self.reap, proc)
         return proc
 
@@ -983,9 +1106,11 @@ class BrowserRunTests(unittest.TestCase):
                 proc.send_signal(sig)
             try:
                 proc.wait(10)
-                return
+                break
             except subprocess.TimeoutExpired:
                 pass
+        proc.stdin.close()
+        proc.stdout.close()
 
     def rpc(self, proc, ident, method, params, wait=90):
         message = {"jsonrpc": "2.0", "method": method, "params": params, **({"id": ident} if ident else {})}
@@ -1007,20 +1132,28 @@ class BrowserRunTests(unittest.TestCase):
         self.assertIn("result", first)
         self.rpc(proc, 0, "notifications/initialized", {})
 
-    def test_headless_chrome_loads_the_app_and_writes_a_screenshot(self):
-        if not CHROME.exists():
-            self.skipTest("Google Chrome is not installed")
+    def visit(self, url, shot):
         proc = self.start()
         self.initialize(proc)
-        url = f"http://127.0.0.1:{self.app.server_address[1]}/"
-        shot = self.evidence / "shot.png"
         for ident, tool, arguments in ((2, "browser_navigate", {"url": url}),
                                        (3, "browser_take_screenshot", {"filename": str(shot)})):
             answer = self.rpc(proc, ident, "tools/call", {"name": tool, "arguments": arguments})
             self.assertFalse(answer["result"].get("isError"), answer)
         self.assertGreater(shot.stat().st_size, 0)
+        self.reap(proc)
+
+    def test_headless_chrome_loads_the_app_and_writes_a_screenshot(self):
+        self.assertEqual(len(str(scratch.browser_path(self.a.run_dir))), self.FOLDER_LENGTH)
+        self.visit(f"http://127.0.0.1:{self.port}/", self.evidence / "shot.png")
         self.assertEqual(stat.S_IMODE((self.run_dir / "browser").stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(browser.server_folder().stat().st_mode), 0o700)
+
+    def test_a_localhost_url_reaches_the_app_on_either_loopback_family(self):
+        for host in ("127.0.0.1", "::1"):
+            with self.subTest(host):
+                port = self.serve(host)
+                scratch.app_port(self.a, f"http://localhost:{port}")
+                self.visit(f"http://localhost:{port}/", self.evidence / f"{host.count(':')}.png")
 
     def test_a_planted_node_modules_in_the_workspace_is_not_used(self):
         planted = self.ws / "node_modules" / "@playwright" / "mcp"
@@ -1031,6 +1164,37 @@ class BrowserRunTests(unittest.TestCase):
         proc = self.start()
         self.initialize(proc)
         self.assertFalse(marker.exists())
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the browser profile is macOS only")
+class BrowserRunFixtureTests(unittest.TestCase):
+    def test_the_browser_run_fixture_opens_only_its_own_authority_and_state(self):
+        opened, real = [], paths.directory_fd
+
+        def watched(path, parent=None, create=False):
+            if parent is None:
+                opened.append(Path(path).absolute())
+            return real(path, parent, create)
+
+        case = BrowserRunTests("test_headless_chrome_loads_the_app_and_writes_a_screenshot")
+        with mock.patch.object(paths, "directory_fd", watched), mock.patch.object(scratch, "sandboxed", return_value=False), \
+                mock.patch.object(pi, "can_confine", return_value=True), \
+                mock.patch.object(shutil, "which", return_value="/bin/sh"), \
+                mock.patch(f"{__name__}.CHROME", Path("/bin/sh")), \
+                mock.patch(f"{__name__}.cached_registry", return_value={"x": b""}), \
+                mock.patch.object(browser, "resolved"), mock.patch.object(browser, "checked"):
+            case.setUp()
+            root = case.root
+            case.doCleanups()
+        self.assertTrue(opened)
+        self.assertEqual([p for p in opened if not p.is_relative_to(root)], [])
+
+
+class NoLiveStateTests(unittest.TestCase):
+    def test_no_test_here_points_at_the_live_authority_or_state(self):
+        live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
+        for path in (scratch.AUTHORITY, paths.SERVER_FILE, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR, pi.SESSIONS_DIR):
+            self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
 if __name__ == "__main__":
