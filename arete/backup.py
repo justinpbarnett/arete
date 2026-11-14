@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import io
 import os
 import re
@@ -7,7 +8,9 @@ import shutil
 import sqlite3
 import subprocess
 import tarfile
+import tempfile
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -54,8 +57,18 @@ def read_last() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+@contextmanager
+def folder_lock(name: str, wait: bool = True):
+    folder = paths.backups_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / f".{name}.lock", "a") as f:
+        if wait:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield wait or util.flock_now(f)
+
+
 def update_last(**fields) -> None:
-    with LOCK:
+    with LOCK, folder_lock("last"):
         util.write_json(paths.backups_dir() / LAST, {**read_last(), **fields})
 
 
@@ -147,6 +160,7 @@ def retain(folder: Path) -> None:
 
 
 def forbidden_name(name: str) -> bool:
+    name = name.lower()
     return name == "verification-authority" or name == "pi.env" or name.endswith(".env")
 
 
@@ -187,7 +201,10 @@ def layers_bundle() -> bytes | None:
 
 def build_archive(day: str) -> Path:
     folder = paths.backups_dir()
-    final, draft = folder / f"config-{day}.tar.gz", folder / f".config-{day}.tar.gz.tmp"
+    final = folder / f"config-{day}.tar.gz"
+    handle, name = tempfile.mkstemp(dir=folder, prefix=f".config-{day}-", suffix=".tar.gz.tmp")
+    os.close(handle)
+    draft = Path(name)
     try:
         with tarfile.open(draft, "w:gz") as tar:
             for name in ("config.toml", "loop-switches.json"):
@@ -215,16 +232,19 @@ def copied_today(day: str) -> bool:
 
 def run_copy(snapshot_file: Path, copy_to: str, day: str) -> str:
     try:
-        archive = build_archive(day)
-        if not copy_to:
-            return ""
-        with LOCK:
-            IN_FLIGHT.update((snapshot_file, archive))
-        res = util.sh(["rsync", "-t", str(snapshot_file), str(archive), copy_to], timeout=3600)
-        fields = {"copy_exit": res.returncode, "copy_attempted_at": util.iso()}
-        if res.returncode == 0:
-            fields.update(copied_at=util.iso(), copied_file=snapshot_file.name)
-        update_last(**fields)
+        with folder_lock("copy", wait=False) as mine:
+            if not mine or (copy_to and copied_today(day)):
+                return ""
+            archive = build_archive(day)
+            if not copy_to:
+                return ""
+            with LOCK:
+                IN_FLIGHT.update((snapshot_file, archive))
+            res = util.sh(["rsync", "-t", str(snapshot_file), str(archive), copy_to], timeout=3600)
+            fields = {"copy_exit": res.returncode, "copy_attempted_at": util.iso()}
+            if res.returncode == 0:
+                fields.update(copied_at=util.iso(), copied_file=snapshot_file.name)
+            update_last(**fields)
         return "" if res.returncode == 0 else f"rsync exited {res.returncode}: {util.first_line(res.stderr or res.stdout, 200)}"
     except Exception as e:
         update_last(copy_exit=1, copy_attempted_at=util.iso(), copy_error=util.first_line(str(e), 300))
