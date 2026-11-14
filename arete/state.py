@@ -1504,10 +1504,15 @@ def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db, whole:
 
 def ab_placements(since: str, name: str = "", connect=db) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute(
+        labelled = [dict(r) for r in c.execute(
             "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "
             "JOIN runs r ON r.id = steps.run_id WHERE COALESCE(steps.ab, '') != '' AND r.kind = 'pipeline' "
             "AND r.started >= ?" + (" AND steps.ab = ?" if name else ""), (since, *([name] if name else [])))]
+        held = c.execute("SELECT repo, issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "
+                         "AND COALESCE(ab_held, '') != ''", (since,)).fetchall()
+    assigned = [{"ab": ab, "ab_side": side, "atom": role, "repo": r["repo"], "issue": r["issue"]}
+                for r in held for role, (ab, side, _) in json.loads(r["ab_held"]).items() if not name or ab == name]
+    return list({tuple(p.values()): p for p in labelled + assigned}.values())
 
 
 def ab_held(run_id: str, connect=db) -> dict[str, tuple[str, str, dict]]:
