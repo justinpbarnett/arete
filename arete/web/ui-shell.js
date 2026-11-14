@@ -3,6 +3,7 @@ import htm from "./vendor-htm.js";
 import * as data from "./ui-data.js";
 import { screenKeys } from "./ui-keys.js";
 import { KeyBar, KeySheet } from "./ui-keybar.js";
+import { List, demoQueue, demoFocus } from "./ui-list.js";
 
 const html = htm.bind(h);
 const glyphs = { floor: "▦", triage: "!", "my-work": "○", board: "▤", runs: "▷", intake: "↓", outbox: "↑", prompts: "≡", adws: "◇", insights: "▥", settings: "⚙" };
@@ -50,9 +51,10 @@ function Pane({ name, label, children }) {
 
 export function Shell({ route, snapshot, now }) {
   const page = data[route.screen](route);
+  const health = route.screen === "settings" && route.path[0] === "health";
   const slots = route.screen === "floor" ? html`<p class="slots mono">Slots <span>${snapshot.slots}</span> / <span>${snapshot.capacity}</span></p>` : null;
   const extra = page.extra ? html`<${Pane} name="auxiliary" label=${page.extra} />` : null;
-  return html`<div class="ui-app" data-screen=${route.screen}>
+  return html`<div class="ui-app" data-screen=${route.screen} data-health-demo=${health ? "" : undefined}>
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
       <div class="top-bar" aria-label="Top bar"></div>
@@ -62,9 +64,9 @@ export function Shell({ route, snapshot, now }) {
         ${page.tabs ? html`<div class="tabs-slot" aria-label="Tabs"></div>` : null}
       </header>
       <div class="pane-grid">
-        <${Pane} name="queue" label=${page.queue}>${slots}<//>
+        <${Pane} name="queue" label=${page.queue}>${slots}${health ? html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />` : null}<//>
         ${route.screen === "run" ? html`<div class="run-focus"><${Pane} name="focus" label=${page.focus} />${extra}</div>`
-          : html`<${Pane} name="focus" label=${page.focus} />${extra}`}
+          : html`<${Pane} name="focus" label=${page.focus}>${health ? html`<${List} id="health-focus" controller=${demoFocus} />` : null}<//>${extra}`}
       </div>
       <${KeyBar} />
     </main>

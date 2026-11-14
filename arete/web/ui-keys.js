@@ -1,5 +1,6 @@
 import { signal, batch } from "./vendor-signals.js";
 import { parse } from "./ui-router.js";
+import { dismissMenu } from "./ui-menu.js";
 
 export const screenKeys = [
   ["f", "floor", "Floor", "#floor"],
@@ -78,7 +79,7 @@ function paneOf(target) {
 
 function focusedList() {
   const found = lists(pane.value);
-  return found.find((el) => el.dataset.list === listId && listRows(el).length) ?? found.find((el) => listRows(el).length) ?? null;
+  return found.find((el) => el.dataset.list === listId) ?? found[0] ?? null;
 }
 
 function cursorRow(list) {
@@ -103,8 +104,20 @@ function move(index, relative) {
   const list = focusedList();
   if (!list) return;
   const rows = listRows(list);
+  if (!rows.length) return;
+  const active = document.activeElement;
+  if (active?.tagName === "BUTTON" && list.contains(active) && !active.closest("[data-row]")) active.blur();
   const base = relative ? currentIndex(list) + index : index < 0 ? rows.length - 1 : index;
   place(list, rows[Math.max(0, Math.min(rows.length - 1, base))]);
+}
+
+export function syncList(list) {
+  const rows = listRows(list);
+  if (!rows.some((row) => itemId(row) === cursors.get(list.dataset.list))) {
+    if (rows.length) cursors.set(list.dataset.list, itemId(rows[0]));
+    else cursors.delete(list.dataset.list);
+  }
+  marks();
 }
 
 export function marks() {
@@ -203,9 +216,10 @@ export function toggleSheet() {
 function escape() {
   if (sheet.value) return closeSheet();
   if (pending.value) { pending.value = ""; return; }
-  if (searched?.isConnected && searched.value) {
-    searched.value = "";
-    searched.dispatchEvent(new Event("input", { bubbles: true }));
+  const field = focusedList()?.querySelector("[data-search]") ?? searched;
+  if (field?.isConnected && field.value) {
+    field.value = "";
+    field.dispatchEvent(new Event("input", { bubbles: true }));
   }
   searched = null;
 }
@@ -229,6 +243,7 @@ function normal(event) {
   if (key === "Escape") { escape(); return true; }
   if (pending.value && chord(key)) return true;
   if (key === "?") { toggleSheet(); return true; }
+  if (key === "c" && focusedList()?.uiCreate) { focusedList().uiCreate(); return true; }
   if (key === "g" || key === "d" || key === "z") { pending.value = key; return true; }
   const screen = screenKeys.find(([letter]) => letter === key);
   if (screen) { go(screen[3]); return true; }
@@ -264,6 +279,13 @@ function onKey(event) {
   if (event.isComposing || event.keyCode === 229) return;
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) { event.preventDefault(); return; }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.key === "Escape" && !sheet.value && (dismissMenu() || focusedList()?.uiDismiss?.())) {
+    if (writable(event.target)) event.target.blur();
+    mode.value = "NORMAL";
+    event.preventDefault();
+    return;
+  }
+  if (event.key === "Enter" && event.target.closest?.("button") && !sheet.value) return;
   const handled = mode.value === "INSERT" ? editing(event) : normal(event);
   if (handled) event.preventDefault();
 }
