@@ -16,6 +16,9 @@ NO_ROOM = research_search.NO_ROOM
 ROUNDS_USED = "both extra search rounds were used"
 NOTHING_NEW = "a further search returned no usable source"
 NOT_SYNTHESIZED = "the evidence from the last search round was not synthesized"
+AUDITED_LEAD = ("The audit checks only conclusions and inferences, and Arete writes the published lead and summary "
+                "from the ones that pass, so list every assertion the answer rests on, the direct answer included, as "
+                "a conclusion or an inference.")
 TEXT = {"type": "string"}
 TEXTS = {"type": "array", "items": TEXT}
 BOOL = {"type": "boolean"}
@@ -173,6 +176,7 @@ def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, too
                       claims=research_plan.bullets(plan["claims"]), tasks=research_search.task_lines(evidence),
                       sources=json.dumps(research_search.supplied(evidence), indent=2),
                       gaps="\n".join(research_search.gap_lines(evidence)) or "none",
+                      audit=AUDITED_LEAD if cfg.research_audit else "",
                       more=more_text(round_no, got.may_search, ROUNDS_USED if round_no >= MAX_ROUNDS else NO_ROOM))
         res = budget.call(text + feedback, cwd, usd, seconds, reserve=got.may_search, model=s.model, runner=s.runner,
                           effort=s.call["effort"], tools=tools, allowed_tools=tools, instructions=list(s.instructions),
@@ -271,83 +275,23 @@ def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]],
     return report(answer, {sid: written(source["url"]) for sid, source in sources.items()}, extra, sources, audit)
 
 
-REVISION_SCHEMA = shape(summary=TEXT, answer=TEXT)
-SUMMARY_WITHHELD = ("The collator's lead and summary were withheld because the audit did not cover them; the "
-                    "sections below carry the audited claims.")
-LEAD_WITHHELD = "**Audit note:** " + SUMMARY_WITHHELD
-
-
-def revision_faults(answer, known) -> list[str]:
-    if not isinstance(answer, dict):
-        return ["the answer is not an object"]
-    found = [f"{key} must not be empty" for key in ("summary", "answer") if not present(answer.get(key))]
-    for key in ("summary", "answer"):
-        text = answer.get(key)
-        if not isinstance(text, str):
-            continue
-        found += [f"[{sid}] was not supplied" for sid in dict.fromkeys(CITE.findall(text)) if sid not in known]
-        if hits := unsafe(text, () if key == "summary" else known):
-            found.append(f"{key} holds {', '.join(map(repr, hits[:5]))}; {PLAIN}")
-    return list(dict.fromkeys(found))
-
-
-def revise(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, tools: list[str], last: dict,
-           audit, known: dict, ref: str, where: dict, cwd, add_dirs: list) -> dict | None:
-    findings = json.dumps([{k: r[k] for k in ("claim", "verdict", "outcome", "note", "correction")}
-                           for r in audit.records if r["outcome"] in ("corrected", "qualified", "gap")], indent=2)
-    text = prompt("research_revision", summary=last["summary"], answer=last["answer"], findings=findings,
-                  shape=where["shape"])
-    feedback = ""
-    for n in range(1, s.tries + 1):
-        usd, seconds = budget.final()
-        seconds = min(seconds, s.timeout_minutes * 60)
-        if budget.short(usd, seconds):
-            research_search.say(ref, "revision skipped: the research budget left no room")
-            return None
-        res = budget.call(text + feedback, cwd, usd, seconds, model=s.model, runner=s.runner,
-                          effort=s.call["effort"], tools=tools, allowed_tools=tools, instructions=list(s.instructions),
-                          json_schema=REVISION_SCHEMA, add_dirs=add_dirs, tier=s.tier,
-                          trace=("", f"research {ref} revision"), cfg=cfg, settings=s)
-        if budget.error:
-            return None
-        found = revision_faults(res.structured, known) if res.ok else [
-            util.first_line(res.error or "the collator gave no revision")]
-        if not found:
-            return res.structured
-        research_search.say(ref, f"revision try {n} refused: {'; '.join(found)[:300]}")
-        if res.usage_limit:
-            break
-        feedback = refusal(found)
-    return None
-
-
-def audited(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, tools: list[str], last: dict,
-            current: dict, extra: list, ref: str, judged: bool, where: dict, cwd, add_dirs: list) -> Result:
+def audited(cfg: config.Config, budget: research_plan.Budget, last: dict, current: dict, extra: list, ref: str,
+            judged: bool) -> Result:
     from . import research_audit
 
     audit = research_audit.run(cfg, budget, last, current, ref, judged)
     if audit.error:
         return Result(ok=False, error=audit.error + research_search.NO_REPORT)
     revised = research_audit.applied(last, audit)
-    summary, lead_revised = last["summary"], False
-    if research_audit.unaudited_lead(audit):
-        known = {source["id"]: source["url"] for source in research_search.supplied(current)["sources"]}
-        lead = (revise(cfg, budget, s, tools, last, audit, known, ref, where, cwd, add_dirs)
-                if research_audit.changed(audit) else None)
-        if budget.error:
-            return Result(ok=False, error=budget.error + research_search.NO_REPORT)
-        if lead:
-            revised["answer"], summary, lead_revised = lead["answer"], lead["summary"], True
-        else:
-            revised["answer"], summary = LEAD_WITHHELD, SUMMARY_WITHHELD
+    lead, summary = research_audit.lead(revised, audit), research_audit.summary(revised, audit)
+    revised["answer"], revised["summary"] = lead, summary
     urls = {source["id"]: written(source["url"]) for source in current["sources"]}
     text, used = assemble(revised, current, extra, research_audit.section(audit, urls))
     a = steps.resolve(cfg, None, "research_audit")
     current["audit"] = {"at": util.iso(), "runner": a.runner, "model": a.model, "tools": list(a.tools),
                         "status": audit.status, "why": audit.why, "paid_usd": audit.paid_usd, "calls": audit.calls,
-                        "claims": audit.records, "disagreements": audit.disagreements, "revised": lead_revised}
+                        "claims": audit.records, "disagreements": audit.disagreements}
     current["synthesis"]["cited"] = used
-    summary = f"{summary} {research_audit.summary_words(audit, lead_revised)}"
     return Result(ok=True, structured={"summary": summary, "report": text, "name": last["name"]})
 
 
@@ -393,7 +337,7 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, evidence: 
     current["synthesis"] = {"at": util.iso(), "runner": s.runner, "model": s.model, "tools": tools, "rounds": rounds,
                             "cited": []}
     if cfg.research_audit:
-        res = audited(cfg, budget, s, tools, last, current, extra, ref, judged, where, cwd, add_dirs)
+        res = audited(cfg, budget, last, current, extra, ref, judged)
         if not res.ok:
             return res
     else:

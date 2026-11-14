@@ -21,7 +21,10 @@ LIMITED ="a usage limit stopped the audit"
 WITHHELD = "the injection screen withheld the auditor's finding"
 HOST = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 KEYS = {"conclusion": "conclusions", "inference": "inferences"}
-CHANGED = ("corrected", "qualified", "gap")
+UNAUDITED = "Not audited"
+LEAD_NOTE = ("**Audit note:** Arete wrote this lead and the summary from the claims the audit checked. The "
+             "collator's own lead and summary are not published, because the audit does not check them.")
+NO_LEAD = "No claim of the synthesis passed the audit."
 SCHEMA = synth.shape(
     checks=synth.listed(synth.shape(claim=synth.TEXT, verdict=synth.TEXT, sources=synth.TEXTS, quote=synth.TEXT,
                                     fetched=synth.TEXTS, note=synth.TEXT, correction=synth.TEXT)),
@@ -288,10 +291,6 @@ def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence
     return audit
 
 
-def changed(audit: Audit) -> bool:
-    return any(r["outcome"] in CHANGED for r in audit.records)
-
-
 def applied(answer: dict, audit: Audit) -> dict:
     by_id = {r["id"]: r for r in audit.records}
     revised = {**answer, "conclusions": [], "inferences": [], "gaps": list(answer["gaps"]),
@@ -300,7 +299,7 @@ def applied(answer: dict, audit: Audit) -> dict:
         item, r = answer[KEYS[c["kind"]]][c["index"]], by_id[c["id"]]
         kept_in = KEYS[c["kind"]]
         if r["outcome"] == NOT_AUDITED:
-            item = {**item, "mark": "Not audited"}
+            item = {**item, "mark": UNAUDITED}
         elif r["outcome"] == "corrected":
             item = {**item, "claim": r["correction"], "sources": r["sources"], "mark": "Corrected by the audit"}
         elif r["outcome"] == "qualified":
@@ -351,7 +350,35 @@ def section(audit: Audit, urls: dict[str, str]) -> tuple[list[str], list[str]]:
     return lines, ids
 
 
-def summary_words(audit: Audit, revised: bool) -> str:
+def standing(revised: dict) -> list[tuple[str, dict]]:
+    found = [(kind, item) for kind, key in KEYS.items() for item in revised[key] if item.get("mark") != UNAUDITED]
+    return [f for f in found if f[1]["critical"]] or found
+
+
+def lead(revised: dict, audit: Audit) -> str:
+    bullets = []
+    for kind, item in standing(revised):
+        cites = "".join(f" [{sid}]" for sid in item["sources"] if f"[{sid}]" not in item["claim"])
+        bullets.append("- " + ("Inference: " if kind == "inference" else "") + item["claim"] + cites)
+    parts = [LEAD_NOTE, "\n".join(bullets) or f"{NO_LEAD} See Gaps and Audit below."]
+    if n := sum(r["critical"] and r["outcome"] in ("gap", NOT_AUDITED) for r in audit.records):
+        parts.append(f"{util.count(n, 'decision-critical claim')} did not pass the audit; see Gaps and Audit below.")
+    return "\n\n".join(parts)
+
+
+def summary(revised: dict, audit: Audit) -> str:
+    found = standing(revised)
+    if found:
+        kind, item = found[0]
+        text = " ".join(synth.CITE.sub("", item["claim"]).split())
+        text = util.first_line(re.sub(r"\s+([.,;:])", r"\1", text), 300)
+        text = ("Inference: " if kind == "inference" else "") + (text if text.endswith((".", "!", "?")) else text + ".")
+    else:
+        text = NO_LEAD
+    return f"{text} {summary_words(audit)}"
+
+
+def summary_words(audit: Audit) -> str:
     if audit.status == COMPLETE:
         a, b, c, d = tally(audit)
         words = (f"Audit complete: {len(audit.records)} claims checked; {a} supported, {b} corrected, "
@@ -359,7 +386,3 @@ def summary_words(audit: Audit, revised: bool) -> str:
     else:
         words = f"Audit {audit.status}: {not_audited(audit)}"
     return words + "."
-
-
-def unaudited_lead(audit: Audit) -> bool:
-    return changed(audit) or not audit.records

@@ -1637,7 +1637,7 @@ def batch1(c3_quote=BETA):
         "disagreements": [{"issue": "The 2021 page states 10 requests per second and the 2025 page states 20.",
                            "sources": ["S1", "S2"]}]}
 BATCH2 = {"checks": [chk("C6", "supported", ["S2"], NEW)], "disagreements": []}
-def seed(ref):
+def seed(ref, synthesis=None):
     put(f"research-{ref}-plan", {"needs_search": True, "covered_by": [], "questions": ["What is the limit?"],
         "tasks": [task("one"), task("two"), task("three")], "source_criteria": ["primary"],
         "claims": ["The limit is known"]})
@@ -1645,7 +1645,7 @@ def seed(ref):
                                                       src("https://example.net/new", "2025-06-01", NEW)], "notes": ""})
     put(f"research-{ref}-task-2-search", {"sources": [], "notes": ""})
     put(f"research-{ref}-task-3-search", {"sources": [src("https://example.com/beta", "2024-11-05", BETA)], "notes": ""})
-    put(f"research-{ref}-synthesis", {"summary": "The limit is 10 requests per second.", "name": "",
+    put(f"research-{ref}-synthesis", synthesis or {"summary": "The limit is 10 requests per second.", "name": "",
         "answer": "The limit is 10 requests per second [S1].",
         "conclusions": [concl("The limit is 10 requests per second.", "S1", True),
                         concl("Throttling is fully resolved.", "S3", True),
@@ -1670,8 +1670,6 @@ seed("A")
 put("research-A-batch-1-audit", batch1("Throttling was fully resolved during the beta."))
 put("research-A-batch-1-audit2", batch1())
 put("research-A-batch-2-audit", BATCH2)
-put("research-A-revision", {"summary": "Sources disagree on the limit, 10 in 2021 and 20 in 2025; moderately sure.",
-                            "answer": "The limit was 10 as of March 2021 [S1] and a June 2025 page states 20 [S2]."})
 out["a"] = drive("A", cfg)
 seed("B")
 put("research-B-batch-1-audit", batch1(), 4.996)
@@ -1685,6 +1683,15 @@ out["c"] = drive("C", cfg)
 seed("D")
 cfg.research_audit = False
 out["d"] = drive("D", cfg)
+cfg.research_audit = True
+seed("E", {"summary": "The limit was raised in June 2025 and the vendor guarantees 99.99 percent uptime.", "name": "",
+           "answer": "The vendor guarantees 99.99 percent uptime [S2].",
+           "conclusions": [concl("The limit was raised in June 2025.", "S2", True),
+                           concl("Customers reported throttling during the beta.", "S3")],
+           "inferences": [], "contradictions": [], "gaps": [], "searches": []})
+put("research-E-batch-1-audit", {"checks": [chk("C1", "supported", ["S2"], NEW), chk("C2", "supported", ["S3"], BETA)],
+                                 "disagreements": []})
+out["e"] = drive("E", cfg)
 config.CONFIG_FILE = paths.CONFIG_FILE
 s = steps.resolve(config.load(), None, "research_audit")
 known = {f"S{n}": {"url": u} for n, u in enumerate(
@@ -1727,15 +1734,21 @@ print("RESULT" + json.dumps(out))
     def names(self, which):
         return [c[0] for c in self.out[which]["calls"]]
 
-    def test_audit_corrects_qualifies_and_gaps_claims_and_revises_the_lead(self):
+    def test_audit_corrects_qualifies_and_gaps_claims_and_writes_the_lead_from_audited_claims(self):
         a = self.out["a"]
         self.assertTrue(a["ok"], a["error"])
         report = a["structured"]["report"]
         self.assertEqual(self.names("a").count("research A batch 1 audit"), 2)
         self.assertEqual(self.names("a").count("research A batch 2 audit"), 1)
-        self.assertEqual(self.names("a").count("research A revision"), 1)
+        self.assertEqual(self.names("a").count("research A revision"), 0)
         self.assertIn("quote is not in a retained passage of S3", a["evidence"]["audit"]["calls"][0]["refused"][0])
-        self.assertTrue(report.startswith("The limit was 10 as of March 2021"))
+        self.assertTrue(report.startswith("**Audit note:**"))
+        lead = report[:report.index("## Supported conclusions")]
+        self.assertIn("The limit was 10 requests per second as of March 2021", lead)
+        self.assertIn("(https://example.org/old)", lead)
+        self.assertIn("(https://example.net/new)", lead)
+        self.assertIn("1 decision-critical claim did not pass the audit", lead)
+        self.assertNotIn("The limit is 10 requests per second [", lead)
         conclusions = report[report.index("## Supported conclusions"):report.index("## Inference")]
         self.assertRegex(conclusions, r"\*\*Decision-critical:\*\* \*\*Corrected by the audit:\*\* .*example\.org/old"
                                       r".*example\.net/new")
@@ -1756,8 +1769,10 @@ print("RESULT" + json.dumps(out))
         sources = report[report.index("## Sources"):]
         self.assertIn("published 2021-03-01", sources)
         self.assertIn("published 2025-06-01", sources)
-        self.assertTrue(a["structured"]["summary"].startswith("Sources disagree"))
-        self.assertIn(" Audit complete:", a["structured"]["summary"])
+        summary = a["structured"]["summary"]
+        self.assertTrue(summary.startswith("The limit was 10 requests per second as of March 2021"))
+        self.assertNotIn("[", summary)
+        self.assertIn(" Audit complete:", summary)
         self.assertEqual(a["evidence"]["audit"]["status"], "complete")
         self.assertEqual(len(a["evidence"]["audit"]["claims"]), 6)
 
@@ -1771,7 +1786,7 @@ print("RESULT" + json.dumps(out))
         self.assertEqual(sorted(a for a in audits[0][2] if a.startswith("WebFetch")),
                          ["WebFetch(domain:example.com)", "WebFetch(domain:example.net)", "WebFetch(domain:example.org)"])
         self.assertEqual([a for a in audits[2][2] if a.startswith("WebFetch")], ["WebFetch(domain:example.net)"])
-        for _, tools, _ in (c for c in self.out["a"]["calls"] if "synthesis" in c[0] or "revision" in c[0]):
+        for _, tools, _ in (c for c in self.out["a"]["calls"] if "synthesis" in c[0]):
             self.assertEqual(tools, ["Read", "Glob", "Grep"])
         self.assertEqual(self.out["hosts"], {"example.org": ["S2"]})
         self.assertIn("WebSearch cannot load on research_audit", self.out["web"])
@@ -1785,7 +1800,7 @@ print("RESULT" + json.dumps(out))
         self.assertIn("the research budget left no room for the audit", report)
         self.assertIn("1 of 6 claims was not audited", report)
         self.assertIn("**Not audited:** Capacity planning", report)
-        self.assertIn("were withheld because the audit did not cover them", report)
+        self.assertTrue(report.startswith("**Audit note:**"))
         self.assertNotIn("The limit is 10 requests per second", b["structured"]["summary"])
         self.assertNotIn("Audit complete", report)
         self.assertTrue(b["structured"]["summary"].count("Audit incomplete:"))
@@ -1813,6 +1828,19 @@ print("RESULT" + json.dumps(out))
         self.assertNotIn("Not audited", report)
         self.assertNotIn("audit", d["evidence"])
         self.assertIn("The limit is 10 requests per second.", report)
+
+    def test_a_claim_only_in_the_summary_or_lead_is_not_published(self):
+        e = self.out["e"]
+        self.assertTrue(e["ok"], e["error"])
+        report, summary = e["structured"]["report"], e["structured"]["summary"]
+        self.assertEqual(e["evidence"]["audit"]["status"], "complete")
+        self.assertIn("Audit complete: 2 claims checked", report)
+        self.assertNotIn("99.99", report)
+        self.assertNotIn("99.99", summary)
+        self.assertTrue(report.startswith("**Audit note:**"))
+        self.assertIn("The limit was raised in June 2025", report[:report.index("## Supported conclusions")])
+        self.assertIn("The limit was raised in June 2025", summary)
+        self.assertFalse([n for n in self.names("e") if "revision" in n])
 
     def test_audit_needs_synthesis(self):
         with self.assertRaisesRegex(ValueError, "audit needs synthesis = true"):
