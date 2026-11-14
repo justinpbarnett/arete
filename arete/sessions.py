@@ -226,7 +226,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
                  branch=spec.branch or None)
     if chat:
         state.chat_link_session(chat, spec.id, budget_usd)
-    clone =f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
+    clone = f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
     state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
                                      f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
                                                                 for reason, withheld in off.items())
@@ -277,7 +277,7 @@ def turn_arguments(spec: Spec, cfg: config.Config, device: devices.Device) -> di
 
     return {"model": spec.model, "runner": spec.runner, "cfg": cfg, "device": device, "tools": spec.tools,
             "allowed_tools": spec.tools, "disallowed_tools": runner.NO_GIT_WRITES, "remaining_budget": remaining_budget,
-            "timeout": TURN_TIMEOUT_SECONDS, "say": lambda text: log_line(spec, "wait", text),
+            "hard_cap": bool(spec.chat), "timeout": TURN_TIMEOUT_SECONDS, "say": lambda text: log_line(spec, "wait", text),
             "repo": session_repo(spec, cfg)}
 
 

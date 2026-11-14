@@ -29,7 +29,7 @@ KEY_PROVIDER = "openai"
 READ_PROFILE, WRITE_PROFILE = "read_only", "workspace_write"
 PROFILE_BASE = {READ_PROFILE: ":read-only", WRITE_PROFILE: ":workspace"}
 WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "NotebookEdit"})
-READ_BASH = re.compile(r"git -C \S+ (?:status|diff|log|show)\*")
+READ_BASH = re.compile(r"git -C \S+ (?:status|diff|log|show)\*|arete session (?:start|list|report|stop) --chat \d+(?: \*)?")
 FEATURES_OFF = ("plugins", "apps", "tool_suggest", "memories", "image_generation", "goals", "shell_snapshot", "multi_agent", "multi_agent_v2",
                 "browser_use", "computer_use", "skill_search", "skill_mcp_dependency_install")
 ALWAYS = ("--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--dangerously-bypass-hook-trust")

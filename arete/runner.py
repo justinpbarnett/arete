@@ -284,7 +284,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
-        scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
+        scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None, hard_cap: bool = False, needs_server: bool = False,
         **kw) -> Result:
     cfg = cfg or config.load()
     run_with = runner or (resume.runner if not model else "")
@@ -317,13 +317,16 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     active = layer if layer is not None else layer_of(repo)
     trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
                 remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
-                tokens=remaining_tokens, structured=kw.get("json_schema") is not None)
+                tokens=remaining_tokens, structured=kw.get("json_schema") is not None,
+                hard_cap=hard_cap, needs_server=needs_server)
     from . import routing
 
     limited: list[Result] = []
     previous: Stopped | None = None
     launches, measured = 0, size
     while True:
+        if hard_cap and kw.get("max_budget_usd") is not None:
+            trip.max_budget = kw["max_budget_usd"] - sum(r.paid_usd for r in limited)
         picked, skipped = pick(trip)
         if not picked:
             wake = wake_up(skipped)
@@ -418,6 +421,8 @@ class Trip:
     layer: config.RepoLayer | None = None
     tokens: Callable[[], int] | None = None
     structured: bool = False
+    hard_cap: bool = False
+    needs_server: bool = False
 
 
 @dataclass
@@ -596,6 +601,13 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
             skipped.append(passed_over(candidate, "ineligible", why))
             continue
         remaining = None
+        if trip.needs_server and candidate.runner == "codex":
+            skipped.append(passed_over(candidate, "ineligible", "codex runs with the network off, so it cannot "
+                                                                "reach the arete server"))
+            continue
+        if trip.hard_cap and candidate.billing == "paid" and candidate.runner == "codex":
+            skipped.append(passed_over(candidate, "ineligible", "codex cannot stop a paid call at a dollar limit"))
+            continue
         if candidate.billing == "paid" and candidate.state in ("ready", "held"):
             remaining = trip.budget() if trip.budget else trip.max_budget
             if remaining is not None and remaining <= BUDGET_FLOOR_USD:
@@ -747,7 +759,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     if trip.tokens is not None:
         kw["max_tokens"] = trip.tokens()
     if which == "claude":
-        if trip.tokens is not None:
+        if trip.tokens is not None or (trip.hard_cap and picked.candidate.billing == "paid" and picked.budget):
             kw["max_budget_usd"] = picked.budget
         else:
             kw.pop("max_budget_usd", None)

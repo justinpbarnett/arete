@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 
 from . import board, config, control, gh, paths, pipeline, record, routing, runner, sessions, state, util
@@ -10,6 +11,7 @@ CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
 OLD_CHAT_FILE = paths.STATE_DIR / "chat.json"
 MOVED_CHAT_FILE = paths.STATE_DIR / "chat.json.moved"
 BUDGET_USD = 2
+REPLY_SHARE = 0.5
 TIMEOUT_SECONDS = 900
 TITLE_CHARS = 120
 SENDER_LABELS = {"you": "You", "arete": "Arete", "tool": "Tool",
@@ -174,7 +176,7 @@ def answer(chat_id: int, text: str, message_id: int, project: str) -> None:
 def reserve_reply(chat_id: int, cfg: config.Config) -> float:
     with starting:
         left = limits(chat_id, chat_row(chat_id), cfg)["left"]
-        allowance = round(min(BUDGET_USD, left), 4)
+        allowance = round(min(BUDGET_USD, left * REPLY_SHARE), 4)
         if allowance > 0:
             replying[chat_id] = allowance
         return allowance
@@ -251,7 +253,7 @@ def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config,
             pipeline.prompt("chat_summary", summary=summary or "(none yet)", messages=render_all(batch)),
             paths.STATE_DIR, model=cfg.chat.summary_model, tools=[], persist=False,
             timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=min(SUMMARY_BUDGET_USD, allowance - cost),
-            wait_out_limits=False,
+            hard_cap=True, wait_out_limits=False,
             trace=("chat", f"chat {chat_id} summary"), cfg=cfg)
         cost, paid = cost + res.cost_usd, paid + res.paid_usd
         summary = capped(res.text.strip(), summary_limit(cfg)) if res.ok else ""
@@ -374,6 +376,8 @@ def refuse_session(chat_id: int, name: str, budget_usd: float | None, cfg: confi
         raise control.Refused(
             f"a change to arete goes through an issue the owner files, not a session; draft the issue, or start the "
             f"session with --repo none or another repo than {name}")
+    if budget_usd is not None and not math.isfinite(budget_usd):
+        raise control.Refused(f"the budget {budget_usd} is not a number of dollars")
     if now["running"] >= cfg.chat.max_sessions:
         raise control.Refused(f"chat {chat_id} already has {util.count(now['running'], 'session')} running "
                               f"([chat] max_sessions {cfg.chat.max_sessions}); wait for one to end or stop one")
@@ -510,6 +514,8 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
                                max_sessions=cfg.chat.max_sessions, budget=f"{cfg.chat.budget_usd:g}",
                                project=project_section(work) if project else ""),
         max_budget_usd=budget_usd,
+        hard_cap=True,
+        needs_server=True,
         timeout=TIMEOUT_SECONDS,
         wait_out_limits=False,
         add_dirs=[paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR, *([arete.path] if project else [])],
