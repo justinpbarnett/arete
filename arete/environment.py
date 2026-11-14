@@ -23,7 +23,7 @@ def build(names: Iterable[str], sets: Mapping[str, str] | None = None, *, never:
     patterns, never = [*BASE, *names], set(never)
     kept = {k: v for k, v in (os.environ if source is None else source).items()
             if k not in never and passes(k, patterns)}
-    return {**kept, **(sets or {})}
+    return util.foreground_maintenance({**kept, **(sets or {})})
 
 
 def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:

@@ -33,6 +33,20 @@ def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+FOREGROUND_MAINTENANCE = ("maintenance.autoDetach", "gc.autoDetach")
+
+
+def foreground_maintenance(env: dict) -> dict:
+    try:
+        held = max(int(env.get("GIT_CONFIG_COUNT", "0")), 0)
+    except ValueError:
+        held = 0
+    added = {}
+    for i, key in enumerate(FOREGROUND_MAINTENANCE, held):
+        added[f"GIT_CONFIG_KEY_{i}"], added[f"GIT_CONFIG_VALUE_{i}"] = key, "false"
+    return {**env, **added, "GIT_CONFIG_COUNT": str(held + len(FOREGROUND_MAINTENANCE))}
+
+
 def sh(
     cmd: list[str] | str,
     cwd: Path | str | None = None,
@@ -43,7 +57,7 @@ def sh(
     inherit: bool = True,
     keeps: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
-    full_env = {**(os.environ if inherit else {}), **(env or {})}
+    full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
     from . import scratch
 
     command = scratch.protected_command(cmd, cwd, keeps)
