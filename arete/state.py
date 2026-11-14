@@ -469,7 +469,10 @@ CREATE TABLE IF NOT EXISTS incidents (
     policies TEXT,
     phase TEXT DEFAULT '',
     waiting TEXT DEFAULT '',
-    rearmed INTEGER DEFAULT 0
+    rearmed INTEGER DEFAULT 0,
+    landed TEXT DEFAULT '',
+    recovery TEXT DEFAULT '',
+    alerted INTEGER DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -509,12 +512,23 @@ CREATE TABLE IF NOT EXISTS asks (
     answered TEXT,
     session TEXT DEFAULT '{}',
     answers TEXT DEFAULT '[]',
-    taken_by TEXT DEFAULT ''
+    taken_by TEXT DEFAULT '',
+    reminded TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS asks_run ON asks (run);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    label TEXT DEFAULT '',
+    contact TEXT DEFAULT '',
+    created TEXT NOT NULL,
+    last_success TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 """
-MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
+("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
               ("capture_evidence", "inspection", "ALTER TABLE capture_evidence ADD COLUMN inspection TEXT DEFAULT ''"),
@@ -564,7 +578,8 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
                   ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
                   ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"),
                   ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"),
-                  ("rearmed", "INTEGER DEFAULT 0"))]]
+                  ("rearmed", "INTEGER DEFAULT 0"),
+                  ("landed", "TEXT DEFAULT ''"), ("recovery", "TEXT DEFAULT ''"), ("alerted", "INTEGER DEFAULT 0"))]]
 
 
 @contextmanager
@@ -984,6 +999,11 @@ def woken_incidents() -> list[dict]:
     with db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' AND decision = 'wake' "
                                            "AND injection = 0 ORDER BY id")]
+
+
+def closed_alerted() -> list[int]:
+    with db() as c:
+        return [r[0] for r in c.execute("SELECT id FROM incidents WHERE alerted = 1 AND state != 'open' ORDER BY id")]
 
 
 def add_repair(incident_id: int, repo: str) -> int:
@@ -2195,6 +2215,36 @@ def asks_retire(run_id: str, status: str) -> None:
 def asks_taken(ids: list[str], run_id: str) -> None:
     with db() as c:
         c.executemany("UPDATE asks SET taken_by = ? WHERE id = ?", [(run_id, i) for i in ids])
+
+
+def ask_remind(ask_id: str) -> bool:
+    with db() as c:
+        return c.execute("UPDATE asks SET reminded = ? WHERE id = ? AND status = 'open' AND reminded = ''",
+                         (util.iso(), ask_id)).rowcount > 0
+
+
+def push_add(endpoint: str, p256dh: str, auth: str, label: str, contact: str) -> None:
+    with db() as c:
+        c.execute("INSERT INTO push_subscriptions (endpoint, p256dh, auth, label, contact, created) "
+                  "VALUES (?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, "
+                  "auth = excluded.auth, label = excluded.label, contact = excluded.contact",
+                  (endpoint, p256dh, auth, label, contact, util.iso()))
+
+
+def push_list(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM push_subscriptions ORDER BY created, rowid")]
+
+
+def push_drop(endpoints: list[str]) -> int:
+    with db() as c:
+        return sum(c.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (e,)).rowcount for e in endpoints)
+
+
+def push_succeeded(endpoints: list[str]) -> None:
+    with db() as c:
+        c.executemany("UPDATE push_subscriptions SET last_success = ? WHERE endpoint = ?",
+                      [(util.iso(), e) for e in endpoints])
 
 
 def asks_asked_before(iso: str) -> list[dict]:

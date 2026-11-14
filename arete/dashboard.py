@@ -50,6 +50,7 @@ from . import (
     triage,
     util,
     webapp,
+    webpush,
 )
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
@@ -78,6 +79,7 @@ FEED_PATH = "/api/feed/"
 RUN_PATH = "/api/runs/"
 APPROVAL_PATH = "/api/approvals/"
 ASK_PATH = "/api/asks/"
+PUSH_PATH = "/api/push"
 SESSION_PATH = "/api/sessions/"
 DEVICE_PATH = "/api/devices/"
 TRIAGE_PATH = "/api/triage/"
@@ -379,7 +381,8 @@ STATUS_OF_REFUSAL = {capture.TooLarge: 413, capture.Refused: 400, capture.NotSta
                      chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
-                     triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409, tasks.TrackerFailed: 502}
+                     triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409, tasks.TrackerFailed: 502,
+                     webpush.Refused: 400}
 
 
 def refusal_status(e: Exception) -> int | None:
@@ -442,7 +445,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             if status := refusal_status(e):
                 return self.send_json(status, refusal_answer(e))
-            said = type(e).__name__ if self.path.startswith(ASK_PATH) else f"{type(e).__name__}: {e}"
+            said = type(e).__name__ if self.path.startswith((ASK_PATH, PUSH_PATH)) else f"{type(e).__name__}: {e}"
             self.log_error("%s", said)
             self.send_json(500, {"error": as_sentence(util.first_line(said, 300))})
 
@@ -461,6 +464,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, method: str, path: str, query: dict):
         if method == "GET":
+            if path == PUSH_PATH:
+                return webpush.view()
             if path == "/api/sidebar":
                 return board.sidebar(chat.pulse())
             if path == "/api/live":
@@ -559,6 +564,12 @@ class Handler(BaseHTTPRequestHandler):
                     return tasks.repair(run_id)
                 if action.startswith("steps/"):
                     return tasks.run_step(run_id, action[len("steps/"):], self.body().get("set") or {})
+            if path == f"{PUSH_PATH}/subscribe":
+                return webpush.subscribe(self.body(), self.server.node.owner)
+            if path == f"{PUSH_PATH}/remove":
+                return webpush.remove(str(self.body().get("id") or ""))
+            if path == f"{PUSH_PATH}/test":
+                return webpush.test(config.load())
             if path.startswith(ASK_PATH):
                 ask_id, _, action = unquote(path[len(ASK_PATH):]).partition("/")
                 if action == "answer":
