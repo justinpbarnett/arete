@@ -34,6 +34,10 @@ class Refused(ValueError):
     pass
 
 
+class KeyFault(RuntimeError):
+    pass
+
+
 def base64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
@@ -42,9 +46,9 @@ def openssl(args: list[str], stdin: bytes | None = None) -> bytes:
     try:
         res = subprocess.run(["openssl", *args], input=stdin, capture_output=True, timeout=30, check=False)
     except (OSError, subprocess.SubprocessError):
-        raise Refused("openssl could not make the push key") from None
+        raise KeyFault("openssl could not make the push key") from None
     if res.returncode != 0:
-        raise Refused("openssl could not make the push key")
+        raise KeyFault("openssl could not make the push key")
     return res.stdout
 
 
@@ -77,7 +81,7 @@ def public_key() -> str:
         return known_key[1]
     point = openssl(["ec", "-in", str(file), "-pubout", "-outform", "DER"])[-SPKI_POINT_BYTES:]
     if len(point) != SPKI_POINT_BYTES or point[0] != 4:
-        raise Refused("openssl could not make the push key")
+        raise KeyFault("openssl could not make the push key")
     known_key = (stamp, base64url(point))
     return known_key[1]
 
