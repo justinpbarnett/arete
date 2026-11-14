@@ -649,6 +649,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     layer = pipeline.resolve_layer(cfg, run, job.ws)
     if why := pipeline.furnish(cfg, run, layer, job.ws):
         return end_as("fail", "failed", why=why)
+    pipeline.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
     approval = state.triage_approval(t.ref if repo.tracker == "jira" else tracker.ticket_name(repo.name, t.ref))
     return Outcome("pass", data={
         "ticket": {k: getattr(t, k) for k in TICKET_FIELDS}, "branch": branch,
@@ -1080,10 +1081,10 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
                                                                   replies or [])
     elif ending == "pr":
         pr_url = pipeline.record_prs(run, job.branch, job.with_prs)
-        pipeline.remove_workspace(job.ws, job.checkouts)
+        pipeline.release_workspace(run, job.ws, job.checkouts)
     elif ending == "done":
         run.say(done_comment(job, summary))
-        pipeline.remove_workspace(job.ws, job.checkouts)
+        pipeline.release_workspace(run, job.ws, job.checkouts)
     elif ending == "dry-run":
         run.log(f"dry run: {summary}; worktree kept at {job.ws}")
     return Outcome("pass", data={"status": status or ending, "summary": summary, "pr_url": pr_url})

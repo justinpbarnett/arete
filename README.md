@@ -484,6 +484,18 @@ Pipeline budgets span repairs, continuations and individual step reruns. The def
 
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
+## When a worktree is kept and when it is removed
+
+A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The run that makes it owns it: `workspaces/<name>.json` under the state folder holds the owner (run id, repo, ticket, created time and the checkouts) and a fingerprint of every file arete made there, including the setup outputs such as `.venv/`, written when the workspace is made and again before any removal.
+
+- Kept after a failed, parked or stopped run, a waiting ask, a dry run, leftover verification scratch, or any file the record does not cover.
+- Removed by the run itself at a `pr`, `done`, no-change or plain needs-info ending. When the removal is blocked, `run.log` says `workspace kept at ...: removal blocked by` and lists the names.
+- Removed by the next run of the same ticket, when the worktree still matches the record.
+- Removed by each poll's sweep when the owning run is `merged`, `rejected` or `done` (or the ticket is a closed local task), no run holds the ticket, and every file still matches the record. The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock. A workspace waiting for its ticket, or blocked by a file arete did not make, stays.
+- Every poll also runs `git worktree prune` on each configured repo. The local `arete/<n>-...` branch stays.
+
+The sweep writes the workspaces it keeps to `held-workspaces.json` in the state folder. The heartbeat check `workspaces:held` shows their count, size and oldest, and warns when one is blocked; the Health view lists them under Held workspaces. A folder with no owner is removed after 7 days when it holds no file.
+
 ## Records
 
 Every agent call writes its runner's raw output to `runs/<run_id>/record/<step>.jsonl.gz` under the state folder while it runs.
@@ -658,7 +670,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, `benchmarks/`, loop digests, `serve.json`, `server.json`, `price-snapshot.json`)
+- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, `benchmarks/`, loop digests, `serve.json`, `server.json`, `price-snapshot.json`, `workspaces/` records, `held-workspaces.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -1701,7 +1713,7 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
   Refresh triage now starts a refresh.
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.
 - Outcomes: for the last 30 days, the pipeline runs that shipped (a pull request, or a branch the adw flow pushed) and failed each day, the decisions that went without you against the ones you made, what you paid by day, model, runner and loop, the runs by repo, and the eval pass rate by repo.
-- Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, and the loops that report on their own.
+- Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, the loops that report on their own, and the held workspaces with their size, age and reason.
 - Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`.
   A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use.
   An empty model removes its line, so the role goes back to its default.

@@ -217,6 +217,36 @@ def check_disk() -> list[Check]:
     return [Check("disk:home", free_gb > 15, f"{free_gb:.0f} GB free")]
 
 
+def size_words(n: int) -> str:
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
+
+
+def age_words(since: str) -> str:
+    try:
+        hours = (util.now() - util.parse_iso(since.replace("Z", "+00:00"))).total_seconds() / 3600
+    except ValueError:
+        return "of unknown age"
+    return f"{hours / 24:.0f} days ago" if hours >= 48 else f"{max(hours, 0):.0f} h ago"
+
+
+def blocked_words(row: dict) -> str:
+    names = row.get("names") or []
+    return f"held by {', '.join(names)}" if names else util.first_line(row.get("why") or "", 160)
+
+
+def check_workspaces() -> list[Check]:
+    from . import pipeline
+
+    held = pipeline.held_summary()
+    if not held["count"]:
+        return [Check("workspaces:held", True, "none held", "warn")]
+    detail = f"{held['count']} held, {size_words(held['bytes'])}, oldest {age_words(held['oldest'])} ({held['oldest_name']})"
+    blocked = [r for r in held["rows"] if r.get("blocked")]
+    if blocked:
+        detail += f"; {len(blocked)} blocked: {blocked[0]['name']}: {blocked_words(blocked[0])}"
+    return [Check("workspaces:held", not blocked, detail, "warn")]
+
+
 def check_serve() -> list[Check]:
     from . import control
 
@@ -301,6 +331,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_serve,),
         (check_loops, cfg),
         (check_oncall, cfg),
+        (check_workspaces,),
     ):
         crash_key = f"heartbeat:{fn.__name__}"
         try:
