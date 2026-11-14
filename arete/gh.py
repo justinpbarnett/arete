@@ -224,6 +224,43 @@ def pr_reply(url: str, comment_id: int, body: str) -> None:
         "--input", "-"], input=Outgoing(json.dumps({"body": outgoing(body, mark=True)})))
 
 
+def ensure_branch(repo: str, branch: str) -> None:
+    try:
+        gh(["api", f"repos/{repo}/git/ref/heads/{branch}", "--jq", ".object.sha"])
+        return
+    except GhError as e:
+        if "HTTP 404" not in str(e):
+            raise
+    sha = branch_sha(repo, default_branch(repo))
+    try:
+        gh(["api", "-X", "POST", f"repos/{repo}/git/refs", "--input", "-"],
+           input=Outgoing(json.dumps({"ref": f"refs/heads/{branch}", "sha": sha})))
+    except GhError as e:
+        if "Reference already exists" not in str(e):
+            raise
+
+
+def file_sha(repo: str, path: str, ref: str) -> str:
+    try:
+        return gh(["api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".sha"]).strip()
+    except GhError as e:
+        if "HTTP 404" in str(e):
+            return ""
+        raise
+
+
+def put_file(repo: str, path: str, data: bytes, branch: str, message: str, replaces: str = "") -> str:
+    payload = {"message": message, "content": base64.b64encode(data).decode(), "branch": branch,
+               **({"sha": replaces} if replaces else {})}
+    out = gh(["api", "-X", "PUT", f"repos/{repo}/contents/{path}", "--input", "-"],
+             input=Outgoing(json.dumps(payload)), timeout=600)
+    return json.loads(out)["commit"]["sha"]
+
+
+def blob_url(repo: str, commit: str, path: str) -> str:
+    return f"https://github.com/{repo}/blob/{commit}/{path}"
+
+
 def api_list(path: str) -> list[dict]:
     pages = gh_json(["api", f"{path}?per_page=100", "--paginate", "--slurp"]) or []
     return [item for page in pages for item in page]

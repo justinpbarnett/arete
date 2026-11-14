@@ -333,12 +333,13 @@
     <button type="button" id="feedback-attach">Attach a file</button>
     <input type="file" id="feedback-file" accept="image/png,image/jpeg,image/webp,video/webm,video/mp4" multiple hidden>
   </div>
-  <p class="muted limit">PNG, JPEG or WebP images up to 5 MB and WebM or MP4 videos up to 25 MB and 30 seconds. A draft holds six items and 40 MB. Nothing is captured until you press a button, and staged files stay on this machine.</p>
+  <p class="muted limit">PNG, JPEG or WebP images up to 5 MB and WebM or MP4 videos up to 25 MB and 30 seconds. A draft holds six items and 40 MB. Nothing is captured until you press a button, and staged files stay on this machine until Submit files the request.</p>
   <p id="feedback-evidence-said" aria-live="polite" tabindex="-1" hidden></p>
   <h3>What will be sent</h3>
   <div id="feedback-sending">
     <p><strong id="feedback-sending-title"></strong></p>
     <pre id="feedback-sending-text"></pre>
+    <p class="muted" id="feedback-sending-source"></p>
     <p id="feedback-sending-context"></p>
     <ul id="feedback-evidence"></ul>
     <p class="muted" id="feedback-evidence-total"></p>
@@ -348,6 +349,7 @@
   <p class="muted" id="feedback-checks-cost"></p>
   <p id="feedback-ready" aria-live="polite"></p>
   <p id="feedback-result" aria-live="polite" tabindex="-1" hidden></p>
+  <p id="feedback-filed" tabindex="-1" hidden></p>
   <div class="actions"><button type="button" id="feedback-submit">Submit</button><button type="button" id="feedback-close">Close</button><button type="button" id="feedback-discard">Discard</button><span class="muted keys">Esc closes · the draft is kept</span></div>
 </dialog>
 <div id="feedback-recording" hidden role="status">

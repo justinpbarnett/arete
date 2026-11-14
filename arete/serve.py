@@ -392,7 +392,7 @@ class Server:
         if chat.any_busy():
             return "a chat message is still running"
         if capture.checking():
-            return "a feedback check is still running"
+            return "a feedback request is still being checked or filed"
         return ""
 
     def load_new_code(self) -> None:

@@ -17,7 +17,7 @@ const ACTION_WORDS = {
   research: "Research a ticket", "ticket-send": "Send a ticket to the pipeline", probe: "Probe a device", "checks-run": "Run the checks",
   "settings-save": "Save the settings", "filter-window": "Usage window", "console-open": "Open the console",
   "chat-send": "Send in the console", "chat-new": "New chat", "draft-file": "File a drafted issue from the console",
-  "draft-drop": "Drop a drafted issue from the console", find: "Find", "feedback-open": "Open feedback", "feedback-submit": "Submit feedback for checks","feedback-screenshot": "Take a screenshot for feedback",
+  "draft-drop": "Drop a drafted issue from the console", find: "Find", "feedback-open": "Open feedback", "feedback-submit": "Submit feedback","feedback-screenshot": "Take a screenshot for feedback",
   "feedback-record": "Record a video for feedback", "feedback-attach": "Attach a file to feedback", "feedback-remove": "Remove feedback evidence", "go-key": "G then a letter",
 };
 const USAGE_WINDOWS = ["7", "30", "90"];

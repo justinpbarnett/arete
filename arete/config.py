@@ -35,7 +35,8 @@ TIER_KEYS = ("runner", "provider", "model")
 PAYMENT_MODES = ("subscription", "api_key", "local")
 DOCUMENT_KINDS = ("message", "ticket", "pr", "doc")
 DOCUMENT_KEYS = ("enabled", "voice", "style", "words")
-CAPTURE_KEYS = ("vision",)
+CAPTURE_KEYS = ("vision", "evidence_branch", "public_evidence")
+EVIDENCE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 DOCUMENT_WORDS = {"message": (20, 60), "ticket": (80, 140)}
 WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
@@ -253,6 +254,8 @@ class Config:
     chat: ChatConfig = field(default_factory=ChatConfig)
     document: dict = field(default_factory=dict)
     capture_vision: str = ""
+    capture_evidence_branch: str = "feedback-evidence"
+    capture_public_evidence: bool = False
     oncall: OncallConfig = field(default_factory=OncallConfig)
 
     def repo(self, name: str) -> Repo:
@@ -629,10 +632,21 @@ def voice_file(entry, folder: Path) -> str:
     return str(found)
 
 
-def capture_table(data, folder: Path) -> str:
+def capture_table(data, folder: Path) -> tuple[str, str, bool]:
     table = table_of(data, "capture")
     if bad := sorted(set(table) - set(CAPTURE_KEYS)):
         raise ValueError(f"[capture]: unknown key {', '.join(bad)}; use {', '.join(CAPTURE_KEYS)}")
+    branch = table.get("evidence_branch", "feedback-evidence")
+    if (not isinstance(branch, str) or not EVIDENCE_BRANCH.fullmatch(branch) or ".." in branch
+            or branch.endswith(("/", ".", ".lock"))):
+        raise ValueError(f"[capture] evidence_branch must be a branch name such as feedback-evidence, not {branch!r}")
+    public = table.get("public_evidence", False)
+    if type(public) is not bool:
+        raise TypeError(f"[capture] public_evidence must be true or false, not {public!r}")
+    return capture_vision_file(table, folder), branch, public
+
+
+def capture_vision_file(table: dict, folder: Path) -> str:
     named = table.get("vision", "")
     if not isinstance(named, str):
         raise TypeError(f"[capture] vision must be a file name, not {named!r}")
@@ -840,7 +854,8 @@ def load(path: Path | None = None) -> Config:
     cfg.chat = chat_table(data.get("chat") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)
-    cfg.capture_vision = capture_table(data.get("capture") or {}, path.parent)
+    cfg.capture_vision, cfg.capture_evidence_branch, cfg.capture_public_evidence = capture_table(
+        data.get("capture") or {}, path.parent)
     from . import steps
     steps.check(cfg, defer_tiers=True)
     return cfg
