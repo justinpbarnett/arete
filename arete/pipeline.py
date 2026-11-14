@@ -833,7 +833,7 @@ def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> Non
     drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
-    holding = vault.held(git(["diff", "--cached", "--no-renames"], c.wt))
+    holding = vault.held(git(["diff", "--cached", "--no-renames", "--text", "--src-prefix=a/", "--dst-prefix=b/"], c.wt))
     if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
                   if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny) or n in holding]:
         git(["reset", "-q", "--", *denied], c.wt)
@@ -1009,18 +1009,21 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
         elif not diff.counts:
             continue
         shown = checkout_patch(c, diff.locks, "--cached", against)
-        resolved = ""
-        if merged and c.resolved and not from_base:
-            resolved = git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
-                            c.base_commit, "HEAD", "--", *c.resolved], c.wt)
+        resolving = bool(merged and c.resolved and not from_base)
+        resolved = resolved_patch(c) if resolving else ""
         if vault.every():
-            whole = checkout_patch(c, [], "--cached", against) if diff.locks else shown
-            diff.denied += vault.refusals(whole + resolved)
+            whole = checkout_patch(c, [], "--text", "--cached", against)
+            diff.denied += vault.refusals(whole + (resolved_patch(c, "--text") if resolving else ""))
         out += diff
         out.changed.append(c)
         out.patch += shown + resolved
     out.patch = vault.hidden(out.patch)
     return out
+
+
+def resolved_patch(c: Checkout, *flags: str) -> str:
+    return git(["diff", "--no-renames", *flags, f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
+                c.base_commit, "HEAD", "--", *c.resolved], c.wt)
 
 
 def pending_merge(c: Checkout) -> bool:

@@ -50,9 +50,13 @@ def save(repo: str, found: dict[str, str]) -> None:
         raise
 
 
-def put(repo: str, name: str, value: str) -> None:
+def put_all(repo: str, given: dict[str, str]) -> None:
     with util.lock(LOCK, wait=True):
-        save(repo, {**read(repo), name: value})
+        save(repo, {**read(repo), **given})
+
+
+def put(repo: str, name: str, value: str) -> None:
+    put_all(repo, {name: value})
 
 
 def remove(repo: str, name: str) -> bool:

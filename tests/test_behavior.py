@@ -142,6 +142,12 @@ lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
     "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
     ("2" if scenario == "edited-after-held-pr" else "1") + "\n")
+marker = "arete117-marker-value-9f3k2"
+if scenario == "secret-in-patch":
+    from arete import vault
+    vault.put("replay-sample", "REPLAY_SECRET", marker)
+    (root / "sample/replay/build.patch").write_text(
+        "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1,2 @@\n A small file for replay checks.\n+kumquat " + marker + "\n")
 if scenario == "failed-check":
     with (root / "sample/layer/config.toml").open("a") as out:
         out.write('\n[steps.check_repair]\ntries=1\n')
@@ -346,7 +352,6 @@ if scenario.startswith("asked"):
     asking = {"questions": [{"header": "Spelling", "question": "How is it spelled?", "kind": "text"}],
               "why": "The task leaves it open.", "tried": "Read the task."}
     placing = {**asking, "questions": [{"header": "Place", "question": "Where does it go?", "kind": "text"}]}
-    marker = "arete117-marker-value-9f3k2"
     if scenario == "asked-secret":
         layer_file = root / "sample/layer/config.toml"
         layer_file.write_text(layer_file.read_text().replace(
@@ -383,7 +388,8 @@ if scenario.startswith("asked"):
             except control.Refused as e:
                 result[name] = str(e)
     if scenario == "asked-secret":
-        from arete import control, tasks, vault
+        from arete import control, environment, tasks, vault
+        other = config.Repo(name="replay-other", path=root / "sample/repo")
         try:
             tasks.answer_ask(waiting[0]["id"], {"answers": [{"secret": "short"}]})
         except control.Refused as e:
@@ -394,6 +400,9 @@ if scenario.startswith("asked"):
             tasks.answer_ask(waiting[0]["id"], {"answers": [{"secret": marker}]})
         result["mode"] = oct(vault.file_of("replay-sample").stat().st_mode & 0o777)
         result["names"] = sorted(vault.read("replay-sample"))
+        result["seen"] = "REPLAY_SECRET" in environment.commands(cfg, cfg.repo("replay-sample"))
+        result["unseen"] = "REPLAY_SECRET" in environment.commands(cfg, other)
+        result["reserved_names"] = [runner.reserved(n) for n in ("ARETE_RUN_ID", "CLAUDE_CODE_OAUTH_TOKEN", "REPLAY_SECRET")]
         result["diff_refusal"] = vault.refusals(f"diff --git a/notes.txt b/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n+kumquat {marker}\n")
     else:
         for ask in waiting:
@@ -487,6 +496,8 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
                "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
                "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text()}
     if scenario == "asked-secret":
+        vault.remove("replay-sample", "REPLAY_SECRET")
+        result["after_removal"] = "REPLAY_SECRET" in environment.commands(cfg, cfg.repo("replay-sample"))
         result["answer_lines"] = [e.get("answers") for e in events if e.get("event") == "answer"]
         result["leaks"] = [str(p) for base in (paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR) for p in base.rglob("*")
                            if p.is_file() and not p.is_symlink() and marker.encode() in p.read_bytes()]
@@ -503,6 +514,10 @@ verification = [e.get("data", {}).get("verified") for e in events
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
           "verified":[v["verdict"] for v in verification if v],
           "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git")}
+if scenario == "secret-in-patch":
+    result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+    result["leaks"] = [str(p) for base in (paths.STATE_DIR, paths.LOG_DIR) for p in base.rglob("*")
+                       if p.is_file() and not p.is_symlink() and marker.encode() in p.read_bytes()]
 if scenario == "edited-after-held-pr":
     result["old"] = old
     result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
@@ -552,6 +567,16 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["answer_lines"], [[{"header": "Token", "kind": "secret", "name": "REPLAY_SECRET",
                                                     "set": True}]])
         self.assertEqual(result["diff_refusal"], ["notes.txt (holds the stored value of REPLAY_SECRET)"])
+        self.assertEqual((result["seen"], result["unseen"], result["after_removal"]), (True, False, False))
+        self.assertEqual([bool(r) for r in result["reserved_names"]], [True, True, False])
+
+    def test_patch_holding_a_stored_value_fails_naming_the_variable_only(self):
+        result = self.workflow("secret-in-patch")
+        self.assertEqual(result["status"], "failed")
+        text = result["summary"] + result["log"]
+        self.assertIn("holds the stored value of REPLAY_SECRET", text)
+        self.assertNotIn("arete117-marker-value-9f3k2", text)
+        self.assertEqual(result["leaks"], [])
 
     def test_answered_run_stopped_while_waiting_for_a_slot_resumes_with_the_answers(self):
         result = self.workflow("asked-stopped-waiting")

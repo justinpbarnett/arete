@@ -292,11 +292,10 @@ def answer_ask(ask_id: str, body) -> dict:
             raise control.Refused("; ".join(problems) + "; nothing was stored")
         free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
         command = continuing(cfg, repo, row)
-        for name, value in given.items():
-            try:
-                vault.put(repo.name, name, value)
-            except OSError as e:
-                raise control.Refused(f"could not store {name} ({e.strerror}); the ask stays open") from None
+        try:
+            vault.put_all(repo.name, given)
+        except OSError as e:
+            raise control.Refused(f"could not store {', '.join(given)} ({e.strerror}); the ask stays open") from None
         state.ask_close(ask_id, "answered", answers)
         if more := state.asks_of(row["id"], "open"):
             return answer(tid, repo.name, "", "waiting",

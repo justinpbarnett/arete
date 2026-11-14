@@ -26,6 +26,7 @@ from . import (
     settings,
     state,
     util,
+    vault,
 )
 from .agent import NO_SESSION, Session
 
@@ -361,6 +362,11 @@ def denied_work(spec: Spec, repo: config.Repo) -> list[str]:
         for parent in parents or [empty]:
             for path in diffguard.between(repo.path, parent, commit, deny=spec.deny).denied:
                 found.setdefault(path, f"{path} in {commit[:10]}")
+            if vault.every():
+                patch = util.git(["diff", "--no-renames", "--text", "--src-prefix=a/", "--dst-prefix=b/", parent,
+                                  commit], repo.path)
+                for entry in vault.refusals(patch):
+                    found.setdefault(entry, f"{entry} in {commit[:10]}")
     return list(found.values())
 
 

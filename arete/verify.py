@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import config, environment, paths, scratch, util
+from . import config, environment, paths, scratch, util, vault
 from .util import git
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
@@ -141,6 +141,7 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         yield url
     finally:
         stop(proc)
+        hide_in(log)
         if lifetime is not None:
             try:
                 os.killpg(proc.pid, 0)
@@ -167,8 +168,17 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
     raise ServerError(f"{url} did not answer within {seconds} seconds{output(log)}")
 
 
+def hide_in(log: Path) -> None:
+    try:
+        text = log.read_text(errors="replace")
+        if (hidden := vault.hidden(text)) != text:
+            log.write_text(hidden)
+    except OSError:
+        pass
+
+
 def output(log: Path) -> str:
-    text = util.tail(log.read_text(errors="replace").strip(), 3000)
+    text = vault.hidden(util.tail(log.read_text(errors="replace").strip(), 3000))
     return f"\n\n```\n{text}\n```" if text else "; the start command printed nothing"
 
 

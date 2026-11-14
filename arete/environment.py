@@ -51,8 +51,8 @@ def sh(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None
        sets: Mapping[str, str] | None = None, **kw):
     res = util.sh(cmd, env=commands(cfg, repo, sets), inherit=False, **kw)
     for value in sorted(stored(repo).values(), key=len, reverse=True):
-        res.stdout = res.stdout.replace(value, vault.REDACTED)
-        res.stderr = res.stderr.replace(value, vault.REDACTED)
+        res.stdout = (res.stdout or "").replace(value, vault.REDACTED)
+        res.stderr = (res.stderr or "").replace(value, vault.REDACTED)
     return res
 
 
