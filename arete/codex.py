@@ -64,7 +64,8 @@ NOTES = ("read-only or workspace-write sandbox according to the step's tools; ne
          "git writes and gh are refused by the guard, including shell command arrays and bash -lc",
          "all secret patterns and credential directories are excluded recursively, independently of file discovery",
          "repo instructions only; a login with global AGENTS.md instructions cannot be isolated and is refused",
-         "only declared MCP servers/tools are enabled and preapproved; environment values stay out of argv")
+         "only declared MCP servers/tools are enabled and preapproved; environment values stay out of argv",
+         "under trusted scratch the only MCP server is the engine's pinned browser, confined by its own profile")
 LEADING_WORD = re.compile(r"\w+=.*|-.*|\d+")
 
 
@@ -348,12 +349,23 @@ def guard_hook(judge: bool, scratch: tuple[str, ...] = ()) -> list[str]:
 def mcp_settings(mcp_config: str, allowed_tools: list[str] | None = None) -> list[str]:
     servers = (json.loads(mcp_config).get("mcpServers") or {}) if mcp_config else {}
     out: list[str] = []
+    attempt = verification_scratch.PRODUCING.get()
+    browser = bool(servers) and attempt is not None and verification_scratch.activated(attempt)
+    if browser:
+        try:
+            expected = {"playwright": verification_scratch.browser_server(attempt)}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise ValueError(f"browser confinement unavailable: {error}") from error
+        if servers != expected:
+            raise ValueError("under trusted scratch the only MCP server allowed is the engine's confined browser")
     for name, server in servers.items():
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             continue
         table = ({"url": server["url"]} if server.get("url") else
                  {"command": server.get("command", ""), "args": list(server.get("args") or [])})
-        if "command" in table:
+        if browser:
+            table["cwd"] = server["cwd"]
+        elif "command" in table:
             confined = verification_scratch.protected_command([table["command"], *table["args"]])
             table["command"], table["args"] = confined[0], confined[1:]
         prefix = f"mcp__{name}"
@@ -471,8 +483,7 @@ def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
 def launch(cmd, cwd, prompt, env, timeout, on_line, *, hidden=(), scratch=(), add_dirs=None, mcp_config=""):
     attempt = verification_scratch.PRODUCING.get()
     protected = {Path(p).resolve() for p in hidden}
-    confined = (attempt is None or not scratch or (not json.loads(mcp_config or "{}").get("mcpServers")
-                     and verification_scratch.AUTHORITY.resolve() in protected
+    confined = (attempt is None or not scratch or (verification_scratch.AUTHORITY.resolve() in protected
                      and paths.WORKTREES_DIR.resolve() in protected
                      and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
     return claude.run_streaming(cmd, str(cwd), prompt, env, timeout, on_line, actor_confined=confined)
@@ -533,7 +544,7 @@ def _run(
         cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                       system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, instructions=instructions,
                       judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
     if json_schema:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
