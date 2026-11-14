@@ -1,5 +1,7 @@
 import { sheet, toggleSheet, writable } from "./ui-keys.js";
 import { openPalette, register, pickerModes } from "./ui-palette.js";
+import { createList } from "./ui-list.js";
+import { fixture, fixtureRevision } from "./ui-actions.js";
 
 const named = { enter: "Enter", escape: "Escape", esc: "Escape", tab: "Tab", comma: ",", space: " ", plus: "+" };
 const modifiers = { cmd: "metaKey", meta: "metaKey", ctrl: "ctrlKey", alt: "altKey", shift: "shiftKey" };
@@ -189,6 +191,7 @@ export function paletteFixture(mode) {
 
 export async function startHooks() {
   const query = readQuery();
+  if (query.get("actions") === "fixture") actionFixture();
   paletteFixture(query.get("palette"));
   const jobs = [["keys", replayKeys], ["drag", replayDrag], ["wheel", replayWheel]]
     .filter(([name]) => query.has(name)).map(([name, run]) => [name, () => run(query.get(name))]);
@@ -209,4 +212,31 @@ export async function startHooks() {
   }
   root.uiReplay = "done";
   root.uiReplayKind = jobs.map(([name]) => name).join(",");
+}
+
+export function actionFixture() {
+  const rows = [
+    { id: "TR-209", title: "Review the proposed change", priority: "HIGH", version: 3, verb: "reject" },
+    { id: "TR-210", title: "Review the next change", priority: "HIGH", version: 0, verb: "reject" },
+    { id: "TR-211", title: "Discard a draft", priority: "MED", verb: "discard" },
+    { id: "TR-212", title: "Decline a proposal", priority: "MED", version: 1, verb: "decline" },
+    { id: "TR-213", title: "Remove a wire", priority: "MED", version: 2, verb: "remove" },
+    { id: "TR-214", title: "Stop a run", priority: "MED", version: 1, verb: "stop" },
+    { id: "TR-215", title: "Low priority item", priority: "LOW", verb: "remove" },
+  ].map((row) => ({ ...row, state: "Needs you", repo: "fixture", number: row.id }));
+  const list = createList({ rows, group: "priority", onCreate: () => {},
+    groups: [{ id: "priority", label: "Priority" }], sorts: [{ id: "title", label: "Title", key: "title" }],
+    actions: {
+      compatible: "fixture",
+      request: (action, item, reason) => ({ url: `/__ui_actions/items/${encodeURIComponent(item?.id ?? "new")}/${action.name}`,
+        data: { id: item?.id, reason } }),
+      inverse: (action, item, result) => ({ url: `/__ui_actions/items/${encodeURIComponent(item?.id ?? result.id)}/undo`,
+        data: { action: action.name }, object: result }),
+      created: (result, reason) => ({ id: result.id, title: reason, priority: "MED", state: "Needs you", repo: "fixture", version: result.version }),
+      label: (action, item, result, reason) => action.name === "create" ? `Created ${reason}`
+        : `${({ reject: "Rejected", discard: "Discarded", decline: "Declined", remove: "Removed", stop: "Stopped", snooze: "Snoozed", shelve: "Shelved", repair: "Retried" })[action.name] ?? action.label} ${item.id}`,
+    } });
+  list.subscribe((before) => { if (!before) fixtureRevision.value += 1; });
+  fixture.value = list;
+  return list;
 }

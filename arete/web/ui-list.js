@@ -1,6 +1,7 @@
 import { h, Component } from "./vendor-preact.js";
 import { Menu } from "./ui-menu.js";
-import { syncList } from "./ui-keys.js";
+import { syncList, selectItem, selectedItem, pane } from "./ui-keys.js";
+import { actions, perform } from "./ui-actions.js";
 
 export const shortCount = (n, total) => total == null ? String(n) : `${n}/${total}`;
 export const longCount = (n, total) => total == null ? String(n) : `${n} of ${total}`;
@@ -10,7 +11,7 @@ const compare = (a, b) => typeof a === "number" && typeof b === "number" ? a - b
 export function createList(options) {
   const listeners = new Set();
   const state = { rows: [...options.rows], query: "", facets: {}, group: options.group ?? "", sort: options.sort ?? "source", toggle: true,
-    detail: null, draft: false };
+    detail: null, draft: false, stale: {}, parked: [] };
   for (const [key, values] of Object.entries(options.selected ?? {})) state.facets[key] = [...values];
   const update = (change) => {
     for (const listener of listeners) listener(true);
@@ -28,27 +29,60 @@ export function createList(options) {
     setSort(sort) { update({ sort }); },
     setGroup(group) { update({ group }); },
     setToggle(toggle) { update({ toggle }); },
+    stale(id, current) { update({ stale: { ...state.stale, [id]: current ?? {} } }); },
+    counts() {
+      const high = state.rows.filter((row) => row.priority === "HIGH").length;
+      const med = state.rows.filter((row) => row.priority === "MED").length;
+      return { total: state.rows.length, high, med, needsYou: high + med };
+    },
+    resolve(row) {
+      const visible = api.groups().flatMap(([, rows]) => rows);
+      const at = visible.findIndex((one) => one.id === row.id);
+      const next = visible[at + 1] ?? visible[at - 1];
+      const index = state.rows.findIndex((one) => one.id === row.id);
+      update({ rows: state.rows.filter((one) => one.id !== row.id) });
+      return { next: next?.id, undo: () => {
+        if (state.rows.some((one) => one.id === row.id)) return;
+        const rows = [...state.rows];
+        rows.splice(index, 0, row);
+        update({ rows });
+      } };
+    },
+    insert(row) {
+      update({ rows: [{ ...row, new: true }, ...state.rows.filter((one) => one.id !== row.id)] });
+      return { next: row.id, undo: () => update({ rows: state.rows.filter((one) => one.id !== row.id) }) };
+    },
+    park(row, group) {
+      const transition = api.resolve(row);
+      update({ parked: [...state.parked, { ...row, parked: group }] });
+      return { ...transition, undo: () => {
+        update({ parked: state.parked.filter((one) => one.id !== row.id) });
+        transition.undo();
+      } };
+    },
     pick(key, value) {
       const values = state.facets[key] ?? [];
       update({ facets: { ...state.facets, [key]: values.includes(value) ? values.filter((v) => v !== value) : [...values, value] } });
     },
     facetCount(key, value) { return state.rows.filter((row) => matches(row, key) && row[key] === value).length; },
     rows() {
-      const rows = state.rows.filter((row) => matches(row));
+      const rows = state.rows.filter((row) => row.new || matches(row));
       const sort = options.sorts?.find((one) => one.id === state.sort);
       if (sort?.key) rows.sort((a, b) => (sort.direction ?? 1) * compare(a[sort.key], b[sort.key]) || compare(a.id, b.id));
-      return rows;
+      return [...rows.filter((row) => row.new), ...rows.filter((row) => !row.new)];
     },
     groups() {
       const rows = api.rows();
       if (!state.group) return [["", rows]];
       const buckets = new Map();
-      for (const row of rows) {
+      for (const row of rows.filter((one) => !one.new)) {
         const key = row[state.group];
         if (!buckets.has(key)) buckets.set(key, []);
         buckets.get(key).push(row);
       }
-      return [...buckets].sort(([a], [b]) => compare(a, b));
+      const rank = { HIGH: 0, MED: 1, LOW: 2 };
+      const groups = [...buckets].sort(([a], [b]) => state.group === "priority" ? compare(rank[a] ?? 3, rank[b] ?? 3) : compare(a, b));
+      return rows.some((row) => row.new) ? [["New", rows.filter((row) => row.new)], ...groups] : groups;
     },
     open(row) { update({ detail: row, draft: false }); options.onOpen?.(row); },
     create() { update({ draft: true, detail: null }); options.onCreate?.(); },
@@ -61,12 +95,41 @@ export function createList(options) {
   return api;
 }
 
+export function listContext(list, listId, id) {
+  const item = list.state.rows.find((one) => one.id === id);
+  const hash = location.hash;
+  const originPane = pane.peek();
+  const originItem = item?.id ?? selectedItem(listId);
+  const adapter = list.options.actions;
+  if (!adapter) return null;
+  let successor;
+  return {
+    item, listId, compatible: adapter.compatible ?? listId, primary: adapter.primary,
+    request: (action, reason) => adapter.request(action, item, reason),
+    inverse: adapter.inverse ? (action, result, transition) => adapter.inverse(action, item, result, transition) : null,
+    stale: (current) => list.stale(item?.id, current),
+    commit(action, result, reason) {
+      const transition = action.name === "create" ? list.insert(adapter.created(result, reason))
+        : ["snooze", "shelve"].includes(action.name) ? list.park(item, action.name === "snooze" ? "Snoozed" : "Shelved") : list.resolve(item);
+      successor = transition.next;
+      selectItem(listId, transition.next, originPane);
+      return { ...transition, label: adapter.label?.(action, item, result, reason) };
+    },
+    restore() {
+      location.hash = hash;
+      const selected = list.state.rows.find((row) => row.id === originItem)?.id
+        ?? list.rows().find((row) => row.id === successor)?.id ?? list.rows()[0]?.id;
+      selectItem(listId, selected, originPane);
+    },
+  };
+}
+
 function choice(label, checked, action, count) {
   return h("button", { type: "button", role: "menuitemcheckbox", "aria-checked": checked, onClick: action },
     h("span", null, `${checked ? "✓" : "　"} ${label}`), count == null ? null : h("b", null, count));
 }
 
-export function ListHeader({ controller: list, queue = false }) {
+export function ListHeader({ controller: list, queue = false, id }) {
   const { options: o, state: s } = list;
   const n = list.rows().length;
   const group = o.groups?.find((one) => one.id === s.group)?.label ?? "None";
@@ -90,14 +153,15 @@ export function ListHeader({ controller: list, queue = false }) {
     h("span", { key: "count", class: "ui-list-count", title: longCount(n, total) }, shortCount(n, total)),
     o.sorts?.length ? h(Menu, { key: "sort", label: queue ? "⇅" : "Sort", title: `Sort: ${sort}` }, (close) =>
       o.sorts.map((one) => choice(one.label, s.sort === one.id, () => { list.setSort(one.id); close(); }))) : null,
-    o.onCreate ? h("button", { key: "new", type: "button", "data-primary-candidate": "", onClick: () => list.create() }, "[c] New") : null);
+    o.onCreate ? h("button", { key: "new", type: "button", "data-primary-candidate": "",
+      onClick: () => o.actions ? perform(actions.create, listContext(list, id)) : list.create() }, "[c] New") : null);
 }
 
 export function ListRow({ row, onOpen }) {
   const glyph = { "Needs you": "!", Running: "▷", Done: "✓", Fault: "×" }[row.state] ?? "○";
   return h("div", { class: "ui-list-row", "data-row": "", "data-item": row.id, onClick: () => onOpen(row) },
     h("span", { class: "ui-list-state" }, `${glyph} ${row.state}`),
-    h("span", { class: "ui-list-title", title: row.title }, row.title),
+    h("span", { class: "ui-list-title", title: row.title }, row.new ? `+ ${row.title} · new` : row.title),
     h("span", { class: "ui-list-number" }, row.number));
 }
 
@@ -128,6 +192,10 @@ export class List extends Component {
   commit() {
     const list = this.props.controller;
     this.base.uiCreate = list.options.onCreate ? () => list.create() : null;
+    if (list.options.actions) {
+      this.base.uiContext = (id) => listContext(list, this.props.id, id);
+      this.base.uiCreate = () => perform(actions.create, listContext(list, this.props.id));
+    }
     this.base.uiDismiss = () => list.dismiss();
     syncList(this.base);
     if (this.offset) {
@@ -142,11 +210,18 @@ export class List extends Component {
   render({ controller: list, id, queue }) {
     const { detail, draft } = list.state;
     return h("div", { class: "ui-list", "data-list": id },
-      h(ListHeader, { controller: list, queue }),
+      h(ListHeader, { controller: list, queue, id }),
       h("div", { class: "ui-list-scroll" }, list.rows().length ? list.groups().map(([name, rows]) =>
         h("div", { key: name }, name && h("div", { class: "ui-list-group" }, `${name} · ${rows.length}`),
-          rows.map((row) => h(ListRow, { key: row.id, row, onOpen: (one) => list.open(one) }))))
-        : h("p", { class: "ui-list-empty" }, "No matching items. Clear search or remove a filter.")),
+          rows.map((row) => h("div", { key: row.id }, h(ListRow, { row, onOpen: (one) => list.open(one) }),
+            Object.hasOwn(list.state.stale, row.id) ? h("div", { class: "ui-stale", role: "alert" },
+              `Stale · current: ${JSON.stringify(list.state.stale[row.id])}`) : null))))
+        : h("p", { class: "ui-list-empty" }, "No matching items. Clear search or remove a filter."),
+        ["Snoozed", "Shelved"].map((group) => {
+          const rows = list.state.parked.filter((row) => row.parked === group);
+          return rows.length ? h("details", { key: group }, h("summary", { class: "ui-list-group" }, `${group} · ${rows.length}`),
+            rows.map((row) => h(ListRow, { key: row.id, row, onOpen: (one) => list.open(one) }))) : null;
+        })),
       draft ? h("div", { class: "ui-list-draft" }, h("label", null, "New demo item ", h("input", { placeholder: "Title" })),
         h("button", { onClick: () => list.dismiss() }, "Close")) : null,
       detail ? h("div", { class: "ui-list-detail" }, h("strong", null, detail.title),

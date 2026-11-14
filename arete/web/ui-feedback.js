@@ -1,4 +1,5 @@
 import { notice, mode } from "./ui-keys.js";
+import { postBody } from "./ui-write.js";
 
 const KEPT = "arete.feedback";
 const SAVE_MS = 600;
@@ -105,11 +106,10 @@ function sayIn(target, state, sentence) {
 }
 
 async function call(path, body, signal) {
-  const changes = body !== undefined;
   const raw = body instanceof Blob;
-  const options = changes ? { method: "POST", headers: { "Content-Type": raw ? "application/octet-stream" : "application/json", "X-Arete": "1" }, body: raw ? body : JSON.stringify(body) }
-    : { cache: "no-store", signal };
-  const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });
+  const sent = body === undefined ? fetch(path, { cache: "no-store", signal })
+    : postBody(path, raw ? body : JSON.stringify(body), raw ? "application/octet-stream" : "application/json");
+  const response = await sent.catch(() => { throw new NoAnswer("The connection to arete failed."); });
   const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
   if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data, response.status);
   return data;

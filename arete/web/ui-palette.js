@@ -10,6 +10,8 @@ export const pickerModes = {
 };
 export const palette = signal(null);
 const snapshots = new Map();
+let commands = [];
+export function globalCommands(rows) { commands = [...rows]; refresh(); }
 let navigation = [];
 let everywhere = [];
 let opener = null;
@@ -26,7 +28,7 @@ export function configurePalette(rows, beforeOpen = () => {}, beforeClose = () =
 function source(state) {
   if (state.mode) return state.rows;
   const screen = parse(location.hash).screen;
-  return [...navigation, ...[...snapshots.values()].flatMap((entry) => entry.items.map((row) => ({ ...row, group: "Items" }))),
+  return [...navigation, ...commands.map((row) => ({ ...row, group: "Commands" })), ...[...snapshots.values()].flatMap((entry) => entry.items.map((row) => ({ ...row, group: "Items" }))),
     ...(snapshots.get(screen)?.commands ?? []).map((row) => ({ ...row, group: "Commands" })), ...everywhere];
 }
 

@@ -5,6 +5,7 @@ import { screenKeys } from "./ui-keys.js";
 import { KeyBar, KeySheet } from "./ui-keybar.js";
 import { List, demoQueue, demoFocus } from "./ui-list.js";
 import { Palette, openPalette } from "./ui-palette.js";
+import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 
 const html = htm.bind(h);
 const glyphs = { floor: "▦", triage: "!", "my-work": "○", board: "▤", runs: "▷", intake: "↓", outbox: "↑", prompts: "≡", adws: "◇", insights: "▥", settings: "⚙" };
@@ -51,6 +52,10 @@ function Pane({ name, label, children }) {
 }
 
 export function Shell({ route, snapshot, now }) {
+  fixtureRevision.value;
+  const actionList = fixture.value;
+  const counts = actionList?.counts();
+  if (counts) snapshot = { ...snapshot, needsYou: counts.needsYou };
   const page = data[route.screen](route);
   const health = route.screen === "settings" && route.path[0] === "health";
   const slots = route.screen === "floor" ? html`<p class="slots mono">Slots <span>${snapshot.slots}</span> / <span>${snapshot.capacity}</span></p>` : null;
@@ -62,14 +67,17 @@ export function Shell({ route, snapshot, now }) {
       <header class="page-head">
         <div class="head-row"><h1>${page.title}</h1><div class="head-tools"></div></div>
         <p class="subtitle">${page.subtitle}</p>
+        ${counts ? html`<p class="subtitle">${counts.total} open · ${counts.needsYou} need you · ${counts.high} high · ${counts.med} med</p>` : null}
         ${page.tabs ? html`<div class="tabs-slot" aria-label="Tabs"></div>` : null}
       </header>
       <div class="pane-grid">
-        <${Pane} name="queue" label=${page.queue}>${slots}${health ? html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />` : null}<//>
+        <${Pane} name="queue" label=${page.queue}>${slots}${actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />` : health ? html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />` : null}<//>
         ${route.screen === "run" ? html`<div class="run-focus"><${Pane} name="focus" label=${page.focus} />${extra}</div>`
           : html`<${Pane} name="focus" label=${page.focus}>${health ? html`<${List} id="health-focus" controller=${demoFocus} />` : null}<//>${extra}`}
       </div>
       <${KeyBar} />
+      ${actionList ? html`<button class="fixture-replay" type="button" onClick=${replayLast}>Replay last request</button>` : null}
+      <${ReasonBox} />
     </main>
     <${KeySheet} />
     <${Palette} />
