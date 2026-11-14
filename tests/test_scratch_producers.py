@@ -112,7 +112,7 @@ class FakeTableTests(unittest.TestCase):
         for patch in (
                 mock.patch.object(scratch, "AUTHORITY", self.root / "authority-parent/verification-authority"),
                 mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees"),
-                mock.patch.object(scratch, "processes", lambda workspace="": dict(self.table)),
+                mock.patch.object(scratch, "processes", lambda *workspaces: dict(self.table)),
                 mock.patch.object(scratch, "identity_of", self.identity_of),
                 mock.patch.object(launchd, "printed", self.printed),
                 mock.patch.object(launchd, "sealed", lambda path: path.startswith(("/System/", "/usr/libexec/"))),
