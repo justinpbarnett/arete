@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -33,6 +34,9 @@ from .pipeline import (
 from .util import git
 
 EVALS = ".agents/evals"
+MAX_BASES = 4
+BASES: dict[tuple[str, str, str], Base] = {}
+BASES_LOCK = threading.Lock()
 OVERLAY_EXTRA = [".agents/config.toml"]
 ARETE_PROMPTS = "arete/prompts"
 BUILDER_PROMPTS = ("plan", "build", "fix")
@@ -246,12 +250,46 @@ def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
                 "eval base"], staging).strip()
 
 
-def write_files_through_repo(repo_path: Path, snapshot: str, dest: Path) -> None:
-    env = {"GIT_DIR": git(["rev-parse", "--absolute-git-dir"], repo_path).strip(), "GIT_WORK_TREE": str(dest),
+@dataclass
+class Base:
+    folder: tempfile.TemporaryDirectory
+    snapshot: str
+    git_dir: str
+
+    @property
+    def path(self) -> Path:
+        return Path(self.folder.name)
+
+
+def write_files_through_repo(git_dir: str, snapshot: str, dest: Path) -> None:
+    env = {"GIT_DIR": git_dir, "GIT_WORK_TREE": str(dest),
            "GIT_INDEX_FILE": str(dest / ".git" / "index"),
            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(dest / ".git" / "objects")}
     git(["read-tree", snapshot], dest, env=env)
     git(["checkout-index", "-a"], dest, timeout=600, env=env)
+
+
+def base_without_evals(repo_path: Path, sha: str, beside: Path) -> Base:
+    key = (str(repo_path), sha, str(beside))
+    found = BASES.get(key)
+    if found and found.path.is_dir():
+        return found
+    folder = tempfile.TemporaryDirectory(prefix="eval-base-", dir=beside)
+    try:
+        git(["init", "-q"], Path(folder.name))
+        with tempfile.TemporaryDirectory(prefix="eval-staging-", dir=beside) as staging:
+            snapshot = commit_without_evals(repo_path, sha, Path(staging))
+            git(["fetch", "-q", "--no-tags", staging, snapshot], Path(folder.name), timeout=600)
+        git(["update-ref", "refs/eval/base", snapshot], Path(folder.name))
+        made = Base(folder, snapshot, git(["rev-parse", "--absolute-git-dir"], repo_path).strip())
+    except BaseException:
+        folder.cleanup()
+        raise
+    BASES.pop(key, None)
+    while len(BASES) >= MAX_BASES:
+        BASES.pop(next(iter(BASES))).folder.cleanup()
+    BASES[key] = made
+    return made
 
 
 def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> None:
@@ -259,10 +297,10 @@ def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> None
     sha = git(["rev-parse", f"{base}^{{commit}}"], repo_path).strip()
     dest.mkdir(parents=True)
     git(["init", "-q"], dest)
-    with tempfile.TemporaryDirectory(prefix=f"{dest.name}-base-", dir=dest.parent) as staging:
-        snapshot = commit_without_evals(repo_path, sha, Path(staging))
-        git(["fetch", "-q", "--no-tags", staging, snapshot], dest, timeout=600)
-    write_files_through_repo(repo_path, snapshot, dest)
+    with BASES_LOCK:
+        made = base_without_evals(repo_path, sha, dest.parent)
+        git(["fetch", "-q", "--no-tags", str(made.path), made.snapshot], dest, timeout=600)
+    write_files_through_repo(made.git_dir, made.snapshot, dest)
     git(["checkout", "-q", "-B", "main", "FETCH_HEAD"], dest)
 
 
