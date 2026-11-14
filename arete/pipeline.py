@@ -3673,10 +3673,14 @@ def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
            or next(iter(state.ticket_runs(repo, tid, limit=1, whole=True)), None))
     status = (row or {}).get("status") or ""
     run_id = (row or {}).get("id") or owner.get("run") or ""
-    closed = status not in SWEPT and status not in WAITING and ticket_closed(cfg, repo, tid, status)
+    closed = (status not in SWEPT and status not in WAITING and tracker.is_task_id(tid)
+              and ticket_closed(cfg, repo, tid, status))
     if status not in SWEPT and not closed:
         return held_entry(d, owner, row, False,
                           f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket")
+    made = made_before(d)
+    if any(made.get(onto_key(c)) and (c.wt / ".git").exists() for c in checkouts):
+        return held_entry(d, owner, row, False, f"run {run_id} kept edits in the workspace, so it waits for a resume")
     with util.lock(lock_name) as got:
         if not got:
             return None

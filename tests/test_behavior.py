@@ -4229,14 +4229,14 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("notes.txt", out["check_e"][1])
         self.assertFalse(out["e_after"])
         self.assertEqual(out["check_after"], [True, "none held"])
-        self.assertEqual(out["g"], [False, False, False])
+        self.assertEqual(out["g"], [True, True, True])
         self.assertTrue(out["f"])
-        self.assertEqual(len(out["held_f"]), 1)
+        self.assertEqual(len(out["held_f"]), 2)
         self.assertFalse(out["held_f"][0]["blocked"])
         self.assertEqual(out["held_f"][0]["names"], [])
         self.assertTrue(out["held_f"][0]["why"].endswith("waits for the ticket"))
         self.assertTrue(out["check_f"][0])
-        self.assertTrue(out["check_f"][1].startswith("1 held"), out["check_f"])
+        self.assertTrue(out["check_f"][1].startswith("2 held"), out["check_f"])
 
 
 class ChatContextTests(unittest.TestCase):
