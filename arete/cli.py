@@ -1457,6 +1457,22 @@ def cmd_secrets(args) -> int:
     return 2
 
 
+def cmd_rotate_authority(args) -> int:
+    from . import scratch
+
+    try:
+        records, pins = scratch.rotate()
+    except scratch.RotationRefused as e:
+        for line in str(e).splitlines():
+            print(f"refused: {line}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"cannot rotate the verification signing secret: {e}", file=sys.stderr)
+        return 1
+    print(f"re-signed records: {records}, pins: {pins}")
+    return 0
+
+
 def cmd_resume(args) -> int:
     from . import client
 
@@ -1809,6 +1825,11 @@ def main(argv: list[str] | None = None) -> int:
                                        "(rm REPO NAME); it never prints a value")
     p.add_argument("words", nargs="+", metavar="[rm] REPO [NAME]")
     p.set_defaults(fn=cmd_secrets)
+
+    p = sub.add_parser("rotate-authority", help="re-sign every scratch record and the browser pin under a new "
+                                                "verification signing secret, then swap it in; refuses while a run, "
+                                                "an attempt lease or an engine lock is live")
+    p.set_defaults(fn=cmd_rotate_authority)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))

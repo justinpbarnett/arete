@@ -51,6 +51,9 @@ LEASES: dict[str, int] = {}
 RUN_BASELINES: dict[str, dict[int, int] | None] = {}
 RUN_LABELS: dict[str, dict | None] = {}
 MAX_RECORD_BYTES = 1024 * 1024
+SECRET = "signing.secret"
+NEXT_SECRET = "signing.secret.next"
+ROTATION_MARKER = "rotation.marker"
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
 IN_GROUP = "in a producer group"
 ORPHAN = "orphan of a producer"
@@ -115,6 +118,27 @@ def encoded(value) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
+def create_secret(fd: int, name: str) -> None:
+    key = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+    with os.fdopen(key, "wb") as out:
+        out.write(secrets.token_bytes(32))
+        out.flush()
+        os.fsync(key)
+
+
+def read_secret(fd: int, name: str = SECRET) -> bytes:
+    key = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    with os.fdopen(key, "rb") as source:
+        st = os.fstat(key)
+        checked(st, identity(st))
+        if st.st_mode & 0o077:
+            raise PermissionError("scratch signing secret is not private")
+        secret = source.read(33)
+    if len(secret) != 32:
+        raise PermissionError("invalid scratch authority")
+    return secret
+
+
 @contextmanager
 def registry(create: bool = False):
     from . import pi
@@ -132,24 +156,9 @@ def registry(create: bool = False):
         if st.st_uid != os.getuid() or st.st_mode & 0o077:
             raise PermissionError("scratch authority is not private")
         if create:
-            try:
-                key = os.open("signing.secret", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                              0o600, dir_fd=fd)
-            except FileExistsError:
-                pass
-            else:
-                with os.fdopen(key, "wb") as out:
-                    out.write(secrets.token_bytes(32))
-        key = os.open("signing.secret", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-        with os.fdopen(key, "rb") as source:
-            st = os.fstat(key)
-            checked(st, identity(st))
-            if st.st_mode & 0o077:
-                raise PermissionError("scratch signing secret is not private")
-            secret = source.read(33)
-        if len(secret) != 32:
-            raise PermissionError("invalid scratch authority")
-        yield fd, secret
+            with suppress(FileExistsError):
+                create_secret(fd, SECRET)
+        yield fd, read_secret(fd)
 
 
 def load(fd: int, key: bytes, selector: str) -> dict:
@@ -169,15 +178,153 @@ def load(fd: int, key: bytes, selector: str) -> dict:
     return data
 
 
-def store(fd: int, key: bytes, data: dict) -> None:
-    name = data["attempt"]["selector"] + ".json"
+def write_atomic(fd: int, name: str, payload: bytes) -> None:
     temporary = secrets.token_hex(16) + ".new"
     out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
     with os.fdopen(out, "wb") as target:
-        target.write(encoded({"data": data, "signature": hmac.digest(key, encoded(data), "sha256").hex()}))
+        target.write(payload)
         target.flush()
         os.fsync(out)
     os.rename(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
+
+
+def store(fd: int, key: bytes, data: dict) -> None:
+    signature = hmac.digest(key, encoded(data), "sha256").hex()
+    write_atomic(fd, data["attempt"]["selector"] + ".json", encoded({"data": data, "signature": signature}))
+
+
+class RotationRefused(RuntimeError):
+    pass
+
+
+def rotation_blockers(fd: int) -> list[str]:
+    from . import state, util
+
+    found = [f"run {r['id']} is active" for r in state.runs_marked_running()]
+    for name in sorted(os.listdir(fd)):
+        if name.endswith(".lease"):
+            lease = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                found.append(f"attempt lease {name} is held")
+            finally:
+                os.close(lease)
+    if paths.LOCKS_DIR.is_dir():
+        for path in sorted(paths.LOCKS_DIR.glob("*.lock")):
+            if util.lock_is_held(path.stem):
+                found.append(f"engine lock {path.stem} is held")
+    return found
+
+
+def resigned_names(fd: int) -> list[str] | None:
+    try:
+        source = os.open(ROTATION_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(source, "rb") as inp:
+        try:
+            return [str(n) for n in json.loads(inp.read(MAX_RECORD_BYTES))["resigned"]]
+        except (ValueError, KeyError, TypeError):
+            return []
+
+
+def note_resigned(fd: int, names) -> None:
+    write_atomic(fd, ROTATION_MARKER, encoded({"resigned": sorted(names)}))
+
+
+def rotation_secret(fd: int, started: bool) -> bytes:
+    try:
+        return read_secret(fd, NEXT_SECRET)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        if started:
+            raise
+        os.unlink(NEXT_SECRET, dir_fd=fd)
+    create_secret(fd, NEXT_SECRET)
+    os.fsync(fd)
+    return read_secret(fd, NEXT_SECRET)
+
+
+def verifies(fd: int, key: bytes, name: str) -> bool:
+    from . import browser
+
+    try:
+        if name == browser.PIN:
+            browser.load_pin(fd, key)
+        else:
+            load(fd, key, name[:-5])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return True
+
+
+def resign(fd: int, old: bytes, new: bytes, name: str) -> None:
+    from . import browser
+
+    if name == browser.PIN:
+        browser.store_pin(fd, new, browser.load_pin(fd, old))
+    else:
+        store(fd, new, load(fd, old, name[:-5]))
+
+
+def swap_secret(fd: int) -> None:
+    os.rename(NEXT_SECRET, SECRET, src_dir_fd=fd, dst_dir_fd=fd)
+    os.fsync(fd)
+    with suppress(FileNotFoundError):
+        os.unlink(ROTATION_MARKER, dir_fd=fd)
+    os.fsync(fd)
+
+
+def unverified(names: list[str]) -> RotationRefused:
+    return RotationRefused("verifies under neither secret: " + ", ".join(names))
+
+
+def rotation_counts(names, files: list[str]) -> tuple[int, int]:
+    from . import browser
+
+    present = [n for n in names if n in files]
+    return sum(n != browser.PIN for n in present), int(browser.PIN in present)
+
+
+def rotate() -> tuple[int, int]:
+    from . import browser
+
+    with registry() as (fd, _):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        old = read_secret(fd)
+        blockers = rotation_blockers(fd)
+        if blockers:
+            raise RotationRefused("\n".join(blockers))
+        listing = os.listdir(fd)
+        files = sorted(n for n in listing if n.endswith(".json")) + [n for n in listing if n == browser.PIN]
+        marker = resigned_names(fd)
+        has_next = NEXT_SECRET in listing
+        if not has_next:
+            bad = [n for n in files if not verifies(fd, old, n)]
+            if bad:
+                raise unverified(bad)
+            if marker is not None:
+                os.fsync(fd)
+                os.unlink(ROTATION_MARKER, dir_fd=fd)
+                return rotation_counts(marker, files)
+        new = rotation_secret(fd, marker is not None)
+        bad = [n for n in files if not verifies(fd, new, n) and not verifies(fd, old, n)]
+        if bad:
+            raise unverified(bad)
+        done = {n for n in files if verifies(fd, new, n)}
+        note_resigned(fd, done)
+        for name in files:
+            if name not in done:
+                resign(fd, old, new, name)
+                done.add(name)
+                note_resigned(fd, done)
+        bad = [n for n in files if not verifies(fd, new, n)]
+        if bad:
+            raise RotationRefused("not signed by the new secret: " + ", ".join(bad))
+        swap_secret(fd)
+        return rotation_counts(done, files)
 
 
 def records(strict: bool = False) -> list[dict]:
