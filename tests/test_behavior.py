@@ -4359,7 +4359,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
 '''
 
     def run_script(self, scenario):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(suffix=".noindex") as directory:
             root = Path(directory).resolve()
             for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
                 (root / folder).mkdir()
