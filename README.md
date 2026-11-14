@@ -56,8 +56,8 @@ A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete we
 ## On-call
 
 The watcher notices operational failures on its own and keeps one durable incident for each underlying symptom.
-JEV decides whether an incident may wake a repair; a wake starts one bounded repair.
-Following the repair, recovery, escalation and steering come in later parts, so an incident whose repair started stays `repairing`.
+JEV decides whether an incident may wake a repair; a wake starts one bounded repair, and the incident is resolved only when the original failure is seen to be gone.
+Steering commands and an off switch come in a later part.
 
 ```toml
 [oncall]
@@ -87,7 +87,7 @@ scope = "Only the checkout module"
 `confidence` and `injection` are numbers from 0 to 1 and default to `[jev] confidence` and `[jev] injection`.
 When on, serve scans on its tick, on the poll pool, so a slow scan never blocks the tick.
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
-`repo` names the repo a repair works in; `check` is recorded for a later part.
+`repo` names the repo a repair works in; `check` is the command Arete reruns to prove recovery.
 When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is asked only `injection` and `actionable`, and a result that would be `wake` is stored as `unsure` for the owner, so no entry's text can ignore or wake it alone.
 An entry matches a file when its glob finds that file by any path, so a symlink, a hard link or another letter case names the same file, and it also matches the rotated `.1` copy of any file its glob names, which its watcher drains, even after the file itself was renamed away.
 Which entries match a file is looked up when its lines are read: a listed file renamed, re-created or linked anew after the scan began is matched again before its lines are read, and a listed file no `[[oncall.source]]` glob finds any more is treated like a gone file, never as one under the `[oncall]` text.
@@ -163,7 +163,7 @@ So planning, the isolated worktree, checks, verify, review, the PR, automerge an
 The task prompt is `arete/prompts/oncall_repair.md`: diagnose and reproduce first, then make the smallest repair; the redacted evidence is a fenced block marked as untrusted data.
 Before a wake, Arete resolves the plan, build, verify, review and repair steps of that repo with `steps.resolve` and checks each with `routing.fit_refusal`, `routing.modes_for` and `routing.outlook`.
 A hold, a spent budget or a payment mode refusal leaves the incident `waiting` with that reason; with `payment_modes = ["subscription"]` no paid route is used, and no hold is bypassed.
-Task start and the route lookup go through `oncall.start_task` and `oncall.route_outlook`, which a harness can replace.
+Task start, the route lookup, the check run and the alerts go through `oncall.start_task`, `oncall.route_outlook`, `oncall.run_check`, `oncall.raise_alert` and `oncall.clear_alert`, which a harness can replace.
 
 | `[oncall]` key | Default | Bound |
 | --- | --- | --- |
@@ -177,6 +177,20 @@ Task start and the route lookup go through `oncall.start_task` and `oncall.route
 **No storms.** Lines a repair's run writes (run rows, `[repo task]` lines and a stalled run of its task) never open or wake an incident; each is counted in a note on the incident being repaired.
 A failure of a ticket with a live run counts as owned.
 A scan that died after the task was created adopts that task on the next scan instead of starting another.
+
+**Following a repair.** Each scan reads the newest run of the repair's task.
+A run that ended stopped, failed without a PR, rejected or with nothing to build is a failed attempt.
+An interrupted run continues on the same task and is not a new attempt; when it cannot start again or the budget is used up it is a failed attempt, and a run that dies a second time ends failed.
+
+**Recovery.** A merged repair moves the incident to `verifying`, never straight to `resolved`.
+Arete reruns the source's `check`, or re-reads the heartbeat, the stalled run or serve's beat.
+An incident with neither resolves after `cooldown_minutes` without a recurrence.
+The signature must not have recurred since the repair landed. The result is stored in `recovery`.
+A failing recheck or a recurrence is a failed attempt.
+
+**Escalation.** A run that asks, a held PR or a branch with no PR, a route policy refusal, and attempts or budget used up raise one alert through `alerts.raise_alert`, with one sanitized line of Arete's own words.
+Evidence and log text are never sent.
+The alert clears when the incident resolves or is dismissed.
 
 ```
 arete oncall             # incidents, newest first, each with its decision, repair state, then the watcher's state

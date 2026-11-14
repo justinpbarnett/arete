@@ -468,7 +468,10 @@ CREATE TABLE IF NOT EXISTS incidents (
     shapes TEXT DEFAULT '',
     policies TEXT,
     phase TEXT DEFAULT '',
-    waiting TEXT DEFAULT ''
+    waiting TEXT DEFAULT '',
+    landed TEXT DEFAULT '',
+    recovery TEXT DEFAULT '',
+    alerted INTEGER DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
 CREATE TABLE IF NOT EXISTS incident_notes (
@@ -573,7 +576,8 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                   ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
                   ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
                   ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"),
-                  ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"))]]
+                  ("phase", "TEXT DEFAULT ''"), ("waiting", "TEXT DEFAULT ''"),
+                  ("landed", "TEXT DEFAULT ''"), ("recovery", "TEXT DEFAULT ''"), ("alerted", "INTEGER DEFAULT 0"))]]
 
 
 @contextmanager
@@ -993,6 +997,11 @@ def woken_incidents() -> list[dict]:
     with db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' AND decision = 'wake' "
                                            "AND injection = 0 ORDER BY id")]
+
+
+def closed_alerted() -> list[int]:
+    with db() as c:
+        return [r[0] for r in c.execute("SELECT id FROM incidents WHERE alerted = 1 AND state != 'open' ORDER BY id")]
 
 
 def add_repair(incident_id: int, repo: str) -> int:

@@ -1722,6 +1722,7 @@ def report_fields(row: dict, facts: dict) -> dict:
             "requirements": facts.get("requirements") or [],
             "assumptions": [*(facts.get("assumptions") or []), *asks.assumed(factory.chain(row["id"]))],
             "left_for_a_person": facts.get("left_for_a_person") or "", "held": facts.get("held") or "",
+            "merge_held": facts.get("merge_held") or "",
             "review": facts.get("review") or report_review({}), "question": str(asked.get("summary") or ""),
             "steps": factory.tally(row["id"]), "minutes": run_minutes(row),
             "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": lines.wait_minutes(row["id"])}
@@ -2142,6 +2143,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
         return
     if approval and approval["sent_by"] == "triage":
         run.log("automerge left off: triage approved the ticket, so a person merges it")
+        run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
         return
     try:
         risk = jev.risk(vault.hidden(patch_from_base(opened)), about, cfg,
@@ -2153,6 +2155,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
     for c in opened:
         try:
             if hold:
+                run.facts["merge_held"] = hold
                 run.log(f"automerge left off on {c.pr}: {hold}")
                 gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
                 continue
@@ -2165,6 +2168,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
             elif did == "auto":
                 run.log(f"automerge enabled on {c.pr}")
             else:
+                run.facts["merge_held"] = why
                 run.log(f"automerge left {c.pr} for a person: {why}")
                 gh.pr_comment(c.pr, public_text(run, f"Automerge could not merge this PR: {why}. A person merges it."))
         except gh.GhError as e:

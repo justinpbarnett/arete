@@ -1627,7 +1627,17 @@ def routes(cfg, repo, setting):
                               "pi_key" if MODE == "policy" else "cli_login", "paid" if MODE == "policy" else "free",
                               "", 0, True, "", (), None, MODE, detail)]
 
-oncall.start_task, oncall.route_outlook = start, routes
+def check(command, cwd):
+    log("check", command, str(cwd))
+    ok = os.path.exists(FIXED)
+    return ok, "exit 0" if ok else "exit 1"
+
+def cleared(cfg, key):
+    log("clear", key)
+    return True
+
+oncall.start_task, oncall.route_outlook, oncall.run_check, oncall.clear_alert = start, routes, check, cleared
+oncall.raise_alert = lambda cfg, key, title, line: log("alert", key, title, line)
 """
 SCAN = "print(json.dumps(oncall.scan(config.load())))\n"
 DYING = """
@@ -1648,15 +1658,16 @@ class Repairs(Scratch):
         self.app.mkdir()
         self.log = self.app / "app.log"
         self.seam_file = Path(self.tmp.name) / "seams.jsonl"
+        self.fixed = Path(self.tmp.name) / "fixed"
         self.bounds("max_attempts = 2\ncooldown_minutes = 0\n")
 
     def bounds(self, text, extra=""):
         self.write_config(f'{DECIDING}{text}{extra}\n[[repo]]\nname = "demo"\npath = "{self.app}"\n\n'
-                          f'[[oncall.source]]\npath = "{self.app}/*.log"\nrepo = "demo"\n')
+                          f'[[oncall.source]]\npath = "{self.app}/*.log"\nrepo = "demo"\ncheck = "make check"\n')
 
     def scanned(self, mode="ready", tail=SCAN):
         code = (f"RULES = {{}}\nCALLS = {str(self.calls_file)!r}\nSEAM_LOG = {str(self.seam_file)!r}\n"
-                f"MODE = {mode!r}\n{HEAD}{SEAMS}{tail}")
+                f"FIXED = {str(self.fixed)!r}\nMODE = {mode!r}\n{HEAD}{SEAMS}{tail}")
         res = self.py(code)
         self.assertEqual(res.returncode, 0, res.stderr)
         return json.loads(res.stdout.splitlines()[-1])
@@ -1671,6 +1682,9 @@ class Repairs(Scratch):
     def end(self):
         now = self.py("from arete import util\nprint(util.iso())").stdout.strip()
         self.sql("UPDATE incident_repairs SET ended = ?, outcome = 'failed' WHERE ended = ''", now)
+
+    def finish(self, status, n=-1):
+        self.sql("UPDATE runs SET status = ? WHERE id = ?", status, self.seam("start")[n][3])
 
     def failing(self, n=1):
         self.scanned()
@@ -1751,6 +1765,7 @@ class Repairs(Scratch):
         state, phase, waiting = self.phase()
         self.assertEqual((state, phase), ("open", "waiting"))
         self.assertIn("payment_modes allows subscription", waiting)
+        self.assertEqual(len(self.seam("alert")), 1)
 
     def test_a_held_route_waits_with_the_hold_then_starts_when_it_clears(self):
         self.scanned()
@@ -1758,6 +1773,7 @@ class Repairs(Scratch):
         self.scanned(mode="held")
         self.assertEqual(self.seam("start"), [])
         self.assertIn("usage limit reached, held until cleared", self.phase()[2])
+        self.assertEqual(self.seam("alert"), [])
         self.scanned()
         self.assertEqual(len(self.seam("start")), 1)
 
@@ -1790,6 +1806,7 @@ class Repairs(Scratch):
         self.assertEqual(self.phase()[:2], ("open", "blocked"))
         self.assertIn("USD", self.phase()[2])
         self.assertEqual(len(self.seam("start")), 1)
+        self.assertEqual(len(self.seam("alert")), 1)
 
     def test_a_second_incident_waits_while_a_repair_is_running(self):
         self.failing()
@@ -1798,6 +1815,106 @@ class Repairs(Scratch):
         self.assertEqual(len(self.seam("start")), 1)
         self.assertEqual(self.phase(2)[:2], ("open", "waiting"))
         self.assertIn("already running", self.phase(2)[2])
+
+    def test_a_merged_repair_resolves_only_when_the_check_passes_and_clears_its_alert(self):
+        self.failing()
+        self.finish("pr")
+        self.scanned()
+        self.scanned()
+        self.assertIn("held for the owner", self.phase()[2])
+        self.assertEqual(len(self.seam("alert")), 1)
+        self.finish("merged")
+        self.scanned()
+        self.assertEqual(self.phase()[:2], ("open", "verifying"))
+        self.assertEqual(self.seam("check"), [])
+        self.scanned()
+        self.assertEqual(self.seam("check")[0][1], "make check")
+        self.assertEqual(self.phase()[0], "open")
+        self.assertEqual(len(self.seam("start")), 2)
+        self.fixed.write_text("")
+        self.finish("merged")
+        self.scanned()
+        self.scanned()
+        self.assertEqual(self.phase()[:2], ("resolved", ""))
+        shown = self.arete("show", "1").stdout
+        self.assertIn("recovered: check `make check` (exit 0) passed", shown)
+        self.assertIn("no recurrence since the repair landed", shown)
+        self.assertEqual(self.seam("clear"), [["clear", "oncall:incident:1"]])
+        self.assertEqual(len(self.seam("alert")), 1)
+
+    def test_repairs_that_always_fail_stop_at_max_attempts_with_one_sanitized_alert(self):
+        self.failing()
+        self.finish("stopped")
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 2)
+        self.finish("failed")
+        self.scanned()
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 2)
+        self.assertEqual(self.phase()[:2], ("open", "blocked"))
+        self.assertIn("2 of 2 attempts used", self.phase()[2])
+        (alert,) = self.seam("alert")
+        self.assertEqual(alert[1], "oncall:incident:1")
+        for text in ("payment", "db", "failed after", "4f2a9c1e"):
+            self.assertNotIn(text, alert[3])
+        shown = self.arete("show", "1").stdout
+        for text in ("ended stopped", "ended failed", "escalated once"):
+            self.assertIn(text, shown)
+
+    def test_an_interrupted_run_continues_its_task_and_one_that_cannot_restart_fails_the_attempt(self):
+        self.failing()
+        self.finish("interrupted")
+        self.scanned()
+        first, second = self.seam("start")
+        self.assertEqual((second[2], second[5]), (first[2], first[2]))
+        self.assertEqual(self.sql("SELECT COUNT(*), SUM(ended != '') FROM incident_repairs"), [(1, 0)])
+        self.finish("interrupted")
+        refusing = ("from arete import control\ndef refusing(*a, **k):\n    raise control.Refused('no run slot is free')\n"
+                    "oncall.start_task = refusing\n")
+        self.scanned(tail=refusing + SCAN)
+        self.assertEqual(self.sql("SELECT outcome FROM incident_repairs ORDER BY id LIMIT 1"), [("not restarted",)])
+        shown = self.arete("show", "1").stdout
+        self.assertIn("attempt failed: run", shown)
+        self.assertIn("would not start", shown)
+
+    def test_a_recurrence_after_the_repair_landed_is_a_failed_attempt_even_when_the_check_passes(self):
+        self.failing()
+        self.fixed.write_text("")
+        self.sql("UPDATE runs SET finished = '2020-01-01T00:00:00Z'")
+        self.finish("merged")
+        self.scanned()
+        self.scanned()
+        self.assertNotEqual(self.phase()[0], "resolved")
+        self.assertEqual(self.seam("check"), [])
+        self.assertIn("recurred after the repair landed", self.arete("show", "1").stdout)
+
+    def test_a_run_that_asks_escalates_once_and_a_dismissed_incident_clears_the_alert(self):
+        self.failing()
+        self.finish("needs-info")
+        self.scanned()
+        self.scanned()
+        self.assertIn("asked a question", self.phase()[2])
+        self.assertEqual(len(self.seam("alert")), 1)
+        self.sql("UPDATE incidents SET state = 'dismissed'")
+        self.scanned()
+        self.scanned()
+        self.assertEqual(len(self.seam("clear")), 1)
+
+    def test_heartbeat_recovery_needs_the_whole_check_key_to_pass(self):
+        code = ("import json\nfrom arete import config, oncall, paths\n"
+                "cfg = config.load()\n"
+                "row = {'class': 'heartbeat', 'source': 'heartbeat', 'landed': '2026-11-13T10:00:00Z',\n"
+                "       'evidence': 'disk:home: 3 GB free'}\n"
+                "out = []\n"
+                "for checks in ([{'key': 'disk', 'ok': True}],\n"
+                "               [{'key': 'disk', 'ok': True}, {'key': 'disk:home', 'ok': False}],\n"
+                "               [{'key': 'disk', 'ok': True}, {'key': 'disk:home', 'ok': True}]):\n"
+                "    paths.HEARTBEAT_FILE.write_text(json.dumps({'ts': '2026-11-13T11:00:00Z', 'checks': checks}))\n"
+                "    out.append(oncall.reread(cfg, oncall.Policies(cfg), row)[0])\n"
+                "print(json.dumps(out))")
+        res = self.py(code)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout.splitlines()[-1]), [False, False, True])
 
     def test_bad_repair_bounds_raise(self):
         for text in ("max_attempts = 0", "max_repairs = -1", "wakes_per_hour = 1.5", "incident_budget_usd = 0",
