@@ -1048,6 +1048,23 @@ learn = "codex:gpt-5.4-mini"
 
 `openai/gpt-5.4-mini` keeps routing to pi on keys from `pi.env`. `arete steps --repo NAME` shows the resolved runners, models, instruction defaults and codex safety notes. For one adw run, `--set implement.runner=codex --set implement.model=gpt-5.4` overrides just build.
 
+### A/B routes
+
+An `[ab.NAME]` table in the private config or a repo layer tries a cheaper route for one step on a share of live tickets:
+
+```toml
+[ab.cheap-plan]
+step = "plan"
+share = 0.5
+arm = { model = "haiku" }
+```
+
+`step` names one step, `kind` (optional) limits it to `feat` or `fix` tickets, `share` is a number above 0 and at most 0.5, and `arm` takes the step keys `tier`, `runner`, `provider`, `model` and `effort`. It applies after every other setting. An unknown key or step, a share out of range, a route the step cannot resolve, or two A/B tables on the same step and kind are refused when the config loads. A repo layer table with the same name replaces the private one.
+
+A stable hash of the A/B name, the repo and the ticket number decides whether a ticket is in the arm, so the same ticket lands on the same side across retries, repairs and restarts. Step rows and `step_end` lines carry `ab` and `ab_side` (`arm` or `baseline`). Removing a table stops new assignments; runs already started keep the route they began with.
+
+`arete ab [NAME] [--days N] [--json]` (30 days by default) reports each side's tickets, merged PRs, runs that ended without a PR, repairs, review rounds and cost per merged PR, split into api price and subscription share as `arete costs` splits them. It shows the merge rate difference with a 95% Wilson interval and says "too few tickets" under 20 tickets a side. `arete steps` shows the A/B and its share in the `ab` field of the step it changes.
+
 ### Chains and routes
 
 Each `arete steps` line also holds `chain`, `fallback` and `routes`. `chain` is the ordered list of models the step could use: the requested one first (position 0), then the other entries of its tier. A step that names a tier uses that tier. A step with a `model` or a `[models]` role looks first in the tier the step names, if that tier holds the model, then in the selected map's tiers in declaration order, and takes the first tier that holds it; duplicates are fine. A model outside every tier has a chain of itself. Models match by vendor and id, so `opus`, `claude-opus-5-5` and `anthropic/claude-opus-5-5` are one model and `openrouter/openai/gpt-5.4` is not `openai/gpt-5.4`. Each link carries the step's effort, or the nearest lower level its runner takes (its default when none is lower), and that runner's default `instructions` unless the step sets them. `fallback` is the `[routing] fallback` result, engine AND layer.

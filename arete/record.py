@@ -83,6 +83,19 @@ def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: st
                   (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
 
 
+def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
+    with state.db() as c:
+        c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",
+                  (*labels.values(), run_id, step, try_no))
+
+
+def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
+    with state.db() as c:
+        row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
+        held = {**json.loads((row["ab_held"] if row else "") or "{}"), role: [name, side, arm]}
+        c.execute("UPDATE runs SET ab_held = ? WHERE id = ?", (json.dumps(held), run_id))
+
+
 def metered_spent(run_id: str) -> float:
     return state.paid_by_run([run_id]).get(run_id, 0.0)
 
