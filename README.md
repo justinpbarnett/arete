@@ -174,6 +174,7 @@ A hold, a spent budget or a payment-mode refusal leaves the incident `waiting` w
 
 **No storms.** Lines a repair's run writes (run rows, `[repo task]` lines and a stalled run of its task) never open or wake an incident; each is counted in a note on the incident being repaired.
 A failure of a ticket with a live run counts as owned.
+A repair run that was interrupted is restarted on the same task and is not a new attempt.
 
 **Recovery.** A merged repair moves the incident to `verifying`, never straight to `resolved`.
 Arete then reruns the original check: the source's `check` command, or a built-in re-read of the heartbeat, the stalled run or serve's beat; an incident with neither is resolved after `cooldown_minutes` without a recurrence.

@@ -1745,6 +1745,69 @@ class Repairs(Scratch):
         self.assertEqual(self.phase()[0], "open")
         self.assertIn("recurred after the repair landed", self.arete("show", "1").stdout)
 
+    def test_a_recurrence_between_the_merge_and_the_scan_fails_the_attempt(self):
+        self.failing()
+        run = self.seam("start")[0][3]
+        self.fixed.write_text("")
+        self.sql("UPDATE runs SET landed = '2026-11-13T11:00:00Z' WHERE id = ?", run)
+        self.sql("UPDATE incidents SET last_seen = '2026-11-13T12:00:00Z'")
+        self.end(run, "merged")
+        self.scanned()
+        self.scanned()
+        self.assertNotEqual(self.phase()[0], "resolved")
+        self.assertIn("recurred after the repair landed", self.arete("show", "1").stdout)
+
+    def test_a_queued_repair_does_not_start_while_wakes_are_off(self):
+        self.failing()
+        self.sql("DELETE FROM runs")
+        self.arete("off")
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 1)
+        self.assertIn("wakes are off", self.phase()[2])
+        self.arete("on")
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 2)
+
+    def picked(self):
+        code = ("import json\nfrom arete import config, pipeline, tracker\n"
+                "cfg = config.load()\nrepo = cfg.repos[0]\n"
+                "pick = pipeline.next_pick(repo, tracker.for_repo(cfg, repo), pipeline.SkipLog({}), set())\n"
+                "print(json.dumps(pick))")
+        res = self.py(code)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return json.loads(res.stdout.splitlines()[-1])
+
+    def test_the_pipeline_poller_skips_a_repair_task_while_wakes_are_off(self):
+        self.failing()
+        task, run = self.seam("start")[0][2:4]
+        self.end(run, "interrupted")
+        self.assertEqual(self.picked()[0], task)
+        self.arete("off")
+        self.assertIsNone(self.picked())
+        self.arete("on")
+        self.sql("DELETE FROM runs")
+        self.assertEqual(self.picked()[0], task)
+        self.arete("off")
+        self.assertIsNone(self.picked())
+        self.arete("on")
+        self.assertEqual(self.picked()[0], task)
+
+    def test_heartbeat_recovery_needs_the_whole_check_key_to_pass(self):
+        code = ("import json\nfrom arete import config, oncall, paths\n"
+                "cfg = config.load()\n"
+                "row = {'class': 'heartbeat', 'source': 'heartbeat', 'landed': '2026-11-13T10:00:00Z',\n"
+                "       'evidence': 'disk:home: 3 GB free'}\n"
+                "out = []\n"
+                "for checks in ([{'key': 'disk', 'ok': True}],\n"
+                "               [{'key': 'disk', 'ok': True}, {'key': 'disk:home', 'ok': False}],\n"
+                "               [{'key': 'disk', 'ok': True}, {'key': 'disk:home', 'ok': True}]):\n"
+                "    paths.HEARTBEAT_FILE.write_text(json.dumps({'ts': '2026-11-13T11:00:00Z', 'checks': checks}))\n"
+                "    out.append(oncall.reread(cfg, oncall.Policies(cfg), row)[0])\n"
+                "print(json.dumps(out))")
+        res = self.py(code)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout.splitlines()[-1]), [False, False, True])
+
     def test_repairs_that_always_fail_stop_at_max_attempts_with_one_sanitized_alert(self):
         self.failing()
         self.end(self.seam("start")[0][3], "failed")
@@ -1781,6 +1844,26 @@ class Repairs(Scratch):
         self.assertEqual(self.seam("alert"), [])
         self.scanned()
         self.assertEqual(len(self.seam("start")), 1)
+
+    def test_an_interrupted_repair_run_restarts_the_same_task_and_is_no_new_attempt(self):
+        self.failing()
+        (first,) = self.seam("start")
+        task, run = first[2], first[3]
+        self.end(run, "interrupted")
+        self.arete("off")
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 1)
+        self.assertIn("was interrupted", self.phase()[2])
+        self.arete("on")
+        self.scanned()
+        starts = self.seam("start")
+        self.assertEqual(len(starts), 2)
+        self.assertEqual((starts[1][2], starts[1][5]), (task, task))
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM tasks")[0][0], 1)
+        self.assertEqual(tuple(self.sql("SELECT COUNT(*), SUM(ended != '') FROM incident_repairs")[0]), (1, 0))
+        self.assertEqual(tuple(self.phase()[:2]), ("open", "repairing"))
+        self.scanned()
+        self.assertEqual(len(self.seam("start")), 2)
 
     def test_cancel_stops_the_run_once_and_nothing_restarts_inside_the_cooldown(self):
         self.bounds("max_attempts = 2\ncooldown_minutes = 30\n")

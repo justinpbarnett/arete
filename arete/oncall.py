@@ -870,6 +870,12 @@ def switched_off() -> bool:
     return cursor_value(SWITCH)[1] == "off"
 
 
+def parked(repo: str) -> set[str]:
+    if not switched_off():
+        return set()
+    return {str(r["task"]) for r in state.incident_repairs() if r["task"] and not r["ended"] and r["repo"] == repo}
+
+
 def alert_key(incident_id: int) -> str:
     return f"oncall:incident:{incident_id}"
 
@@ -967,20 +973,22 @@ def check_words(cfg: config.Config, policies: Policies, row: dict) -> str:
 
 
 def reread(cfg: config.Config, policies: Policies, row: dict) -> tuple[bool, str] | None:
-    key = (row["evidence"].splitlines() or [""])[0].partition(":")[0]
+    head = (row["evidence"].splitlines() or [""])[0]
     if row["class"] == HEARTBEAT:
         beat = util.read_json(paths.HEARTBEAT_FILE, {})
         if not beat.get("ts") or beat["ts"] <= row["landed"]:
             return None
-        failing = any(c.get("key") == key and not c.get("ok") for c in beat.get("checks", []))
-        return not failing, f"heartbeat read of {beat['ts']}"
+        mine = [c for c in beat.get("checks", []) if c.get("key") == head.partition(": ")[0]]
+        if not mine:
+            return False, f"heartbeat read of {beat['ts']} has no result for the check"
+        return all(c.get("ok") for c in mine), f"heartbeat read of {beat['ts']}"
     if row["class"] == STALLED:
         found = state.run_get(row["source"].removeprefix("run ")) or {}
         gone = found.get("status") != "running" or not (process_gone(found) or silent(tail_of(lines.path(found["id"]))[0]))
         return gone, f"run {found.get('id', '-')} {found.get('status', 'is unknown')}"
     if row["source"] == "serve":
         beat = control.serve_beat()
-        failing = any(text.startswith(f"{key}:") for text in serve_failures(beat).values())
+        failing = any(text.partition(": ")[0] == head.partition(": ")[0] for text in serve_failures(beat).values())
         return bool(beat.get("alive")) and not failing, "serve's beat"
     if found := check_for(cfg, policies, row):
         ok, detail = run_check(*found)
@@ -1098,11 +1106,31 @@ def end_repair(repair: dict, outcome: str) -> None:
     state.set_repair(repair["id"], ended=util.iso(), outcome=outcome)
 
 
+def resume(cfg: config.Config, row: dict, repair: dict, run_id: str) -> None:
+    if switched_off():
+        hold(cfg, row, f"run {run_id} was interrupted; wakes are off")
+        return
+    try:
+        started = start_task(repair["repo"], ticket=repair["task"])
+    except (control.Refused, control.NotFound) as e:
+        end_repair(repair, "interrupted")
+        lose(cfg, row, f"run {run_id} was interrupted and would not restart: {outbound.sanitize(str(e), 160)}")
+        return
+    if started.get("run"):
+        state.add_incident_note(row["id"], f"run {run_id} was interrupted; restarted task "
+                                f"{repair['task']} as run {started['run']}")
+        moved(row, "repairing")
+    else:
+        hold(cfg, row, f"run {run_id} was interrupted; its restart is queued")
+
+
 def follow(cfg: config.Config, row: dict, repair: dict) -> None:
     from . import tasks
 
     found = state.ticket_runs(repair["repo"], repair["task"], limit=1, whole=True)
     if not found:
+        if switched_off():
+            return hold(cfg, row, "the queued repair waits; wakes are off")
         try:
             start_task(repair["repo"], ticket=repair["task"])
         except (control.Refused, control.NotFound) as e:
@@ -1127,7 +1155,9 @@ def follow(cfg: config.Config, row: dict, repair: dict) -> None:
     elif status == "merged":
         end_repair(repair, "merged")
         moved(row, "verifying", note=f"run {run['id']} merged the repair; rechecking the original failure",
-              landed=util.iso())
+              landed=run.get("landed") or run.get("finished") or util.iso())
+    elif status == "interrupted":
+        resume(cfg, row, repair, run["id"])
     else:
         end_repair(repair, status)
         lose(cfg, row, f"run {run['id']} ended {status}")

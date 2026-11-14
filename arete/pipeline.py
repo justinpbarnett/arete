@@ -3641,6 +3641,9 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
 
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset()) -> tuple[str, str] | None:
+    from . import oncall
+
+    excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded)
     for tid in state.interrupted_tickets(repo.name):
         if str(tid) not in excluded and not state.issue_running(repo.name, tid):
