@@ -30,8 +30,8 @@ MAX_SCREENSHOTS = 8
 MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_SAW_CHARS = 1200
 VERDICTS = ("pass", "fail", "blocked")
-ENVIRONMENT_FAULT = re.compile(r"Operation not permitted|Permission denied|PermissionError|EPERM|sandbox-exec|"
-                               r"exited 12[67] before", re.IGNORECASE)
+ENVIRONMENT_FAULT = re.compile(r"[Oo]peration not permitted|[Pp]ermission denied|\bPermissionError\b|\bEPERM\b|"
+                               r"\bsandbox-exec\b|exited 12[67] before")
 
 SCHEMA = {
     "type": "object",
@@ -178,7 +178,11 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
 
 
 def environment_fault(error: str) -> str:
-    return next((line.strip() for line in error.splitlines() if ENVIRONMENT_FAULT.search(line)), "")
+    lines = error.splitlines()
+    if not lines or not lines[0].startswith("the start command exited"):
+        return ""
+    found = next((line.strip() for line in lines[1:] if ENVIRONMENT_FAULT.search(line)), "")
+    return found or (lines[0].strip() if ENVIRONMENT_FAULT.search(lines[0]) else "")
 
 
 def output(log: Path) -> str:
@@ -233,7 +237,7 @@ class Verified:
             v.verdict, v.blocked_by = "blocked", "the verifier said pass but listed no checks"
         elif v.verdict == "pass" and v.failed_checks:
             v.verdict = "fail"
-        if v.verdict == "fail" and v.failed_checks and all(c.get("cause") == "environment" for c in v.failed_checks):
+        if v.verdict == "fail" and v.failed_checks and all(str(c.get("cause") or "").strip().lower() == "environment" for c in v.failed_checks):
             v.verdict = "blocked"
             v.blocked_by = v.blocked_by or util.first_line(str(v.failed_checks[0].get("what") or "")
                                                            + ": " + str(v.failed_checks[0].get("saw") or ""), 300)
@@ -269,7 +273,7 @@ class Verified:
             lines.append(f"\nBlocked by: {self.blocked_by}")
         embedded: set[str] = set()
         for c in self.checks:
-            lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed'}**: {c['what'].strip()}",
+            lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed (environment)' if str(c.get('cause') or '').strip().lower() == 'environment' else 'Failed'}**: {c['what'].strip()}",
                       f"  - How: {one_line(c['how'])}", f"  - Saw: {one_line(c['saw'])[:MAX_SAW_CHARS]}"]
             shot = Path(c.get("screenshot") or "").name
             if shot in embedded:
