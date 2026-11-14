@@ -246,7 +246,7 @@ class Server:
             self.oncall_error = text
             return
         self.oncall_error = ""
-        if found and found.get("opened"):
+        if found and (found.get("opened") or found.get("decisions")):
             self.say(f"on-call: {oncall.said(found)}")
 
     def sweeping(self) -> bool:

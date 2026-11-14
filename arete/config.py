@@ -188,12 +188,18 @@ class OncallSource:
     pattern: str = ""
     repo: str = ""
     check: str = ""
+    vision: str = ""
+    scope: str = ""
 
 
 @dataclass(frozen=True)
 class OncallConfig:
     enabled: bool = False
     sources: tuple[OncallSource, ...] = ()
+    vision: str = ""
+    scope: str = ""
+    confidence: float | None = None
+    injection: float | None = None
 
 
 @dataclass
@@ -531,7 +537,7 @@ def research_table(data) -> dict:
 
 def oncall_source(entry, repos: list[Repo]) -> OncallSource:
     table = table_of(entry, "oncall.source")
-    keys = ("path", "pattern", "repo", "check")
+    keys = ("path", "pattern", "repo", "check", "vision", "scope")
     if bad := sorted(set(table) - set(keys)):
         raise ValueError(f"[[oncall.source]]: unknown key {', '.join(bad)}; use {', '.join(keys)}")
     for key in keys:
@@ -551,15 +557,26 @@ def oncall_source(entry, repos: list[Repo]) -> OncallSource:
 
 def oncall_table(data, repos: list[Repo]) -> OncallConfig:
     table = table_of(data, "oncall")
-    if bad := sorted(set(table) - {"enabled", "source"}):
-        raise ValueError(f"[oncall]: unknown key {', '.join(bad)}; use enabled, source")
+    allowed = ("enabled", "source", "vision", "scope", "confidence", "injection")
+    if bad := sorted(set(table) - set(allowed)):
+        raise ValueError(f"[oncall]: unknown key {', '.join(bad)}; use {', '.join(allowed)}")
     enabled = table.get("enabled", False)
     if type(enabled) is not bool:
         raise ValueError(f"[oncall] enabled must be true or false, not {enabled!r}")
     entries = table.get("source", [])
     if not isinstance(entries, list):
         raise TypeError(f"[oncall] source must be a list of [[oncall.source]] tables, not {entries!r}")
-    return OncallConfig(enabled, tuple(oncall_source(entry, repos) for entry in entries))
+    for key in ("vision", "scope"):
+        if not isinstance(table.get(key, ""), str):
+            raise TypeError(f"[oncall] {key} must be a string, not {table[key]!r}")
+    for key in ("confidence", "injection"):
+        value = table.get(key)
+        if value is not None and (type(value) not in (int, float) or not 0 <= value <= 1):
+            raise ValueError(f"[oncall] {key} must be a number from 0 to 1, not {value!r}")
+    return OncallConfig(enabled, tuple(oncall_source(entry, repos) for entry in entries),
+                        table.get("vision", ""), table.get("scope", ""),
+                        None if table.get("confidence") is None else float(table["confidence"]),
+                        None if table.get("injection") is None else float(table["injection"]))
 
 
 def variable_names(value, where: str) -> tuple[str, ...]:
