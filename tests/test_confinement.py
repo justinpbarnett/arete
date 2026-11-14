@@ -438,8 +438,8 @@ class BrowserServerTests(unittest.TestCase):
         folder = scratch.browser_folder(self.a)
         served = scratch.browser_profile(self.a, 43210, folder, 45678)
         text = served[served.index("-p") + 1]
-        self.assertIn('(deny network-bind network-inbound (local tcp "*:*"))', text)
-        self.assertIn('(allow network-bind network-inbound (local tcp "localhost:45678"))', text)
+        self.assertIn('(deny network-bind network-inbound (local ip "*:*"))', text)
+        self.assertIn('(allow network-bind network-inbound (local ip "localhost:45678"))', text)
         self.assertNotIn("network-bind", " ".join(scratch.browser_profile(self.a, 43210, folder)))
         plain = self.build()
         self.assertFalse(any(w.startswith(("--port", "DEBUG=")) for w in plain))
@@ -1023,7 +1023,7 @@ class EscapeTests(unittest.TestCase):
 
     def test_the_served_browser_profile_listens_on_its_one_port_only(self):
         attempt, folder = self.browser_attempt()
-        listen, wrong = verify.free_port(), verify.free_port()
+        listen, wrong = scratch.listen_port(attempt, self.other.getsockname()[1]), verify.free_port()
         profile = scratch.browser_profile(attempt, self.other.getsockname()[1], folder, listen)
         server = subprocess.Popen([*profile, "/usr/bin/nc", "-l", "127.0.0.1", str(listen)], cwd=folder,
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1353,7 +1353,7 @@ class BrowserRunTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(browser.server_folder().stat().st_mode), 0o700)
 
     def test_the_engine_started_server_answers_over_http_and_leaves_no_process(self):
-        listen = verify.free_port(scratch.dashboard_ports() | {self.port})
+        listen = scratch.listen_port(self.a, self.port, scratch.dashboard_ports())
         scratch.update_browser(self.a, listen=listen)
         self.addCleanup(scratch.stop_served, self.a)
         built, reason = scratch.serve_browser(self.a, verify.mcp_config(self.evidence), [self.evidence])

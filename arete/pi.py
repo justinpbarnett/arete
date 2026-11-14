@@ -624,8 +624,8 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
         profile += (f'(deny network-outbound)(allow network-outbound (remote tcp "localhost:{int(tcp_port)}") '
                     '(subpath (param "UNIX")))')
     if listen_port is not None:
-        profile += ('(deny network-bind network-inbound (local tcp "*:*"))'
-                    f'(allow network-bind network-inbound (local tcp "localhost:{int(listen_port)}"))')
+        profile += ('(deny network-bind network-inbound (local ip "*:*"))'
+                    f'(allow network-bind network-inbound (local ip "localhost:{int(listen_port)}"))')
     if unix_confined:
         params += ["-D", f"UNIX={real_path(cwd)}"]
         profile += ('(deny network-outbound (subpath "/"))(allow network-outbound (subpath (param "UNIX")) '

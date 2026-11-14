@@ -133,7 +133,7 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
     listen = None
     if attempt:
         app = scratch.app_port(attempt, url)
-        listen = free_port(scratch.dashboard_ports() | {app})
+        listen = scratch.listen_port(attempt, app, scratch.dashboard_ports())
         scratch.update_browser(attempt, listen=listen)
     command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
     env = environment.commands(cfg or config.load(), repo, sets)

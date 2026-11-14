@@ -14,6 +14,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -72,6 +73,8 @@ BROWSER_HIDDEN = ("Library/Application Support/Google/Chrome", "Library/Keychain
                   ".config/fish")
 BROWSER_GRACE_SECONDS = 3
 BROWSER_PREFLIGHT_SECONDS = 30
+LISTEN_TRIES = 8
+LISTEN_PROBE_SECONDS = 5
 BROWSER_SERVE_SECONDS = 60
 BROWSER_STOP_SECONDS = 10
 CHROME_ERROR = re.compile(r"error|fatal|fail|denied|not permitted|abort", re.IGNORECASE)
@@ -486,8 +489,40 @@ def browser_profile(a: Attempt, port: int, folder: Path, listen: int | None = No
     evidence = evidence_path(a.run_dir)
     return pi.write_confinement(folder, [evidence], hidden=hidden, agent_roots=False, peers=paths.WORKTREES_DIR,
                                 secrets_denied=True, temp_writes=False,
-                                state=(paths.STATE_DIR, (evidence, folder, browser.server_folder())),
+                                state=(paths.STATE_DIR, (evidence, folder, browser.server_folder(), browser_log(a))),
                                 mach=(BROWSER_MACH, BROWSER_MACH_PATTERN), tcp_port=port, listen_port=listen)
+
+
+def listen_port(a: Attempt, app: int, avoid: frozenset[int] = frozenset()) -> int:
+    from . import pi, verify
+
+    avoid, port = avoid | {app}, 0
+    for _ in range(LISTEN_TRIES if pi.can_confine(False) else 1):
+        port = verify.free_port(avoid)
+        with suppress(OSError, ConfinementUnavailable):
+            folder = browser_folder(a)
+            if listens([*browser_profile(a, app, folder, port), "/usr/bin/nc", "-l", "127.0.0.1", str(port)], port,
+                       folder):
+                return port
+    return port
+
+
+def listens(argv: list[str], port: int, folder: Path) -> bool:
+    proc = subprocess.Popen(argv, cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        deadline = time.monotonic() + LISTEN_PROBE_SECONDS
+        while proc.poll() is None and time.monotonic() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", port), .5).close()
+                return True
+            except OSError:
+                time.sleep(.1)
+        return False
+    finally:
+        with suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
 def temp_grants() -> tuple[Path, ...]:
@@ -902,7 +937,8 @@ def start_served(a: Attempt, words: list[str]) -> Served:
             raise ConfinementUnavailable("no browser port is recorded for the confined browser")
         browser_exposure(a)
         browser.resolved()
-        argv = browser_command(a, [*words, "--host", "127.0.0.1", "--port", str(listen)], listen)[5:]
+        served = [*words, "--host", "127.0.0.1", "--port", str(listen), "--allowed-hosts", f"127.0.0.1:{listen}"]
+        argv = browser_command(a, served, listen)[5:]
         folder, log = browser_folder(a), browser_log(a)
         reason = browser_preflight(a, record["port"], listen, folder, log)
         if not reason:
