@@ -595,7 +595,7 @@ Every agent step of an adw run has the `ask_owner` tool (claude and codex throug
 
 `[factory] path` in a layer is `classic` (the default) or `adw`; any other value fails the layer's load. The switch works on every repo. A repo with a `github` name gets its PRs, CI watch, ticket comment and merge as a classic run does. A repo with no `github` name needs a git remote `origin`, or `arete run` refuses it as before, and gets a pushed branch.
 
-A run with open review feedback takes the revise flow (`adws/revise.py`); any other run takes the feature flow (`adws/feature.py`). The flows run these seam steps, each with the pipeline's own helpers and the agent call names of the classic run (`plan`, `build`, `revise`, `fix2`, `review_fix`, `ci_fix`, `verify`, `verify2`, `review`, `review2`, `learn`):
+A run with open review feedback takes the revise flow (`adws/revise.py`); any other run takes the feature flow (`adws/feature.py`). The flows run these seam steps, each with the pipeline's own helpers and the agent call names of the classic run (`plan`, `build`, `revise`, `fix2`, `review_fix`, `ci_fix`, `verify`, `verify2`, `review`, `review2`, `learn`, `learn2`):
 
 | step | does |
 |---|---|
@@ -607,7 +607,7 @@ A run with open review feedback takes the revise flow (`adws/revise.py`); any ot
 | `checks` | Runs the layer's checks. A fail goes back to `implement` until the `check_repair` step's `tries` (build's, unless set) run out; then learn runs without applying and the run fails. |
 | `verify` | Checks the change in use, with its own rounds as in a classic run. |
 | `review` | Reviews. Only a blocker (`issue`, `regression`, `security` or `data_loss`, with the path a real caller takes) requests changes; majors and minors go on the PR under "Review notes (not blocking)". Later reviews get the earlier blockers, the fixer's reply and what changed since, check those and regressions first, and mark each earlier blocker fixed, open or waived (never waived for security or data loss; a missing status counts as open). `request_changes` goes back to `implement`, then `checks`, `verify` and `review` again, until the review step's `tries` reviews are used (`review`, `review2`, ...). The last review that still requests changes ends `fail`, and the run still publishes a held draft whose report keeps `review.unresolved` and `held`. |
-| `learn` | Rewrites `expertise.md` as a classic run does. |
+| `learn` | Rewrites `expertise.md` as a classic run does. Its outcome holds `applied` and `commit`. |
 | `document` | Only with `[document] enabled`: writes the PR `## Summary` text with a fresh writer (see [Document](#document)). Its outcome holds `text`, empty when the writer's text was refused. |
 | `pr` | Commits the staged change with `git.subject` and the ticket ref and pushes it. With a `github` name it opens each PR, or pushes to the open one, with the classic body, sibling section, labels and draft rule; its outcome holds the PR links. A ready PR the run pushed to, checked again with nothing new to push, or found open on its branch when the prepare outcome named no PR, turns into a draft when the run is held. A found PR gets the new report as its body and keeps a CI section that says an earlier CI watch stopped. Without a `github` name it notes the branch on the run. |
 | `ci` | With a `github` name, watches CI in rounds. A red check this change caused runs `implement` with the red output, then the push and the watch again. |
@@ -870,6 +870,8 @@ path = "classic"
 A template with an unknown field falls back to the default. A layer may also hold `[steps]`, `[kinds]`, `[tiers]` and `[routing]`, which set its steps apart from the engine's; see [Steps](#steps). A layer in `.agents/` that is not committed yet still works: runs read it from the main checkout and lessons land there, but arete never proposes automerge until it is committed. A layer outside the repo is read in place, lessons land in its `expertise.md`, and the miner leaves the repo's `.agents/` alone. Arete never proposes automerge for it: raise `trust.level` by hand.
 
 After a run that had something to learn from (a failed check, a fix, a failed check in use, or PR feedback), the learn step rewrites `expertise.md` whole, in at most 80 lines. It checks each lesson against the code in the worktree and drops a lesson the code now contradicts, with the reason in the run's report. A rewrite over the cap is not applied. A layer outside the repo is made a git repo, and arete commits each rewrite there, so its log shows what was learned and from which run. A clean run learns nothing.
+
+Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
 
 ## Steps
 
