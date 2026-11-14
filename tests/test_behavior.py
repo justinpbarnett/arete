@@ -812,12 +812,13 @@ def drive(ref, run_id, cfg):
 cfg = config.load()
 out = {}
 seed("A")
-put("research-A-synthesis", good(conclusions=[{"claim": "Bad", "sources": ["S9"], "critical": True}]))
+put("research-A-synthesis", good(answer="The limit is 10 [S1]; see [the note](\f//outside.example/).",
+                                 conclusions=[{"claim": "Bad", "sources": ["S9"], "critical": True}]))
 put("research-A-synthesis2", good(contradictions=[{"issue": "Limit differs", "sources": ["S1", "S2"]}],
                                   searches=[ask("resolve")]))
 put("research-A-task-4-search", found(source("https://example.org/a/?utm_source=x", "limit is 10 again"),
                                       source("https://example.org/d", "limit is 15")))
-put("research-A-gap-1-synthesis", good(answer="Resolved [S4]. Mislinked [S1](https://example.net/b).", conclusions=[
+put("research-A-gap-1-synthesis", good(answer="Resolved [S4]. Cited [S1].", conclusions=[
     {"claim": "Found", "sources": ["S3", "S4"], "critical": True}],
     contradictions=[{"issue": "Limit differs", "sources": ["S1", "S2"]}]))
 out["a"] = drive("A", "run-a", cfg)
@@ -882,8 +883,9 @@ print("RESULT" + json.dumps(out))
         self.assertEqual(heads, sorted(heads))
         self.assertEqual(self.names("a").count("research A synthesis"), 2)
         self.assertNotIn("S9", report)
-        self.assertNotIn("[S1](https://example.net/b)", report)
-        self.assertIn("Mislinked [S1](https://example.org/a)", report)
+        self.assertNotIn("outside.example", report)
+        self.assertIn("Cited [S1](https://example.org/a)", report)
+        self.assertIn("answer holds '[', ']', '\\x0c'", a["evidence"]["synthesis"]["rounds"][0]["refused"][0])
         contradictions = report[heads[2]:heads[3]]
         self.assertIn("[S1](https://example.org/a)", contradictions)
         self.assertIn("[S2](https://example.net/b)", contradictions)
@@ -924,100 +926,89 @@ print("RESULT" + json.dumps(out))
         self.assertFalse([n for n in self.names("d") if "synthesis" in n])
         self.assertNotIn("synthesis", d["evidence"])
 
-    def test_links_are_checked_whatever_the_scheme_case(self):
+    def setUp(self):
+        self.known = {"S1": "https://example.org/a", "S2": "https://example.net/b"}
+
+    @staticmethod
+    def synthesis(field="answer", text="The limit is 10 [S1]."):
+        answer = {"summary": "Short.", "name": "", "answer": "The limit is 10 [S1].",
+                  "conclusions": [{"claim": "Documented", "sources": ["S1"], "critical": True}],
+                  "inferences": [{"claim": "Likely", "basis": "Stated", "sources": ["S1"], "critical": False}],
+                  "contradictions": [{"issue": "Limit differs", "sources": ["S1", "S2"]}],
+                  "gaps": [{"question": "Which limit applies?", "why": "Unstated"}],
+                  "searches": [{"goal": "Find the limit", "queries": ["limit terms"], "max_sources": 2}]}
+        for item in (answer, *(entry for key in ("conclusions", "inferences", "contradictions", "gaps", "searches")
+                               for entry in answer[key])):
+            if field in item:
+                item[field] = text
+        return answer
+
+    @staticmethod
+    def evidence(*urls, title="Vendor"):
+        return {"sources": [{"id": f"S{n}", "url": url, "title": title, "published": "2025-01-02", "event_date": ""}
+                            for n, url in enumerate(urls, 1)]}
+
+    def test_model_text_holding_link_syntax_is_refused_in_every_field(self):
         from arete import research_synthesis as rs
-        known = {"S1": "https://example.org/a"}
-        answer = {"summary": "s", "name": "", "answer": "See [x](HTTPS://outside.example/y) and [S1](HTTPS://EXAMPLE.org/a).",
-                  "conclusions": [{"claim": "c", "sources": ["S1"], "critical": True}], "inferences": [],
-                  "contradictions": [], "gaps": [], "searches": []}
-        found = rs.faults(answer, known, set())
-        self.assertEqual(len(found), 1)
-        self.assertIn("outside.example", found[0])
+        far = "//outside.example/"
+        self.assertEqual(rs.faults(self.synthesis(), self.known), [])
+        for text in (f"See [the note](\f{far}).", f"See [the note](\v{far}).", f"See ![x](\f{far}p.png).",
+                     "See \fhttp:outside.example/ now.", f"Notes:\n\n- [ ] [r]: {far}",
+                     "Notes:\n\n- [x] [r]: http:outside.example/", f"See [x][r].\n\n> [r]: {far}",
+                     f"See [S1][r].\n\n[r]: {far}", "See \\[S1] now.", "See [S3].", "See <b>x</b>.", "Q&A here.",
+                     "Mail admin@outside.example.", "See www.outside.example now.", "See https://outside.example/.",
+                     "Write mailto:admin now.", "Write XMPP:admin now.", "Line\rbreak.", "Null\x00here."):
+            for field in ("answer", "claim", "basis", "issue", "question", "why", "goal"):
+                found = rs.faults(self.synthesis(field, text), self.known)
+                self.assertTrue(found, (field, text))
+        found = rs.faults(self.synthesis("answer", f"See [the note](\f{far})."), self.known)
+        self.assertEqual(found, ["answer holds '[', ']', '\\x0c'; " + rs.PLAIN])
 
-    def test_links_are_checked_whole_as_the_report_renders_them(self):
+    def test_summary_cites_no_source_because_it_is_written_raw(self):
         from arete import research_synthesis as rs
-        known = {"S1": "https://example.org/", "S2": "https://en.wikipedia.org/wiki/Mercury_(planet)",
-                 "S3": "https://example.com/what's-new"}
+        self.assertTrue(rs.faults(self.synthesis("summary", "Limit 10 [S1]."), self.known))
+        self.assertTrue(rs.faults(self.synthesis("summary", "See [S1]( //outside.example/)."), self.known))
+        self.assertEqual(rs.faults(self.synthesis("summary", "Limit 10, per the vendor."), self.known), [])
 
-        def faults(text):
-            answer = {"summary": "s", "name": "", "answer": text,
-                      "conclusions": [{"claim": "c", "sources": ["S1"], "critical": True}], "inferences": [],
-                      "contradictions": [], "gaps": [], "searches": []}
-            return rs.faults(answer, known, set())
-
-        for text in ("See <https://example.org)@outside.example/>.", "See https://example.org)@outside.example/ now.",
-                     "See [it](https://example.org\\)@outside.example/).",
-                     "See [it](https://example.org&#64;outside.example/).",
-                     "See [https://example.org/](https://outside.example/).", "See [it](//outside.example/)."):
-            found = faults(text)
-            self.assertTrue(found, text)
-            self.assertIn("outside.example", " ".join(found), text)
-        self.assertEqual(faults("See https://en.wikipedia.org/wiki/Mercury_(planet), "
-                                "[it](https://en.wikipedia.org/wiki/Mercury_(planet)) and "
-                                "(https://en.wikipedia.org/wiki/Mercury_(planet))."), [])
-        self.assertEqual(faults("See https://example.com/what's-new, [it](https://example.com/what's-new) and "
-                                "'https://example.org/'."), [])
-        self.assertEqual(faults("See <https://example.org/> and [https://example.org/](https://example.org/)."), [])
-        self.assertEqual(rs.ticket_links("Read https://u@outside.example/ and "
-                                         "https://en.wikipedia.org/wiki/Mercury_(planet)."),
-                         {("https", "en.wikipedia.org", 443, "/wiki/Mercury_(planet)", "")})
-
-    def test_cited_link_with_parentheses_renders_whole(self):
+    def test_cites_in_lists_quotes_and_plain_punctuation_pass_and_render_inline(self):
         from arete import research_synthesis as rs
-        urls = {"S2": "https://en.wikipedia.org/wiki/Mercury_(planet)"}
-        self.assertEqual(rs.link_ids("See [S2](https://en.wikipedia.org/wiki/Mercury_(planet)).", urls),
-                         "See [S2](https://en.wikipedia.org/wiki/Mercury_(planet)).")
-
-    def test_links_in_containers_line_ends_attributes_and_emails_are_refused(self):
-        from arete import research_synthesis as rs
-        known, far = {"S1": "https://example.org"}, "//outside.example/"
-
-        def faults(text, gaps=(), links=frozenset()):
-            answer = {"summary": "s", "name": "", "answer": text,
-                      "conclusions": [{"claim": "c", "sources": ["S1"], "critical": True}], "inferences": [],
-                      "contradictions": [], "gaps": [{"question": q, "why": w} for q, w in gaps], "searches": []}
-            return rs.faults(answer, known, set(links))
-
-        for text in (f"See [x][r].\n\n> [r]: {far}", f"See [x][r].\n\n> [r]: https\\:{far}",
-                     f"See [x][r].\n\n- [r]: https&#58;{far}", f"See [x][r].\n\n* [r]: {far}",
-                     f"See [x][r].\n\n1. a\n\n    [r]: https\\:{far}", f"See [r].\n\n> [r]: https\\:{far}",
-                     f"See [S1][r].\n\n> [r]: {far}", f"See [x][r].\r\r[r]: https\\:{far}",
-                     f"[r]:\r{far}\r\rSee [x][r].", f"See [x][r].\n\n> [r]: {far} \"t\"",
-                     f"See [x](\rhttps\\:{far}).", f"See [x](\r\n{far}).",
-                     f"See <a title='href=\"https://example.org/#' href=\"https&#58;{far}\">x</a>.",
-                     f"<img alt='src=\"https://example.org/#' src=\"{far}p.png\">",
-                     "<div>\n<a href=https&#58;//example.org'@outside.example/>x</a>\n</div>",
-                     "<div>\n<a href=https&#58;//example.org=@outside.example/>x</a>\n</div>",
-                     "<div>\n<a href=https&#58;//example.org`@outside.example/>x</a>\n</div>",
-                     "<p>\n<a href=ht&#9;tps://example.org'@outside.example/>x</a>\n</p>",
-                     "Write to <admin@outside.example>.", "Write to sales@outside.example today.",
-                     "Write to mailto:admin@outside.example today.", "See \\[S1](https://outside.example/) now."):
-            self.assertIn("outside.example", " ".join(faults(text)), repr(text))
-        for why in (far, f"https\\:{far}"):
-            self.assertIn("outside.example", " ".join(faults("See [x][r].", [("[r]", why)])), why)
-        self.assertEqual(faults("See [S1]'s note, ([S1]) and [S1].", [("Which limit applies?", "[S1] is dated")]), [])
-        self.assertEqual(faults("Write to admin@vendor.example.", links=rs.ticket_links("Mail admin@vendor.example.")),
-                         [])
-
-    def test_escaped_cites_and_source_details_render_as_plain_text(self):
-        from arete import research_synthesis as rs
-        evidence = {"sources": [
-            {"id": "S1", "url": "https://example.org/a) [docs](https://outside.example",
-             "title": "Vendor [docs](https://outside.example/)", "published": "", "event_date": ""},
-            {"id": "S2", "url": "https://example.org", "title": "Q&A: <b>R&D</b> *notes*", "published": "2025-01-02",
-             "event_date": ""}]}
-        answer = {"summary": "s", "name": "", "answer": "Limit 10 [S1]; see \\[S2]@outside.example now.",
-                  "conclusions": [{"claim": "c", "sources": ["S1", "S2"], "critical": True}], "inferences": [],
-                  "contradictions": [], "gaps": [], "searches": []}
-        self.assertEqual(rs.faults(answer, {s["id"]: s["url"] for s in evidence["sources"]}, set()), [])
-        report, used = rs.assemble(answer, evidence, [])
+        text = ("Key points:\n\n- [S1]: the limit is 10\n- [S2]: the limit is 12\n\n> [S1]: dated 2025\n\n"
+                "See [S1]'s note, ([S1]), [S1](//outside.example/) and ![S2] at UTC+2:00 with **Note:** the `timeout:` "
+                "key, std::vector, 50%.")
+        answer = self.synthesis("answer", text)
+        self.assertEqual(rs.faults(answer, self.known), [])
+        report, used = rs.assemble(answer, self.evidence(*self.known.values()), [])
         self.assertEqual(used, ["S1", "S2"])
-        self.assertIn("Limit 10 [S1](https://example.org/a%29%20[docs]%28https://outside.example); "
-                      "see \\[S2]@outside.example now.", report)
-        self.assertIn("- [S1](https://example.org/a%29%20[docs]%28https://outside.example) "
-                      "`Vendor [docs](https://outside.example/)`; published not stated", report)
-        self.assertIn("- [S2](https://example.org) Q&#38;A\\: &#60;b&#62;R&#38;D&#60;\\/b&#62; \\*notes\\*; "
-                      "published 2025-01-02", report)
+        self.assertIn("- [S1](https://example.org/a): the limit is 10\n- [S2](https://example.net/b): the limit is 12"
+                      "\n\n> [S1](https://example.org/a): dated 2025", report)
+        self.assertIn("See [S1](https://example.org/a)'s note, ([S1](https://example.org/a)), "
+                      "[S1](https://example.org/a)(//outside.example/) and \\![S2](https://example.net/b) at", report)
+        self.assertNotRegex(report, r"(?m)^[\s>*+-]*(\[[ xX]\]\s*)?\[S\d+\]:")
+
+    def test_source_urls_are_rebuilt_percent_encoded_without_user_details(self):
+        from arete import research_synthesis as rs
+        evidence = self.evidence("https://user:pw@example.org/a|[x](//outside.example/)?q=1&r=2#f",
+                                 "https://en.wikipedia.org/wiki/Mercury_(planet)")
+        answer = self.synthesis("answer", "| Source | Limit |\n| --- | --- |\n| [S1] | 10 |\n| [S2] | 12 |")
+        report, _ = rs.assemble(answer, evidence, [])
+        self.assertIn("| [S1](https://example.org/a%7C%5Bx%5D%28//outside.example/%29?q=1\\&r=2#f) | 10 |\n"
+                      "| [S2](https://en.wikipedia.org/wiki/Mercury%5F%28planet%29) | 12 |", report)
+        self.assertNotIn("user", report)
+        self.assertEqual(rs.written("https://example.org/a b\"'<>\\`*_\x01|()[]~"),
+                         "https://example.org/a%20b%22%27%3C%3E%5C%60%2A%5F%01%7C%28%29%5B%5D~")
+
+    def test_source_titles_are_escaped_or_written_as_code(self):
+        from arete import research_synthesis as rs
+        self.assertEqual(rs.inert_text("Q&A: <b>R&D</b> *notes* | [x]"),
+                         "Q\\&A\\: \\<b\\>R\\&D\\<\\/b\\> \\*notes\\* \\| \\[x\\]")
+        self.assertEqual(rs.inert_text("Vendor [docs](https://outside.example/)"),
+                         "`Vendor [docs](https://outside.example/)`")
+        for title in ("Mail admin@outside.example", "See WWW.outside.example", "Write mailto:x", "Ask xmpp:x"):
+            self.assertEqual(rs.inert_text(title), f"`{title}`")
+        self.assertEqual(rs.inert_text("`a` www.x"), "`` `a` www.x ``")
+        self.assertEqual(rs.inert_text("a\fb\x00 c\n"), "a b c")
+        report, _ = rs.assemble(self.synthesis(), self.evidence("https://example.org/a", title="Q&A [x]"), [])
+        self.assertIn("- [S1](https://example.org/a) Q\\&A \\[x\\]; published 2025-01-02", report)
 
     def test_research_subprocess_keeps_gh_state_out_of_the_worktree(self):
         self.assertEqual(self.out["home"], self.home)

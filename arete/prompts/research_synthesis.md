@@ -55,7 +55,7 @@ $filing
 
 Return these fields:
 
-- `summary`: two sentences at most: the answer, and how sure you are.
+- `summary`: two sentences at most: the answer, and how sure you are. Cite no source id here.
 - `name`: $file_name
 - `answer`: the lead of the report, under 600 words. $shape Arete adds the sections for conclusions, inference,
   contradictions, gaps and sources after it, so do not write them.
@@ -70,7 +70,10 @@ Return these fields:
 
 Rules:
 
-- Cite only the ids in the evidence, written `[S1]`. Do not invent an id and write no other outside link.
+- Cite only the ids in the evidence, written `[S1]`; Arete turns each into its link. Do not invent an id.
+- Write plain text in every field: apart from `[S1]` citations, no link, address, HTML, entity or escape. That
+  means no `[` or `]`, `<`, `&`, backslash, `@`, `://`, `www.` or scheme such as `mailto:`, and no control
+  character other than newline and tab. Write "and" for `&`. Arete refuses a field that holds one.
 - Keep what a source states apart from your inference.
 - Use only the dates the evidence states. An empty date is not stated; do not fill it in.
 - Put conflicting sources under `contradictions` with both ids, unresolved.
