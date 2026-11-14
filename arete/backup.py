@@ -184,12 +184,12 @@ def layers_bundle() -> bytes | None:
         return None
     if layers.is_symlink() or (layers / ".git").is_symlink() or not (layers / ".git").is_dir():
         raise RuntimeError("layers is linked or has no plain .git folder, so it is not bundled")
-    listed = subprocess.run(["git", "rev-list", "--objects", "--all"], check=False, cwd=layers, capture_output=True,
-                            timeout=300)
+    listed = subprocess.run(["git", "log", "--all", "-m", "--no-renames", "--name-only", "--format=", "-z"],
+                            check=False, cwd=layers, capture_output=True, timeout=300)
     if listed.returncode != 0:
         raise RuntimeError(f"listing layers history failed ({listed.returncode})")
-    for line in listed.stdout.decode(errors="replace").splitlines():
-        path = line.partition(" ")[2]
+    for path in listed.stdout.decode(errors="replace").split("\0"):
+        path = path.strip("\n")
         if path and any(forbidden_name(part) for part in path.split("/")):
             raise RuntimeError(f"layers history holds {path}, which never leaves the machine; the bundle was not made")
     res =subprocess.run(["git", "bundle", "create", "-", "--all"], check=False, cwd=layers, capture_output=True, timeout=300)
