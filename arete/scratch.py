@@ -484,8 +484,8 @@ def browser_profile(a: Attempt, port: int, folder: Path) -> list[str]:
 
 def temp_grants() -> tuple[Path, ...]:
     temp = os.getenv("TMPDIR", "/tmp")
-    if not os.path.isabs(temp):
-        raise ConfinementUnavailable(f"TMPDIR {temp!r} is not an absolute path")
+    if not os.path.isabs(temp) or ".." in Path(temp).parts:
+        raise ConfinementUnavailable(f"TMPDIR {temp!r} is not an absolute path free of '..'")
     return (Path("/tmp").resolve(), Path("/private/tmp"), Path(temp).resolve())
 
 

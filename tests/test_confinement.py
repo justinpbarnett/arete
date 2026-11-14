@@ -465,6 +465,19 @@ class BrowserServerTests(unittest.TestCase):
                 with self.assertRaisesRegex(scratch.ConfinementUnavailable, "TMPDIR"):
                     scratch.browser_exposure(self.a)
 
+    def test_a_tmpdir_that_climbs_back_through_a_link_is_refused(self):
+        self.assertTrue(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
+        scratch.browser_exposure(self.a, self.node)
+        (self.root / "away" / "deeper").mkdir(parents=True)
+        (self.root / "link").symlink_to(self.root / "away" / "deeper")
+        for temp in (str(self.root / "link" / ".."), "/var/../opt", "/tmp/../usr/local", "/var/folders/../../Users"):
+            with self.subTest(temp), mock.patch.dict(os.environ, {"TMPDIR": temp}):
+                self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
+                with self.assertRaisesRegex(scratch.ConfinementUnavailable, "TMPDIR .* free of '..'"):
+                    scratch.browser_exposure(self.a, self.node)
+                with self.assertRaisesRegex(scratch.ConfinementUnavailable, "TMPDIR"):
+                    scratch.actor_grants(self.a)
+
     def test_an_odd_spelling_or_a_removed_cwd_never_escapes_as_a_raw_error(self):
         nowhere = (Path("/private/var/empty"),)
         spelled = Path("/.resolve/1" + str(self.ws))
