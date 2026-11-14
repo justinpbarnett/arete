@@ -55,16 +55,17 @@ def declared_accept(data: dict) -> None:
         raise experiment.Refused(f"accept.split: a benchmark decides on {DECIDES}")
 
 
-def reviewer(exp: experiment.Experiment) -> dict:
+def reviewer(exp: experiment.Experiment) -> tuple[dict, list[str]]:
     try:
         s = steps.resolve(exp.cfg, exp.layer, "review", "")
     except ValueError as e:
         raise experiment.Refused(f"the reviewer: {e}") from e
+    routes = experiment.codex_route("the reviewer", s, exp.limits)
     which = runner.chosen(s.model, s.runner, exp.cfg)[0]
-    if why := runner.CANNOT_STOP.get(which) or runner.CANNOT_GATE.get(which):
+    if why := runner.CANNOT_GATE.get(which):
         raise experiment.Refused(f"the reviewer: {why}")
     return {"runner": s.runner, "model": s.model, "effort": s.effort, "settings": experiment.effective(exp.cfg, s),
-            "prompt": experiment.sha((paths.PROMPTS_DIR / "review.md").read_bytes())}
+            "prompt": experiment.sha((paths.PROMPTS_DIR / "review.md").read_bytes())}, routes
 
 
 def content_of(title: str, prompt: str, verify: str, base: str, source: str) -> tuple:
@@ -120,10 +121,10 @@ def load(path: Path) -> Bench:
         if not any(exp.splits[t] == DECIDES for t, g in groups.items() if g == group):
             raise experiment.Refused(f"the {group} group has no {DECIDES} task")
     references = resolved_references(exp, references)
-    held = reviewer(exp) if reviews else None
+    held, routes = reviewer(exp) if reviews else (None, [])
     design = {**exp.design, "benchmark": {"groups": groups, "references": references, "review": held}}
     return Bench(replace(exp, design=design, digest=experiment.sha_json(design)[:12], reviews=reviews,
-                         checks_required=True), groups, references)
+                         checks_required=True, codex=[*exp.codex, *routes]), groups, references)
 
 
 @dataclass
@@ -246,8 +247,8 @@ def prove(bench: Bench, path: Path, clock: Clock) -> None:
         raise experiment.Refused("\n".join(failures))
 
 
-def unusable(candidates: list, atom: str) -> list:
-    return [c for c in candidates if not (c.state == "ready" and c.runner not in runner.CANNOT_STOP
+def unusable(candidates: list, atom: str, codex: bool) -> list:
+    return [c for c in candidates if not (c.state == "ready" and (c.runner not in runner.CANNOT_STOP or codex)
                                           and not (atom == "plan" and c.runner in runner.CANNOT_GATE))]
 
 
@@ -262,7 +263,7 @@ def unavailable(exp: experiment.Experiment) -> dict[str, str]:
             continue
         kw = {**s.agent_kw(exp.cfg), **({} if exp.atom == "plan" else {"disallowed_tools": runner.NO_GIT_WRITES})}
         found = discovery.routes(runner.request_for(exp.cfg, exp.repo, which, name, s, True, kw, 0, exp.layer))
-        if len(unusable(found, exp.atom)) == len(found):
+        if len(unusable(found, exp.atom, experiment.HEADROOM in exp.limits)) == len(found):
             missing[arm] = "; ".join(f"{c.runner} ({c.credential}) {c.state}: {c.detail}" for c in found) or "no route"
     return missing
 
