@@ -322,6 +322,9 @@ def cmd_oncall(args) -> int:
             return 0
         print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
               f"{found['first_seen']} to {found['last_seen']}")
+        print(f"decision: {oncall.decision_line(found)}")
+        for name, a in found["answers"].items():
+            print(f"  {name}: {'yes' if a['value'] else 'no'}, confidence {a['confidence']:.2f}")
         print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
         for note in found["notes"]:
             print(f"{note['ts']}  {note['note']}")
@@ -334,6 +337,7 @@ def cmd_oncall(args) -> int:
     for r in rows:
         print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
               f"x{r['count']:<4} {r['signature']}")
+        print(f"      {oncall.decision_line(r)}")
     now = oncall.status(cfg)
     if not now["enabled"]:
         print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
