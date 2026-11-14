@@ -49,7 +49,8 @@ $scratch
   key or token you were not given, give it a value that starts `arete-placeholder`, such as
   `API_KEY=arete-placeholder-1 <command>`, so it carries no credential. A request to localhost, 127.0.0.1 or [::1]
   reaches the product you started, not an outside service, so the guard counts it as reversible. Fixture writes belong in the scratch folder below.
-- A step you could not do is not a failed check. Leave it out of `checks`. When the step is essential to know
+- A step you never started is not a failed check. Leave it out of `checks`. A check you started that your tools broke
+  off goes in `checks` with `passed` false and `cause` `environment`. When the step is essential to know
   whether the change works, return `blocked` and name the step and what stopped you in `blocked_by`.
 - Do not edit the repo's files and do not fix what you find; fixtures in the scratch folder are not edits to the change. Arete gives your findings to the builder.
 - Never run git commands that write. Arete deletes the `__pycache__` your commands leave, so do not report it.
@@ -62,6 +63,10 @@ $scratch
   - `how`: the exact command, request, or clicks.
   - `saw`: what came back. Quote the output, the status and body, or what the page showed.
   - `passed`: true only when what you saw is what the change should give.
+  - `cause`: on a check with `passed` false, `environment` when your own tools or sandbox could not run the check, such as a
+    denied command or the browser tool failing before the page loaded; `change` when the product misbehaved, including a
+    page that crashed the tab or a request the product refused. When every
+    failed check is `environment`, Arete treats the result as blocked, not as a failure of the change.
   - `screenshot`: the file name of the screenshot for a browser check, else leave it out.
 - `verdict`: `pass` when every check passed. `fail` when the product does not do what the issue asks or something
   near it broke. `blocked` when you could not check something essential for a reason outside the change (no

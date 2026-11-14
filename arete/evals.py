@@ -335,7 +335,8 @@ def review(run: EvalRun, wt: Path, task: Task, plan: str, report: str, evidence:
            timeout: float) -> int:
     res = run.agent("review", prompt("review", repo=run.repo.name, workspace=workspace, ref=task.name,
                                      title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
-                                     checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT)),
+                                     checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT),
+                                     earlier=""),
                     wt, role="review", allowed_tools=bash_rules(config.DEFAULT_ALLOW_BASH),
                     json_schema=REVIEW_SCHEMA, timeout=timeout)
     if not res.ok or not isinstance(res.structured, dict):

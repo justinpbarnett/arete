@@ -30,6 +30,7 @@ MAX_SCREENSHOTS = 8
 MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_SAW_CHARS = 1200
 VERDICTS = ("pass", "fail", "blocked")
+ENVIRONMENT_FAULT = re.compile(r"[Oo]peration not permitted|\bEPERM\b|\[Errno 1\]|\bsandbox-exec\b")
 
 SCHEMA = {
     "type": "object",
@@ -43,6 +44,7 @@ SCHEMA = {
                 "how": {"type": "string"},
                 "saw": {"type": "string"},
                 "passed": {"type": "boolean"},
+                "cause": {"type": "string", "enum": ["change", "environment"]},
                 "screenshot": {"type": "string"},
             },
             "required": ["what", "how", "saw", "passed"],
@@ -177,6 +179,14 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
     raise ServerError(f"{url} did not answer within {seconds} seconds{output(log)}")
 
 
+def environment_fault(error: str) -> str:
+    lines = error.splitlines()
+    if not lines or not lines[0].startswith("the start command exited"):
+        return ""
+    found = next((m for line in lines[1:] if (m := ENVIRONMENT_FAULT.search(line))), None)
+    return found.group(0) if found else ""
+
+
 def output(log: Path) -> str:
     text = util.tail(log.read_text(errors="replace").strip(), 3000)
     return f"\n\n```\n{text}\n```" if text else "; the start command printed nothing"
@@ -229,6 +239,10 @@ class Verified:
             v.verdict, v.blocked_by = "blocked", "the verifier said pass but listed no checks"
         elif v.verdict == "pass" and v.failed_checks:
             v.verdict = "fail"
+        if v.verdict == "fail" and v.failed_checks and all(str(c.get("cause") or "").strip().lower() == "environment" for c in v.failed_checks):
+            v.verdict = "blocked"
+            v.blocked_by = v.blocked_by or util.first_line(str(v.failed_checks[0].get("what") or "")
+                                                           + ": " + str(v.failed_checks[0].get("saw") or ""), 300)
         return v
 
     @classmethod
@@ -261,7 +275,7 @@ class Verified:
             lines.append(f"\nBlocked by: {self.blocked_by}")
         embedded: set[str] = set()
         for c in self.checks:
-            lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed'}**: {c['what'].strip()}",
+            lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed (environment)' if str(c.get('cause') or '').strip().lower() == 'environment' else 'Failed'}**: {c['what'].strip()}",
                       f"  - How: {one_line(c['how'])}", f"  - Saw: {one_line(c['saw'])[:MAX_SAW_CHARS]}"]
             shot = Path(c.get("screenshot") or "").name
             if shot in embedded:
