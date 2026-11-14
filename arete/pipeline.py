@@ -694,9 +694,28 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
 
 def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     if held := scratch_left(ws, checkouts):
-        scratch.recover_pending()
+        finalize_scratch()
         held = scratch_left(ws, checkouts)
     return held
+
+
+def finalize_scratch() -> list[str]:
+    done = scratch.recover_pending()
+    for root in done:
+        refresh_released(Path(root).parent)
+    return done
+
+
+def refresh_released(ws: Path) -> None:
+    made = made_before(ws)
+    names, salt = made.pop(RETAINED_KEY, None), str(made.get(SALT_KEY) or "")
+    if not isinstance(names, list) or not salt:
+        return
+    try:
+        made |= {n: fingerprint(ws / n, salt) for n in names if isinstance(n, str) and n in made}
+        made_record(ws).write_text(json.dumps(made))
+    except OSError:
+        pass
 
 
 def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
@@ -802,6 +821,7 @@ def head_key(c: Checkout) -> str:
 
 
 SALT_KEY = "\0salt"
+RETAINED_KEY = "\0retained"
 
 
 def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
@@ -817,12 +837,18 @@ def onto_key(c: Checkout) -> str:
 
 def note_made(ws: Path, checkouts: list[Checkout]) -> None:
     try:
-        names = outside_scratch(ws, leftovers(ws, checkouts), scratch_left(ws, checkouts)) if ws.is_dir() else []
+        names, held = [], []
+        if ws.is_dir():
+            names, held = leftovers(ws, checkouts), scratch_left(ws, checkouts)
+            names = outside_scratch(ws, names, held)
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         heads |= {onto_key(c): c.onto for c in checkouts if c.onto and (c.wt / ".git").exists()}
         if names or heads:
             salt = os.urandom(16).hex()
             made = {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
+            if held:
+                ignored = {c.prefix + n for c in checkouts if (c.wt / ".git").exists() for n in ignored_files(c.wt)}
+                made[RETAINED_KEY] = [n for n in names if n in ignored]
             made_record(ws).parent.mkdir(parents=True, exist_ok=True)
             made_record(ws).write_text(json.dumps(made))
             return
@@ -3565,7 +3591,7 @@ def retained_line(step: str, attempt: scratch.Attempt) -> str:
 
 
 def retry_scratch() -> None:
-    for root in scratch.recover_pending():
+    for root in finalize_scratch():
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
         if data["state"] in ("pending", "retained", "preserved") and data["diagnostic"]:
