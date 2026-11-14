@@ -1,9 +1,10 @@
 import { h, render } from "./vendor-preact.js";
 import { signal, effect } from "./vendor-signals.js";
-import { Shell } from "./ui-shell.js";
+import { Shell, applyRuns } from "./ui-shell.js";
 import { current, listen } from "./ui-router.js";
-import { shell, visit } from "./ui-data.js";
-import { startKeys, marks, screenKeys, pending, sheet, mode } from "./ui-keys.js";
+import { visit } from "./ui-data.js";
+import { live, connectivity, readFault } from "./ui-live.js";
+import { startKeys, marks, screenKeys, pending, sheet, mode, connection, readRetry } from "./ui-keys.js";
 import { configurePalette, globalCommands } from "./ui-palette.js";
 import { actions, dispatch } from "./ui-actions.js";
 import { dismissMenu } from "./ui-menu.js";
@@ -12,7 +13,8 @@ import { feedbackCommand, startFeedback } from "./ui-feedback.js";
 import { normalizePrimary } from "./ui-list.js";
 
 const route = signal(current());
-const snapshot = signal({});
+let feed = live(route.value.screen);
+const snapshot = feed.snapshot;
 const now = signal(Date.now());
 const tab = [...crypto.getRandomValues(new Uint8Array(8))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 const phone = matchMedia("(pointer: coarse) and (max-width: 1040px)");
@@ -31,9 +33,16 @@ function finish() {
     ms: Math.max(0, Math.min(86400000, Math.round(performance.now() - outgoing.at))) });
 }
 
+const retry = () => feed.retry();
+
+effect(() => applyRuns(snapshot.value.runs));
+
 effect(() => {
   const selected = route.value;
-  render(h(Shell, { route: selected, snapshot: snapshot.value, now: now.value }), document.getElementById("app"));
+  const latest = snapshot.value;
+  connection.value = connectivity(latest, now.value);
+  readRetry.value = readFault(selected.screen, latest) ? retry : null;
+  render(h(Shell, { route: selected, snapshot: latest, now: now.value, retry }), document.getElementById("app"));
   marks();
   normalizePrimary();
   document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "My work" : selected.screen}`;
@@ -42,6 +51,7 @@ effect(() => {
 listen((selected) => {
   if (selected.hash === route.value.hash) return;
   finish();
+  feed = live(selected.screen);
   route.value = selected;
   start(via);
   via = "hash";
@@ -56,14 +66,8 @@ document.addEventListener("visibilitychange", () => document.hidden ? finish() :
 window.addEventListener("pagehide", finish);
 window.addEventListener("pageshow", () => start("return"));
 
-async function refresh() {
-  snapshot.value = await shell();
-  setTimeout(refresh, 10000);
-}
-
 setInterval(() => { now.value = Date.now(); }, 1000);
 start("open");
-refresh();
 const destinations = [
   ["▦", "lines, timeline, health"], ["!", "needs you"], ["○", "open work owned by you"], ["▤", "open work by state"],
   ["▷", "running work"], ["↓", "incoming items"], ["↑", "drafts and sends"], ["≡", "prompt files"],

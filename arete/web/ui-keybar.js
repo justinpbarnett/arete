@@ -1,7 +1,8 @@
 import { h, Component } from "./vendor-preact.js";
 import { effect } from "./vendor-signals.js";
 import htm from "./vendor-htm.js";
-import { mode, pane, pending, sheet, notice, hints, sheetGroups, toggleSheet } from "./ui-keys.js";
+import { mode, pane, pending, sheet, notice, connection, readRetry, hints, sheetGroups, toggleSheet } from "./ui-keys.js";
+import { Connectivity } from "./ui-states.js";
 
 import { openFeedback } from "./ui-feedback.js";
 
@@ -18,7 +19,7 @@ export class KeyBar extends Component {
   state = { revision: 0 };
   componentDidMount() {
     this.unsubscribe = effect(() => {
-      mode.value; pane.value; pending.value; sheet.value; notice.value;
+      mode.value; pane.value; pending.value; sheet.value; notice.value; connection.value; readRetry.value;
       this.setState({ revision: this.state.revision + 1 });
     });
   }
@@ -32,6 +33,7 @@ function keyBar() {
     <span class=${`mode${insert ? " insert" : ""}`} data-mode=${mode.value}>${mode.value}</span>
     <span class="hints">${hints().map(([keys, label]) => html`<span class="hint" key=${label}>${caps(keys)}<span>${label}</span></span>`)}</span>
     <span class="echo mono" aria-label="Pending key">${pending.value}</span>
+    <${Connectivity} word=${connection.value} />
     <span class="notice" role="status">${notice.value}</span>
     <button type="button" class="help" data-act="help" aria-label="Key sheet" onClick=${toggleSheet}><kbd class="cap">?</kbd></button>
   </footer>`;

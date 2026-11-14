@@ -23,7 +23,7 @@
 .ui-list-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ui-list-number { flex: none; color: var(--muted); font: var(--text-micro) var(--font-data); }
 .ui-list-group { height: var(--list-row); padding: 0 10px; font: var(--text-micro)/var(--list-row) var(--font-data); color: var(--muted); background: var(--panel); }
-.ui-list-empty, .ui-list-detail, .ui-list-draft { padding: 12px; color: var(--muted); }
+.ui-list-detail, .ui-list-draft { padding: 12px; color: var(--muted); }
 .ui-list-detail, .ui-list-draft { border-top: 1px solid var(--rule); background: var(--panel); }
 .ui-list-draft input { background: var(--canvas); border: 1px solid var(--rule-strong); }
 .ui-list button.primary { color: var(--ink); border-bottom: 2px solid var(--accent); }

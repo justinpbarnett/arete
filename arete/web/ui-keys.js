@@ -55,6 +55,8 @@ export const mode = signal("NORMAL");
 export const pane = signal("queue");
 export const pending = signal("");
 export const sheet = signal(false);
+export const connection = signal("");
+export const readRetry = signal(null);
 
 const cursors = new Map();
 export const selectedItem = (id) => cursors.get(id);
@@ -274,6 +276,7 @@ function normal(event) {
     const context = actionContext();
     const action = context?.item && (context.setAside ?? actions[key === "s" ? "snooze" : key === "S" ? "shelve" : "repair"]);
     if (action) { perform(action, context); return true; }
+    if (key === "R" && readRetry.peek()) { readRetry.peek()(); return true; }
   }
   if (key === "c" && focusedList()?.uiCreate) { focusedList().uiCreate(); return true; }
   if (key === "g" || key === "d" || key === "z") { pending.value = key; return true; }
@@ -373,5 +376,6 @@ export function hints() {
   if (document.querySelector("[data-search]")) found.push([["/"], "search"]);
   if (document.querySelector(tabSelector)) found.push([["gt", "gT"], "tab"]);
   if (list?.uiContext) found.push([["dd"], "act"], [["u"], "undo"], [["."], "repeat"]);
+  if (readRetry.value) found.push([["⇧r"], "retry"]);
   return found;
 }
