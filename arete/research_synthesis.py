@@ -272,8 +272,9 @@ def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]],
 
 
 REVISION_SCHEMA = shape(summary=TEXT, answer=TEXT)
-LEAD_NOT_REVISED = ("**Audit note:** this lead was written before the audit and was not revised; the sections below "
-                    "carry the audited claims.")
+SUMMARY_WITHHELD = ("The collator's lead and summary were withheld because the audit did not cover them; the "
+                    "sections below carry the audited claims.")
+LEAD_WITHHELD = "**Audit note:** " + SUMMARY_WITHHELD
 
 
 def revision_faults(answer, known) -> list[str]:
@@ -329,15 +330,16 @@ def audited(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings,
         return Result(ok=False, error=audit.error + research_search.NO_REPORT)
     revised = research_audit.applied(last, audit)
     summary, lead_revised = last["summary"], False
-    if research_audit.changed(audit):
+    if research_audit.unaudited_lead(audit):
         known = {source["id"]: source["url"] for source in research_search.supplied(current)["sources"]}
-        lead = revise(cfg, budget, s, tools, last, audit, known, ref, where, cwd, add_dirs)
+        lead = (revise(cfg, budget, s, tools, last, audit, known, ref, where, cwd, add_dirs)
+                if research_audit.changed(audit) else None)
         if budget.error:
             return Result(ok=False, error=budget.error + research_search.NO_REPORT)
         if lead:
             revised["answer"], summary, lead_revised = lead["answer"], lead["summary"], True
         else:
-            revised["answer"] = revised["answer"].rstrip() + "\n\n" + LEAD_NOT_REVISED
+            revised["answer"], summary = LEAD_WITHHELD, SUMMARY_WITHHELD
     urls = {source["id"]: written(source["url"]) for source in current["sources"]}
     text, used = assemble(revised, current, extra, research_audit.section(audit, urls))
     a = steps.resolve(cfg, None, "research_audit")

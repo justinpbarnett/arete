@@ -16,7 +16,8 @@ FETCHES = 3
 QUOTE_CHARS = 20
 COMPLETE, INCOMPLETE, FAILED = "complete", "incomplete", "failed"
 NO_ROOM = "the research budget left no room for the audit"
-LIMITED = "a usage limit stopped the audit"
+NO_CLAIMS = "the synthesis listed no conclusions or inferences to audit"
+LIMITED ="a usage limit stopped the audit"
 WITHHELD = "the injection screen withheld the auditor's finding"
 HOST = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 KEYS = {"conclusion": "conclusions", "inference": "inferences"}
@@ -275,6 +276,10 @@ def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence
         research_search.say(ref, f"audit batch {n}: {util.count(got.tries, 'try', 'tries')}, "
                                  f"{len(got.refused)} refused, {util.count(len(batch), 'claim')} checked")
     audit.records.sort(key=lambda r: int(r["id"][1:]))
+    if not audit.records:
+        audit.status, audit.why = INCOMPLETE, NO_CLAIMS
+        research_search.say(ref, f"audit {audit.status}: {audit.why}")
+        return audit
     unchecked = [r for r in audit.records if r["verdict"] == NOT_AUDITED]
     audit.why = unchecked[0]["why"] if unchecked else ""
     audit.status = FAILED if failed else INCOMPLETE if unchecked else COMPLETE
@@ -317,6 +322,8 @@ def tally(audit: Audit) -> tuple[int, int, int, int]:
 
 
 def not_audited(audit: Audit) -> str:
+    if not audit.records:
+        return "nothing was audited"
     k = sum(r["verdict"] == NOT_AUDITED for r in audit.records)
     return f"{k} of {len(audit.records)} claims {'was' if k == 1 else 'were'} not audited"
 
@@ -351,4 +358,8 @@ def summary_words(audit: Audit, revised: bool) -> str:
                  f"{c} qualified, {d} left as gaps")
     else:
         words = f"Audit {audit.status}: {not_audited(audit)}"
-    return words + ("; the summary predates the audit" if changed(audit) and not revised else "") + "."
+    return words + "."
+
+
+def unaudited_lead(audit: Audit) -> bool:
+    return changed(audit) or not audit.records
