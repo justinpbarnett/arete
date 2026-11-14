@@ -18,6 +18,7 @@
 .sheet-head { display: flex; align-items: center; gap: 12px; }
 .sheet-title { font: 600 var(--text-micro) var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
 .sheet-note { flex: 1; min-width: 0; color: var(--ink-2); }
+.sheet-action { padding: 4px 10px; border: 1px solid var(--rule-strong); background: var(--canvas); cursor: pointer; }
 .close { padding: 0; border: 0; background: none; cursor: pointer; }
 .sheet-group h3 { margin: 16px 0 6px; font: 500 var(--text-micro) var(--font-data); letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
 .sheet-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; }

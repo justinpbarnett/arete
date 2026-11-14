@@ -11,12 +11,14 @@ export const pickerModes = {
 export const palette = signal(null);
 const snapshots = new Map();
 let navigation = [];
+let everywhere = [];
 let opener = null;
 let prepare = () => {};
 let leave = () => {};
 
-export function configurePalette(rows, beforeOpen = () => {}, beforeClose = () => {}) {
+export function configurePalette(rows, beforeOpen = () => {}, beforeClose = () => {}, commands = []) {
   navigation = rows.map((row) => ({ ...row, group: "Go to" }));
+  everywhere = commands.map((row) => ({ ...row, group: "Commands" }));
   prepare = beforeOpen;
   leave = beforeClose;
 }
@@ -25,7 +27,7 @@ function source(state) {
   if (state.mode) return state.rows;
   const screen = parse(location.hash).screen;
   return [...navigation, ...[...snapshots.values()].flatMap((entry) => entry.items.map((row) => ({ ...row, group: "Items" }))),
-    ...(snapshots.get(screen)?.commands ?? []).map((row) => ({ ...row, group: "Commands" }))];
+    ...(snapshots.get(screen)?.commands ?? []).map((row) => ({ ...row, group: "Commands" })), ...everywhere];
 }
 
 function refresh(change = {}, reset = false) {
