@@ -481,9 +481,19 @@ class Run(AgentRun):
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
         fresh = self.fresh_text(text, due)
         if session.id and kw.get("persist", True):
-            message = "\n\n".join(part for part in (asks.answers_message(due), self.base_note) if part)
+            parts = (asks.answers_message(due), self.base_note, self.moved_folder_note(due[0]["run"]))
+            message = "\n\n".join(part for part in parts if part)
             return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
         return fresh, {**kw, "resume": NO_SESSION}
+
+    def moved_folder_note(self, asking_run: str) -> str:
+        if not asking_run or asking_run == self.id:
+            return ""
+        script = self.dir / CHECKS_SCRIPT
+        checks = f", for example `{script} NAME` for a check" if script.exists() else ""
+        return (f"This run's folder is `{self.dir}`, not the one of the run that started this session. Commands from "
+                f"earlier in the conversation that name the earlier run's folder no longer run: use the same commands "
+                f"under this run's folder{checks}.")
 
     def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
         ask_ids = [f"{self.id}-a{self.asks_made + n}" for n in range(1, len(sent) + 1)]

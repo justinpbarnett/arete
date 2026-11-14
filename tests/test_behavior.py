@@ -521,7 +521,7 @@ if scenario.startswith("fix-ask"):
               "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
               "merges": [{k: m.get(k) for k in ("outcome", "error")} for m in merges], "merged_first": merged_first,
               "same_session": bool(session(first)) and session(first) == session(events),
-              "answered": "Main now has the fix." in prompt,
+              "answered": "Main now has the fix." in prompt, "prompt": prompt, "parked_id": parked["id"],
               "taken": [a["taken_by"] for a in state.asks_of(parked["id"])]}
     branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines() if b != "refs/heads/main"]
     if branches:
@@ -770,6 +770,11 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["taken"], [result["id"]])
         self.assertIn("kumquat", result["notes"])
         self.assertEqual(result["moved_file"].strip(), "moved")
+
+    def test_answered_run_resumes_the_session_with_the_new_run_folder_and_its_checks_path(self):
+        result = self.workflow("fix-ask-still")
+        self.assertIn(f"{result['id']}/checks NAME`", result["prompt"])
+        self.assertNotIn(result["parked_id"], result["prompt"])
 
     def test_answered_run_with_an_unmoved_base_writes_no_base_merge(self):
         result = self.workflow("fix-ask-still")
