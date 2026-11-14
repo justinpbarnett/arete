@@ -261,7 +261,7 @@ def health_board() -> dict:
     beat = control.serve_beat()
     found = checks_and_alerts()
     return {**found, "now": util.iso(), "serve": beat, "state": health_word(beat, found),
-            "devices": panel(control.fleet)}
+            "devices": panel(control.fleet), "workspaces": panel(pipeline.held_summary)}
 
 
 def runs_board(filters: dict[str, str], limit: int = RECENT_RUNS) -> dict:
