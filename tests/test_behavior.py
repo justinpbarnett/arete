@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2166,6 +2167,8 @@ PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
 
 
 class OptimizeTests(unittest.TestCase):
+    slow = True
+
     def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
         from arete import experiment, optimize
 
@@ -4248,6 +4251,163 @@ result(counts=counts, before=before, summary=last["summary"], prompt=prompt, las
         self.assertGreater(found["kept"], 0)
         self.assertLessEqual(found["size"], 100)
         self.assertEqual(found["last"], "Reply 6.")
+
+
+class ParallelSuiteTests(unittest.TestCase):
+    HANGS = (
+        "import os, time, unittest\n"
+        "from pathlib import Path\n"
+        "class Hanging(unittest.TestCase):\n"
+        "    def hang(self):\n"
+        "        Path(__file__).with_name('pid-' + self._testMethodName).write_text(str(os.getpid()))\n"
+        "        time.sleep(60)\n"
+        "    def test_a(self): self.hang()\n"
+        "    def test_b(self): self.hang()\n"
+        "    def test_c(self): self.hang()\n"
+    )
+
+    def sample_folder(self, source: str):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        scratch_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch_temp.cleanup)
+        Path(folder.name, "test_sample.py").write_text(source)
+        return folder.name, {**os.environ, "TMPDIR": scratch_temp.name}
+
+    def command(self, folder: str, *extra: str):
+        return [sys.executable, "-m", "tests.parallel", "-s", folder, *extra]
+
+    def run_sample(self, source: str, *extra: str):
+        folder, env = self.sample_folder(source)
+        command = self.command(folder, "-j", "2", "--timeout", "2", "-v", *extra)
+        done = subprocess.run(command, cwd=SOURCE, capture_output=True, text=True, timeout=120, env=env,
+                              check=False)
+        return folder, done, done.stdout.strip().splitlines()
+
+    def start_sample(self, source: str, *extra: str):
+        folder, env = self.sample_folder(source)
+        proc = subprocess.Popen(self.command(folder, *extra), cwd=SOURCE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env)
+        self.addCleanup(proc.kill)
+        return folder, proc
+
+    def pids_in(self, folder: str):
+        return {path.name: int(path.read_text()) for path in Path(folder).glob("pid-*") if path.read_text().strip()}
+
+    def wait_for_pids(self, folder: str, count: int):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            found = self.pids_in(folder)
+            if len(found) >= count:
+                return found
+            time.sleep(0.1)
+        self.fail(f"fewer than {count} workers started in {folder}")
+
+    def gone(self, pid: int):
+        self.addCleanup(self.kill_quietly, pid)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def kill_quietly(self, pid: int):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def test_hung_test_leaves_no_process(self):
+        folder, done, _ = self.run_sample(
+            "import os, subprocess, sys, time, unittest\n"
+            "from pathlib import Path\n"
+            "class Hanging(unittest.TestCase):\n"
+            "    def test_stuck(self):\n"
+            "        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "        Path(__file__).with_name('pid-stuck').write_text(str(os.getpid()))\n"
+            "        Path(__file__).with_name('pid-child').write_text(str(child.pid))\n"
+            "        time.sleep(60)\n"
+        )
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("ERROR: test_stuck (test_sample.Hanging.test_stuck)", done.stdout)
+        found = self.pids_in(folder)
+        self.assertEqual(set(found), {"pid-stuck", "pid-child"})
+        for pid in found.values():
+            self.assertTrue(self.gone(pid), pid)
+
+    def test_interrupt_ends_every_worker(self):
+        for number in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=number.name):
+                folder, proc = self.start_sample(self.HANGS, "-j", "2", "--timeout", "60")
+                found = self.wait_for_pids(folder, 2)
+                proc.send_signal(number)
+                output, _ = proc.communicate(timeout=30)
+                self.assertEqual(proc.returncode, 130, output)
+                self.assertIn("interrupted; tests in flight:", output)
+                for name in found:
+                    self.assertIn(f"test_{name[-1]} (test_sample.Hanging.test_{name[-1]})", output)
+                self.assertEqual(set(self.pids_in(folder)), set(found))
+                self.assertEqual(len(found), 2)
+                self.assertNotIn("Ran ", output)
+                for pid in found.values():
+                    self.assertTrue(self.gone(pid), pid)
+
+    def test_killed_runner_takes_its_workers_along(self):
+        folder, proc = self.start_sample(self.HANGS, "-j", "2", "--timeout", "60")
+        found = self.wait_for_pids(folder, 2)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=30)
+        proc.stdout.close()
+        for pid in found.values():
+            self.assertTrue(self.gone(pid), pid)
+
+    def test_failing_hanging_and_serial_tests_are_reported(self):
+        _, done, lines = self.run_sample(
+            "import time, unittest\n"
+            "class Passing(unittest.TestCase):\n"
+            "    def test_ok(self): pass\n"
+            "class Failing(unittest.TestCase):\n"
+            "    def test_bad(self): self.fail('deliberate')\n"
+            "class Hanging(unittest.TestCase):\n"
+            "    def test_stuck(self): time.sleep(60)\n"
+            "class Alone(unittest.TestCase):\n"
+            "    serial = True\n"
+            "    def test_one(self): pass\n"
+            "    def test_two(self): pass\n"
+        )
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("FAIL: test_bad (test_sample.Failing.test_bad)", done.stdout)
+        self.assertIn("deliberate", done.stdout)
+        self.assertIn("ERROR: test_stuck (test_sample.Hanging.test_stuck)", done.stdout)
+        self.assertIn("killed after 2 seconds", done.stdout)
+        self.assertTrue(lines[-1].startswith("Ran 5 tests in "), lines[-1])
+        self.assertTrue(lines[-1].endswith("FAILED (failures=1, errors=1)"), lines[-1])
+        verbose = [index for index, line in enumerate(lines) if " ... " in line]
+        alone = [index for index in verbose if "Alone" in lines[index]]
+        others = [index for index in verbose if "Alone" not in lines[index]]
+        self.assertEqual(len(alone), 2)
+        self.assertGreater(min(alone), max(others))
+
+    def test_passing_sample_counts_match_discovery(self):
+        folder, done, lines = self.run_sample(
+            "import unittest\n"
+            "class Passing(unittest.TestCase):\n"
+            "    def test_one(self): pass\n"
+            "    def test_two(self): pass\n"
+            "    @unittest.skip('not now')\n"
+            "    def test_skipped(self): pass\n",
+            "--slowest", "1",
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("Slowest classes:", lines)
+        self.assertTrue(any("test_sample.Passing" in line for line in lines[lines.index("Slowest classes:") + 1:]))
+        total = unittest.TestLoader().discover(folder).countTestCases()
+        self.assertTrue(lines[-1].startswith(f"Ran {total} tests in "), lines[-1])
+        self.assertTrue(lines[-1].endswith("OK (skipped=1)"), lines[-1])
+        self.assertEqual(len([line for line in lines if " ... " in line]), total)
 
 
 FAKE_GH ='''#!{python}
