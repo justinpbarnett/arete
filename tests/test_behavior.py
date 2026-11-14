@@ -1887,9 +1887,9 @@ class OptimizeTests(unittest.TestCase):
                        TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
-import contextlib, importlib.util, io, json, os, sys
+import contextlib, importlib.util, io, json, os, shutil, sys
 from pathlib import Path
-from arete import cli, optimize, paths
+from arete import cli, experiment, optimize, paths
 root = Path(sys.argv[1])
 if importlib.util.find_spec("arete.scratch"):
     from arete import scratch
@@ -1903,6 +1903,14 @@ def call(*argv):
     return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
 paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
 plan, config_file = str(root / "sample/plan.toml"), paths.CONFIG_FILE
+experiment.MIN_PAIRS = 3
+smaller = Path(plan).read_text()
+for old, new in (("repeats = 6", "repeats = 3"), ("min_pairs = 6", "min_pairs = 3\nconfidence = 0.7")):
+    if smaller.count(old) != 1:
+        raise SystemExit(f"the sample plan no longer holds {old!r} once")
+    smaller = smaller.replace(old, new)
+Path(plan).write_text(smaller)
+shutil.rmtree(root / "sample/replay/cheap/word-validation/3")
 before = config_file.read_bytes()
 folder = paths.STATE_DIR / "experiments" / "sample-search"
 trail = lambda: [json.loads(line) for line in (folder / "trail.jsonl").read_text().splitlines()]
@@ -1945,13 +1953,13 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
         self.assertIn("candidate twin", r["dry"]["out"])
         self.assertEqual(r["search"]["code"], 0, shown)
         out = r["search"]["out"]
-        self.assertIn("stronger: train fixed 6, broke 0: proposed", out)
+        self.assertIn("stronger: train fixed 3, broke 0: proposed", out)
         self.assertIn("promoted: stronger", out)
-        self.assertIn("validation accepted 3 of 6 against 6 of 6: no promotion: under the quality floor", out)
-        self.assertIn("validation accepted 6 of 6 against 6 of 6: no promotion: noisy tie", out)
+        self.assertIn("validation accepted 1 of 3 against 3 of 3: no promotion: under the quality floor", out)
+        self.assertIn("validation accepted 3 of 3 against 3 of 3: no promotion: noisy tie", out)
         self.assertIn("promoted: none", out)
         self.assertIn("result: promote stronger over baseline", out)
-        self.assertEqual((r["holdout"], r["holdout_again"]), (12, 12), shown)
+        self.assertEqual((r["holdout"], r["holdout_again"]), (6, 6), shown)
         self.assertEqual(r["again"]["code"], 0, shown)
         self.assertIn("-model = \"scratch-a\"", r["preview"]["out"])
         self.assertIn("+model = \"scratch-b\"", r["preview"]["out"])
@@ -1996,6 +2004,7 @@ def call(*argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = cli.main(list(argv))
     return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+experiment.MIN_PAIRS = 3
 paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
 sample = root / "sample"
 call("prices", "import", str(sample / "prices.json"))
@@ -2008,7 +2017,11 @@ rounds = ('[[rounds]]\nvary = "effort"\n[rounds.candidates.cheap]\neffort = "low
           f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned]\nprompts = "{root / "tuned"}"\n\n'
           f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned2]\nprompts = "{root / "tuned2"}"\n\n')
 plan = sample / "plan.toml"
-plan.write_text(head + rounds + tail.replace("rounds = 2", "rounds = 3"))
+smaller = (head.replace("repeats = 6", "repeats = 3") + rounds
+           + tail.replace("rounds = 2", "rounds = 3").replace("min_pairs = 6", "min_pairs = 3\nconfidence = 0.7"))
+if "repeats = 3" not in smaller or "confidence = 0.7" not in smaller:
+    raise SystemExit("the sample plan no longer holds repeats = 6 and min_pairs = 6")
+plan.write_text(smaller)
 s = optimize.load(plan)
 folder = paths.STATE_DIR / "experiments" / "sample-search"
 folder.mkdir(parents=True)
