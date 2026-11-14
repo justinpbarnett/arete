@@ -29,6 +29,7 @@ from . import (
     capture,
     chat,
     client,
+    codebase,
     config,
     control,
     devices,
@@ -792,6 +793,10 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def end_headers(self) -> None:
+        self.send_header("X-Arete-Engine", codebase.STAMP)
+        super().end_headers()
+
     def head(self, status: int, kind: str, cache: str, length: int | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", kind)
@@ -1160,7 +1165,7 @@ def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_se
 
 
 def record_server(node: Node, port: int, front: Front) -> None:
-    fields = {"pid": os.getpid(), "addresses": [LOOPBACK] if front.fronted else list(node.addresses), "port": port,
+    fields = {"pid": os.getpid(), "engine": codebase.STAMP, "addresses": [LOOPBACK] if front.fronted else list(node.addresses), "port": port,
               "scheme": front.scheme, "host": node.name}
     if front.fronted:
         fields |= {"login": node.owner, "behind": "tailscale serve"}

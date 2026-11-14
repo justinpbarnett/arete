@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import sys
 import threading
 import time
@@ -9,7 +10,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import paths, util
+from . import codebase, paths, util
 
 FILE = "run.jsonl"
 HEARTBEAT_SECONDS = 30
@@ -20,6 +21,7 @@ WAIT_CAUSES = ("limit", "ci", "slot", "person")
 TAIL_BYTES = 4096
 
 _writing = threading.Lock()
+_named: set[tuple[int, str]] = set()
 
 
 def path(run_id: str) -> Path:
@@ -60,7 +62,7 @@ def tail(f) -> tuple[int, bool]:
 
 def write(run_id: str, event: str, **fields) -> dict:
     line = {"ts": util.iso(), "run": run_id, "seq": 0, "event": event,
-            **{k: v for k, v in fields.items() if k not in FIXED}}
+            **{k: v for k, v in fields.items() if k not in FIXED + ("engine",)}}
     target = path(run_id)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -68,9 +70,14 @@ def write(run_id: str, event: str, **fields) -> dict:
             fcntl.flock(f, fcntl.LOCK_EX)
             seq, torn = tail(f)
             line["ts"], line["seq"] = util.iso(), seq + 1
+            first = (os.getpid(), run_id) not in _named
+            if first:
+                line["engine"] = codebase.STAMP
             text = json.dumps(line, ensure_ascii=False, default=str)
             f.write((b"\n" if torn else b"") + text.encode() + b"\n")
             f.flush()
+            if first:
+                _named.add((os.getpid(), run_id))
     except OSError as e:
         text = json.dumps(line, ensure_ascii=False, default=str)
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)

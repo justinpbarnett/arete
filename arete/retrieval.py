@@ -11,7 +11,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import __version__, config, environment, evals, paths, pipeline, record, replay, routing, runner, util
+from . import codebase, config, environment, evals, paths, pipeline, record, replay, routing, runner, util
 
 SPLITS = ("train", "validation", "holdout")
 KINDS = ("embedding", "rerank")
@@ -631,7 +631,7 @@ class Experiment:
         gen = self.suite.generate
         prompt_file = paths.PROMPTS_DIR / "retrieval_answer.md"
         return {
-            "suite": self.suite.name, "repo": self.repo.name, "run": self.run_id, "arete_version": __version__,
+            "suite": self.suite.name, "repo": self.repo.name, "run": self.run_id, "arete_version": codebase.STAMP,
             "suite_fingerprint": self.suite.fingerprint, "budget_tokens": self.suite.budget,
             "top_k": self.suite.top_k,
             "corpus": {"revision": self.suite.corpus.revision, "commit": self.corpus.commit,

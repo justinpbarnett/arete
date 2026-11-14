@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, gh, paths, state, util, vault
+from . import agent, codebase, gh, paths, state, util, vault
 from . import lines as run_lines
 
 SETTLE_GRACE_SECONDS = 60
@@ -53,7 +53,7 @@ def new_id(prefix: str, tag: str = "") -> str:
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
-           **fields}
+           "engine_sha": codebase.STAMP, **fields}
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
@@ -307,7 +307,7 @@ class Recorder:
         self.lock = threading.RLock()
         self.at, self.started = util.iso(), time.monotonic()
         self.clocked, self.ended = self.started, False
-        self.header = {"arete": "header", **header, "run_id": run_id, "step": step, "started": self.at}
+        self.header = {"arete": "header", **header, "engine": codebase.STAMP, "run_id": run_id, "step": step, "started": self.at}
         self.held: list[str] | None = []
         self.waiting = threading.Timer(HEADER_WAIT_SECONDS, self.release)
         self.waiting.daemon = True

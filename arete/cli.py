@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from contextlib import closing
 from typing import NoReturn
 
-from . import __version__, config, paths
+from . import __version__, codebase, config, paths
 
 DEFAULT_CONFIG = """\
 alert_repo = "you/arete-alerts"
@@ -1672,6 +1672,18 @@ class Parser(argparse.ArgumentParser):
         sys.exit(1)
 
 
+PER_CALL_HOOKS = ("hook", "guard", "codex-guard", "background")
+
+
+class ShowVersion(argparse.Action):
+    def __init__(self, option_strings, dest, **kw):
+        super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, help="show the version and exit")
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(f"arete {__version__} {codebase.load()}")
+        parser.exit()
+
+
 def steering(p: Parser) -> Parser:
     p.json_errors = True
     return p
@@ -1679,7 +1691,7 @@ def steering(p: Parser) -> Parser:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version", action="version", version=f"arete {__version__}")
+    ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
 
     p = sub.add_parser("init", help="write the default global config")
@@ -2105,6 +2117,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_dashboard)
 
     args = ap.parse_args(argv)
+    if args.cmd not in PER_CALL_HOOKS:
+        codebase.load()
     try:
         return args.fn(args) or 0
     except config.UnknownRepo as e:

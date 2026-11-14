@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import asks, config, lines, state, util
+from . import asks, codebase, config, lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
@@ -483,6 +483,7 @@ def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
 
 
 def main(fn: Callable, argv: list[str] | None = None) -> None:
+    codebase.load()
     from . import flows, pipeline
 
     p = argparse.ArgumentParser(description=f"run the {fn.__name__} flow on one ticket")

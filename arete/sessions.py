@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import (
     claude,
+    codebase,
     config,
     control,
     devices,
@@ -572,7 +573,7 @@ def execute(session_id: str) -> str:
             return "busy"
         if (ended := (state.run_get(session_id) or {}).get("status", "gone")) != "running":
             return ended
-        record.note(session_id, pid=os.getpid())
+        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP)
         signal.signal(signal.SIGTERM, stop_on_term)
         status, summary = "done", ""
         try:
