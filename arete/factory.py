@@ -219,7 +219,8 @@ class Flow:
                  restore: Callable[[dict], str] | None = None, refusal: str = "",
                  hold: Callable[[str], str] | None = None, renew: str = "",
                  keeps: Callable[[str, dict], bool] | None = None,
-                 step_runs: list[list[dict]] | None = None) -> None:
+                 step_runs: list[list[dict]] | None = None,
+                 entering: Callable[[str], None] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         if again and again not in STEPS:
@@ -239,6 +240,7 @@ class Flow:
         self.restamped = self.restamps(step_runs or [])
         self.prints: dict[str, str] = {}
         self.renew, self.keeps = renew, keeps or (lambda name, kw: False)
+        self.entering = entering or (lambda name: None)
         self.carrying, self.carry = False, 0
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
         self.redone, self.stepped = 0, False
@@ -278,6 +280,7 @@ class Flow:
                 self.matching = False
                 raise Refused(why)
             self.route()
+            self.entering(name)
         try:
             return self.run(name, args, kw)
         finally:

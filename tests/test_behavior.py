@@ -141,6 +141,31 @@ from pathlib import Path
 from unittest import mock
 from arete import accounts, config, factory, gh, paths, pipeline, record, replay, runlimits, runner, state
 root, scenario = Path(sys.argv[1]), sys.argv[2]
+def note(severity, problem, **more):
+    return {"file": "notes.txt", "problem": problem, "severity": severity, **more}
+BLOCKER = note("blocker", "fixture blocker", category="issue")
+SECURITY = note("blocker", "fixture leak", category="security")
+REGRESSION = note("blocker", "fixture regression", category="regression")
+MAJOR, MINOR, MAJOR_2 = note("major", "fixture major note"), note("minor", "fixture minor note"), note("major", "second major note")
+FIXED = {"id": "B1", "status": "fixed", "why": "quince is listed"}
+REVIEW_ROUNDS = {
+    "review-notes-only": [{"verdict": "request_changes", "summary": "Works; two notes.", "problems": [MAJOR, MINOR]}],
+    "review-notes-dry-run": [{"summary": "Works; two notes.", "problems": [MAJOR, MINOR]}],
+    "review-converges": [{"summary": "B1 open.", "problems": [BLOCKER, MAJOR]},
+                         {"summary": "B1 fixed.", "problems": [MAJOR_2], "earlier": [FIXED]}],
+    "review-security-waived": [{"summary": "Leak.", "problems": [SECURITY]},
+                               {"summary": "Waived.", "problems": [],
+                                "earlier": [{"id": "B1", "status": "waived", "why": "out of scope"}]}],
+    "review-new-regression": [{"summary": "B1 open.", "problems": [BLOCKER]},
+                              {"summary": "B1 fixed, new break.", "problems": [REGRESSION], "earlier": [FIXED]}],
+    "review-severity-slip": [{"summary": "Slip.", "problems": [note("Critical", "fixture slip", category="issue")]},
+                             {"summary": "Still.", "problems": [], "earlier": [{"id": "B1", "status": "open", "why": "no"}]}],
+    "review-problems-missing": [{"verdict": "approve", "summary": "Fine."}],
+    "review-earlier-omitted": [{"summary": "B1 open.", "problems": [BLOCKER]},
+                               {"summary": "Looks fine.", "problems": []}],
+}
+BLOCKED_CHECKS = {"blocked-check-environment": "Target page, context or browser has been closed",
+                  "blocked-check-guard": "The JEV guard refused the command"}
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
 urllib.request.urlopen = forbidden
@@ -154,7 +179,7 @@ if importlib.util.find_spec("arete.scratch"):
 lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
     "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
-    ("2" if scenario == "edited-after-held-pr" else "1") + "\n")
+    ("2" if scenario == "edited-after-held-pr" or scenario in REVIEW_ROUNDS else "1") + "\n")
 if scenario == "failed-check":
     with (root / "sample/layer/config.toml").open("a") as out:
         out.write('\n[steps.check_repair]\ntries=1\n')
@@ -162,6 +187,23 @@ if scenario == "failed-check":
     layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "exit 7"))
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
+elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault"):
+    cause = "change" if scenario == "verify-change-fault" else "environment"
+    answers = root / "sample/replay"
+    failing = json.loads((answers / "verify.json").read_text())
+    failing["structured"] = {"verdict": "pass" if scenario.endswith("-pass") else "fail", "summary": "The check could not run.", "checks": [
+        {"what": "notes.txt holds kumquat", "how": "browser", "saw": "Target page, context or browser has been closed",
+         "passed": False, "cause": cause}]}
+    (answers / "verify2.json").write_text((answers / "verify.json").read_text())
+    (answers / "verify.json").write_text(json.dumps(failing))
+    (answers / "verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+elif scenario in ("verify-start-denied", "verify-start-crash"):
+    urllib.request.urlopen = mock.Mock(side_effect=OSError("refused"))
+    layer = root / "sample/layer/config.toml"
+    denied = ("echo '/bin/bash: sandbox: Operation not permitted'; exit 126" if scenario == "verify-start-denied"
+              else "echo 'at usePermissions (src/hooks/usePermissions.ts:12:5)'; exit 1")
+    (root / "sample/replay/verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    layer.write_text(layer.read_text().replace("[verify]\n", "[verify]\nstart = " + json.dumps(denied) + "\n", 1))
 elif scenario in ("review-rejected", "edited-after-held-pr"):
     file = root / "sample/replay/review.json"
     data = json.loads(file.read_text())
@@ -170,8 +212,27 @@ elif scenario in ("review-rejected", "edited-after-held-pr"):
         (root / "sample/replay/verify2.json").write_text((root / "sample/replay/verify.json").read_text())
         (root / "sample/replay/review_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
     data["structured"] = {"verdict":"request_changes", "summary":"A real behavior is still wrong.",
-                           "problems":[{"file":"notes.txt", "problem":"fixture blocker", "severity":"major"}]}
+                           "problems":[BLOCKER]}
     file.write_text(json.dumps(data))
+    if scenario == "edited-after-held-pr":
+        second = json.loads((root / "sample/replay/review2.json").read_text())
+        second["structured"] = {**second["structured"], "earlier": [FIXED]}
+        (root / "sample/replay/review2.json").write_text(json.dumps(second))
+elif scenario in REVIEW_ROUNDS:
+    replays = root / "sample/replay"
+    sample = json.loads((replays / "review.json").read_text())
+    for number, said in enumerate(REVIEW_ROUNDS[scenario], 1):
+        (replays / f"review{number if number > 1 else ''}.json").write_text(json.dumps({**sample, "structured": said}))
+    if len(REVIEW_ROUNDS[scenario]) > 1:
+        (replays / "verify2.json").write_text((replays / "verify.json").read_text())
+        (replays / "review_fix.json").write_text(json.dumps({"text": "B1 fixed: quince is listed after kumquat.", "ok": True}))
+        (replays / "review_fix.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+elif scenario in BLOCKED_CHECKS:
+    answer = root / "sample/replay/verify.json"
+    said = json.loads(answer.read_text())
+    said["structured"] = {"verdict": "blocked", "summary": "Could not check it.", "checks": [],
+                          "blocked_by": BLOCKED_CHECKS[scenario]}
+    answer.write_text(json.dumps(said))
 cfg = config.load()
 task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
 if scenario == "edited-after-held-pr":
@@ -192,6 +253,23 @@ def forced(*extra):
     except SystemExit:
         pass
     return state.ticket_runs("replay-sample", task, whole=True)[0]
+if "limit-wait" in scenario or scenario == "work-over-budget":
+    import time as real_time
+    from datetime import timedelta
+    from types import SimpleNamespace
+    ahead, real_now, real_launch = [0.0], pipeline.util.now, runner.run
+    pipeline.util.now = lambda: real_now() + timedelta(seconds=ahead[0])
+    runlimits.time = SimpleNamespace(monotonic=lambda: real_time.monotonic() + ahead[0])
+    def jumping(prompt, cwd, **kw):
+        if kw.get("waits") and not ahead[0]:
+            if scenario == "work-over-budget":
+                ahead[0] = 600.0
+            else:
+                with kw["waits"]("limit"):
+                    ahead[0] = 600.0
+        return real_launch(prompt, cwd, **kw)
+    runner.run = jumping
+    mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=1)).start()
 if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits", "kept-push-then-fail") or scenario.startswith(("failed-resume", "failed-again")):
     layer, replays, src, origin = root / "sample/layer/config.toml", root / "sample/replay", root / "sample/repo", root / "sample/origin.git"
     plain, stock = layer.read_text(), (replays / "build.patch").read_text()
@@ -294,6 +372,7 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
                   "published": og("show", f"{branch}:notes.txt") if published else "",
                   "kept_published": published and pipeline.util.sh(["git", "merge-base", "--is-ancestor", kept_head, branch], cwd=origin).returncode == 0,
                   "head_parents": og("log", "-1", "--format=%P", branch).split() if published else [], "main": og("rev-parse", "main"),
+                  "budget": runlimits.metadata(row["id"], "budget.json"),
                   "trailers": og("log", "--format=%B", f"main..{branch}") if published else "", "prompts": [t[1] for t, _ in prompts if t and t[0] == row["id"]]}
         print("BEHAVIOR_RESULT=" + json.dumps(result))
         raise SystemExit(0)
@@ -389,6 +468,72 @@ if scenario.startswith("held-scratch"):
                "edited": (ws / "notes.txt").exists() and "edited by hand" in (ws / "notes.txt").read_text()}
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git") if len(branches) == 1 else ""
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
+if scenario.startswith("fix-ask"):
+    from arete import alerts, asks, tasks
+    alerts.notify = lambda title, message: None
+    src, origin, answers = root / "sample/repo", root / "sample/origin.git", root / "sample/replay"
+    paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace("[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+    layer = root / "sample/layer/config.toml"
+    layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && test -f moved.txt"))
+    question = {"questions": [{"header": "Fix", "question": "Does main fix it?", "kind": "text"}],
+                "why": "The check needs a file.", "tried": "Read the check."}
+    (answers / "fix2.json").write_text(json.dumps({"text": "Asked.", "ok": True, "tool_calls": [{"name": "ask_owner", "input": question}]}))
+    parked = forced()
+    ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+    kept_head = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+    first = [json.loads(line) for line in (paths.RUNS_DIR / parked["id"] / "run.jsonl").read_text().splitlines()]
+    waiting = state.asks_of(parked["id"], "open")
+    def commit_on_main(name, text, message):
+        pipeline.git(["checkout", "-q", "main"], src)
+        with (src / name).open("a") as out:
+            out.write(text)
+        pipeline.git(["add", name], src)
+        pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message], src)
+        pipeline.git(["push", "-q", "origin", "HEAD:main"], src)
+    if scenario == "fix-ask-moved":
+        commit_on_main("moved.txt", "moved\n", "move main")
+    if scenario == "fix-ask-conflict":
+        commit_on_main("notes.txt", "quince\n", "conflict on main")
+    if scenario == "fix-ask-still":
+        (answers / "fix2.patch").write_text("--- /dev/null\n+++ b/moved.txt\n@@ -0,0 +1 @@\n+moved\n")
+    for ask in waiting:
+        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Main now has the fix."))
+    (answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_repair_cycles=5)):
+        try:
+            factory.main(feature, ["replay-sample", task, "--force", "--continue", parked["id"]])
+        except SystemExit:
+            pass
+    row = state.ticket_runs("replay-sample", task, whole=True)[0]
+    events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+    marks = [json.loads(line) for line in record.raw_lines(paths.record_dir(row["id"]) / record.TIMELINE)]
+    merges = [m for m in marks if m.get("kind") == "base_merge"]
+    kinds = [(m.get("kind"), m.get("step")) for m in marks]
+    merged_first = ("base_merge", None) in kinds and ("agent", "fix2") in kinds and kinds.index(("base_merge", None)) < kinds.index(("agent", "fix2"))
+    session = lambda read: next((e["session"]["id"] for e in read if e.get("event") == "step_end" and e.get("step") == "implement" and e.get("session")), "")
+    headers = [f for f in record.record_files(row["id"]) if "fix2" in f.name]
+    prompt = str(json.loads(next(record.raw_lines(headers[-1]))).get("prompt")) if headers else ""
+    result = {"parked": parked["status"], "status": row["status"], "id": row["id"], "summary": row["summary"],
+              "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
+              "skipped": next((e["skipped"] for e in events if e.get("event") == "route" and "skipped" in e), None),
+              "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
+              "merges": [{k: m.get(k) for k in ("outcome", "error")} for m in merges], "merged_first": merged_first,
+              "same_session": bool(session(first)) and session(first) == session(events),
+              "answered": "Main now has the fix." in prompt,
+              "taken": [a["taken_by"] for a in state.asks_of(parked["id"])]}
+    branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines() if b != "refs/heads/main"]
+    if branches:
+        show = lambda name: pipeline.git(["show", f"{branches[0]}:{name}"], origin, check=False)
+        result |= {"notes": show("notes.txt"), "moved_file": show("moved.txt"),
+                   "parents": len(pipeline.git(["log", "-1", "--format=%P", branches[0]], origin).split()),
+                   "trailers": pipeline.git(["log", "-1", "--format=%B", branches[0]], origin)}
+    if scenario == "fix-ask-conflict":
+        result |= {"kept_head": kept_head, "head": pipeline.git(["rev-parse", "HEAD"], ws).strip(),
+                   "dirty": pipeline.git(["status", "--short"], ws).strip()}
+        with mock.patch.object(tasks, "launch", side_effect=lambda cfg, repo, tid, command, ahead=False: command):
+            result["resume"] = tasks.resume(row["id"])
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
 if scenario.startswith("asked"):
@@ -525,7 +670,7 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], origin) if len(branches) == 1 else ""
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
-row = forced()
+row = forced("--dry-run") if scenario == "review-notes-dry-run" else forced()
 events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
                 if e.get("event") == "step_end" and e.get("step") == "verify"]
@@ -536,6 +681,24 @@ if scenario == "edited-after-held-pr":
     result["old"] = old
     result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
     result["budget"] = json.loads((paths.RUNS_DIR / row["id"] / "budget.json").read_text())
+if scenario in REVIEW_ROUNDS:
+    report = [e for e in events if e.get("event") == "report"][-1]
+    result["review"] = report["review"]
+    result["prompt"] = result["fix_prompt"] = ""
+    for file in record.record_files(row["id"]):
+        if "review2" in file.name:
+            result["prompt"] = str(json.loads(next(record.raw_lines(file))).get("prompt"))
+        if "review_fix" in file.name:
+            result["fix_prompt"] = str(json.loads(next(record.raw_lines(file))).get("prompt"))
+    earlier = result["prompt"].split("## Earlier review", 1)[1] if "## Earlier review" in result["prompt"] else ""
+    result["earlier"] = earlier
+    result["fixed"] = earlier.split("What changed since that review:")[-1].split("Check these first:")[0]
+    if scenario == "review-notes-dry-run":
+        result["body"] = (paths.RUNS_DIR / row["id"] / "pr_body.md").read_text()
+if scenario in ("limit-wait", "work-over-budget"):
+    wall = (runlimits.parsed(row["finished"]) - runlimits.parsed(row["started"])).total_seconds() / 60
+    result |= {"budget": runlimits.metadata(row["id"], "budget.json"),
+               "parked": runlimits.metadata(row["id"], "parked.json"), "wall": wall}
 if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
@@ -593,6 +756,41 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertTrue(result["answered"])
         self.assertEqual(result["taken"], [True])
         self.assertIn("kumquat", result["published"])
+
+    def test_answered_run_merges_a_moved_base_before_the_asking_step_resumes(self):
+        result = self.workflow("fix-ask-moved")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["skipped"], 4)
+        self.assertEqual(result["renewed"], [])
+        self.assertEqual([m["outcome"] for m in result["merges"]], ["clean"])
+        self.assertTrue(result["merged_first"])
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [result["id"]])
+        self.assertIn("kumquat", result["notes"])
+        self.assertEqual(result["moved_file"].strip(), "moved")
+
+    def test_answered_run_with_an_unmoved_base_writes_no_base_merge(self):
+        result = self.workflow("fix-ask-still")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["merges"], [])
+        self.assertEqual(result["skipped"], 4)
+        self.assertTrue(result["same_session"])
+        self.assertEqual(result["taken"], [result["id"]])
+
+    def test_answered_run_that_cannot_merge_a_moved_base_fails_and_keeps_the_answers(self):
+        result = self.workflow("fix-ask-conflict")
+        self.assertEqual(result["status"], "failed", result["log"])
+        self.assertIn("origin/main", result["summary"])
+        self.assertIn("notes.txt", result["summary"])
+        self.assertEqual(len(result["merges"]), 1)
+        self.assertTrue(result["merges"][0]["error"])
+        self.assertEqual(result["taken"], [""])
+        self.assertEqual(result["head"], result["kept_head"])
+        self.assertEqual(result["dirty"], "")
+        at = result["resume"].index("--continue")
+        self.assertEqual(result["resume"][at:at + 2], ["--continue", result["id"]])
 
     def test_edits_made_before_an_ask_are_kept_while_it_waits_and_published_after_the_answer(self):
         result = self.workflow("asked-edited")
@@ -852,6 +1050,28 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["moved"], "moved.txt")
         self.assertIn("merged `origin/main` into the edits the last run kept", result["log"])
 
+    def test_a_limit_wait_longer_than_the_budget_does_not_park_the_run(self):
+        result = self.workflow("limit-wait")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertGreater(result["wall"], 1)
+        self.assertAlmostEqual(result["budget"]["wait_minutes_left_out"]["limit"], 10, delta=0.1)
+        self.assertEqual(result["parked"], {})
+
+    def test_work_longer_than_the_budget_still_parks_the_run(self):
+        result = self.workflow("work-over-budget")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("parked: the run chain reached its cumulative 1 minute budget", result["summary"])
+        self.assertEqual(result["parked"]["wait_minutes_left_out"], {"limit": 0, "slot": 0})
+
+    def test_a_continuation_leaves_out_the_limit_wait_of_the_earlier_run(self):
+        result = self.workflow("failed-again-prepare-limit-wait")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
+        self.assertAlmostEqual(result["budget"]["earlier_wait_minutes_left_out"]["limit"], 10, delta=0.1)
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+
     def test_preparing_again_over_a_chain_commit_with_no_kept_record_is_still_held(self):
         result = self.workflow("failed-again-prepare-unrecorded")
         self.assertEqual(result["status"], "failed")
@@ -866,11 +1086,37 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertNotIn("verify", result["steps"])
         self.assertEqual(result["origin"].strip(), "refs/heads/main")
 
-    def test_missing_verification_cannot_become_done(self):
+    def test_missing_verification_is_reported_blocked_and_does_not_hold_an_approved_review(self):
         result = self.workflow("missing-verification")
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["verified"], ["blocked"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("in use blocked", result["summary"])
+
+    def test_failed_check_caused_by_the_environment_is_blocked_without_a_repair(self):
+        result = self.workflow("verify-environment-fault")
+        self.assertEqual(result["verified"], ["blocked"])
+        self.assertNotIn("verify_fix", result["steps"])
+        self.assertIn("blocked", result["summary"])
+
+    def test_passing_verdict_with_an_environment_failed_check_is_blocked_without_a_repair(self):
+        result = self.workflow("verify-environment-fault-pass")
+        self.assertEqual(result["verified"], ["blocked"])
+        self.assertNotIn("verify_fix", result["steps"])
+
+    def test_app_start_crash_naming_a_permissions_identifier_still_runs_the_repair(self):
+        result = self.workflow("verify-start-crash")
+        self.assertIn("verify_fix", result["steps"])
+
+    def test_failed_check_caused_by_the_change_still_runs_the_repair(self):
+        result = self.workflow("verify-change-fault")
+        self.assertIn("verify_fix", result["steps"])
+        self.assertEqual(result["verified"], ["pass"])
+
+    def test_app_start_denied_by_the_sandbox_is_blocked_without_a_repair(self):
+        result = self.workflow("verify-start-denied")
         self.assertEqual(result["verified"], ["blocked"])
         self.assertIn("blocked", result["summary"])
+        self.assertNotIn("verify_fix", result["steps"])
 
     def test_substantive_review_failure_cannot_become_done(self):
         result = self.workflow("review-rejected")
@@ -885,6 +1131,73 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("left out 3 earlier repair cycles", result["log"])
         self.assertEqual(result["budget"]["left_out"], [result["old"]])
         self.assertEqual(result["budget"]["parents"], [])
+
+    def test_notes_only_review_finishes_without_a_fix_round(self):
+        result = self.workflow("review-notes-only")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertNotIn("review_fix", result["steps"])
+        self.assertEqual(result["review"]["verdict"], "approve")
+        self.assertFalse(result["review"]["unresolved"])
+        self.assertEqual(result["review"]["problems"], [])
+        self.assertEqual(len(result["review"]["notes"]), 2)
+
+    def test_notes_go_in_the_pr_body_and_do_not_hold_it(self):
+        result = self.workflow("review-notes-dry-run")
+        self.assertIn("Review notes (not blocking)", result["body"])
+        self.assertIn("fixture major note", result["body"])
+        self.assertIn("fixture minor note", result["body"])
+        self.assertNotIn("Held as a draft", result["body"])
+
+    def test_review_loop_converges_on_the_earlier_blocker(self):
+        result = self.workflow("review-converges")
+        self.assertEqual(result["status"], "done", result["summary"])
+        for name in ("review", "review_fix", "review2"):
+            self.assertIn(name, result["steps"])
+        for name in ("review_fix2", "review3"):
+            self.assertNotIn(name, result["steps"])
+        for text in ("B1", "[issue]", "quince is listed after kumquat"):
+            self.assertIn(text, result["earlier"])
+        self.assertIn("+quince", result["fixed"])
+        self.assertNotIn("+kumquat", result["fixed"])
+        self.assertNotIn("could not read what changed", result["earlier"])
+        for text in ("B1", "fixture major note", "[issue]"):
+            self.assertIn(text, result["fix_prompt"])
+        self.assertEqual(len(result["review"]["notes"]), 1)
+
+    def test_security_blocker_cannot_be_waived(self):
+        result = self.workflow("review-security-waived")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("requested changes", result["summary"])
+
+    def test_regression_from_the_fix_still_blocks(self):
+        result = self.workflow("review-new-regression")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("requested changes", result["summary"])
+
+    def test_severity_outside_the_scale_still_blocks(self):
+        result = self.workflow("review-severity-slip")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("requested changes", result["summary"])
+
+    def test_review_answer_without_a_problems_list_does_not_approve(self):
+        result = self.workflow("review-problems-missing")
+        self.assertEqual(result["status"], "failed")
+
+    def test_unanswered_earlier_blocker_stays_open(self):
+        result = self.workflow("review-earlier-omitted")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("requested changes", result["summary"])
+
+    def test_approved_review_is_not_held_by_a_blocked_check_that_is_an_environment_fault(self):
+        result = self.workflow("blocked-check-environment")
+        self.assertEqual(result["verified"], ["blocked"])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("in use blocked", result["summary"])
+
+    def test_blocked_check_that_names_the_guard_still_holds_an_approved_review(self):
+        result = self.workflow("blocked-check-guard")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("blocked", result["summary"])
 
 
 class StagedResearchSynthesisTests(unittest.TestCase):
@@ -2765,6 +3078,8 @@ class PushedPrDraftTests(unittest.TestCase):
             return json.dumps({"isDraft": self.draft, "headRefOid": self.remote_head})
         if args[:2] == ["pr", "view"] and "body" in args:
             return json.dumps({"body": self.body})
+        if args[:2] == ["pr", "view"] and "title" in args:
+            return json.dumps({"title": "feat: Title"})
         if args[:2] == ["pr", "view"]:
             return json.dumps({"mergeStateStatus": "DRAFT" if self.draft else "CLEAN", "mergeable": "MERGEABLE"})
         if args[0] == "api":
@@ -2782,7 +3097,7 @@ class PushedPrDraftTests(unittest.TestCase):
     def reads(self):
         return [a for a, _ in self.calls if "isDraft,headRefOid" in a]
 
-    def found_run(self, held=False, feedback=False, pushed=False, moved=False, preset=False, legacy=False):
+    def found_run(self, held=False, feedback=False, pushed=False, moved=False, preset=False, legacy=False, fault=False):
         from arete import flows, tracker
         root = Path(tempfile.mkdtemp(dir=self.root))
         origin, wt = root / "origin.git", root / "wt"
@@ -2814,7 +3129,8 @@ class PushedPrDraftTests(unittest.TestCase):
                                    log=self.logs.append, tracker=tk, enter=lambda s: None, say=self.said.append)
         layer = config.RepoLayer(dir=Path())
         layer.trust_level = "automerge"
-        verified = verify.Verified("blocked" if held else "pass", blocked_by="needs a login")
+        verified = verify.Verified("blocked" if held or fault else "pass",
+                                   blocked_by="the dev server did not start" if fault else "the JEV guard refused it")
         job = flows.Job(config.Config(), self.run, root / "ws", ticket=tracker.Ticket("123", "#123", "Title"),
                         branch="work", checkouts=[c], layer=layer, verified=verified, review={"verdict": "approve"})
         staged = pipeline.Staged(counts={"a.txt": 1}, changed=[c])
@@ -2836,8 +3152,14 @@ class PushedPrDraftTests(unittest.TestCase):
         self.assertEqual(self.names("pr", "create"), [])
         self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]])
         self.assertEqual(len(self.names("pr", "merge")), 1)
+        self.assertEqual(self.names("pr", "merge")[0][-2:], ["--subject", f"feat: Title (#{gh.pr_number(self.URL)})"])
         self.assertFalse(self.draft)
         self.assertIn(f"pr: marked {self.URL} ready for review", self.logs)
+
+    def test_found_draft_pr_with_an_approved_review_and_a_check_blocked_by_the_environment_is_marked_ready(self):
+        self.found_run(fault=True)
+        self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]])
+        self.assertFalse(self.draft)
 
     def test_found_ready_pr_held_is_made_a_draft(self):
         for pushed in (False, True):
@@ -2848,7 +3170,7 @@ class PushedPrDraftTests(unittest.TestCase):
                 self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL, "--undo"]])
                 self.assertEqual(self.names("pr", "merge"), [])
                 self.assertTrue(self.draft)
-                self.assertTrue(self.said[-1].endswith("The PRs are drafts: the check in use was blocked. needs a login"))
+                self.assertTrue(self.said[-1].endswith("The PRs are drafts: the check in use was blocked. the JEV guard refused it"))
 
     def test_found_pr_in_a_revise_run_is_left_alone(self):
         for draft, held in ((True, False), (False, True), (False, False)):
