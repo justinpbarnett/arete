@@ -241,8 +241,8 @@ def question_text(i: int, q: dict) -> str:
                             for n, o in enumerate(q["options"]))
         return f"{head}\n   {pick}\n{options}"
     if q["kind"] == "secret":
-        return (f"{head}\n   Do not post the value here. Pass the variable `{q['name']}` through the layer's "
-                f"`[environment] pass`.")
+        return (f"{head}\n   Do not post the value here. `arete answer` stores `{q['name']}` for this repo without "
+                f"showing it.")
     if q["kind"] == "done":
         steps = "\n".join(f"   {n}. {outbound.plain(s, 400)}" for n, s in enumerate(q["steps"], 1))
         return f"{head}\n   Do this outside arete:\n{steps}"
@@ -315,8 +315,9 @@ def one_answer(i: int, q: dict, entry, recommended: bool) -> tuple[dict, str]:
     if entry == {"declined": True}:
         return {**base, "declined": True}, ""
     if q["kind"] == "secret":
-        return {}, (f"{at}: arete stores no secret values yet, so {q['name']} cannot be set; send "
-                    "{\"declined\": true} for it. Nothing was stored.")
+        if set(entry) == {"secret"} and isinstance(entry["secret"], str):
+            return {**base, "set": True}, ""
+        return {}, (f"{at}: give {{\"secret\": \"...\"}} with the value of {q['name']}, or {{\"declined\": true}}")
     if q["kind"] == "choice" and set(entry) == {"choice"}:
         picked, why = options_picked(q, entry["choice"])
         return ({**base, "picked": picked}, "") if not why else ({}, f"{at}: {why}")
@@ -334,7 +335,7 @@ def answers_for(ask: dict, body) -> list[dict]:
     questions = ask["questions"]
     if not isinstance(body, dict):
         raise TypeError("the answer must be an object")
-    problems = [f"unknown key {k}" for k in body if k not in ANSWER_KEYS]
+    problems = ["the body takes only answers and recommended"] if any(k not in ANSWER_KEYS for k in body) else []
     recommended = body.get("recommended", False)
     if not isinstance(recommended, bool):
         problems.append("recommended must be true or false")
@@ -353,6 +354,14 @@ def answers_for(ask: dict, body) -> list[dict]:
     if problems:
         raise ValueError("; ".join(problems))
     return found
+
+
+def secret_values(ask: dict, body: dict) -> dict[str, str]:
+    given = body.get("answers")
+    if not isinstance(given, list):
+        return {}
+    return {q["name"]: entry["secret"] for q, entry in zip(ask["questions"], given, strict=False)
+            if q["kind"] == "secret" and isinstance(entry, dict) and isinstance(entry.get("secret"), str)}
 
 
 def text_answers(ask: dict, text: str) -> list[dict]:

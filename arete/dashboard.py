@@ -253,8 +253,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             if status := refusal_status(e):
                 return self.send_json(status, refusal_answer(e))
-            self.log_error("%s", f"{type(e).__name__}: {e}")
-            self.send_json(500, {"error": as_sentence(util.first_line(f"{type(e).__name__}: {e}", 300))})
+            said = type(e).__name__ if self.path.startswith(ASK_PATH) else f"{type(e).__name__}: {e}"
+            self.log_error("%s", said)
+            self.send_json(500, {"error": as_sentence(util.first_line(said, 300))})
 
     def admit(self, method: str, path: str) -> None:
         node: Node = self.server.node
