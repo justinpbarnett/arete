@@ -21,6 +21,7 @@ from unittest import mock
 
 import arete
 from arete import config, control, devices, gh, outbound, paths, pi, pipeline, scratch, sessions, state, util, verify
+from arete import cli, codex, guard, runner, uploads
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -3039,6 +3040,186 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertTrue(Path(a.root).exists())
 
 
+@unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
+                     "needs macOS confinement")
+class AuthorityRotationTests(unittest.TestCase):
+    STATES = ("initializing", "prepared", "active", "pending", "retained", "done")
+    SCRIPT = r'''
+import contextlib, fcntl, hmac, io, json, os, sys
+from pathlib import Path
+from arete import browser, cli, hooks, record, scratch, util
+root, mode = Path(sys.argv[1]), sys.argv[2]
+scratch.AUTHORITY = root / "home/verification-authority"
+A = scratch.AUTHORITY
+def rotate():
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(["rotate-authority"])
+    print("BEHAVIOR_RESULT=" + json.dumps({"code": code, "out": out.getvalue(), "err": err.getvalue()}))
+if mode == "seed":
+    with scratch.registry(True) as (fd, key):
+        for i, s in enumerate(sys.argv[3].split(",")):
+            scratch.store(fd, key, {"version": 2, "attempt": {"selector": f"{i:064x}"}, "state": s,
+                                    "source_mutations": False})
+    browser.write_pin({"@playwright/mcp": {"version": "0.0.0", "integrity": "sha512-demo"}})
+    hooks.secret("demo")
+elif mode == "rotate":
+    rotate()
+elif mode == "kill-first-note":
+    scratch.note_resigned = lambda *a: os._exit(9)
+    rotate()
+elif mode == "kill-third-resign":
+    real, n = scratch.resign, [0]
+    def die(*a):
+        n[0] += 1
+        if n[0] == 3:
+            os._exit(9)
+        real(*a)
+    scratch.resign = die
+    rotate()
+elif mode == "kill-swap":
+    scratch.swap_secret = lambda *a: os._exit(9)
+    rotate()
+elif mode == "run":
+    record.start("pipeline", tag="x", repo="r", issue="1")
+elif mode == "lease":
+    lease = os.open(A / (f"{0:064x}" + ".lease"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lease, fcntl.LOCK_EX)
+    rotate()
+elif mode == "unheld-lease":
+    os.close(os.open(A / (f"{0:064x}" + ".lease"), os.O_RDWR | os.O_CREAT, 0o600))
+    rotate()
+elif mode == "lock":
+    with util.lock("poll"):
+        rotate()
+elif mode == "tamper":
+    p = A / (f"{int(sys.argv[3]):064x}" + ".json")
+    e = json.loads(p.read_text())
+    e["signature"] = "0" * 64
+    p.write_text(json.dumps(e))
+elif mode == "report":
+    old = bytes.fromhex(sys.argv[3])
+    envs = [json.loads(p.read_text()) for p in [*A.glob("*.json"), A / browser.PIN]]
+    broken = 0
+    for s in (f"{i:064x}" for i in range(6)):
+        try:
+            with scratch.registry() as (fd, key):
+                scratch.load(fd, key, s)
+        except (OSError, ValueError, KeyError):
+            broken += 1
+    print("BEHAVIOR_RESULT=" + json.dumps({
+        "states": sorted(r["state"] for r in scratch.records(True)) if not broken else None, "broken": broken,
+        "pin": sorted(browser.read_pin()) if not broken else None,
+        "old": sum(e["signature"] == hmac.digest(old, scratch.encoded(e["data"]), "sha256").hex() for e in envs),
+        "mode": os.stat(A / "signing.secret").st_mode & 0o777, "size": os.stat(A / "signing.secret").st_size,
+        "folder": os.stat(A).st_mode & 0o777,
+        "extra": sorted(p.name for p in A.iterdir() if p.name in ("signing.secret.next", "rotation.marker"))}))
+'''
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        for name in ("home", "config", "state", "logs", "worktrees"):
+            (self.root / name).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
+        self.env.update(ARETE_CONFIG_DIR=str(self.root / "config"), ARETE_STATE_DIR=str(self.root / "state"),
+                        ARETE_LOG_DIR=str(self.root / "logs"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"))
+        self.authority = self.root / "home/verification-authority"
+        self.hook = self.root / "config/hooks/demo.secret"
+        self.run_mode("seed", ",".join(self.STATES))
+        self.old = self.secret()
+
+    def run_mode(self, mode, *extra):
+        bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+        done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(self.root), mode, *extra], cwd=self.root,
+                              env=self.env, text=True, capture_output=True, timeout=300, check=False)
+        found = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                      if line.startswith("BEHAVIOR_RESULT=")), None)
+        result = json.loads(found) if found else {}
+        result["exit"] = done.returncode
+        result["stderr"] = done.stderr
+        return result
+
+    def secret(self):
+        return (self.authority / "signing.secret").read_bytes()
+
+    def files(self):
+        return {p.name: p.read_bytes() for p in self.authority.glob("*.json")}
+
+    def report(self):
+        return self.run_mode("report", self.old.hex())
+
+    def assertRotated(self):
+        shown = self.report()
+        self.assertEqual(shown["broken"], 0, shown)
+        self.assertEqual(sorted(shown["states"]), sorted(self.STATES), shown)
+        self.assertEqual(shown["pin"], ["@playwright/mcp"], shown)
+        self.assertEqual(shown["old"], 0, shown)
+        self.assertEqual(shown["extra"], [], shown)
+        self.assertNotEqual(self.secret(), self.old)
+
+    def test_a_clean_rotation_re_signs_every_record_and_the_pin(self):
+        hook = self.hook.read_bytes()
+        done = self.run_mode("rotate")
+        self.assertEqual((done["code"], done["out"]), (0, "re-signed records: 6, pins: 1\n"), done)
+        self.assertRotated()
+        shown = self.report()
+        self.assertEqual((shown["mode"], shown["size"], shown["folder"]), (0o600, 32, 0o700), shown)
+        self.assertEqual(self.hook.read_bytes(), hook)
+        for key in (self.old, self.secret()):
+            self.assertNotIn(key.hex(), done["out"] + done["err"])
+
+    def test_a_live_run_lease_or_engine_lock_refuses_and_changes_nothing(self):
+        cases = (("run", "pipeline"), ("lease", "attempt lease"), ("lock", "engine lock poll is held"))
+        self.assertEqual(self.run_mode("unheld-lease")["code"], 0)
+        self.assertRotated()
+        for mode, text in cases:
+            with self.subTest(mode=mode):
+                if mode == "run":
+                    self.run_mode("run")
+                before = (self.secret(), self.files())
+                done = self.run_mode("rotate" if mode == "run" else mode)
+                self.assertEqual(done["code"], 1, done)
+                self.assertIn("refused:", done["err"])
+                if mode != "run":
+                    self.assertIn(text, done["err"])
+                self.assertEqual((self.secret(), self.files()), before)
+                self.assertEqual(self.report()["extra"], [])
+
+    def test_a_killed_rotation_finishes_when_run_again(self):
+        for mode in ("kill-first-note", "kill-third-resign", "kill-swap"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.run_mode(mode)["exit"], 9)
+                self.assertEqual(self.secret(), self.old)
+                self.assertTrue((self.authority / "signing.secret.next").exists())
+                marker = self.authority / "rotation.marker"
+                if mode != "kill-first-note":
+                    names = json.loads(marker.read_text())["resigned"]
+                    self.assertTrue(names and all(n.endswith((".json", ".pin")) for n in names), names)
+                done = self.run_mode("rotate")
+                self.assertEqual(done["code"], 0, done)
+                self.assertRotated()
+                self.old = self.secret()
+
+    def test_a_file_that_verifies_under_neither_secret_stops_before_the_swap(self):
+        self.run_mode("tamper", "2")
+        name = f"{2:064x}.json"
+        done = self.run_mode("rotate")
+        self.assertEqual(done["code"], 1, done)
+        self.assertIn(name, done["err"])
+        self.assertEqual(self.secret(), self.old)
+        self.assertFalse((self.authority / "signing.secret.next").exists())
+        self.assertEqual(self.report()["broken"], 1)
+
+    def test_a_tampered_file_after_a_partial_rotation_still_stops_before_the_swap(self):
+        self.assertEqual(self.run_mode("kill-third-resign")["exit"], 9)
+        self.run_mode("tamper", "5")
+        done = self.run_mode("rotate")
+        self.assertEqual(done["code"], 1, done)
+        self.assertEqual(self.secret(), self.old)
+
+
 class EvidenceLinkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -4792,6 +4973,140 @@ gh.issue_create("fixture/repo", "Report", probe)
                 with self.subTest(args=args), self.assertRaisesRegex(TypeError, "gh.outgoing"):
                     gh.gh(args)
         self.assertTrue(gh.outgoing("x", "Closes #5").startswith("Closes #5\n\n"))
+
+
+class UploadGuardTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        self.evidence = self.root / "runs" / "run" / "evidence"
+        self.browser = self.root / "runs" / "run" / "browser"
+        self.outside = self.root / "outside.txt"
+        for d in (self.evidence, self.browser):
+            d.mkdir(parents=True)
+        self.outside.write_text("x")
+        for patch in (mock.patch.object(paths, "RUNS_DIR", self.root / "runs"),
+                      mock.patch.dict(os.environ, {"ARETE_RUN_ID": "run"})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        noted = mock.patch.object(guard, "note")
+        self.note = noted.start()
+        self.addCleanup(noted.stop)
+
+    def call(self, payload, raw=None):
+        text = raw if raw is not None else json.dumps(payload)
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(text)), mock.patch.object(sys, "stdout", out):
+            code = uploads.main()
+        return code, out.getvalue()
+
+    def upload(self, *names):
+        return {"tool_name": uploads.TOOL, "tool_input": {"paths": [str(n) for n in names]}}
+
+    def assertDenied(self, payload, rule, shown=None):
+        reason = uploads.decide(payload)
+        self.assertIn(rule, reason)
+        self.assertIn(str(shown or payload["tool_input"]["paths"][-1]), reason)
+        self.assertIn(str(self.evidence), reason)
+        _, out = self.call(payload)
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.note.call_args.args[0].error, reason)
+
+    def test_files_in_the_run_folders_are_allowed(self):
+        good = self.evidence / "a.png"
+        also = self.browser / "b.txt"
+        good.write_text("x")
+        also.write_text("x")
+        self.assertEqual(uploads.decide(self.upload(good, also)), "")
+        self.assertEqual(self.call(self.upload(good, also)), (0, ""))
+        self.note.assert_not_called()
+
+    def test_other_files_are_denied(self):
+        (self.evidence / "leak.txt").symlink_to(self.outside)
+        for name in (".env", "id_rsa", "x.pem"):
+            (self.evidence / name).write_text("x")
+        (self.evidence / "plain.txt").symlink_to(self.evidence / ".env")
+        cases = [(self.outside, uploads.OUTSIDE), ("rel.png", uploads.OUTSIDE),
+                 (self.evidence / "leak.txt", uploads.OUTSIDE), (self.evidence / ".env", uploads.SECRET),
+                 (self.evidence / "id_rsa", uploads.SECRET), (self.evidence / "x.pem", uploads.SECRET),
+                 (self.evidence / "plain.txt", uploads.SECRET), (self.evidence / "none.png", uploads.MISSING),
+                 (self.evidence, uploads.MISSING)]
+        for path, rule in cases:
+            with self.subTest(path=str(path)):
+                self.assertDenied(self.upload(path), rule)
+
+    def test_one_bad_path_denies_the_whole_call(self):
+        good = self.evidence / "a.png"
+        good.write_text("x")
+        self.assertDenied(self.upload(good, self.outside), uploads.OUTSIDE, self.outside)
+
+    def test_closing_the_chooser_is_allowed(self):
+        for args in ({"paths": []}, {}):
+            self.assertEqual(self.call({"tool_name": uploads.TOOL, "tool_input": args}), (0, ""))
+
+    def test_errors_deny(self):
+        good = self.evidence / "a.png"
+        good.write_text("x")
+        bad = [("not json", None), ({"tool_input": {"paths": str(good)}}, None),
+               ({"tool_input": {"paths": [1]}}, None), ({"tool_input": "x"}, None)]
+        for payload, _ in bad:
+            with self.subTest(payload=payload):
+                _, out = self.call(payload, payload if isinstance(payload, str) else None)
+                self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+        with mock.patch.dict(os.environ, {"ARETE_RUN_ID": ""}):
+            _, out = self.call(self.upload(good))
+            self.assertIn("deny", out)
+        with mock.patch.object(uploads, "decide", side_effect=RuntimeError):
+            self.assertIn("deny", self.call(self.upload(good))[1])
+        self.note.side_effect = OSError
+        self.assertIn("deny", self.call(self.upload(self.outside))[1])
+
+    def test_cli_denies_and_fails_closed(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.upload(self.outside)))), \
+                mock.patch.object(sys, "stdout", out):
+            self.assertEqual(cli.main(["upload-guard"]), 0)
+        self.assertIn("deny", out.getvalue())
+        with mock.patch.object(uploads, "main", side_effect=RuntimeError), mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(cli.main(["upload-guard"]), 2)
+
+    def launch(self, which="claude", guarded=False, remote=None):
+        picked = SimpleNamespace(candidate=SimpleNamespace(runner=which, effort="", instructions=()), selected=None, budget=None)
+        trip = SimpleNamespace(cfg=SimpleNamespace(jev=SimpleNamespace(guard=guarded),
+                                                   environment=SimpleNamespace(providers=())), repo=None, scratch=None,
+                               target=SimpleNamespace(remote=remote), tokens=None, hard_cap=False)
+        tools = [uploads.TOOL, "mcp__playwright__browser_click"]
+        with mock.patch.object(runner.environment, "passed", return_value=[]):
+            return runner.launch_kwargs({"allowed_tools": tools}, picked, trip, ("r", "s"), False, [].append)
+
+    def test_only_local_claude_gets_the_tool_and_its_hook(self):
+        for guarded in (False, True):
+            kw = self.launch(guarded=guarded)
+            groups = kw["settings"]["hooks"]["PreToolUse"]
+            self.assertIn(uploads.TOOL, kw["allowed_tools"])
+            self.assertEqual([g["matcher"] for g in groups if "playwright" in g["matcher"]], [uploads.TOOL])
+            self.assertEqual(guard.MATCHER in [g["matcher"] for g in groups], guarded)
+        for which, remote in (("codex", None), ("pi", None), ("claude", SimpleNamespace())):
+            with self.subTest(which=which, remote=bool(remote)):
+                kw = self.launch(which, remote=remote)
+                self.assertEqual(kw["allowed_tools"], ["mcp__playwright__browser_click"])
+                self.assertIn(uploads.WITHHELD, kw["system"])
+
+    def test_codex_refuses_the_tool_and_keeps_other_tools(self):
+        payload = {"tool_name": uploads.TOOL, "tool_input": {"paths": []}}
+        self.assertEqual(codex.guard_reason(payload, False, []), uploads.CODEX_REFUSAL)
+        click = {"tool_name": "mcp__playwright__browser_click", "tool_input": {}}
+        self.assertEqual(codex.guard_reason(click, False, []), "")
+
+    def test_the_tool_list_prompt_and_server_limit(self):
+        self.assertIn("browser_file_upload", verify.PLAYWRIGHT_TOOLS)
+        for name in ("browser_evaluate", "browser_run_code_unsafe"):
+            self.assertNotIn(name, verify.PLAYWRIGHT_TOOLS)
+        self.assertNotIn("--allow-unrestricted-file-access", verify.mcp_config(self.evidence))
+        note = pipeline.surface_note(SimpleNamespace(start="x"), "http://127.0.0.1:1", self.evidence)
+        self.assertIn("`browser_file_upload`", note)
+        self.assertIn(f"copy a worktree file into `{self.evidence}`", note)
 
 
 class NoLiveStateTests(unittest.TestCase):

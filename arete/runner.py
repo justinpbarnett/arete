@@ -29,6 +29,7 @@ from . import (
     record,
     replay,
     state,
+    uploads,
     util,
 )
 from . import scratch as verification_scratch
@@ -811,6 +812,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["selected"] = picked.selected
         if not target.remote:
             kw["providers"] = cfg.environment.providers
+    if uploads.granted(kw.get("allowed_tools")) and (which != "claude" or target.remote):
+        kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), uploads.WITHHELD]))
     return kw
 
 
@@ -1016,6 +1020,8 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), ask.rule()]
         kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), ask.note()]))
+    if uploads.granted(kw.get("allowed_tools")):
+        kw["settings"] = uploads.with_hook(kw.get("settings"))
     return kw
 
 

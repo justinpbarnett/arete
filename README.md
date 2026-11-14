@@ -56,7 +56,8 @@ A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete we
 ## On-call
 
 The watcher notices operational failures on its own and keeps one durable incident for each underlying symptom.
-JEV decides whether an incident may wake a repair; no repair starts yet.
+JEV decides whether an incident may wake a repair; a wake starts one bounded repair.
+Following the repair, recovery, escalation and steering come in later parts, so an incident whose repair started stays `repairing`.
 
 ```toml
 [oncall]
@@ -65,6 +66,12 @@ vision = "A payments service that must stay up"
 scope = "Bug fixes in the payment worker only"
 confidence = 0.8
 injection = 0.5
+max_repairs = 1
+wakes_per_hour = 10
+max_attempts = 2
+incident_budget_usd = 5.0
+daily_budget_usd = 10.0
+cooldown_minutes = 30
 
 [[oncall.source]]
 path = "~/Library/Logs/myapp/*.log"
@@ -80,7 +87,7 @@ scope = "Only the checkout module"
 `confidence` and `injection` are numbers from 0 to 1 and default to `[jev] confidence` and `[jev] injection`.
 When on, serve scans on its tick, on the poll pool, so a slow scan never blocks the tick.
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
-`repo` and `check` are recorded for a later repair part and start nothing now.
+`repo` names the repo a repair works in; `check` is recorded for a later part.
 When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is asked only `injection` and `actionable`, and a result that would be `wake` is stored as `unsure` for the owner, so no entry's text can ignore or wake it alone.
 An entry matches a file when its glob finds that file by any path, so a symlink, a hard link or another letter case names the same file, and it also matches the rotated `.1` copy of any file its glob names, which its watcher drains, even after the file itself was renamed away.
 Which entries match a file is looked up when its lines are read: a listed file renamed, re-created or linked anew after the scan began is matched again before its lines are read, and a listed file no `[[oncall.source]]` glob finds any more is treated like a gone file, never as one under the `[oncall]` text.
@@ -151,9 +158,29 @@ Twin checks and decisions share one budget: at most 20 JEV evaluations per scan,
 A symptom from a run that is still live gets no twin check and no decision until the run ends.
 All calls go through `oncall.ask_jev`, one function a test harness can replace.
 
+**Repairs.** Each scan, an incident decided `wake` starts one local task of kind `fix` with `tasks.start`, in the config's `arete_repo` for Arete's own sources (the heartbeat, serve, a run, or Arete's log and run folders) and in the source's `repo` otherwise.
+So planning, the isolated worktree, checks, verify, review, the PR, automerge and the permission rules are the ones every task has.
+The task prompt is `arete/prompts/oncall_repair.md`: diagnose and reproduce first, then make the smallest repair; the redacted evidence is a fenced block marked as untrusted data.
+Before a wake, Arete resolves the plan, build, verify, review and repair steps of that repo with `steps.resolve` and checks each with `routing.fit_refusal`, `routing.modes_for` and `routing.outlook`.
+A hold, a spent budget or a payment mode refusal leaves the incident `waiting` with that reason; with `payment_modes = ["subscription"]` no paid route is used, and no hold is bypassed.
+Task start and the route lookup go through `oncall.start_task` and `oncall.route_outlook`, which a harness can replace.
+
+| `[oncall]` key | Default | Bound |
+| --- | --- | --- |
+| `max_repairs` | 1 | repairs running at once |
+| `wakes_per_hour` | 10 | repairs started in the last hour |
+| `max_attempts` | 2 | repairs per incident; past it the incident is `blocked` |
+| `incident_budget_usd` | 5.0 | paid spend on one incident's repairs, counted like `state.paid_by_run`; past it the incident is `blocked` |
+| `daily_budget_usd` | 10.0 | paid spend of all repairs started in the last 24 hours; past it incidents wait |
+| `cooldown_minutes` | 30 | pause after each ended attempt |
+
+**No storms.** Lines a repair's run writes (run rows, `[repo task]` lines and a stalled run of its task) never open or wake an incident; each is counted in a note on the incident being repaired.
+A failure of a ticket with a live run counts as owned.
+A scan that died after the task was created adopts that task on the next scan instead of starting another.
+
 ```
-arete oncall             # incidents, newest first, each with its decision, confidence and reason, then the watcher's state
-arete oncall show ID     # one incident with its decision, answers, evidence and notes
+arete oncall             # incidents, newest first, each with its decision, repair state, then the watcher's state
+arete oncall show ID     # one incident with its decision, answers, repair attempts, evidence and notes
 arete oncall scan        # one scan now
 ```
 
@@ -202,6 +229,7 @@ Its sandbox and the `arete codex-guard` PreToolUse hook keep the promises claude
 | A read only step writes nothing | no write tools | A `read_only` permission profile: no file writes and no network. |
 | A build step writes only its worktree | write tools in the worktree | A `workspace_write` profile: the step's folder, its extra folders, `/tmp` and `$TMPDIR`, and no network. |
 | Secret files stay out | the guard hook | The profile denies every guard secret name pattern, including `.env.*` and `id_rsa*`, and credential directories recursively across the filesystem, including skipped dependency folders and arbitrary depths. It also excludes `CODEX_HOME`, both the active and original arete configuration directories, Claude's and Pi's private directories and any additional known secret paths. Protection does not depend on file discovery or a command naming a secret. Matching example and template files are conservatively excluded too. The hook also refuses commands naming secrets and patches targeting them. |
+| Browser file uploads | The `arete upload-guard` hook allows `browser_file_upload` only for files inside the run's evidence or browser folder, never a secret file, and denies on any error | The tool is withheld and the hook refuses it |
 | The guard's judge | `arete guard` with JEV | The same JEV judge, run by the hook. |
 | A timeout stops the step | SIGTERM, then SIGKILL after 30 s | The same. |
 
@@ -717,7 +745,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
-| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
+| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796), `owner`, the tailnet login the page opens for (default: the login that owns this machine), and `https` (default `false`; `true` fetches a tailscale certificate that lists the machine and tailnet name in public certificate transparency logs, and plain HTTP then gets a 308). See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
@@ -1189,6 +1217,8 @@ Checks passing is not the bar. After the checks, a verifier agent uses the chang
 Eligible local Codex verification attempts get a fresh mode-700 `.arete-scratch-<16 hex>` folder in their worktree. Arete exclusively creates five empty fixture slots: `config/config.toml`, `state/arete.db`, `fixtures/config.toml`, `fixtures/fixture.db` and `out/output.txt`. Rewrite these in place for fake configuration, SQLite state and output. Files and folders the verifier or the service creates in scratch are verification output and are archived with the scratch root at finalization, without any ownership claim from the guard. An entry that existed before the attempt, a folder holding one at any depth, a file with more than one link, an entry on another device, or one that cannot be classified keeps the attempt pending, and the diagnostic names each such entry and its reason under `unknown_entries` and `reasons`. The test compares the APFS file id with the largest id of the layout the attempt recorded, never a timestamp, and links are never followed.
 
 Harness authority and evidence live under the operating-system account's `.config/arete/verification-authority`, independently of HOME and Arete environment settings. Signed initialization intent is persisted before creating workspace resources, with progress checkpoints and lease release on failure. Records bind each run directory, step, attempt, workspace, original resources and lifecycle. Hook arguments only select this authority; hooks never create or adopt records. Repository commands, including checks and setup, exclude the authority through the shared command seam. A signed baseline is captured before repository execution; kernel process identities and ancestry distinguish unrelated concurrent runs while retaining unknown descendants. Producers wait behind a pipe gate until their process group is durably registered: engine death before release cannot start actor code, and polling waits for registered groups after release. Kernel process identities captured before release also detect descendants that leave their group. A new process whose origin cannot be ruled out conservatively keeps the original worktree retained until it exits; no unrelated process is killed. With the producer baseline, Arete records every job label loaded in the account's `gui` and `user` launchd domains, idle or running. A process that launchd started for one of those labels does not hold an attempt when the job is defined on the sealed system volume and runs the program it declares, as an Apple on demand agent does. A sealed job whose label is not in the baseline holds as a submitted launchd job, and as unclassified when the record has no label baseline. A producer that boots out a baseline label and bootstraps it again, or starts a loaded agent with `launchctl kickstart`, is not told apart from a system start. Submitted launchd jobs, orphans of a producer and processes that cannot be classified do hold it. The retained diagnostic and the run log name each holder with its pid, executable and reason. Legacy ambiguous producer records and relocated registered roots remain retained. Snapshot reads traverse checked directory descriptors without following links, validate original single-link file identities and enforce size limits. After producers stop, finalization snapshots the registered slots and journals a transaction to archive the whole scratch root in protected evidence. It seals the owned captured directories against new entries through existing directory handles and validates the complete tree again before marking the attempt `done`, releasing the clean worktree for removal or reuse. A run that ends while scratch is left still records the edits, git-ignored files and branch heads it left. The record leaves out engine scratch roots, which are the folders that a signed attempt record names. Arete records a folder that only has the scratch name, and removes it like other leftovers. A folder whose name a record names keeps the workspace retained in every state, and the park message names the held folders. Where arete cannot read the attempt records, every folder with the scratch name keeps the workspace retained. Once the attempt is `done` a forced run reuses the worktree as after a clean run, and a file changed after that record still stops it. The kept edits are committed to the local branch first, so the record names the kept commit and a forced run continues from it. A raced replacement is restored without overwriting a newly created source entry; incomplete restoration retains both resources and the worktree for retry. Entries the attempt did not create stay protected, and no recursive source deletion occurs. Ordinary polling retries failed snapshots and cleanup transactions after completion, cancellation or interruption. Previously authenticated snapshot-only attempts can finish using their registered identities; unsigned markers grant no recovery permission.
+
+`arete rotate-authority` rotates the authority's signing secret: it re-signs every attempt record, including `done` ones, and the browser server pin under a new secret, checks every file, then renames the new secret over the old one. It refuses, naming the blocker and changing nothing, while a run is active, an attempt lease is held or an engine lock is held. A file that verifies under neither secret stops it before the swap. Run it again after an interruption to finish. Webhook and hook secrets are separate and untouched.
 
 Trusted ownership context is restricted to local Codex confinement in isolated worktrees outside broad temporary-directory grants, with the registry, evidence and neighboring worktrees excluded through its existing permission profile. Service-backed attempts also receive scratch and substitute `{scratch}` in start commands and notes. Supported local services reuse the existing macOS confinement seam with workspace writes, neighboring-worktree exclusions and secret-file protections, without Pi credential-directory grants. Their environment drops credential values and directs Arete config, state, logs and worktrees into scratch. Startup failure, teardown and cancellation retain the same preservation lifecycle. Other runners continue ordinary verification without enhanced ownership hooks. Unsupported routes receive guidance to run ordinary checks and report unavailable required fixtures or services as blocked. A Codex verify with a verify URL on `localhost` or a loopback IP literal may use one browser server, the one `scratch.browser_command` builds: the pinned `@playwright/mcp` run by the engine's `node` in its own process group, inside a profile that writes only a `browser` folder under the run folder (mode 700, never published) and the run's evidence folder, hides the authority, the state folder except this run's evidence, its own `browser` folder and the pinned server folder (read only), the real Chrome profile, keychains and shell startup files, denies mach lookups outside an allowlist, and allows outbound network only to the app's TCP port on `localhost` and unix sockets under its folder, which the server reaches through a path relative to that folder so a long run folder still fits the socket name limit. Chrome gets `--no-sandbox` only there. `scratch.isolation` accepts a server list only when it is exactly that server, and any failure to build it fails the step rather than falling back. Ending the attempt kills the group and keeps the worktree when it cannot confirm that nothing able to write the browser folder, evidence or workspace remains. The mach allowlist is a candidate: a person must confirm it with a real headless Chrome run on a machine that does not itself run under confinement. Local ordinary producers exclude the authority store, including evidence; this does not grant them trusted fixture authority. Tracking a process group or isolating its environment grants no filesystem protection. These profiles also deny LaunchServices opens, Apple events and launchd job creation, deny connections to the tmux, ssh agent and docker sockets and to the port of the live dashboard or a running `arete serve`, and the service profile allows unix socket connections only under its workspace and the system temp folders. A verify URL on a dashboard port is refused as blocked. Engine fetches and pushes keep the ssh agent, and `arete install` and local notifications keep launch rights. The installed guard supplies authenticated facts about the five slots to JEV for the entire original command; it never replaces a hold, changes a threshold or exempts a command. Unsupported confinement and evaluation grades receive no enhanced ownership context; grades need separate lifecycle support before this can be enabled there.
 
@@ -1908,6 +1938,7 @@ Each of these commands makes one call to the server and prints JSON and nothing 
 | `arete answer RUN_ID [--ask ID] [--json BODY]` | `GET /api/asks`, then `POST /api/asks/ASK_ID/answer` for the run's oldest open ask; with no `--json` it prompts per question on stderr, reading a secret without echo or from a pipe; `--json` refuses a secret value |
 | `arete secrets REPO` | lists the names of the secrets stored for REPO, never a value |
 | `arete secrets rm REPO NAME` | removes one stored secret; exits 1 when REPO has none by that name |
+| `arete rotate-authority` | re-signs every scratch record and the browser pin under a new verification signing secret, then swaps it in; exits 1 and names the blocker while a run, an attempt lease or an engine lock is live |
 | `arete resume RUN_ID [--step STEP]` | `POST /api/runs/RUN_ID/resume` |
 | `arete repair RUN_ID` | `POST /api/runs/RUN_ID/repair` |
 | `arete step RUN_ID STEP [key=value ...]` | `POST /api/runs/RUN_ID/steps/STEP` |
