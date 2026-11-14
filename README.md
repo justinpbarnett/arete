@@ -493,6 +493,18 @@ Pipeline budgets span repairs, continuations and individual step reruns. The def
 
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
+## When a worktree is kept and when it is removed
+
+A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The run that makes it owns it: `workspaces/<name>.json` under the state folder holds the owner (run id, repo, ticket, created time and the checkouts) and a fingerprint of every file arete made there, including the setup outputs such as `.venv/`, written when the workspace is made and again before any removal.
+
+- Kept after a failed, parked or stopped run, a waiting ask, a dry run, leftover verification scratch, or any file the record does not cover.
+- Removed by the run itself at a `pr`, `done`, no-change or plain needs-info ending. When the removal is blocked, `run.log` says `workspace kept at ...: removal blocked by` and lists the names.
+- Removed by the next run of the same ticket, when the worktree still matches the record.
+- Removed by each poll's sweep when the owning run is `merged`, `rejected` or `done` (or the ticket is a closed local task), no run holds the ticket, and every file still matches the record. The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock. A workspace waiting for its ticket, or blocked by a file arete did not make, stays.
+- Every poll also runs `git worktree prune` on each configured repo. The local `arete/<n>-...` branch stays.
+
+The sweep writes the workspaces it keeps to `held-workspaces.json` in the state folder. A blocked workspace is listed with the names of the files that block it (ignored, untracked or edited tracked files that the record does not cover). The heartbeat check `workspaces:held` shows their count, size and oldest, and warns when one is blocked; the Health view lists them under Held workspaces. A folder with no owner is removed after 7 days when it holds no file.
+
 ## Records
 
 Every agent call writes its runner's raw output to `runs/<run_id>/record/<step>.jsonl.gz` under the state folder while it runs.
@@ -667,7 +679,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, `benchmarks/`, loop digests, `captures/`, `serve.json`, `server.json`, `price-snapshot.json`)
+- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, `benchmarks/`, loop digests, `captures/`, `serve.json`, `server.json`, `price-snapshot.json`, `workspaces/` records, `held-workspaces.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -708,7 +720,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. See [The seam](#the-seam). |
 | `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
-| `[dashboard]` | `port` (default 8796) and `owner`, the tailnet login the page opens for. Default: the login that owns this machine. See [Dashboard](#dashboard). |
+| `[dashboard]` | `port` (default 8796), `owner`, the tailnet login the page opens for (default: the login that owns this machine), and `https` (default `false`; `true` fetches a tailscale certificate that lists the machine and tailnet name in public certificate transparency logs, and plain HTTP then gets a 308). See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
 | `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `[jev.screen_lines]` (the chance at which each push screen question holds a push: `weakens` 0.5, `secrets` 0.7, `outside` 0.7, `irreversible` 0.5, `feature` 0.6, `removes` 0.5, `renames` 0.5, and `reach` 0.8, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost; it outranks an imported [price snapshot](#price-snapshots) in route sorting. A component you leave out stays unknown in `arete steps`, not zero, and a call still charges it as zero. |
@@ -1699,6 +1711,25 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 It listens only on the machine's tailnet addresses.
 A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 
+By default it answers plain HTTP on the machine's tailnet addresses, calls no `tailscale cert` and makes no `tailscale serve` mapping.
+HTTPS is off until the owner turns it on with `https = true` under `[dashboard]` in the config; the key takes `true` or `false` and defaults to `false`.
+With it on, the dashboard answers over HTTPS on the machine's tailnet name (`https://NAME:PORT`) with a tailnet certificate from `tailscale cert`.
+The certificate and key are `dashboard.crt` and `dashboard.key` in the state folder, mode 0600; arete fetches them at start and every week, and keeps the old ones when a renewal fails.
+The first fetch makes Tailscale issue a public certificate, which lists the machine and tailnet name in public certificate transparency logs, and that cannot be undone.
+With HTTPS on, plain HTTP on the same port answers 308 and redirects to HTTPS, so webhook senders should use the HTTPS address.
+Admission is the same over HTTPS: the host must be the tailnet name or address, the login must be the owner's, and a change needs `X-Arete`.
+When `tailscale cert` cannot run, as under the sandboxed macOS app, arete falls back to `tailscale serve`, and only ever changes a mapping it made itself.
+It reserves its listener first, writes `dashboard-proxy-PORT.json` in the state folder before it asks for the mapping, and completes that record from `tailscale serve status`.
+It never uses, replaces or removes a mapping it did not record, and when the port already has one it serves plain HTTP.
+Its own mapping stays when the dashboard stops, and the next start on that port reuses it; that start opens the 127.0.0.1 listener as soon as it finds the record, before it asks for a certificate or reads `tailscale serve status`.
+It removes the mapping only when a certificate is ready for a dashboard on that port and every mapping on the port is its own; otherwise remove it by hand with `tailscale serve --https=PORT off`.
+A dashboard moved to another port therefore leaves the old mapping and its record where they were.
+While its mapping is, or may be, on the port the dashboard keeps listening on 127.0.0.1 only, trusting Tailscale's login header from loopback alone. That listener stays open while Tailscale reports no address, while arete tries again for a certificate every hour, and when the tailnet name, address or owner changes. arete closes it only after `tailscale serve status` shows its mapping gone.
+A second dashboard on the same state folder and port waits and changes nothing.
+With HTTPS on, scratch state asks for no certificate and changes no mapping.
+When the fallback fails too, the dashboard serves plain HTTP as before and tries for a certificate again every hour.
+Turning HTTPS off again releases a `tailscale serve` mapping that an earlier run recorded and calls nothing else of Tailscale's. Over HTTPS the page can be added to the Home Screen of a phone, where it opens as the app Arete without browser chrome.
+
 A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find, Console and Feedback.
 It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
 Below 1040 px the sidebar wraps into a block above the page.
@@ -1733,7 +1764,7 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
   Refresh triage now starts a refresh.
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.
 - Outcomes: for the last 30 days, the pipeline runs that shipped (a pull request, or a branch the adw flow pushed) and failed each day, the decisions that went without you against the ones you made, what you paid by day, model, runner and loop, the runs by repo, and the eval pass rate by repo.
-- Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, and the loops that report on their own.
+- Health: the open alerts and failures first, then serve's beat with Install serve or Restart serve when serve is not running, each device with its last probe, tools and Probe, the heartbeat checks with Run the checks now, the probes, the loops that report on their own, and the held workspaces with their size, age and reason.
 - Settings: `max_parallel`, `max_parallel_per_repo` and the model for each role in `[models]`.
   A save changes only the lines that changed in `config.toml`, keeps the file's mode, and refuses a value arete cannot use.
   An empty model removes its line, so the role goes back to its default.
@@ -1881,7 +1912,7 @@ Each of these commands makes one call to the server and prints JSON and nothing 
 | `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
 
-They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, process id, state folder and config file to `server.json` in the state folder. The commands call that server while its process is alive, it works on the same state folder and config file as they do, and its address answers within a second; when it does not answer, a command says so and names `arete serve` and `ARETE_SERVER`. `ARETE_SERVER=http://HOST:PORT` names a server and skips that check. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
+They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, scheme, tailnet name, process id, state folder and config file to `server.json` in the state folder; over HTTPS the commands verify the certificate against that name. The commands call that server while its process is alive, it works on the same state folder and config file as they do, and its address answers within a second; when it does not answer, a command says so and names `arete serve` and `ARETE_SERVER`. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check; a plain HTTP address follows the dashboard's redirect to HTTPS. Behind `tailscale serve`, `server.json` names the loopback listener and the owner's login, and the commands call it there with the tailnet name as host, so any process on the machine is trusted as the owner. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
 
 A failed command prints one line with `error` and no `event`, with `code` when the server answered with an HTTP status, and exits 1. A command line these commands cannot parse, such as a missing argument or an unknown flag, prints one line with `error` and `usage` and exits 1. A `step_end` line or a step row with an `error` field is a step's error, not the command's. When no server works on the state, the readers (`task show`, `lines` and `status --json`) read the local state instead, and the others print one `error` line and exit 1. When a stream of lines drops, as it does when serve restarts on new code, `wait`, `lines --follow` and `arete run` connect again and go on from the last line they read. They give up with an `error` line when the run ended with no `report` line, or when no line came for 2 minutes.
 

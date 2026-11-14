@@ -72,10 +72,26 @@ function tally(failing, what, after = "") {
   return el("p", {}, stateChip(failing ? "fault" : "ok"), ` ${what}, ${failing} failing.${after}`);
 }
 
+function megabytes(n) {
+  return n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`;
+}
+
+function heldRow(r) {
+  return el("tr", {}, cell(r.name), cell([r.run, r.status ? ` · ${r.status}` : ""], "nb"), cell(megabytes(r.bytes), "nb"),
+    cell(liveAgo(r.since), "nb"), cell([r.blocked ? stateChip("caution") : null, r.blocked ? " " : "", r.why || ""], "muted-cell"));
+}
+
+function heldWorkspaces(w) {
+  return w.count
+    ? [el("p", {}, stateChip(w.blocked ? "caution" : "ok"), ` ${count(w.count, "workspace is", "workspaces are")} held, ${megabytes(w.bytes)} in all. The oldest, ${w.oldest_name}, since `, liveAgo(w.oldest), "."),
+      fold("health:workspaces", showAll(w.count, "workspace", "workspaces"), table("", [["Workspace"], ["Run and status", "nb"], ["Size", "c-time"], ["Since", "c-time"], ["Why"]], w.rows.map(heldRow)))]
+    : quiet("No workspace is held.");
+}
+
 function drawHealth(h) {
   const failed = failures(h);
   const s = h.serve;
-  const titles = ["Alerts and failures", "Serve", "Devices", "Checks", "Loops", "Probes"];
+  const titles = ["Alerts and failures", "Serve", "Devices", "Checks", "Loops", "Probes", "Held workspaces"];
   fill("health-body",
     healthSummary(h, failed),
     jumps(titles),
@@ -107,6 +123,8 @@ function drawHealth(h) {
       ? [tally(a.probes.filter((p) => !p.ok).length, count(a.probes.length, "probe", "probes")),
         fold("health:probes", showAll(a.probes.length, "probe", "probes"), table("", [["Probe"], ["State", "c-status"], ["Last run", "c-time"], ["Last good", "c-time wide-only"], ["Detail", "wide-only"]],
           a.probes.map((p) => el("tr", {}, cell(p.name), cell(stateChip(p.ok ? "ok" : "fault")), cell(liveAgo(p.last_run)), cell(liveAgo(p.last_ok)), cell(p.detail || "")))))]
-      : quiet("No probe has run yet."))));
+      : quiet("No probe has run yet."))),
+    heading(7, titles[6]),
+    panelParts(h.workspaces, "The held workspaces", heldWorkspaces));
   return h.checks.rows?.running ? LIVE_MS : SLOW_MS;
 }

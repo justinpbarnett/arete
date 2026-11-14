@@ -222,6 +222,8 @@ WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "D
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 SERVER_FILE = STATE_DIR / "server.json"
+TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
+TLS_KEY_FILE = STATE_DIR / "dashboard.key"
 LOOP_MARKS_FILE = STATE_DIR / "loops.json"
 LOCKS_DIR = STATE_DIR / "locks"
 
@@ -246,6 +248,10 @@ def short_path(p: str | Path) -> str:
         return "~"
     below_home = home.rstrip(os.sep) + os.sep
     return "~/" + s[len(below_home):] if s.startswith(below_home) else s
+
+
+def proxy_file(port: int) -> Path:
+    return STATE_DIR / f"dashboard-proxy-{port}.json"
 
 
 def scratch_dir(run_id: str) -> Path:
