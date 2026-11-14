@@ -38,7 +38,8 @@ def saved_review(run_id: str) -> tuple[dict, int]:
     if review.get("verdict") != "request_changes" or not listed:
         raise Refused(f"run {run_id} requested changes but saved no findings to repair")
     found = {"verdict": "request_changes", "problems": pipeline.review_problems(
-        [{"file": p.get("file"), "problem": p["text"], "severity": p.get("severity")} for p in listed])}
+        [{"file": p.get("file"), "problem": p["text"], "severity": "blocker", "category": p.get("category")}
+         for p in listed])}
     return found, int(report.get("seq") or 0)
 
 

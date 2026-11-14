@@ -56,6 +56,13 @@ from .heartbeat import mark_loop, network_up_or_skip
 from .util import git
 
 MAX_DIFF_IN_PROMPT = 60_000
+MAX_FIX_DIFF_IN_PROMPT = 20_000
+BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
+UNWAIVABLE = ("security", "data_loss")
+EARLIER_STATUSES = ("fixed", "open", "waived")
+NO_FIX_REPLY = "The builder gave no reply."
+NO_FIX_DIFF = "Arete could not read what changed; judge the diff above."
+REFUSAL_WORDS = re.compile(r"guard|jev|credential", re.IGNORECASE)
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
@@ -114,7 +121,6 @@ PLAN_SCHEMA = {
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
-        "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
         "summary": {"type": "string"},
         "changes": {"type": "string"},
         "problems": {
@@ -125,12 +131,25 @@ REVIEW_SCHEMA = {
                     "file": {"type": "string"},
                     "problem": {"type": "string"},
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                    "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
                 },
                 "required": ["problem", "severity"],
             },
         },
+        "earlier": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "status": {"type": "string", "enum": list(EARLIER_STATUSES)},
+                    "why": {"type": "string"},
+                },
+                "required": ["id", "status", "why"],
+            },
+        },
     },
-    "required": ["verdict", "summary", "problems"],
+    "required": ["summary", "problems"],
 }
 LEARN_SCHEMA = {
     "type": "object",
@@ -1578,7 +1597,7 @@ def round_name(name: str, n: int) -> str:
 
 
 def review_findings(review: dict) -> str:
-    return "\n".join(f"- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in review.get("problems", []))
+    return "" if review.get("failed") else numbered(blocking(review))
 
 
 def repaired_by(run_id: str) -> str:
@@ -1588,8 +1607,12 @@ def repaired_by(run_id: str) -> str:
 def report_review(review: dict) -> dict:
     return {"verdict": str(review.get("verdict") or ""), "summary": str(review.get("summary") or ""),
             "unresolved": review.get("verdict") == "request_changes",
-            "problems": [{"file": p["file"], "text": p["problem"], "severity": p["severity"]}
-                         for p in review_problems(review.get("problems"))]}
+            "problems": reported(blocking(review)), "notes": reported(review_notes(review))}
+
+
+def reported(listed: list[dict]) -> list[dict]:
+    return [{"file": p["file"], "text": p["problem"], "severity": p["severity"], "category": p.get("category") or ""}
+            for p in listed]
 
 
 def note_review(run: Run, review: dict, verified: verify.Verified) -> None:
@@ -1840,16 +1863,18 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
 
     verified = verify_in_use(b, goal, build_summary)
     reviews, n = max(1, run.settings("review").tries), 1
-    review = _review(b, plan_to_review, verified)
+    review, reply = _review(b, plan_to_review, verified), ""
     note_review(run, review, verified)
     while review.get("verdict") == "request_changes" and n < reviews:
         if problems := review_findings(review):
             run.story.append(f"Review requested changes:\n{problems}")
-            b.resume(round_name("review_fix", n), prompt("review_fix", problems=problems), role="review_repair")
+            reply = b.resume(round_name("review_fix", n),
+                             prompt("review_fix", problems=problems, notes=notes_text(review)),
+                             role="review_repair").text
             b.recheck("the review fixes")
             verified = verify_in_use(b, goal, build_summary)
         n += 1
-        review = _review(b, plan_to_review, verified, round_name("review", n))
+        review = _review(b, plan_to_review, verified, round_name("review", n), review, reply)
         note_review(run, review, verified)
     draft_why = draft_reason(review, verified, n)
     note_review(run, review, verified)
@@ -1956,7 +1981,6 @@ def summary_of(review: dict, build_summary: str) -> str:
 def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
                 size: str, held: str = "", written: str = "") -> str:
-    problems = review.get("problems", [])
     return public_text(run, (
         f"## Summary\n\n{written or summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
@@ -1964,7 +1988,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
         + assumed_block(run)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
         f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
-        + "".join(f"\n- [{p['severity']}] {p.get('file', '')}: {p['problem']}" for p in problems)
+        + review_lists(review)
         + (f"\n\nHeld as a draft: {held}." if held else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else
@@ -2639,23 +2663,101 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch
     return "pr", "answered the review without code changes", urls
 
 
-def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review") -> dict:
-    t = b.ticket
+def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: dict | None = None,
+            reply: str = "") -> dict:
+    t, before = b.ticket, before or {}
+    earlier = blocking(before)
     res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
-                                   diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT)),
+                                   diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT),
+                                   earlier=earlier_review(earlier, reply,
+                                                          fixed_since(b, before.get("trees") or {}))),
                       b.ws, role="review", allowed_tools=bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
-        return {"verdict": "request_changes", "summary": "review step failed", "problems": []}
-    return {**res.structured, "problems": review_problems(res.structured.get("problems"))}
+        return {"verdict": "request_changes", "summary": "review step failed", "problems": [], "failed": True,
+                "earlier": [{**p, "id": f"B{n}", "status": "open", "why": "the review step failed"}
+                            for n, p in enumerate(earlier, 1)],
+                "waived": before.get("waived") or [], "trees": before.get("trees") or {}}
+    return judged(res.structured, earlier, before.get("waived") or [], index_trees(b.checkouts))
+
+
+def judged(said: dict, earlier: list[dict], waived: list[dict], trees: dict) -> dict:
+    answered = settled(earlier, said.get("earlier"))
+    found = {**said, "problems": review_problems(said.get("problems")), "earlier": answered, "trees": trees,
+             "waived": waived + [e for e in answered if e["status"] == "waived"]}
+    return {**found, "verdict": "request_changes" if blocking(found) else "approve"}
+
+
+def settled(earlier: list[dict], answers) -> list[dict]:
+    said = ({str(a.get("id") or "").strip().upper(): a for a in answers if isinstance(a, dict)}
+            if isinstance(answers, list) else {})
+    out = []
+    for n, p in enumerate(earlier, 1):
+        answer = said.get(f"B{n}", {})
+        status = answer.get("status") if answer.get("status") in EARLIER_STATUSES else "open"
+        if status == "waived" and p.get("category") in UNWAIVABLE:
+            status = "open"
+        out.append({**p, "id": f"B{n}", "status": status, "why": str(answer.get("why") or "")})
+    return out
+
+
+def blocking(review: dict) -> list[dict]:
+    return ([p for p in review_problems(review.get("problems")) if p["severity"] == "blocker"]
+            + [e for e in review.get("earlier") or [] if e.get("status") == "open"])
+
+
+def review_notes(review: dict) -> list[dict]:
+    return [p for p in review_problems(review.get("problems")) if p["severity"] != "blocker"]
+
+
+def numbered(listed: list[dict]) -> str:
+    return "\n".join(f"- B{n} [{p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
+                     for n, p in enumerate(listed, 1))
+
+
+def notes_text(review: dict) -> str:
+    return "\n".join(f"- [{p['severity']}] {p['file']}: {p['problem']}" for p in review_notes(review)) or "None."
+
+
+def review_lists(review: dict) -> str:
+    notes = ([f"[{p['severity']}] {p['file']}: {p['problem']}" for p in review_notes(review)]
+             + [f"[waived {p.get('category') or 'blocker'}] {p.get('file', '')}: {p['problem']} ({p['why']})"
+                for p in review.get("waived") or []])
+    return ("".join(f"\n- [blocker, {p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
+                    for p in blocking(review))
+            + ("\n\n### Review notes (not blocking)\n" + "".join(f"\n- {n}" for n in notes) if notes else ""))
+
+
+def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
+    if not earlier:
+        return ""
+    return prompt("review_earlier", blockers=numbered(earlier), reply=reply.strip() or NO_FIX_REPLY,
+                  fixed=fixed or NO_FIX_DIFF)
+
+
+def index_trees(checkouts: list[Checkout]) -> dict[str, str]:
+    try:
+        return {c.prefix: git(["write-tree"], c.wt).strip() for c in checkouts}
+    except RuntimeError:
+        return {}
+
+
+def fixed_since(b: Build, trees: dict[str, str]) -> str:
+    try:
+        return util.tail("".join(
+            checkout_patch(c, [n for n in b.staged.locks if n.startswith(c.prefix)], "--cached", trees[c.prefix])
+            for c in b.checkouts if trees.get(c.prefix)), MAX_FIX_DIFF_IN_PROMPT)
+    except RuntimeError:
+        return ""
 
 
 def review_problems(listed) -> list[dict]:
     if not isinstance(listed, list):
         return []
-    return [{"file": p.get("file") or "", "problem": p.get("problem") or "", "severity": p.get("severity") or "unrated"}
+    return [{"file": p.get("file") or "", "problem": p.get("problem") or "", "severity": p.get("severity") or "unrated",
+             "category": p.get("category") if p.get("category") in BLOCKER_CATEGORIES else ""}
             for p in listed if isinstance(p, dict)]
 
 
@@ -2830,13 +2932,15 @@ def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[st
 
 
 def draft_reason(review: dict, verified: verify.Verified, reviews: int = 0) -> str:
-    if verified.verdict == "blocked":
+    approved = review.get("verdict") == "approve"
+    refused = REFUSAL_WORDS.search(f"{verified.blocked_by} {verified.summary}")
+    if verified.verdict == "blocked" and (not approved or refused):
         return "the check in use was blocked"
-    if review.get("verdict") == "approve":
+    if approved:
         return ""
     if review.get("verdict") == "request_changes" and reviews:
         return (f"the review still requested changes after {util.count(reviews, 'review')}, the most the review "
-                f"step's tries allow, so {util.count(len(review.get('problems', [])), 'finding')} stay unresolved")
+                f"step's tries allow, so {util.count(len(blocking(review)), 'blocker')} stay unresolved")
     return "the review did not approve it"
 
 
