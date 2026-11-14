@@ -173,7 +173,7 @@ class Server:
         self.beat(every_loop, live)
 
     def prune(self) -> None:
-        state.prune()
+        state.prune(keep_days=self.cfg.oncall.keep_days)
         limits = self.cfg.retention
         try:
             found = record.prune(limits.days, limits.max_gb)

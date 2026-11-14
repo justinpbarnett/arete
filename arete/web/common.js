@@ -8,10 +8,11 @@ const VIEWS = {
   triage: { label: "Triage", group: "Work", key: "t", sub: "Every open ticket, grouped by what it needs before it can be built." },
   outcomes: { label: "Outcomes", group: "Watch", key: "m", sub: "What shipped, what went without you, and what you paid." },
   health: { label: "Health", group: "Watch", key: "h", sub: "Alerts and failures first, then serve, the devices, the checks and the loops." },
+  incidents: { label: "Incidents", group: "Watch", key: "i", sub: "What the on-call watcher found, what it decided, and what it is doing about it." },
   settings: { label: "Settings", group: "Settings", key: "e", sub: "How many runs go at once, and the model for each role." },
   usage: { label: "Usage", group: "Settings", key: "u", sub: "Which views you open, how you reach them, and what you press." },
 };
-const ITEM_LABELS = { run: "Run", session: "Session", loop: "Loop", ticket: "Ticket" };
+const ITEM_LABELS = { run: "Run", session: "Session", loop: "Loop", ticket: "Ticket", incident: "Incident" };
 const LIVE_MS = 5000;
 const SLOW_MS = 30000;
 const CHAT_BUSY_MS = 3000;

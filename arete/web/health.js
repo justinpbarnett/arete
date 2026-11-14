@@ -55,12 +55,13 @@ function failures(h) {
   for (const l of h.checks.rows?.loops ?? []) if (!l.ok) add("fault", "Loop", l.name, l.detail);
   for (const [name, why] of Object.entries(h.serve.broken || {})) add("fault", "Loop file", name, why);
   for (const [source, error] of Object.entries(h.serve.poll_errors || {})) add("caution", "Source", source, error);
+  for (const i of h.incidents?.rows ?? []) add("caution", "Incident", itemLink("incident", String(i.id), `#${i.id}`, `incident:${i.id}`), `blocked: ${i.waiting} · ${i.signature}`);
   for (const d of h.devices.rows ?? []) if (d.probe && !d.probe.ok) add("fault", "Device", d.name, probeWords(d.probe));
   return rows.sort((a, b) => (a.state === "fault" ? 0 : 1) - (b.state === "fault" ? 0 : 1));
 }
 
 function healthSummary(h, failed) {
-  const unread = [h.checks, h.alerts, h.devices].filter((p) => !("rows" in p)).length;
+  const unread = [h.checks, h.alerts, h.devices, h.incidents ?? { rows: [] }].filter((p) => !("rows" in p)).length;
   const serveDown = !h.serve.at ? "serve has never run" : !h.serve.alive ? (h.serve.process_gone ? "serve's process is gone" : "serve looks stuck") : "";
   const { faults, cautions } = countStates(failed.map((f) => f.state));
   const parts = [serveDown, faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",

@@ -39,6 +39,11 @@ const LOADERS = {
     const data = await call("/api/health");
     return () => drawHealth(data);
   },
+  incidents: async (r) => {
+    const [list, detail] = await Promise.all([call("/api/incidents"),
+      r.detail ? settle(call(`/api/incidents/${encodeURIComponent(r.detail.id)}`)) : null]);
+    return () => Math.min(drawIncidents(list), r.detail ? drawIncidentDetail(detail) : SLOW_MS);
+  },
   settings: async () => {
     const [fresh, push] = await Promise.all([call("/api/settings"), call("/api/push").catch(() => null)]);
     return () => {

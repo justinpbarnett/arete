@@ -2075,11 +2075,232 @@ class Repairs(Scratch):
 
     def test_bad_repair_bounds_raise(self):
         for text in ("max_attempts = 0", "max_repairs = -1", "wakes_per_hour = 1.5", "incident_budget_usd = 0",
-                     "daily_budget_usd = -1", "cooldown_minutes = 'x'", "max_attempts = true"):
+                     "daily_budget_usd = -1", "cooldown_minutes = 'x'", "max_attempts = true",
+                     "keep_days = -1"):
             self.write_config(f"{ON}{text}\n")
             res = self.arete("scan")
             self.assertNotEqual(res.returncode, 0, text)
             self.assertIn(text.split()[0], res.stderr)
+
+
+SERVER = '''
+import json, os, threading, urllib.error, urllib.request
+from datetime import timedelta
+from arete import board, dashboard, oncall, record, state, util
+state.ensure_schema()
+ALERTS = []
+oncall.raise_alert = lambda *a: ALERTS.append(a)
+
+
+class Owner:
+    def of(self, address):
+        return "me@example.com"
+
+
+server = dashboard.Server("127.0.0.1", 0, dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", ""),
+                          Owner(), False)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def call(method, path, body=None, header=True):
+    data = json.dumps(body if body is not None else {}).encode() if method == "POST" else None
+    req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}{path}", data=data, method=method,
+                                 headers={"X-Arete": "1"} if header else {})
+    try:
+        with opener.open(req) as r:
+            return [r.status, json.loads(r.read()), r.headers["Content-Type"]]
+    except urllib.error.HTTPError as e:
+        return [e.code, json.loads(e.read()), e.headers["Content-Type"]]
+
+
+def new(n, evidence="payment job failed: db"):
+    return state.record_incident(f"seed{n}", "unexpected", "/tmp/app.log", "demo", f"<time> ERROR seed {n} failed", n,
+                                 evidence, json.dumps([["v", "s"]]))[0]
+
+
+def wake(i, **fields):
+    answers = json.dumps({"actionable": {"value": True, "confidence": 0.95, "p": 0.95}})
+    state.update_incident(i, "decided wake (confidence 0.94): actionable", decision="wake", confidence=0.94,
+                          reason="actionable and in scope", decided=util.iso(), answers=answers, **fields)
+
+
+def repair(i, status, ended, outcome="", mode="api_key", runner="pi"):
+    made = state.add_repair(i, "demo")
+    task = state.task_add("demo", f"repair {i}", f"On-call incident {i}: repair", "fix")
+    run = record.start("pipeline", repo="demo", issue=task, pid=999999)
+    with state.db() as c:
+        c.execute("UPDATE runs SET status = ?, finished = ? WHERE id = ?", (status, util.iso(), run))
+        c.execute("INSERT INTO steps (run_id, step, runner, model, provider, auth_mode, cost_usd) "
+                  "VALUES (?, 'build', ?, 'm', 'openai', ?, 2.0)", (run, runner, mode))
+    state.set_repair(made, task=task, **({"ended": util.iso(), "outcome": outcome} if ended else {}))
+    return run
+
+
+def notes(i):
+    return [n["note"] for n in state.incident(i)["notes"]]
+
+
+def show(value):
+    print(json.dumps(value))
+'''
+
+
+class Dashboard(Scratch):
+    def serve(self, body):
+        res = self.py(SERVER + body)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return json.loads(res.stdout.splitlines()[-1])
+
+    def test_list_puts_open_first_and_tells_what_the_watcher_is_doing(self):
+        body = ("resolved = new(1)\n"
+                "state.update_incident(resolved, 'resolved: check passed', state='resolved', recovery='check passed')\n"
+                "open_one = new(2)\n"
+                "dismissed = new(3)\n"
+                "state.update_incident(dismissed, 'dismissed by the owner', state='dismissed')\n"
+                "listed = call('GET', '/api/incidents')\n"
+                "off = call('POST', '/api/incidents/switch', {'on': False})\n"
+                "after = call('GET', '/api/incidents')\n"
+                "show([listed, off, after])\n")
+        listed, off, after = self.serve(body)
+        self.assertEqual(listed[0], 200)
+        self.assertEqual([i["state"] for i in listed[1]["incidents"]], ["open", "dismissed", "resolved"])
+        self.assertEqual(listed[1]["watcher"]["state"], "on")
+        self.assertEqual(listed[1]["watcher"]["switched"], "")
+        self.assertTrue(all("evidence" not in i for i in listed[1]["incidents"]))
+        self.assertEqual(off[:2], [200, {"wakes": "off"}])
+        self.assertEqual(after[1]["watcher"]["state"], "switched_off")
+        self.assertTrue(after[1]["watcher"]["switched"])
+        self.write_config("")
+        self.assertEqual(self.serve("show(call('GET', '/api/incidents'))")[1]["watcher"]["state"], "disabled")
+
+    def test_detail_gives_everything_the_view_shows(self):
+        body = ("i = new(1)\n"
+                "wake(i, phase='blocked', waiting='2 of 2 attempts used')\n"
+                "paid = repair(i, 'failed', True, 'failed')\n"
+                "free = repair(i, 'failed', True, 'failed', mode='subscription', runner='claude')\n"
+                "state.update_incident(i, recovery='check passed')\n"
+                "show([paid, free, call('GET', f'/api/incidents/{i}')])\n")
+        paid, free, got = self.serve(body)
+        self.assertEqual(got[0], 200)
+        i = got[1]["incident"]
+        self.assertEqual((i["state"], i["phase"], i["class"], i["source"], i["count"]),
+                         ("open", "blocked", "unexpected", "/tmp/app.log", 1))
+        self.assertTrue(i["first_seen"] and i["last_seen"])
+        self.assertEqual(i["evidence"], "payment job failed: db")
+        self.assertEqual((i["decision"], i["confidence"], i["reason"]), ("wake", 0.94, "actionable and in scope"))
+        self.assertEqual(i["answers"]["actionable"]["value"], True)
+        self.assertEqual(i["recovery"], "check passed")
+        self.assertTrue(all(n["ts"] and n["note"] for n in i["notes"]))
+        self.assertEqual([(r["attempt"], r["runs"][0]["id"], r["runs"][0]["status"], r["runs"][0]["paid"])
+                          for r in i["repairs"]], [(1, paid, "failed", 2.0), (2, free, "failed", 0)])
+        self.assertEqual(i["paid"], 2.0)
+        self.assertEqual(i["can"], {"dismiss": True, "retry": True, "cancel": False})
+
+    def test_steering_routes_close_re_arm_and_cancel_without_raising_an_alert(self):
+        body = ("blocked = new(1)\n"
+                "wake(blocked, phase='blocked', waiting='2 of 2 attempts used')\n"
+                "repair(blocked, 'failed', True, 'failed')\n"
+                "live = new(2)\n"
+                "wake(live, phase='repairing')\n"
+                "repair(live, 'failed', False)\n"
+                "plain = new(3)\n"
+                "answers = [call('POST', f'/api/incidents/{blocked}/retry'), call('POST', f'/api/incidents/{live}/cancel'),\n"
+                "           call('POST', f'/api/incidents/{plain}/dismiss'), call('POST', '/api/incidents/switch', {'on': True})]\n"
+                "rows = {i: state.incident(i) for i in (blocked, live, plain)}\n"
+                "show([answers, {i: [r['state'], r['phase'], r['rearmed'], r['closed'], [x['outcome'] for x in r['repairs']],\n"
+                "                  [n['note'] for n in r['notes']]] for i, r in rows.items()}, len(ALERTS)])\n")
+        answers, rows, alerts = self.serve(body)
+        self.assertEqual([a[0] for a in answers], [200, 200, 200, 200])
+        self.assertEqual(answers[3][1], {"wakes": "on"})
+        blocked, live, plain = rows["1"], rows["2"], rows["3"]
+        self.assertEqual(blocked[:3], ["open", "", 1])
+        self.assertIn("re-armed by the owner: attempts, spend and the cooldown count from here", blocked[5])
+        self.assertEqual((live[0], live[1], live[4]), ("open", "waiting", ["cancelled"]))
+        self.assertTrue(any(n.startswith("cancelled by the owner: no run was live") for n in live[5]))
+        self.assertEqual((plain[0], plain[1]), ("dismissed", ""))
+        self.assertTrue(plain[3])
+        self.assertIn("dismissed by the owner", plain[5])
+        self.assertEqual(alerts, 0)
+
+    def test_unknown_and_refused_steering_answer_404_and_400_and_a_missing_header_403(self):
+        body = ("closed = new(1)\n"
+                "state.update_incident(closed, 'dismissed by the owner', state='dismissed')\n"
+                "ignored = new(2)\n"
+                "state.update_incident(ignored, 'decided ignore', decision='ignore', confidence=0.9, reason='noise')\n"
+                "idle = new(3)\n"
+                "wake(idle)\n"
+                "show([call('POST', '/api/incidents/nope/dismiss'), call('POST', '/api/incidents/999/retry'),\n"
+                "      call('GET', '/api/incidents/999'), call('GET', '/api/incidents/nope'),\n"
+                "      call('POST', f'/api/incidents/{closed}/dismiss'), call('POST', f'/api/incidents/{ignored}/retry'),\n"
+                "      call('POST', f'/api/incidents/{idle}/cancel'), call('POST', '/api/incidents/switch', {}),\n"
+                "      call('POST', '/api/incidents/switch', {'on': 'yes'}),\n"
+                "      call('POST', f'/api/incidents/{idle}/dismiss', header=False), call('POST', '/api/incidents/switch', {'on': False}, header=False),\n"
+                "      [state.incident(idle)['state'], oncall.switched_off()]])\n")
+        *answers, last = self.serve(body)
+        self.assertEqual([a[0] for a in answers], [404, 404, 404, 404, 400, 400, 400, 400, 400, 403, 403])
+        self.assertTrue(all(a[1].get("error") for a in answers))
+        self.assertEqual(last, ["open", False])
+
+    def test_evidence_with_markup_is_json_text_and_the_view_never_writes_html(self):
+        hostile = "<script>alert(1)</script> <b>bold</b>"
+        got = self.serve(f"i = new(1, {hostile!r})\nshow(call('GET', f'/api/incidents/{{i}}'))")
+        self.assertEqual(got[0], 200)
+        self.assertTrue(got[2].startswith("application/json"))
+        self.assertEqual(got[1]["incident"]["evidence"], hostile)
+        source = (ROOT / "arete" / "web" / "incidents.js").read_text()
+        self.assertNotIn("innerHTML", source)
+        self.assertNotIn("insertAdjacentHTML", source)
+        self.assertNotIn("withLinks", source)
+
+    def test_a_blocked_incident_turns_health_and_the_sidebar_word_to_caution(self):
+        body = ("from arete import control, paths\n"
+                "control.BEAT_FILE.write_text(json.dumps({'at': util.iso(), 'pid': os.getpid(), 'started': util.iso()}))\n"
+                "paths.HEARTBEAT_FILE.write_text(json.dumps({'ts': util.iso(), 'checks': []}))\n"
+                "i = new(1)\n"
+                "wake(i, phase='waiting', waiting='cooling down')\n"
+                "calm = call('GET', '/api/health')\n"
+                "calm_word = board.health_word(control.serve_beat(), board.checks_and_alerts())\n"
+                "state.update_incident(i, phase='blocked', waiting='2 of 2 attempts used')\n"
+                "blocked = call('GET', '/api/health')\n"
+                "show([calm[1]['state'], calm[1]['incidents'], calm_word, blocked[1]['state'], blocked[1]['incidents'],\n"
+                "      board.health_word(control.serve_beat(), board.checks_and_alerts())])\n")
+        calm, calm_rows, calm_word, blocked, rows, word = self.serve(body)
+        self.assertEqual((calm, calm_rows, calm_word), ("ok", {"rows": []}, "ok"))
+        self.assertEqual((blocked, word), ("caution", "caution"))
+        self.assertEqual([r["id"] for r in rows["rows"]], [1])
+        self.assertEqual(rows["rows"][0]["waiting"], "2 of 2 attempts used")
+
+    def test_closed_incidents_keep_notes_and_evidence_for_keep_days_and_open_ones_drop_repeats(self):
+        body = ("def age(i, days):\n"
+                "    when = util.iso(util.now() - timedelta(days=days))\n"
+                "    with state.db() as c:\n"
+                "        c.execute('UPDATE incident_notes SET ts = ? WHERE incident = ?', (when, i))\n"
+                "        c.execute('UPDATE incidents SET last_seen = ? WHERE id = ?', (when, i))\n"
+                "closed = new(1)\n"
+                "state.update_incident(closed, 'dismissed by the owner', state='dismissed')\n"
+                "stamped = state.incident(closed)['closed']\n"
+                "with state.db() as c:\n"
+                "    c.execute('UPDATE incidents SET closed = ? WHERE id = ?', (util.iso(util.now() - timedelta(days=10)), closed))\n"
+                "age(closed, 20)\n"
+                "open_one = new(2)\n"
+                "state.update_incident(open_one, 'decided wake (confidence 0.94): actionable', decision='wake')\n"
+                "state.add_incident_note(open_one, state.SEEN_AGAIN + ': 2 more from /tmp/app.log, 3 in all')\n"
+                "age(open_one, 20)\n"
+                "def held():\n"
+                "    c = state.incident(closed)\n"
+                "    return [len(c['notes']), c['evidence'], state.incident(closed) is not None,\n"
+                "            [n['note'][:7] for n in state.incident(open_one)['notes']]]\n"
+                "state.prune(keep_days=30)\n"
+                "kept = held()\n"
+                "state.prune(keep_days=5)\n"
+                "show([stamped, kept, held(), state.incident(open_one)['evidence']])\n")
+        stamped, kept, dropped, open_evidence = self.serve(body)
+        self.assertTrue(stamped)
+        self.assertEqual(kept[:3], [2, "payment job failed: db", True])
+        self.assertEqual(kept[3], ["opened:", "decided"])
+        self.assertEqual(dropped[:3], [0, "", True])
+        self.assertEqual(open_evidence, "payment job failed: db")
 
 
 if __name__ == "__main__":
