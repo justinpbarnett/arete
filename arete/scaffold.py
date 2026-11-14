@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import (
+    codebase,
     config,
     control,
     cron,
@@ -153,7 +154,7 @@ def start_draft(request: DraftRequest) -> dict:
 def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
     cfg = config.load()
     if run_id:
-        record.note(run_id, pid=os.getpid())
+        record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP)
     else:
         check_request(request, cfg, loop_names(cfg))
         run_id = record.start("draft", trigger="manual", summary=util.first_line(request.sentence, 200))

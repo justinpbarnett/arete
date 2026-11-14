@@ -570,7 +570,8 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
                   ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
-                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("wait_minutes", "TEXT"), ("only_step", "TEXT DEFAULT ''"))],
+                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("wait_minutes", "TEXT"), ("only_step", "TEXT DEFAULT ''"),
+                  ("engine_sha", "TEXT"))],
               ("steps", "first_context_tokens", "ALTER TABLE steps ADD COLUMN first_context_tokens INTEGER DEFAULT 0"),
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
                   ("effort", "TEXT DEFAULT ''"), ("tier", "TEXT DEFAULT ''"), ("try", "INTEGER DEFAULT 0"),

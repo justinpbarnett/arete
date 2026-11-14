@@ -73,6 +73,7 @@ def session_report(run_id: str, connect=state.db) -> dict:
 
 def command(args: list[str]) -> list[str]:
     entrypoint = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                  "from arete import codebase; codebase.load(); "
                   "from arete.cli import main; raise SystemExit(main())")
     return [sys.executable, "-I", "-c", entrypoint, *args]
 

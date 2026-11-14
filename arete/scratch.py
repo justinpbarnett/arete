@@ -63,6 +63,7 @@ WAITING = "waiting for registered verification producers to exit; authority revo
 GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
               "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
 BROWSER_EXEC = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                "from arete import codebase; codebase.load(); "
                 "from arete import scratch; scratch.browser_start(sys.argv[1:])")
 BROWSER_MACH = ("com.apple.system.opendirectoryd.libinfo", "com.apple.system.opendirectoryd.membership",
                 "com.apple.system.notification_center", "com.apple.system.logger", "com.apple.logd",

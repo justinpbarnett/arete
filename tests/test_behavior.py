@@ -5,9 +5,11 @@ import json
 import os
 from datetime import timedelta
 from pathlib import Path
+import pkgutil
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -876,6 +878,19 @@ if scenario in ("limit-wait", "work-over-budget"):
     wall = (runlimits.parsed(row["finished"]) - runlimits.parsed(row["started"])).total_seconds() / 60
     result |= {"budget": runlimits.metadata(row["id"], "budget.json"),
                "parked": runlimits.metadata(row["id"], "parked.json"), "wall": wall}
+if scenario == "code-identity":
+    import subprocess
+    from arete import codebase
+    second = (f"import sys; sys.path.insert(0, {str(Path(codebase.__file__).parent.parent)!r}); "
+              "from arete import codebase, lines; codebase.STAMP = 'second-engine'; "
+              "lines.write(sys.argv[1], 'first'); lines.write(sys.argv[1], 'second')")
+    subprocess.run([sys.executable, "-I", "-c", second, row["id"]], env=os.environ, check=True, capture_output=True)
+    result["identity"] = {
+        "stamp": codebase.STAMP, "row": state.run_get(row["id"])["engine_sha"],
+        "first": events[0].get("engine"),
+        "headers": [json.loads(next(record.raw_lines(f))).get("engine") for f in record.record_files(row["id"])],
+        "later": [e.get("engine") for e in events[1:]],
+        "second": [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()][-2:]}
 if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
@@ -5825,6 +5840,192 @@ class BackupTests(unittest.TestCase):
         self.assertEqual((r["loaded"], r["refused"], r["unchanged"], r["events"]), (3, 2, True, []))
         self.assertEqual((r["mode"], r["left"], r["copy_to"]), (0o640, ["config.toml"], "h:/x"))
         self.assertEqual((r["bad"], r["default"]), (4, ""))
+
+
+class CodeIdentityTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        for name in ("config", "state", "logs", "worktrees", "tmp", "home"):
+            (self.root / name).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+        self.env.update(ARETE_CONFIG_DIR=str(self.root / "config"), ARETE_STATE_DIR=str(self.root / "state"),
+                        ARETE_LOG_DIR=str(self.root / "logs"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
+                        TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"),
+                        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+
+    def tree(self, name="tree") -> Path:
+        copy = self.root / name
+        copy.mkdir()
+        for folder in ("arete", "adws"):
+            shutil.copytree(SOURCE / folder, copy / folder, ignore=shutil.ignore_patterns("__pycache__"))
+        return copy
+
+    def run_child(self, tree, script, *args, **env):
+        argv = [sys.executable, "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(tree)!r});" + script, *args]
+        done = subprocess.run(argv, env={**self.env, **env}, cwd=self.root, text=True, capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        return done.stdout.strip()
+
+    def stamp_in(self, tree):
+        return self.run_child(tree, "from arete import codebase; print(codebase.load())")
+
+    def edit_during_import(self, tree, hook, target, text):
+        marker = self.root / f"{tree.name}.edited"
+        module = tree / "arete" / f"{hook}.py"
+        module.write_text(module.read_text() + (
+            f"\nimport os as _os\nif not _os.path.exists({str(marker)!r}):\n    open({str(marker)!r}, 'w').close()\n"
+            f"    open({str(tree / 'arete' / target)!r}, 'a').write({text!r})\n"))
+
+    def test_a_child_keeps_the_code_it_started_with(self):
+        tree = self.tree()
+        entry = control.command([])[3].replace(repr(str(paths.PACKAGE_DIR.parent)), repr(str(tree)))
+        entry = entry.split("raise SystemExit")[0] + "print('READY', flush=True); sys.stdin.readline(); "
+        entry += "import arete.auditor as a; print('present' if hasattr(a, 'MARK') else 'absent')"
+        child = subprocess.Popen([sys.executable, "-I", "-B", "-c", entry], env=self.env, cwd=self.root, text=True,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "READY")
+            with open(tree / "arete/auditor.py", "a") as f:
+                f.write('\nMARK = "new"\n')
+            out, err = child.communicate("go\n", timeout=60)
+        finally:
+            child.kill()
+        self.assertEqual((child.returncode, out.strip()), (0, "absent"), err)
+
+    def test_code_that_moves_during_load_loads_again(self):
+        first = next(m.name for m in pkgutil.iter_modules([str(SOURCE / "arete")]) if not m.ispkg)
+        show = "from arete import codebase; codebase.load(); print(os.environ.get('ARETE_CODE_RELOADS'), codebase.STAMP)"
+        tree = self.tree()
+        self.edit_during_import(tree, first, "auditor.py", "\n# moved\n")
+        out = self.run_child(tree, "import os; " + show)
+        digest = self.run_child(tree, "from arete import codebase; print(codebase.inventory()[0][:12])")
+        self.assertEqual(out, f"1 code.{digest}")
+
+        tree = self.tree("late")
+        marker = self.root / "late.edited"
+        late = (f"import os, arete.cli; from pathlib import Path; m = Path({str(marker)!r})\n"
+                f"if not m.exists():\n    m.touch(); open({str(tree / 'arete/config.py')!r}, 'a').write('\\n# late\\n')\n" + show)
+        self.assertTrue(self.run_child(tree, late).startswith("1 code."))
+
+        tree = self.tree("limit")
+        self.edit_during_import(tree, first, "auditor.py", "\n# moved\n")
+        out = self.run_child(tree, "import os; " + show, ARETE_CODE_RELOADS="5")
+        self.assertRegex(out, r"^5 code\.[0-9a-f]{12}\+moving$")
+
+    def test_a_dirty_checkout_gets_its_own_stamp(self):
+        tree = self.tree()
+        self.assertRegex(self.stamp_in(tree), r"^code\.[0-9a-f]{12}$")
+
+        def git(*args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-C", str(tree), *args],
+                                  env=self.env, check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q")
+        git("add", "arete", "adws")
+        git("commit", "-q", "-m", "tree")
+        head = git("rev-parse", "--short=12", "HEAD")
+        self.assertEqual(self.stamp_in(tree), head)
+        stamps = []
+        for text in ("\n# one\n", "\n# two\n"):
+            git("checkout", "-q", "--", "arete/auditor.py")
+            with open(tree / "arete/auditor.py", "a") as f:
+                f.write(text)
+            stamps.append(self.stamp_in(tree))
+        self.assertTrue(all(re.fullmatch(head + r"\+dirty\.[0-9a-f]{8}", s) for s in stamps), stamps)
+        self.assertNotEqual(*stamps)
+
+    def test_every_record_names_the_code_that_wrote_it(self):
+        found = OfflineWorkflowTests.workflow(self, "code-identity")["identity"]
+        stamp = found["stamp"]
+        self.assertTrue(stamp)
+        self.assertEqual((found["row"], found["first"]), (stamp, stamp))
+        self.assertEqual(set(found["headers"]), {stamp})
+        self.assertEqual([line.get("engine") for line in found["second"]], ["second-engine", None])
+        self.assertEqual(found["second"][1]["seq"], found["second"][0]["seq"] + 1)
+
+    def test_a_child_claims_the_row_with_its_own_code(self):
+        script = r'''
+import json, os
+from unittest import mock
+from arete import codebase, control, engine, record, scaffold, sessions, state
+state.ensure_schema()
+codebase.STAMP = "a"
+loop = record.start("loop", pid=None, loop="x")
+session = record.start("session", pid=None)
+draft = record.start("draft", pid=None)
+codebase.STAMP = "b"
+with mock.patch.object(engine.loops, "find"), mock.patch.object(engine, "LoopRun"), \
+        mock.patch.object(engine.util, "read_json", return_value=[]), mock.patch.object(engine, "carry", return_value="ok"):
+    engine.carry_opened(loop)
+with mock.patch.object(sessions, "load_spec", return_value=mock.Mock(device="", id=session)), \
+        mock.patch.object(sessions.devices, "lease", side_effect=RuntimeError("stop")):
+    try:
+        sessions.execute(session)
+    except Exception:
+        pass
+with mock.patch.object(scaffold, "write_draft", side_effect=control.Refused("stop")):
+    try:
+        scaffold.draft(mock.Mock(), run_id=draft)
+    except control.Refused:
+        pass
+print(json.dumps([[state.run_get(r)["engine_sha"], state.run_get(r)["pid"] == os.getpid()] for r in (loop, session, draft)]))
+'''
+        for claimed in json.loads(self.run_child(SOURCE, script)):
+            self.assertEqual(claimed, ["b", True])
+
+    def test_serve_and_dashboard_name_their_code(self):
+        script = r'''
+import json, threading, urllib.request, urllib.error
+from arete import codebase, control, dashboard, paths, serve, state, util
+codebase.load()
+state.ensure_schema()
+serve.Server().beat([], [])
+node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+class Owner:
+    def of(self, address):
+        return "me@example.com"
+server = dashboard.Server("127.0.0.1", 0, node, Owner(), False)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+dashboard.record_server(node, server.server_port, dashboard.Front("http", [server]))
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+heads = []
+for path in ("/", "/nothing-here"):
+    try:
+        r = opener.open(f"http://127.0.0.1:{server.server_port}{path}")
+    except urllib.error.HTTPError as e:
+        r = e
+    heads.append(r.headers.get_all("X-Arete-Engine"))
+print(json.dumps({"stamp": codebase.STAMP, "beat": util.read_json(control.BEAT_FILE, {}).get("engine"),
+                  "file": util.read_json(paths.SERVER_FILE, {}).get("engine"), "heads": heads}))
+'''
+        found = json.loads(self.run_child(SOURCE, script))
+        self.assertTrue(found["stamp"])
+        self.assertEqual((found["beat"], found["file"]), (found["stamp"], found["stamp"]))
+        self.assertEqual(found["heads"], [[found["stamp"]]] * 2)
+
+    def test_serve_keeps_its_code_when_new_code_cannot_load_whole(self):
+        tree = self.tree()
+        with open(tree / "arete/benchmark.py", "a") as f:
+            f.write("\ndef broken(:\n")
+        script = r'''
+import json, os, sys
+from unittest import mock
+from arete import serve, state
+state.ensure_schema()
+os.chdir(sys.argv[1])
+server = serve.Server()
+server.code, server.code_seen = frozenset(), serve.code_stamp()
+notes = []
+server.say = notes.append
+with mock.patch.object(serve.os, "execv", side_effect=AssertionError("restarted onto code that cannot load")):
+    server.load_new_code()
+print(json.dumps(notes))
+'''
+        notes = json.loads(self.run_child(SOURCE, script, str(tree)))
+        self.assertEqual(len(notes), 1)
+        self.assertIn("new code does not import", notes[0])
+        self.assertIn("arete.benchmark", notes[0])
 
 
 if __name__ == "__main__":

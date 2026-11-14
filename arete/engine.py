@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import (
+    codebase,
     config,
     control,
     delivery,
@@ -329,7 +330,7 @@ def carry_opened(run_id: str) -> str:
     cfg = config.load()
     run = LoopRun(loops.find(r["loop"], cfg), run_id, cfg, trial=r["trigger"] == "try", trigger=r["trigger"])
     run.events = util.read_json(run.events_file, [])
-    record.note(run_id, pid=os.getpid())
+    record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP)
     return carry(run)
 
 

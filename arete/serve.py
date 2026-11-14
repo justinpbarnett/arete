@@ -17,6 +17,7 @@ from . import (
     backup,
     capture,
     chat,
+    codebase,
     config,
     control,
     dashboard,
@@ -45,7 +46,7 @@ PRUNE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
 POLL_THREADS = 8
-IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.engine"
+IMPORT_CHECK = "from arete import codebase; codebase.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
            "!=": operator.ne}
@@ -450,7 +451,7 @@ class Server:
 
     def beat(self, every_loop: list[Loop], live: list[Loop]) -> None:
         util.write_json(control.BEAT_FILE, {
-            "pid": os.getpid(), "at": util.iso(), "started": util.iso(self.started), "ticks": self.ticks,
+            "pid": os.getpid(), "engine": codebase.STAMP, "at": util.iso(), "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": len(state.pending()),
             "running": sum(r["kind"] == "loop" for r in state.runs_marked_running()), "poll_errors": dict(self.errors),
