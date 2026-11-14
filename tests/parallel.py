@@ -90,7 +90,7 @@ class Runner:
         self.lifeline = self.held = None
         self.ran = 0
         self.errors, self.failures = [], []
-        self.skipped, self.expected, self.unexpected = 0, 0, 0
+        self.skipped, self.expected, self.unexpected = 0, 0, []
         self.folder = None
         self.history = load_history()
         self.seen = {}
@@ -166,7 +166,7 @@ class Runner:
             self.failures += [(title, text, report["tail"]) for title, text in report["failures"]]
             self.skipped += len(report["skipped"])
             self.expected += report["expected"]
-            self.unexpected += len(report["unexpected"])
+            self.unexpected += report["unexpected"]
             if not self.verbose:
                 return
             if report["errors"]:
@@ -261,11 +261,13 @@ class Runner:
                 print(f"{RULE}\n{kind}: {title}\n{DASH}\n{text.rstrip()}")
                 if tail.strip():
                     print(f"Output:\n{tail.rstrip()}")
+        for title in self.unexpected:
+            print(f"{RULE}\nUNEXPECTED SUCCESS: {title}")
         if self.slowest:
             self.slowest_block()
         bad = bool(self.errors or self.failures or self.unexpected)
         counts = [("failures", len(self.failures)), ("errors", len(self.errors)), ("skipped", self.skipped),
-                  ("expected failures", self.expected), ("unexpected successes", self.unexpected)]
+                  ("expected failures", self.expected), ("unexpected successes", len(self.unexpected))]
         detail = ", ".join(f"{name}={count}" for name, count in counts if count)
         line = f"Ran {self.ran} tests in {seconds:.1f}s: {'FAILED' if bad else 'OK'}"
         print(f"{line} ({detail})" if detail else line, flush=True)
