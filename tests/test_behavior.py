@@ -2908,6 +2908,8 @@ class PushedPrDraftTests(unittest.TestCase):
             return json.dumps({"isDraft": self.draft, "headRefOid": self.remote_head})
         if args[:2] == ["pr", "view"] and "body" in args:
             return json.dumps({"body": self.body})
+        if args[:2] == ["pr", "view"] and "title" in args:
+            return json.dumps({"title": "feat: Title"})
         if args[:2] == ["pr", "view"]:
             return json.dumps({"mergeStateStatus": "DRAFT" if self.draft else "CLEAN", "mergeable": "MERGEABLE"})
         if args[0] == "api":
@@ -2979,6 +2981,7 @@ class PushedPrDraftTests(unittest.TestCase):
         self.assertEqual(self.names("pr", "create"), [])
         self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]])
         self.assertEqual(len(self.names("pr", "merge")), 1)
+        self.assertEqual(self.names("pr", "merge")[0][-2:], ["--subject", f"feat: Title (#{gh.pr_number(self.URL)})"])
         self.assertFalse(self.draft)
         self.assertIn(f"pr: marked {self.URL} ready for review", self.logs)
 
