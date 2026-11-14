@@ -160,6 +160,8 @@ REVIEW_ROUNDS = {
                               {"summary": "B1 fixed, new break.", "problems": [REGRESSION], "earlier": [FIXED]}],
     "review-severity-slip": [{"summary": "Slip.", "problems": [note("Critical", "fixture slip", category="issue")]},
                              {"summary": "Still.", "problems": [], "earlier": [{"id": "B1", "status": "open", "why": "no"}]}],
+    "review-fix-breaks-check": [{"summary": "B1 open.", "problems": [BLOCKER, MAJOR]},
+                                {"summary": "B1 fixed.", "problems": [MAJOR_2], "earlier": [FIXED]}],
     "review-problems-missing": [{"verdict": "approve", "summary": "Fine."}],
     "review-earlier-omitted": [{"summary": "B1 open.", "problems": [BLOCKER]},
                                {"summary": "Looks fine.", "problems": []}],
@@ -188,8 +190,8 @@ if scenario == "failed-check":
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
 elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault",
-                  "verify-change-fault-timed"):
-    cause = "change" if scenario.startswith("verify-change-fault") else "environment"
+                  "verify-change-fault-timed", "verify-fix-breaks-check"):
+    cause = "change" if scenario.startswith(("verify-change-fault", "verify-fix-breaks")) else "environment"
     answers = root / "sample/replay"
     failing = json.loads((answers / "verify.json").read_text())
     failing["structured"] = {"verdict": "pass" if scenario.endswith("-pass") else "fail", "summary": "The check could not run.", "checks": [
@@ -203,6 +205,14 @@ elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "
         checks_in_verification.append(bool(run.budget and run.budget.verification_active_since))
         return real_checks(layer, cwd, git_dirs, run, *args, **kw)
     pipeline.run_checks = timed_checks
+    if scenario == "verify-fix-breaks-check":
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace(
+            "[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+        layer = root / "sample/layer/config.toml"
+        layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && ! grep -q quince notes.txt"))
+        (answers / "verify_fix.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+        (answers / "check_repair.json").write_text(json.dumps({"text": "Removed quince.", "ok": True}))
+        (answers / "check_repair.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,2 @@\n A small file for replay checks.\n kumquat\n-quince\n")
 elif scenario in ("verify-start-denied", "verify-start-crash"):
     urllib.request.urlopen = mock.Mock(side_effect=OSError("refused"))
     layer = root / "sample/layer/config.toml"
@@ -233,6 +243,13 @@ elif scenario in REVIEW_ROUNDS:
         (replays / "verify2.json").write_text((replays / "verify.json").read_text())
         (replays / "review_fix.json").write_text(json.dumps({"text": "B1 fixed: quince is listed after kumquat.", "ok": True}))
         (replays / "review_fix.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+    if scenario == "review-fix-breaks-check":
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace(
+            "[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+        layer = root / "sample/layer/config.toml"
+        layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && ! grep -q quince notes.txt"))
+        (replays / "check_repair1_2.json").write_text(json.dumps({"text": "Removed quince.", "ok": True}))
+        (replays / "check_repair1_2.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,2 @@\n A small file for replay checks.\n kumquat\n-quince\n")
 elif scenario in BLOCKED_CHECKS:
     answer = root / "sample/replay/verify.json"
     said = json.loads(answer.read_text())
@@ -1239,6 +1256,13 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("verify_fix", result["steps"])
         self.assertEqual(result["verified"], ["pass"])
 
+    def test_check_broken_by_a_verify_fix_gets_a_repair_before_the_run_fails(self):
+        result = self.workflow("verify-fix-breaks-check")
+        self.assertIn("verify_fix", result["steps"])
+        self.assertIn("check_repair", result["steps"])
+        self.assertNotIn("the checks failed after", result["summary"])
+        self.assertEqual(result["status"], "done", result["summary"])
+
     def test_checks_run_again_after_a_verify_fix_count_as_run_time_not_verification_time(self):
         result = self.workflow("verify-change-fault-timed")
         self.assertIn("verify_fix", result["steps"])
@@ -1296,6 +1320,12 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         for text in ("B1", "fixture major note", "[issue]"):
             self.assertIn(text, result["fix_prompt"])
         self.assertEqual(len(result["review"]["notes"]), 1)
+
+    def test_check_broken_by_a_review_fix_gets_a_repair_before_the_run_fails(self):
+        result = self.workflow("review-fix-breaks-check")
+        self.assertIn("check_repair1_2", result["steps"])
+        self.assertNotIn("the checks failed after", result["summary"])
+        self.assertEqual(result["status"], "done", result["summary"])
 
     def test_security_blocker_cannot_be_waived(self):
         result = self.workflow("review-security-waived")
