@@ -197,7 +197,7 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {capture.TooLarge: 413, capture.Refused: 400, capture.NotStaged: 404, board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
+STATUS_OF_REFUSAL = {capture.TooLarge: 413, capture.Refused: 400, capture.NotStaged: 404, capture.Conflict: 409,board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
                      chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
@@ -339,6 +339,8 @@ class Handler(BaseHTTPRequestHandler):
                 return capture.save(self.body())
             if path == "/api/capture/context":
                 return capture.add_context(self.body(), WEB_CODE)
+            if path == "/api/capture/submit":
+                return capture.submit(self.body())
             if path == "/api/capture/context/drop":
                 return capture.drop_context()
             if path == "/api/capture/discard":
@@ -722,6 +724,7 @@ def serve(port: int | None = None, inside_serve: bool = False) -> NoReturn:
     port = port or cfg.dashboard_port
     state.ensure_schema()
     chat.recover()
+    capture.recover()
     logins = Logins()
     waiting_for = ""
     atexit.register(forget_server)

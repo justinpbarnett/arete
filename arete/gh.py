@@ -126,6 +126,11 @@ def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
+def recent_issues(repo: str, limit: int = 100) -> list[dict]:
+    return gh_json(["issue", "list", "--repo", repo, "--state", "all", "--limit", str(limit), "--search",
+                    "sort:updated-desc", "--json", "number,title,body,state,stateReason,updatedAt"]) or []
+
+
 def issue_url(repo: str, number: int | str) -> str:
     return f"https://github.com/{repo}/issues/{number}"
 
