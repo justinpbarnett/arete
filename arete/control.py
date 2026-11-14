@@ -55,6 +55,18 @@ class KeptFailure(Refused):
     pass
 
 
+def session_report(run_id: str, connect=state.db) -> dict:
+    row = state.run_get(run_id, connect)
+    if not row or row["kind"] != "session":
+        raise NotFound(f"no session {run_id}")
+    report = state.report(run_id, connect)
+    if report is None:
+        why = "it is still running" if row["status"] == "running" else f"it ended {row['status']} without one"
+        raise Refused(f"session {run_id} has no report: {why}")
+    return {"id": run_id, "status": row["status"], "finished": row["finished"], "pr_url": row["pr_url"] or "",
+            "report": report}
+
+
 def command(args: list[str]) -> list[str]:
     entrypoint = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
                   "from arete.cli import main; raise SystemExit(main())")

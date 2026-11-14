@@ -12,13 +12,14 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, lines, state, util
+from . import asks, config, lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
 LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode", "atom")
 COUNTS = ("tokens_in", "tokens_out", "turns", "cache_read", "cache_write")
 MAX_ERROR_CHARS = 500
+OPENING = "prepare"
 
 
 @dataclass(frozen=True)
@@ -102,15 +103,25 @@ def fingerprint(folder: Path | str) -> str:
     found = util.sh(["git", "rev-parse", "--git-path", "index"], cwd=where)
     if found.returncode != 0:
         return ""
-    with tempfile.TemporaryDirectory() as tmp:
-        index, real = Path(tmp) / "index", where / found.stdout.strip()
+    try:
+        handle, name = tempfile.mkstemp(prefix="arete-index-")
+    except OSError:
+        return ""
+    os.close(handle)
+    index, real = Path(name), where / found.stdout.strip()
+    try:
         if real.is_file():
             shutil.copyfile(real, index)
+        else:
+            index.unlink()
         env = {"GIT_INDEX_FILE": str(index)}
         if util.sh(["git", "add", "-A"], cwd=where, env=env).returncode != 0:
             return ""
         tree = util.sh(["git", "write-tree"], cwd=where, env=env)
         return tree.stdout.strip() if tree.returncode == 0 else ""
+    finally:
+        index.unlink(missing_ok=True)
+        index.with_name(index.name + ".lock").unlink(missing_ok=True)
 
 
 def first(read: list[dict], event: str) -> dict:
@@ -130,12 +141,30 @@ def chain(run_id: str) -> list[list[dict]]:
     return found
 
 
+def unopened(read: list[dict]) -> bool:
+    return any(line.get("step") == OPENING and line.get("result") != "pass" for line in ends(read))
+
+
+def reopening(chained: list[list[dict]]) -> bool:
+    for read in chained:
+        if opened := [line for line in ends(read) if line.get("step") == OPENING]:
+            return opened[-1].get("result") != "pass"
+    return False
+
+
 def history(chained: list[list[dict]]) -> list[dict]:
     done: list[dict] = []
     for read in reversed(chained):
-        skipped = next((line["skipped"] for line in read
-                        if line.get("event") == "route" and type(line.get("skipped")) is int), None)
-        done = (done if skipped is None else done[:skipped]) + ends(read)
+        if unopened(read):
+            continue
+        own = ends(read)
+        route = next((line for line in reversed(read)
+                      if line.get("event") == "route" and type(line.get("skipped")) is int), None)
+        if route is None:
+            done = done + own
+            continue
+        redone = route["redone"] if type(route.get("redone")) is int else 0
+        done = own[:redone] + done[redone:redone + route["skipped"]] + own[redone:]
     return done
 
 
@@ -187,13 +216,19 @@ def checked(name: str, value) -> Outcome:
 class Flow:
     def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None,
                  labels: Callable[[str, dict], dict] | None = None, again: str = "",
-                 restore: Callable[[dict], str] | None = None) -> None:
+                 restore: Callable[[dict], str] | None = None, refusal: str = "",
+                 hold: Callable[[str], str] | None = None, renew: str = "",
+                 keeps: Callable[[str, dict], bool] | None = None,
+                 step_runs: list[list[dict]] | None = None,
+                 entering: Callable[[str], None] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         if again and again not in STEPS:
             raise KeyError(f"from {again}: no step by that name")
         chained = chain(continues)
         self.run_id, self.continues, self.only, self.ctx, self.again = run_id, continues, only, ctx, again
+        self.refusal = refusal
+        self.hold = hold or (lambda name: "")
         self.labels = labels or (lambda name, kw: {})
         self.restore = restore or (lambda line: "a step can run alone only on a run whose folder is kept")
         self.earlier = history(chained)
@@ -202,17 +237,38 @@ class Flow:
         self.tries = tries_in([lines.read(run_id), *chained])
         self.last_prints = {str(line["tree"]): str(line.get("fingerprint") or "")
                             for line in self.earlier if line.get("tree")}
+        self.restamped = self.restamps(step_runs or [])
         self.prints: dict[str, str] = {}
+        self.renew, self.keeps = renew, keeps or (lambda name, kw: False)
+        self.entering = entering or (lambda name: None)
+        self.carrying, self.carry = False, 0
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
+        self.redone, self.stepped = 0, False
+        self.reopens = (bool(continues) and not only and again != OPENING and reopening(chained)
+                        and bool(self.earlier) and self.earlier[0].get("step") == OPENING)
         if self.matching:
-            lines.write(run_id, "route", continues=continues, only=only, again=again)
+            lines.write(run_id, "route", continues=continues, only=only, again=again, renew=renew)
 
     def step(self, name: str, *args, **kw) -> Outcome:
         if name not in STEPS:
             raise KeyError(f"no step {name}")
+        self.stepped = True
         if self.done:
             raise OnlyDone(f"only {self.only} runs in this flow")
+        if self.refusal:
+            self.matching = False
+            raise Refused(self.refusal)
+        if self.matching and name == self.renew:
+            return self.renewed(name, args, kw)
+        if not self.matching and self.carrying and (found := self.carried(name, kw)) is not None:
+            return found
         if self.matching:
+            if self.reopens and name == OPENING:
+                self.reopens = False
+                self.note_route()
+                outcome = self.run(name, args, kw)
+                self.redone = 1
+                return outcome
             if self.takes(name) and (found := self.stored(name, kw)):
                 self.skipped += 1
                 return found
@@ -220,35 +276,104 @@ class Flow:
                 if not any(line.get("step") == self.only for line in self.earlier):
                     raise Refused(f"only {self.only}: run {self.continues} never started {self.only}")
                 raise Refused(f"only {self.only}: {name} before it has no stored outcome it can take")
+            if why := self.hold(name):
+                self.matching = False
+                raise Refused(why)
             self.route()
+            self.entering(name)
         try:
             return self.run(name, args, kw)
         finally:
             self.done = self.done or name == self.only
 
+    def restamps(self, step_runs: list[list[dict]]) -> dict[int, str]:
+        newest = max((str(line.get("ts") or "") for line in self.earlier), default="")
+        found: dict[int, str] = {}
+        for read in step_runs:
+            opened = first(read, "route")
+            only = str(opened.get("only") or "")
+            began = next((line for line in read if line.get("event") == "step_start" and line.get("step") == only
+                          and line.get("tree") and line.get("fingerprint")), {})
+            ended = [line for line in ends(read) if line.get("step") == only]
+            routed = next((line for line in read if line.get("event") == "route" and type(line.get("skipped")) is int),
+                          {})
+            if not began or not ended or not routed or str(ended[-1].get("ts") or "") < newest:
+                continue
+            at = routed["skipped"] + (routed["redone"] if type(routed.get("redone")) is int else 0)
+            reach = at + 1 if ended[-1].get("result") == "pass" else at
+            taken = history(chain(str(opened.get("continues") or "")))
+            tree, before, after = str(began["tree"]), str(began["fingerprint"]), str(ended[-1].get("fingerprint") or "")
+            for i, line in enumerate(self.earlier[:reach]):
+                if (i >= len(taken) or (line.get("run"), line.get("seq")) != (taken[i].get("run"), taken[i].get("seq"))
+                        or i == at and line.get("step") != only):
+                    break
+                if line.get("tree") != tree:
+                    continue
+                if not after or found.get(i, self.last_prints.get(tree, "")) != before:
+                    break
+                found[i] = after
+        return found
+
+    def expected(self, index: int, tree: str) -> str:
+        return self.restamped.get(index, self.last_prints.get(tree, ""))
+
+    def renewed(self, name: str, args: tuple, kw: dict) -> Outcome:
+        line = self.earlier[self.at] if self.at < len(self.earlier) else {}
+        tree = str(line.get("tree") or "")
+        now, then = self.print_of(kw.get("tree") or tree) if tree else "", self.expected(self.at, tree)
+        intact = (line.get("step") == name and line.get("result") == "pass" and bool(tree)
+                  and (bool(then) and now == then or not then and not now and self.holds_worktrees(line)))
+        self.route()
+        outcome = self.run(name, args, kw)
+        self.prints.clear()
+        self.carrying, self.carry = intact and outcome.passed, self.at + 1
+        return outcome
+
+    def holds_worktrees(self, line: dict) -> bool:
+        data = line.get("data") if isinstance(line.get("data"), dict) else {}
+        listed = data.get("checkouts")
+        return isinstance(listed, list) and bool(listed) and all(
+            isinstance(c, dict) and os.path.exists(os.path.join(str(c.get("wt") or ""), ".git")) for c in listed)
+
+    def carried(self, name: str, kw: dict) -> Outcome | None:
+        line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
+        if (line.get("step") == name and line.get("result") == "pass" and self.keeps(name, kw)
+                and (not self.again or self.carry < self.again_at)):
+            n = self.tries[name] = self.tries.get(name, 0) + 1
+            outcome = outcome_of(line)
+            self.end(name, n, outcome, "", Calls(self.run_id, name, n=n), time.monotonic(), kw,
+                     carried=self.continues)
+            self.carry += 1
+            return outcome
+        self.carrying = False
+        return None
+
     def takes(self, name: str) -> bool:
-        return name != self.only and (name != self.again or self.skipped < self.again_at)
+        return name != self.only and (name != self.again or self.at < self.again_at)
 
     def stored(self, name: str, kw: dict) -> Outcome | None:
-        line = self.earlier[self.skipped] if self.skipped < len(self.earlier) else {}
+        line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
-        if self.only and line.get("tree") and not os.path.isdir(line["tree"]):
+        if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
             why = self.restore(line)
             if why or not os.path.isdir(line["tree"]):
                 why = why or "its work folder is still missing after restoring from origin"
+                if not self.only:
+                    return None
                 raise Refused(f"only {self.only}: run {self.continues} removed its work folder {line['tree']} when it "
                               f"ended, and {why}")
         if not self.only and line.get("tree"):
             now = self.print_of(kw.get("tree") or line["tree"])
-            if not now or now != self.last_prints.get(str(line["tree"])):
+            if not now or now != self.expected(self.at, str(line["tree"])):
                 return None
         return outcome_of(line)
 
     def takable(self, line: dict) -> bool:
         if line.get("result") == "pass":
             return True
-        return line.get("result") == "fail" and not line.get("error") and self.skipped + 1 < len(self.earlier)
+        return (line.get("result") == "fail" and not line.get("error") and line.get("step") != OPENING
+                and self.at + 1 < len(self.earlier))
 
     def print_of(self, folder: Path | str) -> str:
         key = os.path.abspath(folder)
@@ -256,10 +381,17 @@ class Flow:
             self.prints[key] = fingerprint(key)
         return self.prints[key]
 
-    def route(self) -> None:
-        after = str(self.earlier[self.skipped - 1].get("step") or "") if self.skipped else ""
+    @property
+    def at(self) -> int:
+        return self.redone + self.skipped
+
+    def note_route(self) -> None:
+        after = str(self.earlier[self.at - 1].get("step") or "") if self.skipped else ""
         lines.write(self.run_id, "route", continues=self.continues, after=after, skipped=self.skipped,
-                    only=self.only, again=self.again)
+                    redone=self.redone, only=self.only, again=self.again)
+
+    def route(self) -> None:
+        self.note_route()
         self.matching = False
 
     def run(self, name: str, args: tuple, kw: dict) -> Outcome:
@@ -271,9 +403,16 @@ class Flow:
             lines.write(self.run_id, "step_start", step=name, **{"try": n})
             self.failed(name, n, e, calls, started, kw)
             raise
-        lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels)
+        began = ({"tree": os.path.abspath(kw["tree"]), "fingerprint": fingerprint(kw["tree"])}
+                 if name == self.only and kw.get("tree") else {})
+        lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels, **began)
         try:
             outcome = self.call(name, calls, args, kw)
+        except asks.Asked as e:
+            outcome = Outcome("ask", feedback=asks.summary(e.sent), data={"ask_ids": e.ask_ids, "call": e.call},
+                              session=e.session)
+            self.end(name, n, outcome, "", calls, started, kw)
+            raise
         except Exception as e:
             self.failed(name, n, e, calls, started, kw)
             raise
@@ -297,7 +436,8 @@ class Flow:
             _open.reset(token)
         return checked(name, value)
 
-    def end(self, name: str, n: int, outcome: Outcome, error: str, calls: Calls, started: float, kw: dict) -> None:
+    def end(self, name: str, n: int, outcome: Outcome, error: str, calls: Calls, started: float, kw: dict,
+            **extra) -> None:
         seconds, tree = round(time.monotonic() - started, 1), {}
         if kw.get("tree"):
             where = os.path.abspath(kw["tree"])
@@ -305,10 +445,10 @@ class Flow:
         lines.write(self.run_id, "step_end", step=name, **{"try": n}, result=outcome.result, ok=outcome.passed,
                     next=outcome.next, feedback=outcome.feedback, data=outcome.data,
                     session=asdict(outcome.session), **envelope(calls.made), seconds=seconds,
-                    error=error[:MAX_ERROR_CHARS], **tree)
+                    error=error[:MAX_ERROR_CHARS], **tree, **extra)
 
     def respond(self, status: str, **fields) -> dict:
-        if self.matching:
+        if self.matching and self.stepped:
             self.route()
         return lines.write(self.run_id, "report", **{**fields, "status": status, "steps": tally(self.run_id)})
 
@@ -316,7 +456,7 @@ class Flow:
 def tally(run_id: str) -> dict[str, dict]:
     found: dict[str, list] = {}
     for line in lines.read(run_id):
-        if line.get("event") == "step_end":
+        if line.get("event") == "step_end" and not line.get("carried"):
             counts = found.setdefault(str(line.get("step") or ""), [0, 0.0, 0.0])
             counts[0] += 1
             counts[1] += amount(line, "seconds")
@@ -338,7 +478,7 @@ def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
             int(value) if key in config.STEP_COUNTS and value.isdigit()
             else float(value) if key in config.STEP_AMOUNTS and value.replace(".", "", 1).isdigit()
             else [v for v in value.split(",") if v] if key in config.STEP_LISTS
-            else value == "true" if key == "structured_output" and value in ("true", "false") else value)
+            else value == "true" if key in ("structured_output", "directory_cleanup") and value in ("true", "false") else value)
     return config.step_tables(table, "--set")
 
 

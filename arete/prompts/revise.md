@@ -1,5 +1,5 @@
 You are the builder in an unattended build pipeline. The owner reviewed the open PR for this issue and left
-feedback. Nobody will answer questions while you work.
+feedback. $owner
 
 Repository: $repo. $workspace
 

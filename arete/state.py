@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -22,7 +23,7 @@ REFRESH_SCOPE = "credential-refresh-v1:"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,            -- pipeline | miner | eval | draft | loop | session
+    kind TEXT NOT NULL,            -- pipeline | miner | eval | experiment | draft | loop | session
     repo TEXT,
     issue INTEGER,
     status TEXT NOT NULL,          -- running | pr | needs-info | skipped | noop | dry-run | failed | interrupted
@@ -324,12 +325,14 @@ CREATE TABLE IF NOT EXISTS chats (
     session_spent REAL DEFAULT 0,
     runner TEXT DEFAULT '',
     draft_title TEXT DEFAULT '',
-    draft_body TEXT DEFAULT ''
+    draft_body TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    summarized_to INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
-    sender TEXT NOT NULL,          -- you | arete
+    sender TEXT NOT NULL,          -- you | arete | tool
     text TEXT,
     cost REAL DEFAULT 0,
     paid_usd REAL,
@@ -376,14 +379,73 @@ CREATE TABLE IF NOT EXISTS task_comments (
     ts TEXT
 );
 CREATE INDEX IF NOT EXISTS task_comments_task ON task_comments (task);
+CREATE TABLE IF NOT EXISTS reports (run_id TEXT PRIMARY KEY, saved TEXT NOT NULL, report TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS passed_over (
     repo TEXT NOT NULL,
     issue TEXT NOT NULL,
     since TEXT NOT NULL,           -- when the poller first passed this ready ticket over for want of a slot
     PRIMARY KEY (repo, issue)
 );
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    class TEXT NOT NULL,
+    source TEXT NOT NULL,
+    repo TEXT DEFAULT '',
+    signature TEXT DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'open',
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    count INTEGER DEFAULT 1,
+    evidence TEXT DEFAULT '',
+    decision TEXT DEFAULT '',
+    confidence REAL DEFAULT 0,
+    reason TEXT DEFAULT '',
+    answers TEXT DEFAULT '',
+    injection INTEGER DEFAULT 0,
+    decided TEXT DEFAULT '',
+    tries INTEGER DEFAULT 0,
+    retry_at TEXT DEFAULT '',
+    decided_count INTEGER DEFAULT 0,
+    shapes TEXT DEFAULT '',
+    policies TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS incidents_open ON incidents (fingerprint) WHERE state = 'open';
+CREATE TABLE IF NOT EXISTS incident_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS incident_notes_incident ON incident_notes (incident, id);
+CREATE TABLE IF NOT EXISTS incident_aliases (
+    fingerprint TEXT PRIMARY KEY,
+    incident INTEGER NOT NULL,
+    ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS asks (
+    id TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    ticket TEXT NOT NULL,
+    step TEXT NOT NULL,
+    call TEXT DEFAULT '',
+    why TEXT DEFAULT '',
+    tried TEXT DEFAULT '',
+    questions TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',    -- open | answered | stopped | expired
+    asked TEXT NOT NULL,
+    answered TEXT,
+    session TEXT DEFAULT '{}',
+    answers TEXT DEFAULT '[]',
+    taken_by TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS asks_run ON asks (run);
+CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+              ("chats", "summary", "ALTER TABLE chats ADD COLUMN summary TEXT DEFAULT ''"),
+              ("chats", "summarized_to", "ALTER TABLE chats ADD COLUMN summarized_to INTEGER DEFAULT 0"),
               ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
               ("triage", "code", "ALTER TABLE triage ADD COLUMN code INTEGER"),
@@ -411,7 +473,12 @@ MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFA
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
                   ("effort", "TEXT DEFAULT ''"), ("tier", "TEXT DEFAULT ''"), ("try", "INTEGER DEFAULT 0"),
                   ("kind", "TEXT DEFAULT ''"), ("cache_read", "INTEGER DEFAULT 0"), ("cache_write", "INTEGER DEFAULT 0"),
-                  ("api_seconds", "REAL DEFAULT 0"), ("auth_mode", "TEXT DEFAULT ''"))]]
+                  ("api_seconds", "REAL DEFAULT 0"), ("auth_mode", "TEXT DEFAULT ''"))],
+              *[("incidents", col, f"ALTER TABLE incidents ADD COLUMN {col} {kind}") for col, kind in (
+                  ("decision", "TEXT DEFAULT ''"), ("confidence", "REAL DEFAULT 0"), ("reason", "TEXT DEFAULT ''"),
+                  ("answers", "TEXT DEFAULT ''"), ("injection", "INTEGER DEFAULT 0"), ("decided", "TEXT DEFAULT ''"),
+                  ("tries", "INTEGER DEFAULT 0"), ("retry_at", "TEXT DEFAULT ''"),
+                  ("decided_count", "INTEGER DEFAULT 0"), ("shapes", "TEXT DEFAULT ''"), ("policies", "TEXT"))]]
 
 
 @contextmanager
@@ -511,7 +578,7 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
 
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
-            "eval": f"eval-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
+            "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
 
 
 def loop_lock(name: str) -> str:
@@ -522,6 +589,22 @@ def run_get(run_id: str, connect=db) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(r) if r else None
+
+
+def save_report(run_id: str, report: dict, connect=db) -> None:
+    with connect() as c:
+        c.execute("INSERT OR REPLACE INTO reports (run_id, saved, report) VALUES (?, ?, ?)",
+                  (run_id, util.iso(), json.dumps(report)))
+
+
+def report(run_id: str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT report FROM reports WHERE run_id = ?", (run_id,)).fetchone()
+    try:
+        found = json.loads(r["report"]) if r else None
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
 
 
 def steps(run_id: str, connect=db) -> list[dict]:
@@ -715,6 +798,118 @@ def prune(days: float = 14) -> None:
         c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
         c.execute("DELETE FROM queue WHERE run_id IS NOT NULL AND enqueued < ?", (since,))
         c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
+        old = util.iso(util.now() - timedelta(days=days * 4))
+        c.execute("DELETE FROM incident_notes WHERE ts < ?", (since,))
+        c.execute("DELETE FROM incident_notes WHERE incident IN (SELECT id FROM incidents WHERE last_seen < ?)", (old,))
+        c.execute("DELETE FROM incidents WHERE last_seen < ?", (old,))
+        c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
+
+
+def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signature: str, count: int,
+                   evidence: str, policies: str) -> tuple[int, bool]:
+    now = util.iso()
+    row = c.execute("SELECT id, count FROM incidents WHERE state = 'open' AND (fingerprint = ? OR id IN "
+                    "(SELECT incident FROM incident_aliases WHERE fingerprint = ?)) ORDER BY fingerprint = ? DESC "
+                    "LIMIT 1", (fingerprint, fingerprint, fingerprint)).fetchone()
+    if row:
+        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ?, "
+                  "policies = COALESCE(policies, ?) WHERE id = ?", (count, now, evidence, policies, row["id"]))
+        note = f"seen again: {count} more from {source}, {row['count'] + count} in all"
+        opened, incident_id = False, row["id"]
+    else:
+        incident_id = c.execute("INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, "
+                                "last_seen, count, evidence, policies) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                (fingerprint, kind, source, repo, signature, now, now, count, evidence,
+                                 policies)).lastrowid
+        note, opened = f"opened: {kind}, {count} from {source}", True
+    c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, now, note))
+    return incident_id, opened
+
+
+def record_incident(*args) -> tuple[int, bool]:
+    with db() as c:
+        return write_incident(c, *args)
+
+
+def commit_scan(incident_rows: list[tuple], cursor_rows: list[tuple[str, str, bool, str]],
+                aliases=(), marks=None) -> list[bool]:
+    with db() as c:
+        for fingerprint, incident_id, note in aliases:
+            c.execute("INSERT OR REPLACE INTO incident_aliases (fingerprint, incident, ts) VALUES (?,?,?)",
+                      (fingerprint, incident_id, util.iso()))
+            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
+                      (incident_id, util.iso(), note))
+        opened = []
+        for row in incident_rows:
+            incident_id, new = write_incident(c, *row)
+            opened.append(new)
+            if new and row[0] in (marks or {}):
+                fields, note = marks[row[0]]
+                c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+                          (*fields.values(), incident_id))
+                c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
+                          (incident_id, util.iso(), note))
+        for source, value, ok, detail in cursor_rows:
+            c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
+                      (source, value, util.iso(), int(ok), detail[:500]))
+        return opened
+
+
+def add_incident_note(incident_id: int, note: str) -> None:
+    with db() as c:
+        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, util.iso(), note))
+
+
+def open_incidents(limit: int = 500) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' "
+                                           "ORDER BY last_seen DESC, id DESC LIMIT ?", (limit,))]
+
+
+def incidents_to_decide() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM incidents WHERE state = 'open' AND injection = 0 AND class != 'expected' "
+            "AND decision IN ('', 'ignore') ORDER BY id")]
+
+
+def known_fingerprints() -> dict[str, dict]:
+    with db() as c:
+        held = {r[0]: {"source": r[1], "repo": r[2], "policies": r[3]} for r in c.execute(
+            "SELECT a.fingerprint, i.source, i.repo, i.policies FROM incident_aliases a JOIN incidents i "
+            "ON i.id = a.incident WHERE i.state = 'open'")}
+        held.update((r[0], {"source": r[1], "repo": r[2], "policies": r[3]}) for r in c.execute(
+            "SELECT fingerprint, source, repo, policies FROM incidents WHERE state = 'open'"))
+        return held
+
+
+def update_incident(incident_id: int, note: str = "", **fields) -> None:
+    with db() as c:
+        if fields:
+            c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+                      (*fields.values(), incident_id))
+        if note:
+            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
+                      (incident_id, util.iso(), note))
+
+
+def parsed(row: dict) -> dict:
+    return {**row, "answers": json.loads(row["answers"] or "{}")}
+
+
+def incidents(connect=db, limit: int = 200) -> list[dict]:
+    with connect() as c:
+        return [parsed(dict(r)) for r in c.execute("SELECT * FROM incidents ORDER BY last_seen DESC, id DESC "
+                                                   "LIMIT ?", (limit,))]
+
+
+def incident(incident_id: int, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+        if not r:
+            return None
+        notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
+        return {**parsed(dict(r)), "notes": [dict(n) for n in notes]}
 
 
 def add_metric(name: str, value: float, loop: str = "", run_id: str = "") -> None:
@@ -849,30 +1044,39 @@ def chats() -> list[dict]:
 
 def chat_messages(chat_id: int) -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT sender, text, cost, paid_usd, ts FROM chat_messages WHERE chat_id = ? "
+        return [dict(r) for r in c.execute("SELECT id, sender, text, cost, paid_usd, ts FROM chat_messages WHERE chat_id = ? "
                                            "ORDER BY id", (chat_id,))]
 
 
-def chat_claim(chat_id: int, text: str, title: str) -> bool:
+def chat_claim(chat_id: int, text: str, title: str) -> int:
     ts = util.iso()
     with db() as c:
         claimed = c.execute("UPDATE chats SET busy = 1, updated = ?, title = CASE WHEN title = '' THEN ? ELSE title END "
                             "WHERE id = ? AND busy = 0", (ts, title, chat_id)).rowcount
         if claimed:
-            c.execute("INSERT INTO chat_messages (chat_id, sender, text, ts) VALUES (?,?,?,?)", (chat_id, "you", text, ts))
-        return bool(claimed)
+            return c.execute("INSERT INTO chat_messages (chat_id, sender, text, ts) VALUES (?,?,?,?)",
+                             (chat_id, "you", text, ts)).lastrowid
+        return 0
 
 
 def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_usd: float | None = None,
-             reported_cost: float | None = None, **fields) -> None:
+             reported_cost: float | None = None, before: Sequence[tuple[str, str]] = (), **fields) -> None:
     ts = util.iso()
     reported_cost = cost if reported_cost is None else reported_cost
     paid_usd = 0.0 if reported_cost == 0 and paid_usd is None else paid_usd
     with db() as c:
+        for kind, note in before:
+            c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
+                      (chat_id, kind, note, 0, 0, ts))
         c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
                   (chat_id, sender, text, reported_cost, paid_usd, ts))
         c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",
                   (*fields.values(), ts, reported_cost, chat_id))
+
+
+def chat_summarize(chat_id: int, summary: str, upto: int) -> None:
+    with db() as c:
+        c.execute("UPDATE chats SET summary = ?, summarized_to = ? WHERE id = ?", (summary, upto, chat_id))
 
 
 def chat_drop_draft(chat_id: int, title: str, body: str) -> None:
@@ -1049,6 +1253,11 @@ def pass_over(repo: str, issue: str) -> None:
         c.execute("INSERT OR IGNORE INTO passed_over (repo, issue, since) VALUES (?,?,?)", (repo, str(issue), util.iso()))
 
 
+def tickets_passed_over() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM passed_over ORDER BY since")]
+
+
 def take_passed_over(repo: str, issue: str) -> str:
     with db() as c:
         r = c.execute("SELECT since FROM passed_over WHERE repo = ? AND issue = ?", (repo, str(issue))).fetchone()
@@ -1217,6 +1426,33 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
         )
 
 
+SETTLED_PROPOSALS = ("merged", "rejected", "skipped", "filed")
+
+
+def pin_record(run_id: str) -> bool:
+    with db() as c:
+        return c.execute("INSERT OR IGNORE INTO record_pins (run_id, pinned) VALUES (?, ?)",
+                         (run_id, util.iso())).rowcount > 0
+
+
+def unpin_record(run_id: str) -> bool:
+    with db() as c:
+        return c.execute("DELETE FROM record_pins WHERE run_id = ?", (run_id,)).rowcount > 0
+
+
+def record_pins(connect=db) -> set[str]:
+    with connect() as c:
+        return {r["run_id"] for r in c.execute("SELECT run_id FROM record_pins")}
+
+
+def runs_cited_by_pending_proposals(run_ids, connect=db) -> set[str]:
+    marks = ",".join("?" * len(SETTLED_PROPOSALS))
+    with connect() as c:
+        rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",
+                         SETTLED_PROPOSALS).fetchall()
+    return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
+
+
 def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> list[dict]:
     q, args = "SELECT * FROM proposals", []
     if status:
@@ -1355,6 +1591,12 @@ def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why:
     with db() as c:
         c.execute("INSERT OR REPLACE INTO mined (pr_url, repo, issue, run_id, status, why, task, ts) "
                   "VALUES (?,?,?,?,?,?,?,?)", (pr_url, repo, issue, run_id, status, why, task, util.iso()))
+
+
+def mined_row(pr_url: str) -> dict:
+    with db() as c:
+        row = c.execute("SELECT * FROM mined WHERE pr_url = ?", (pr_url,)).fetchone()
+    return dict(row) if row else {}
 
 
 def mined_urls() -> set[str]:
@@ -1536,3 +1778,71 @@ def tasks_replied(repo: str) -> list[dict]:
         return [dict(r) for r in c.execute(
             "SELECT * FROM tasks WHERE repo = ? AND state = 'needs-info' AND (SELECT author FROM task_comments c "
             "WHERE c.task = tasks.id ORDER BY c.rowid DESC LIMIT 1) = 'owner' ORDER BY created, rowid", (repo,))]
+
+
+def ask_row(r) -> dict:
+    return {**dict(r), "questions": json.loads(r["questions"]), "session": json.loads(r["session"] or "{}"),
+            "answers": json.loads(r["answers"] or "[]")}
+
+
+def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str, why: str, tried: str,
+            questions: list[dict], session: dict) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
+                  "session) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
+                   json.dumps(session)))
+
+
+def ask_get(ask_id: str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM asks WHERE id = ?", (ask_id,)).fetchone()
+        return ask_row(r) if r else None
+
+
+def asks_of(run: str, status: str = "", connect=db) -> list[dict]:
+    with connect() as c:
+        return [ask_row(r) for r in c.execute(
+            "SELECT * FROM asks WHERE run = ?" + (" AND status = ?" if status else "") + " ORDER BY asked, rowid",
+            (run, status) if status else (run,))]
+
+
+def open_asks(connect=db) -> list[dict]:
+    with connect() as c:
+        return [ask_row(r) for r in c.execute(
+            "SELECT * FROM asks WHERE status = 'open' AND NOT EXISTS (SELECT 1 FROM runs a, runs later WHERE "
+            "a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue AND "
+            "COALESCE(later.only_step, '') = '' AND later.rowid > a.rowid) ORDER BY asked, rowid")]
+
+
+def asks_due(run_ids) -> list[dict]:
+    ids = list(run_ids)
+    if not ids:
+        return []
+    with db() as c:
+        return [ask_row(r) for r in c.execute(
+            f"SELECT * FROM asks WHERE status = 'answered' AND taken_by = '' AND run IN ({','.join('?' * len(ids))}) "
+            "ORDER BY asked, rowid", ids)]
+
+
+def ask_close(ask_id: str, status: str, answers: list[dict] | None = None) -> bool:
+    with db() as c:
+        return c.execute("UPDATE asks SET status = ?, answered = ?, answers = ? WHERE id = ? AND status = 'open'",
+                         (status, util.iso(), json.dumps(answers or []), ask_id)).rowcount > 0
+
+
+def asks_retire(run_id: str, status: str) -> None:
+    with db() as c:
+        c.execute("UPDATE asks SET status = ?, answered = COALESCE(answered, ?) WHERE run = ? AND "
+                  "(status = 'open' OR (status = 'answered' AND taken_by = ''))", (status, util.iso(), run_id))
+
+
+def asks_taken(ids: list[str], run_id: str) -> None:
+    with db() as c:
+        c.executemany("UPDATE asks SET taken_by = ? WHERE id = ?", [(run_id, i) for i in ids])
+
+
+def asks_asked_before(iso: str) -> list[dict]:
+    with db() as c:
+        return [ask_row(r) for r in c.execute("SELECT * FROM asks WHERE status = 'open' AND asked < ? "
+                                              "ORDER BY asked, rowid", (iso,))]

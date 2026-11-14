@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import socket
+import stat
 import subprocess
 import time
 import urllib.error
@@ -12,18 +13,24 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import config, environment, paths, scratch, util
 from .util import git
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
+PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
+    "navigate", "navigate_back", "snapshot", "click", "type", "press_key", "hover", "select_option", "fill_form",
+    "wait_for", "take_screenshot", "console_messages", "network_requests", "resize", "handle_dialog", "tabs", "close"))
 PORT_FIELD = re.compile(r"\{(port\d*)\}")
 SCRATCH_FIELD = "{scratch}"
 STOP_GRACE_SECONDS = 10
 EVIDENCE_BRANCH = "arete/evidence"
 MAX_SCREENSHOTS = 8
+MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_SAW_CHARS = 1200
 VERDICTS = ("pass", "fail", "blocked")
+ENVIRONMENT_FAULT = re.compile(r"[Oo]peration not permitted|\bEPERM\b|\[Errno 1\]|\bsandbox-exec\b")
 
 SCHEMA = {
     "type": "object",
@@ -37,6 +44,7 @@ SCHEMA = {
                 "how": {"type": "string"},
                 "saw": {"type": "string"},
                 "passed": {"type": "boolean"},
+                "cause": {"type": "string", "enum": ["change", "environment"]},
                 "screenshot": {"type": "string"},
             },
             "required": ["what", "how", "saw", "passed"],
@@ -51,14 +59,32 @@ class ServerError(RuntimeError):
     pass
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def free_port(avoid: frozenset[int] = frozenset()) -> int:
+    while True:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in avoid:
+            return port
+
+
+def port_refusal(v: config.Verify) -> str:
+    if not v.start:
+        return ""
+    try:
+        parts = urlsplit(v.url)
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return ""
+    if port not in scratch.dashboard_ports():
+        return ""
+    return (f"The verify URL {v.url} uses port {port}, which the live dashboard or a running arete serve uses; "
+            "use {port} so verification gets a free port.")
 
 
 def with_free_ports(v: config.Verify) -> config.Verify:
-    ports = {name: free_port() for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
+    avoid = scratch.dashboard_ports()
+    ports = {name: free_port(avoid) for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
 
     def filled(text: str) -> str:
         return PORT_FIELD.sub(lambda m: str(ports[m.group(1)]), text)
@@ -104,7 +130,12 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         yield ""
         return
     url = v.url.rstrip("/")
-    command = scratch.service_command(attempt, v.start) if attempt else v.start
+    listen = None
+    if attempt:
+        app = scratch.app_port(attempt, url)
+        listen = scratch.listen_port(attempt, app, scratch.dashboard_ports())
+        scratch.update_browser(attempt, listen=listen)
+    command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
     env = environment.commands(cfg or config.load(), repo, sets)
     if attempt:
         env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k)}
@@ -146,6 +177,14 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
             pass
         time.sleep(1)
     raise ServerError(f"{url} did not answer within {seconds} seconds{output(log)}")
+
+
+def environment_fault(error: str) -> str:
+    lines = error.splitlines()
+    if not lines or not lines[0].startswith("the start command exited"):
+        return ""
+    found = next((m for line in lines[1:] if (m := ENVIRONMENT_FAULT.search(line))), None)
+    return found.group(0) if found else ""
 
 
 def output(log: Path) -> str:
@@ -200,6 +239,10 @@ class Verified:
             v.verdict, v.blocked_by = "blocked", "the verifier said pass but listed no checks"
         elif v.verdict == "pass" and v.failed_checks:
             v.verdict = "fail"
+        if v.verdict == "fail" and v.failed_checks and all(str(c.get("cause") or "").strip().lower() == "environment" for c in v.failed_checks):
+            v.verdict = "blocked"
+            v.blocked_by = v.blocked_by or util.first_line(str(v.failed_checks[0].get("what") or "")
+                                                           + ": " + str(v.failed_checks[0].get("saw") or ""), 300)
         return v
 
     @classmethod
@@ -212,7 +255,7 @@ class Verified:
 
     def screenshots(self, evidence: Path) -> list[Path]:
         names = [Path(c["screenshot"]).name for c in self.checks if (c.get("screenshot") or "").strip()]
-        return [evidence / n for n in dict.fromkeys(names) if (evidence / n).is_file()][:MAX_SCREENSHOTS]
+        return [evidence / n for n in dict.fromkeys(names) if evidence_bytes(evidence, n, 0) is not None][:MAX_SCREENSHOTS]
 
     def requirements(self) -> list[dict]:
         return [{"what": str(c.get("what") or "").strip(), "passed": bool(c.get("passed")),
@@ -220,8 +263,8 @@ class Verified:
 
     def evidence_of(self, check: dict) -> str:
         shot = Path(str(check.get("screenshot") or "")).name
-        if self.saved and shot and (found := Path(self.saved).parent / "evidence" / shot).is_file():
-            return os.path.abspath(found)
+        if self.saved and shot and evidence_bytes(Path(self.saved).parent / "evidence", shot, 0) is not None:
+            return os.path.abspath(Path(self.saved).parent / "evidence" / shot)
         return self.saved
 
     def markdown(self, image_url: dict[str, str] | None = None) -> str:
@@ -232,7 +275,7 @@ class Verified:
             lines.append(f"\nBlocked by: {self.blocked_by}")
         embedded: set[str] = set()
         for c in self.checks:
-            lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed'}**: {c['what'].strip()}",
+            lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed (environment)' if str(c.get('cause') or '').strip().lower() == 'environment' else 'Failed'}**: {c['what'].strip()}",
                       f"  - How: {one_line(c['how'])}", f"  - Saw: {one_line(c['saw'])[:MAX_SAW_CHARS]}"]
             shot = Path(c.get("screenshot") or "").name
             if shot in embedded:
@@ -257,10 +300,30 @@ def one_line(text: str) -> str:
     return " ".join((text or "").split())
 
 
+def evidence_bytes(folder: Path, name: str, limit: int = MAX_EVIDENCE_BYTES) -> bytes | None:
+    try:
+        with paths.directory_fd(Path(os.path.abspath(folder))) as parent:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return handle.read(limit + 1) if limit else b""
+
+
 def push_evidence(src: Path, github: str, run_id: str, files: list[Path]) -> dict[str, str]:
+    contents = {f: evidence_bytes(f.parent, f.name) for f in files}
+    files = [f for f in files if contents[f] is not None and len(contents[f]) <= MAX_EVIDENCE_BYTES]
     if not files:
         return {}
-    blobs = "".join(f"100644 blob {git(['hash-object', '-w', str(f)], src).strip()}\t{f.name}\n" for f in files)
+    blobs = ""
+    for f in files:
+        command = scratch.protected_command(["git", "hash-object", "-w", "--stdin"], src)
+        done = subprocess.run(command, check=False, cwd=src, input=contents[f], capture_output=True, timeout=300)
+        if done.returncode != 0:
+            raise RuntimeError(f"git hash-object: {util.git_error(done.stderr.decode(errors='replace'))}")
+        blobs += f"100644 blob {done.stdout.decode().strip()}\t{f.name}\n"
     run_tree = git(["mktree"], src, input=blobs).strip()
     old = git(["ls-remote", "origin", f"refs/heads/{EVIDENCE_BRANCH}"], src).split()
     rows = ""

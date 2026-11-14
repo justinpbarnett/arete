@@ -15,7 +15,40 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arete import claude, config, lines, paths, pipeline, record, runlimits, state, tracker, util
+from arete import (
+    claude,
+    cli,
+    config,
+    diffguard,
+    factory,
+    flows,
+    gh,
+    lines,
+    paths,
+    pi,
+    pipeline,
+    record,
+    runlimits,
+    scratch,
+    serve,
+    state,
+    tracker,
+    util,
+)
+from arete.agent import Result
+
+
+def setUpModule():
+    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
+    unittest.addModuleCleanup(folder.cleanup)
+    root = Path(folder.name).resolve()
+    for pointer in (patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+                    patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
+                    patch.object(paths, "PI_KEYS_FILE", root / "config" / "pi.env"),
+                    *(patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                      for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
+        pointer.start()
+        unittest.addModuleCleanup(pointer.stop)
 
 
 class Isolated(unittest.TestCase):
@@ -185,7 +218,9 @@ class BudgetTests(Isolated):
                 "\nexcept runlimits.Parked:print('budget remained exhausted')"
                 "\nelse:raise AssertionError('restart reset the budget')")
         done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
-                              env={k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")})
+                              cwd=str(self.root),
+                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
+                                   "HOME": str(self.root)})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("budget remained exhausted", done.stdout)
 
@@ -217,7 +252,9 @@ class BudgetTests(Isolated):
                 "lines.write=lambda *a,**k:{};"
                 "\nwith budget.watching(),budget.verifying():os._exit(0)")
         done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
-                              env={k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")})
+                              cwd=str(self.root),
+                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
+                                   "HOME": str(self.root)})
         self.assertEqual(done.returncode, 0, done.stderr)
         previous = state.ticket_runs(self.repo.name, self.ticket)[0]
         record.settle(previous["id"], "interrupted")
@@ -241,6 +278,55 @@ class BudgetTests(Isolated):
         with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
             with second.budget.watching():
                 self.fail("an exhausted chain must not run")
+
+    def test_idle_waits_move_the_deadline_and_other_waits_do_not(self):
+        for cause in ("limit", "slot"):
+            with self.subTest(cause=cause):
+                run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
+                started = time.monotonic()
+                with self.assertRaisesRegex(runlimits.Parked, "run chain"):
+                    with run.budget.watching():
+                        with run.waiting(cause):
+                            time.sleep(.9)
+                        self.assertGreater(run.budget.deadline - time.monotonic(), 0)
+                        time.sleep(6)
+                self.assertLess(time.monotonic() - started, 3 + .9 + 1)
+                self.assertGreater(runlimits.metadata(run.id, "budget.json")["wait_minutes_left_out"][cause], 0)
+        run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
+        with self.assertRaisesRegex(runlimits.Parked, "run chain"):
+            with run.budget.watching(), run.waiting("ci"):
+                time.sleep(6)
+
+    def chained_after(self, *waits):
+        first = self.made_run()
+        record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
+        for cause, since, until in waits:
+            if until is None:
+                lines.wait_start(first.id, cause, util.iso(util.now() - timedelta(minutes=since)))
+            else:
+                lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
+                             util.iso(util.now() - timedelta(minutes=until)))
+        record.settle(first.id, "interrupted")
+        return first, self.made_run(first.id)
+
+    def test_limit_wait_of_an_earlier_run_is_left_out_of_prior_seconds(self):
+        for waits in ([("limit", 50, 10)], [("limit", 50, None)]):
+            with self.subTest(waits=waits):
+                first, second = self.chained_after(*waits)
+                self.assertLess(second.budget.prior_seconds, 25 * 60)
+                self.assertGreater(second.budget.earlier_idle["limit"], 35 * 60)
+                with second.budget.watching():
+                    pass
+                self.assertGreater(
+                    runlimits.metadata(second.id, "budget.json")["earlier_wait_minutes_left_out"]["limit"], 35)
+
+    def test_ci_waits_and_waits_before_the_run_started_still_count(self):
+        for waits in ([("ci", 50, 10)], [("slot", 90, 70)]):
+            with self.subTest(waits=waits):
+                first, second = self.chained_after(*waits)
+                with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
+                    with second.budget.watching():
+                        self.fail("an exhausted chain must not run")
 
     def test_verification_deadline_interrupts_and_is_accounted(self):
         run = self.made_run(policy=runlimits.Policy(max_verify_minutes=.001))
@@ -466,7 +552,7 @@ class BudgetTests(Isolated):
 
         script = pipeline.Script("feature", drive)
         with patch.object(config, "load", return_value=self.cfg), patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.005)), \
+                patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.05)), \
                 patch.object(pipeline.runner, "run", side_effect=transport):
             self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
         row = state.ticket_runs(self.repo.name, self.ticket, whole=True)[0]
@@ -648,6 +734,317 @@ class CheckConcurrencyTests(Isolated):
     def test_explicit_isolated_checks_overlap(self):
         first, second = self.checks(True)
         self.assertLess(max(first[0], second[0]), min(first[1], second[1]))
+
+
+class KeptEditsTests(Isolated):
+    BRANCH = "arete/t1-fixture"
+    URL = "https://github.com/o/fixture/pull/1"
+
+    def setUp(self):
+        super().setUp()
+        self.origin = self.root / "origin.git"
+        util.git(["init", "-q", "--bare", "-b", "main", str(self.origin)], self.root)
+        util.git(["init", "-q", "-b", "main"], self.repo.path)
+        self.commit(self.repo.path, "shared.txt", "one\n", "first")
+        util.git(["remote", "add", "origin", str(self.origin)], self.repo.path)
+        util.git(["push", "-q", "origin", "main:main", f"main:refs/heads/{self.BRANCH}"], self.repo.path)
+        self.repo.parts = [config.Part("", "o/fixture")]
+        self.patches.enter_context(patch.object(gh, "open_pr_url", return_value=self.URL))
+        self.patches.enter_context(patch.object(gh, "closed_pr_heads", return_value=[]))
+        self.layer, self.ticket_data = config.RepoLayer(dir=Path()), tracker.Ticket("", "", "")
+
+    def commit(self, where, name, text, message):
+        (where / name).write_text(text)
+        util.git(["add", name], where)
+        util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message], where)
+
+    def head(self, where):
+        return util.git(["rev-parse", "HEAD"], where).strip()
+
+    def start(self, run):
+        made = pipeline.make_workspace(run.id, self.repo, "main", self.BRANCH, "t1", [])
+        run.workspace = made
+        return made
+
+    def parked_edit(self, name="edit.txt", text="edit\n"):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        (checkouts[0].wt / name).write_text(text)
+        pipeline.keep_edits(run)
+        pipeline.note_made(ws, checkouts)
+        return ws, checkouts[0]
+
+    def push_from_elsewhere(self, name, text, ref=BRANCH):
+        src = self.repo.path
+        util.git(["fetch", "-q", "origin"], src)
+        util.git(["checkout", "-q", "--detach", f"origin/{ref}"], src)
+        self.commit(src, name, text, "moved")
+        util.git(["push", "-q", "origin", f"HEAD:refs/heads/{ref}"], src)
+        util.git(["checkout", "-q", "main"], src)
+
+    def run_of(self, where, rev="HEAD"):
+        return util.git(["log", "-1", "--format=%(trailers:key=Arete-Run,valueonly)", rev], where).strip()
+
+    def test_next_run_continues_on_the_kept_edits_over_the_pr_head(self):
+        _, first = self.parked_edit()
+        kept, pr_head = self.head(first.wt), util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(self.head(checkouts[0].wt), kept)
+        self.assertEqual(checkouts[0].onto, pr_head)
+        self.assertIn("left unpushed", checkouts[0].starting_point)
+        self.assertEqual(pipeline.stage(checkouts, []).files, ["edit.txt"])
+
+    def test_reset_worktree_is_refused_naming_both_commits(self):
+        _, first = self.parked_edit()
+        kept = self.head(first.wt)
+        util.git(["reset", "-q", "--hard", "HEAD~1"], first.wt)
+        with self.assertRaises(pipeline.RunFailed) as refused:
+            self.start(self.made_run())
+        self.assertIn(kept[:12], refused.exception.why)
+        self.assertIn(self.head(first.wt)[:12], refused.exception.why)
+        self.assertTrue((first.wt / ".git").exists())
+
+    def test_moved_branch_is_merged_into_the_kept_edits(self):
+        _, first = self.parked_edit()
+        kept = self.head(first.wt)
+        self.push_from_elsewhere("moved.txt", "moved\n")
+        new_head = util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        wt = checkouts[0].wt
+        self.assertEqual(util.git(["rev-list", "--parents", "-n1", "HEAD"], wt).split()[1:], [kept, new_head])
+        self.assertEqual(checkouts[0].onto, new_head)
+        self.assertTrue((wt / "edit.txt").exists() and (wt / "moved.txt").exists())
+        self.assertEqual(self.run_of(wt), run.id)
+        self.assertEqual(flows.foreign(wt, "HEAD", [kept, new_head], {run.id}), [])
+
+    def test_base_merged_into_a_published_branch_through_a_resolved_conflict_stays_in_the_runs_chain(self):
+        self.push_from_elsewhere("shared.txt", "mine\n")
+        self.push_from_elsewhere("shared.txt", "theirs\n", "main")
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        wt = checkouts[0].wt
+
+        def resolver(step, text, cwd, **kw):
+            (cwd / "shared.txt").write_text("mine and theirs\n")
+            return Result(True, structured={"resolved": True})
+
+        with patch.object(run, "agent", side_effect=resolver):
+            pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(checkouts[0].resolved, ["shared.txt"])
+        self.assertEqual((wt / "shared.txt").read_text(), "mine and theirs\n")
+        self.assertEqual(self.run_of(wt), run.id)
+        self.assertEqual(flows.foreign(wt, "HEAD", [f"origin/{self.BRANCH}"], {run.id}), [])
+
+    def test_denied_paths_stay_out_of_the_kept_commit(self):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        wt = checkouts[0].wt
+        (wt / "edit.txt").write_text("edit\n")
+        (wt / ".env").write_text("SECRET=1\n")
+        pipeline.keep_edits(run)
+        self.assertEqual(util.git(["show", "--name-only", "--format=", "HEAD"], wt).split(), ["edit.txt"])
+        self.assertTrue((wt / ".env").exists())
+        self.assertEqual(pipeline.stage(checkouts, diffguard.denied_paths(self.layer)).denied, [".env"])
+        pipeline.note_made(ws, checkouts)
+        self.push_from_elsewhere("moved.txt", "moved\n")
+        again = self.made_run()
+        _, second = self.start(again)
+        with self.assertRaises(pipeline.RunFailed) as refused:
+            pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
+        self.assertIn(".env", refused.exception.why)
+        self.assertTrue((wt / ".env").exists())
+
+    def test_commit_left_unpushed_by_a_failed_publication_is_kept_for_the_retry(self):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        wt, pr_head = checkouts[0].wt, self.head(checkouts[0].wt)
+        (wt / "edit.txt").write_text("edit\n")
+        staged = pipeline.stage(checkouts, [])
+        with patch.object(pipeline, "remote_head", return_value="someone-else"), \
+                self.assertRaises(pipeline.RunFailed):
+            pipeline.commit_and_push(checkouts, staged.changed, self.BRANCH, "work")
+        committed = self.head(wt)
+        self.assertNotEqual(committed, pr_head)
+        pipeline.keep_edits(run)
+        pipeline.note_made(ws, checkouts)
+        again = self.made_run()
+        _, second = self.start(again)
+        pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(self.head(second[0].wt), committed)
+        self.assertEqual(second[0].onto, pr_head)
+        self.assertEqual(pipeline.stage(second, []).files, ["edit.txt"])
+
+    def test_failed_retention_commit_does_not_lose_the_edits_on_retry(self):
+        run = self.made_run()
+        ws, checkouts = self.start(run)
+        wt, head = checkouts[0].wt, self.head(checkouts[0].wt)
+        (wt / "edit.txt").write_text("edit\n")
+        with patch.object(pipeline, "commit_kept", side_effect=RuntimeError("hook failed")):
+            pipeline.keep_edits(run)
+        pipeline.note_made(ws, checkouts)
+        again = self.made_run()
+        _, second = self.start(again)
+        pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual((second[0].wt / "edit.txt").read_text(), "edit\n")
+        self.assertEqual(second[0].onto, head)
+        self.assertEqual(pipeline.stage(second, []).files, ["edit.txt"])
+
+    def test_renewed_flow_carries_stored_steps_when_the_workspace_holds_several_worktrees(self):
+        container = self.root / "container"
+        for part in ("a", "b"):
+            (container / part).mkdir(parents=True)
+            util.git(["init", "-q", "-b", "main"], container / part)
+        earlier = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
+        listed = [{"wt": str(container / part)} for part in ("a", "b")]
+        lines.write(earlier, "step_end", step="prepare", result="pass", tree=str(container), fingerprint="",
+                    data={"checkouts": listed})
+        lines.write(earlier, "step_end", step="plan", result="pass", data={"plan": "p"})
+        made = []
+        fakes = {"prepare": lambda flow, tree: factory.Outcome("pass"),
+                 "plan": lambda flow: made.append("plan") or factory.Outcome("pass")}
+        with patch.dict(factory.STEPS, fakes):
+            flow = factory.Flow("later", continues=earlier, renew="prepare", keeps=lambda name, kw: name == "plan")
+            flow.step("prepare", tree=str(container))
+            carried = flow.step("plan")
+        self.assertTrue(carried.passed)
+        self.assertEqual(made, [])
+        self.assertTrue(any(line.get("carried") == earlier for line in lines.read("later")))
+
+    def test_conflicting_move_with_a_failed_resolver_leaves_the_kept_commit(self):
+        _, first = self.parked_edit("shared.txt", "mine\n")
+        kept = self.head(first.wt)
+        self.push_from_elsewhere("shared.txt", "theirs\n")
+        run = self.made_run()
+        _, checkouts = self.start(run)
+        with patch.object(pipeline, "resolve_conflicts", side_effect=pipeline.RunFailed("resolver failed")), \
+                self.assertRaises(pipeline.RunFailed):
+            pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
+        self.assertEqual(self.head(checkouts[0].wt), kept)
+        self.assertEqual(util.git(["status", "--short"], checkouts[0].wt).strip(), "")
+
+
+class RecordRetentionTests(Isolated):
+    def written(self, rid, days, size=1000):
+        folder = paths.record_dir(rid)
+        folder.mkdir(parents=True)
+        (folder / "call.jsonl.gz").write_bytes(b"x" * size)
+        (folder.parent / "run.log").write_text("log\n")
+        at = time.time() - days * 86400
+        os.utime(folder / "call.jsonl.gz", (at, at))
+        os.utime(folder, (at, at))
+        return folder
+
+    def proposal(self, run_id, evidence):
+        state.add_proposal(run_id, {"layer": "repo", "repo": "r", "file": "f", "change": "c", "why": "w",
+                                    "evidence": evidence, "confidence": 0.9}, "hand")
+
+    def test_age_removes_only_the_old_record(self):
+        old, new = self.written("pip-old", 40), self.written("pip-new", 2)
+        found = record.prune(30, 20)
+        self.assertEqual([r.run_id for r in found.removed], ["pip-old"])
+        self.assertFalse(old.exists())
+        self.assertTrue((old.parent / "run.log").is_file())
+        self.assertTrue(new.exists())
+
+    def test_size_removes_oldest_first(self):
+        folders = [self.written(f"pip-{n}", d) for n, d in (("a", 3), ("b", 2), ("c", 1))]
+        found = record.prune(30, 1500 / record.GB)
+        self.assertEqual([r.run_id for r in found.removed], ["pip-a", "pip-b"])
+        self.assertEqual([f.exists() for f in folders], [False, False, True])
+        self.assertFalse(found.over)
+
+    def test_pinned_and_cited_records_stay_until_released(self):
+        pinned, by_run, by_text = (self.written(n, 40) for n in ("pip-pinned", "pip-run", "pip-text"))
+        record.pin("pip-pinned")
+        self.proposal("pip-run", [])
+        self.proposal("min-x", ["run pip-text at 10:00"])
+        self.assertEqual(record.prune(30, 20).removed, ())
+        record.unpin("pip-pinned")
+        state.move_proposal(1, ("hand",), "rejected")
+        self.assertEqual([r.run_id for r in record.prune(30, 20).removed], ["pip-pinned", "pip-run"])
+        self.assertTrue(by_text.exists())
+        state.move_proposal(2, ("hand",), "skipped")
+        record.prune(30, 20)
+        self.assertFalse(by_text.exists())
+        self.assertFalse(pinned.exists() or by_run.exists())
+
+    def test_running_and_fresh_records_stay_over_the_limit(self):
+        rid = record.start("pipeline", repo="r", issue=1)
+        running = self.written(rid, 40, 5000)
+        fresh = self.written("pip-fresh", 0, 5000)
+        found = record.prune(30, 1 / record.GB)
+        self.assertEqual(found.removed, ())
+        self.assertTrue(found.over)
+        self.assertTrue(running.exists() and fresh.exists())
+
+    def test_symlinked_run_folder_is_never_scanned_or_removed(self):
+        target = self.written("pip-real", 40)
+        (paths.RUNS_DIR / "alias").symlink_to(paths.RUNS_DIR / "pip-real", target_is_directory=True)
+        self.assertEqual([r.run_id for r in record.stored()], ["pip-real"])
+        record.pin("pip-real")
+        self.assertEqual(record.prune(30, 20).removed, ())
+        self.assertTrue(target.exists())
+
+    def test_unreadable_record_is_left_out_of_the_scan(self):
+        self.written("pip-a", 40)
+        self.written("pip-b", 40)
+        real = os.walk
+
+        def walk(top, *args, onerror=None, **kwargs):
+            if "pip-a" in str(top):
+                onerror(PermissionError("denied"))
+                return iter(())
+            return real(top, *args, onerror=onerror, **kwargs)
+
+        with patch.object(os, "walk", walk):
+            self.assertEqual([r.run_id for r in record.stored()], ["pip-b"])
+
+    def test_retention_table(self):
+        self.assertEqual(config.retention_table({}), config.Retention(30, 20))
+        self.assertEqual(config.retention_table({"days": 0.5}), config.Retention(0.5, 20))
+        for bad in ({"days": 0}, {"max_gb": "x"}, {"days": True}, {"weeks": 1}):
+            with self.assertRaises(ValueError):
+                config.retention_table(bad)
+
+    def test_pin_commands(self):
+        self.written("pip-a", 1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["record", "pin", "pip-a"]), 0)
+            self.assertEqual(state.record_pins(), {"pip-a"})
+            self.assertEqual(cli.main(["record", "pin", "nope"]), 1)
+            self.assertEqual(cli.main(["record", "pin"]), 2)
+            self.assertEqual(cli.main(["record", "unpin", "pip-a"]), 0)
+            self.assertEqual(cli.main(["record", "unpin", "pip-a"]), 1)
+            self.assertEqual(cli.main(["record", "pip-a"]), 0)
+
+    def test_serve_prune_removes_records_and_prunes_state_once(self):
+        old = self.written("pip-old", 40)
+        server = serve.Server()
+        with patch.object(state, "prune") as pruned:
+            server.prune()
+        pruned.assert_called_once_with()
+        self.assertFalse(old.exists())
+
+    def test_store_reports_size_oldest_and_pins(self):
+        self.written("pip-a", 5, 1000)
+        self.written("pip-b", 1, 500)
+        record.pin("pip-b")
+        found = record.store()
+        self.assertEqual((found["bytes"], found["records"], found["pins"]), (1500, 2, 1))
+        self.assertEqual(found["oldest"]["run_id"], "pip-a")
+        self.assertEqual(record.size_text(1500), "1.5 KB")
+
+
+class NoLiveStateTests(unittest.TestCase):
+    def test_no_test_here_points_at_the_live_authority_or_state(self):
+        live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
+        for path in (scratch.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR,
+                     pi.SESSIONS_DIR):
+            self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
 if __name__ == "__main__":

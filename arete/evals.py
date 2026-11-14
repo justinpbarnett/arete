@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -13,7 +14,9 @@ from . import config, environment, gh, paths, record, runner, scratch, state, tr
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
+    MAX_DIFF_IN_PROMPT,
     PLAN_SCHEMA,
+    REVIEW_SCHEMA,
     AgentRun,
     Checkout,
     RunFailed,
@@ -24,12 +27,16 @@ from .pipeline import (
     check_script,
     code_list,
     prompt,
+    review_problems,
     run_checks,
     use_product,
 )
 from .util import git
 
 EVALS = ".agents/evals"
+MAX_BASES = 4
+BASES: dict[tuple[str, str, str], Base] = {}
+BASES_LOCK = threading.Lock()
 OVERLAY_EXTRA = [".agents/config.toml"]
 ARETE_PROMPTS = "arete/prompts"
 BUILDER_PROMPTS = ("plan", "build", "fix")
@@ -56,6 +63,9 @@ class Task:
 @dataclass
 class EvalRun(AgentRun):
     task: str = ""
+    trial: str = ""
+    reviews: bool = False
+    checks_required: bool = False
 
     @property
     def ref(self) -> str:
@@ -64,6 +74,15 @@ class EvalRun(AgentRun):
     @property
     def where(self) -> str:
         return f"eval {self.repo.name}/{self.task}"
+
+    def repair_limit(self, layer) -> int:
+        return self.settings("check_repair").tries if self.trial else layer.max_attempts
+
+    def gate(self, layer, wt: Path, task, timeout: float) -> tuple[bool, str]:
+        return run_checks(layer, wt, [wt], self, self.time_for(timeout))
+
+    def may_repair(self, attempts: int, limit: int) -> bool:
+        return attempts < limit
 
 
 @dataclass
@@ -195,23 +214,29 @@ def remove_base_harness(wt: Path, globs: list[str]) -> None:
             remove_empty_parents(p.parent, wt)
 
 
+def harness_globs() -> list[str]:
+    return [g for g in config.HARNESS_GLOBS if not g.startswith(EVALS)] + OVERLAY_EXTRA
+
+
+def harness_files(src: Source) -> list[str]:
+    globs = harness_globs()
+    return [f for f in src.files() if util.matches_any(f, globs) and not f.startswith(EVALS + "/")]
+
+
 def overlay_harness(src: Source, wt: Path) -> list[str]:
     shutil.rmtree(wt / EVALS, ignore_errors=True)
-    globs = [g for g in config.HARNESS_GLOBS if not g.startswith(EVALS)] + OVERLAY_EXTRA
-    remove_base_harness(wt, globs)
-    copied = []
-    for f in src.files():
-        if util.matches_any(f, globs) and not f.startswith(EVALS + "/"):
-            dest = wt / f
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.is_symlink() or dest.is_file():
-                dest.unlink()
-            target = src.link(f)
-            if target is not None:
-                os.symlink(target, dest)
-            else:
-                dest.write_bytes(src.read(f))
-            copied.append(f)
+    remove_base_harness(wt, harness_globs())
+    copied = harness_files(src)
+    for f in copied:
+        dest = wt / f
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        target = src.link(f)
+        if target is not None:
+            os.symlink(target, dest)
+        else:
+            dest.write_bytes(src.read(f))
     return copied
 
 
@@ -225,12 +250,46 @@ def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
                 "eval base"], staging).strip()
 
 
-def write_files_through_repo(repo_path: Path, snapshot: str, dest: Path) -> None:
-    env = {"GIT_DIR": git(["rev-parse", "--absolute-git-dir"], repo_path).strip(), "GIT_WORK_TREE": str(dest),
+@dataclass
+class Base:
+    folder: tempfile.TemporaryDirectory
+    snapshot: str
+    git_dir: str
+
+    @property
+    def path(self) -> Path:
+        return Path(self.folder.name)
+
+
+def write_files_through_repo(git_dir: str, snapshot: str, dest: Path) -> None:
+    env = {"GIT_DIR": git_dir, "GIT_WORK_TREE": str(dest),
            "GIT_INDEX_FILE": str(dest / ".git" / "index"),
            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(dest / ".git" / "objects")}
     git(["read-tree", snapshot], dest, env=env)
     git(["checkout-index", "-a"], dest, timeout=600, env=env)
+
+
+def base_without_evals(repo_path: Path, sha: str, beside: Path) -> Base:
+    key = (str(repo_path), sha, str(beside))
+    found = BASES.get(key)
+    if found and found.path.is_dir():
+        return found
+    folder = tempfile.TemporaryDirectory(prefix="eval-base-", dir=beside)
+    try:
+        git(["init", "-q"], Path(folder.name))
+        with tempfile.TemporaryDirectory(prefix="eval-staging-", dir=beside) as staging:
+            snapshot = commit_without_evals(repo_path, sha, Path(staging))
+            git(["fetch", "-q", "--no-tags", staging, snapshot], Path(folder.name), timeout=600)
+        git(["update-ref", "refs/eval/base", snapshot], Path(folder.name))
+        made = Base(folder, snapshot, git(["rev-parse", "--absolute-git-dir"], repo_path).strip())
+    except BaseException:
+        folder.cleanup()
+        raise
+    BASES.pop(key, None)
+    while len(BASES) >= MAX_BASES:
+        BASES.pop(next(iter(BASES))).folder.cleanup()
+    BASES[key] = made
+    return made
 
 
 def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> None:
@@ -238,10 +297,10 @@ def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> None
     sha = git(["rev-parse", f"{base}^{{commit}}"], repo_path).strip()
     dest.mkdir(parents=True)
     git(["init", "-q"], dest)
-    with tempfile.TemporaryDirectory(prefix=f"{dest.name}-base-", dir=dest.parent) as staging:
-        snapshot = commit_without_evals(repo_path, sha, Path(staging))
-        git(["fetch", "-q", "--no-tags", staging, snapshot], dest, timeout=600)
-    write_files_through_repo(repo_path, snapshot, dest)
+    with BASES_LOCK:
+        made = base_without_evals(repo_path, sha, dest.parent)
+        git(["fetch", "-q", "--no-tags", str(made.path), made.snapshot], dest, timeout=600)
+    write_files_through_repo(made.git_dir, made.snapshot, dest)
     git(["checkout", "-q", "-B", "main", "FETCH_HEAD"], dest)
 
 
@@ -256,7 +315,7 @@ def fetch_origin(repo: config.Repo) -> None:
         git(["fetch", "-q", "origin"], repo.path, check=False, timeout=300)
 
 
-def prepare(repo: config.Repo, src: Source, wt: Path, run: AgentRun) -> config.RepoLayer:
+def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.RepoLayer:
     copied = overlay_harness(src, wt)
     run.log(f"harness from {src.label} ({len(copied)} files)")
     layer = config.load_layer(repo.layer or wt / ".agents")
@@ -266,7 +325,7 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: AgentRun) -> config.R
             (wt / c).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, wt / c)
     for cmd in layer.setup:
-        if environment.sh(cmd, run.config, repo, cwd=wt, timeout=1200).returncode != 0:
+        if environment.sh(cmd, run.config, repo, cwd=wt, timeout=run.time_for(1200)).returncode != 0:
             raise RunFailed(f"setup `{cmd}` failed")
     commit_overlay(wt)
     return layer
@@ -288,15 +347,52 @@ def grade_failure(graded: verify.Verified) -> str:
     return f"failed in use: {util.first_line(failed[0]['what'] if failed else graded.summary, 200)}"
 
 
+def step_call(cfg: config.Config, run: EvalRun, role: str, tools: list[str], rules: list[str]) -> dict:
+    if run.trial:
+        return {"role": role, "allowed_tools": rules}
+    return {"model": cfg.model(config.INHERITS.get(role, role)), "allowed_tools": tools + rules}
+
+
+def switched_prompt(which: str, wt: Path, task: Task, plan: str, summary: str, feedback: str) -> str:
+    return (f"The earlier session cannot continue on {which}. Continue the existing work in {wt}; inspect its "
+            f"current diff before editing.\n\n## Task {task.name}: {task.title}\n\n{task.prompt}\n\n"
+            f"## Saved plan\n\n{plan}\n\n## Earlier builder summary\n\n{summary}\n\n"
+            "Keep the current task's tool restrictions and never write git metadata or secret files."
+            f"\n\n## Current feedback\n\n{feedback}")
+
+
+def hidden_check(cfg: config.Config, repo: config.Repo, task: Task, wt: Path, timeout: float):
+    for rel, data in task.hidden_files.items():
+        dest = wt / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    return environment.sh(task.check, cfg, repo, cwd=wt, timeout=timeout)
+
+
+def review(run: EvalRun, wt: Path, task: Task, plan: str, report: str, evidence: str, diff: str, workspace: str,
+           timeout: float) -> int:
+    res = run.agent("review", prompt("review", repo=run.repo.name, workspace=workspace, ref=task.name,
+                                     title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
+                                     checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT),
+                                     earlier=""),
+                    wt, role="review", allowed_tools=bash_rules(config.DEFAULT_ALLOW_BASH),
+                    json_schema=REVIEW_SCHEMA, timeout=timeout)
+    if not res.ok or not isinstance(res.structured, dict):
+        raise RunFailed("review step failed")
+    return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
+
+
 def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run_id: str, dry_run: bool,
-             prompts: Prompts) -> dict:
-    run_dir = paths.RUNS_DIR / run_id / task.name
+             prompts: Prompts, run: EvalRun | None = None) -> dict:
+    run = run or EvalRun(id=run_id, repo=repo, dir=paths.RUNS_DIR / run_id / task.name, dry_run=dry_run,
+                         task=task.name)
+    run_dir = run.dir
     run_dir.mkdir(parents=True, exist_ok=True)
-    run = EvalRun(id=run_id, repo=repo, dir=run_dir, dry_run=dry_run, task=task.name)
     base = task.base or f"origin/{gh.default_branch(repo.github) if repo.github else 'main'}"
-    wt = paths.WORKTREES_DIR / f"eval-{repo.name}-{task.name}"
+    wt = paths.WORKTREES_DIR / "-".join(filter(None, ["eval", repo.name, task.name, run.trial]))
     started = time.time()
-    result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "paid": 0.0, "seconds": 0.0}
+    result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "paid": 0.0, "seconds": 0.0,
+              "repairs": 0, "failures": [], "checks": "", "verify": "", "hidden": "", "blocking": None}
     try:
         if not task.check and not task.verify:
             raise RunFailed("the task has neither `check` nor `verify`")
@@ -304,6 +400,8 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         checkout_without_origin_refs(repo.path, base, wt)
         run.log(f"checkout at {base}")
         layer = prepare(repo, src, wt, run)
+        if run.trial:
+            run.cfg, run.layer = cfg, layer
         if prompts.label:
             run.log(f"plan, build and fix prompts from {prompts.label}")
         if task.verify and not layer.verify:
@@ -321,7 +419,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                         body=task.prompt, comments="", attachments="", triage="", expertise=expertise,
                                         commands=commands, denied=code_list(denied_paths(layer)),
                                         max_lines=layer.max_diff_lines, checks=checks),
-                        wt, model=cfg.model("plan"), allowed_tools=runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
+                        wt, **step_call(cfg, run, "plan", runner.READ_TOOLS, bash_rules(config.DEFAULT_ALLOW_BASH)),
                         json_schema=PLAN_SCHEMA, timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
             result["why"] = "plan step failed"
@@ -329,45 +427,63 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
-        tools = runner.BUILD_TOOLS + bash_rules(layer.builder_bash + check_rules)
+        rules = bash_rules(layer.builder_bash + check_rules)
         res = run.agent("build", prompt("build", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name,
                                          title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
                                          expertise=expertise, checks=runs_checks, commands=commands,
                                          max_lines=layer.max_diff_lines, estimate=estimate,
                                          verify=in_use),
-                        wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES, timeout=timeout)
+                        wt, **step_call(cfg, run, "build", runner.BUILD_TOOLS, rules),
+                        disallowed_tools=runner.NO_GIT_WRITES, timeout=timeout)
         if not res.ok:
             result["why"] = "build step failed"
             return result
-        session, attempts = res.session, 1
-        ok, report = run_checks(layer, wt, [wt], run, timeout)
-        while not ok and attempts < layer.max_attempts:
-            attempts += 1
-            res = run.agent(f"fix{attempts}", prompt("fix", prompts.dir, attempt=attempts, max_attempts=layer.max_attempts,
-                                                     failures=report, checks=runs_checks),
-                            wt, model=cfg.model("build"), allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES,
-                            resume=session, timeout=timeout)
-            session = res.session
-            ok, report = run_checks(layer, wt, [wt], run, timeout)
+        session, attempts, summary = res.session, 1, res.text
+        max_attempts = run.repair_limit(layer)
+        ok, report = run.gate(layer, wt, task, timeout)
+        try:
+            while not ok and run.may_repair(attempts, max_attempts):
+                attempts += 1
+                fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
+                             checks=runs_checks)
+                res = run.agent(f"fix{attempts}", fix, wt,
+                                **step_call(cfg, run, "check_repair", runner.BUILD_TOOLS, rules),
+                                disallowed_tools=runner.NO_GIT_WRITES, resume=session, timeout=timeout,
+                                fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
+                                    which, wt, task, plan, summary, fix))
+                session, summary = res.session, res.text
+                ok, report = run.gate(layer, wt, task, timeout)
+        except RunFailed:
+            result["repairs"] = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
+            raise
+        result["repairs"] = attempts - 1
+        result["checks"] = "pass" if ok else "fail"
         git(["add", "-A"], wt)
-        (run_dir / "diff.patch").write_text(git(["diff", "--cached", "HEAD"], wt))
-        failures = []
+        diff = git(["diff", "--cached", "HEAD"], wt)
+        (run_dir / "diff.patch").write_text(diff)
+        failures = ["repo checks failing"] if run.checks_required and not ok else []
+        evidence ="No check in use ran for this task."
         if task.verify:
-            graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, timeout)
+            graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
+            result["verify"] = graded.verdict
+            evidence = graded.markdown()
             if graded.verdict != "pass":
                 failures.append(grade_failure(graded))
+        if run.reviews:
+            blocking = review(run, wt, task, plan, report, evidence, diff, workspace, run.time_for(timeout))
+            result["blocking"] = blocking
+            if blocking:
+                failures.append(util.count(blocking, "blocking review finding"))
         if task.check:
-            for rel, data in task.hidden_files.items():
-                dest = wt / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(data)
-            res = environment.sh(task.check, cfg, repo, cwd=wt, timeout=timeout)
+            res = hidden_check(cfg, repo, task, wt, run.time_for(timeout))
+            result["hidden"] = "pass" if res.returncode == 0 else "fail"
             (run_dir / "check.log").write_text(res.stdout + res.stderr)
             run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
             if res.returncode != 0:
                 failures.append(f"check exit {res.returncode}")
         result["passed"] = not failures
-        result["why"] = "; ".join(failures) + ("" if ok or not failures else ", repo checks failing")
+        result["failures"] = failures
+        result["why"] = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
         return result
     except RunFailed as e:
         result["why"] = e.why

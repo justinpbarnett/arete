@@ -75,6 +75,7 @@ LOOP_PATH = "/api/loops/"
 FEED_PATH = "/api/feed/"
 RUN_PATH = "/api/runs/"
 APPROVAL_PATH = "/api/approvals/"
+ASK_PATH = "/api/asks/"
 SESSION_PATH = "/api/sessions/"
 DEVICE_PATH = "/api/devices/"
 TRIAGE_PATH = "/api/triage/"
@@ -457,6 +458,8 @@ class Handler(BaseHTTPRequestHandler):
                 return board.run_board(unquote(path[len(RUN_PATH):]))
             if path.startswith(TASK_PATH):
                 return tasks.view(unquote(path[len(TASK_PATH):]), query.get("repo", ""))
+            if path == "/api/asks":
+                return tasks.asks_view()
             if path == "/api/health":
                 return board.health_board()
             if path == "/api/triage":
@@ -517,6 +520,10 @@ class Handler(BaseHTTPRequestHandler):
                     return tasks.repair(run_id)
                 if action.startswith("steps/"):
                     return tasks.run_step(run_id, action[len("steps/"):], self.body().get("set") or {})
+            if path.startswith(ASK_PATH):
+                ask_id, _, action = unquote(path[len(ASK_PATH):]).partition("/")
+                if action == "answer":
+                    return tasks.answer_ask(ask_id, self.body())
             if path.startswith(APPROVAL_PATH):
                 return control.decide(whole_number(unquote(path[len(APPROVAL_PATH):])),
                                       self.body().get("approve") is True)

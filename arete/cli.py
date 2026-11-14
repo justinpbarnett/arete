@@ -78,7 +78,7 @@ def cmd_init(args) -> int:
 
 
 def cmd_status(args) -> int:
-    from . import board, control
+    from . import board, control, record
 
     if args.json:
         return status_lines(args.run_id)
@@ -90,7 +90,7 @@ def cmd_status(args) -> int:
     snap = board.snapshot(recent_runs=args.limit)
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
-    print("models:" + "".join(f"\n  {role:<13} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
+    print("models:" + "".join(f"\n  {role:<15} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
     show(snap["checks"], "the heartbeat", print_checks)
@@ -102,6 +102,7 @@ def cmd_status(args) -> int:
     show(snap["alerts"], "the alerts", print_alerts)
     show(snap["recent"], "the recent runs", print_recent)
     show(snap["proposals"], "the miner proposals", print_proposals)
+    show(board.panel(record.store), "the record store", lambda s: print_records(s, cfg.retention))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
     show(snap["triage"], "triage", print_triage)
@@ -181,6 +182,17 @@ def print_recent(runs: list[dict]) -> None:
         print("recent runs:")
         print_table([(r["id"], r["kind"], r["ticket"], r["status"], util.paid_note(r["paid"]), r["pr_url"] or r["summary"])
                      for r in runs], 200)
+
+
+def print_records(s: dict, limits) -> None:
+    from . import record, util
+
+    kept = f"kept {limits.days:g} days, up to {limits.max_gb:g} GB"
+    if not s["oldest"]:
+        print(f"records: none ({kept}), {s['pins']} pinned")
+        return
+    print(f"records: {record.size_text(s['bytes'])} in {util.count(s['records'], 'record')} ({kept}), "
+          f"oldest {s['oldest']['run_id']} written {when(s['oldest']['written'])}, {s['pins']} pinned")
 
 
 def print_proposals(p: dict) -> None:
@@ -287,6 +299,56 @@ def cmd_heartbeat(args) -> int:
     return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
 
 
+def cmd_oncall(args) -> int:
+    from . import oncall, state
+
+    cfg = config.load()
+    if args.action == "scan":
+        summary = oncall.scan(cfg)
+        if summary is None:
+            print(f"on-call is off; set [oncall] enabled = true in {paths.CONFIG_FILE}")
+        elif "skipped" in summary:
+            print(summary["skipped"])
+        else:
+            print(json.dumps(summary) if args.json else f"on-call: {oncall.said(summary)}")
+        return 0
+    if args.action == "show":
+        found = state.incident(int(args.id)) if args.id.isdigit() else None
+        if not found:
+            print(f"no incident {args.id}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(found))
+            return 0
+        print(f"#{found['id']}  {found['state']}  {found['class']}  {found['source']}  x{found['count']}  "
+              f"{found['first_seen']} to {found['last_seen']}")
+        print(f"decision: {oncall.decision_line(found)}")
+        for name, a in found["answers"].items():
+            print(f"  {name}: {'yes' if a['value'] else 'no'}, confidence {a['confidence']:.2f}")
+        print(f"{found['signature']}\nevidence:\n{found['evidence']}\nnotes:")
+        for note in found["notes"]:
+            print(f"{note['ts']}  {note['note']}")
+        return 0
+    rows = state.incidents()
+    if args.json:
+        for row in rows:
+            print(json.dumps(row))
+        return 0
+    for r in rows:
+        print(f"#{r['id']:<4} {r['state']:<7} {r['class']:<13} {when(r['first_seen'])}  {when(r['last_seen'])}  "
+              f"x{r['count']:<4} {r['signature']}")
+        print(f"      {oncall.decision_line(r)}")
+    now = oncall.status(cfg)
+    if not now["enabled"]:
+        print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
+    else:
+        last = "no scan yet"
+        if now["last_scan"]:
+            last = f"last scan {when(now['last_scan'])}" + ("" if now["ok"] else f" failed: {now['detail']}")
+        print(f"on-call is on; {last}; {now['expected']} expected events counted")
+    return 0
+
+
 def cmd_hook(args) -> int:
     from . import hook
 
@@ -313,6 +375,12 @@ def cmd_codex_guard(args) -> int:
     return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
 
 
+def cmd_mcp_ask(args) -> int:
+    from . import asks
+
+    return asks.check(sys.stdin, sys.stdout) if args.check else asks.serve(sys.stdin, sys.stdout)
+
+
 def cmd_background(args) -> int:
     from . import background
 
@@ -326,6 +394,11 @@ def cmd_ask(args) -> int:
 
 
 def cmd_jev(args) -> int:
+    if args.action != "report":
+        from . import calibrate
+
+        return calibrate.main(args)
+
     import json
 
     from . import verdicts
@@ -491,6 +564,27 @@ def cmd_audit(args) -> int:
     return auditor.run(dry_run=args.dry_run)
 
 
+def cmd_verifiers(args) -> int:
+    import tomllib
+
+    from . import verifiers
+
+    if args.dry_run and args.action != "run" or args.json and args.action != "report":
+        print("usage: arete verifiers sample FOLDER | run SUITE [--dry-run] | report FILE [--json]", file=sys.stderr)
+        return 2
+    target = paths.expand(args.target)
+    try:
+        if args.action == "sample":
+            print_lines(verifiers.sample(target))
+            return 0
+        if args.action == "run":
+            return verifiers.run(target, dry=args.dry_run)
+        return verifiers.report(target, as_json=args.json)
+    except (verifiers.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
 def cmd_eval(args) -> int:
     from . import eval_mine, evals
 
@@ -508,6 +602,106 @@ def cmd_eval(args) -> int:
     prompts_dir = paths.expand(args.prompts).resolve() if args.prompts else None
     prompts = evals.Prompts(prompts_dir, paths.short_path(prompts_dir)) if prompts_dir else None
     return evals.run(words[0], task=args.task, ref=args.ref, dry_run=args.dry_run, prompts=prompts)
+
+
+def cmd_experiment(args) -> int:
+    import tomllib
+
+    from . import experiment, optimize
+
+    searching = args.action in ("run", "optimize")
+    wrong = ((args.dry_run or args.out) and not searching) or (args.json and args.action != "summary") \
+        or ((args.apply or args.rollback) and args.action != "promote") or (args.apply and args.rollback)
+    if wrong:
+        print("usage: arete experiment run MANIFEST [--dry-run] [--out FILE] | summary FILE [--json] | "
+              "optimize PLAN [--dry-run] [--out FOLDER] | promote FOLDER [--apply | --rollback] | sample FOLDER",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.action == "summary":
+            return experiment.show(paths.expand(args.path), args.json)
+        if args.action == "sample":
+            print_lines(optimize.sample(paths.expand(args.path)))
+            return 0
+        if args.action == "promote":
+            return optimize.promote(paths.expand(args.path), args.apply, args.rollback)
+        if args.action == "optimize":
+            return optimize.run(paths.expand(args.path), args.out, args.dry_run)
+        return experiment.run(paths.expand(args.path), args.out, args.dry_run)
+    except (experiment.Refused, tomllib.TOMLDecodeError, OSError) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
+def implementation_manifest(path) -> bool:
+    import tomllib
+
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return "candidates" not in data and ("arms" in data or "tasks" in data)
+
+
+def cmd_implementations(args) -> int:
+    import tomllib
+
+    from . import experiment, implbench, workers
+
+    if args.action == "run" and args.json:
+        print("usage: arete benchmark run MANIFEST [--dry-run] [--out FILE] | report FILE [--json] | "
+              "sample FOLDER [--workers]", file=sys.stderr)
+        return 2
+    try:
+        if args.action == "sample":
+            print("\n".join((workers.sample if args.workers else implbench.sample)(paths.expand(args.folder))))
+            return 0
+        if args.action == "report":
+            file = paths.expand(args.file)
+            return (workers.show if workers.holds(file) else implbench.show)(file, args.json)
+        manifest = paths.expand(args.manifest)
+        return (workers.run if workers.declared(manifest) else implbench.run)(manifest, args.out or "", args.dry_run)
+    except (experiment.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+        print(e, file=sys.stderr)
+        return 1
+
+
+BENCHMARK_NEVER = "It never pulls weights, provisions a device or schedules load."
+
+
+def cmd_benchmark(args) -> int:
+    from pathlib import Path
+
+    from . import benchmark, devices, util
+
+    if args.action in ("report", "sample") or (args.action == "run" and implementation_manifest(
+            paths.expand(args.manifest))):
+        return cmd_implementations(args)
+    if args.action == "fixture":
+        if not 1 <= args.seconds <= 3600:
+            print("arete benchmark: --seconds must be from 1 to 3600", file=sys.stderr)
+            return 2
+        try:
+            return benchmark.serve_fixture(args.port, args.seconds)
+        except OSError as e:
+            print(f"arete benchmark: cannot serve the fixture on port {args.port}: {util.first_line(str(e), 200)}",
+                  file=sys.stderr)
+            return 1
+    if args.dry_run:
+        print("arete benchmark: --dry-run applies to a manifest of arms and tasks", file=sys.stderr)
+        return 2
+    try:
+        found = benchmark.run(benchmark.read_manifest(paths.expand(args.manifest)))
+        if args.out:
+            util.write_json(Path(args.out), found)
+    except (benchmark.Refused, ValueError, TypeError, OSError, devices.DeviceError) as e:
+        print(f"arete benchmark: {util.first_line(str(e), 400)}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(found))
+    else:
+        print_lines(benchmark.report_lines(found))
+    return 0
 
 
 def cmd_triage(args) -> int:
@@ -531,8 +725,15 @@ def cmd_triage(args) -> int:
 
 
 def cmd_research(args) -> int:
-    from . import research
+    from . import research, research_search
 
+    if args.ref and args.evidence:
+        found = research_search.shown(args.ref)
+        if found is None:
+            print(f"no search evidence for {args.ref}", file=sys.stderr)
+            return 1
+        print(found)
+        return 0
     if args.next or (args.dry_run and not args.ref):
         return research.next_due(dry_run=args.dry_run, asked=piped_events())
     if args.ref and args.run:
@@ -783,9 +984,13 @@ def cmd_session(args) -> int:
         if args.action == "start":
             tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
             s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
-                                tools=tools, repo=args.repo, budget_usd=args.budget)
+                                tools=tools, repo=args.repo, budget_usd=args.budget, task=args.task,
+                                draft_pr=args.draft_pr)
             print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
                   + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
+            if s["task"] and not args.attach:
+                print(f"`arete session report {s['id']}` prints its report when it ends")
+                return 0
             if not args.attach:
                 print(f"`arete session attach {s['id']}` follows it and sends what you type")
                 return 0
@@ -811,6 +1016,9 @@ def cmd_session(args) -> int:
                 follow(args.id, send=send_typed)
             except KeyboardInterrupt:
                 print(f"\ndetached; the session keeps running. `arete session stop {args.id}` ends it")
+            return 0
+        if args.action == "report":
+            print(json.dumps(control.session_report(args.id)))
             return 0
         if args.action == "send":
             print(json.dumps(sessions.send(args.id, " ".join(args.words))))
@@ -939,7 +1147,7 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import routing, runner, steps
+    from . import research_audit, research_search, routing, runner, steps
 
     where = ""
     try:
@@ -956,6 +1164,10 @@ def cmd_steps(args) -> int:
     found = None if cfg.replay.all else routing.Discovery(cfg, repo, layer=layer)
     for s in sheet:
         notes = list(s.notes)
+        if s.step in steps.SEARCHES and (why := research_search.unavailable(s)):
+            notes.append(why)
+        if s.step in steps.FETCHES and (why := research_audit.fetch_note(s)):
+            notes.append(why)
         if s.runner == "pi" and not cfg.replay.all:
             selected = runner.pi_route(s.model, cfg, repo)
             if selected.login_refused:
@@ -1007,6 +1219,18 @@ def cmd_document(args) -> int:
 def cmd_record(args) -> int:
     from . import record
 
+    if args.run_id in ("pin", "unpin"):
+        if not args.step:
+            print("usage: arete record pin|unpin RUN_ID", file=sys.stderr)
+            return 2
+        try:
+            (record.pin if args.run_id == "pin" else record.unpin)(args.step)
+        except LookupError as e:
+            print(e, file=sys.stderr)
+            return 1
+        print(f"pinned {args.step}: its record stays until `arete record unpin {args.step}`" if args.run_id == "pin"
+              else f"unpinned {args.step}: its record ages out like any other")
+        return 0
     if args.follow and not args.step:
         print("arete record --follow requires STEP", file=sys.stderr)
         return 2
@@ -1143,7 +1367,7 @@ def cmd_wait(args) -> int:
 def cmd_answer(args) -> int:
     from . import client
 
-    return client.say("POST", client.run_path(args.run_id, "answer"), {"text": " ".join(args.text)})
+    return client.answer(args.run_id, " ".join(args.text), args.json, args.ask)
 
 
 def cmd_resume(args) -> int:
@@ -1243,7 +1467,7 @@ def cmd_devices_args(args) -> int:
 
 def cmd_session_args(args) -> int:
     words = list(args.words)
-    if args.action in ("attach", "send", "stop", "exec"):
+    if args.action in ("attach", "send", "stop", "exec", "report"):
         if not words:
             print(f"arete session {args.action} needs a session id", file=sys.stderr)
             return 2
@@ -1307,6 +1531,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_heartbeat)
 
+    p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
+    p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan"))
+    p.add_argument("id", nargs="?", default="", help="with show: the incident number")
+    p.add_argument("--json", action="store_true", help="one JSON line per incident")
+    p.set_defaults(fn=cmd_oncall)
+
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
 
@@ -1320,6 +1550,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--judge", action="store_true")
     scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
+
+    p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "
+                                       "validates one call read from stdin")
+    p.add_argument("--check", action="store_true")
+    p.set_defaults(fn=cmd_mcp_ask)
 
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "
@@ -1336,8 +1571,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_ask)
 
-    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts")
-    p.add_argument("action", choices=("report",))
+    p = sub.add_parser("jev", help="what came of JEV's verdicts: holds by question, close holds, near misses, reverts; "
+                                   "compare decision models offline")
+    p.add_argument("action", choices=("report", "compare", "sample"))
+    p.add_argument("target", nargs="?", default="", help="compare: the spec file; sample: a new empty folder")
+    p.add_argument("--out", metavar="DIR", help="compare: where to write proposal.json and predictions.jsonl "
+                                                "(default: out next to the spec)")
     p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
     p.add_argument("--json", action="store_true", help="print JSON")
     p.set_defaults(fn=cmd_jev)
@@ -1374,15 +1613,20 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_devices_args)
 
     p = sub.add_parser("session", help="start, follow, message and stop agent sessions on any device")
-    p.add_argument("action", choices=("start", "attach", "send", "list", "stop", "exec"))
+    p.add_argument("action", choices=("start", "attach", "send", "list", "stop", "exec", "report"))
     p.add_argument("words", nargs="*", help="start: the first message; others: the session id, then send: the text")
     p.add_argument("--device", default="local")
     p.add_argument("--model", default="")
     p.add_argument("--runner", default="", help="claude, pi or codex; by the model when left out")
     p.add_argument("--tools", default=None, help="comma separated; Read,Edit,Write,Glob,Grep,Bash by default")
-    p.add_argument("--repo", default="", help="a repo name from the config; work in a new worktree of it on a device of kind local")
+    p.add_argument("--repo", default="", help="a repo name from the config; local works in a new worktree of it, another device in a "
+                                              "fresh clone whose work arete fetches back and pushes")
     p.add_argument("--budget", type=float, default=None, help="USD for the whole session")
     p.add_argument("--attach", action="store_true", help="start: follow it at once")
+    p.add_argument("--task", action="store_true", help="start: run the prompt to the end, save a report, close and release "
+                                                       "the device")
+    p.add_argument("--draft-pr", action="store_true", help="start, with --task and --repo: open a draft PR for the pushed "
+                                                           "branch")
     p.set_defaults(fn=cmd_session_args)
 
     p = sub.add_parser("approve", help="list emits waiting for approval, or approve one by id; "
@@ -1419,8 +1663,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_document)
 
     p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
-                                      "events")
-    p.add_argument("run_id")
+                                      "events; `pin RUN_ID` and `unpin RUN_ID` keep a record from rotating out")
+    p.add_argument("run_id", help="a run id, or pin RUN_ID or unpin RUN_ID")
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")
@@ -1456,10 +1700,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_id")
     p.set_defaults(fn=cmd_wait)
 
-    p = steering(sub.add_parser("answer", help="answer the question of a run that ended needs-info, through the "
-                                               "server, which starts the next run"))
+    p = steering(sub.add_parser("answer", help="answer the ask of a run that parked needs-info, through the server, "
+                                               "which continues the run: per question on a terminal, or with --json "
+                                               "BODY such as {\"recommended\": true}; TEXT answers the run's text "
+                                               "question the older way"))
     p.add_argument("run_id")
-    p.add_argument("text", nargs="+")
+    p.add_argument("text", nargs="*")
+    p.add_argument("--json", default="", metavar="BODY", help="the body of POST /api/asks/ID/answer")
+    p.add_argument("--ask", default="", metavar="ID", help="the ask to answer when the run holds several")
     p.set_defaults(fn=cmd_answer)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
@@ -1545,8 +1793,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_poll)
 
-    p = sub.add_parser("mine", help="loop 1: mine transcripts into harness PRs")
-    p.add_argument("--hours", type=float, default=None)
+    p = sub.add_parser("mine", help="loop 1: mine transcripts and recorded runs into harness PRs")
+    p.add_argument("--hours", type=float, default=None,
+                   help="window for both sources; without it recorded runs are read since the last mine")
     p.add_argument("--dry-run", action="store_true", help="print proposals, change nothing")
     p.add_argument("--no-apply", action="store_true", help="record proposals but open no PRs")
     p.set_defaults(fn=cmd_mine)
@@ -1581,6 +1830,55 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_eval)
 
+    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, summarize its results, "
+                                          "or search for a better setting and promote the winner")
+    p.add_argument("action", choices=("run", "summary", "optimize", "promote", "sample"))
+    p.add_argument("path", metavar="MANIFEST | FILE | PLAN | FOLDER",
+                   help="run: the manifest; summary: the results file; optimize: the plan; promote: the trail "
+                        "folder; sample: a new folder for the replay fixture")
+    p.add_argument("--dry-run", action="store_true", help="with run or optimize: validate and print the plan; "
+                                                          "writes and calls nothing")
+    p.add_argument("--out", default="", metavar="FILE", help="with run: the results file, by default one named for "
+                                                             "the manifest; with optimize: the trail folder")
+    p.add_argument("--json", action="store_true", help="with summary: print one JSON line")
+    p.add_argument("--apply", action="store_true", help="with promote: write the winner's keys to config.toml")
+    p.add_argument("--rollback", action="store_true", help="with promote: undo the last apply")
+    p.set_defaults(fn=cmd_experiment)
+
+    p = sub.add_parser("benchmark", help="measure already configured local model endpoints under 8K and 32K context "
+                                         "and concurrency, or compare implementation routes on ordinary and "
+                                         "difficult tasks; " + BENCHMARK_NEVER,
+                       description="Benchmark already configured local model endpoints once, on request. "
+                                   + BENCHMARK_NEVER + " `run` takes a manifest of candidates (endpoints) or of arms "
+                                   "and tasks (implementation routes); `report` and `sample` belong to the latter.")
+    bsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
+    b = bsub.add_parser("run", help="run a manifest once: endpoint candidates print a comparable report; arms and "
+                                    "tasks run the implementation benchmark")
+    b.add_argument("manifest", metavar="MANIFEST", help="a TOML manifest of candidates, or of arms and tasks")
+    b.add_argument("--json", action="store_true", help="endpoint manifests: print the report as one JSON line")
+    b.add_argument("--out", metavar="FILE", help="endpoint manifests: also write the report JSON to FILE; "
+                                                  "implementation manifests: the results file")
+    b.add_argument("--dry-run", action="store_true",
+                   help="implementation manifests: validate and print the plan; writes and calls nothing")
+    b = bsub.add_parser("report", help="print the report of an implementation benchmark results file")
+    b.add_argument("file", metavar="FILE", help="the results file")
+    b.add_argument("--json", action="store_true", help="print one JSON line")
+    b = bsub.add_parser("sample", help="write a replay fixture for the implementation benchmark into a new folder")
+    b.add_argument("folder", metavar="FOLDER", help="a new, empty folder")
+    b.add_argument("--workers", action="store_true", help="write the bounded-worker fixture instead")
+    b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
+    b.add_argument("--port", type=int, required=True)
+    b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
+    p.set_defaults(fn=cmd_benchmark)
+
+    p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
+                                         "`sample FOLDER`, `run SUITE`, `report FILE`")
+    p.add_argument("action", choices=["sample", "run", "report"])
+    p.add_argument("target", metavar="FOLDER | SUITE | FILE")
+    p.add_argument("--dry-run", action="store_true", help="with run: list arms, tasks and trials; no calls, no writes")
+    p.add_argument("--json", action="store_true", help="with report: the summary as one JSON line")
+    p.set_defaults(fn=cmd_verifiers)
+
     p = sub.add_parser("triage", help="loop 5: the triage board of your open tickets without the agent label")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")
     p.add_argument("--refresh", action="store_true", help="triage what changed, then show the board")
@@ -1589,6 +1887,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("research", help="the reports arete writes for research tickets on the triage board")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="print one ticket's report")
+    p.add_argument("--evidence", action="store_true", help="with REF: print the sources its search workers found")
     p.add_argument("--run", action="store_true", help="with REF: research it now")
     p.add_argument("--force", action="store_true", help="with --run: skip the JEV injection screen")
     p.add_argument("--next", action="store_true", help="research the next ticket due; what the research loop runs")

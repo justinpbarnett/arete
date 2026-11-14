@@ -268,6 +268,56 @@ def say(method: str, path: str, body: dict | None = None) -> int:
     return steered(lambda: emit(call(method, path, body)) or 0)
 
 
+def prompted(i: int, q: dict) -> dict:
+    print(f"{i}. {q['header']}: {q['question']}", file=sys.stderr)
+    kind = q["kind"]
+    if kind == "secret":
+        print(f"   arete stores no secret value yet, so {q['name']} is declined", file=sys.stderr)
+        return {"declined": True}
+    for n, o in enumerate(q.get("options") or [], 1):
+        print(f"   {n}. {o['label']}: {o['description']}", file=sys.stderr)
+    for n, s in enumerate(q.get("steps") or [], 1):
+        print(f"   step {n}: {s}", file=sys.stderr)
+    print("   Enter to confirm" if kind == "done" else
+          "   option numbers, Enter for the first, or other words" if kind == "choice" else
+          "   your answer, Enter to decline", file=sys.stderr)
+    line = sys.stdin.readline().strip()
+    if kind == "done":
+        return {"done": True}
+    if kind == "choice":
+        numbers = line.replace(",", " ").split()
+        if not line:
+            return {"choice": 1}
+        if all(x.isdigit() for x in numbers):
+            return {"choice": [int(x) for x in numbers] if len(numbers) > 1 else int(numbers[0])}
+    return {"text": line} if line else {"declined": True}
+
+
+def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:
+    open_asks = [a for a in call("GET", "/api/asks")["asks"]
+                 if a["run"] == run_id and (not ask_id or a["id"] == ask_id)]
+    if not open_asks:
+        raise Failed({"error": f"run {run_id} has no open ask"})
+    if raw:
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            raise Failed({"error": "--json is not JSON"}) from None
+        if not isinstance(body, dict):
+            raise Failed({"error": "--json must be a JSON object"})
+    else:
+        body = {"answers": [prompted(i, q) for i, q in enumerate(open_asks[0]["questions"], 1)]}
+    return call("POST", f"/api/asks/{quote(open_asks[0]['id'], safe='')}/answer", body)
+
+
+def answer(run_id: str, text: str, raw: str, ask_id: str) -> int:
+    if text and (raw or ask_id):
+        return failed(Failed({"error": "give the answer as text, or with --json and --ask, not both"}))
+    if text:
+        return say("POST", run_path(run_id, "answer"), {"text": text})
+    return steered(lambda: emit(answered_ask(run_id, ask_id, raw)) or 0)
+
+
 def wait(run_id: str) -> int:
     asked = False
     try:
