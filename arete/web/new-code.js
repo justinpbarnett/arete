@@ -30,7 +30,9 @@ function newCodeServed() {
 function newCodeWaitsFor() {
   if (changesInFlight) return "your last action ends";
   if (document.querySelector("dialog[open]")) return "you close the dialog";
+  if (feedbackUnsaved()) return "your feedback draft is saved";
   if (settingsData && Object.keys(settingsChanges()).length) return "you save or undo the settings";
+  if (secretTyped()) return "you send or clear the secret you typed";
   if (unsentText()) return "you send or clear what you typed";
   if (!getSelection().isCollapsed) return "you clear the selection";
   return "";

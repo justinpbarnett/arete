@@ -23,9 +23,11 @@ from . import (
     record,
     repairs,
     runlimits,
+    runner,
     state,
     tracker,
     util,
+    vault,
 )
 
 TITLE_CHARS = 80
@@ -246,7 +248,7 @@ def store_answer(cfg: config.Config, repo: config.Repo, tid: str, text: str) -> 
 def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: list[dict], text: str) -> dict:
     if any(asks.has_secret(a["questions"]) for a in waiting):
         raise control.Refused(f"run {row['id']} asks a secret question, which a text reply cannot answer; answer it "
-                              f"on the dashboard or with `arete answer {row['id']} --json`")
+                              f"on the dashboard or with `arete answer {row['id']}`")
     tid = str(row["issue"])
     free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
     command = continuing(cfg, repo, row)
@@ -284,8 +286,16 @@ def answer_ask(ask_id: str, body) -> dict:
             answers = asks.answers_for(ask, body)
         except (ValueError, TypeError) as e:
             raise control.Refused(str(e)) from None
+        given = asks.secret_values(ask, body)
+        if problems := [f"{name}: {why}" for name, value in given.items()
+                        if (why := runner.reserved(name) or vault.unfit(value))]:
+            raise control.Refused("; ".join(problems) + "; nothing was stored")
         free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
         command = continuing(cfg, repo, row)
+        try:
+            vault.put_all(repo.name, given)
+        except OSError as e:
+            raise control.Refused(f"could not store {', '.join(given)} ({e.strerror}); the ask stays open") from None
         state.ask_close(ask_id, "answered", answers)
         if more := state.asks_of(row["id"], "open"):
             return answer(tid, repo.name, "", "waiting",

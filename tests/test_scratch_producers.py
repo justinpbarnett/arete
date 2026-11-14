@@ -348,6 +348,8 @@ def confined(command: list[str]) -> list[str]:
 
 @unittest.skipUnless(ON_MAC, "producer inspection needs macOS")
 class LiveTests(unittest.TestCase):
+    serial = True
+
     def setUp(self):
         try:
             self.temp = tempfile.TemporaryDirectory(dir=Path.home() / "Library")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import http.client
 import json
 import os
@@ -272,8 +273,10 @@ def prompted(i: int, q: dict) -> dict:
     print(f"{i}. {q['header']}: {q['question']}", file=sys.stderr)
     kind = q["kind"]
     if kind == "secret":
-        print(f"   arete stores no secret value yet, so {q['name']} is declined", file=sys.stderr)
-        return {"declined": True}
+        print(f"   the value of {q['name']} is not shown; it is stored for this repo. Enter declines", file=sys.stderr)
+        value = (getpass.getpass("   ", stream=sys.stderr) if sys.stdin.isatty()
+                 else sys.stdin.readline().rstrip("\r\n"))
+        return {"secret": value} if value else {"declined": True}
     for n, o in enumerate(q.get("options") or [], 1):
         print(f"   {n}. {o['label']}: {o['description']}", file=sys.stderr)
     for n, s in enumerate(q.get("steps") or [], 1):
@@ -305,6 +308,10 @@ def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:
             raise Failed({"error": "--json is not JSON"}) from None
         if not isinstance(body, dict):
             raise Failed({"error": "--json must be a JSON object"})
+        given = body.get("answers")
+        if isinstance(given, list) and any(isinstance(a, dict) and "secret" in a for a in given):
+            raise Failed({"error": "a secret value is never given as an argument; run `arete answer "
+                                   f"{run_id}` and type or pipe it"})
     else:
         body = {"answers": [prompted(i, q) for i, q in enumerate(open_asks[0]["questions"], 1)]}
     return call("POST", f"/api/asks/{quote(open_asks[0]['id'], safe='')}/answer", body)

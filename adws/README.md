@@ -147,7 +147,7 @@ just adw-wait RUN2
 
 Read `summary` and `question`. Answer only from what the person or the task already settled. When neither did, ask the person and pass their words on with `just adw-answer`. Never guess a requirement.
 
-Then wait on the run the answer starts: its id is in the `run` field of the answer's line. A `409` means the answer was not stored, because a run of the task is going; try again once that run ends. An answer waits for a run slot ahead of new runs instead of being refused. When the question is a choice, a secret or a `done`, answer with `uv run arete answer <id> --json '{"answers": [...]}'` or `{"recommended": true}`.
+Then wait on the run the answer starts: its id is in the `run` field of the answer's line. A `409` means the answer was not stored, because a run of the task is going; try again once that run ends. An answer waits for a run slot ahead of new runs instead of being refused. When the question is a choice or a `done`, answer with `uv run arete answer <id> --json '{"answers": [...]}'` or `{"recommended": true}`. A secret is answered with `uv run arete answer <id>` at the prompt, or piped in; `--json` takes only `{"declined": true}` for it.
 
 ## Waiting on another task
 

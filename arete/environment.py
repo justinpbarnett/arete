@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 
-from . import config, util
+from . import config, util, vault
 
 BASE = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TZ", "TMPDIR", "TERM", "XDG_CONFIG_HOME",
         "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "ARETE_CONFIG_DIR", "ARETE_STATE_DIR", "ARETE_LOG_DIR",
         "ARETE_WORKTREES_DIR")
 SHELL_BOOKKEEPING = ("_", "PWD", "OLDPWD", "SHLVL", "ARETE_SERVE_RESTARTED_FOR_NEW_CODE")
+LOADER_HOOKS = ("LD_", "DYLD_", "PYTHON", "GIT_", "NPM_CONFIG_", "CLAUDE_CODE_", "CODEX_")
+SHELL_HOOKS = ("BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "PERL5OPT", "RUBYOPT", "JAVA_TOOL_OPTIONS",
+               "NODE_OPTIONS", "NODE_PATH", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL")
 
 
 def passes(name: str, patterns: Iterable[str]) -> bool:
@@ -33,13 +36,35 @@ def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:
         return names
 
 
+def reserved(name: str) -> bool:
+    return (passes(name, BASE) or name in SHELL_BOOKKEEPING or name in SHELL_HOOKS or name.startswith("ARETE_")
+            or name.upper().startswith(LOADER_HOOKS))
+
+
+def stored(repo: config.Repo | None) -> dict[str, str]:
+    if repo is None:
+        return {}
+    return {n: v for n, v in vault.read(repo.name).items() if not reserved(n)}
+
+
+def started(cfg: config.Config, repo: config.Repo | None = None,
+            sets: Mapping[str, str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
+    kept = stored(repo)
+    return build(passed(cfg, repo), {**kept, **(sets or {})}), kept
+
+
 def commands(cfg: config.Config, repo: config.Repo | None = None, sets: Mapping[str, str] | None = None) -> dict:
-    return build(passed(cfg, repo), sets)
+    return started(cfg, repo, sets)[0]
 
 
 def sh(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None,
        sets: Mapping[str, str] | None = None, **kw):
-    return util.sh(cmd, env=commands(cfg, repo, sets), inherit=False, **kw)
+    env, kept = started(cfg, repo, sets)
+    given = set(kept.values())
+    res = util.sh(cmd, env=env, inherit=False, **kw)
+    res.stdout = vault.hidden(res.stdout or "", given)
+    res.stderr = vault.hidden(res.stderr or "", given)
+    return res
 
 
 def dropped(cfg: config.Config, source: Mapping[str, str] | None = None) -> list[str]:
