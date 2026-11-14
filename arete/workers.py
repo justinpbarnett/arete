@@ -90,8 +90,7 @@ def resolved_escalation(exp: experiment.Experiment, arm: str, found: dict | None
         s = steps.resolve(exp.cfg, exp.layer, "check_repair", "", found["route"])
     except ValueError as e:
         raise experiment.Refused(f"{where}: {e}") from e
-    if why := runner.CANNOT_STOP.get(runner.chosen(s.model, s.runner, exp.cfg)[0]):
-        raise experiment.Refused(f"{where}: {why}")
+    experiment.codex_route(where, s, exp.limits)
     return {**found, "runner": s.runner, "model": s.model, "settings": experiment.effective(exp.cfg, s)}
 
 
@@ -108,8 +107,11 @@ def load(path: Path) -> implbench.Bench:
     references = implbench.resolved_references(exp, references)
     held = {arm: {**b, "escalation": resolved_escalation(exp, arm, b["escalation"])} for arm, b in arms.items()}
     design = {**exp.design, "workers": {"kinds": kinds, "references": references, "arms": held}}
+    codex = [f"arms.{arm}.escalation ({w} {e['model']})" for arm, b in held.items() if (e := b["escalation"])
+             and (w := runner.stands_for(e["model"], e["runner"])[0]) in runner.CANNOT_STOP]
     return implbench.Bench(replace(exp, design=design, digest=experiment.sha_json(design)[:12], checks_required=True,
-                                   make_run=worker_run, recovered=recovered), kinds, references)
+                                   make_run=worker_run, recovered=recovered, codex=[*exp.codex, *codex]), kinds,
+                           references)
 
 
 def declared(path: Path) -> bool:
