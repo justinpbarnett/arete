@@ -660,7 +660,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, `benchmarks/`, loop digests, `serve.json`, `server.json`, `price-snapshot.json`)
+- State: `~/.local/share/arete/` (sqlite, events, run logs, `experiments/`, `benchmarks/`, loop digests, `captures/`, `serve.json`, `server.json`, `price-snapshot.json`)
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -1700,7 +1700,7 @@ Submit sends the answers, Go with the recommendations takes each choice's first 
 A refusal shows on the card and keeps what you typed; a secret is never kept in page storage and is cleared after every submit.
 `#ask/ID` scrolls to that card, also when a notification opens the page.
 Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME`, `#ticket/REF` and `#ask/ID`, so reload, Back and Forward put you where you were.
-An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find, the key list or the feedback composer open, feedback text not yet saved, text selected or an action still going.
+An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find, the key list or the feedback composer open, feedback text not yet saved, text selected, a screen capture or an upload still going, or an action still going.
 Then the status line says what the new version waits for.
 Close or Escape on an open item goes back to where you opened it, with focus on its row.
 Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, ticket or action.
@@ -1767,6 +1767,14 @@ One draft is kept in `arete.db` and mirrored in the browser, so it survives clos
 Reading the stored draft never locks the composer; a read waits at most 8 seconds, then the page says the draft is kept on this device and reads again before its next save; text typed before the stored draft arrived is added below the stored text, and untouched fields take the stored values.
 Discard removes the draft; anything typed after the click is kept and saved as a new draft. Nothing is filed yet.
 
+Three buttons add evidence to the draft, and nothing is captured until you press one: Take a screenshot, Record a video and Attach a file.
+PNG, JPEG and WebP images up to 5 MB and WebM and MP4 videos up to 25 MB are accepted, six items and 40 MB to a draft; the server decides the type from the file's first bytes, not its name.
+A recording stops by itself at 30 seconds. The server checks format and size only, so an attached video's length is read from the browser's metadata after it is staged, and a video over 30 seconds is removed with a sentence saying so.
+While the screen is captured the composer steps aside so the capture shows the view, and it comes back with the draft intact.
+Staged files live in `~/.local/share/arete/captures/<draft id>/`, named by their SHA-256, and go with Remove and with Discard. The same bytes added twice to a draft count once.
+A browser with no screen capture, as on a phone or on a plain `http` tailnet address, says so and suggests attaching a screenshot taken with the device; a refused capture says nothing was captured. Neither changes the draft.
+What will be sent lists the text, the app state and each item with a preview, its name, type, size, length and a Remove button. A failed upload stays in the list with Try again and leaves the text alone.
+
 Money counts only what you pay, on the dashboard and everywhere else arete shows a sum: the CLI, a run's end line in its feed, PR bodies, research reports and eval results.
 Explicit subscription calls contribute no paid spend and retain all their tokens and reported cost. API-key calls contribute their cost even on a runner that also supports subscriptions. `arete costs` shows paid spend; `arete costs --by model` and other groupings show raw call cost and tokens, including subscription usage. Run details split the same model into subscription and metered rows when both occur, independent of call order. A zero-cost metered call says nothing paid without claiming subscription use. Chat stores each new reply's paid amount in `paid_usd` and its reported cost in `cost`, retaining full precision until display. Paid amounts show independently of the current login. Historical messages retain their old reported `cost` and a NULL `paid_usd`; the console labels those amounts as reported with payment unknown, rather than inferring billing from today's login. Chat paid totals sum only known paid amounts, while the stored `spent` total continues to track reported cost. Histories remain readable when a project leaves the configuration.
 
@@ -1800,19 +1808,23 @@ These routes steer a ticket's run. The first four answer `{"task", "repo", "run"
 
 Each refuses a run in the wrong state and names the state. `answer` and `resume` also refuse a run that is not the ticket's latest and name the run that came after it; runs of one step alone do not count. `steps` has no such rule.
 
-The feedback draft has five routes. Each answers `{"draft", "limits", "kinds"}`: `draft` is the open draft (`id`, `status`, `kind`, `text`, `expected`, `actual`, `steps`, `context`, `revision`, `created`, `updated`) or `null`, and `limits` holds the character limits and `context_bytes`.
+The feedback draft has eight routes. Each answers `{"draft", "limits", "kinds"}`: `draft` is the open draft (`id`, `status`, `kind`, `text`, `expected`, `actual`, `steps`, `context`, `revision`, `created`, `updated`, `evidence`) or `null`, `evidence` lists the staged items (`id`, `capture`, `name`, `kind`, `type`, `bytes`, `sha256`, `source`, `seconds`, `added`), and `limits` holds the character limits, `context_bytes`, `image_bytes`, `video_bytes`, `evidence_items`, `evidence_bytes` and `video_seconds`.
 
 - `GET /api/capture` returns the draft and the limits.
 - `POST /api/capture` saves `kind` (`idea`, `adjustment` or `bug`) and any of `text`, `expected`, `actual` and `steps`, and creates the draft when none is open. Only a change bumps `revision`. It answers 400 for no field, an unknown kind, a field that is not text, or text over its limit.
 - `POST /api/capture/context` with `{"view": "runs", "detail": {"kind": "run", "id": "ID"}}` builds the app-state snapshot and keeps it in the draft. `detail` is optional. It answers 400 for an unknown view, a bad `detail`, or a snapshot over 8 KB.
 - `POST /api/capture/context/drop` removes the snapshot.
-- `POST /api/capture/discard` discards the draft. With no draft it still answers 200.
+- `POST /api/capture/discard` discards the draft and removes its staged files. With no draft it still answers 200.
+- `POST /api/capture/evidence?name=NAME&source=screenshot|recording|attached&seconds=N` stages the raw request body as evidence, and answers the usual body plus `evidence` (the row) and `existing`, true when the same bytes were already staged (nothing changes then). `source` defaults to `attached`; `seconds` is optional. It answers 413 for an image over 5 MB, a video over 25 MB or a draft over 40 MB, and 400 for a body that is not a PNG, JPEG, WebP, WebM or MP4 file, a seventh item, or a bad `source` or `seconds`. A refusal changes nothing.
+- `GET /api/capture/evidence/ID` serves a staged file with its stored type and honours one `Range: bytes=` request; it answers 404 for an unknown id.
+- `POST /api/capture/evidence/ID/drop` removes one item and its file. An unknown id still answers 200.
 
 ```sh
 curl -H 'X-Arete: 1' -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' http://HOST:PORT/api/tasks
 curl 'http://HOST:PORT/api/runs/RUN_ID/events?follow=1'
 curl -H 'X-Arete: 1' -d '{"text": "Put the toggle in the header."}' http://HOST:PORT/api/runs/RUN_ID/answer
 curl -H 'X-Arete: 1' -d '{"step": "verify"}' http://HOST:PORT/api/runs/RUN_ID/resume
+curl -H 'X-Arete: 1' --data-binary @shot.png 'http://HOST:PORT/api/capture/evidence?name=shot.png&source=attached'
 ```
 
 ### From the CLI
