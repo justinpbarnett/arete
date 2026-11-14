@@ -651,17 +651,21 @@ def update_browser(a: Attempt, **fields) -> None:
         store(fd, key, data)
 
 
+def loopback(url: str) -> bool:
+    host = urlsplit(url).hostname
+    try:
+        return host == "localhost" or ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        return False
+
+
 def app_port(a: Attempt, url: str) -> int:
     parts = urlsplit(url)
     try:
         port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError:
         port = 0
-    try:
-        loopback = parts.hostname == "localhost" or ipaddress.ip_address(parts.hostname or "").is_loopback
-    except ValueError:
-        loopback = False
-    update_browser(a, port=port, loopback=loopback)
+    update_browser(a, port=port, loopback=loopback(url))
     return port
 
 

@@ -298,6 +298,12 @@ class Handler(BaseHTTPRequestHandler):
                 return settings.current()
             if path == "/api/chats":
                 return chat.listing()
+            if path.startswith(CHAT_PATH) and "/sessions" in path:
+                parts = unquote(path[len(CHAT_PATH):]).split("/")
+                if len(parts) == 2 and parts[1] == "sessions":
+                    return chat.sessions_of(whole_number(parts[0]))
+                if len(parts) == 4 and parts[1] == "sessions" and parts[3] == "report":
+                    return chat.session_report(whole_number(parts[0]), parts[2])
             if path.startswith(CHAT_PATH):
                 return chat.view(whole_number(unquote(path[len(CHAT_PATH):])))
             if path.startswith(LOG_PATH):
@@ -320,6 +326,12 @@ class Handler(BaseHTTPRequestHandler):
                 return settings.save(self.body())
             if path == "/api/chats/new":
                 return chat.new(str(self.body().get("project") or ""))
+            if path.startswith(CHAT_PATH) and "/sessions" in path:
+                parts = unquote(path[len(CHAT_PATH):]).split("/")
+                if len(parts) == 2 and parts[1] == "sessions":
+                    return self.start_chat_session(whole_number(parts[0]))
+                if len(parts) == 4 and parts[1] == "sessions" and parts[3] == "stop":
+                    return chat.stop_session(whole_number(parts[0]), parts[2])
             if path.startswith(CHAT_PATH):
                 chat_id, action = last_part(path, CHAT_PATH)
                 if action == "send":
@@ -419,6 +431,17 @@ class Handler(BaseHTTPRequestHandler):
                                model=str(b.get("model") or ""), run_with=str(b.get("runner") or ""), tools=tools,
                                repo=str(b.get("repo") or ""),
                                budget_usd=None if budget in (None, "") else float(budget))
+
+    def start_chat_session(self, chat_id: int) -> dict:
+        b = self.body()
+        budget = b.get("budget_usd")
+        if budget not in (None, "") and (isinstance(budget, bool) or not isinstance(budget, int | float)):
+            raise Refusal(400, "budget_usd is a number of dollars.")
+        repo = b.get("repo")
+        return chat.start_session(chat_id, str(b.get("prompt", "")), repo=None if repo is None else str(repo),
+                                  device=str(b.get("device") or ""), model=str(b.get("model") or ""),
+                                  runner=str(b.get("runner") or ""),
+                                  budget_usd=None if budget in (None, "") else float(budget))
 
     def send_ticket(self, ref: str) -> dict:
         b = self.body()

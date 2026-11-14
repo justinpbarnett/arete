@@ -59,7 +59,7 @@ async function pollChat() {
     if (mine !== chatCount || id !== openChat) return;
     drawChats(list);
     drawChat(shown);
-    chatBusy = list.chats.some((c) => c.busy);
+    chatBusy = list.chats.some((c) => c.busy || c.running_sessions);
   } catch (e) {
     if (mine !== chatCount) return;
     say("chat-result", "fault", `The chat could not be read: ${e.message}`);
@@ -72,8 +72,70 @@ function pollSoon() {
   chatTimer = setTimeout(pollChat, 0);
 }
 
+function sessionReport(text) {
+  let found;
+  try {
+    found = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!found || typeof found !== "object" || Array.isArray(found) || typeof found.id !== "string") return null;
+  const report = found.report && typeof found.report === "object" ? found.report : {};
+  const listed = (v) => (Array.isArray(v) ? v : []);
+  return {
+    id: found.id,
+    status: String(found.status || ""),
+    note: String(found.note || ""),
+    summary: String(report.summary || ""),
+    checks: listed(report.checks).map((k) => ({ name: String(k?.name || ""), result: String(k?.result || ""), detail: String(k?.detail || "") })),
+    questions: listed(report.open_questions).map(String),
+    branch: String(report.branch || ""),
+    commit: String(report.commit || ""),
+    pr: String(found.pr_url || report.pr_url || ""),
+    problems: listed(report.problems).map(String),
+    paid: report.paid_usd || 0,
+  };
+}
+
+function reportLines(r) {
+  const lines = [el("p", {}, `${r.id} ended ${r.status}${r.paid ? ` · ${money(r.paid)} paid` : ""}`)];
+  if (r.summary) lines.push(el("p", {}, r.summary));
+  else if (r.note) lines.push(el("p", {}, r.note));
+  if (r.checks.length) lines.push(el("ul", {}, r.checks.map((k) => el("li", {}, `${k.name}: ${k.result}${k.detail ? ` (${k.detail})` : ""}`))));
+  if (r.questions.length) lines.push(el("p", {}, "Open questions"), el("ul", {}, r.questions.map((q) => el("li", {}, q))));
+  if (r.branch) lines.push(el("p", {}, `Branch ${r.branch}${r.commit ? ` at ${r.commit.slice(0, 10)}` : ""}`));
+  if (r.pr) lines.push(el("p", {}, link(r.pr, r.pr)));
+  if (r.problems.length) lines.push(el("p", {}, "Problems"), el("ul", {}, r.problems.map((q) => el("li", {}, q))));
+  return lines;
+}
+
+function messageBody(m) {
+  const report = m.sender === "session" ? sessionReport(m.text) : null;
+  return report ? el("div", { class: "report" }, reportLines(report)) : el("p", {}, withLinks(m.text));
+}
+
+async function stopChatSession(chat, id, btn) {
+  btn.disabled = true;
+  document.getElementById("chat-sessions-result").hidden = true;
+  try {
+    await call(`/api/chats/${chat}/sessions/${encodeURIComponent(id)}/stop`, {});
+  } catch (e) {
+    say("chat-sessions-result", "fault", e.message);
+  }
+  pollSoon();
+}
+
+function drawChatSessions(c) {
+  const listed = c.sessions?.sessions || [];
+  document.getElementById("chat-sessions").hidden = !listed.length;
+  fill("chat-sessions-list", listed.map((s) => el("li", {},
+    el("a", { href: detailHash("session", s.id), "data-focus": `chat-session:${s.id}` }, s.id),
+    ` ${s.status} · ${s.prompt || "no first message"}${s.paid ? ` · ${money(s.paid)} paid` : ""} `,
+    s.status === "running" ? button("Stop", "chat-session-stop", (btn) => stopChatSession(c.id, s.id, btn), { of: s.id }) : null)));
+}
+
 function chatLabel(c) {
-  const note = c.busy ? "waiting on an answer" : c.drafted ? "a drafted issue waits" : "";
+  const note = c.busy ? "waiting on an answer" : c.running_sessions ? `${c.running_sessions} running` : c.drafted ? "a drafted issue waits" : "";
   return [clock(c.created), c.project || "no project", c.title || "Nothing asked yet", note].filter(Boolean).join(" · ");
 }
 
@@ -107,7 +169,9 @@ function switchChat(id) {
 function chatAbout(c) {
   const where = c.project ? `on ${c.project}, ${c.folder ? `in ${c.folder}` : "which left the config"}` : `no project, in arete's folder ${c.folder}`;
   const paid = c.unclassified_messages ? `${money(c.spent)} known paid · older payment amounts unknown` : `${money(c.spent)} paid so far`;
-  return `Started ${clock(c.created)} · ${where} · ${paid}`;
+  const s = c.sessions;
+  const sessions = s ? ` · ${s.running} of ${s.max_sessions} sessions running · ${money(Math.max(s.left, 0))} of ${money(s.budget_usd)} left` : "";
+  return `Started ${clock(c.created)} · ${where} · ${paid}${sessions}`;
 }
 
 function messageCost(m) {
@@ -125,6 +189,7 @@ function drawChat(c) {
   if (!c?.draft) document.getElementById("draft-result").hidden = true;
   if (!c) {
     chatSeen = "";
+    document.getElementById("chat-sessions").hidden = true;
     return fill("messages", quiet("No chat yet. Pick a project, or none, under New chat on and press New chat."));
   }
   if (c.id !== openChat) return;
@@ -138,14 +203,15 @@ function drawChat(c) {
     const asked = [...c.messages].reverse().find((m) => m.sender === "you");
     working.textContent = `Working on it · sent ${clock(asked?.ts)} · the answer shows here when it comes`;
   }
-  const seen = `${c.id}:${JSON.stringify(c.messages)}:${c.busy}`;
+  drawChatSessions(c);
+  const seen = `${c.id}:${JSON.stringify(c.messages)}:${c.busy}:${JSON.stringify(c.sessions)}`;
   if (seen === chatSeen) return;
   const grew = c.messages.length !== chatLength;
   chatSeen = seen;
   chatLength = c.messages.length;
   fill("messages", c.messages.length ? c.messages.map((m) => el("div", { class: `msg from-${m.sender}` },
-    el("div", { class: "who" }, withFigures([{ you: "You", tool: "Tool" }[m.sender] || "Arete", clock(m.ts), messageCost(m)].filter(Boolean).join(" · "))),
-    el("p", {}, withLinks(m.text))))
+    el("div", { class: "who" }, withFigures([{ you: "You", tool: "Tool", session: "Session report" }[m.sender] || "Arete", clock(m.ts), messageCost(m)].filter(Boolean).join(" · "))),
+    messageBody(m)))
     : quiet(c.project ? `No messages yet. Ask about ${c.project}'s code, its checks, or how arete works on it.`
       : "No messages yet. Ask what is running, why a run failed, or what to change."));
   if (grew) {
