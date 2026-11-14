@@ -1695,7 +1695,7 @@ Admission is the same over HTTPS: the host must be the tailnet name or address, 
 When `tailscale cert` cannot run, as under the sandboxed macOS app, arete falls back to `tailscale serve`, and only ever changes a mapping it made itself.
 It reserves its listener first, writes `dashboard-proxy-PORT.json` in the state folder before it asks for the mapping, and completes that record from `tailscale serve status`.
 It never uses, replaces or removes a mapping it did not record, and when the port already has one it serves plain HTTP.
-Its own mapping stays when the dashboard stops, and the next start on that port reuses it.
+Its own mapping stays when the dashboard stops, and the next start on that port reuses it; that start opens the 127.0.0.1 listener as soon as it finds the record, before it asks for a certificate or reads `tailscale serve status`.
 It removes the mapping only when a certificate is ready for a dashboard on that port and every mapping on the port is its own; otherwise remove it by hand with `tailscale serve --https=PORT off`.
 A dashboard moved to another port therefore leaves the old mapping and its record where they were.
 While its mapping is, or may be, on the port the dashboard keeps listening on 127.0.0.1 only, trusting Tailscale's login header from loopback alone. That listener stays open while Tailscale reports no address, while arete tries again for a certificate every hour, and when the tailnet name, address or owner changes. arete closes it only after `tailscale serve status` shows its mapping gone.

@@ -1093,6 +1093,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
     waiting_for = ""
     kept: Server | None = None
     kept_front: Front | None = None
+    opened_once = False
     last_line = ""
     atexit.register(forget_server)
     try:
@@ -1107,7 +1108,12 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
                 held = held or util.flock_now(hold)
                 if not held:
                     raise OSError(f"another dashboard on this state holds port {port}")
+                if kept is None and not opened_once and (resumed := resume_fallback(node, port, inside_serve)):
+                    kept_front = resumed
+                    kept = resumed.servers[0]
+                    last_line = announce(node, port, resumed, last_line)
                 front = open_front(host, node, port, logins, inside_serve, kept)
+                opened_once = True
             except OSError as e:
                 if str(e) != waiting_for:
                     say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
@@ -1118,11 +1124,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
             for s in front.servers:
                 if s is not kept:
                     threading.Thread(target=s.serve_forever, daemon=True).start()
-            line = listening_line(node, port, front)
-            if line != last_line:
-                say(line)
-                last_line = line
-            record_server(node, port, front)
+            last_line = announce(node, port, front, last_line)
             reason = watch(host, cfg.dashboard_owner, node, front)
             kept = front.servers[0] if front.fronted else None
             kept_front = front if front.fronted else None
@@ -1135,6 +1137,28 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
                 forget_server()
     finally:
         forget_server()
+
+
+RESUMING = "checking the tailscale serve mapping arete recorded"
+
+
+def resume_fallback(node: Node, port: int, inside_serve: bool) -> Front | None:
+    if proxy_record(port) is None:
+        return None
+    try:
+        loopback = Server(LOOPBACK, port, node, FrontedLogins(), inside_serve, handler=FrontedHandler)
+    except OSError:
+        return None
+    threading.Thread(target=loopback.serve_forever, daemon=True).start()
+    return Front("http", [loopback], fronted=True, why=RESUMING)
+
+
+def announce(node: Node, port: int, front: Front, last_line: str) -> str:
+    line = listening_line(node, port, front)
+    if line != last_line:
+        say(line)
+    record_server(node, port, front)
+    return line
 
 
 def listening_line(node: Node, port: int, front: Front) -> str:
