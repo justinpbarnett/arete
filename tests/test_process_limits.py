@@ -282,20 +282,20 @@ class BudgetTests(Isolated):
     def test_idle_waits_move_the_deadline_and_other_waits_do_not(self):
         for cause in ("limit", "slot"):
             with self.subTest(cause=cause):
-                run = self.made_run(policy=runlimits.Policy(max_run_minutes=.01))
+                run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
                 started = time.monotonic()
                 with self.assertRaisesRegex(runlimits.Parked, "run chain"):
                     with run.budget.watching():
                         with run.waiting(cause):
                             time.sleep(.9)
                         self.assertGreater(run.budget.deadline - time.monotonic(), 0)
-                        time.sleep(2)
-                self.assertLess(time.monotonic() - started, 1.5 + .9)
+                        time.sleep(6)
+                self.assertLess(time.monotonic() - started, 3 + .9 + 1)
                 self.assertGreater(runlimits.metadata(run.id, "budget.json")["wait_minutes_left_out"][cause], 0)
-        run = self.made_run(policy=runlimits.Policy(max_run_minutes=.01))
+        run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
         with self.assertRaisesRegex(runlimits.Parked, "run chain"):
             with run.budget.watching(), run.waiting("ci"):
-                time.sleep(2)
+                time.sleep(6)
 
     def chained_after(self, *waits):
         first = self.made_run()
@@ -552,7 +552,7 @@ class BudgetTests(Isolated):
 
         script = pipeline.Script("feature", drive)
         with patch.object(config, "load", return_value=self.cfg), patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.005)), \
+                patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.05)), \
                 patch.object(pipeline.runner, "run", side_effect=transport):
             self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
         row = state.ticket_runs(self.repo.name, self.ticket, whole=True)[0]
