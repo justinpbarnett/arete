@@ -187,8 +187,9 @@ if scenario == "failed-check":
     layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "exit 7"))
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
-elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault"):
-    cause = "change" if scenario == "verify-change-fault" else "environment"
+elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault",
+                  "verify-change-fault-timed"):
+    cause = "change" if scenario.startswith("verify-change-fault") else "environment"
     answers = root / "sample/replay"
     failing = json.loads((answers / "verify.json").read_text())
     failing["structured"] = {"verdict": "pass" if scenario.endswith("-pass") else "fail", "summary": "The check could not run.", "checks": [
@@ -197,6 +198,11 @@ elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "
     (answers / "verify2.json").write_text((answers / "verify.json").read_text())
     (answers / "verify.json").write_text(json.dumps(failing))
     (answers / "verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    checks_in_verification, real_checks = [], pipeline.run_checks
+    def timed_checks(layer, cwd, git_dirs, run, *args, **kw):
+        checks_in_verification.append(bool(run.budget and run.budget.verification_active_since))
+        return real_checks(layer, cwd, git_dirs, run, *args, **kw)
+    pipeline.run_checks = timed_checks
 elif scenario in ("verify-start-denied", "verify-start-crash"):
     urllib.request.urlopen = mock.Mock(side_effect=OSError("refused"))
     layer = root / "sample/layer/config.toml"
@@ -762,6 +768,8 @@ verification = [e.get("data", {}).get("verified") for e in events
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
           "verified":[v["verdict"] for v in verification if v],
           "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git")}
+if scenario == "verify-change-fault-timed":
+    result["checks_in_verification"] = checks_in_verification
 if scenario == "edited-after-held-pr":
     result["old"] = old
     result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
@@ -1230,6 +1238,12 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         result = self.workflow("verify-change-fault")
         self.assertIn("verify_fix", result["steps"])
         self.assertEqual(result["verified"], ["pass"])
+
+    def test_checks_run_again_after_a_verify_fix_count_as_run_time_not_verification_time(self):
+        result = self.workflow("verify-change-fault-timed")
+        self.assertIn("verify_fix", result["steps"])
+        self.assertEqual(result["verified"], ["pass"])
+        self.assertEqual(result["checks_in_verification"], [False, False])
 
     def test_app_start_denied_by_the_sandbox_is_blocked_without_a_repair(self):
         result = self.workflow("verify-start-denied")
