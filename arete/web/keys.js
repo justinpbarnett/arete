@@ -33,7 +33,7 @@ function onEscape(event) {
 function onKey(event) {
   if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k") {
     event.preventDefault();
-    if (!document.getElementById("keys").open) openPalette();
+    if (!document.querySelector("#keys[open], #feedback[open]")) openPalette();
     return;
   }
   if (event.key === "Escape") return onEscape(event);
@@ -57,6 +57,7 @@ function onKey(event) {
       const open = document.getElementById("console").hidden;
       setConsole(open, { focus: open });
     },
+    f: openFeedback,
     "?": openKeys,
   };
   const run = keys[event.key];

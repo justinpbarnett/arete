@@ -24,6 +24,7 @@ function paletteItems() {
       () => `Started the checks at ${clock(new Date())}. Their results show here when they end.`) },
     { kind: "Action", text: "Refresh triage now", note: "Triage", run: () => paletteAct("/api/triage/refresh", "triage", "triage-refresh",
       () => `Started triage at ${clock(new Date())}. It reads every open ticket, so it can take a few minutes; the verdicts here change when it ends.`) },
+    { kind: "Action", text: "Send feedback", note: "Write down an idea, an adjustment or a bug", run: openFeedback },
     { kind: "Action", text: "Open the console", note: "Ask arete about runs, health or cost", run: () => setConsole(true, { focus: true }) },
   ];
   const found = findData ?? { loops: [], runs: [], sessions: [], tickets: [] };

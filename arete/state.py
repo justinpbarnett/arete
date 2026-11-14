@@ -359,6 +359,20 @@ CREATE TABLE IF NOT EXISTS usage (
     ms INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS usage_at ON usage (at);
+CREATE TABLE IF NOT EXISTS captures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL DEFAULT 'draft',   -- draft | discarded
+    kind TEXT DEFAULT 'idea',               -- idea | adjustment | bug
+    text TEXT DEFAULT '',
+    expected TEXT DEFAULT '',
+    actual TEXT DEFAULT '',
+    steps TEXT DEFAULT '',
+    context TEXT DEFAULT '',                -- the snapshot's JSON text, or '' for none
+    revision INTEGER DEFAULT 0,
+    created TEXT,
+    updated TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS captures_open ON captures (status) WHERE status = 'draft';
 CREATE TABLE IF NOT EXISTS vms (
     name TEXT PRIMARY KEY,         -- a VM arete asked for and has not yet seen deleted
     run_id TEXT,                   -- NULL for a probe
@@ -1759,6 +1773,30 @@ def add_usage(row: dict, keep_days: float) -> None:
     with db() as c:
         c.execute(insert_sql("usage", USAGE_COLUMNS), tuple(row.get(k) for k in USAGE_COLUMNS))
         c.execute("DELETE FROM usage WHERE at < ?", (util.iso(util.now() - timedelta(days=keep_days)),))
+
+
+def capture_draft(connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM captures WHERE status = 'draft'").fetchone()
+        return dict(r) if r else None
+
+
+def capture_save(**fields) -> None:
+    now = util.iso()
+    names = list(fields)
+    sets = "".join(f"{n} = ?, " for n in names)
+    with db() as c:
+        changed = c.execute(f"UPDATE captures SET {sets}revision = revision + 1, updated = ? WHERE status = 'draft'",
+                            (*fields.values(), now)).rowcount
+        if not changed:
+            c.execute(f"INSERT INTO captures ({', '.join(names)}, status, revision, created, updated) "
+                      f"VALUES ({', '.join('?' * len(names))}, 'draft', 1, ?, ?)", (*fields.values(), now, now))
+
+
+def capture_discard() -> bool:
+    with db() as c:
+        return c.execute("UPDATE captures SET status = 'discarded', revision = revision + 1, updated = ? WHERE status = 'draft'",
+                         (util.iso(),)).rowcount > 0
 
 
 def usage_since(since: str, connect=db) -> list[dict]:

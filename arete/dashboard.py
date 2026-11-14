@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import (
     board,
+    capture,
     chat,
     config,
     control,
@@ -190,7 +191,7 @@ class Refusal(Exception):
         self.status = status
 
 
-STATUS_OF_REFUSAL = {board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
+STATUS_OF_REFUSAL = {capture.Refused: 400, board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
                      chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
@@ -296,6 +297,8 @@ class Handler(BaseHTTPRequestHandler):
                 return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))))
             if path == "/api/settings":
                 return settings.current()
+            if path == "/api/capture":
+                return capture.view(connect=state.reader)
             if path == "/api/chats":
                 return chat.listing()
             if path.startswith(CHAT_PATH) and "/sessions" in path:
@@ -322,6 +325,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/usage":
                 state.add_usage(self.usage_row(), board.KEEP_USAGE_DAYS)
                 return {}
+            if path == "/api/capture":
+                return capture.save(self.body())
+            if path == "/api/capture/context":
+                return capture.add_context(self.body(), WEB_CODE)
+            if path == "/api/capture/context/drop":
+                return capture.drop_context()
+            if path == "/api/capture/discard":
+                return capture.discard()
             if path == "/api/settings":
                 return settings.save(self.body())
             if path == "/api/chats/new":
