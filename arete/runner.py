@@ -30,6 +30,7 @@ from . import (
     replay,
     state,
     util,
+    vault,
 )
 from . import scratch as verification_scratch
 from .agent import (
@@ -361,7 +362,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
                  "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
                  "position": chosen_route.position, "requested": chosen_route.requested,
-                 "env": launch_env(picked, cfg, repo, trace[0], kw.get("extra_env"), launch_kw.get("ask_owner", False)),
+                 "env": launch_env(picked, cfg, repo, trace[0], launch_kw.get("extra_env"),
+                                   launch_kw.get("ask_owner", False)),
                  "skipped": skipped, "launch": launches,
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         on_launch(route)
@@ -693,6 +695,18 @@ def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[
     return f"{fresh}\n\n## Interrupted attempt\n\n{note}", NO_SESSION
 
 
+LOGIN_NAMES = frozenset({*claude.LOGIN_VARS, *claude.PARENT_SESSION_VARS, *codex.LOGIN_VARS, *codex.NEVER,
+                         *pi.PARENT_SESSION_VARS})
+
+
+def reserved(name: str) -> str:
+    if environment.reserved(name):
+        return f"{name} is a variable arete sets itself"
+    if name in LOGIN_NAMES:
+        return f"{name} is a login variable of an agent runner"
+    return ""
+
+
 def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str], ask_jev: bool,
                   say: Callable[[str], None]) -> dict:
     kw = {k: list(v) if isinstance(v, list) else v for k, v in base.items()}
@@ -705,6 +719,11 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["remote"] = target
     else:
         kw["passing"] = environment.passed(cfg, repo)
+        kept = {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
+        if picked.selected:
+            kept = {n: v for n, v in kept.items() if n not in picked.selected.env}
+        if kept:
+            kw["extra_env"] = {**kept, **(kw.get("extra_env") or {})}
     hook = ()
     kw.pop("verification_attempt", None)
     if trip.scratch:
@@ -865,7 +884,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             res.cost_usd = 0.0 if on_local else priced(res, cfg)
         if not budget_error:
             quote_calls(res, which, name, at)
-        if selected:
+        if selected or vault.values():
             refresh_hidden()
             res.error = record.scrub(res.error, hidden)
             res.text = record.scrub(res.text, hidden)

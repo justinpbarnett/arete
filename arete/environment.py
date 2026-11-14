@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 
-from . import config, util
+from . import config, util, vault
 
 BASE = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TZ", "TMPDIR", "TERM", "XDG_CONFIG_HOME",
         "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "ARETE_CONFIG_DIR", "ARETE_STATE_DIR", "ARETE_LOG_DIR",
@@ -33,13 +33,27 @@ def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:
         return names
 
 
+def reserved(name: str) -> bool:
+    return passes(name, BASE) or name in SHELL_BOOKKEEPING or name.startswith("ARETE_")
+
+
+def stored(repo: config.Repo | None) -> dict[str, str]:
+    if repo is None:
+        return {}
+    return {n: v for n, v in vault.read(repo.name).items() if not reserved(n)}
+
+
 def commands(cfg: config.Config, repo: config.Repo | None = None, sets: Mapping[str, str] | None = None) -> dict:
-    return build(passed(cfg, repo), sets)
+    return build(passed(cfg, repo), {**stored(repo), **(sets or {})})
 
 
 def sh(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None,
        sets: Mapping[str, str] | None = None, **kw):
-    return util.sh(cmd, env=commands(cfg, repo, sets), inherit=False, **kw)
+    res = util.sh(cmd, env=commands(cfg, repo, sets), inherit=False, **kw)
+    for value in sorted(stored(repo).values(), key=len, reverse=True):
+        res.stdout = res.stdout.replace(value, vault.REDACTED)
+        res.stderr = res.stderr.replace(value, vault.REDACTED)
+    return res
 
 
 def dropped(cfg: config.Config, source: Mapping[str, str] | None = None) -> list[str]:

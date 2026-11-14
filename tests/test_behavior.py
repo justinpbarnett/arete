@@ -346,6 +346,13 @@ if scenario.startswith("asked"):
     asking = {"questions": [{"header": "Spelling", "question": "How is it spelled?", "kind": "text"}],
               "why": "The task leaves it open.", "tried": "Read the task."}
     placing = {**asking, "questions": [{"header": "Place", "question": "Where does it go?", "kind": "text"}]}
+    marker = "arete117-marker-value-9f3k2"
+    if scenario == "asked-secret":
+        layer_file = root / "sample/layer/config.toml"
+        layer_file.write_text(layer_file.read_text().replace(
+            "[checks]\n", "[checks]\nsecret = \"test ${#REPLAY_SECRET} -eq " + str(len(marker)) + "\"\n"))
+        asking = {"questions": [{"header": "Token", "question": "What is the token?", "kind": "secret",
+                                 "name": "REPLAY_SECRET"}], "why": "The check needs it.", "tried": "Read the task."}
     calls = [asking, placing] if scenario == "asked-twice" else [asking]
     (answers / "build.json").write_text(json.dumps({"text": "Asked.", "ok": True,
                                                     "tool_calls": [{"name": "ask_owner", "input": a} for a in calls]}))
@@ -375,8 +382,22 @@ if scenario.startswith("asked"):
                 result[name] = call()
             except control.Refused as e:
                 result[name] = str(e)
-    for ask in waiting:
-        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
+    if scenario == "asked-secret":
+        from arete import control, tasks, vault
+        try:
+            tasks.answer_ask(waiting[0]["id"], {"answers": [{"secret": "short"}]})
+        except control.Refused as e:
+            result["short"] = str(e)
+        result["reserved"] = runner.reserved("PATH")
+        result["stored_before"] = vault.read("replay-sample")
+        with mock.patch.object(tasks, "continue_asked", return_value={}):
+            tasks.answer_ask(waiting[0]["id"], {"answers": [{"secret": marker}]})
+        result["mode"] = oct(vault.file_of("replay-sample").stat().st_mode & 0o777)
+        result["names"] = sorted(vault.read("replay-sample"))
+        result["diff_refusal"] = vault.refusals(f"diff --git a/notes.txt b/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n+kumquat {marker}\n")
+    else:
+        for ask in waiting:
+            state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
     gone = scenario == "asked-gone"
     (answers / "build.json").write_text(json.dumps({"ok": False, "error": "No conversation found with session ID x"})
                                         if gone else passing)
@@ -465,6 +486,10 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
                "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])],
                "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
                "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text()}
+    if scenario == "asked-secret":
+        result["answer_lines"] = [e.get("answers") for e in events if e.get("event") == "answer"]
+        result["leaks"] = [str(p) for base in (paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR) for p in base.rglob("*")
+                           if p.is_file() and not p.is_symlink() and marker.encode() in p.read_bytes()]
     origin = root / "sample/origin.git"
     branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines()
                 if b != "refs/heads/main"]
@@ -513,6 +538,20 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertTrue(result["same_session"])
         self.assertTrue(result["answered"])
         self.assertEqual(result["taken"], [True])
+
+    def test_secret_answer_reaches_the_check_by_name_and_is_stored_nowhere_else(self):
+        result = self.workflow("asked-secret")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertIn("kumquat", result["published"])
+        self.assertEqual((result["mode"], result["names"], result["stored_before"]), ("0o600", ["REPLAY_SECRET"], {}))
+        self.assertIn("nothing was stored", result["short"])
+        self.assertNotIn("short", result["short"].replace("shortest", ""))
+        self.assertIn("arete sets itself", result["reserved"])
+        self.assertEqual(result["leaks"], [])
+        self.assertEqual(result["answer_lines"], [[{"header": "Token", "kind": "secret", "name": "REPLAY_SECRET",
+                                                    "set": True}]])
+        self.assertEqual(result["diff_refusal"], ["notes.txt (holds the stored value of REPLAY_SECRET)"])
 
     def test_answered_run_stopped_while_waiting_for_a_slot_resumes_with_the_answers(self):
         result = self.workflow("asked-stopped-waiting")

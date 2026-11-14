@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, gh, paths, state, util
+from . import agent, gh, paths, state, util, vault
 from . import lines as run_lines
 
 SETTLE_GRACE_SECONDS = 60
@@ -175,7 +175,7 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
 
 def secrets(*files: Path) -> tuple[str, ...]:
     found = {v for k, v in os.environ.items() if CREDENTIAL_NAME.search(k)}
-    found |= {gh.auth_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True)}
+    found |= {gh.auth_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True), *vault.values()}
     for f in files:
         found |= file_secrets(f)
     found = {v for v in found if len(v) >= SHORTEST_SECRET}

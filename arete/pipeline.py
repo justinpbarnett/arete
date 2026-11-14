@@ -48,6 +48,7 @@ from . import (
     steps,
     tracker,
     util,
+    vault,
     verdicts,
     verify,
 )
@@ -832,8 +833,9 @@ def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> Non
     drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
+    holding = vault.held(git(["diff", "--cached", "--no-renames"], c.wt))
     if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
-                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny)]:
+                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny) or n in holding]:
         git(["reset", "-q", "--", *denied], c.wt)
     if git(["diff", "--cached", "--name-only"], c.wt).strip():
         message = f"wip: edits of arete run {run_id}, kept when it ended before pushing\n\nArete-Run: {run_id}"
@@ -1006,12 +1008,18 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
             out.merged.append(c)
         elif not diff.counts:
             continue
+        shown = checkout_patch(c, diff.locks, "--cached", against)
+        resolved = ""
+        if merged and c.resolved and not from_base:
+            resolved = git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
+                            c.base_commit, "HEAD", "--", *c.resolved], c.wt)
+        if vault.every():
+            whole = checkout_patch(c, [], "--cached", against) if diff.locks else shown
+            diff.denied += vault.refusals(whole + resolved)
         out += diff
         out.changed.append(c)
-        out.patch += checkout_patch(c, diff.locks, "--cached", against)
-        if merged and c.resolved and not from_base:
-            out.patch += git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
-                              c.base_commit, "HEAD", "--", *c.resolved], c.wt)
+        out.patch += shown + resolved
+    out.patch = vault.hidden(out.patch)
     return out
 
 
