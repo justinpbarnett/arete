@@ -2046,7 +2046,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
         run.log("automerge left off: triage approved the ticket, so a person merges it")
         return
     try:
-        risk = jev.risk(patch_from_base(opened), about, cfg,
+        risk = jev.risk(vault.hidden(patch_from_base(opened)), about, cfg,
                         trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
         hold = risk.hold if risk else ""
     except jev.Unjudged as e:
