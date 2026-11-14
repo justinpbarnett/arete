@@ -134,14 +134,27 @@ def title_of(text: str, limit: int = TITLE_CHARS) -> str:
     return (line[:limit + 1].rpartition(" ")[0] or line[:limit]).rstrip() + "…"
 
 
+def answer_lock(chat_id: int) -> str:
+    return f"chat-{chat_id}"
+
+
 def send(chat_id: int, text: str) -> dict:
     chat_row(chat_id)
     sessions.tell_chats()
-    message_id = state.chat_claim(chat_id, text, title_of(text))
-    if not message_id:
-        raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
-    row = chat_row(chat_id)
-    threading.Thread(target=answer, args=(chat_id, text, message_id, row["project"]), daemon=True).start()
+    held = util.lock_file(answer_lock(chat_id))
+    try:
+        if not util.take_lock(held, wait=False) or not (message_id := state.chat_claim(chat_id, text, title_of(text))):
+            raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
+        row = chat_row(chat_id)
+
+        def locked_answer() -> None:
+            with held:
+                answer(chat_id, text, message_id, row["project"])
+
+        threading.Thread(target=locked_answer, daemon=True).start()
+    except BaseException:
+        held.close()
+        raise
     return view(chat_id)
 
 
@@ -470,11 +483,13 @@ def move_old_chat() -> None:
 def recover() -> None:
     move_old_chat()
     for chat_id in state.busy_chats():
-        state.chat_say(chat_id, "arete", RESTARTED, busy=0)
+        with util.lock(answer_lock(chat_id)) as free:
+            if free and chat_row(chat_id)["busy"]:
+                state.chat_say(chat_id, "arete", RESTARTED, busy=0)
 
 
 def any_busy() -> bool:
-    return bool(state.busy_chats())
+    return any(util.lock_is_held(answer_lock(chat_id)) for chat_id in state.busy_chats())
 
 
 def arete_repo(cfg: config.Config) -> config.Repo:

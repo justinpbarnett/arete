@@ -1218,7 +1218,14 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
     port = port or cfg.dashboard_port
     state.ensure_schema()
     chat.recover()
-    capture.recover()
+    if inside_serve:
+        capture.recover()
+    else:
+        from . import serve
+
+        with util.lock(serve.SERVE_LOCK) as free:
+            if free:
+                capture.recover()
     host = host or host_services()
     logins = Logins(host)
     hold = util.lock_file(f"dashboard-{port}")
