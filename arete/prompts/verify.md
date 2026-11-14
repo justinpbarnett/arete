@@ -62,6 +62,9 @@ $scratch
   - `how`: the exact command, request, or clicks.
   - `saw`: what came back. Quote the output, the status and body, or what the page showed.
   - `passed`: true only when what you saw is what the change should give.
+  - `cause`: on a check with `passed` false, `environment` when your own tools, sandbox, permissions, browser or setup
+    could not run the check (a closed browser, a denied command), `change` when the product misbehaved. When every
+    failed check is `environment`, Arete treats the result as blocked, not as a failure of the change.
   - `screenshot`: the file name of the screenshot for a browser check, else leave it out.
 - `verdict`: `pass` when every check passed. `fail` when the product does not do what the issue asks or something
   near it broke. `blocked` when you could not check something essential for a reason outside the change (no

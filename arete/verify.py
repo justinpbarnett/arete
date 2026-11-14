@@ -30,6 +30,8 @@ MAX_SCREENSHOTS = 8
 MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_SAW_CHARS = 1200
 VERDICTS = ("pass", "fail", "blocked")
+ENVIRONMENT_FAULT = re.compile(r"Operation not permitted|Permission denied|PermissionError|EPERM|sandbox-exec|"
+                               r"exited 12[67] before", re.IGNORECASE)
 
 SCHEMA = {
     "type": "object",
@@ -43,6 +45,7 @@ SCHEMA = {
                 "how": {"type": "string"},
                 "saw": {"type": "string"},
                 "passed": {"type": "boolean"},
+                "cause": {"type": "string", "enum": ["change", "environment"]},
                 "screenshot": {"type": "string"},
             },
             "required": ["what", "how", "saw", "passed"],
@@ -174,6 +177,10 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
     raise ServerError(f"{url} did not answer within {seconds} seconds{output(log)}")
 
 
+def environment_fault(error: str) -> str:
+    return next((line.strip() for line in error.splitlines() if ENVIRONMENT_FAULT.search(line)), "")
+
+
 def output(log: Path) -> str:
     text = util.tail(log.read_text(errors="replace").strip(), 3000)
     return f"\n\n```\n{text}\n```" if text else "; the start command printed nothing"
@@ -226,6 +233,10 @@ class Verified:
             v.verdict, v.blocked_by = "blocked", "the verifier said pass but listed no checks"
         elif v.verdict == "pass" and v.failed_checks:
             v.verdict = "fail"
+        if v.verdict == "fail" and v.failed_checks and all(c.get("cause") == "environment" for c in v.failed_checks):
+            v.verdict = "blocked"
+            v.blocked_by = v.blocked_by or util.first_line(str(v.failed_checks[0].get("what") or "")
+                                                           + ": " + str(v.failed_checks[0].get("saw") or ""), 300)
         return v
 
     @classmethod
