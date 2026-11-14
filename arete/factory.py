@@ -219,7 +219,7 @@ class Flow:
                  restore: Callable[[dict], str] | None = None, refusal: str = "",
                  hold: Callable[[str], str] | None = None, renew: str = "",
                  keeps: Callable[[str, dict], bool] | None = None,
-                 stepped: list[list[dict]] | None = None) -> None:
+                 step_runs: list[list[dict]] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         if again and again not in STEPS:
@@ -236,7 +236,7 @@ class Flow:
         self.tries = tries_in([lines.read(run_id), *chained])
         self.last_prints = {str(line["tree"]): str(line.get("fingerprint") or "")
                             for line in self.earlier if line.get("tree")}
-        self.restamped = self.restamps(stepped or [])
+        self.restamped = self.restamps(step_runs or [])
         self.prints: dict[str, str] = {}
         self.renew, self.keeps = renew, keeps or (lambda name, kw: False)
         self.carrying, self.carry = False, 0
@@ -283,17 +283,32 @@ class Flow:
         finally:
             self.done = self.done or name == self.only
 
-    def restamps(self, stepped: list[list[dict]]) -> dict[int, str]:
+    def restamps(self, step_runs: list[list[dict]]) -> dict[int, str]:
         newest = max((str(line.get("ts") or "") for line in self.earlier), default="")
         found: dict[int, str] = {}
-        for read in stepped:
-            step = str(first(read, "route").get("only") or "")
-            last = max((i for i, line in enumerate(self.earlier) if line.get("step") == step), default=-1)
-            for line in ends(read):
-                if line.get("tree") and str(line.get("ts") or "") >= newest:
-                    for i in range(last + 1):
-                        if self.earlier[i].get("tree") == line["tree"]:
-                            found[i] = str(line.get("fingerprint") or "")
+        for read in step_runs:
+            opened = first(read, "route")
+            only = str(opened.get("only") or "")
+            began = next((line for line in read if line.get("event") == "step_start" and line.get("step") == only
+                          and line.get("tree") and line.get("fingerprint")), {})
+            ended = [line for line in ends(read) if line.get("step") == only]
+            routed = next((line for line in read if line.get("event") == "route" and type(line.get("skipped")) is int),
+                          {})
+            if not began or not ended or not routed or str(ended[-1].get("ts") or "") < newest:
+                continue
+            at = routed["skipped"] + (routed["redone"] if type(routed.get("redone")) is int else 0)
+            reach = at + 1 if ended[-1].get("result") == "pass" else at
+            taken = history(chain(str(opened.get("continues") or "")))
+            tree, before, after = str(began["tree"]), str(began["fingerprint"]), str(ended[-1].get("fingerprint") or "")
+            for i, line in enumerate(self.earlier[:reach]):
+                if (i >= len(taken) or (line.get("run"), line.get("seq")) != (taken[i].get("run"), taken[i].get("seq"))
+                        or i == at and line.get("step") != only):
+                    break
+                if line.get("tree") != tree:
+                    continue
+                if not after or found.get(i, self.last_prints.get(tree, "")) != before:
+                    break
+                found[i] = after
         return found
 
     def expected(self, index: int, tree: str) -> str:
@@ -385,7 +400,9 @@ class Flow:
             lines.write(self.run_id, "step_start", step=name, **{"try": n})
             self.failed(name, n, e, calls, started, kw)
             raise
-        lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels)
+        began = ({"tree": os.path.abspath(kw["tree"]), "fingerprint": fingerprint(kw["tree"])}
+                 if name == self.only and kw.get("tree") else {})
+        lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels, **began)
         try:
             outcome = self.call(name, calls, args, kw)
         except asks.Asked as e:

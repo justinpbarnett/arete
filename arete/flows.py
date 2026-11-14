@@ -83,7 +83,7 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.R
         renew = "prepare"
     return factory.Flow(run.id, continues=continues, only=only, ctx=job, labels=job.labels, again=again,
                         restore=lambda line: restore(job, line, only), refusal=refusal, hold=job.hold, renew=renew,
-                        stepped=list(step_runs(continues).values()) if continues else [],
+                        step_runs=list(step_runs(continues).values()) if continues else [],
                         keeps=lambda name, kw: any(c.onto for c in job.checkouts) and (
                             name in ("plan", "revise", "repair") or name == "implement" and kw.get("round") == BUILD))
 

@@ -237,14 +237,23 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
             mid = state.ticket_runs("replay-sample", task)[0]
             mid["unmoved"] = pipeline.git(["rev-parse", "HEAD"], ws).strip() == before
         quince = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n"
+        lime = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n A small file for replay checks.\n-kumquat\n+lime\n"
         if "stepped" in scenario:
-            (replays / "build.patch").write_text(quince)
+            (replays / "build.patch").write_text(lime if "broken" in scenario else quince)
             try:
                 factory.main(feature, ["replay-sample", task, "--continue", failed["id"], "--only", "implement"])
             except SystemExit:
                 pass
             mid = state.ticket_runs("replay-sample", task)[0]
             mid["head"] = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+            if "broken-" in scenario:
+                try:
+                    factory.main(feature, ["replay-sample", task, "--continue", failed["id"], "--only",
+                                           scenario.rsplit("-", 1)[1]])
+                except SystemExit:
+                    pass
+                later = state.ticket_runs("replay-sample", task)[0]
+                mid["later"] = {k: later.get(k) for k in ("only_step", "status", "summary")}
             if scenario.endswith(("-hand", "-forged")):
                 trailer = "\n\nArete-Run: " + mid["id"] if scenario.endswith("-forged") else ""
                 (ws / "hand.txt").write_text("hand\n")
@@ -264,7 +273,7 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
                   "steps": [s["step"] for s in state.steps(row["id"])],
                   "started": [l["step"] for l in __import__("arete.lines", fromlist=["read"]).read(row["id"]) if l.get("event") == "step_start"],
                   "failed_id": failed["id"],
-                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved", "head")},
+                  "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved", "head", "later")},
                   "stepped_published": published and bool(mid.get("head")) and pipeline.util.sh(["git", "merge-base", "--is-ancestor", mid["head"], branch], cwd=origin).returncode == 0,
                   "seed": og("show", f"{branch}:seed.txt") if "pushed" in scenario and published else "",
                   "unmoved": ws.exists() and pipeline.git(["rev-parse", "HEAD"], ws).strip() == before,
@@ -769,6 +778,28 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertNotIn("implement", result["started"])
         self.assertTrue(result["stepped_published"])
         self.assertIn("quince", result["published"])
+
+    def assert_broken_build_not_published(self, result, step, said):
+        self.assertIn("publishing failed", result["failed"])
+        self.assertEqual(result["mid"]["status"], "step", result["mid"]["summary"])
+        self.assertEqual(result["mid"]["later"]["only_step"], step)
+        self.assertEqual(result["mid"]["later"]["status"], "step")
+        self.assertIn(said, result["mid"]["later"]["summary"])
+        self.assertEqual(result["status"], "failed", result["summary"])
+        self.assertIn("checks", result["started"])
+        self.assertNotIn("pr", result["started"])
+        self.assertNotIn("publish", result["started"])
+        self.assertFalse(result["stepped_published"])
+        self.assertIn("kumquat", result["published"])
+        self.assertNotIn("lime", result["published"])
+
+    def test_failed_checks_run_alone_after_a_new_build_leave_the_resume_running_checks(self):
+        result = self.workflow("failed-resume-stepped-late-broken-checks")
+        self.assert_broken_build_not_published(result, "checks", "checks fail")
+
+    def test_verify_run_alone_after_a_new_build_leaves_the_resume_running_checks(self):
+        result = self.workflow("failed-resume-stepped-late-broken-verify")
+        self.assert_broken_build_not_published(result, "verify", "verify pass")
 
     def test_hand_commit_after_an_implement_run_alone_still_stops_the_resume(self):
         result = self.workflow("failed-resume-stepped-hand")
