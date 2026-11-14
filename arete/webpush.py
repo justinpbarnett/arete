@@ -181,7 +181,7 @@ def ask_opened(cfg: config.Config, ask_ids: list[str]) -> list[str]:
     try:
         if not state.push_list():
             return []
-        return [f"push for ask {ask_id}: {words(send_all(cfg))}" for ask_id in ask_ids]
+        return [f"push for ask {', '.join(ask_ids)}: {words(send_all(cfg))}"]
     except Exception as e:
         return [f"push for a new ask failed: {type(e).__name__}"]
 
