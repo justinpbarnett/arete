@@ -1,21 +1,12 @@
 import { h } from "./vendor-preact.js";
 import htm from "./vendor-htm.js";
 import * as data from "./ui-data.js";
+import { screenKeys } from "./ui-keys.js";
+import { KeyBar, KeySheet } from "./ui-keybar.js";
 
 const html = htm.bind(h);
-const navigation = [
-  ["floor", "Floor", "f", "▦", "#floor"],
-  ["triage", "Triage", "t", "!", "#triage"],
-  ["my-work", "My work", "w", "○", "#board/open-work"],
-  ["board", "Board", "b", "▤", "#board"],
-  ["runs", "Runs", "r", "▷", "#run"],
-  ["intake", "Intake", "n", "↓", "#intake"],
-  ["outbox", "Outbox", "o", "↑", "#outbox"],
-  ["prompts", "Prompts", "p", "≡", "#prompts"],
-  ["adws", "ADWs", "a", "◇", "#adws"],
-  ["insights", "Insights", "v", "▥", "#insights"],
-  ["settings", "Settings", ",", "⚙", "#settings/health"],
-];
+const glyphs = { floor: "▦", triage: "!", "my-work": "○", board: "▤", runs: "▷", intake: "↓", outbox: "↑", prompts: "≡", adws: "◇", insights: "▥", settings: "⚙" };
+const navigation = screenKeys.map(([key, id, label, href]) => [id, label, key, glyphs[id], href]);
 
 function duration(seconds) {
   if (!Number.isFinite(seconds)) return "";
@@ -33,9 +24,9 @@ function Sidebar({ route, snapshot, now }) {
   return html`<aside class="sidebar frame" data-pane="sidebar" aria-label="Sidebar">
     <div class="side-top"><span class="mark">A</span><span class="wordmark">arete</span><span class="version" aria-label="Server version"></span></div>
     <div class="search" role="search"><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></div>
-    <nav class="side-nav" aria-label="Screens">${navigation.map(([id, label, key, glyph, href]) => {
+    <nav class="side-nav" aria-label="Screens" data-list="screens">${navigation.map(([id, label, key, glyph, href]) => {
       const count = id === "triage" ? snapshot.needsYou : id === "runs" ? snapshot.running : null;
-      return html`<a key=${id} class=${`nav-row${route.active === id ? " selected" : ""}`} href=${href}
+      return html`<a key=${id} data-row data-item=${id} data-act=${`go-${id}`} class=${`nav-row${route.active === id ? " selected" : ""}`} href=${href}
         aria-current=${route.active === id ? "page" : undefined}>
         <kbd class="key-slot">${key}</kbd><span class="glyph" aria-hidden="true">${glyph}</span>
         <span class="nav-label">${label}</span><span class=${`count${id === "triage" && count > 0 ? " accent" : ""}`}>${count}</span>
@@ -75,7 +66,8 @@ export function Shell({ route, snapshot, now }) {
         ${route.screen === "run" ? html`<div class="run-focus"><${Pane} name="focus" label=${page.focus} />${extra}</div>`
           : html`<${Pane} name="focus" label=${page.focus} />${extra}`}
       </div>
-      <footer class="key-bar" aria-label="Key bar"></footer>
+      <${KeyBar} />
     </main>
+    <${KeySheet} />
   </div>`;
 }

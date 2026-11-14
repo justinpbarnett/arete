@@ -6425,9 +6425,10 @@ from arete import dashboard, state
 class Assets(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.scripts, self.styles = set(), set()
+        self.scripts, self.styles, self.declared = set(), set(), set()
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        self.declared.update(value for name, value in attrs.items() if name in ("src", "href") and value.startswith("/"))
         if tag == "script" and attrs.get("src"):
             self.scripts.add(attrs["src"])
         if tag == "link" and attrs.get("rel") == "modulepreload":
@@ -6456,9 +6457,13 @@ try:
     assets = Assets()
     assets.feed(page)
     check.assertEqual(assets.scripts, {
-        "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js",
+        "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js", "/ui-keys.js", "/ui-keybar.js", "/ui-hooks.js",
         "/vendor-preact.js", "/vendor-htm.js", "/vendor-signals.js"})
-    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css"})
+    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css"})
+    check.assertIn("/icon-192.png", assets.declared)
+    for path in sorted(assets.declared):
+        with opener.open(base + path, timeout=5) as response:
+            check.assertEqual(response.status, 200)
     for path in sorted(assets.scripts):
         get(path, "text/javascript")
     for path in sorted(assets.styles):
@@ -6476,6 +6481,19 @@ finally:
             command = [sys.executable, "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(SOURCE)!r});" + script]
             done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=45)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
+    def test_keyboard_files_hold_every_screen_key_and_every_replay_hook(self):
+        web = SOURCE / "arete" / "web"
+        keys, hooks = (web / "ui-keys.js").read_text(), (web / "ui-hooks.js").read_text()
+        routes = {"f": "#floor", "t": "#triage", "w": "#board/open-work", "b": "#board", "r": "#run", "n": "#intake",
+                  "o": "#outbox", "p": "#prompts", "a": "#adws", "v": "#insights", ",": "#settings/health"}
+        for letter, route in routes.items():
+            self.assertRegex(keys, rf'\["{re.escape(letter)}", "[a-z-]+", "[^"]+", "{re.escape(route)}"\]')
+        for name in ("keys", "clicks", "drag", "wheel"):
+            self.assertIn(f'"{name}"', hooks)
+        for source in (keys, hooks):
+            for banned in ("innerHTML", "insertAdjacentHTML", "eval"):
+                self.assertNotIn(banned, source)
 
 
 if __name__ == "__main__":
