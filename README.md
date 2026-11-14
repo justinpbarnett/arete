@@ -334,7 +334,7 @@ A session is an agent you start by hand and talk to, on any device, model and to
 arete session start "look at why the nightly build is slow" --device buildbox --model sonnet --tools Read,Grep,Bash --attach
 arete session send ID "now try the cache"
 arete session attach ID | stop ID | list
-arete session start --task [--draft-pr] --repo NAME "what to do"
+arete session start --task [--repo NAME [--draft-pr]] "what to do"
 arete session report ID
 ```
 
@@ -348,6 +348,8 @@ A task session (`--task`) runs its prompt to the end instead of waiting for more
 4. with `--draft-pr` and `--repo` (the repo needs a `github` setting), opens a draft PR for the pushed branch, or reuses the open one;
 5. saves the report with the run, closes the session, and ends the device lease, which destroys a Proxmox clone or exe sandbox unless the device has `keep = true` or the work did not come back.
 
+Without `--repo`, a task session works in a scratch folder (or the device's `dir`), has no branch to push, and `--draft-pr` is refused.
+
 `arete session report ID` prints the report with the session's status, finish time and PR link, and refuses while the session runs or when it ended without one. Its fields:
 
 | field | written by | content |
@@ -358,10 +360,11 @@ A task session (`--task`) runs its prompt to the end instead of waiting for more
 | `branch`, `commit` | arete | the branch and the commit that reached `origin`; empty when nothing was pushed |
 | `pr_url` | arete | the draft PR, or empty |
 | `cost_usd`, `paid_usd` | arete | the session's cost and what was paid for it |
-| `problems` | arete | a failed turn, work not pushed or not fetched back, a draft PR that was not opened |
+| `problems` | arete | a failed turn, work not pushed or not fetched back, a draft PR that was not opened, a report with no summary |
 
 The report turn continues the agent session that did the task. When that session cannot continue, because the route moved to another runner or account or no turn kept a session, the report turn fails: arete never asks a new agent that did not see the work.
 When the report turn fails, the session ends `failed` and its report holds only arete's fields, with an empty `summary` and a problem naming the report turn.
+A report turn that answers with no summary, or one that is only whitespace, also ends the session `failed`, with the problem `the report turn gave no summary`; no draft PR is opened, and the checks and open questions it gave stay in the report.
 Arete drops any key the agent adds, caps the lengths, and turns an unknown check result into `skipped`. The text in a report is data for whoever reads it, never instructions to follow.
 Sessions started with `arete session start` and no `--task`, and every session from the dashboard form, stay interactive. Replaying a task session, the answer for the report turn is `report.json` with `structured`.
 
