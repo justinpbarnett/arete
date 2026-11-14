@@ -1856,7 +1856,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
 
     if run.dry_run:
         run.save("diff.patch", staged.patch)
-        run.save("pr_body.md", outbound.screen(report_body(
+        run.save("pr_body.md", gh.outgoing(report_body(
             run, summary=build_summary, review=review, verified=verified, left=left_for_a_person, images={},
             approval=approval, attempts=attempts, checks=checks, plan_text=plan_text, size=size, held=draft_why,
             written=written)))
@@ -1875,8 +1875,8 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     opened: list[Checkout] = []
     for c in staged.changed:
         if not c.pr:
-            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), f"{link}\n\n{pr_report}",
-                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt)
+            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), pr_report,
+                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
             opened.append(c)
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
@@ -1888,16 +1888,16 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
             if others:
-                gh.pr_edit_body(c.pr, f"{link}\n\n{pr_report}{others}")
+                gh.pr_edit_body(c.pr, f"{pr_report}{others}", link=link)
             continue
         body = gh.pr_body(c.pr)
         if c in pushed and ci.stopped(body):
             ci_stopped.append(c)
-        new_body = synced_pr_body(run, c.pr, body, t, left_for_a_person)
+        kept, text = synced_pr_body(run, c.pr, body, t, left_for_a_person)
         if opened:
-            new_body = with_siblings(new_body, others)
-        if new_body != body:
-            gh.pr_edit_body(c.pr, new_body)
+            text = with_siblings(text, others)
+        if gh.outgoing(text, kept) != body:
+            gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{pr_report}")
     drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
@@ -2019,8 +2019,9 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Chec
                     "pick it up.", f"nothing to build: {why}")
     for c in with_prs:
         body = gh.pr_body(c.pr)
-        if (new_body := synced_pr_body(run, c.pr, body, t, left)) != body:
-            gh.pr_edit_body(c.pr, new_body)
+        kept, text = synced_pr_body(run, c.pr, body, t, left)
+        if gh.outgoing(text, kept) != body:
+            gh.pr_edit_body(c.pr, text, link=kept)
     run.enter("pr")
     prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
     run.say(f"Nothing more to build, since the open PRs already cover this:\n\n{prs}\n\n{said}")
@@ -2029,21 +2030,21 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Chec
     return "pr", f"nothing to build: {why}", urls
 
 
-def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> str:
-    link = run.tracker.pr_link(t, whole=not left)
-    relinked_body = relinked(body, link, run.tracker.pr_link(t, whole=bool(left)))
-    if relinked_body != body:
-        run.log(f"{pr} now links the ticket with: {link}")
-    left_synced = with_left_section(relinked_body, left)
-    if left_synced != relinked_body:
+def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> tuple[str, str]:
+    wanted = run.tracker.pr_link(t, whole=not left)
+    had, text = gh.split_link(body, (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False)))
+    if had and had != wanted:
+        run.log(f"{pr} now links the ticket with: {wanted}")
+    left_synced = with_left_section(text, left)
+    if left_synced != text:
         run.log(f"{pr}: {'wrote' if left else 'removed'} the {LEFT_TITLE} section")
-    return public_text(run, left_synced)
+    return (wanted if had else ""), public_text(run, left_synced)
 
 
 def left_section(run: Run, text: str) -> str:
     if len(text) <= MAX_LEFT_FOR_A_PERSON_CHARS:
-        return outbound.screen(text)
-    return outbound.screen(
+        return gh.outgoing(text)
+    return gh.outgoing(
         f"{text[:MAX_LEFT_FOR_A_PERSON_CHARS]}\n\n(Cut at {MAX_LEFT_FOR_A_PERSON_CHARS} characters. The whole "
         f"change is `left_for_a_person` in `plan.json` of run `{run.id}`.)")
 
@@ -2076,11 +2077,6 @@ def left_on_prs(urls: list[str]) -> str:
         if found := LEFT_FOR_A_PERSON.search(gh.pr_body(url)):
             return found.group(1)
     return ""
-
-
-def relinked(body: str, link: str, other_link: str) -> str:
-    first, newline, rest = body.partition("\n")
-    return f"{link}{newline}{rest}" if first == other_link else body
 
 
 def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
@@ -2128,14 +2124,14 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
     try:
         for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
-            publish_ci(run, pushed, ci.section(rounds, max_rounds))
+            publish_ci(run, b.ticket, pushed, ci.section(rounds, max_rounds))
     except asks.Asked:
         raise
     except Exception as e:
         failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
         drafted = [c for c in with_prs if set_draft(run, c, True)]
         ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, with_prs)}"
-        publish_ci(run, with_prs, ci.section(rounds, max_rounds, ending))
+        publish_ci(run, b.ticket, with_prs, ci.section(rounds, max_rounds, ending))
         if failed is e:
             raise
         raise failed from e
@@ -2146,7 +2142,7 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
     elif stopped_before:
         why = draft_why or "arete could not read every check"
         ending = f"{ci.STOPPED} an earlier CI watch made this PR a draft. It stays a draft, since in this run {why}."
-        publish_ci(run, stopped_before, ci.section(rounds, max_rounds, ending))
+        publish_ci(run, b.ticket, stopped_before, ci.section(rounds, max_rounds, ending))
     return last.summary()
 
 
@@ -2541,10 +2537,12 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
 
-def publish_ci(run: AgentRun, pushed: list[Checkout], ci_section: str) -> None:
+def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[Checkout], ci_section: str) -> None:
+    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
     for c in pushed:
         try:
-            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(gh.pr_body(c.pr), ci_section)))
+            kept, text = gh.split_link(gh.pr_body(c.pr), links)
+            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
         except gh.GhError as e:
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 

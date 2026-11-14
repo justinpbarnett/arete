@@ -79,11 +79,23 @@ def issue(repo: str, number: int) -> dict:
     )
 
 
+def outgoing(text: str, link: str = "") -> str:
+    text = outbound.inert(outbound.screen(text))
+    return f"{outbound.screen(link)}\n\n{text}" if link else text
+
+
+def split_link(body: str, links) -> tuple[str, str]:
+    first, _, rest = body.partition("\n")
+    if first and first in links:
+        return first, rest.lstrip("\n")
+    return "", body
+
+
 def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
-    args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
+    args = ["issue", "create", "--repo", repo, "--title", outgoing(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
-    url = gh(args, input=outbound.screen(body)).strip().splitlines()[-1]
+    url = gh(args, input=outgoing(body)).strip().splitlines()[-1]
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
@@ -92,13 +104,13 @@ def issue_url(repo: str, number: int | str) -> str:
 
 
 def issue_comment(repo: str, number: int, body: str) -> None:
-    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=outbound.screen(body))
+    gh(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
 def issue_close(repo: str, number: int, comment: str = "") -> None:
     args = ["issue", "close", str(number), "--repo", repo]
     if comment:
-        args += ["--comment", outbound.screen(comment)]
+        args += ["--comment", outgoing(comment)]
     gh(args)
 
 
@@ -122,7 +134,7 @@ def issue_state(repo: str, number: int) -> str:
 
 
 def issue_edit_body(repo: str, number: int, body: str) -> None:
-    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outbound.screen(body))
+    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
 def issue_reopen(repo: str, number: int) -> None:
@@ -130,14 +142,14 @@ def issue_reopen(repo: str, number: int) -> None:
 
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
-              draft: bool = False, cwd=None) -> str:
-    args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outbound.screen(title),
+              draft: bool = False, cwd=None, link: str = "") -> str:
+    args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outgoing(title),
             "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
     if draft:
         args.append("--draft")
-    return gh(args, cwd=cwd, input=outbound.screen(body)).strip().splitlines()[-1]
+    return gh(args, cwd=cwd, input=outgoing(body, link)).strip().splitlines()[-1]
 
 
 def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> list[dict]:
@@ -167,17 +179,17 @@ def pr_diff(url: str) -> str:
     return gh(["pr", "diff", url])
 
 
-def pr_edit_body(url: str, body: str) -> None:
-    gh(["pr", "edit", url, "--body-file", "-"], input=outbound.screen(body))
+def pr_edit_body(url: str, body: str, link: str = "") -> None:
+    gh(["pr", "edit", url, "--body-file", "-"], input=outgoing(body, link))
 
 
 def pr_comment(url: str, body: str) -> None:
-    gh(["pr", "comment", url, "--body-file", "-"], input=marked(outbound.screen(body)))
+    gh(["pr", "comment", url, "--body-file", "-"], input=marked(outgoing(body)))
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
     gh(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
-        "--input", "-"], input=json.dumps({"body": marked(outbound.screen(body))}))
+        "--input", "-"], input=json.dumps({"body": marked(outgoing(body))}))
 
 
 def api_list(path: str) -> list[dict]:

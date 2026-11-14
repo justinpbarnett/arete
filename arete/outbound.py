@@ -142,3 +142,75 @@ def screen(text: str) -> str:
     text = ORIGIN.sub(screen_origin, text)
     text = BARE_PRIVATE.sub(screen_bare, text)
     return HOME_PATH.sub("~", registered(text))
+
+
+FENCE_LINE = re.compile(r"[ \t]*(`{3,}(?=[^`\n]*$)|~{3,})", re.MULTILINE)
+FENCE_END = r"[ \t]*{mark}{{{size},}}[ \t]*$"
+TICKS = re.compile(r"`+")
+REFERENCE = r"(?:https?://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|[\w.-]+/[\w.-]+#\d+|#\d+)(?![\w-])"
+CLOSING = re.compile(r"(?<![\w-])((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*)(" + REFERENCE + ")", re.IGNORECASE)
+MENTION = re.compile(r"(?<![\w/])@[A-Za-z0-9](?:[\w./-]*\w)?")
+
+
+def split_fences(text: str) -> list[tuple[bool, str]]:
+    parts: list[tuple[bool, str]] = []
+    lines = text.splitlines(keepends=True)
+    prose: list[str] = []
+    i = 0
+    while i < len(lines):
+        opening = FENCE_LINE.match(lines[i])
+        if not opening:
+            prose.append(lines[i])
+            i += 1
+            continue
+        if prose:
+            parts.append((False, "".join(prose)))
+            prose = []
+        mark = opening.group(1)
+        closing = re.compile(FENCE_END.format(mark=re.escape(mark[0]), size=len(mark)))
+        j = i + 1
+        while j < len(lines) and not closing.match(lines[j]):
+            j += 1
+        parts.append((True, "".join(lines[i:j + 1])))
+        i = j + 1
+    if prose:
+        parts.append((False, "".join(prose)))
+    return parts
+
+
+def split_spans(text: str) -> tuple[list[tuple[bool, str]], set[int]]:
+    runs = list(TICKS.finditer(text))
+    parts: list[tuple[bool, str]] = []
+    unmatched: set[int] = set()
+    at = 0
+    i = 0
+    while i < len(runs):
+        size = len(runs[i].group())
+        j = next((k for k in range(i + 1, len(runs)) if len(runs[k].group()) == size), None)
+        if j is None:
+            unmatched.add(size)
+            i += 1
+            continue
+        parts.append((False, text[at:runs[i].start()]))
+        parts.append((True, text[runs[i].start():runs[j].end()]))
+        at = runs[j].end()
+        i = j + 1
+    parts.append((False, text[at:]))
+    return parts, unmatched
+
+
+def inert_prose(text: str) -> str:
+    parts, unmatched = split_spans(text)
+    tick = "`" * next(n for n in range(1, len(unmatched) + 2) if n not in unmatched)
+
+    def wrap(found: re.Match) -> str:
+        return f"{tick}{found.group()}{tick}"
+
+    def close(found: re.Match) -> str:
+        return f"{found.group(1)}{tick}{found.group(2)}{tick}"
+
+    return "".join(part if code else MENTION.sub(wrap, CLOSING.sub(close, part)) for code, part in parts)
+
+
+def inert(text: str) -> str:
+    return "".join(part if code else inert_prose(part) for code, part in split_fences(text))

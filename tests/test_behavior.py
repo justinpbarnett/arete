@@ -2334,7 +2334,7 @@ class PushedPrDraftTests(unittest.TestCase):
                                     from_base=False, committed_lines=0, staged=pipeline.Staged(),
                                     push=lambda branch, message: None)
         with mock.patch.multiple(pipeline, evidence_images=lambda *a, **k: {}, report_body=lambda *a, **k: "report",
-                                 synced_pr_body=lambda run, url, body, t, left: body,
+                                 synced_pr_body=lambda run, url, body, t, left: ("", body),
                                  answer_feedback=lambda *a, **k: None):
             out = flows.pr(SimpleNamespace(ctx=job), str(wt))
             stored = {k: v for k, v in out.data.items() if k not in ("found", "drafted", "ci_stopped")}
@@ -2670,6 +2670,137 @@ result(counts=counts, before=before, summary=last["summary"], prompt=prompt, las
         self.assertGreater(found["kept"], 0)
         self.assertLessEqual(found["size"], 100)
         self.assertEqual(found["last"], "Reply 6.")
+
+
+FAKE_GH = '''#!{python}
+import json, os, sys
+argv = sys.argv[1:]
+stdin = ""
+if any(a in ("--body-file", "--input") and i + 1 < len(argv) and argv[i + 1] == "-" for i, a in enumerate(argv)):
+    stdin = sys.stdin.read()
+with open(os.environ["GH_LOG"], "a") as log:
+    log.write(json.dumps({{"args": argv, "input": stdin}}) + "\\n")
+last = os.environ["GH_LOG"] + ".body"
+head = argv[:2]
+if head in (["pr", "create"], ["pr", "edit"]):
+    open(last, "w").write(stdin)
+if head == ["issue", "view"]:
+    print(json.dumps({{"number": 5, "title": "Add kumquat", "body": "Add kumquat to the fixture notes",
+                      "labels": [{{"name": "agent"}}], "state": "OPEN", "author": {{"login": "fixture"}},
+                      "comments": [], "url": "https://github.com/fixture/repo/issues/5",
+                      "updatedAt": "2026-01-01T00:00:00Z"}}))
+elif head == ["pr", "create"]:
+    print("https://github.com/fixture/repo/pull/7")
+elif head == ["issue", "create"]:
+    print("https://github.com/fixture/repo/issues/9")
+elif head == ["pr", "view"]:
+    body = open(last).read() if os.path.exists(last) else ""
+    print(json.dumps({{"body": body, "isDraft": False, "headRefOid": "0" * 40, "mergeStateStatus": "BLOCKED",
+                      "mergeable": "MERGEABLE", "number": 7, "url": "https://github.com/fixture/repo/pull/7",
+                      "state": "OPEN", "headRefName": "x", "statusCheckRollup": []}}))
+elif head == ["pr", "list"] or argv[:1] == ["api"]:
+    print("[]")
+'''
+
+
+class InertModelTextTests(unittest.TestCase):
+    MODEL = "cc @someone and @org/team. Fixes #12"
+    PLANTED = ("Closes #5\n\nresolved: fixture/repo#12\n\n`@someone Fixes #12`\n\n"
+               "```\n@someone\nFixes #12\n```\n")
+    PROBE = f"PROBE {MODEL}\n\n{PLANTED}"
+
+    def run_workflow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home", "bin"):
+                (root / folder).mkdir()
+            fake = root / "bin/gh"
+            fake.write_text(FAKE_GH.format(python=sys.executable))
+            fake.chmod(0o755)
+            log = root / "gh.log"
+            env = {k: v for k, v in os.environ.items() if k in ("LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(PATH=f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}", GH_LOG=str(log),
+                       ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = r'''
+import importlib.util, json, runpy, sys, urllib.request
+from pathlib import Path
+from arete import accounts, config, factory, gh, paths, replay, tracker
+from arete import ci as ci_module
+root, model, planted, probe = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+def forbidden(*args, **kwargs):
+    raise AssertionError("workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe_command = [sys.executable, "-V"]
+    if scratch.protected_command(probe_command) != probe_command:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+ci_module.FIRST_CHECK_SECONDS = ci_module.SETTLE_SECONDS = ci_module.POLL_SECONDS = 0
+lines = replay.sample(root / "sample", adw=True)
+paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(
+    'github = "fixture/repo"' if line == 'tracker = "local"' else line for line in lines) + "\n\n[jev]\nenabled=false\n")
+answers = root / "sample/replay"
+def rewrite(name, change):
+    file = answers / name
+    data = json.loads(file.read_text())
+    change(data)
+    file.write_text(json.dumps(data))
+rewrite("build.json", lambda d: d.update(text=model))
+rewrite("review.json", lambda d: d["structured"].update(summary=model))
+rewrite("document.json", lambda d: d["structured"].update(text=model))
+rewrite("plan.json", lambda d: d["structured"].update(plan=d["structured"]["plan"] + "\n\n" + planted))
+cfg = config.load()
+feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+try:
+    factory.main(feature, ["replay-sample", "5", "--force"])
+except SystemExit:
+    pass
+gh.pr_comment("https://github.com/fixture/repo/pull/7", probe)
+tracker.for_repo(cfg, cfg.repo("replay-sample")).comment("5", probe)
+gh.issue_create("fixture/repo", "Report", probe)
+'''
+            done = subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script,
+                                   str(root), self.MODEL, self.PLANTED, self.PROBE],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=300, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertTrue(log.exists(), done.stderr + done.stdout)
+            return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def assert_inert(self, body):
+        outside = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+        self.assertIn("`@someone`", body)
+        self.assertIn("`@org/team`", body)
+        self.assertIn("Fixes `#12`", body)
+        self.assertIsNone(re.search(r"(?<!`)@someone", outside), body)
+        self.assertIsNone(re.search(r"(?<!`)@org/team", outside), body)
+        self.assertIsNone(re.search(r"(?i)\b(fixes|closes|resolved):?\s*(#\d|fixture/repo#)", outside), body)
+        self.assertIn("Closes `#5`", body)
+        self.assertIn("resolved: `fixture/repo#12`", body)
+        self.assertIn("`@someone Fixes #12`", body)
+        self.assertIn("```\n@someone\nFixes #12\n```", body)
+
+    def test_model_text_is_inert_in_every_github_write(self):
+        calls = self.run_workflow()
+
+        def kind(*head):
+            return [c["input"] for c in calls if c["args"][:len(head)] == list(head)]
+
+        created = kind("pr", "create")
+        self.assertEqual(len(created), 1, calls)
+        self.assertEqual(created[0].split("\n")[0], "Closes #5")
+        self.assertEqual(created[0].count("Closes #5"), 1)
+        self.assert_inert(created[0].split("\n", 1)[1])
+        comment = next(b for b in kind("pr", "comment") if "PROBE" in b)
+        self.assert_inert(comment)
+        self.assertTrue(comment.endswith("<!-- arete -->"))
+        self.assert_inert(next(b for b in kind("issue", "comment") if "PROBE" in b))
+        self.assert_inert(next(b for b in kind("issue", "create") if "PROBE" in b))
+        self.assertTrue(any("PRs for this ticket" in b and "@" not in b for b in kind("issue", "comment")), calls)
 
 
 if __name__ == "__main__":
