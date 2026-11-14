@@ -202,6 +202,7 @@ Its sandbox and the `arete codex-guard` PreToolUse hook keep the promises claude
 | A read only step writes nothing | no write tools | A `read_only` permission profile: no file writes and no network. |
 | A build step writes only its worktree | write tools in the worktree | A `workspace_write` profile: the step's folder, its extra folders, `/tmp` and `$TMPDIR`, and no network. |
 | Secret files stay out | the guard hook | The profile denies every guard secret name pattern, including `.env.*` and `id_rsa*`, and credential directories recursively across the filesystem, including skipped dependency folders and arbitrary depths. It also excludes `CODEX_HOME`, both the active and original arete configuration directories, Claude's and Pi's private directories and any additional known secret paths. Protection does not depend on file discovery or a command naming a secret. Matching example and template files are conservatively excluded too. The hook also refuses commands naming secrets and patches targeting them. |
+| Browser file uploads | The `arete upload-guard` hook allows `browser_file_upload` only for files inside the run's evidence or browser folder, never a secret file, and denies on any error | The tool is withheld and the hook refuses it |
 | The guard's judge | `arete guard` with JEV | The same JEV judge, run by the hook. |
 | A timeout stops the step | SIGTERM, then SIGKILL after 30 s | The same. |
 

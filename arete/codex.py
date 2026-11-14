@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import accounts, claude, config, environment, guard, paths, util
+from . import accounts, claude, config, environment, guard, paths, uploads, util
 from . import scratch as verification_scratch
 from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
 from .pi import SCHEMA_RULE
@@ -769,6 +769,8 @@ def reads_git(sub: str, args: list[str]) -> bool:
 
 def guard_reason(payload: dict, judge: bool, rules: list[str]) -> str:
     tool = str(payload.get("tool_name") or "").rsplit(".", 1)[-1]
+    if tool.endswith(uploads.NAME):
+        return uploads.CODEX_REFUSAL
     args = payload.get("tool_input") or {}
     if isinstance(args, str):
         try:
