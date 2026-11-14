@@ -552,7 +552,7 @@ class BudgetTests(Isolated):
 
         script = pipeline.Script("feature", drive)
         with patch.object(config, "load", return_value=self.cfg), patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.005)), \
+                patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.05)), \
                 patch.object(pipeline.runner, "run", side_effect=transport):
             self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
         row = state.ticket_runs(self.repo.name, self.ticket, whole=True)[0]
