@@ -39,7 +39,20 @@ def auth_token() -> str:
     return res.stdout.strip() if res.returncode == 0 else ""
 
 
+class Outgoing(str):
+    pass
+
+
+def unscreened_text(args: list[str], input: str | None) -> bool:
+    if input is not None and not isinstance(input, Outgoing):
+        return True
+    return any(flag in ("--body", "--comment") and not isinstance(value, Outgoing)
+               for flag, value in itertools.pairwise(args))
+
+
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None) -> str:
+    if unscreened_text(args, input):
+        raise TypeError("text sent to GitHub must come from gh.outgoing")
     res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input)
     if res.returncode != 0:
         command = " ".join(itertools.takewhile(lambda arg: not arg.startswith("-"), args))
@@ -79,9 +92,11 @@ def issue(repo: str, number: int) -> dict:
     )
 
 
-def outgoing(text: str, link: str = "") -> str:
+def outgoing(text: str, link: str = "", mark: bool = False) -> Outgoing:
     text = outbound.inert(outbound.screen(text))
-    return f"{outbound.screen(link)}\n\n{text}" if link else text
+    if link:
+        text = f"{outbound.screen(link)}\n\n{text}"
+    return Outgoing(marked(text) if mark else text)
 
 
 def split_link(body: str, links) -> tuple[str, str]:
@@ -92,7 +107,7 @@ def split_link(body: str, links) -> tuple[str, str]:
 
 
 def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
-    args = ["issue", "create", "--repo", repo, "--title", outgoing(title), "--body-file", "-"]
+    args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
     url = gh(args, input=outgoing(body)).strip().splitlines()[-1]
@@ -143,7 +158,7 @@ def issue_reopen(repo: str, number: int) -> None:
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
               draft: bool = False, cwd=None, link: str = "") -> str:
-    args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outgoing(title),
+    args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outbound.screen(title),
             "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
@@ -184,12 +199,12 @@ def pr_edit_body(url: str, body: str, link: str = "") -> None:
 
 
 def pr_comment(url: str, body: str) -> None:
-    gh(["pr", "comment", url, "--body-file", "-"], input=marked(outgoing(body)))
+    gh(["pr", "comment", url, "--body-file", "-"], input=outgoing(body, mark=True))
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
     gh(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
-        "--input", "-"], input=json.dumps({"body": marked(outgoing(body))}))
+        "--input", "-"], input=Outgoing(json.dumps({"body": outgoing(body, mark=True)})))
 
 
 def api_list(path: str) -> list[dict]:

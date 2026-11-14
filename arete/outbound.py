@@ -144,73 +144,102 @@ def screen(text: str) -> str:
     return HOME_PATH.sub("~", registered(text))
 
 
-FENCE_LINE = re.compile(r"[ \t]*(`{3,}(?=[^`\n]*$)|~{3,})", re.MULTILINE)
-FENCE_END = r"[ \t]*{mark}{{{size},}}[ \t]*$"
+FENCE_OPEN = re.compile(r" {0,3}(`{3,}(?=[^`\n]*$)|~{3,})")
+HTML_START = re.compile(r" {0,3}<[A-Za-z/!]")
+BLOCK_START = re.compile(r" {0,3}(?:[-*+]|\d+[.)]|#{1,6})[ \t]")
 TICKS = re.compile(r"`+")
-REFERENCE = r"(?:https?://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|[\w.-]+/[\w.-]+#\d+|#\d+)(?![\w-])"
-CLOSING = re.compile(r"(?<![\w-])((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*)(" + REFERENCE + ")", re.IGNORECASE)
-MENTION = re.compile(r"(?<![\w/])@[A-Za-z0-9](?:[\w./-]*\w)?")
+KEPT_ELEMENT = re.compile(r"(?<!\\)<(code|pre)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+REFERENCE = (r"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|[\w.-]+/[\w.-]+#\d+"
+             r"|GH-\d+|#\d+)(?![\w-])")
+EXPOSED = re.compile(r"(?P<closing>(?<![\w-])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?!\w)[\s:*_~]*)"
+                     r"(?P<reference>" + REFERENCE + r")"
+                     r"|(?P<url>(?:https?://|(?<!\w)www\.)[^\s<>]+)"
+                     r"|(?P<mention>(?<!\w)@[A-Za-z0-9](?:[\w./-]*\w)?)", re.IGNORECASE)
 
 
-def split_fences(text: str) -> list[tuple[bool, str]]:
-    parts: list[tuple[bool, str]] = []
-    lines = text.splitlines(keepends=True)
-    prose: list[str] = []
-    i = 0
-    while i < len(lines):
-        opening = FENCE_LINE.match(lines[i])
-        if not opening:
-            prose.append(lines[i])
-            i += 1
-            continue
-        if prose:
-            parts.append((False, "".join(prose)))
-            prose = []
-        mark = opening.group(1)
-        closing = re.compile(FENCE_END.format(mark=re.escape(mark[0]), size=len(mark)))
-        j = i + 1
-        while j < len(lines) and not closing.match(lines[j]):
-            j += 1
-        parts.append((True, "".join(lines[i:j + 1])))
-        i = j + 1
-    if prose:
-        parts.append((False, "".join(prose)))
-    return parts
-
-
-def split_spans(text: str) -> tuple[list[tuple[bool, str]], set[int]]:
-    runs = list(TICKS.finditer(text))
-    parts: list[tuple[bool, str]] = []
-    unmatched: set[int] = set()
-    at = 0
-    i = 0
-    while i < len(runs):
-        size = len(runs[i].group())
-        j = next((k for k in range(i + 1, len(runs)) if len(runs[k].group()) == size), None)
-        if j is None:
-            unmatched.add(size)
-            i += 1
-            continue
-        parts.append((False, text[at:runs[i].start()]))
-        parts.append((True, text[runs[i].start():runs[j].end()]))
-        at = runs[j].end()
-        i = j + 1
-    parts.append((False, text[at:]))
-    return parts, unmatched
+def expose(found: re.Match) -> str:
+    if found.group("url"):
+        return found.group()
+    if found.group("mention"):
+        gap = " " if found.string[found.start() - 1:found.start()] == "\\" else ""
+        return f"{gap}<code>{found.group()}</code>"
+    return f"{found.group('closing')}<code>{found.group('reference')}</code>"
 
 
 def inert_prose(text: str) -> str:
-    parts, unmatched = split_spans(text)
-    tick = "`" * next(n for n in range(1, len(unmatched) + 2) if n not in unmatched)
+    parts = []
+    at = 0
+    for kept in KEPT_ELEMENT.finditer(text):
+        parts.append(EXPOSED.sub(expose, text[at:kept.start()]))
+        parts.append(kept.group())
+        at = kept.end()
+    parts.append(EXPOSED.sub(expose, text[at:]))
+    return "".join(parts)
 
-    def wrap(found: re.Match) -> str:
-        return f"{tick}{found.group()}{tick}"
 
-    def close(found: re.Match) -> str:
-        return f"{found.group(1)}{tick}{found.group(2)}{tick}"
+def span_end(runs: list[re.Match], i: int, size: int) -> int | None:
+    return next((k for k in range(i + 1, len(runs)) if runs[k].end() - runs[k].start() == size), None)
 
-    return "".join(part if code else MENTION.sub(wrap, CLOSING.sub(close, part)) for code, part in parts)
+
+def inert_markdown(text: str) -> str:
+    runs = list(TICKS.finditer(text))
+    out = []
+    at = 0
+    i = 0
+    while i < len(runs):
+        start, end = runs[i].span()
+        before = text[:start]
+        if (len(before) - len(before.rstrip("\\"))) % 2:
+            start += 1
+        closer = span_end(runs, i, end - start) if end > start else None
+        if closer is None:
+            i += 1
+            continue
+        out.append(inert_prose(text[at:start]))
+        out.append(text[start:runs[closer].end()])
+        at = runs[closer].end()
+        i = closer + 1
+    out.append(inert_prose(text[at:]))
+    return "".join(out)
 
 
 def inert(text: str) -> str:
-    return "".join(part if code else inert_prose(part) for code, part in split_fences(text))
+    out: list[str] = []
+    block: list[str] = []
+    html = False
+
+    def flush() -> None:
+        if block:
+            joined = "".join(block)
+            out.append(inert_prose(joined) if html else inert_markdown(joined))
+            block.clear()
+
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        opening = None if html else FENCE_OPEN.match(line)
+        if not line.strip():
+            flush()
+            out.append(line)
+            html = False
+        elif opening:
+            flush()
+            mark = opening.group(1)
+            closing = re.compile(rf" {{0,3}}{re.escape(mark[0])}{{{len(mark)},}}[ \t]*$")
+            j = i + 1
+            while j < len(lines) and not closing.match(lines[j].rstrip("\r\n")):
+                j += 1
+            out.append("".join(lines[i:j + 1]))
+            i = j
+        elif not html and HTML_START.match(line):
+            flush()
+            html = True
+            block.append(line)
+        else:
+            if not html and BLOCK_START.match(line):
+                flush()
+            block.append(line)
+        i += 1
+    flush()
+    return "".join(out)

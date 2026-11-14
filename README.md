@@ -1159,12 +1159,14 @@ Public links such as `https://github.com/o/r/pull/1` and the local tracker are n
 
 Every GitHub write also makes the text inert, so model text can neither notify people nor close issues:
 
-- `@user` and `@org/team` go into a code span, so nobody is notified. An email address or a URL path with an `@` is left alone;
-- the reference after a closing keyword (close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved, in any case, with or without a colon), whether `#N`, `owner/repo#N` or an issue URL, goes into a code span, so it neither links nor closes. A plain `#N` with no keyword stays as it is;
-- code spans and fenced code blocks stay as they are;
-- arete's own `Closes #N` or `Part of #N` line is passed apart from the text and stays live.
+- `@user` and `@org/team` go into `<code>…</code>`, so nobody is notified. An email address and a URL stay as they are;
+- the reference after a closing keyword (close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved, in any case, with or without a colon), whether `#N`, `owner/repo#N`, `GH-N` or an issue URL, goes into `<code>…</code>`, so it neither links nor closes. A plain `#N` with no keyword stays as it is;
+- backtick spans, fenced code blocks and existing `<code>` or `<pre>` elements stay as they are;
+- arete's own `Closes #N` or `Part of #N` line is passed apart from the text and stays live;
+- a PR body that arete reads back and writes again passes the same step whole, so a mention or closing keyword a person typed into it goes inert too; its first line stays live only when it is the ticket's own link line;
+- `gh.gh` refuses text that did not pass `gh.outgoing`.
 
-Jira comments get the private string screen only.
+Titles get the private string screen only. Commit messages and Jira comments are not changed.
 
 ### Compare writers
 

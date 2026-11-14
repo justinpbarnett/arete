@@ -19,7 +19,7 @@ import urllib.error
 from unittest import mock
 
 import arete
-from arete import config, control, devices, gh, paths, pipeline, sessions, state, util, verify
+from arete import config, control, devices, gh, outbound, paths, pipeline, sessions, state, util, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -3017,15 +3017,15 @@ gh.issue_create("fixture/repo", "Report", probe)
             return [json.loads(line) for line in log.read_text().splitlines()]
 
     def assert_inert(self, body):
-        outside = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
-        self.assertIn("`@someone`", body)
-        self.assertIn("`@org/team`", body)
-        self.assertIn("Fixes `#12`", body)
-        self.assertIsNone(re.search(r"(?<!`)@someone", outside), body)
-        self.assertIsNone(re.search(r"(?<!`)@org/team", outside), body)
+        outside = re.sub(r"```.*?```|`[^`\n]*`|<code>.*?</code>", "", body, flags=re.DOTALL)
+        self.assertIn("<code>@someone</code>", body)
+        self.assertIn("<code>@org/team</code>", body)
+        self.assertIn("Fixes <code>#12</code>", body)
+        self.assertNotIn("@someone", outside, body)
+        self.assertNotIn("@org/team", outside, body)
         self.assertIsNone(re.search(r"(?i)\b(fixes|closes|resolved):?\s*(#\d|fixture/repo#)", outside), body)
-        self.assertIn("Closes `#5`", body)
-        self.assertIn("resolved: `fixture/repo#12`", body)
+        self.assertIn("Closes <code>#5</code>", body)
+        self.assertIn("resolved: <code>fixture/repo#12</code>", body)
         self.assertIn("`@someone Fixes #12`", body)
         self.assertIn("```\n@someone\nFixes #12\n```", body)
 
@@ -3046,6 +3046,44 @@ gh.issue_create("fixture/repo", "Report", probe)
         self.assert_inert(next(b for b in kind("issue", "comment") if "PROBE" in b))
         self.assert_inert(next(b for b in kind("issue", "create") if "PROBE" in b))
         self.assertTrue(any("PRs for this ticket" in b and "@" not in b for b in kind("issue", "comment")), calls)
+        for edited in kind("pr", "edit"):
+            self.assertEqual(edited.split("\n")[0], "Closes #5")
+            self.assertNotIn("<code><code>", edited)
+
+    def test_inert_table(self):
+        table = [
+            ("cc @someone and @org/team.", "cc <code>@someone</code> and <code>@org/team</code>."),
+            ("Fixes #12", "Fixes <code>#12</code>"),
+            ("fixes: #12", "fixes: <code>#12</code>"),
+            ("CLOSED fixture/repo#12", "CLOSED <code>fixture/repo#12</code>"),
+            ("Resolve https://github.com/o/r/issues/12", "Resolve <code>https://github.com/o/r/issues/12</code>"),
+            ("**Fixes** #12", "**Fixes** <code>#12</code>"),
+            ("resolved GH-12", "resolved <code>GH-12</code>"),
+            ("example.com/@someone", "example.com/<code>@someone</code>"),
+            ("\\@someone", "\\ <code>@someone</code>"),
+            ("a ` stray\n\n@someone", "a ` stray\n\n<code>@someone</code>"),
+            ("- one ` tick\n- @someone ` end", "- one ` tick\n- <code>@someone</code> ` end"),
+            ("`a\\` @someone `b`", "`a\\` <code>@someone</code> `b`"),
+            ("<summary>ping `@someone`</summary>", "<summary>ping `<code>@someone</code>`</summary>"),
+            ("<details>\n```\n@someone\n```\n</details>", "<details>\n```\n<code>@someone</code>\n```\n</details>"),
+        ]
+        unchanged = ["see #12", "prefixes #12", "a@b.co", "https://example.com/@someone/post",
+                     "`@someone Fixes #12`", "```\n@someone\nFixes #12\n```", "~~~\n@someone\nFixes #12\n~~~",
+                     "<code>@someone</code>", "<pre>Fixes #12</pre>",
+                     "<details><summary>Plan</summary>\n\n```\n@someone\n```\n\n</details>"]
+        table += [(text, text) for text in unchanged]
+        for text, expected in table:
+            with self.subTest(text=text):
+                self.assertEqual(outbound.inert(text), expected)
+                self.assertEqual(outbound.inert(expected), expected)
+
+    def test_gh_refuses_text_that_skipped_outgoing(self):
+        with mock.patch.object(util, "sh_with_network", side_effect=AssertionError("reached")):
+            with self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                gh.gh(["issue", "comment", "5", "--body-file", "-"], input="@someone")
+            with self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                gh.gh(["issue", "close", "5", "--comment", "@someone"])
+        self.assertTrue(gh.outgoing("x", "Closes #5").startswith("Closes #5\n\n"))
 
 
 if __name__ == "__main__":
