@@ -11,9 +11,10 @@ from . import outbound, paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
                "classify", "loop", "session", "research", "research_plan", "research_search",
-               "explain", "document")
+               "research_synthesis", "explain", "document")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
-                   "research": "opus", "research_plan": "opus", "research_search": "sonnet", "explain": "haiku"}
+                   "research": "opus", "research_plan": "opus", "research_search": "sonnet",
+                   "research_synthesis": "opus", "explain": "haiku"}
 STEP_ALIASES = {"implement": "build"}
 INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify"}
 STEP_ROLES = (*MODEL_ROLES, *INHERITS)
@@ -233,6 +234,7 @@ class Config:
     mcp: dict[str, dict] = field(default_factory=dict)
     research_planner: bool = False
     research_search: bool = False
+    research_synthesis: bool = False
     research_search_workers: int = 3
     research_search_share: float = 0.6
     ask: AskConfig = field(default_factory=AskConfig)
@@ -501,7 +503,7 @@ def chat_table(data) -> ChatConfig:
 
 def research_table(data) -> dict:
     table = table_of(data, "research")
-    keys = ("planner", "search", "search_workers", "search_share")
+    keys = ("planner", "search", "synthesis", "search_workers", "search_share")
     if bad := sorted(set(table) - set(keys)):
         raise ValueError(f"[research]: unknown key {', '.join(bad)}; use {', '.join(keys)}")
     planner = table.get("planner", False)
@@ -512,13 +514,19 @@ def research_table(data) -> dict:
         raise ValueError(f"[research] search must be true or false, not {search!r}")
     if search and not planner:
         raise ValueError("[research] search needs planner = true, because the planner sets the search tasks")
+    synthesis = table.get("synthesis", False)
+    if type(synthesis) is not bool:
+        raise ValueError(f"[research] synthesis must be true or false, not {synthesis!r}")
+    if synthesis and not search:
+        raise ValueError("[research] synthesis needs search = true, because the collator writes from the search "
+                         "workers' evidence")
     workers = table.get("search_workers", Config.research_search_workers)
     if type(workers) is not int or not 1 <= workers <= 8:
         raise ValueError(f"[research] search_workers must be a whole number from 1 to 8, not {workers!r}")
     share = table.get("search_share", Config.research_search_share)
     if type(share) not in (int, float) or not 0 < share < 1:
         raise ValueError(f"[research] search_share must be a number above 0 and under 1, not {share!r}")
-    return {"planner": planner, "search": search, "search_workers": workers, "search_share": float(share)}
+    return {"planner": planner, "search": search, "synthesis": synthesis, "search_workers": workers, "search_share": float(share)}
 
 
 def oncall_source(entry, repos: list[Repo]) -> OncallSource:
@@ -772,6 +780,7 @@ def load(path: Path | None = None) -> Config:
     research = research_table(data.get("research") or {})
     cfg.research_planner = research["planner"]
     cfg.research_search = research["search"]
+    cfg.research_synthesis = research["synthesis"]
     cfg.research_search_workers = research["search_workers"]
     cfg.research_search_share = research["search_share"]
     cfg.ask = ask_table(data.get("ask") or {})

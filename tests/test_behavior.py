@@ -874,6 +874,270 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["budget"]["parents"], [])
 
 
+class StagedResearchSynthesisTests(unittest.TestCase):
+    SCRIPT = r'''
+import json, os, sys, time
+from pathlib import Path
+from arete import config, paths, research, runner, steps
+root = Path(sys.argv[1])
+replay = root / "replay"
+paths.ensure_dirs()
+calls = []
+real = runner.run
+def spy(*args, **kwargs):
+    calls.append([kwargs["trace"][1], list(kwargs.get("tools") or [])])
+    return real(*args, **kwargs)
+runner.run = spy
+def put(name, structured, cost=0):
+    (replay / f"{name}.json").write_text(json.dumps({"structured": structured, "cost_usd": cost}))
+def source(url, claim):
+    return {"question": "q", "url": url, "title": "Page " + url[-1], "published": "2025-01-02", "event_date": "",
+            "passage": claim, "uncertainty": "none"}
+def found(*sources):
+    return {"sources": list(sources), "notes": ""}
+def task(goal):
+    return {"goal": goal, "queries": ["general terms"], "max_sources": 3}
+def seed(ref, cost=0, search=True):
+    put(f"research-{ref}-plan", {"needs_search": True, "covered_by": [], "questions": ["What is the limit?"],
+        "tasks": [task("one"), task("two"), task("three")], "source_criteria": ["primary"],
+        "claims": ["The limit is known"]})
+    put(f"research-{ref}-task-1-search", found(source("https://example.org/a", "limit is 10"),
+                                              source("https://example.net/b", "limit is 20")), cost)
+    put(f"research-{ref}-task-2-search", found(), cost)
+    put(f"research-{ref}-task-3-search", found(source("https://example.com/c", "limit is documented")), cost)
+def answer(**kw):
+    base = {"summary": "Short.", "name": "", "answer": "The limit is disputed [S1].", "conclusions": [],
+            "inferences": [], "contradictions": [], "gaps": [], "searches": []}
+    return {**base, **kw}
+def good(**kw):
+    return answer(**{"conclusions": [{"claim": "Documented", "sources": ["S3"], "critical": True}], **kw})
+def ask(goal):
+    return {"goal": goal, "queries": ["more general terms"], "max_sources": 2}
+def drive(ref, run_id, cfg):
+    os.environ["ARETE_RUN_ID"] = run_id
+    values = {"ref": ref, "title": "Invented", "ticket": "Find the limit.", "related": "none", "repos": "none"}
+    start = len(calls)
+    res, paid = research.staged(cfg, ref, values, research.filing(None, ""), research.REPORTS_DIR, [], [],
+                                time.monotonic(), False)
+    evidence = research.research_search.evidence_file(ref)
+    return {"ok": res.ok, "error": res.error, "structured": res.structured, "paid": paid,
+            "calls": calls[start:], "evidence": json.loads(evidence.read_text()) if evidence.exists() else {}}
+cfg = config.load()
+out = {}
+seed("A")
+put("research-A-synthesis", good(answer="The limit is 10 [S1]; see [the note](\f//outside.example/).",
+                                 conclusions=[{"claim": "Bad", "sources": ["S9"], "critical": True}]))
+put("research-A-synthesis2", good(contradictions=[{"issue": "Limit differs", "sources": ["S1", "S2"]}],
+                                  searches=[ask("resolve")]))
+put("research-A-task-4-search", found(source("https://example.org/a/?utm_source=x", "limit is 10 again"),
+                                      source("https://example.org/d", "limit is 15")))
+put("research-A-gap-1-synthesis", good(answer="Resolved [S4]. Cited [S1].", conclusions=[
+    {"claim": "Found", "sources": ["S3", "S4"], "critical": True}],
+    contradictions=[{"issue": "Limit differs", "sources": ["S1", "S2"]}]))
+out["a"] = drive("A", "run-a", cfg)
+seed("B")
+for n in ("synthesis", "gap-1-synthesis", "gap-2-synthesis"):
+    put(f"research-B-{n}", good(searches=[ask(f"more {n}")]))
+put("research-B-task-4-search", found(source("https://example.org/e", "e")))
+put("research-B-task-5-search", found(source("https://example.org/f", "f")))
+out["b"] = drive("B", "run-b", cfg)
+seed("C", cost=0.9)
+put("research-C-synthesis", good(searches=[ask("late")]), 1.298)
+out["c"] = drive("C", "run-c", cfg)
+seed("D")
+put("research-D-report", {"summary": "S", "report": "Plain report."})
+cfg.research_synthesis = False
+out["d"] = drive("D", "run-d", cfg)
+config.CONFIG_FILE = paths.CONFIG_FILE
+with paths.CONFIG_FILE.open("a") as f:
+    f.write('\n[steps.research_synthesis]\ntools = ["Read", "Glob", "Grep", "WebSearch"]\n')
+try:
+    steps.resolve(config.load(), None, "research_synthesis")
+    out["web"] = ""
+except ValueError as e:
+    out["web"] = str(e)
+out["home"] = os.environ.get("HOME", "")
+print("RESULT" + json.dumps(out))
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        gh_state = SOURCE / ".local/state/gh"
+        had_gh_state = gh_state.exists()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay", "home"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text(
+                '[replay]\nall = true\n\n[research]\nplanner = true\nsearch = true\nsynthesis = true\n\n'
+                '[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
+                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
+                                  capture_output=True, text=True, timeout=120, check=False)
+            line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
+            if not line:
+                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
+            cls.out = json.loads(line[len("RESULT"):])
+            cls.home = str(root / "home")
+        cls.wrote_gh_state = not had_gh_state and gh_state.exists()
+
+    def names(self, which):
+        return [c[0] for c in self.out[which]["calls"]]
+
+    def test_refused_id_is_retried_and_conflict_and_gap_round_reach_the_report(self):
+        a = self.out["a"]
+        self.assertTrue(a["ok"], a["error"])
+        report = a["structured"]["report"]
+        heads = [report.index(f"## {h}") for h in
+                 ("Supported conclusions", "Inference", "Unresolved contradictions", "Gaps", "Sources")]
+        self.assertEqual(heads, sorted(heads))
+        self.assertEqual(self.names("a").count("research A synthesis"), 2)
+        self.assertNotIn("S9", report)
+        self.assertNotIn("outside.example", report)
+        self.assertIn("Cited [S1](https://example.org/a)", report)
+        self.assertIn("answer holds '[', ']', '\\x0c'", a["evidence"]["synthesis"]["rounds"][0]["refused"][0])
+        contradictions = report[heads[2]:heads[3]]
+        self.assertIn("[S1](https://example.org/a)", contradictions)
+        self.assertIn("[S2](https://example.net/b)", contradictions)
+        self.assertIn("research A task 4 search", self.names("a"))
+        self.assertIn("[S4](https://example.org/d)", report)
+        ids = {s["url"]: s["id"] for s in a["evidence"]["sources"]}
+        self.assertEqual(ids["https://example.org/a"], "S1")
+        self.assertEqual(ids["https://example.org/d"], "S4")
+        self.assertEqual(a["evidence"]["sources"][0]["tasks"], [1, 4])
+        self.assertEqual(a["evidence"]["workers"][3]["round"], 1)
+        self.assertEqual(a["evidence"]["synthesis"]["cited"], ["S1", "S2", "S3", "S4"])
+
+    def test_collator_never_gets_web_tools(self):
+        for which in "ab":
+            synthesis = [c for c in self.out[which]["calls"] if "synthesis" in c[0]]
+            self.assertTrue(synthesis)
+            for _, tools in synthesis:
+                self.assertEqual(tools, ["Read", "Glob", "Grep"])
+            self.assertTrue(all("WebSearch" in c[1] for c in self.out[which]["calls"] if c[0].endswith("search")))
+        self.assertIn("WebSearch cannot load on research_synthesis", self.out["web"])
+
+    def test_extra_requests_become_explicit_gaps(self):
+        b = self.out["b"]
+        self.assertTrue(b["ok"], b["error"])
+        self.assertIn("both extra search rounds were used", b["structured"]["report"])
+        self.assertNotIn("research B task 6 search", self.names("b"))
+        self.assertNotIn("research B gap 3 synthesis", self.names("b"))
+        c = self.out["c"]
+        self.assertTrue(c["ok"], c["error"])
+        self.assertIn("the research budget left no room for another search round", c["structured"]["report"])
+        self.assertNotIn("research C task 4 search", self.names("c"))
+
+    def test_synthesis_off_keeps_the_report_call(self):
+        d = self.out["d"]
+        self.assertTrue(d["ok"], d["error"])
+        self.assertEqual(d["structured"]["report"], "Plain report.")
+        self.assertIn("research D report", self.names("d"))
+        self.assertFalse([n for n in self.names("d") if "synthesis" in n])
+        self.assertNotIn("synthesis", d["evidence"])
+
+    def setUp(self):
+        self.known = {"S1": "https://example.org/a", "S2": "https://example.net/b"}
+
+    @staticmethod
+    def synthesis(field="answer", text="The limit is 10 [S1]."):
+        answer = {"summary": "Short.", "name": "", "answer": "The limit is 10 [S1].",
+                  "conclusions": [{"claim": "Documented", "sources": ["S1"], "critical": True}],
+                  "inferences": [{"claim": "Likely", "basis": "Stated", "sources": ["S1"], "critical": False}],
+                  "contradictions": [{"issue": "Limit differs", "sources": ["S1", "S2"]}],
+                  "gaps": [{"question": "Which limit applies?", "why": "Unstated"}],
+                  "searches": [{"goal": "Find the limit", "queries": ["limit terms"], "max_sources": 2}]}
+        for item in (answer, *(entry for key in ("conclusions", "inferences", "contradictions", "gaps", "searches")
+                               for entry in answer[key])):
+            if field in item:
+                item[field] = text
+        return answer
+
+    @staticmethod
+    def evidence(*urls, title="Vendor"):
+        return {"sources": [{"id": f"S{n}", "url": url, "title": title, "published": "2025-01-02", "event_date": ""}
+                            for n, url in enumerate(urls, 1)]}
+
+    def test_model_text_holding_link_syntax_is_refused_in_every_field(self):
+        from arete import research_synthesis as rs
+        far = "//outside.example/"
+        self.assertEqual(rs.faults(self.synthesis(), self.known), [])
+        for text in (f"See [the note](\f{far}).", f"See [the note](\v{far}).", f"See ![x](\f{far}p.png).",
+                     "See \fhttp:outside.example/ now.", f"Notes:\n\n- [ ] [r]: {far}",
+                     "Notes:\n\n- [x] [r]: http:outside.example/", f"See [x][r].\n\n> [r]: {far}",
+                     f"See [S1][r].\n\n[r]: {far}", "See \\[S1] now.", "See [S3].", "See <b>x</b>.", "Q&A here.",
+                     "Mail admin@outside.example.", "See www.outside.example now.", "See https://outside.example/.",
+                     "Write mailto:admin now.", "Write XMPP:admin now.", "Run javascript:alert now.",
+                     "Load data:text/html now.", "Line\rbreak.", "Null\x00here."):
+            for field in ("answer", "claim", "basis", "issue", "question", "why", "goal"):
+                found = rs.faults(self.synthesis(field, text), self.known)
+                self.assertTrue(found, (field, text))
+        found = rs.faults(self.synthesis("answer", f"See [the note](\f{far})."), self.known)
+        self.assertEqual(found, ["answer holds '[', ']', '\\x0c'; " + rs.PLAIN])
+
+    def test_summary_cites_no_source_because_it_is_written_raw(self):
+        from arete import research_synthesis as rs
+        self.assertTrue(rs.faults(self.synthesis("summary", "Limit 10 [S1]."), self.known))
+        self.assertTrue(rs.faults(self.synthesis("summary", "See [S1]( //outside.example/)."), self.known))
+        self.assertEqual(rs.faults(self.synthesis("summary", "Limit 10, per the vendor."), self.known), [])
+
+    def test_cites_in_lists_quotes_and_plain_punctuation_pass_and_render_inline(self):
+        from arete import research_synthesis as rs
+        text = ("Key points:\n\n- [S1]: the limit is 10\n- [S2]: the limit is 12\n\n> [S1]: dated 2025\n\n"
+                "See [S1]'s note, ([S1]), [S1](//outside.example/) and ![S2] at UTC+2:00 with **Note:** the `timeout:` "
+                "key, std::vector, 50%. The token needs the read:org and repo:status scopes, s3:GetObject and "
+                "nginx:alpine, a 9 to 1 read:write ratio, an M:N relationship, key:value pairs, a:hover, sha256:abc123, "
+                "C:/ProgramData and app:web. Raw data: 10 rows; config file: x.")
+        answer = self.synthesis("answer", text)
+        self.assertEqual(rs.faults(answer, self.known), [])
+        report, used = rs.assemble(answer, self.evidence(*self.known.values()), [])
+        self.assertEqual(used, ["S1", "S2"])
+        self.assertIn("- [S1](https://example.org/a): the limit is 10\n- [S2](https://example.net/b): the limit is 12"
+                      "\n\n> [S1](https://example.org/a): dated 2025", report)
+        self.assertIn("See [S1](https://example.org/a)'s note, ([S1](https://example.org/a)), "
+                      "[S1](https://example.org/a)(//outside.example/) and \\![S2](https://example.net/b) at", report)
+        self.assertNotRegex(report, r"(?m)^[\s>*+-]*(\[[ xX]\]\s*)?\[S\d+\]:")
+
+    def test_source_urls_are_rebuilt_percent_encoded_without_user_details(self):
+        from arete import research_synthesis as rs
+        evidence = self.evidence("https://user:pw@example.org/a|[x](//outside.example/)?q=1&r=2#f",
+                                 "https://en.wikipedia.org/wiki/Mercury_(planet)")
+        answer = self.synthesis("answer", "| Source | Limit |\n| --- | --- |\n| [S1] | 10 |\n| [S2] | 12 |")
+        report, _ = rs.assemble(answer, evidence, [])
+        self.assertIn("| [S1](https://example.org/a%7C%5Bx%5D%28//outside.example/%29?q=1&amp;r=2#f) | 10 |\n"
+                      "| [S2](https://en.wikipedia.org/wiki/Mercury%5F%28planet%29) | 12 |", report)
+        self.assertNotIn("user", report)
+        self.assertEqual(rs.written("https://example.org/a b\"'<>\\`*_\x01|()[]~"),
+                         "https://example.org/a%20b%22%27%3C%3E%5C%60%2A%5F%01%7C%28%29%5B%5D~")
+        self.assertEqual(rs.written("https://docs.python.org&commat;outside.example/library/?a=1&sol;b#&num;c"),
+                         "https://docs.python.org&amp;commat;outside.example/library/?a=1&amp;sol;b#&amp;num;c")
+
+    def test_source_titles_are_escaped_or_written_as_code(self):
+        from arete import research_synthesis as rs
+        self.assertEqual(rs.inert_text("Q&A: <b>R&D</b> *notes* | [x]"),
+                         "Q\\&A\\: \\<b\\>R\\&D\\<\\/b\\> \\*notes\\* \\| \\[x\\]")
+        self.assertEqual(rs.inert_text("Vendor [docs](https://outside.example/)"),
+                         "`Vendor [docs](https://outside.example/)`")
+        for title in ("Mail admin@outside.example", "See WWW.outside.example", "Write mailto:x", "Ask xmpp:x"):
+            self.assertEqual(rs.inert_text(title), f"`{title}`")
+        self.assertEqual(rs.inert_text("`a` www.x"), "`` `a` www.x ``")
+        self.assertEqual(rs.inert_text("Pin nginx:alpine"), "Pin nginx\\:alpine")
+        self.assertEqual(rs.inert_text("a\fb\x00 c\n"), "a b c")
+        report, _ = rs.assemble(self.synthesis(), self.evidence("https://example.org/a", title="Q&A [x]"), [])
+        self.assertIn("- [S1](https://example.org/a) Q\\&A \\[x\\]; published 2025-01-02", report)
+
+    def test_research_subprocess_keeps_gh_state_out_of_the_worktree(self):
+        self.assertEqual(self.out["home"], self.home)
+        self.assertFalse(self.wrote_gh_state)
+
+    def test_synthesis_needs_search(self):
+        with self.assertRaisesRegex(ValueError, "synthesis needs search = true"):
+            config.research_table({"planner": True, "synthesis": True})
+
+
 class ScratchLookAlikeTests(unittest.TestCase):
     PRELUDE = r'''
 import json, os, secrets, subprocess, sys, time
