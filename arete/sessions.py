@@ -82,6 +82,7 @@ class Spec:
     pr: str = ""
     turn_error: str = ""
     publish_error: str = ""
+    chat: int = 0
 
 
 class SessionStopped(Exception):
@@ -185,7 +186,8 @@ def published_baseline(repo: config.Repo) -> str:
 
 
 def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str = "", tools: list[str] | None = None,
-           repo: str = "", budget_usd: float | None = None, task: bool = False, draft_pr: bool = False) -> dict:
+           repo: str = "", budget_usd: float | None = None, task: bool = False, draft_pr: bool = False,
+           chat: int = 0) -> dict:
     prompt = prompt.strip()
     if not prompt:
         raise control.Refused("a session needs a first message")
@@ -214,14 +216,16 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     if (refusal := "" if cfg.replay.all else routing.fit_refusal(asked, target, routing.modes_for(cfg, work_repo))):
         raise control.Refused(refusal)
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
-                budget_usd, created=util.iso(), task=task, draft_pr=draft_pr)
+                budget_usd, created=util.iso(), task=task, draft_pr=draft_pr, chat=chat)
     workspace(spec, target, work_repo)
     save_spec(spec)
     record.start("session", run_id=spec.id, lock=session_lock(spec.id), pid=None, repo=spec.repo or None,
                  device=spec.device, model=name, runner=which, trigger="manual",
                  log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"), summary=util.first_line(prompt, 200),
                  branch=spec.branch or None)
-    clone = f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
+    if chat:
+        state.chat_link_session(chat, spec.id, budget_usd)
+    clone =f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
     state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
                                      f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
                                                                 for reason, withheld in off.items())
@@ -229,7 +233,8 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     proc = control.detach(["session", "exec", spec.id], SESSION_LOG)
     record.note(spec.id, pid=proc.pid)
     return {"id": spec.id, "cwd": spec.cwd, "branch": spec.branch, "model": name, "runner": which,
-            "device": spec.device, "tools": tools, "task": task}
+            "device": spec.device, "tools": tools, "task": task, "repo": spec.repo, "budget_usd": budget_usd,
+            "chat": chat}
 
 
 def send(session_id: str, text: str) -> dict:
@@ -629,6 +634,18 @@ def close(spec: Spec, status: str, summary: str) -> None:
     end_line = f"{status}: {summary}{kept} ({util.paid_note(paid)})"
     if record.settle(spec.id, status, end_line=end_line, summary=f"{summary}{kept}"[:500]):
         write_log(spec, "end", end_line)
+        if spec.chat:
+            tell_chats()
+
+
+def ended_message(link: dict) -> str:
+    run_id = link["run_id"]
+    return json.dumps({"id": run_id, "status": link["status"] or "gone", "finished": link["finished"],
+                       "pr_url": link["pr_url"] or "", "note": link["summary"] or "", "report": state.report(run_id)})
+
+
+def tell_chats() -> int:
+    return sum(state.chat_tell_session(link["run_id"], ended_message(link)) for link in state.chat_sessions_untold())
 
 
 def views(limit: int = 30, connect=state.db) -> list[dict]:
@@ -641,7 +658,8 @@ def views(limit: int = 30, connect=state.db) -> list[dict]:
                                           "cost_usd", "summary", "branch")}
                    | {"paid": paid.get(r["id"], 0), "prompt": util.first_line(spec.get("prompt", ""), 200),
                       "tools": spec.get("tools", []), "cwd": paths.short_path(spec.get("cwd", "")),
-                      "repo": spec.get("repo", ""), "task": spec.get("task", False)})
+                      "repo": spec.get("repo", ""), "task": spec.get("task", False),
+                      "chat": spec.get("chat", 0)})
     return out
 
 

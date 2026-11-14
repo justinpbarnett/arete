@@ -41,7 +41,7 @@ REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle", "expire_days")
 MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb")
-CHAT_KEYS = ("context_tokens", "summary_model")
+CHAT_KEYS = ("context_tokens", "summary_model", "max_sessions", "budget_usd")
 FACTORY_PATHS = ("classic", "adw")
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
@@ -156,6 +156,8 @@ class Retention:
 class ChatConfig:
     context_tokens: int = 40_000
     summary_model: str = "haiku"
+    max_sessions: int = 2
+    budget_usd: float = 10.0
 
 
 @dataclass
@@ -496,7 +498,13 @@ def chat_table(data) -> ChatConfig:
     model = table.get("summary_model", ChatConfig.summary_model)
     if type(model) is not str or not model.strip():
         raise ValueError(f"[chat] summary_model must be a model name, not {model!r}")
-    return ChatConfig(context_tokens=tokens, summary_model=model.strip())
+    most = table.get("max_sessions", ChatConfig.max_sessions)
+    if type(most) is not int or most < 1:
+        raise ValueError(f"[chat] max_sessions must be a whole number of at least 1, not {most!r}")
+    budget = table.get("budget_usd", ChatConfig.budget_usd)
+    if isinstance(budget, bool) or not isinstance(budget, int | float) or not math.isfinite(budget) or budget <= 0:
+        raise ValueError(f"[chat] budget_usd must be a number of dollars above 0, not {budget!r}")
+    return ChatConfig(context_tokens=tokens, summary_model=model.strip(), max_sessions=most, budget_usd=float(budget))
 
 
 def research_table(data) -> dict:

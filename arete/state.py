@@ -332,13 +332,21 @@ CREATE TABLE IF NOT EXISTS chats (
 CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
-    sender TEXT NOT NULL,          -- you | arete | tool
+    sender TEXT NOT NULL,          -- you | arete | tool | session
     text TEXT,
     cost REAL DEFAULT 0,
     paid_usd REAL,
     ts TEXT
 );
 CREATE INDEX IF NOT EXISTS chat_messages_chat ON chat_messages (chat_id, id);
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    run_id TEXT PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    budget_usd REAL,
+    linked TEXT NOT NULL,
+    told TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS chat_sessions_chat ON chat_sessions (chat_id);
 CREATE TABLE IF NOT EXISTS usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
@@ -996,6 +1004,50 @@ def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_us
                   (chat_id, sender, text, reported_cost, paid_usd, ts))
         c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",
                   (*fields.values(), ts, reported_cost, chat_id))
+
+
+CHAT_SESSION_COLUMNS = ("l.run_id, l.chat_id, l.budget_usd, l.told, r.status, r.started, r.finished, r.repo, "
+                        "r.branch, r.device, r.model, r.runner, r.summary, r.pr_url, r.lock, r.pid")
+
+
+def chat_link_session(chat_id: int, run_id: str, budget_usd: float | None) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO chat_sessions (run_id, chat_id, budget_usd, linked) VALUES (?,?,?,?)",
+                  (run_id, chat_id, budget_usd, util.iso()))
+
+
+def chat_sessions(chat_id: int | None = None, connect=db) -> list[dict]:
+    where, args = ("WHERE l.chat_id = ?", (chat_id,)) if chat_id is not None else ("", ())
+    with connect() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id {where} "
+            "ORDER BY l.linked DESC, l.rowid DESC", args)]
+
+
+def chat_of_session(run_id: str, connect=db) -> int | None:
+    with connect() as c:
+        r = c.execute("SELECT chat_id FROM chat_sessions WHERE run_id = ?", (run_id,)).fetchone()
+        return r["chat_id"] if r else None
+
+
+def chat_sessions_untold() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id "
+            "WHERE l.told = '' AND COALESCE(r.status, '') != 'running' ORDER BY l.rowid")]
+
+
+def chat_tell_session(run_id: str, text: str) -> bool:
+    ts = util.iso()
+    with db() as c:
+        row = c.execute("SELECT chat_id FROM chat_sessions WHERE run_id = ? AND told = ''", (run_id,)).fetchone()
+        if not row or not c.execute("UPDATE chat_sessions SET told = ? WHERE run_id = ? AND told = ''",
+                                    (ts, run_id)).rowcount:
+            return False
+        c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
+                  (row["chat_id"], "session", text, 0, 0, ts))
+        c.execute("UPDATE chats SET updated = ? WHERE id = ?", (ts, row["chat_id"]))
+        return True
 
 
 def chat_summarize(chat_id: int, summary: str, upto: int) -> None:
