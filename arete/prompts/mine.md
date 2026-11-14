@@ -30,7 +30,11 @@ what it already says. If the file is long, prefer sharpening an existing line ov
 
 $pending
 
-## Rejected before (do not propose again unless the evidence is new and much stronger)
+## Done before (do not propose again)
+
+$done
+
+## Rejected or skipped before (do not propose again unless the evidence is new and much stronger)
 
 $rejected
 

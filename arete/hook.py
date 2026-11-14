@@ -175,8 +175,9 @@ def rotate_events(keep_days: float) -> None:
             continue
 
 
-def read_events(since_hours: float | None = None) -> list[dict]:
-    cutoff = None
+def read_events(since_hours: float | None = None, since_ts: float | None = None,
+                until_ts: float | None = None) -> list[dict]:
+    cutoff = since_ts
     if since_hours is not None:
         cutoff = datetime.now(UTC).timestamp() - since_hours * 3600
     out = []
@@ -187,7 +188,7 @@ def read_events(since_hours: float | None = None) -> list[dict]:
             for path, mtime, _ in before:
                 if path != paths.EVENTS_FILE and cutoff is not None and mtime < cutoff:
                     continue
-                out.extend(read_event_file(path, cutoff))
+                out.extend(read_event_file(path, cutoff, until_ts))
         except FileNotFoundError:
             continue
         if [(p, i) for p, _, i in event_stats()] == [(p, i) for p, _, i in before]:
@@ -195,7 +196,7 @@ def read_events(since_hours: float | None = None) -> list[dict]:
     return out
 
 
-def read_event_file(path, cutoff) -> list[dict]:
+def read_event_file(path, cutoff, until=None) -> list[dict]:
     out = []
     with path.open() as f:
         for line in f:
@@ -205,12 +206,12 @@ def read_event_file(path, cutoff) -> list[dict]:
                 continue
             if not isinstance(ev, dict):
                 continue
-            if cutoff is not None:
+            if cutoff is not None or until is not None:
                 try:
                     t = datetime.fromisoformat(ev["ts"]).timestamp()
                 except (KeyError, ValueError, TypeError):
                     continue
-                if t < cutoff:
+                if (cutoff is not None and t < cutoff) or (until is not None and t >= until):
                     continue
             out.append(ev)
     return out

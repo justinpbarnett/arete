@@ -565,6 +565,8 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
               ("triage", "in_sprint", "ALTER TABLE triage ADD COLUMN in_sprint INTEGER DEFAULT 0"),
               ("triage", "parent", "ALTER TABLE triage ADD COLUMN parent TEXT DEFAULT ''"),
               ("feedback", "asks", "ALTER TABLE feedback ADD COLUMN asks REAL"),
+              ("feedback", "recorded", "ALTER TABLE feedback ADD COLUMN recorded TEXT"),
+              ("runs", "mined_until", "ALTER TABLE runs ADD COLUMN mined_until TEXT"),
               ("triage_approvals", "tracker", "ALTER TABLE triage_approvals ADD COLUMN tracker TEXT DEFAULT 'jira'"),
               ("triage_approvals", "sent_by", "ALTER TABLE triage_approvals ADD COLUMN sent_by TEXT DEFAULT 'triage'"),
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
@@ -1882,7 +1884,7 @@ def evals_since(since: str, connect=db) -> list[dict]:
 
 
 FEEDBACK_COLUMNS = ("pr_url", "kind", "gh_id", "repo", "issue", "body", "path", "line", "hunk", "thread", "at_once",
-                    "created", "pr_state", "status", "asks")
+                    "created", "pr_state", "status", "asks", "recorded")
 
 
 def feedback_keys(pr_url: str) -> set[tuple[str, int]]:
@@ -1896,7 +1898,7 @@ def add_feedback(rows: list[dict]) -> int:
         before = c.total_changes
         c.executemany(f"INSERT OR IGNORE INTO feedback ({', '.join(FEEDBACK_COLUMNS)}) "
                       f"VALUES ({', '.join('?' * len(FEEDBACK_COLUMNS))})",
-                      [tuple(r.get(k) for k in FEEDBACK_COLUMNS) for r in rows])
+                      [(*(r.get(k) for k in FEEDBACK_COLUMNS[:-1]), util.iso()) for r in rows])
         return c.total_changes - before
 
 
@@ -1944,10 +1946,16 @@ def settle_feedback(run_id: str, status: str) -> None:
         c.execute("UPDATE feedback SET status = ? WHERE run_id = ? AND status = 'taken'", (status, run_id))
 
 
-def feedback_since(since: str) -> list[dict]:
+def feedback_between(since: str, until: str) -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE created >= ? ORDER BY pr_url, created",
-                                           (since,))]
+        return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE COALESCE(recorded, created) >= ? "
+                                           "AND COALESCE(recorded, created) < ? ORDER BY pr_url, created",
+                                           (since, until))]
+
+
+def mined_until() -> str | None:
+    with db() as c:
+        return c.execute("SELECT MAX(mined_until) FROM runs WHERE kind = 'miner'").fetchone()[0]
 
 
 def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why: str = "", task: str = "") -> None:
