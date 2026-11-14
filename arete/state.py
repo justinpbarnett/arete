@@ -533,8 +533,10 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     last_success TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS run_purges (run_id TEXT PRIMARY KEY, reason TEXT NOT NULL, queued TEXT NOT NULL);
 """
 MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
+              ("runs", "files_purged", "ALTER TABLE runs ADD COLUMN files_purged TEXT"),
               ("queue", "attempts", "ALTER TABLE queue ADD COLUMN attempts INTEGER DEFAULT 0"),
               ("queue", "dead_at", "ALTER TABLE queue ADD COLUMN dead_at TEXT"),
               ("queue", "dead_reason", "ALTER TABLE queue ADD COLUMN dead_reason TEXT DEFAULT ''"),
@@ -982,11 +984,28 @@ SEEN_AGAIN = "seen again"
 CLOSED_AT = "COALESCE(NULLIF(closed, ''), last_seen)"
 
 
-def prune(days: float = 14, keep_days: float = 30) -> None:
+def prune(days: float = 14, keep_days: float = 30, lines_days: float = 90) -> None:
     since = util.iso(util.now() - timedelta(days=days))
+    lines_since, now = util.iso(util.now() - timedelta(days=lines_days)), util.iso()
     with db() as c:
+        c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "
+                  f"WHERE {FIRINGS} AND started < ?", (now, since))
         c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
         c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
+        eligible = c.execute(
+            "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
+            "AND status NOT IN ('running', 'pr', 'needs-info') "
+            "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
+            "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
+            "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
+            "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "
+            "(status IS NULL OR status NOT IN ('merged', 'rejected', 'skipped', 'filed')) "
+            "AND (run_id = runs.id OR instr(COALESCE(evidence, ''), runs.id) > 0)) "
+            "AND NOT EXISTS (SELECT 1 FROM runs recent WHERE recent.repo = runs.repo "
+            "AND recent.issue = runs.issue AND recent.started >= ?)", (lines_since, lines_since)).fetchall()
+        for row in eligible:
+            c.execute("INSERT OR IGNORE INTO run_purges VALUES (?, 'lines', ?)", (row["id"], now))
+            c.execute("UPDATE runs SET files_purged = ? WHERE id = ?", (now, row["id"]))
         c.execute("DELETE FROM queue WHERE dead_at < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         old = util.iso(util.now() - timedelta(days=days * 4))
@@ -1770,7 +1789,7 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
         )
 
 
-SETTLED_PROPOSALS = ("merged", "rejected", "skipped", "filed")
+RELEASING_PROPOSALS = ("rejected", "skipped", "filed")
 
 
 def pin_record(run_id: str) -> bool:
@@ -1789,11 +1808,11 @@ def record_pins(connect=db) -> set[str]:
         return {r["run_id"] for r in c.execute("SELECT run_id FROM record_pins")}
 
 
-def runs_cited_by_pending_proposals(run_ids, connect=db) -> set[str]:
-    marks = ",".join("?" * len(SETTLED_PROPOSALS))
+def runs_cited_by_kept_proposals(run_ids, connect=db) -> set[str]:
+    marks = ",".join("?" * len(RELEASING_PROPOSALS))
     with connect() as c:
         rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",
-                         SETTLED_PROPOSALS).fetchall()
+                         RELEASING_PROPOSALS).fetchall()
     return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
 
 

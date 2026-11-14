@@ -406,6 +406,9 @@ def expire_asks(cfg: config.Config) -> list[str]:
 def resume(run_id: str, step: str = "") -> dict:
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = run_of(run_id)
+        if row.get("files_purged"):
+            raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
+                                  "start the ticket again with POST /api/tasks")
         if row["status"] == "running":
             with record.dead(row) as gone:
                 if gone and (settled := record.interrupt(row)):

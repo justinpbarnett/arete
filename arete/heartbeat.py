@@ -6,7 +6,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import accounts, alerts, backup, codex, config, devices, install, paths, pi, runner, state, steps, util
+from . import accounts, alerts, backup, codex, config, devices, hook, install, paths, pi, runner, state, steps, util
 
 
 @dataclass
@@ -203,10 +203,11 @@ def check_hook() -> list[Check]:
     registered = "arete" in json.dumps(settings.get("hooks", {}))
     out = [Check("hook:registered", registered, "arete hook registered" if registered else "arete hook missing from settings")]
     if registered:
-        if not paths.EVENTS_FILE.exists():
+        files = hook.event_stats()
+        if not files:
             out.append(Check("hook:events", False, "no events logged yet", "warn"))
         else:
-            age = util.hours_awake_since(paths.EVENTS_FILE.stat().st_mtime)
+            age = util.hours_awake_since(max(m for _, m, _ in files))
             ok = age < 72
             out.append(Check("hook:events", ok, f"last event {age:.0f}h ago", "fail" if not ok else "warn"))
     return out

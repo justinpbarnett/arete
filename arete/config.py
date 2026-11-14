@@ -46,7 +46,7 @@ TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle", "expire_days", "remind_hours", "push_contact")
 MAX_ASK_EXPIRE_DAYS = 3650
-RETENTION_KEYS = ("days", "max_gb")
+RETENTION_KEYS = ("days", "max_gb", "lines_days")
 BACKUP_KEYS = ("copy_to",)
 CHAT_KEYS = ("context_tokens", "summary_model", "max_sessions", "budget_usd")
 FACTORY_PATHS = ("classic", "adw")
@@ -159,6 +159,7 @@ class AskConfig:
 class Retention:
     days: float = 30
     max_gb: float = 20
+    lines_days: float = 90
 
 
 @dataclass(frozen=True)
@@ -560,11 +561,13 @@ def retention_table(data) -> Retention:
     if bad := sorted(set(table) - set(RETENTION_KEYS)):
         raise ValueError(f"[retention]: unknown key {', '.join(bad)}; use {', '.join(RETENTION_KEYS)}")
     found = {}
-    for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb)):
+    for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb), ("lines_days", Retention.lines_days)):
         value = table.get(key, default)
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"[retention] {key} must be a number above 0, not {value!r}")
         found[key] = value
+    if found["lines_days"] < found["days"]:
+        raise ValueError("[retention] lines_days must be at least days")
     return Retention(**found)
 
 
