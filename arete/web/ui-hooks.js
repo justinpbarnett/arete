@@ -1,4 +1,5 @@
 import { sheet, toggleSheet, writable } from "./ui-keys.js";
+import { openPalette, register, pickerModes } from "./ui-palette.js";
 
 const named = { enter: "Enter", escape: "Escape", esc: "Escape", tab: "Tab", comma: ",", space: " ", plus: "+" };
 const modifiers = { cmd: "metaKey", meta: "metaKey", ctrl: "ctrlKey", alt: "altKey", shift: "shiftKey" };
@@ -162,8 +163,33 @@ function readQuery() {
   return found;
 }
 
+export function paletteFixture(mode) {
+  const picked = (row) => { root.uiPaletteResult = row.id; };
+  const sample = (id, title, group, description = "") => ({ id, title, group, description, run: picked });
+  if (mode === "registry") {
+    register("floor", [sample("sample-item", "Sample item <literal>", "Items", "<b>plain text</b>")],
+      [sample("settings-sample", "Settings sample", "Commands"), sample("display-sample", "Display sample", "Commands")]);
+    register("triage", [], [sample("triage-only", "Triage-only command", "Commands")]);
+    openPalette();
+    return;
+  }
+  if (!pickerModes[mode]) return;
+  const fixtures = {
+    steps: [sample("implement", "Implement", "Agent", "Build the change"), sample("review", "Review", "Agent"), sample("check", "Run checks", "Script")],
+    triggers: [sample("manual", "Manual", "Triggers"), sample("issue", "Issue opened", "Triggers")],
+    prompts: [sample("plan", "arete/prompts/plan.md", "This ADW"), sample("build", "arete/prompts/build.md", "This ADW", "Build the change"),
+      sample("review", "arete/prompts/review.md", "Other ADWs"), sample("loop", "loops/maintain.md", "Loops"), sample("system", "arete/system.md", "Arete")],
+    roles: [sample("builder", "Builder", "Roles"), sample("reviewer", "Reviewer", "Roles")],
+    drop: [sample("implement", "Implement", "Agent", "Compatible input"), sample("check", "Run checks", "Script")],
+    wires: [sample("review-input", "Review · change", "Inputs"), sample("check-input", "Run checks · source", "Inputs"), sample("done", "Done", "Flow")],
+    create: [sample("device", "Device", "Create", "a VM or box that runs work"), sample("connector", "Connector", "Create", "an account linked to a system")],
+  };
+  openPalette({ mode, rows: fixtures[mode], current: mode === "prompts" ? "build" : mode === "roles" ? "default" : undefined, onPick: picked });
+}
+
 export async function startHooks() {
   const query = readQuery();
+  paletteFixture(query.get("palette"));
   const jobs = [["keys", replayKeys], ["drag", replayDrag], ["wheel", replayWheel]]
     .filter(([name]) => query.has(name)).map(([name, run]) => [name, () => run(query.get(name))]);
   if (query.has("clicks")) jobs.push(["clicks", replayClicks]);

@@ -1,6 +1,7 @@
 import { signal, batch } from "./vendor-signals.js";
 import { parse } from "./ui-router.js";
 import { dismissMenu } from "./ui-menu.js";
+import { paletteKey, paletteRouteChanged } from "./ui-palette.js";
 
 export const screenKeys = [
   ["f", "floor", "Floor", "#floor"],
@@ -277,6 +278,7 @@ function editing(event) {
 
 function onKey(event) {
   if (event.isComposing || event.keyCode === 229) return;
+  if (paletteKey(event, writable(event.target))) return;
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) { event.preventDefault(); return; }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.key === "Escape" && !sheet.value && (dismissMenu() || focusedList()?.uiDismiss?.())) {
@@ -313,7 +315,7 @@ export function startKeys() {
   document.addEventListener("pointerdown", touch, true);
   document.addEventListener("click", touch, true);
   window.addEventListener("blur", () => { pending.value = ""; });
-  window.addEventListener("hashchange", () => { pending.value = ""; marks(); });
+  window.addEventListener("hashchange", () => { pending.value = ""; paletteRouteChanged(); marks(); });
   marks();
 }
 
