@@ -272,8 +272,14 @@ class AgentRun:
         if self.writes_lines:
             lines.write(self.id, event, **fields)
 
+    @contextmanager
     def waiting(self, cause: str):
-        return lines.waiting(self.id, cause) if self.writes_lines else nullcontext()
+        with ExitStack() as stack:
+            if self.budget is not None:
+                stack.enter_context(self.budget.idling(cause))
+            if self.writes_lines:
+                stack.enter_context(lines.waiting(self.id, cause))
+            yield
 
     def save(self, name: str, data) -> None:
         p = self.dir / name
