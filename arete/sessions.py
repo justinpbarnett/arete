@@ -364,7 +364,7 @@ def denied_work(spec: Spec, repo: config.Repo) -> list[str]:
             for path in diffguard.between(repo.path, parent, commit, deny=spec.deny).denied:
                 found.setdefault(path, f"{path} in {commit[:10]}")
             if vault.every():
-                patch = util.git(["diff", "--no-renames", "--text", "--src-prefix=a/", "--dst-prefix=b/", parent,
+                patch = util.git(["diff", *vault.SCAN, "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", parent,
                                   commit], repo.path)
                 for entry in vault.refusals(patch):
                     found.setdefault(entry, f"{entry} in {commit[:10]}")

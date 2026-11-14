@@ -875,7 +875,7 @@ def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> Non
     drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
-    holding = vault.held(git(["diff", "--cached", "--no-renames", "--text", "--src-prefix=a/", "--dst-prefix=b/"],
+    holding = vault.held(git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"],
                              c.wt)) if vault.every() else {}
     if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
                   if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny) or n in holding]:
@@ -1055,8 +1055,8 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
         resolving = bool(merged and c.resolved and not from_base)
         resolved = resolved_patch(c) if resolving else ""
         if vault.every():
-            whole = checkout_patch(c, [], "--text", "--cached", against)
-            diff.denied += vault.refusals(whole + (resolved_patch(c, "--text") if resolving else ""))
+            whole = checkout_patch(c, [], *vault.SCAN, "--cached", against)
+            diff.denied += vault.refusals(whole + (resolved_patch(c, *vault.SCAN) if resolving else ""))
         out += diff
         out.changed.append(c)
         out.patch += shown + resolved
@@ -2853,7 +2853,7 @@ def fixed_since(b: Build, trees: dict[str, str]) -> str:
                                         trees[c.prefix]))
         except RuntimeError:
             continue
-    return util.tail("".join(parts), MAX_FIX_DIFF_IN_PROMPT)
+    return util.tail(vault.hidden("".join(parts)), MAX_FIX_DIFF_IN_PROMPT)
 
 
 def review_problems(listed) -> list[dict]:

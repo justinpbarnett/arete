@@ -754,7 +754,7 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
         return "", f"{idea} (thrown away: touched {', '.join(outside[:5])})"
     staged = diffguard.stage(ws.wt, ws.deny, against=ws.start)
     if vault.every():
-        patch = util.git(["diff", "--cached", "--no-renames", "--text", "--src-prefix=a/", "--dst-prefix=b/",
+        patch = util.git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
                           ws.start], ws.wt)
         staged.denied += vault.refusals(patch)
     if why := staged.refusal(ws.max_diff_lines, since=ws.base):

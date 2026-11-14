@@ -13,6 +13,7 @@ SUFFIX = ".secrets"
 SHORTEST, LONGEST = 8, 4096
 REDACTED = "[redacted]"
 LOCK = "secret-store"
+SCAN = ("--no-ext-diff", "--no-textconv", "--no-color", "--text")
 
 
 def file_of(repo: str) -> Path:
@@ -39,6 +40,7 @@ def save(repo: str, found: dict[str, str]) -> None:
         target.unlink(missing_ok=True)
         return
     FOLDER.mkdir(mode=0o700, parents=True, exist_ok=True)
+    FOLDER.chmod(0o700)
     fd, temp = tempfile.mkstemp(dir=FOLDER, prefix=".", suffix=SUFFIX)
     try:
         os.fchmod(fd, 0o600)
@@ -128,7 +130,7 @@ def held(patch: str) -> dict[str, list[str]]:
         return {}
     found: dict[str, list[str]] = {}
     path, header = "", False
-    for line in patch.splitlines():
+    for line in patch.split("\n"):
         if line.startswith("diff --git "):
             header = True
             tail = line.rpartition(' "b/')

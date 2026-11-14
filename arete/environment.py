@@ -9,6 +9,9 @@ BASE = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TZ", "TMPDI
         "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "ARETE_CONFIG_DIR", "ARETE_STATE_DIR", "ARETE_LOG_DIR",
         "ARETE_WORKTREES_DIR")
 SHELL_BOOKKEEPING = ("_", "PWD", "OLDPWD", "SHLVL", "ARETE_SERVE_RESTARTED_FOR_NEW_CODE")
+LOADER_HOOKS = ("LD_", "DYLD_", "PYTHON", "GIT_", "NPM_CONFIG_", "CLAUDE_CODE_", "CODEX_")
+SHELL_HOOKS = ("BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "PERL5OPT", "RUBYOPT", "JAVA_TOOL_OPTIONS",
+               "NODE_OPTIONS", "NODE_PATH", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL")
 
 
 def passes(name: str, patterns: Iterable[str]) -> bool:
@@ -34,7 +37,8 @@ def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:
 
 
 def reserved(name: str) -> bool:
-    return passes(name, BASE) or name in SHELL_BOOKKEEPING or name.startswith("ARETE_")
+    return (passes(name, BASE) or name in SHELL_BOOKKEEPING or name in SHELL_HOOKS or name.startswith("ARETE_")
+            or name.upper().startswith(LOADER_HOOKS))
 
 
 def stored(repo: config.Repo | None) -> dict[str, str]:
