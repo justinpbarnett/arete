@@ -213,12 +213,17 @@
     <button type="button" id="console-close">Close</button>
   </div>
   <div class="console-body" id="console-body">
-    <p class="muted">Ask about runs, health, cost, settings, or arete's own code. It reads and advises. Ask it for a change and it drafts an issue on arete, which you file here or from Live. A chat on a project works in that repo's folder and knows its checks and what arete's agents learned there.</p>
+    <p class="muted">The chat is arete's orchestrator. Ask about runs, health, cost, settings, or arete's own code, and ask it for work: it starts task sessions in sandboxes, watches them, and shows each report here when the session ends. It never edits a file or pushes itself. A change to arete goes through a drafted issue, which you file here or from Live. A chat on a project starts its sessions on that repo and knows its checks and what arete's agents learned there.</p>
     <div class="field">
       <label for="chat-pick">Chat</label>
       <select id="chat-pick"></select>
     </div>
     <p id="chat-about" class="muted" hidden></p>
+    <div id="chat-sessions" class="chat-sessions" hidden>
+      <h3>Sessions of this chat</h3>
+      <ul id="chat-sessions-list"></ul>
+      <p id="chat-sessions-result" aria-live="polite" tabindex="-1" hidden></p>
+    </div>
     <div id="messages" aria-live="polite"></div>
     <p id="working" class="muted" hidden></p>
     <div id="draft" class="draft" hidden>

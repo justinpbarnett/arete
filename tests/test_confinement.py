@@ -74,6 +74,17 @@ class ProfileTests(unittest.TestCase):
                 "service": scratch.service_command(attempt_for(self.ws), "true"),
                 "agent": pi.write_confinement(self.ws, [])}
 
+    def test_the_service_profile_denies_the_browser_port_only_when_given_one(self):
+        attempt = attempt_for(self.ws)
+        given = scratch.service_command(attempt, "true", 45678)
+        self.assertIn('(deny network-outbound (remote tcp "*:45678"))', given[given.index("-p") + 1])
+        plain = scratch.service_command(attempt, "true")
+        self.assertNotIn("45678", plain[plain.index("-p") + 1])
+        for argv in (given, plain):
+            if os.access("/usr/bin/sandbox-exec", os.X_OK):
+                done = subprocess.run([*argv[:argv.index("-p") + 2], "/usr/bin/true"], capture_output=True, text=True)
+                self.assertTrue(done.returncode == 0 or "sandbox_apply" in done.stderr, done.stderr)
+
     def test_every_profile_denies_launch_routes(self):
         for name, argv in self.profiles().items():
             with self.subTest(name):
@@ -367,9 +378,9 @@ class BrowserServerTests(unittest.TestCase):
                     foreign.listen(1)
                 scratch.update_browser(self.a, port=0, loopback=False)
                 v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
-                with mock.patch.object(scratch, "service_command", side_effect=lambda a, command: command), \
+                with mock.patch.object(scratch, "service_command", side_effect=lambda a, command, port=None: command), \
                         mock.patch.object(scratch, "spawn", side_effect=idle), \
-                        mock.patch.object(verify.environment, "commands", return_value={}), \
+                        mock.patch.object(verify.environment, "started", return_value=({}, {})), \
                         verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a) as url:
                     self.assertEqual(url, f"http://localhost:{port}")
                     self.assertEqual(scratch.browser_record(self.a)["port"], port)
@@ -377,14 +388,188 @@ class BrowserServerTests(unittest.TestCase):
                     built = scratch.browser_config(self.a, self.config, [self.evidence])
                 self.assertEqual(json.loads(built)["mcpServers"]["playwright"], scratch.browser_server(self.a))
 
-    def launch(self, mcp_config, said=None):
-        picked = SimpleNamespace(candidate=SimpleNamespace(runner="codex", effort="", instructions=()))
+    def test_a_scratch_verify_server_keeps_stored_variables_and_drops_other_credentials(self):
+        self.install()
+        port = self.answering(socket.AF_INET, "127.0.0.1")
+        seen = {}
+
+        def spawned(*args, **kwargs):
+            seen.update(kwargs["env"])
+            return subprocess.Popen(["/bin/sleep", "60"], start_new_session=True, stdout=subprocess.PIPE)
+
+        v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
+        env = {"REPLAY_SECRET": "stored-value-1", "OTHER_TOKEN": "ambient-value-1", "PLAIN": "plain"}
+        real_write = verify.write_hidden
+        with mock.patch.object(scratch, "service_command", side_effect=lambda a, command, port=None: command), \
+                mock.patch.object(scratch, "spawn", side_effect=spawned), \
+                mock.patch.object(verify.environment, "started", return_value=(env, {"REPLAY_SECRET": "stored-value-1"})), \
+                mock.patch.object(verify, "write_hidden") as pumped, \
+                verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a):
+            pass
+        self.assertEqual((seen.get("REPLAY_SECRET"), seen.get("PLAIN"), "OTHER_TOKEN" in seen),
+                         ("stored-value-1", "plain", False))
+        self.assertEqual(pumped.call_args.args[2], {"stored-value-1"})
+        log = self.root / "pumped.log"
+        real_write(SimpleNamespace(stdout=[b"token stored-value-1\n"]), log, {"stored-value-1"})
+        self.assertEqual(log.read_text(), "token [redacted]\n")
+
+    def launch(self, mcp_config, said=None, which="codex", allowed=None):
+        picked = SimpleNamespace(candidate=SimpleNamespace(runner=which, effort="", instructions=()), selected=None)
         trip = SimpleNamespace(cfg=SimpleNamespace(jev=SimpleNamespace(guard=False)), repo=None, scratch=self.a,
-                               target=SimpleNamespace(remote=None), tokens=None)
-        base = {"mcp_config": mcp_config, "add_dirs": [self.evidence]}
+                               target=SimpleNamespace(remote=None), tokens=None, hard_cap=False)
+        base = {"mcp_config": mcp_config, "add_dirs": [self.evidence], **({"allowed_tools": allowed} if allowed else {})}
         with mock.patch.dict(scratch.LEASES, {self.a.selector: 0}), \
                 mock.patch.object(runner.environment, "passed", return_value=[]):
             return runner.launch_kwargs(base, picked, trip, ("r", "s"), False, [].append if said is None else said.append)
+
+    DOM = "echo '<html><head></head><body></body></html>'"
+    FATAL = "[1:1] FATAL: sandbox initialization failed: Operation not permitted"
+    SERVER = ("import http.server, sys\n"
+              "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
+              "class H(http.server.BaseHTTPRequestHandler):\n"
+              "    def do_POST(self):\n"
+              "        self.rfile.read(int(self.headers.get('Content-Length', 0)))\n"
+              "        self.send_response(200)\n"
+              "        self.send_header('Content-Length', '2')\n"
+              "        self.end_headers()\n"
+              "        self.wfile.write(b'{}')\n"
+              "    def log_message(self, *args):\n"
+              "        pass\n"
+              "print('fake server listening', flush=True)\n"
+              "http.server.HTTPServer(('127.0.0.1', port), H).serve_forever()\n")
+
+    def fake_browser(self, chrome, node=None):
+        self.install()
+        listen = verify.free_port(scratch.dashboard_ports() | {43210})
+        scratch.update_browser(self.a, listen=listen)
+        (self.root / "server.py").write_text(self.SERVER)
+        for path, body in ((self.root / "chrome", chrome),
+                           (self.node, node or f'exec "{sys.executable}" {self.root / "server.py"} "$@"')):
+            path.write_text("#!/bin/sh\n" + body + "\n")
+            path.chmod(0o755)
+        for patch in (mock.patch.object(scratch, "browser_profile", return_value=[]),
+                      mock.patch.object(browser, "CHROME", self.root / "chrome")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(scratch.stop_served, self.a)
+        return listen
+
+    def gone(self, pid):
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pid, 0)
+
+    def test_the_served_browser_profile_listens_on_one_port_and_the_plain_one_is_unchanged(self):
+        self.prepare()
+        folder = scratch.browser_folder(self.a)
+        served = scratch.browser_profile(self.a, 43210, folder, 45678)
+        text = served[served.index("-p") + 1]
+        self.assertIn('(deny network-bind network-inbound (local ip "*:*"))', text)
+        self.assertIn('(allow network-bind network-inbound (local ip "localhost:45678"))', text)
+        self.assertNotIn("network-bind", " ".join(scratch.browser_profile(self.a, 43210, folder)))
+        plain = self.build()
+        self.assertFalse(any(w.startswith(("--port", "DEBUG=")) for w in plain))
+        command = scratch.browser_command(self.a, ["--port", "45678"], 45678)
+        self.assertIn("DEBUG=pw:browser*", command)
+        self.assertEqual(command[command.index("--port") + 1], "45678")
+        if os.access("/usr/bin/sandbox-exec", os.X_OK):
+            done = subprocess.run([*served[:served.index("-p") + 2], "/usr/bin/true"], capture_output=True, text=True)
+            self.assertTrue(done.returncode == 0 or "sandbox_apply" in done.stderr, done.stderr)
+
+    def test_serving_picks_the_browser_port_before_the_app_starts_and_denies_it_to_the_service(self):
+        port = self.answering(socket.AF_INET, "127.0.0.1")
+        seen = {}
+
+        def idle(*args, **kwargs):
+            seen["at spawn"] = scratch.browser_record(self.a).get("listen")
+            return subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+
+        def service(a, command, browser_port=None):
+            seen["denied"] = browser_port
+            return command
+
+        v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
+        with mock.patch.object(scratch, "service_command", side_effect=service), \
+                mock.patch.object(scratch, "spawn", side_effect=idle), \
+                mock.patch.object(verify.environment, "started", return_value=({}, {})), \
+                verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a):
+            pass
+        listen = seen["at spawn"]
+        self.assertIsInstance(listen, int)
+        self.assertEqual(seen["denied"], listen)
+        self.assertNotEqual(listen, port)
+        self.assertNotIn(listen, scratch.dashboard_ports())
+
+    def test_a_claude_launch_gets_one_http_entry_and_the_server_stops_with_the_attempt(self):
+        listen = self.fake_browser(self.DOM)
+        first = self.launch(self.config, which="claude")
+        entry = {"type": "http", "url": f"http://127.0.0.1:{listen}/mcp"}
+        self.assertEqual(json.loads(first["mcp_config"]), {"mcpServers": {"playwright": entry}})
+        self.assertNotIn("npx", first["mcp_config"])
+        self.assertEqual(runner.described_servers(first["mcp_config"]), {"playwright": entry})
+        log = (self.run_dir / "verify-browser.log").read_text()
+        self.assertLess(log.index("<html"), log.index("fake server listening"))
+        proc = scratch.SERVED[self.a.selector].proc
+        self.assertEqual(self.launch(self.config, which="claude")["mcp_config"], first["mcp_config"])
+        self.assertIs(scratch.SERVED[self.a.selector].proc, proc)
+        scratch.stop_served(self.a)
+        self.gone(proc.pid)
+        self.assertNotIn(self.a.selector, scratch.SERVED)
+
+    def test_a_chrome_that_exits_at_once_leaves_the_verify_without_browser_tools(self):
+        counted = self.root / "chrome-runs"
+        self.fake_browser(f"echo x >> {counted}; echo '{self.FATAL}' >&2; exit 1")
+        ran = self.root / "node-ran"
+        self.node.write_text(f"#!/bin/sh\ntouch {ran}\n")
+        said = []
+        rules = ["mcp__playwright__browser_navigate", "Read"]
+        kw = self.launch(self.config, said, "claude", rules)
+        self.assertEqual(kw["mcp_config"], "")
+        self.assertEqual(kw["allowed_tools"], ["Read"])
+        self.assertIn(f"> {self.FATAL}", kw["system"])
+        self.assertIn(self.FATAL, (self.run_dir / "verify-browser.log").read_text())
+        self.assertTrue(any(self.FATAL in line for line in said))
+        self.assertFalse(ran.exists())
+        self.launch(self.config, which="claude", allowed=rules)
+        self.assertEqual(counted.read_text().count("x"), 1)
+
+    def test_a_chrome_that_sleeps_past_the_limit_is_killed_and_named(self):
+        pid = self.root / "chrome-pid"
+        self.fake_browser(f"echo $$ > {pid}; exec sleep 30")
+        with mock.patch.object(scratch, "BROWSER_PREFLIGHT_SECONDS", 1):
+            kw = self.launch(self.config, which="claude")
+        self.assertIn("did not dump about:blank within 1 seconds", kw["system"])
+        self.gone(int(pid.read_text()))
+
+    def test_a_server_that_exits_gives_its_error_line_and_drops_the_tools(self):
+        self.fake_browser(self.DOM, "echo 'Error: listen EADDRINUSE fake' >&2; exit 3")
+        kw = self.launch(self.config, which="claude", allowed=["mcp__playwright__browser_snapshot"])
+        self.assertEqual(kw["mcp_config"], "")
+        self.assertEqual(kw["allowed_tools"], [])
+        self.assertIn("the browser server exited 3: Error: listen EADDRINUSE fake", kw["system"])
+
+    def test_a_loopback_less_verify_starts_nothing(self):
+        self.fake_browser(self.DOM)
+        scratch.update_browser(self.a, loopback=False)
+        with mock.patch.object(scratch, "spawn", side_effect=AssertionError("started")):
+            kw = self.launch(self.config, which="claude")
+        self.assertIn("not a loopback address", kw["system"])
+        self.assertEqual(kw["mcp_config"], "")
+
+    def test_a_config_that_is_not_the_verifys_own_comes_back_unchanged(self):
+        other = json.dumps({"mcpServers": {"playwright": {"command": "npx", "args": ["-y", "evil"]}}})
+        with mock.patch.object(scratch, "spawn", side_effect=AssertionError("started")):
+            self.assertEqual(scratch.serve_browser(self.a, other, []), (other, ""))
+            self.assertEqual(scratch.serve_browser(self.a, "", []), ("", ""))
+
+    def test_a_codex_launch_after_a_claude_one_stops_the_served_server(self):
+        self.fake_browser(self.DOM)
+        self.launch(self.config, which="claude")
+        proc = scratch.SERVED[self.a.selector].proc
+        kw = self.launch(self.config)
+        self.gone(proc.pid)
+        entry = json.loads(kw["mcp_config"])["mcpServers"]["playwright"]
+        self.assertIn("command", entry)
+        self.assertNotIn("type", entry)
 
     def test_a_browser_tree_an_actor_can_write_or_replace_is_refused_before_any_download(self):
         self.prepare()
@@ -861,6 +1046,37 @@ class EscapeTests(unittest.TestCase):
                 self.assertTrue(control.exists(), f"{name} profile blocks a port that is not the dashboard's")
                 control.unlink()
 
+    def test_the_served_browser_profile_listens_on_its_one_port_only(self):
+        attempt, folder = self.browser_attempt()
+        listen, wrong = scratch.listen_port(attempt, self.other.getsockname()[1]), verify.free_port()
+        profile = scratch.browser_profile(attempt, self.other.getsockname()[1], folder, listen)
+        server = subprocess.Popen([*profile, "/usr/bin/nc", "-l", "127.0.0.1", str(listen)], cwd=folder,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        self.cleanups.append(lambda: (server.kill(), server.wait()))
+        deadline, connected = time.monotonic() + 10, False
+        while not connected and time.monotonic() < deadline and server.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", listen), 1).close()
+                connected = True
+            except OSError:
+                time.sleep(.2)
+        self.assertTrue(connected, "the profile must let the browser server listen on its port")
+        other = subprocess.run([*profile, "/usr/bin/nc", "-l", "127.0.0.1", str(wrong)], cwd=folder,
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+        self.assertNotEqual(other.returncode, 0)
+
+    def test_tcp_to_the_browser_port_fails_inside_the_service_profile(self):
+        attempt = attempt_for(self.ws)
+        port = self.other.getsockname()[1]
+        marker = self.marks / "browser"
+        command = shlex.join([sys.executable, "-c", CONNECT, str(port), str(marker)])
+        subprocess.run(scratch.service_command(attempt, command), cwd=self.ws, capture_output=True, timeout=30)
+        self.assertTrue(marker.exists(), "without the denial the connection must succeed")
+        marker.unlink()
+        subprocess.run(scratch.service_command(attempt, command, port), cwd=self.ws, capture_output=True, timeout=30)
+        self.assertFalse(marker.exists())
+
     def test_authority_reads_fail_inside(self):
         resolved = self.secret.resolve()
         (self.ws / "ok").write_text("ok")
@@ -1160,6 +1376,41 @@ class BrowserRunTests(unittest.TestCase):
         self.visit(f"http://127.0.0.1:{self.port}/", self.evidence / "shot.png")
         self.assertEqual(stat.S_IMODE((self.run_dir / "browser").stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(browser.server_folder().stat().st_mode), 0o700)
+
+    def test_the_engine_started_server_answers_over_http_and_leaves_no_process(self):
+        listen = scratch.listen_port(self.a, self.port, scratch.dashboard_ports())
+        scratch.update_browser(self.a, listen=listen)
+        self.addCleanup(scratch.stop_served, self.a)
+        built, reason = scratch.serve_browser(self.a, verify.mcp_config(self.evidence), [self.evidence])
+        self.assertEqual(reason, "")
+        url = json.loads(built)["mcpServers"]["playwright"]["url"]
+        proc = scratch.SERVED[self.a.selector].proc
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def post(body, session=None):
+            headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                       **({"Mcp-Session-Id": session} if session else {})}
+            with opener.open(urllib.request.Request(url, json.dumps(body).encode(), headers), timeout=90) as reply:
+                text = reply.read().decode()
+                lines = [text] if text.lstrip().startswith("{") else [
+                    line[5:] for line in text.splitlines() if line.startswith("data:")]
+                return reply.headers.get("Mcp-Session-Id") or session, [json.loads(line) for line in lines if line.strip()]
+
+        session, _ = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                                      "clientInfo": {"name": "test", "version": "0"}}})
+        post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
+        shot = self.evidence / "served.png"
+        for ident, tool, arguments in ((2, "browser_navigate", {"url": f"http://127.0.0.1:{self.port}/"}),
+                                       (3, "browser_take_screenshot", {"filename": str(shot)})):
+            _, answers = post({"jsonrpc": "2.0", "id": ident, "method": "tools/call",
+                               "params": {"name": tool, "arguments": arguments}}, session)
+            self.assertTrue(answers and not answers[-1]["result"].get("isError"), answers)
+        self.assertGreater(shot.stat().st_size, 0)
+        self.assertIn("<html", (self.run_dir / "verify-browser.log").read_text())
+        scratch.stop_served(self.a)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(proc.pid, 0)
 
     def test_a_localhost_url_reaches_the_app_on_either_loopback_family(self):
         for host in ("127.0.0.1", "::1"):
