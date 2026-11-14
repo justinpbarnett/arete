@@ -51,6 +51,8 @@ def save(repo: str, found: dict[str, str]) -> None:
 
 
 def put_all(repo: str, given: dict[str, str]) -> None:
+    if not given:
+        return
     with util.lock(LOCK, wait=True):
         save(repo, {**read(repo), **given})
 
@@ -88,8 +90,36 @@ def unfit(value) -> str:
     return f"the value must be one line of {SHORTEST} to {LONGEST} printable characters"
 
 
-def forms(value: str) -> tuple[str, str]:
-    return value, json.dumps(value)[1:-1]
+def forms(value: str) -> tuple[str, ...]:
+    return value, json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def holding(text: str, value: str) -> bool:
+    return any(form in text for form in forms(value))
+
+
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
+
+
+def unquoted(text: str) -> str:
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body, out, i = text[1:-1], bytearray(), 0
+    while i < len(body):
+        if body[i] != "\\" or i + 1 >= len(body):
+            out += body[i].encode()
+            i += 1
+        elif body[i + 1] in "01234567":
+            out.append(int(body[i + 1:i + 4], 8) & 0xFF)
+            i += 4
+        else:
+            out += ESCAPES.get(body[i + 1], body[i + 1]).encode()
+            i += 2
+    return out.decode(errors="replace")
+
+
+def patch_path(text: str) -> str:
+    return unquoted(text.rstrip("\t")).removeprefix("b/")
 
 
 def held(patch: str) -> dict[str, list[str]]:
@@ -100,24 +130,28 @@ def held(patch: str) -> dict[str, list[str]]:
     path, header = "", False
     for line in patch.splitlines():
         if line.startswith("diff --git "):
-            header, path = True, ""
+            header = True
+            tail = line.rpartition(' "b/')
+            path = patch_path('"b/' + tail[2]) if tail[1] else line.rpartition(" b/")[2]
         elif header and line.startswith("@@"):
             header = False
-        elif header and line.startswith("+++ "):
-            path = line[4:].removeprefix("b/")
-        elif not header and line.startswith("+"):
-            for name, value in stored:
-                if any(form in line for form in forms(value)) and name not in found.setdefault(path, []):
-                    found[path].append(name)
+        elif header and line.startswith("+++ ") and line != "+++ /dev/null":
+            path = patch_path(line[4:])
+        elif not header and not line.startswith("+"):
+            continue
+        texts = (line, path) if header else (line,)
+        for name, value in stored:
+            if any(holding(t, value) for t in texts) and name not in found.setdefault(path, []):
+                found[path].append(name)
     return found
 
 
 def refusals(patch: str) -> list[str]:
-    return [f"{path} (holds the stored value of {', '.join(names)})" for path, names in held(patch).items()]
+    return [f"{hidden(path)} (holds the stored value of {', '.join(names)})" for path, names in held(patch).items()]
 
 
-def hidden(text: str) -> str:
-    for value in sorted(values(), key=len, reverse=True):
+def hidden(text: str, given: set[str] | None = None) -> str:
+    for value in sorted(values() if given is None else given, key=len, reverse=True):
         for form in forms(value):
             text = text.replace(form, REDACTED)
     return text

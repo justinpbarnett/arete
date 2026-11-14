@@ -30,7 +30,6 @@ from . import (
     replay,
     state,
     util,
-    vault,
 )
 from . import scratch as verification_scratch
 from .agent import (
@@ -902,13 +901,12 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             res.cost_usd = 0.0 if on_local else priced(res, cfg)
         if not budget_error:
             quote_calls(res, which, name, at)
-        if selected or vault.values():
-            refresh_hidden()
-            res.error = record.scrub(res.error, hidden)
-            res.text = record.scrub(res.text, hidden)
-            res.structured = record.scrub_value(res.structured, hidden)
-            for call in res.calls:
-                call.error = record.scrub(call.error, hidden)
+        refresh_hidden()
+        res.error = record.scrub(res.error, hidden)
+        res.text = record.scrub(res.text, hidden)
+        res.structured = record.scrub_value(res.structured, hidden)
+        for call in res.calls:
+            call.error = record.scrub(call.error, hidden)
         res.effort, res.credential = kw.get("effort", ""), route.get("credential", "")
         res.requested_effort, res.skipped = route.get("requested_effort", ""), route.get("skipped", [])
         res.record = rec.path.name if rec.path else ""

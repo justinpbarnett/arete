@@ -49,10 +49,10 @@ def commands(cfg: config.Config, repo: config.Repo | None = None, sets: Mapping[
 
 def sh(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None,
        sets: Mapping[str, str] | None = None, **kw):
+    given = set(stored(repo).values())
     res = util.sh(cmd, env=commands(cfg, repo, sets), inherit=False, **kw)
-    for value in sorted(stored(repo).values(), key=len, reverse=True):
-        res.stdout = (res.stdout or "").replace(value, vault.REDACTED)
-        res.stderr = (res.stderr or "").replace(value, vault.REDACTED)
+    res.stdout = vault.hidden(res.stdout or "", given)
+    res.stderr = vault.hidden(res.stderr or "", given)
     return res
 
 

@@ -377,8 +377,28 @@ class BrowserServerTests(unittest.TestCase):
                     built = scratch.browser_config(self.a, self.config, [self.evidence])
                 self.assertEqual(json.loads(built)["mcpServers"]["playwright"], scratch.browser_server(self.a))
 
+    def test_a_scratch_verify_server_keeps_stored_variables_and_drops_other_credentials(self):
+        self.install()
+        port = self.answering(socket.AF_INET, "127.0.0.1")
+        seen = {}
+
+        def spawned(*args, **kwargs):
+            seen.update(kwargs["env"])
+            return subprocess.Popen(["/bin/sleep", "60"], start_new_session=True, stdout=subprocess.PIPE)
+
+        v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
+        env = {"REPLAY_SECRET": "stored-value-1", "OTHER_TOKEN": "ambient-value-1", "PLAIN": "plain"}
+        with mock.patch.object(scratch, "service_command", side_effect=lambda a, command: command), \
+                mock.patch.object(scratch, "spawn", side_effect=spawned), \
+                mock.patch.object(verify.environment, "commands", return_value=env), \
+                mock.patch.object(verify.environment, "stored", return_value={"REPLAY_SECRET": "stored-value-1"}), \
+                verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a):
+            pass
+        self.assertEqual((seen.get("REPLAY_SECRET"), seen.get("PLAIN"), "OTHER_TOKEN" in seen),
+                         ("stored-value-1", "plain", False))
+
     def launch(self, mcp_config, said=None):
-        picked = SimpleNamespace(candidate=SimpleNamespace(runner="codex", effort="", instructions=()))
+        picked = SimpleNamespace(candidate=SimpleNamespace(runner="codex", effort="", instructions=()), selected=None)
         trip = SimpleNamespace(cfg=SimpleNamespace(jev=SimpleNamespace(guard=False)), repo=None, scratch=self.a,
                                target=SimpleNamespace(remote=None), tokens=None)
         base = {"mcp_config": mcp_config, "add_dirs": [self.evidence]}

@@ -7,6 +7,7 @@ import signal
 import socket
 import stat
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -133,14 +134,18 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
     command = scratch.service_command(attempt, v.start) if attempt else v.start
     env = environment.commands(cfg or config.load(), repo, sets)
     if attempt:
-        env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k)}
+        kept = environment.stored(repo)
+        env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
         env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
                     "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
                     "ARETE_WORKTREES_DIR": attempt.root + "/state/worktrees"})
-    with open(log, "w") as out, scratch.producing(attempt):
-        proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, env=env,
+    log.write_text("")
+    with scratch.producing(attempt):
+        proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
                              actor_confined=bool(attempt), **util.own_group_args())
+    pump = threading.Thread(target=write_hidden, args=(proc, log, vault.values()), daemon=True)
+    pump.start()
     if lifetime is not None:
         lifetime["stopped"] = False
     try:
@@ -148,7 +153,7 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         yield url
     finally:
         stop(proc)
-        hide_in(log)
+        pump.join(STOP_GRACE_SECONDS)
         if lifetime is not None:
             try:
                 os.killpg(proc.pid, 0)
@@ -175,12 +180,13 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
     raise ServerError(f"{url} did not answer within {seconds} seconds{output(log)}")
 
 
-def hide_in(log: Path) -> None:
+def write_hidden(proc: subprocess.Popen, log: Path, given: set[str]) -> None:
     try:
-        text = log.read_text(errors="replace")
-        if (hidden := vault.hidden(text)) != text:
-            log.write_text(hidden)
-    except OSError:
+        with open(log, "a") as out:
+            for line in proc.stdout:
+                out.write(vault.hidden(line.decode(errors="replace"), given))
+                out.flush()
+    except (OSError, ValueError):
         pass
 
 

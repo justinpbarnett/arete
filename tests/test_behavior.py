@@ -410,6 +410,7 @@ if scenario.startswith("asked"):
         layer_file = root / "sample/layer/config.toml"
         layer_file.write_text(layer_file.read_text().replace(
             "[checks]\n", "[checks]\nsecret = \"test ${#REPLAY_SECRET} -eq " + str(len(marker)) + "\"\n"))
+    if scenario in ("asked-secret", "asked-declined"):
         asking = {"questions": [{"header": "Token", "question": "What is the token?", "kind": "secret",
                                  "name": "REPLAY_SECRET"}], "why": "The check needs it.", "tried": "Read the task."}
     calls = [asking, placing] if scenario == "asked-twice" else [asking]
@@ -445,6 +446,10 @@ if scenario.startswith("asked"):
         from arete import control, environment, tasks, vault
         other = config.Repo(name="replay-other", path=root / "sample/repo")
         try:
+            tasks.reply_to_asks(cfg, cfg.repo("replay-sample"), parked, waiting, "a reply on the ticket")
+        except control.Refused as e:
+            result["reply"] = str(e)
+        try:
             tasks.answer_ask(waiting[0]["id"], {"answers": [{"secret": "short"}]})
         except control.Refused as e:
             result["short"] = str(e)
@@ -458,6 +463,10 @@ if scenario.startswith("asked"):
         result["unseen"] = "REPLAY_SECRET" in environment.commands(cfg, other)
         result["reserved_names"] = [runner.reserved(n) for n in ("ARETE_RUN_ID", "CLAUDE_CODE_OAUTH_TOKEN", "REPLAY_SECRET")]
         result["diff_refusal"] = vault.refusals(f"diff --git a/notes.txt b/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n+kumquat {marker}\n")
+    elif scenario == "asked-declined":
+        from arete import tasks
+        with mock.patch.object(tasks, "continue_asked", return_value={}):
+            tasks.answer_ask(waiting[0]["id"], {"answers": [{"declined": True}]})
     else:
         for ask in waiting:
             state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
@@ -548,7 +557,12 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
                "answered": "Spelled with a K, as in kumquat-7." in prompts,
                "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])],
                "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
-               "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text()}
+               "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
+               "heard": [w for w in ("`REPLAY_SECRET` is set for this repo", asks.DECLINED) if w in prompts]}
+    if scenario == "asked-declined":
+        from arete import vault
+        result["answer_lines"] = [e.get("answers") for e in events if e.get("event") == "answer"]
+        result["stored_after"] = sorted(vault.read("replay-sample"))
     if scenario == "asked-secret":
         vault.remove("replay-sample", "REPLAY_SECRET")
         result["after_removal"] = "REPLAY_SECRET" in environment.commands(cfg, cfg.repo("replay-sample"))
@@ -623,6 +637,16 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["diff_refusal"], ["notes.txt (holds the stored value of REPLAY_SECRET)"])
         self.assertEqual((result["seen"], result["unseen"], result["after_removal"]), (True, False, False))
         self.assertEqual([bool(r) for r in result["reserved_names"]], [True, True, False])
+        self.assertIn("`REPLAY_SECRET` is set for this repo", result["heard"])
+        self.assertIn("secret question", result["reply"])
+
+    def test_declined_secret_resumes_the_step_with_the_owner_declined(self):
+        result = self.workflow("asked-declined")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["heard"], ["the owner declined"])
+        self.assertEqual(result["answer_lines"], [[{"header": "Token", "kind": "secret", "name": "REPLAY_SECRET",
+                                                    "declined": True}]])
+        self.assertEqual(result["stored_after"], [])
 
     def test_patch_holding_a_stored_value_fails_naming_the_variable_only(self):
         result = self.workflow("secret-in-patch")
