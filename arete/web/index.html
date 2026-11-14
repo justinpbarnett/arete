@@ -337,13 +337,18 @@
   <p id="feedback-evidence-said" aria-live="polite" tabindex="-1" hidden></p>
   <h3>What will be sent</h3>
   <div id="feedback-sending">
+    <p><strong id="feedback-sending-title"></strong></p>
     <pre id="feedback-sending-text"></pre>
     <p id="feedback-sending-context"></p>
     <ul id="feedback-evidence"></ul>
     <p class="muted" id="feedback-evidence-total"></p>
   </div>
+  <h3>Checks</h3>
+  <ul id="feedback-checks"></ul>
+  <p class="muted" id="feedback-checks-cost"></p>
+  <p id="feedback-ready" aria-live="polite"></p>
   <p id="feedback-result" aria-live="polite" tabindex="-1" hidden></p>
-  <div class="actions"><button type="button" id="feedback-close">Close</button><button type="button" id="feedback-discard">Discard</button><span class="muted keys">Esc closes · the draft is kept</span></div>
+  <div class="actions"><button type="button" id="feedback-submit">Submit</button><button type="button" id="feedback-close">Close</button><button type="button" id="feedback-discard">Discard</button><span class="muted keys">Esc closes · the draft is kept</span></div>
 </dialog>
 <div id="feedback-recording" hidden role="status">
   <span id="feedback-recording-time">Recording 0:00 of 0:30</span>

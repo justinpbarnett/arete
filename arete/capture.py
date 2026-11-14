@@ -5,9 +5,10 @@ import os
 import re
 import shutil
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import __version__, outbound, paths, state, tracker, util
+from . import __version__, chat, config, gh, jev, outbound, paths, state, tracker, util, verdicts
 
 MB = 1024 * 1024
 MOST_IMAGE_BYTES = 5 * MB
@@ -32,8 +33,37 @@ RUN_ID = re.compile(r"\w[\w.-]*")
 RUN_FACTS = ("kind", "status", "started", "finished")
 EMPTY_DRAFT = {"kind": "idea", "text": "", "expected": "", "actual": "", "steps": ""}
 
+CHECKS = ("vision", "duplicates", "actionable", "injection", "publication")
+TITLES = {"vision": "Vision and scope", "duplicates": "Duplicates", "actionable": "Actionability",
+          "injection": "Untrusted instructions", "publication": "Publication safety"}
+SUBMITTING = threading.Lock()
+DUPLICATES_FRESH_SECONDS = 600
+MOST_ISSUES = 100
+MOST_ISSUE_BODY = 6000
+INTERRUPTED = "The dashboard restarted before this check finished. Submit again."
+READY = "This request passed every check and is ready. Filing arrives with part 5, so nothing was filed."
+VISION_QUESTION = ("Does the request fit what the app is for, according to the product vision? Pick whether the "
+                   "vision supports the request, conflicts with it, or does not address it.")
+VISION_OPTIONS = {"supports": "the vision supports the request", "conflicts": "the vision conflicts with the request",
+                  "not_addressed": "the vision says nothing about the request"}
+DUPLICATE_QUESTION = ("Does the existing issue ask for the same change or report the same problem as the new "
+                      "request?")
+ACTIONABLE_QUESTION = ("Could a developer start work on this request as written? Pick actionable, or the one detail "
+                       "that is most missing.")
+ACTIONABLE_OPTIONS = {"actionable": "a developer could start on it as written",
+                      "what": "it does not say what should change", "where": "it does not say where it happens",
+                      "expected": "it does not say what was expected", "reproduce": "it does not say how to reproduce it"}
+MISSING = {"what": "what should change", "where": "where it happens", "expected": "what was expected",
+           "reproduce": "how to reproduce it"}
+SECRETS_QUESTION = ("Does this text hold a credential, such as a password, token or key, or private personal "
+                    "information, such as an email address, phone number, home address or a person's private details?")
+
 
 class Refused(ValueError):
+    pass
+
+
+class Conflict(RuntimeError):
     pass
 
 
@@ -48,7 +78,8 @@ class NotStaged(LookupError):
 def view(connect=state.db) -> dict:
     limits = {**LIMITS, "context_bytes": MOST_CONTEXT_BYTES, "image_bytes": MOST_IMAGE_BYTES, "video_bytes": MOST_VIDEO_BYTES,
               "evidence_items": MOST_ITEMS, "evidence_bytes": MOST_DRAFT_BYTES, "video_seconds": MOST_VIDEO_SECONDS}
-    return {"draft": state.capture_draft(connect), "limits": limits, "kinds": list(KINDS)}
+    draft = state.capture_draft(connect)
+    return {"draft": shown(draft) if draft else None, "limits": limits, "kinds": list(KINDS)}
 
 
 def sniffed(data: bytes) -> tuple[str, str, str]:
@@ -217,3 +248,340 @@ def discard() -> dict:
         if draft_id is not None:
             shutil.rmtree(CAPTURES_DIR / str(draft_id), ignore_errors=True)
     return view()
+
+
+def fields_of(draft: dict) -> list[tuple[str, str]]:
+    fields = [("Request", draft["text"])]
+    if draft["kind"] == "bug":
+        fields += [("Expected", draft["expected"]), ("Actual", draft["actual"]), ("Steps", draft["steps"])]
+    return fields
+
+
+def filing_text(draft: dict) -> tuple[str, str]:
+    parts = [draft["text"].strip()]
+    parts += [f"## {label}\n{value.strip()}" for label, value in fields_of(draft)[1:] if value.strip()]
+    if draft["context"]:
+        parts.append(f"<details>\n<summary>App state</summary>\n\n```json\n{draft['context']}\n```\n\n</details>")
+    if draft["evidence"]:
+        parts.append("## Evidence\n" + "\n".join(f"- {e['name']}" for e in draft["evidence"]))
+    return chat.title_of(draft["text"]), "\n\n".join(parts)
+
+
+def outgoing(draft: dict) -> dict:
+    title, body = filing_text(draft)
+    return {"title": outbound.screen(title), "body": str(gh.outgoing(body))}
+
+
+def request_text(draft: dict) -> str:
+    return "\n\n".join(f"{label}:\n{value.strip()}" for label, value in fields_of(draft) if value.strip())
+
+
+def evidence_names(draft: dict) -> list[str]:
+    return [e["name"] for e in draft["evidence"]]
+
+
+def vision_of(cfg: config.Config) -> dict:
+    found = {"path": "", "version": "", "text": "", "setting": ""}
+    if not cfg.capture_vision:
+        found["setting"] = (f'No vision file is set. Add vision = "vision.md" under [capture] in '
+                            f'{paths.short_path(paths.CONFIG_FILE)}, naming a file in that folder that says what the '
+                            f'app is for.')
+        return found
+    path = Path(cfg.capture_vision)
+    found["path"] = paths.short_path(path)
+    try:
+        data = paths.read_confined(path)
+        modified = datetime.fromtimestamp(os.stat(path).st_mtime).strftime("%Y-%m-%d")
+    except OSError as e:
+        found["setting"] = (f"The vision file {found['path']} cannot be read ({e.strerror or type(e).__name__}). "
+                            f"Fix [capture] vision in the config file.")
+        return found
+    found["text"] = data.decode(errors="replace").strip()
+    if not found["text"]:
+        found["setting"] = (f"The vision file {found['path']} is empty. Write what the app is for in it, or point "
+                            f"[capture] vision at another file.")
+        return found
+    found["version"] = f"{hashlib.sha256(data).hexdigest()[:12]} of {modified}"
+    return found
+
+
+def digest(*parts) -> str:
+    return hashlib.sha256(json.dumps(parts, default=str).encode()).hexdigest()
+
+
+def fingerprints(draft: dict, cfg: config.Config) -> dict[str, str]:
+    bug = draft["kind"] == "bug"
+    request = [draft["kind"], draft["text"], *(draft[k] for k in ("expected", "actual", "steps") if bug)]
+    model = cfg.jev.model
+    items = [(e["name"], e["kind"], e["sha256"]) for e in draft["evidence"]]
+    sure = cfg.jev.confidence
+    return {"vision": digest(request, vision_of(cfg)["version"], model, sure),
+            "duplicates": digest(request, chat.arete_repo(cfg).github, model, sure),
+            "actionable": digest(request, model, sure),
+            "injection": digest(request, draft["context"], evidence_names(draft), model, cfg.jev.injection),
+            "publication": digest(request, draft["context"], items, model, cfg.jev.secrets_hold)}
+
+
+def stale(row: dict, print_: str, name: str) -> bool:
+    if row["result"] == "running":
+        return False
+    if row["fingerprint"] != print_:
+        return True
+    return (name == "duplicates" and bool(row["checked"])
+            and util.now() - util.parse_iso(row["checked"]) > timedelta(seconds=DUPLICATES_FRESH_SECONDS))
+
+
+def due_checks(draft: dict, prints: dict[str, str]) -> list[str]:
+    rows = draft["checks"]
+    return [n for n in CHECKS if n not in rows or rows[n]["result"] != "pass" or stale(rows[n], prints[n], n)]
+
+
+def shown(draft: dict) -> dict:
+    cfg = config.load()
+    prints = fingerprints(draft, cfg)
+    checks = []
+    for name in CHECKS:
+        row = draft["checks"].get(name)
+        checks.append({"name": name, "title": TITLES[name], "result": row["result"] if row else "none",
+                       "reason": row["reason"] if row else "", "stale": bool(row) and stale(row, prints[name], name),
+                       "checked": row["checked"] if row else "", "detail": row["detail"] if row else {}})
+    vision = vision_of(cfg)
+    ready = draft["status"] == "draft" and all(c["result"] == "pass" and not c["stale"] for c in checks)
+    return {**{k: v for k, v in draft.items() if k != "checks"}, "checks": checks, "outgoing": outgoing(draft),
+            "vision": {k: vision[k] for k in ("path", "version", "setting")},
+            "jev_cost_usd": draft.get("jev_cost_usd") or 0.0, "ready": ready,
+            "summary": summary(draft["status"], checks, ready)}
+
+
+def summary(status: str, checks: list[dict], ready: bool) -> str:
+    if ready:
+        return READY
+    if status == "checking":
+        return "Running the checks. This updates when they finish."
+    if all(c["result"] == "none" for c in checks):
+        return "Press Submit to check this request before it can be filed."
+    counts = {"failed": sum(c["result"] == "fail" for c in checks),
+              "held": sum(c["result"] in ("hold", "interrupted") for c in checks),
+              "stale": sum(c["stale"] for c in checks)}
+    found = ", ".join(f"{n} {word}" for word, n in counts.items() if n)
+    return f"Checks: {found}. Revise and Submit again." if found else "Press Submit to run the checks again."
+
+
+def allowed(cfg: config.Config) -> bool:
+    return cfg.jev_allowed([chat.arete_repo(cfg)])
+
+
+JEV_OFF = "jev is off for the arete repo in the config"
+
+
+def asked(cfg: config.Config, text: str, questions: dict[str, dict]) -> jev.Reply:
+    if not allowed(cfg):
+        return jev.Reply(error=JEV_OFF)
+    return jev.ask(outbound.redact(text), questions, cfg)
+
+
+def unavailable(reply: jev.Reply, detail: dict | None = None) -> tuple[str, str, dict, float]:
+    why = reply.error or "its reply left the question out"
+    return ("hold", f"Not checked: JEV is unavailable ({why}). Submit again when it answers.", detail or {},
+            reply.cost_usd)
+
+
+def chance_of(answer: jev.Answer, option: str) -> float:
+    if option in answer.probabilities:
+        return answer.probabilities[option]
+    return answer.confidence if answer.value == option else 0.0
+
+
+def keep_verdict(draft: dict, subject: str, scores: dict[str, dict], held: str) -> None:
+    verdicts.record(f"capture-{draft['id']}", "capture", subject, chat.title_of(draft["text"]), scores, held)
+
+
+def check_vision(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float]:
+    vision = vision_of(cfg)
+    detail = {"path": vision["path"], "version": vision["version"]}
+    if vision["setting"]:
+        return "hold", vision["setting"], detail, 0.0
+    reply = asked(cfg, f"Product vision:\n{vision['text']}\n\n{request_text(draft)}",
+                  {"vision": jev.pick(VISION_QUESTION, VISION_OPTIONS)})
+    answer = reply.answers.get("vision")
+    if not answer:
+        return unavailable(reply, detail)
+    line = cfg.jev.confidence
+    sure = answer.sure(line)
+    if answer.value == "supports" and sure:
+        result, reason = "pass", f"The vision supports this request (confidence {answer.confidence:.2f})."
+    elif answer.value == "conflicts" and sure:
+        result, reason = "fail", f"The vision conflicts with this request (confidence {answer.confidence:.2f})."
+    else:
+        result = "hold"
+        reason = (f"JEV could not tell whether the vision supports this request: it picked {answer.value} at "
+                  f"confidence {answer.confidence:.2f}, and {line:g} is needed.")
+    scores = {"supports": verdicts.scored(chance_of(answer, "supports"), line, over=False),
+              "conflicts": verdicts.scored(chance_of(answer, "conflicts"), line)}
+    keep_verdict(draft, "vision", scores, "" if result == "pass" else reason)
+    return result, reason, detail, reply.cost_usd
+
+
+def check_duplicates(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float]:
+    repo = chat.arete_repo(cfg).github
+    if not repo:
+        reason = ("Not checked: the arete repo has no github setting. Add github = \"owner/name\" to its [[repo]] "
+                  "in the config file.")
+        return "hold", reason, {}, 0.0
+    try:
+        listed = gh.recent_issues(repo, MOST_ISSUES)
+    except (gh.GhError, OSError, ValueError) as e:
+        return "hold", f"Not checked: GitHub did not answer ({util.first_line(str(e)) or type(e).__name__}).", {}, 0.0
+    issues = [i for i in listed if isinstance(i, dict) and "number" in i
+              and (i.get("state") == "OPEN" or i.get("stateReason") == "COMPLETED")]
+    if not issues:
+        return "pass", "No open or completed issues to compare with.", {"matches": []}, 0.0
+    if not allowed(cfg):
+        return unavailable(jev.Reply(error=JEV_OFF))
+    title = chat.title_of(draft["text"])
+    items = [(outbound.redact(f"New request:\n{title}\n\n{request_text(draft)}\n\nExisting issue #{i['number']} "
+                              f"({str(i.get('state', '')).lower()}): {i.get('title', '')}\n\n"
+                              f"{str(i.get('body') or '')[:MOST_ISSUE_BODY]}"),
+              {"duplicate": jev.yes_no(DUPLICATE_QUESTION)}) for i in issues]
+    replies = jev.ask_many(items, cfg)
+    cost = sum(r.cost_usd for r in replies)
+    line = cfg.jev.confidence
+    sure_yes, sure_no = (1 + line) / 2, (1 - line) / 2
+    chances = [(i, a.yes) for i, r in zip(issues, replies, strict=True) if (a := r.answers.get("duplicate"))]
+    for issue, p in chances:
+        keep_verdict(draft, f"duplicate #{issue['number']}", {"duplicate": verdicts.scored(p, sure_no)},
+                     f"possible duplicate (p {p:.2f})" if p >= sure_no else "")
+
+    def entry(issue: dict, p: float) -> dict:
+        return {"number": issue["number"], "title": issue.get("title", ""), "state": str(issue.get("state", "")).lower(),
+                "chance": round(p, 2), "url": gh.issue_url(repo, issue["number"])}
+
+    if found := [entry(i, p) for i, p in chances if p >= sure_yes]:
+        names = ", ".join(f"#{m['number']} (chance {m['chance']:.2f})" for m in found)
+        return "fail", f"This looks like an issue already filed: {names}.", {"matches": found}, cost
+    if len(chances) < len(issues):
+        error = next((r.error for r in replies if r.error), "")
+        reason = (f"Not checked: JEV is unavailable for {len(issues) - len(chances)} of {len(issues)} issues "
+                  f"({error or 'its reply left the question out'}). Submit again when it answers.")
+        return "hold", reason, {}, cost
+    issue, p = max(chances, key=lambda c: c[1])
+    if p > sure_no:
+        near = entry(issue, p)
+        reason = (f"Issue #{near['number']} may be the same request (chance {p:.2f}); JEV is not sure either way. "
+                  f"Check it, then Submit again.")
+        return "hold", reason, {"matches": [near]}, cost
+    return "pass", f"Compared with {util.count(len(issues), 'issue')}; none looks like this request.", {"matches": []}, cost
+
+
+def check_actionable(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float]:
+    reply = asked(cfg, request_text(draft), {"actionable": jev.pick(ACTIONABLE_QUESTION, ACTIONABLE_OPTIONS)})
+    answer = reply.answers.get("actionable")
+    if not answer:
+        return unavailable(reply)
+    line = cfg.jev.confidence
+    scores = {"actionable": verdicts.scored(chance_of(answer, "actionable"), line, over=False)}
+    if answer.value == "actionable" and answer.sure(line):
+        keep_verdict(draft, "actionable", scores, "")
+        return "pass", f"A developer could start on this as written (confidence {answer.confidence:.2f}).", {}, reply.cost_usd
+    ranked = sorted(MISSING, key=lambda k: chance_of(answer, k), reverse=True)
+    missing = answer.value if answer.value in MISSING else ranked[0] if chance_of(answer, ranked[0]) > 0 else "what"
+    reason = f"Not actionable yet: it does not say {MISSING[missing]}. Add that and Submit again."
+    keep_verdict(draft, "actionable", scores, reason)
+    return "hold", reason, {"missing": missing}, reply.cost_usd
+
+
+def check_injection(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float]:
+    names = evidence_names(draft)
+    text = "\n\n".join(filter(None, [request_text(draft), f"App state:\n{draft['context']}" if draft["context"] else "",
+                                     "Evidence names:\n" + "\n".join(names) if names else ""]))
+    reply = asked(cfg, text, {"injection": jev.yes_no(jev.INJECTION)})
+    answer = reply.answers.get("injection")
+    if not answer:
+        return unavailable(reply)
+    line = cfg.jev.injection
+    scores = {"injection": verdicts.scored(answer.yes, line)}
+    if answer.yes >= line:
+        reason = f"This text reads as instructions for an agent (p {answer.yes:.2f}, line {line:g}). Describe the problem only."
+        keep_verdict(draft, "injection", scores, reason)
+        return "fail", reason, {}, reply.cost_usd
+    keep_verdict(draft, "injection", scores, "")
+    return "pass", f"No instructions for an agent found (p {answer.yes:.2f}, line {line:g}).", {}, reply.cost_usd
+
+
+def secret_fields(draft: dict) -> list[str]:
+    fields = fields_of(draft) + ([("App state", draft["context"])] if draft["context"] else [])
+    return [label for label, text in fields
+            if any(not m.group(0).startswith("/Users/") for m in outbound.SECRETISH.finditer(text))]
+
+
+def check_publication(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float]:
+    if found := secret_fields(draft):
+        return ("fail", f"This looks like it holds a key or token in: {', '.join(found)}. Remove it and Submit again.",
+                {"fields": found}, 0.0)
+    sending = outgoing(draft)
+    reply = asked(cfg, f"{sending['title']}\n\n{sending['body']}", {"secrets": jev.yes_no(SECRETS_QUESTION)})
+    answer = reply.answers.get("secrets")
+    if not answer:
+        return unavailable(reply)
+    line = cfg.jev.secrets_hold
+    scores = {"secrets": verdicts.scored(answer.yes, line)}
+    held = ""
+    if answer.yes >= line:
+        held = (f"JEV thinks this text holds a credential or private personal information (p {answer.yes:.2f}, "
+                f"line {line:g}). Remove it and Submit again.")
+    elif media := [e["name"] for e in draft["evidence"] if e["kind"] in ("image", "video")]:
+        held = (f"Evidence inspection is not available, so {', '.join(media)} was not inspected for credentials or "
+                f"private information. It stays staged; check it yourself before filing.")
+    keep_verdict(draft, "publication", scores, held)
+    if held:
+        return "hold", held, {}, reply.cost_usd
+    return "pass", f"No credential or private information found in the text (p {answer.yes:.2f}, line {line:g}).", {}, reply.cost_usd
+
+
+RUNNERS = {"vision": check_vision, "duplicates": check_duplicates, "actionable": check_actionable,
+           "injection": check_injection, "publication": check_publication}
+
+
+def run_checks(draft: dict, cfg: config.Config, due: list[str]) -> None:
+    try:
+        for name in due:
+            try:
+                result, reason, detail, cost = RUNNERS[name](draft, cfg)
+            except Exception as e:
+                result, reason, detail, cost = "hold", f"Not checked: {util.first_line(str(e)) or type(e).__name__}", {}, 0.0
+            if not state.capture_check_done(draft["id"], name, result, reason, detail, cost):
+                return
+    finally:
+        state.capture_end_checks(draft["id"], INTERRUPTED)
+
+
+def submit(body: dict) -> dict:
+    revision = body.get("revision") if isinstance(body, dict) else None
+    if type(revision) is not int:
+        raise Refused("Send the draft's revision as a whole number.")
+    cfg = config.load()
+    with SUBMITTING:
+        draft = state.capture_draft(state.reader)
+        if not draft:
+            raise Conflict("There is no draft to check.")
+        if draft["status"] == "checking":
+            raise Conflict("The checks are still running.")
+        if draft["revision"] != revision:
+            raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
+        if not draft["text"].strip():
+            raise Refused("Write the request before you submit it.")
+        prints = fingerprints(draft, cfg)
+        due = due_checks(draft, prints)
+        if due:
+            if not state.capture_begin_checks(draft["id"], revision, {n: prints[n] for n in due}):
+                raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
+            threading.Thread(target=run_checks, args=(draft, cfg, due), daemon=True).start()
+    return view()
+
+
+def recover() -> None:
+    state.capture_end_checks(None, INTERRUPTED)
+
+
+def checking() -> bool:
+    return state.capture_checking()

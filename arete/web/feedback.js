@@ -216,6 +216,7 @@ function drawFeedbackDraft(draft) {
   feedbackDraft = draft;
   drawFeedbackContext(draft);
   drawFeedbackText();
+  drawFeedbackChecks(draft);
   drawFeedbackList();
 }
 
@@ -232,11 +233,75 @@ function sayEvidence(state, sentence) {
 }
 
 function drawFeedbackText() {
-  const fields = feedbackFields();
-  const shown = FEEDBACK_TEXTS.filter((name) => (name === "text" || fields.kind === "bug") && fields[name].trim());
-  feedbackBox("sending-text").textContent = shown.length
-    ? [`Kind: ${capitalized(fields.kind)}`, ...shown.map((name) => `${FEEDBACK_LABELS[name]}:\n${fields[name]}`)].join("\n\n")
-    : "Nothing written yet.";
+  const sending = feedbackDraft?.outgoing;
+  const written = Boolean(feedbackDraft?.text?.trim());
+  feedbackBox("sending-title").textContent = written ? sending.title : "";
+  feedbackBox("sending-text").textContent = written ? sending.body : "Nothing written yet.";
+}
+
+const FEEDBACK_CHIPS = { pass: "ok", hold: "caution", interrupted: "caution", fail: "fault" };
+let feedbackChecksShown = "";
+let feedbackPolling = 0;
+
+function feedbackCheckRow(check) {
+  const words = el("div", { class: "check-words" }, el("strong", { text: check.title }), " ", el("span", { text: check.reason || "Not run yet." }));
+  if (check.stale) words.append(" ", el("em", { text: "Stale, Submit runs it again." }));
+  if (check.detail.version) words.append(el("br"), el("span", { class: "muted", text: `Vision: ${check.detail.path}, version ${check.detail.version}` }));
+  for (const match of check.detail.matches ?? []) {
+    words.append(el("br"), link(match.url, `#${match.number} ${match.title}`), el("span", { class: "muted", text: ` · ${match.state} · chance ${match.chance.toFixed(2)}` }));
+  }
+  const chip = stateChip(FEEDBACK_CHIPS[check.result]);
+  return el("li", {}, chip ?? el("span", { class: "state", text: check.result === "running" ? "Running" : "Not run" }), " ", words);
+}
+
+function drawFeedbackChecks(draft) {
+  const checks = draft?.checks ?? [];
+  const shown = JSON.stringify([checks, draft?.summary, draft?.jev_cost_usd, draft?.vision]);
+  const checking = draft?.status === "checking";
+  const submit = feedbackBox("submit");
+  submit.disabled = checking;
+  submit.textContent = checking ? "Checking…" : "Submit";
+  if (checking) pollFeedbackChecks();
+  if (shown === feedbackChecksShown) return;
+  feedbackChecksShown = shown;
+  feedbackBox("checks").replaceChildren(...checks.map(feedbackCheckRow));
+  feedbackBox("checks-cost").textContent = draft?.jev_cost_usd > 0 ? `JEV cost so far: ${money(draft.jev_cost_usd)}` : "";
+  feedbackBox("ready").textContent = draft && checks.some((c) => c.result !== "none") ? draft.summary : "";
+  if (draft && !draft.vision.version && checks.some((c) => c.result !== "none")) feedbackBox("ready").append(" ", draft.vision.setting);
+}
+
+function pollFeedbackChecks() {
+  if (feedbackPolling) return;
+  feedbackPolling = setTimeout(async function again() {
+    feedbackPolling = 0;
+    try {
+      drawFeedbackDraft((await call("/api/capture")).draft);
+    } catch {
+      feedbackPolling = setTimeout(again, FEEDBACK_RETRY_MS);
+    }
+  }, 1000);
+}
+
+function submitFeedback() {
+  return inFeedbackTurn(async () => {
+    await feedbackUploads;
+    await sendFeedbackFields();
+    if (feedbackDirty || feedbackPending.length || !feedbackDraft) {
+      return sayFeedback("caution", feedbackDraft ? "The draft is not saved yet, or a file is still sending. Submit again once it is." : "Write the request before you submit it.");
+    }
+    try {
+      const answered = await call("/api/capture/submit", { revision: feedbackDraft.revision });
+      drawFeedbackDraft(answered.draft);
+      feedbackBox("result").hidden = true;
+    } catch (e) {
+      if (e instanceof ErrorAnswer && e.status === 409) {
+        await readFeedbackDraft();
+        sayFeedback("caution", "The draft changed, so it was read again. Press Submit to check it.");
+      } else {
+        sayFeedback("caution", `The request was not submitted: ${failedFeedback(e)}`);
+      }
+    }
+  });
 }
 
 function evidenceDetails(row, seen) {
@@ -597,6 +662,10 @@ function wireFeedback() {
   feedbackBox("context-again").addEventListener("click", captureFeedbackContext);
   feedbackBox("context-drop").addEventListener("click", dropFeedbackContext);
   document.getElementById("feedback-discard").addEventListener("click", discardFeedback);
+  feedbackBox("submit").addEventListener("click", () => {
+    trackAction("feedback-submit");
+    submitFeedback();
+  });
   document.getElementById("feedback-shot").addEventListener("click", () => {
     trackAction("feedback-screenshot");
     captureFeedbackScreen(false);

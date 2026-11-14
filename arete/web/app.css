@@ -179,6 +179,9 @@ dialog > .actions { margin: 14px 0 12px; }
 #feedback .limit { margin: 0; font-size: 13px; }
 #feedback-context-json { max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 #feedback-sending-text { max-height: 20vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+#feedback-checks { list-style: none; margin: 0; padding: 0; }
+#feedback-checks li { padding: 6px 0; }
+#feedback-checks .check-words { display: inline; overflow-wrap: anywhere; }
 #feedback-evidence { list-style: none; margin: 0; padding: 0; }
 #feedback-evidence li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 8px 0; }
 #feedback-evidence img, #feedback-evidence video { max-width: 200px; max-height: 150px; }

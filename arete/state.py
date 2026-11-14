@@ -361,7 +361,7 @@ CREATE TABLE IF NOT EXISTS usage (
 CREATE INDEX IF NOT EXISTS usage_at ON usage (at);
 CREATE TABLE IF NOT EXISTS captures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    status TEXT NOT NULL DEFAULT 'draft',   -- draft | discarded
+    status TEXT NOT NULL DEFAULT 'draft',   -- draft | checking | discarded
     kind TEXT DEFAULT 'idea',               -- idea | adjustment | bug
     text TEXT DEFAULT '',
     expected TEXT DEFAULT '',
@@ -370,9 +370,20 @@ CREATE TABLE IF NOT EXISTS captures (
     context TEXT DEFAULT '',                -- the snapshot's JSON text, or '' for none
     revision INTEGER DEFAULT 0,
     created TEXT,
-    updated TEXT
+    updated TEXT,
+    jev_cost_usd REAL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS captures_open ON captures (status) WHERE status = 'draft';
+CREATE TABLE IF NOT EXISTS capture_checks (
+    capture INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    result TEXT NOT NULL,          -- running | pass | hold | fail | interrupted
+    reason TEXT DEFAULT '',
+    detail TEXT DEFAULT '{}',      -- JSON
+    fingerprint TEXT DEFAULT '',   -- a hash of the inputs this check read
+    checked TEXT,
+    PRIMARY KEY (capture, name)
+);
 CREATE TABLE IF NOT EXISTS capture_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     capture INTEGER NOT NULL,      -- the captures row it is staged on
@@ -479,6 +490,7 @@ CREATE INDEX IF NOT EXISTS asks_run ON asks (run);
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+              ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("chats", "summary", "ALTER TABLE chats ADD COLUMN summary TEXT DEFAULT ''"),
               ("chats", "summarized_to", "ALTER TABLE chats ADD COLUMN summarized_to INTEGER DEFAULT 0"),
               ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
@@ -1788,21 +1800,69 @@ def add_usage(row: dict, keep_days: float) -> None:
         c.execute("DELETE FROM usage WHERE at < ?", (util.iso(util.now() - timedelta(days=keep_days)),))
 
 
+OPEN_CAPTURE = "status IN ('draft', 'checking')"
+
+
 def capture_draft(connect=db) -> dict | None:
     with connect() as c:
-        r = c.execute("SELECT * FROM captures WHERE status = 'draft'").fetchone()
+        r = c.execute(f"SELECT * FROM captures WHERE {OPEN_CAPTURE}").fetchone()
         if not r:
             return None
         draft = dict(r)
         draft["evidence"] = [dict(e) for e in c.execute(
             "SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft["id"],))]
+        draft["checks"] = {k["name"]: {**dict(k), "detail": json.loads(k["detail"] or "{}")} for k in c.execute(
+            "SELECT * FROM capture_checks WHERE capture = ?", (draft["id"],))}
         return draft
+
+
+def capture_begin_checks(draft_id: int, revision: int, prints: dict[str, str]) -> bool:
+    with db() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        changed = c.execute("UPDATE captures SET status = 'checking' WHERE id = ? AND status = 'draft' AND revision = ?",
+                            (draft_id, revision)).rowcount
+        if not changed:
+            return False
+        for name, print_ in prints.items():
+            c.execute("INSERT OR REPLACE INTO capture_checks (capture, name, result, reason, detail, fingerprint, checked) "
+                      "VALUES (?, ?, 'running', '', '{}', ?, ?)", (draft_id, name, print_, util.iso()))
+        return True
+
+
+def capture_check_done(draft_id: int, name: str, result: str, reason: str, detail: dict, cost: float) -> bool:
+    with db() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        changed = c.execute(
+            "UPDATE capture_checks SET result = ?, reason = ?, detail = ?, checked = ? WHERE capture = ? AND name = ? "
+            "AND result = 'running' AND EXISTS (SELECT 1 FROM captures WHERE id = ? AND status = 'checking')",
+            (result, reason, json.dumps(detail), util.iso(), draft_id, name, draft_id)).rowcount
+        if changed:
+            c.execute("UPDATE captures SET jev_cost_usd = COALESCE(jev_cost_usd, 0) + ? WHERE id = ?", (cost, draft_id))
+        return bool(changed)
+
+
+def capture_end_checks(draft_id: int | None, reason: str) -> None:
+    with db() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        args = () if draft_id is None else (draft_id,)
+        c.execute("UPDATE capture_checks SET result = 'interrupted', reason = ?, checked = ? WHERE result = 'running'"
+                  + ("" if draft_id is None else " AND capture = ?"), (reason, util.iso(), *args))
+        c.execute("UPDATE captures SET status = 'draft' WHERE status = 'checking'"
+                  + ("" if draft_id is None else " AND id = ?"), args)
+
+
+def capture_checking(connect=db) -> bool:
+    with connect() as c:
+        return c.execute("SELECT 1 FROM captures WHERE status = 'checking'").fetchone() is not None
 
 
 def capture_evidence(evidence_id: int, connect=db) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT e.* FROM capture_evidence e JOIN captures k ON k.id = e.capture "
-                      "WHERE e.id = ? AND k.status = 'draft'", (evidence_id,)).fetchone()
+                      "WHERE e.id = ? AND k.status IN ('draft', 'checking')", (evidence_id,)).fetchone()
         return dict(r) if r else None
 
 
@@ -1811,7 +1871,7 @@ def capture_stage(row: dict, admit, keep) -> tuple[dict, bool]:
     with db() as c:
         if not c.in_transaction:
             c.execute("BEGIN IMMEDIATE")
-        draft = c.execute("SELECT id FROM captures WHERE status = 'draft'").fetchone()
+        draft = c.execute(f"SELECT id FROM captures WHERE {OPEN_CAPTURE}").fetchone()
         draft_id = draft["id"] if draft else c.execute(
             "INSERT INTO captures (status, revision, created, updated) VALUES ('draft', 0, ?, ?)", (now, now)).lastrowid
         held = [dict(r) for r in c.execute("SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft_id,))]
@@ -1832,7 +1892,7 @@ def capture_drop_evidence(evidence_id: int) -> dict | None:
         if not c.in_transaction:
             c.execute("BEGIN IMMEDIATE")
         r = c.execute("SELECT e.* FROM capture_evidence e JOIN captures k ON k.id = e.capture "
-                      "WHERE e.id = ? AND k.status = 'draft'", (evidence_id,)).fetchone()
+                      "WHERE e.id = ? AND k.status IN ('draft', 'checking')", (evidence_id,)).fetchone()
         if not r:
             return None
         c.execute("DELETE FROM capture_evidence WHERE id = ?", (evidence_id,))
@@ -1845,7 +1905,7 @@ def capture_save(**fields) -> None:
     names = list(fields)
     sets = "".join(f"{n} = ?, " for n in names)
     with db() as c:
-        changed = c.execute(f"UPDATE captures SET {sets}revision = revision + 1, updated = ? WHERE status = 'draft'",
+        changed = c.execute(f"UPDATE captures SET {sets}revision = revision + 1, updated = ? WHERE {OPEN_CAPTURE}",
                             (*fields.values(), now)).rowcount
         if not changed:
             c.execute(f"INSERT INTO captures ({', '.join(names)}, status, revision, created, updated) "
@@ -1856,10 +1916,11 @@ def capture_discard() -> int | None:
     with db() as c:
         if not c.in_transaction:
             c.execute("BEGIN IMMEDIATE")
-        draft = c.execute("SELECT id FROM captures WHERE status = 'draft'").fetchone()
+        draft = c.execute(f"SELECT id FROM captures WHERE {OPEN_CAPTURE}").fetchone()
         if not draft:
             return None
         c.execute("DELETE FROM capture_evidence WHERE capture = ?", (draft["id"],))
+        c.execute("DELETE FROM capture_checks WHERE capture = ?", (draft["id"],))
         c.execute("UPDATE captures SET status = 'discarded', revision = revision + 1, updated = ? WHERE id = ?",
                   (util.iso(), draft["id"]))
         return draft["id"]

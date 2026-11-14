@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import NoReturn
 
 from . import (
+    capture,
     chat,
     config,
     control,
@@ -390,6 +391,8 @@ class Server:
             return "the dashboard is still answering a request"
         if chat.any_busy():
             return "a chat message is still running"
+        if capture.checking():
+            return "a feedback check is still running"
         return ""
 
     def load_new_code(self) -> None:

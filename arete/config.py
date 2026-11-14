@@ -34,6 +34,7 @@ TIER_KEYS = ("runner", "provider", "model")
 PAYMENT_MODES = ("subscription", "api_key", "local")
 DOCUMENT_KINDS = ("message", "ticket", "pr", "doc")
 DOCUMENT_KEYS = ("enabled", "voice", "style", "words")
+CAPTURE_KEYS = ("vision",)
 DOCUMENT_WORDS = {"message": (20, 60), "ticket": (80, 140)}
 WORD_KINDS = ("message", "ticket", "pr")
 KINDS = ("feat", "fix")
@@ -250,6 +251,7 @@ class Config:
     retention: Retention = field(default_factory=Retention)
     chat: ChatConfig = field(default_factory=ChatConfig)
     document: dict = field(default_factory=dict)
+    capture_vision: str = ""
     oncall: OncallConfig = field(default_factory=OncallConfig)
 
     def repo(self, name: str) -> Repo:
@@ -626,6 +628,22 @@ def voice_file(entry, folder: Path) -> str:
     return str(found)
 
 
+def capture_table(data, folder: Path) -> str:
+    table = table_of(data, "capture")
+    if bad := sorted(set(table) - set(CAPTURE_KEYS)):
+        raise ValueError(f"[capture]: unknown key {', '.join(bad)}; use {', '.join(CAPTURE_KEYS)}")
+    named = table.get("vision", "")
+    if not isinstance(named, str):
+        raise TypeError(f"[capture] vision must be a file name, not {named!r}")
+    if not named.strip():
+        return ""
+    entry = Path(named)
+    found = (folder / entry).resolve()
+    if entry.is_absolute() or ".." in entry.parts or not found.is_relative_to(folder.resolve()):
+        raise ValueError(f"[capture] vision: {named!r} is not a file in {paths.short_path(folder)}")
+    return str(found)
+
+
 def word_range(kind: str, value) -> tuple[int, int]:
     whole = isinstance(value, list) and len(value) == 2 and all(type(n) is int for n in value)
     if kind not in WORD_KINDS or not whole or not 1 <= value[0] <= value[1]:
@@ -821,6 +839,7 @@ def load(path: Path | None = None) -> Config:
     cfg.chat = chat_table(data.get("chat") or {})
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent)
+    cfg.capture_vision = capture_table(data.get("capture") or {}, path.parent)
     from . import steps
     steps.check(cfg, defer_tiers=True)
     return cfg
