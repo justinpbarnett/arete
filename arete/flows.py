@@ -380,7 +380,7 @@ class Job:
                 cfg=self.cfg, run=self.run, ticket=self.ticket, ws=self.ws, checkouts=self.checkouts, layer=self.layer,
                 timeout=self.layer.timeout_minutes * 60, workspace=self.workspace, attachments=self.attachments,
                 tools=pipeline.bash_rules(self.builder_bash), deny=diffguard.denied_paths(self.layer),
-                expertise=self.expertise, left_for_a_person=self.left_for_a_person, check_commands=self.checks,
+                left_for_a_person=self.left_for_a_person, check_commands=self.checks,
                 from_base=self.run.alone or bool(self.run.repairs) or self.carried, plan_text=self.plan_text, build_summary=self.build_summary)
         return self.built
 
@@ -858,8 +858,8 @@ def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: in
 @factory.step("learn")
 def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
     job: Job = flow.ctx
-    pipeline._learn(job.run, job.ws, job.layer.expertise_file, job.ticket.title, job.expertise, apply=apply)
-    return Outcome("pass", data={"applied": apply})
+    commit = pipeline._learn(job.run, job.ws, job.layer.expertise_file, job.ticket.title, apply=apply)
+    return Outcome("pass", data={"applied": apply, "commit": commit})
 
 
 def documents(job: Job) -> bool:

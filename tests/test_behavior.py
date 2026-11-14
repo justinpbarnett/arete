@@ -161,6 +161,8 @@ REVIEW_ROUNDS = {
                               {"summary": "B1 fixed, new break.", "problems": [REGRESSION], "earlier": [FIXED]}],
     "review-severity-slip": [{"summary": "Slip.", "problems": [note("Critical", "fixture slip", category="issue")]},
                              {"summary": "Still.", "problems": [], "earlier": [{"id": "B1", "status": "open", "why": "no"}]}],
+    "review-fix-breaks-check": [{"summary": "B1 open.", "problems": [BLOCKER, MAJOR]},
+                                {"summary": "B1 fixed.", "problems": [MAJOR_2], "earlier": [FIXED]}],
     "review-problems-missing": [{"verdict": "approve", "summary": "Fine."}],
     "review-earlier-omitted": [{"summary": "B1 open.", "problems": [BLOCKER]},
                                {"summary": "Looks fine.", "problems": []}],
@@ -188,8 +190,9 @@ if scenario == "failed-check":
     layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "exit 7"))
 elif scenario == "missing-verification":
     (root / "sample/replay/verify.json").unlink()
-elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault"):
-    cause = "change" if scenario == "verify-change-fault" else "environment"
+elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "verify-change-fault",
+                  "verify-change-fault-timed", "verify-fix-breaks-check"):
+    cause = "change" if scenario.startswith(("verify-change-fault", "verify-fix-breaks")) else "environment"
     answers = root / "sample/replay"
     failing = json.loads((answers / "verify.json").read_text())
     failing["structured"] = {"verdict": "pass" if scenario.endswith("-pass") else "fail", "summary": "The check could not run.", "checks": [
@@ -198,6 +201,19 @@ elif scenario in ("verify-environment-fault", "verify-environment-fault-pass", "
     (answers / "verify2.json").write_text((answers / "verify.json").read_text())
     (answers / "verify.json").write_text(json.dumps(failing))
     (answers / "verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    checks_in_verification, real_checks = [], pipeline.run_checks
+    def timed_checks(layer, cwd, git_dirs, run, *args, **kw):
+        checks_in_verification.append(bool(run.budget and run.budget.verification_active_since))
+        return real_checks(layer, cwd, git_dirs, run, *args, **kw)
+    pipeline.run_checks = timed_checks
+    if scenario == "verify-fix-breaks-check":
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace(
+            "[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+        layer = root / "sample/layer/config.toml"
+        layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && ! grep -q quince notes.txt"))
+        (answers / "verify_fix.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+        (answers / "check_repair.json").write_text(json.dumps({"text": "Removed quince.", "ok": True}))
+        (answers / "check_repair.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,2 @@\n A small file for replay checks.\n kumquat\n-quince\n")
 elif scenario in ("verify-start-denied", "verify-start-crash"):
     urllib.request.urlopen = mock.Mock(side_effect=OSError("refused"))
     layer = root / "sample/layer/config.toml"
@@ -228,6 +244,13 @@ elif scenario in REVIEW_ROUNDS:
         (replays / "verify2.json").write_text((replays / "verify.json").read_text())
         (replays / "review_fix.json").write_text(json.dumps({"text": "B1 fixed: quince is listed after kumquat.", "ok": True}))
         (replays / "review_fix.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+    if scenario == "review-fix-breaks-check":
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace(
+            "[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+        layer = root / "sample/layer/config.toml"
+        layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && ! grep -q quince notes.txt"))
+        (replays / "check_repair1_2.json").write_text(json.dumps({"text": "Removed quince.", "ok": True}))
+        (replays / "check_repair1_2.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,2 @@\n A small file for replay checks.\n kumquat\n-quince\n")
 elif scenario in BLOCKED_CHECKS:
     answer = root / "sample/replay/verify.json"
     said = json.loads(answer.read_text())
@@ -522,7 +545,7 @@ if scenario.startswith("fix-ask"):
               "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
               "merges": [{k: m.get(k) for k in ("outcome", "error")} for m in merges], "merged_first": merged_first,
               "same_session": bool(session(first)) and session(first) == session(events),
-              "answered": "Main now has the fix." in prompt,
+              "answered": "Main now has the fix." in prompt, "prompt": prompt, "parked_id": parked["id"],
               "taken": [a["taken_by"] for a in state.asks_of(parked["id"])]}
     branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines() if b != "refs/heads/main"]
     if branches:
@@ -671,13 +694,100 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], origin) if len(branches) == 1 else ""
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
+if scenario.startswith("learn-"):
+    import subprocess
+    paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace("max_parallel=1", "max_parallel=2").replace(
+        "[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+    layer_dir = root / "sample/layer"
+    (layer_dir / "config.toml").write_text((layer_dir / "config.toml").read_text().replace("grep -q kumquat", "grep -q quince"))
+    answers = root / "sample/replay"
+    (answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    (answers / "fix2.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+    LESSON_A, LESSON_B = "- `notes.txt`: lesson A from the first run.", "- `notes.txt`: lesson B from the second run."
+    def learning(*lessons):
+        added = [l.split(": ", 1)[1] for l in lessons]
+        return json.dumps({"text": "Learned.", "structured": {"expertise": "# Expertise\n\n## Notes\n" + "\n".join(lessons),
+                                                              "added": added, "removed": []}})
+    other_answers = root / "sample/replay-b"
+    import shutil
+    shutil.copytree(answers, other_answers)
+    (answers / "learn.json").write_text(learning(LESSON_A))
+    (other_answers / "learn.json").write_text(learning(LESSON_B))
+    overlapping = scenario.startswith("learn-overlap")
+    if scenario == "learn-overlap":
+        (answers / "learn2.json").write_text(learning(LESSON_A, LESSON_B))
+    elif scenario == "learn-unrelated-file":
+        pipeline.git(["init", "-q"], layer_dir)
+        pipeline.git(["add", "config.toml"], layer_dir)
+        pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "layer"], layer_dir)
+        with (layer_dir / "config.toml").open("a") as out:
+            out.write("\n# edited by hand\n")
+        (layer_dir / "config.toml.bak").write_text("backup\n")
+    other, child = None, []
+    if overlapping:
+        other = state.task_add("replay-sample", "Add kumquat again", "Add kumquat again", "feat")
+        second_run = """
+import runpy, sys, urllib.request
+from pathlib import Path
+from arete import accounts, factory, gh, paths
+def forbidden(*args, **kwargs):
+    raise AssertionError("offline workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+gh.gh = forbidden
+import importlib.util
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = Path(sys.argv[1]) / "authority-parent/verification-authority"
+feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+try:
+    factory.main(feature, sys.argv[2:])
+except SystemExit:
+    pass
+"""
+        source = str(Path(pipeline.__file__).resolve().parent.parent)
+        real_launch, started = runner.run, []
+        def overlapping_launch(prompt, cwd, **kw):
+            trace = kw.get("trace") or ()
+            if not started and len(trace) > 1 and trace[1] == "learn":
+                started.append(True)
+                done = subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{source!r});" + second_run,
+                                       str(root), "replay-sample", other, "--force"],
+                                      env={**os.environ, "ARETE_REPLAY_DIR": str(other_answers)}, timeout=90,
+                                      capture_output=True, text=True)
+                child.append(done.stderr[-2000:] if done.returncode else "")
+            return real_launch(prompt, cwd, **kw)
+        runner.run = overlapping_launch
+    row = forced()
+    gitlog = lambda *args: pipeline.git(["log", *args], layer_dir) if (layer_dir / ".git").exists() else ""
+    result = {"status": row["status"], "child": child, "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
+              "expertise": (layer_dir / "expertise.md").read_text() if (layer_dir / "expertise.md").exists() else "",
+              "run_expertise": (paths.RUNS_DIR / row["id"] / "expertise.md").read_text() if (paths.RUNS_DIR / row["id"] / "expertise.md").exists() else "",
+              "subjects": gitlog("--format=%s").splitlines(), "names": gitlog("--format=", "--name-only").split(),
+              "head": pipeline.git(["rev-parse", "HEAD"], layer_dir).strip() if (layer_dir / ".git").exists() else "",
+              "recorded": (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").read_text().strip()
+                          if (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").exists() else "",
+              "other": state.ticket_runs("replay-sample", other, whole=True)[0]["status"] if other else "",
+              "learn2_prompt": ""}
+    for file in record.record_files(row["id"]):
+        if "learn2" in file.name:
+            result["learn2_prompt"] = str(json.loads(next(record.raw_lines(file))).get("prompt"))
+    if scenario == "learn-unrelated-file":
+        result["last_commit"] = pipeline.git(["show", "--name-only", "--format=", "HEAD"], layer_dir).split()
+        result["status_short"] = pipeline.git(["status", "--short"], layer_dir).splitlines()
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
 row = forced("--dry-run") if scenario == "review-notes-dry-run" else forced()
-events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+events =[json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
                 if e.get("event") == "step_end" and e.get("step") == "verify"]
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
           "verified":[v["verdict"] for v in verification if v],
           "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], root / "sample/origin.git")}
+if scenario == "verify-change-fault-timed":
+    result["checks_in_verification"] = checks_in_verification
 if scenario == "edited-after-held-pr":
     result["old"] = old
     result["log"] = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
@@ -714,6 +824,35 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
                            if line.startswith("BEHAVIOR_RESULT=")), None)
             self.assertIsNotNone(output, result.stdout + result.stderr)
             return json.loads(output)
+
+    def test_overlapping_runs_keep_each_others_lessons(self):
+        result = self.workflow("learn-overlap")
+        self.assertEqual(result["child"], [""])
+        self.assertEqual((result["status"], result["other"]), ("done", "done"), result["log"])
+        self.assertIn("lesson A", result["expertise"])
+        self.assertIn("lesson B", result["expertise"])
+        self.assertIn("lesson B", result["learn2_prompt"])
+        self.assertIn("so the learn step runs again", result["log"])
+        self.assertEqual(len([s for s in result["subjects"] if "learn from" in s]), 2)
+        self.assertEqual(set(result["names"]), {"expertise.md"})
+        self.assertEqual(result["recorded"], result["head"])
+
+    def test_overlapping_run_whose_second_learn_pass_fails_writes_nothing_of_its_own(self):
+        result = self.workflow("learn-overlap-no-second-answer")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertIn("lesson B", result["expertise"])
+        self.assertNotIn("lesson A", result["expertise"])
+        self.assertIn("saved in the run, not applied", result["log"])
+        self.assertIn("lesson A", result["run_expertise"])
+        self.assertEqual(len([s for s in result["subjects"] if "learn from" in s]), 1)
+
+    def test_learn_commit_leaves_unrelated_layer_files_out(self):
+        result = self.workflow("learn-unrelated-file")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["last_commit"], ["expertise.md"])
+        self.assertIn(" M config.toml", result["status_short"])
+        self.assertIn("?? config.toml.bak", result["status_short"])
+        self.assertIn("lesson A", result["expertise"])
 
     def test_complete_local_workflow_publishes_verified_change(self):
         result = self.workflow("pass")
@@ -771,6 +910,11 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["taken"], [result["id"]])
         self.assertIn("kumquat", result["notes"])
         self.assertEqual(result["moved_file"].strip(), "moved")
+
+    def test_answered_run_resumes_the_session_with_the_new_run_folder_and_its_checks_path(self):
+        result = self.workflow("fix-ask-still")
+        self.assertIn(f"{result['id']}/checks NAME`", result["prompt"])
+        self.assertNotIn(result["parked_id"], result["prompt"])
 
     def test_answered_run_with_an_unmoved_base_writes_no_base_merge(self):
         result = self.workflow("fix-ask-still")
@@ -1113,6 +1257,19 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("verify_fix", result["steps"])
         self.assertEqual(result["verified"], ["pass"])
 
+    def test_check_broken_by_a_verify_fix_gets_a_repair_before_the_run_fails(self):
+        result = self.workflow("verify-fix-breaks-check")
+        self.assertIn("verify_fix", result["steps"])
+        self.assertIn("check_repair", result["steps"])
+        self.assertNotIn("the checks failed after", result["summary"])
+        self.assertEqual(result["status"], "done", result["summary"])
+
+    def test_checks_run_again_after_a_verify_fix_count_as_run_time_not_verification_time(self):
+        result = self.workflow("verify-change-fault-timed")
+        self.assertIn("verify_fix", result["steps"])
+        self.assertEqual(result["verified"], ["pass"])
+        self.assertEqual(result["checks_in_verification"], [False, False])
+
     def test_app_start_denied_by_the_sandbox_is_blocked_without_a_repair(self):
         result = self.workflow("verify-start-denied")
         self.assertEqual(result["verified"], ["blocked"])
@@ -1164,6 +1321,12 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         for text in ("B1", "fixture major note", "[issue]"):
             self.assertIn(text, result["fix_prompt"])
         self.assertEqual(len(result["review"]["notes"]), 1)
+
+    def test_check_broken_by_a_review_fix_gets_a_repair_before_the_run_fails(self):
+        result = self.workflow("review-fix-breaks-check")
+        self.assertIn("check_repair1_2", result["steps"])
+        self.assertNotIn("the checks failed after", result["summary"])
+        self.assertEqual(result["status"], "done", result["summary"])
 
     def test_security_blocker_cannot_be_waived(self):
         result = self.workflow("review-security-waived")
