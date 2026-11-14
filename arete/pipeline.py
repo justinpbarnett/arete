@@ -60,9 +60,11 @@ MAX_FIX_DIFF_IN_PROMPT = 20_000
 BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
 UNWAIVABLE = ("security", "data_loss")
 EARLIER_STATUSES = ("fixed", "open", "waived")
+NOTE_SEVERITIES = ("major", "minor")
 NO_FIX_REPLY = "The builder gave no reply."
+MAX_FIX_REPLY_IN_PROMPT = 4000
 NO_FIX_DIFF = "Arete could not read what changed; judge the diff above."
-REFUSAL_WORDS = re.compile(r"guard|jev|credential", re.IGNORECASE)
+REFUSAL_WORDS = re.compile(r"guard|jev|credential|secret|confine|authority", re.IGNORECASE)
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
@@ -2675,7 +2677,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                                                           fixed_since(b, before.get("trees") or {}))),
                       b.ws, role="review", allowed_tools=bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA)
-    if not res.ok or not isinstance(res.structured, dict):
+    if not res.ok or not isinstance(res.structured, dict) or not isinstance(res.structured.get("problems"), list):
         return {"verdict": "request_changes", "summary": "review step failed", "problems": [], "failed": True,
                 "earlier": [{**p, "id": f"B{n}", "status": "open", "why": "the review step failed"}
                             for n, p in enumerate(earlier, 1)],
@@ -2697,19 +2699,27 @@ def settled(earlier: list[dict], answers) -> list[dict]:
     for n, p in enumerate(earlier, 1):
         answer = said.get(f"B{n}", {})
         status = answer.get("status") if answer.get("status") in EARLIER_STATUSES else "open"
-        if status == "waived" and p.get("category") in UNWAIVABLE:
+        if status == "waived" and (p.get("category") or "") in (*UNWAIVABLE, ""):
             status = "open"
         out.append({**p, "id": f"B{n}", "status": status, "why": str(answer.get("why") or "")})
     return out
 
 
+def stored_before_blockers(review: dict) -> bool:
+    return "earlier" not in review and review.get("verdict") == "request_changes"
+
+
+def is_note(review: dict, p: dict) -> bool:
+    return p["severity"] in NOTE_SEVERITIES and not stored_before_blockers(review)
+
+
 def blocking(review: dict) -> list[dict]:
-    return ([p for p in review_problems(review.get("problems")) if p["severity"] == "blocker"]
+    return ([p for p in review_problems(review.get("problems")) if not is_note(review, p)]
             + [e for e in review.get("earlier") or [] if e.get("status") == "open"])
 
 
 def review_notes(review: dict) -> list[dict]:
-    return [p for p in review_problems(review.get("problems")) if p["severity"] != "blocker"]
+    return [p for p in review_problems(review.get("problems")) if is_note(review, p)]
 
 
 def numbered(listed: list[dict]) -> str:
@@ -2733,7 +2743,7 @@ def review_lists(review: dict) -> str:
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
     if not earlier:
         return ""
-    return prompt("review_earlier", blockers=numbered(earlier), reply=reply.strip() or NO_FIX_REPLY,
+    return prompt("review_earlier", blockers=numbered(earlier), reply=util.tail(reply.strip(), MAX_FIX_REPLY_IN_PROMPT) or NO_FIX_REPLY,
                   fixed=fixed or NO_FIX_DIFF)
 
 
@@ -2745,19 +2755,25 @@ def index_trees(checkouts: list[Checkout]) -> dict[str, str]:
 
 
 def fixed_since(b: Build, trees: dict[str, str]) -> str:
-    try:
-        return util.tail("".join(
-            checkout_patch(c, [n for n in b.staged.locks if n.startswith(c.prefix)], "--cached", trees[c.prefix])
-            for c in b.checkouts if trees.get(c.prefix)), MAX_FIX_DIFF_IN_PROMPT)
-    except RuntimeError:
-        return ""
+    parts = []
+    for c in b.checkouts:
+        if not trees.get(c.prefix):
+            continue
+        try:
+            parts.append(checkout_patch(c, [n for n in b.staged.locks if n.startswith(c.prefix)], "--cached",
+                                        trees[c.prefix]))
+        except RuntimeError:
+            continue
+    return util.tail("".join(parts), MAX_FIX_DIFF_IN_PROMPT)
 
 
 def review_problems(listed) -> list[dict]:
     if not isinstance(listed, list):
         return []
-    return [{"file": p.get("file") or "", "problem": p.get("problem") or "", "severity": p.get("severity") or "unrated",
-             "category": p.get("category") if p.get("category") in BLOCKER_CATEGORIES else ""}
+    return [{"file": p.get("file") or "", "problem": p.get("problem") or "",
+             "severity": str(p.get("severity") or "unrated").strip().lower(),
+             "category": str(p.get("category") or "").strip().lower()
+             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else ""}
             for p in listed if isinstance(p, dict)]
 
 
@@ -2939,8 +2955,12 @@ def draft_reason(review: dict, verified: verify.Verified, reviews: int = 0) -> s
     if approved:
         return ""
     if review.get("verdict") == "request_changes" and reviews:
+        left = len(blocking(review))
+        if review.get("failed"):
+            return (f"the last review failed after {util.count(reviews, 'review')}, with {util.count(left, 'earlier blocker')} "
+                    f"not rechecked")
         return (f"the review still requested changes after {util.count(reviews, 'review')}, the most the review "
-                f"step's tries allow, so {util.count(len(blocking(review)), 'blocker')} stay unresolved")
+                f"step's tries allow, so {util.count(left, 'blocker')} {'is' if left == 1 else 'are'} left unresolved")
     return "the review did not approve it"
 
 
