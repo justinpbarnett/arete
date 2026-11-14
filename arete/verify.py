@@ -7,6 +7,7 @@ import signal
 import socket
 import stat
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import config, environment, paths, scratch, util
+from . import config, environment, paths, scratch, util, vault
 from .util import git
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
@@ -136,16 +137,19 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         listen = scratch.listen_port(attempt, app, scratch.dashboard_ports())
         scratch.update_browser(attempt, listen=listen)
     command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
-    env = environment.commands(cfg or config.load(), repo, sets)
+    env, kept = environment.started(cfg or config.load(), repo, sets)
     if attempt:
-        env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k)}
+        env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
         env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
                     "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
                     "ARETE_WORKTREES_DIR": attempt.root + "/state/worktrees"})
-    with open(log, "w") as out, scratch.producing(attempt):
-        proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, env=env,
+    log.write_text("")
+    with scratch.producing(attempt):
+        proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
                              actor_confined=bool(attempt), **util.own_group_args())
+    pump = threading.Thread(target=write_hidden, args=(proc, log, set(kept.values())), daemon=True)
+    pump.start()
     if lifetime is not None:
         lifetime["stopped"] = False
     try:
@@ -153,6 +157,7 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         yield url
     finally:
         stop(proc)
+        pump.join(STOP_GRACE_SECONDS)
         if lifetime is not None:
             try:
                 os.killpg(proc.pid, 0)
@@ -179,6 +184,16 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
     raise ServerError(f"{url} did not answer within {seconds} seconds{output(log)}")
 
 
+def write_hidden(proc: subprocess.Popen, log: Path, given: set[str]) -> None:
+    try:
+        with open(log, "a") as out:
+            for line in proc.stdout:
+                out.write(vault.hidden(line.decode(errors="replace"), given))
+                out.flush()
+    except (OSError, ValueError):
+        pass
+
+
 def environment_fault(error: str) -> str:
     lines = error.splitlines()
     if not lines or not lines[0].startswith("the start command exited"):
@@ -188,7 +203,7 @@ def environment_fault(error: str) -> str:
 
 
 def output(log: Path) -> str:
-    text = util.tail(log.read_text(errors="replace").strip(), 3000)
+    text = vault.hidden(util.tail(log.read_text(errors="replace").strip(), 3000))
     return f"\n\n```\n{text}\n```" if text else "; the start command printed nothing"
 
 
