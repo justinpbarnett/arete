@@ -169,13 +169,15 @@ def relay_server(url: str) -> ThreadingHTTPServer:
             body = self.rfile.read(length) if length else None
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP | {"host"}}
             headers["Host"] = secure["via"].netloc if "via" in secure else target.netloc
+            plain = "via" not in secure
             try:
                 upstream = connect(target.hostname, target.port)
                 upstream.request(self.command, self.path, body, headers)
                 resp = upstream.getresponse()
-                if "via" not in secure and (moved := upgrade_target(resp, target.port)):
+                if plain and (moved := upgrade_target(resp, target.port)):
                     upstream.close()
-                    secure["via"] = moved
+                    secure.setdefault("via", moved)
+                    moved = secure["via"]
                     headers["Host"] = moved.netloc
                     upstream = connect(target.hostname, target.port)
                     upstream.request(self.command, self.path, body, headers)
