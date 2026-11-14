@@ -371,7 +371,8 @@ CREATE TABLE IF NOT EXISTS captures (
     revision INTEGER DEFAULT 0,
     created TEXT,
     updated TEXT,
-    jev_cost_usd REAL DEFAULT 0
+    jev_cost_usd REAL DEFAULT 0,
+    inspect_cost_usd REAL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS captures_open ON captures (status) WHERE status = 'draft';
 CREATE TABLE IF NOT EXISTS capture_checks (
@@ -394,7 +395,8 @@ CREATE TABLE IF NOT EXISTS capture_evidence (
     sha256 TEXT,
     source TEXT,                   -- screenshot | recording | attached
     seconds REAL,                  -- NULL when unknown
-    added TEXT
+    added TEXT,
+    inspection TEXT DEFAULT ''     -- the inspection result's JSON, or '' for none
 );
 CREATE UNIQUE INDEX IF NOT EXISTS capture_evidence_once ON capture_evidence (capture, sha256);
 CREATE TABLE IF NOT EXISTS vms (
@@ -491,7 +493,9 @@ CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT
 """
 MIGRATIONS = [("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
-              ("chats", "summary", "ALTER TABLE chats ADD COLUMN summary TEXT DEFAULT ''"),
+              ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
+              ("capture_evidence", "inspection", "ALTER TABLE capture_evidence ADD COLUMN inspection TEXT DEFAULT ''"),
+              ("chats", "summary","ALTER TABLE chats ADD COLUMN summary TEXT DEFAULT ''"),
               ("chats", "summarized_to", "ALTER TABLE chats ADD COLUMN summarized_to INTEGER DEFAULT 0"),
               ("chat_messages", "paid_usd", "ALTER TABLE chat_messages ADD COLUMN paid_usd REAL"),
               ("runs", "landed", "ALTER TABLE runs ADD COLUMN landed TEXT"),
@@ -1809,7 +1813,7 @@ def capture_draft(connect=db) -> dict | None:
         if not r:
             return None
         draft = dict(r)
-        draft["evidence"] = [dict(e) for e in c.execute(
+        draft["evidence"] = [{**dict(e), "inspection": json.loads(e["inspection"] or "{}")} for e in c.execute(
             "SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft["id"],))]
         draft["checks"] = {k["name"]: {**dict(k), "detail": json.loads(k["detail"] or "{}")} for k in c.execute(
             "SELECT * FROM capture_checks WHERE capture = ?", (draft["id"],))}
@@ -1841,6 +1845,20 @@ def capture_check_done(draft_id: int, name: str, result: str, reason: str, detai
         if changed:
             c.execute("UPDATE captures SET jev_cost_usd = COALESCE(jev_cost_usd, 0) + ? WHERE id = ?", (cost, draft_id))
         return bool(changed)
+
+
+def capture_inspected(evidence_id: int, sha256: str, inspection: dict, cost: float) -> bool:
+    with db() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT capture FROM capture_evidence WHERE id = ? AND sha256 = ?",
+                        (evidence_id, sha256)).fetchone()
+        if not row:
+            return False
+        c.execute("UPDATE capture_evidence SET inspection = ? WHERE id = ?", (json.dumps(inspection), evidence_id))
+        c.execute("UPDATE captures SET inspect_cost_usd = COALESCE(inspect_cost_usd, 0) + ? WHERE id = ?",
+                  (cost, row["capture"]))
+        return True
 
 
 def capture_end_checks(draft_id: int | None, reason: str) -> None:

@@ -5,10 +5,26 @@ import os
 import re
 import shutil
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import __version__, chat, config, gh, jev, outbound, paths, state, tracker, util, verdicts
+from . import (
+    __version__,
+    chat,
+    config,
+    gh,
+    jev,
+    outbound,
+    paths,
+    pipeline,
+    runner,
+    state,
+    steps,
+    tracker,
+    util,
+    verdicts,
+)
 
 MB = 1024 * 1024
 MOST_IMAGE_BYTES = 5 * MB
@@ -57,6 +73,18 @@ MISSING = {"what": "what should change", "where": "where it happens", "expected"
            "reproduce": "how to reproduce it"}
 SECRETS_QUESTION = ("Does this text hold a credential, such as a password, token or key, or private personal "
                     "information, such as an email address, phone number, home address or a person's private details?")
+FLAGS = {"credential": "a credential", "personal": "private personal information",
+         "private_address": "a private address", "agent_text": "text addressed to an agent"}
+LEAKS = ("credential", "personal", "private_address")
+MEDIA = ("image", "video")
+READS_EVIDENCE = ("injection", "publication")
+EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/webm": "webm", "video/mp4": "mp4"}
+EVIDENCE_SCHEMA = {"type": "object",
+                   "properties": {"viewed": {"type": "boolean"}, **{k: {"type": "boolean"} for k in FLAGS},
+                                  "saw": {"type": "string"}},
+                   "required": ["viewed", *FLAGS, "saw"]}
+NOT_INSPECTED_YET = "Not inspected yet. Submit inspects it."
+ROUTE_CHANGED = "The model or data handling it was inspected under has changed. Submit inspects it again."
 
 
 class Refused(ValueError):
@@ -309,17 +337,115 @@ def digest(*parts) -> str:
     return hashlib.sha256(json.dumps(parts, default=str).encode()).hexdigest()
 
 
+def evidence_route(cfg: config.Config) -> tuple[steps.Settings | None, str]:
+    try:
+        return steps.resolve(cfg, None, "capture_evidence"), ""
+    except (ValueError, TypeError) as e:
+        return None, util.first_line(str(e)) or type(e).__name__
+
+
+def route_print(route: tuple[steps.Settings | None, str]) -> str:
+    s, error = route
+    return digest(s.runner, s.model, s.requires.data_handling) if s else digest(error)
+
+
+def item_print(row: dict, route: tuple[steps.Settings | None, str]) -> str:
+    return digest(row["sha256"], route_print(route))
+
+
+def media_of(draft: dict) -> list[dict]:
+    return [e for e in draft["evidence"] if e["kind"] in MEDIA]
+
+
+def fresh(row: dict, route: tuple[steps.Settings | None, str]) -> bool:
+    found = row["inspection"]
+    return found.get("state") == "inspected" and found.get("print") == item_print(row, route)
+
+
+def inspection_view(row: dict, route: tuple[steps.Settings | None, str]) -> dict:
+    found = row["inspection"]
+    if fresh(row, route):
+        return {"inspected": True, "model": found["model"], "runner": found["runner"], "flags": found["flags"],
+                "saw": found["saw"], "why": ""}
+    if not found:
+        why = NOT_INSPECTED_YET
+    elif found.get("print") != item_print(row, route):
+        why = ROUTE_CHANGED
+    else:
+        why = found["why"]
+    return {"inspected": False, "model": "", "runner": "", "flags": [], "saw": "", "why": why}
+
+
+def outcome(print_: str, result: str, why: str = "", **found) -> dict:
+    return {"state": result, "print": print_, "why": why, "checked": util.iso(), **found}
+
+
+def complete(answer: dict) -> bool:
+    return (all(type(answer.get(k)) is bool for k in ("viewed", *FLAGS)) and isinstance(answer.get("saw"), str))
+
+
+def judged(res, row: dict, print_: str) -> dict:
+    answer = res.structured if res.ok and isinstance(res.structured, dict) else {}
+    if complete(answer) and answer["viewed"]:
+        saw = util.first_line(safe(answer["saw"]), 200) or "nothing described"
+        return outcome(print_, "inspected", model=res.model, runner=res.runner,
+                       flags=[k for k in FLAGS if answer[k]], saw=saw)
+    ineligible = [s for s in res.skipped if s["state"] == "ineligible"]
+    if runner.NO_ROUTE in res.error and ineligible:
+        reasons = "; ".join(f"{s['model']} ({s['runner']}): {s['detail']}" for s in ineligible)
+        return outcome(print_, "held", f"No route can inspect a {row['kind']}: {reasons}.")
+    why = util.first_line(res.error) or ("the model could not view the file" if complete(answer)
+                                         else "the answer was incomplete")
+    return outcome(print_, "unavailable", f"Inspection is unavailable ({why}).")
+
+
+def look_at(row: dict, draft_id: int, s: steps.Settings, print_: str, cfg: config.Config) -> tuple[dict, float]:
+    folder = CAPTURES_DIR / str(draft_id)
+    viewable = folder / f"{row['sha256']}.{EXTENSIONS[row['type']]}"
+    kept = tuple(m for m in s.requires.modalities if m not in MEDIA)
+    settings = replace(s, requires=replace(s.requires, modalities=(*kept, row["kind"]), structured_output=True))
+    text = pipeline.prompt("capture_evidence", file=viewable.name, kind=row["kind"])
+    try:
+        shutil.copyfile(folder / row["sha256"], viewable)
+        res = runner.run(text, folder, **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
+                         instructions=list(s.instructions), json_schema=EVIDENCE_SCHEMA, persist=False,
+                         wait_out_limits=False, hard_cap=True, tier=s.tier,
+                         trace=("", f"capture_evidence {row['sha256'][:12]}"), cfg=cfg, settings=settings)
+    finally:
+        viewable.unlink(missing_ok=True)
+    return judged(res, row, print_), res.paid_usd
+
+
+def inspect_item(row: dict, draft_id: int, route: tuple[steps.Settings | None, str], cfg: config.Config) -> None:
+    s, error = route
+    print_ = item_print(row, route)
+    if s:
+        inspection, cost = look_at(row, draft_id, s, print_, cfg)
+    else:
+        inspection, cost = outcome(print_, "unavailable", f"Inspection is unavailable ({error})."), 0.0
+    state.capture_inspected(row["id"], row["sha256"], inspection, cost)
+    row["inspection"] = inspection
+
+
+def inspect_media(draft: dict, cfg: config.Config) -> None:
+    route = evidence_route(cfg)
+    for row in media_of(draft):
+        if not fresh(row, route):
+            inspect_item(row, draft["id"], route, cfg)
+
+
 def fingerprints(draft: dict, cfg: config.Config) -> dict[str, str]:
     bug = draft["kind"] == "bug"
     request = [draft["kind"], draft["text"], *(draft[k] for k in ("expected", "actual", "steps") if bug)]
     model = cfg.jev.model
     items = [(e["name"], e["kind"], e["sha256"]) for e in draft["evidence"]]
+    route = [route_print(evidence_route(cfg))] if media_of(draft) else []
     sure = cfg.jev.confidence
     return {"vision": digest(request, vision_of(cfg)["version"], model, sure),
             "duplicates": digest(request, chat.arete_repo(cfg).github, model, sure),
             "actionable": digest(request, model, sure),
-            "injection": digest(request, draft["context"], evidence_names(draft), model, cfg.jev.injection),
-            "publication": digest(request, draft["context"], items, model, cfg.jev.secrets_hold)}
+            "injection": digest(request, draft["context"], items, model, cfg.jev.injection, *route),
+            "publication": digest(request, draft["context"], items, model, cfg.jev.secrets_hold, *route)}
 
 
 def stale(row: dict, print_: str, name: str) -> bool:
@@ -331,9 +457,11 @@ def stale(row: dict, print_: str, name: str) -> bool:
             and util.now() - util.parse_iso(row["checked"]) > timedelta(seconds=DUPLICATES_FRESH_SECONDS))
 
 
-def due_checks(draft: dict, prints: dict[str, str]) -> list[str]:
+def due_checks(draft: dict, prints: dict[str, str], route: tuple[steps.Settings | None, str]) -> list[str]:
     rows = draft["checks"]
-    return [n for n in CHECKS if n not in rows or rows[n]["result"] != "pass" or stale(rows[n], prints[n], n)]
+    unread = any(not fresh(e, route) for e in media_of(draft))
+    return [n for n in CHECKS if n not in rows or rows[n]["result"] != "pass" or stale(rows[n], prints[n], n)
+            or (unread and n in READS_EVIDENCE)]
 
 
 def shown(draft: dict) -> dict:
@@ -346,10 +474,14 @@ def shown(draft: dict) -> dict:
                        "reason": row["reason"] if row else "", "stale": bool(row) and stale(row, prints[name], name),
                        "checked": row["checked"] if row else "", "detail": row["detail"] if row else {}})
     vision = vision_of(cfg)
+    route = evidence_route(cfg)
+    evidence = [{**e, "inspection": inspection_view(e, route)} for e in draft["evidence"]]
     ready = draft["status"] == "draft" and all(c["result"] == "pass" and not c["stale"] for c in checks)
-    return {**{k: v for k, v in draft.items() if k != "checks"}, "checks": checks, "outgoing": outgoing(draft),
+    return {**{k: v for k, v in draft.items() if k not in ("checks", "evidence")}, "evidence": evidence,
+            "checks": checks, "outgoing": outgoing(draft),
             "vision": {k: vision[k] for k in ("path", "version", "setting")},
-            "jev_cost_usd": draft.get("jev_cost_usd") or 0.0, "ready": ready,
+            "jev_cost_usd": draft.get("jev_cost_usd") or 0.0,
+            "inspect_cost_usd": draft.get("inspect_cost_usd") or 0.0, "ready": ready,
             "summary": summary(draft["status"], checks, ready)}
 
 
@@ -490,7 +622,19 @@ def check_actionable(draft: dict, cfg: config.Config) -> tuple[str, str, dict, f
     return "hold", reason, {"missing": missing}, reply.cost_usd
 
 
+def evidence_detail(draft: dict, route: tuple[steps.Settings | None, str]) -> dict:
+    media = media_of(draft)
+    return {"evidence": [{"name": e["name"], **inspection_view(e, route)} for e in media]} if media else {}
+
+
 def check_injection(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float]:
+    route = evidence_route(cfg)
+    media = media_of(draft)
+    detail = evidence_detail(draft, route)
+    if addressed := [e for e in media if fresh(e, route) and "agent_text" in e["inspection"]["flags"]]:
+        seen = "; ".join(f"{e['name']} holds text addressed to an agent ({e['inspection']['saw']})" for e in addressed)
+        return "fail", f"{seen}. Remove it and Submit again.", detail, 0.0
+    unread = [e["name"] for e in media if not fresh(e, route)]
     names = evidence_names(draft)
     text = "\n\n".join(filter(None, [request_text(draft), f"App state:\n{draft['context']}" if draft["context"] else "",
                                      "Evidence names:\n" + "\n".join(names) if names else ""]))
@@ -503,9 +647,12 @@ def check_injection(draft: dict, cfg: config.Config) -> tuple[str, str, dict, fl
     if answer.yes >= line:
         reason = f"This text reads as instructions for an agent (p {answer.yes:.2f}, line {line:g}). Describe the problem only."
         keep_verdict(draft, "injection", scores, reason)
-        return "fail", reason, {}, reply.cost_usd
+        return "fail", reason, detail, reply.cost_usd
     keep_verdict(draft, "injection", scores, "")
-    return "pass", f"No instructions for an agent found (p {answer.yes:.2f}, line {line:g}).", {}, reply.cost_usd
+    passed = f"No instructions for an agent found (p {answer.yes:.2f}, line {line:g})."
+    if unread:
+        passed += f" {', '.join(unread)} was not read, and Publication safety holds it."
+    return "pass", passed, detail, reply.cost_usd
 
 
 def secret_fields(draft: dict) -> list[str]:
@@ -518,24 +665,37 @@ def check_publication(draft: dict, cfg: config.Config) -> tuple[str, str, dict, 
     if found := secret_fields(draft):
         return ("fail", f"This looks like it holds a key or token in: {', '.join(found)}. Remove it and Submit again.",
                 {"fields": found}, 0.0)
+    route = evidence_route(cfg)
+    media = media_of(draft)
+    detail = evidence_detail(draft, route)
     sending = outgoing(draft)
     reply = asked(cfg, f"{sending['title']}\n\n{sending['body']}", {"secrets": jev.yes_no(SECRETS_QUESTION)})
     answer = reply.answers.get("secrets")
-    if not answer:
-        return unavailable(reply)
     line = cfg.jev.secrets_hold
-    scores = {"secrets": verdicts.scored(answer.yes, line)}
-    held = ""
-    if answer.yes >= line:
-        held = (f"JEV thinks this text holds a credential or private personal information (p {answer.yes:.2f}, "
-                f"line {line:g}). Remove it and Submit again.")
-    elif media := [e["name"] for e in draft["evidence"] if e["kind"] in ("image", "video")]:
-        held = (f"Evidence inspection is not available, so {', '.join(media)} was not inspected for credentials or "
-                f"private information. It stays staged; check it yourself before filing.")
-    keep_verdict(draft, "publication", scores, held)
-    if held:
-        return "hold", held, {}, reply.cost_usd
-    return "pass", f"No credential or private information found in the text (p {answer.yes:.2f}, line {line:g}).", {}, reply.cost_usd
+    scores, held_text = {}, ""
+    if not answer:
+        held_text = unavailable(reply)[1]
+    else:
+        scores = {"secrets": verdicts.scored(answer.yes, line)}
+        if answer.yes >= line:
+            held_text = (f"JEV thinks this text holds a credential or private personal information (p "
+                         f"{answer.yes:.2f}, line {line:g}). Remove it and Submit again.")
+    leaks = [f"{e['name']} shows {', '.join(FLAGS[k] for k in LEAKS if k in e['inspection']['flags'])} "
+             f"({e['inspection']['saw']})" for e in media
+             if fresh(e, route) and any(k in e["inspection"]["flags"] for k in LEAKS)]
+    unseen = [f"{e['name']}: {inspection_view(e, route)['why']}" for e in media if not fresh(e, route)]
+    if leaks:
+        result, reason = "fail", f"{'; '.join(leaks)}. Remove it and Submit again."
+    elif held_text or unseen:
+        said = f"Not inspected, so it stays staged: {' '.join(unseen)}" if unseen else ""
+        result, reason = "hold", " ".join(filter(None, [held_text, said]))
+    else:
+        result = "pass"
+        reason = (f"No credential or private information found in the text (p {answer.yes:.2f}, line {line:g})."
+                  + (f" {util.count(len(media), 'item')} inspected, nothing sensitive found." if media else ""))
+    if answer:
+        keep_verdict(draft, "publication", scores, "" if result == "pass" else reason)
+    return result, reason, detail, reply.cost_usd
 
 
 RUNNERS = {"vision": check_vision, "duplicates": check_duplicates, "actionable": check_actionable,
@@ -543,9 +703,13 @@ RUNNERS = {"vision": check_vision, "duplicates": check_duplicates, "actionable":
 
 
 def run_checks(draft: dict, cfg: config.Config, due: list[str]) -> None:
+    inspected = False
     try:
         for name in due:
             try:
+                if name in READS_EVIDENCE and not inspected:
+                    inspected = True
+                    inspect_media(draft, cfg)
                 result, reason, detail, cost = RUNNERS[name](draft, cfg)
             except Exception as e:
                 result, reason, detail, cost = "hold", f"Not checked: {util.first_line(str(e)) or type(e).__name__}", {}, 0.0
@@ -571,7 +735,7 @@ def submit(body: dict) -> dict:
         if not draft["text"].strip():
             raise Refused("Write the request before you submit it.")
         prints = fingerprints(draft, cfg)
-        due = due_checks(draft, prints)
+        due = due_checks(draft, prints, evidence_route(cfg))
         if due:
             if not state.capture_begin_checks(draft["id"], revision, {n: prints[n] for n in due}):
                 raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")

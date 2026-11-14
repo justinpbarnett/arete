@@ -23,6 +23,7 @@ const FEEDBACK_RECORDER_TYPES = ["video/webm;codecs=vp9", "video/webm;codecs=vp8
 const FEEDBACK_NO_CAPTURE = "This browser cannot capture the screen here. Take a screenshot with the device and use Attach a file.";
 const FEEDBACK_LABELS = { text: "Request", expected: "Expected", actual: "Actual", steps: "Steps" };
 const FEEDBACK_LENGTH_SLACK = 0.5;
+const FEEDBACK_FLAGS = { credential: "a credential", personal: "private personal information", private_address: "a private address", agent_text: "text addressed to an agent" };
 let feedbackLimits = { image_bytes: 5 * FEEDBACK_MB, video_bytes: 25 * FEEDBACK_MB, evidence_items: 6, evidence_bytes: 40 * FEEDBACK_MB, video_seconds: 30 };
 let feedbackDraft = null;
 let feedbackAside = false;
@@ -256,7 +257,7 @@ function feedbackCheckRow(check) {
 
 function drawFeedbackChecks(draft) {
   const checks = draft?.checks ?? [];
-  const shown = JSON.stringify([checks, draft?.summary, draft?.jev_cost_usd, draft?.vision]);
+  const shown = JSON.stringify([checks, draft?.summary, draft?.jev_cost_usd, draft?.inspect_cost_usd, draft?.vision]);
   const checking = draft?.status === "checking";
   const submit = feedbackBox("submit");
   submit.disabled = checking;
@@ -265,7 +266,10 @@ function drawFeedbackChecks(draft) {
   if (shown === feedbackChecksShown) return;
   feedbackChecksShown = shown;
   feedbackBox("checks").replaceChildren(...checks.map(feedbackCheckRow));
-  feedbackBox("checks-cost").textContent = draft?.jev_cost_usd > 0 ? `JEV cost so far: ${money(draft.jev_cost_usd)}` : "";
+  feedbackBox("checks-cost").textContent = [
+    draft?.jev_cost_usd > 0 ? `JEV cost so far: ${money(draft.jev_cost_usd)}` : "",
+    draft?.inspect_cost_usd > 0 ? `Evidence inspection cost so far: ${money(draft.inspect_cost_usd)}` : "",
+  ].filter(Boolean).join(" · ");
   feedbackBox("ready").textContent = draft && checks.some((c) => c.result !== "none") ? draft.summary : "";
   if (draft && !draft.vision.version && checks.some((c) => c.result !== "none")) feedbackBox("ready").append(" ", draft.vision.setting);
 }
@@ -327,7 +331,16 @@ function stagedEvidenceItem(row) {
   const media = row.kind === "image" ? el("img", { src, alt: row.name }) : el("video", { controls: true, preload: "metadata", src });
   if (row.kind === "video") media.addEventListener("loadedmetadata", () => checkEvidenceLength(row, media, details));
   const remove = button("Remove", "feedback-remove", () => removeFeedbackEvidence(row, `Removed ${row.name}.`, remove), { of: String(row.id) });
-  return el("li", {}, media, el("div", { class: "evidence-words" }, el("strong", { text: row.name }), el("br"), details), remove);
+  const inspection = el("span", { class: "evidence-inspection" });
+  return el("li", {}, media, el("div", { class: "evidence-words" }, el("strong", { text: row.name }), el("br"), details, el("br"), inspection), remove);
+}
+
+function inspectionLine(found) {
+  if (!found) return "";
+  if (!found.inspected) return `Not inspected: ${found.why}`;
+  const flags = found.flags.map((f) => FEEDBACK_FLAGS[f] || f).join(", ");
+  const verdict = flags ? `shows ${flags}` : "nothing sensitive found";
+  return `Inspected by ${found.model}: ${verdict}. Saw: ${found.saw}`;
 }
 
 function pendingEvidenceItem(item) {
@@ -351,6 +364,7 @@ function drawFeedbackList() {
   const ids = new Set(staged.map((row) => row.id));
   for (const id of [...feedbackItems.keys()]) if (!ids.has(id)) feedbackItems.delete(id);
   for (const row of staged) if (!feedbackItems.has(row.id)) feedbackItems.set(row.id, stagedEvidenceItem(row));
+  for (const row of staged) feedbackItems.get(row.id).querySelector(".evidence-inspection").textContent = inspectionLine(row.inspection);
   const wanted = [...staged.map((row) => feedbackItems.get(row.id)), ...feedbackPending.map(pendingEvidenceItem)];
   const list = feedbackBox("evidence");
   wanted.forEach((node, i) => {
