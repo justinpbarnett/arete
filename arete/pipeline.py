@@ -865,7 +865,8 @@ def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> Non
     drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
-    holding = vault.held(git(["diff", "--cached", "--no-renames", "--text", "--src-prefix=a/", "--dst-prefix=b/"], c.wt))
+    holding = vault.held(git(["diff", "--cached", "--no-renames", "--text", "--src-prefix=a/", "--dst-prefix=b/"],
+                             c.wt)) if vault.every() else {}
     if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
                   if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny) or n in holding]:
         git(["reset", "-q", "--", *denied], c.wt)

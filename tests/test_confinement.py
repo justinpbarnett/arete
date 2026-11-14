@@ -369,7 +369,7 @@ class BrowserServerTests(unittest.TestCase):
                 v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
                 with mock.patch.object(scratch, "service_command", side_effect=lambda a, command: command), \
                         mock.patch.object(scratch, "spawn", side_effect=idle), \
-                        mock.patch.object(verify.environment, "commands", return_value={}), \
+                        mock.patch.object(verify.environment, "started", return_value=({}, {})), \
                         verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a) as url:
                     self.assertEqual(url, f"http://localhost:{port}")
                     self.assertEqual(scratch.browser_record(self.a)["port"], port)
@@ -388,14 +388,19 @@ class BrowserServerTests(unittest.TestCase):
 
         v = config.Verify(start="app", url=config.Verify.url.replace("{port}", str(port)), ready_seconds=10)
         env = {"REPLAY_SECRET": "stored-value-1", "OTHER_TOKEN": "ambient-value-1", "PLAIN": "plain"}
+        real_write = verify.write_hidden
         with mock.patch.object(scratch, "service_command", side_effect=lambda a, command: command), \
                 mock.patch.object(scratch, "spawn", side_effect=spawned), \
-                mock.patch.object(verify.environment, "commands", return_value=env), \
-                mock.patch.object(verify.environment, "stored", return_value={"REPLAY_SECRET": "stored-value-1"}), \
+                mock.patch.object(verify.environment, "started", return_value=(env, {"REPLAY_SECRET": "stored-value-1"})), \
+                mock.patch.object(verify, "write_hidden") as pumped, \
                 verify.serving(v, self.ws, self.root / "server.log", SimpleNamespace(), attempt=self.a):
             pass
         self.assertEqual((seen.get("REPLAY_SECRET"), seen.get("PLAIN"), "OTHER_TOKEN" in seen),
                          ("stored-value-1", "plain", False))
+        self.assertEqual(pumped.call_args.args[2], {"stored-value-1"})
+        log = self.root / "pumped.log"
+        real_write(SimpleNamespace(stdout=[b"token stored-value-1\n"]), log, {"stored-value-1"})
+        self.assertEqual(log.read_text(), "token [redacted]\n")
 
     def launch(self, mcp_config, said=None):
         picked = SimpleNamespace(candidate=SimpleNamespace(runner="codex", effort="", instructions=()), selected=None)

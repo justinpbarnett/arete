@@ -728,6 +728,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kept = {n: v for n, v in kept.items() if n not in picked.selected.env}
         if kept:
             kw["extra_env"] = {**kept, **(kw.get("extra_env") or {})}
+            kw["stored_values"] = sorted(kept.values())
     hook = ()
     kw.pop("verification_attempt", None)
     if trip.scratch:
@@ -834,7 +835,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     selected = kw.get("selected")
     if selected:
         found.extend(selected.sensitive_files)
-    hidden = list(record.secrets(*found))
+    hidden = list(record.secrets(*found, given=kw.pop("stored_values", ())))
     if selected:
         hidden.extend(selected.hidden)
         hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden},

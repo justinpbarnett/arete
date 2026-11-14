@@ -43,14 +43,21 @@ def stored(repo: config.Repo | None) -> dict[str, str]:
     return {n: v for n, v in vault.read(repo.name).items() if not reserved(n)}
 
 
+def started(cfg: config.Config, repo: config.Repo | None = None,
+            sets: Mapping[str, str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
+    kept = stored(repo)
+    return build(passed(cfg, repo), {**kept, **(sets or {})}), kept
+
+
 def commands(cfg: config.Config, repo: config.Repo | None = None, sets: Mapping[str, str] | None = None) -> dict:
-    return build(passed(cfg, repo), {**stored(repo), **(sets or {})})
+    return started(cfg, repo, sets)[0]
 
 
 def sh(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None,
        sets: Mapping[str, str] | None = None, **kw):
-    given = set(stored(repo).values())
-    res = util.sh(cmd, env=commands(cfg, repo, sets), inherit=False, **kw)
+    env, kept = started(cfg, repo, sets)
+    given = set(kept.values())
+    res = util.sh(cmd, env=env, inherit=False, **kw)
     res.stdout = vault.hidden(res.stdout or "", given)
     res.stderr = vault.hidden(res.stderr or "", given)
     return res

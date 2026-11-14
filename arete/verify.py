@@ -134,9 +134,8 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
     if attempt:
         scratch.app_port(attempt, url)
     command = scratch.service_command(attempt, v.start) if attempt else v.start
-    env = environment.commands(cfg or config.load(), repo, sets)
+    env, kept = environment.started(cfg or config.load(), repo, sets)
     if attempt:
-        kept = environment.stored(repo)
         env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
         env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
                     "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
@@ -146,7 +145,7 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
                              actor_confined=bool(attempt), **util.own_group_args())
-    pump = threading.Thread(target=write_hidden, args=(proc, log, vault.values()), daemon=True)
+    pump = threading.Thread(target=write_hidden, args=(proc, log, set(kept.values())), daemon=True)
     pump.start()
     if lifetime is not None:
         lifetime["stopped"] = False

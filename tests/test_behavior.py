@@ -608,6 +608,10 @@ if scenario.startswith("asked"):
         result["unseen"] = "REPLAY_SECRET" in environment.commands(cfg, other)
         result["reserved_names"] = [runner.reserved(n) for n in ("ARETE_RUN_ID", "CLAUDE_CODE_OAUTH_TOKEN", "REPLAY_SECRET")]
         result["diff_refusal"] = vault.refusals(f"diff --git a/notes.txt b/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n+kumquat {marker}\n")
+        quoted = 'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"\n--- "a/caf\\303\\251.txt"\n+++ "b/caf\\303\\251.txt"\n@@ -1 +1 @@\n+' + marker + '\n'
+        result["quoted"] = sorted(vault.held(quoted))
+        from arete import record
+        result["escaped"] = "caf\\u00e9-token-123" in record.secrets(given=["café-token-123"])
     elif scenario == "asked-declined":
         from arete import tasks
         with mock.patch.object(tasks, "continue_asked", return_value={}):
@@ -709,7 +713,14 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
         result["answer_lines"] = [e.get("answers") for e in events if e.get("event") == "answer"]
         result["stored_after"] = sorted(vault.read("replay-sample"))
     if scenario == "asked-secret":
-        vault.remove("replay-sample", "REPLAY_SECRET")
+        import subprocess
+
+        def removing(cmd, **kw):
+            vault.remove("replay-sample", "REPLAY_SECRET")
+            return subprocess.CompletedProcess(cmd, 0, stdout=kw["env"]["REPLAY_SECRET"], stderr="")
+
+        with mock.patch.object(environment.util, "sh", side_effect=removing):
+            result["raced"] = environment.sh("true", cfg, cfg.repo("replay-sample")).stdout
         result["after_removal"] = "REPLAY_SECRET" in environment.commands(cfg, cfg.repo("replay-sample"))
         result["answer_lines"] = [e.get("answers") for e in events if e.get("event") == "answer"]
         result["leaks"] = [str(p) for base in (paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR) for p in base.rglob("*")
@@ -799,6 +810,9 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
                                                     "set": True}]])
         self.assertEqual(result["diff_refusal"], ["notes.txt (holds the stored value of REPLAY_SECRET)"])
         self.assertEqual((result["seen"], result["unseen"], result["after_removal"]), (True, False, False))
+        self.assertEqual(result["quoted"], ["café.txt"])
+        self.assertTrue(result["escaped"])
+        self.assertEqual(result["raced"], "[redacted]")
         self.assertEqual([bool(r) for r in result["reserved_names"]], [True, True, False])
         self.assertIn("`REPLAY_SECRET` is set for this repo", result["heard"])
         self.assertIn("secret question", result["reply"])
