@@ -957,7 +957,8 @@ print("RESULT" + json.dumps(out))
                      "Notes:\n\n- [x] [r]: http:outside.example/", f"See [x][r].\n\n> [r]: {far}",
                      f"See [S1][r].\n\n[r]: {far}", "See \\[S1] now.", "See [S3].", "See <b>x</b>.", "Q&A here.",
                      "Mail admin@outside.example.", "See www.outside.example now.", "See https://outside.example/.",
-                     "Write mailto:admin now.", "Write XMPP:admin now.", "Line\rbreak.", "Null\x00here."):
+                     "Write mailto:admin now.", "Write XMPP:admin now.", "Run javascript:alert now.",
+                     "Load data:text/html now.", "Line\rbreak.", "Null\x00here."):
             for field in ("answer", "claim", "basis", "issue", "question", "why", "goal"):
                 found = rs.faults(self.synthesis(field, text), self.known)
                 self.assertTrue(found, (field, text))
@@ -974,7 +975,9 @@ print("RESULT" + json.dumps(out))
         from arete import research_synthesis as rs
         text = ("Key points:\n\n- [S1]: the limit is 10\n- [S2]: the limit is 12\n\n> [S1]: dated 2025\n\n"
                 "See [S1]'s note, ([S1]), [S1](//outside.example/) and ![S2] at UTC+2:00 with **Note:** the `timeout:` "
-                "key, std::vector, 50%.")
+                "key, std::vector, 50%. The token needs the read:org and repo:status scopes, s3:GetObject and "
+                "nginx:alpine, a 9 to 1 read:write ratio, an M:N relationship, key:value pairs, a:hover, sha256:abc123, "
+                "C:/ProgramData and app:web. Raw data: 10 rows; config file: x.")
         answer = self.synthesis("answer", text)
         self.assertEqual(rs.faults(answer, self.known), [])
         report, used = rs.assemble(answer, self.evidence(*self.known.values()), [])
@@ -991,11 +994,13 @@ print("RESULT" + json.dumps(out))
                                  "https://en.wikipedia.org/wiki/Mercury_(planet)")
         answer = self.synthesis("answer", "| Source | Limit |\n| --- | --- |\n| [S1] | 10 |\n| [S2] | 12 |")
         report, _ = rs.assemble(answer, evidence, [])
-        self.assertIn("| [S1](https://example.org/a%7C%5Bx%5D%28//outside.example/%29?q=1\\&r=2#f) | 10 |\n"
+        self.assertIn("| [S1](https://example.org/a%7C%5Bx%5D%28//outside.example/%29?q=1&amp;r=2#f) | 10 |\n"
                       "| [S2](https://en.wikipedia.org/wiki/Mercury%5F%28planet%29) | 12 |", report)
         self.assertNotIn("user", report)
         self.assertEqual(rs.written("https://example.org/a b\"'<>\\`*_\x01|()[]~"),
                          "https://example.org/a%20b%22%27%3C%3E%5C%60%2A%5F%01%7C%28%29%5B%5D~")
+        self.assertEqual(rs.written("https://docs.python.org&commat;outside.example/library/?a=1&sol;b#&num;c"),
+                         "https://docs.python.org&amp;commat;outside.example/library/?a=1&amp;sol;b#&amp;num;c")
 
     def test_source_titles_are_escaped_or_written_as_code(self):
         from arete import research_synthesis as rs
@@ -1006,6 +1011,7 @@ print("RESULT" + json.dumps(out))
         for title in ("Mail admin@outside.example", "See WWW.outside.example", "Write mailto:x", "Ask xmpp:x"):
             self.assertEqual(rs.inert_text(title), f"`{title}`")
         self.assertEqual(rs.inert_text("`a` www.x"), "`` `a` www.x ``")
+        self.assertEqual(rs.inert_text("Pin nginx:alpine"), "Pin nginx\\:alpine")
         self.assertEqual(rs.inert_text("a\fb\x00 c\n"), "a b c")
         report, _ = rs.assemble(self.synthesis(), self.evidence("https://example.org/a", title="Q&A [x]"), [])
         self.assertIn("- [S1](https://example.org/a) Q\\&A \\[x\\]; published 2025-01-02", report)

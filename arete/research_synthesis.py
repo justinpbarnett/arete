@@ -21,7 +21,8 @@ TEXTS = {"type": "array", "items": TEXT}
 BOOL = {"type": "boolean"}
 CITE = re.compile(r"\[(S\d+)\]")
 IMAGE_OR_CITE = re.compile(r"(!?)\[(S\d+)\]")
-AUTOLINK = r"://|www\.|@|[a-z][a-z0-9+.-]*:(?=[a-z/])"
+LINK_SCHEMES = ("https", "http", "ftp", "mailto", "xmpp", "file", "data", "javascript", "vbscript")
+AUTOLINK = r"://|www\.|@|\b(?:" + "|".join(LINK_SCHEMES) + r"):(?=[a-z/])"
 AUTOLINKS = re.compile(AUTOLINK, re.IGNORECASE)
 UNSAFE = re.compile(r"[\[\]<&\\\x00-\x08\x0b-\x1f\x7f-\x9f]|" + AUTOLINK, re.IGNORECASE)
 CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -211,7 +212,7 @@ def encoded(text: str) -> str:
 def written(url: str) -> str:
     parts = urlsplit(url)
     return urlunsplit((parts.scheme, encoded(parts.netloc.rpartition("@")[2]), encoded(parts.path),
-                       encoded(parts.query), encoded(parts.fragment))).replace("&", "\\&")
+                       encoded(parts.query), encoded(parts.fragment))).replace("&", "&amp;")
 
 
 def inert_text(text: str) -> str:

@@ -72,8 +72,10 @@ Rules:
 
 - Cite only the ids in the evidence, written `[S1]`; Arete turns each into its link. Do not invent an id.
 - Write plain text in every field: apart from `[S1]` citations, no link, address, HTML, entity or escape. That
-  means no `[` or `]`, `<`, `&`, backslash, `@`, `://`, `www.` or scheme such as `mailto:`, and no control
-  character other than newline and tab. Write "and" for `&`. Arete refuses a field that holds one.
+  means no `[` or `]`, `<`, `&`, backslash, `@`, `://`, `www.`, no link scheme (`http:`, `https:`, `ftp:`, `mailto:`,
+  `xmpp:`, `file:`, `data:`, `javascript:` or `vbscript:`) right before a letter or slash, and no control character
+  other than newline and tab. Write "and" for `&`. Other words before a colon, such as `read:org` or `nginx:alpine`,
+  are fine. Arete refuses a field that holds one.
 - Keep what a source states apart from your inference.
 - Use only the dates the evidence states. An empty date is not stated; do not fill it in.
 - Put conflicting sources under `contradictions` with both ids, unresolved.
