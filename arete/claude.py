@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
@@ -42,6 +43,8 @@ LIMIT_RECHECK_SECONDS = 1800
 MILLISECOND_STAMPS = 1e12
 STOP_GRACE_SECONDS = 30
 DRAIN_SECONDS = 10
+ANSWERED_QUIET_SECONDS = 60
+SETTLE_POLL_SECONDS = 1
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 SETTING_SOURCES = {"user": ("user",), "repo": ("project", "local")}
 
@@ -268,10 +271,12 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
     out: list[str] = []
     err: list[str] = []
     cuts: list[Cut] = []
+    answer = Answer()
 
     def watched(line: str) -> None:
         if cuts:
             return
+        answer.saw(line)
         try:
             on_line(line)
         except Cut as cut:
@@ -284,7 +289,7 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
     for helper in helpers:
         helper.start()
     try:
-        child.wait(timeout=timeout)
+        answered_and_stopped = settle(child, timeout, answer)
     except BaseException:
         stop(child)
         raise
@@ -297,7 +302,46 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
             helper.join(DRAIN_SECONDS)
     if cuts:
         raise cuts[0]
-    return subprocess.CompletedProcess(cmd, child.returncode, "".join(out), "".join(err))
+    return subprocess.CompletedProcess(cmd, 0 if answered_and_stopped else child.returncode, "".join(out), "".join(err))
+
+
+class Answer:
+    def __init__(self) -> None:
+        self.given = False
+        self.last_line = time.monotonic()
+
+    def saw(self, line: str) -> None:
+        self.last_line = time.monotonic()
+        self.given = self.given or structured_result(line)
+
+    def quiet_for(self) -> float:
+        return time.monotonic() - self.last_line if self.given else 0.0
+
+
+def structured_result(line: str) -> bool:
+    if '"structured_output"' not in line:
+        return False
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return False
+    return isinstance(event, dict) and event.get("type") == "result" and event.get("structured_output") is not None
+
+
+def settle(child: subprocess.Popen, timeout: float, answer: Answer) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        left = deadline - time.monotonic()
+        if answer.quiet_for() >= ANSWERED_QUIET_SECONDS or (answer.given and left <= 0):
+            stop(child)
+            return True
+        if left <= 0:
+            raise subprocess.TimeoutExpired(child.args, timeout)
+        try:
+            child.wait(timeout=min(left, SETTLE_POLL_SECONDS))
+            return False
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def feed(stdin, prompt: str) -> None:
