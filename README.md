@@ -1691,7 +1691,12 @@ A request from any other tailnet login gets 403, and a change also needs the `X-
 A sidebar groups the views by job: Work (Live, Runs, Sessions, Loops, Triage), Watch (Outcomes, Health) and Settings (Settings, Usage), then Find and Console.
 It marks the view you are on and shows what waits: Live counts what needs you, Runs what is running, Triage the tickets with questions, and Health shows its state when it is not OK.
 Below 1040 px the sidebar wraps into a block above the page.
-Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME` and `#ticket/REF`, so reload, Back and Forward put you where you were.
+A "Waiting on you" panel above every view lists the open asks, oldest first, and hides when none wait. Its count shows in the tab title and on the app badge.
+Each card shows the repo, ticket, run, step, time waiting, why and what was tried, then a control per question: buttons for a single choice with the recommended one first, checkboxes for several, an "Other" box on every choice, a text area for text, a password field for a secret (with a decline box) and "Done" or "Can't do this" with a note for a step.
+Submit sends the answers, Go with the recommendations takes each choice's first option, and Stop the run asks first and then ends the run stopped.
+A refusal shows on the card and keeps what you typed; a secret is never kept in page storage and is cleared after every submit.
+`#ask/ID` scrolls to that card, also when a notification opens the page.
+Every view, filter and open item has a URL, such as `#runs?status=failed`, `#triage?group=with-questions`, `#run/ID`, `#session/ID`, `#loop/NAME`, `#ticket/REF` and `#ask/ID`, so reload, Back and Forward put you where you were.
 An open page notices when the dashboard runs new code and reloads itself where you were, unless you have text not yet sent, settings not yet saved, Find or the key list open, text selected or an action still going.
 Then the status line says what the new version waits for.
 Close or Escape on an open item goes back to where you opened it, with focus on its row.

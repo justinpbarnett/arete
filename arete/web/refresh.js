@@ -21,10 +21,11 @@ async function refresh() {
   const at = route;
   const label = VIEWS[at.view].label;
   try {
-    const [draw, sidebar] = await Promise.all([LOADERS[at.view](at), call("/api/sidebar").catch(() => null)]);
+    const [draw, sidebar, asks] = await Promise.all([LOADERS[at.view](at), call("/api/sidebar").catch(() => null), call("/api/asks").catch(() => null)]);
     if (mine !== refreshCount) return;
     if (reloadIfNewCode()) return;
     if (sidebar) drawSidebar(sidebar);
+    if (asks) drawWaiting(asks.asks);
     const drawn = draw();
     const held = drawn === HELD;
     const delay = held ? SLOW_MS : drawn || SLOW_MS;
@@ -35,6 +36,7 @@ async function refresh() {
     status("", [label, shown, `refreshes every ${delay / 1000} s`].join(" · "), newCodeNote());
     document.querySelectorAll(".readout").forEach((r) => r.classList.remove("stale"));
     afterDraw();
+    if (asks) showAskedCard();
     schedule(delay);
   } catch (e) {
     if (mine !== refreshCount) return;
