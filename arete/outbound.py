@@ -142,3 +142,146 @@ def screen(text: str) -> str:
     text = ORIGIN.sub(screen_origin, text)
     text = BARE_PRIVATE.sub(screen_bare, text)
     return HOME_PATH.sub("~", registered(text))
+
+
+FENCE_OPEN = re.compile(r"( {0,3})(`{3,}(?=[^`\n]*$)|~{3,})")
+CONTAINER = r"[ \t>]*(?:(?:[-*+]|\d+[.)])[ \t>]+)*"
+HTML_START = re.compile(CONTAINER + "<")
+RAW_START = re.compile(CONTAINER + r"<(?:(?P<tag>(?:pre|script|style|textarea)(?![\w-]))|(?P<comment>!--)"
+                       r"|(?P<pi>\?)|(?P<cdata>!\[CDATA\[)|(?P<decl>![A-Za-z]))", re.IGNORECASE)
+RAW_END = {"tag": re.compile(r"</(?:pre|script|style|textarea)>", re.IGNORECASE), "comment": re.compile("-->"),
+           "pi": re.compile(r"\?>"), "cdata": re.compile(r"\]\]>"), "decl": re.compile(">")}
+TICKS = re.compile(r"`+")
+LINK_DESTINATION = re.compile(r"\]\([^)]*$|(?:^|\n) {0,3}\[[^\]\n]*\]:[^\n]*$")
+MENTION = r"@[A-Za-z0-9](?:[\w./-]*[^\W_])?"
+REFERENCE = (r"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|[\w.-]+/[\w.-]+#\d+"
+             r"|GH-\d+|#\d+)(?![\w-])")
+OWN = re.compile(r"(?<!\\)<code>(?:" + MENTION + "|" + REFERENCE + r")</code>", re.IGNORECASE)
+CLOSING = re.compile(r"(?P<closing>(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?!\w)[\s:*_~\\]*)"
+                     r"(?P<reference>" + REFERENCE + ")", re.IGNORECASE)
+URL = r"(?P<url>(?<![A-Za-z])https?://[A-Za-z0-9][A-Za-z0-9.-]*(?![\w.-])[^\s<>|]*)"
+MENTIONED = r"(?P<mention>(?<![A-Za-z0-9])" + MENTION + ")"
+MENTIONS_AND_URLS = re.compile(URL + "|" + MENTIONED, re.IGNORECASE)
+MENTIONS = re.compile(MENTIONED, re.IGNORECASE)
+
+
+def between_own(text: str, rewrite) -> str:
+    parts = []
+    at = 0
+    for own in OWN.finditer(text):
+        parts.append(rewrite(text[at:own.start()]))
+        parts.append(own.group())
+        at = own.end()
+    parts.append(rewrite(text[at:]))
+    return "".join(parts)
+
+
+def close_reference(found: re.Match) -> str:
+    closing = found.group("closing")
+    gap = " " if closing.endswith("\\") else ""
+    return f"{closing}{gap}<code>{found.group('reference')}</code>"
+
+
+def inert_prose(text: str, urls: bool = True) -> str:
+    pattern = MENTIONS_AND_URLS if urls else MENTIONS
+
+    def mention(found: re.Match) -> str:
+        if found.groupdict().get("url"):
+            return found.group()
+        gap = " " if found.string[found.start() - 1:found.start()] == "\\" else ""
+        return f"{gap}<code>{found.group()}</code>"
+
+    text = between_own(text, lambda gap: CLOSING.sub(close_reference, gap))
+    return between_own(text, lambda gap: pattern.sub(mention, gap))
+
+
+def span_end(runs: list[re.Match], i: int, size: int) -> int | None:
+    return next((k for k in range(i + 1, len(runs)) if runs[k].end() - runs[k].start() == size), None)
+
+
+def inert_markdown(text: str) -> str:
+    runs = list(TICKS.finditer(text))
+    out = []
+    at = 0
+    i = 0
+    while i < len(runs):
+        start, end = runs[i].span()
+        before = text[:start]
+        if (len(before) - len(before.rstrip("\\"))) % 2:
+            start += 1
+        closer = span_end(runs, i, end - start) if end > start else None
+        if closer is None:
+            i += 1
+            continue
+        span = text[start:runs[closer].end()]
+        since = OWN.sub("", text[at:start])
+        if "\n" in span or "|" in span or "<" in since or LINK_DESTINATION.search(since):
+            break
+        out.append(inert_prose(text[at:start]))
+        out.append(span)
+        at = runs[closer].end()
+        i = closer + 1
+    out.append(inert_prose(text[at:]))
+    return "".join(out)
+
+
+def fence_end(lines: list[str], i: int) -> int | None:
+    opening = FENCE_OPEN.match(lines[i])
+    if not opening:
+        return None
+    indent = len(opening.group(1))
+    mark = opening.group(2)
+    closing = re.compile(rf" {{0,3}}{re.escape(mark[0])}{{{len(mark)},}}[ \t]*$")
+    j = i + 1
+    while j < len(lines) and not closing.match(lines[j].rstrip("\r\n")):
+        j += 1
+    if indent == 0:
+        return min(j, len(lines) - 1)
+    if j >= len(lines):
+        return None
+    margin = " " * indent
+    return j if all(line.startswith(margin) for line in lines[i:j + 1] if line.strip()) else None
+
+
+def inert(text: str) -> str:
+    out: list[str] = []
+    block: list[str] = []
+    html = False
+    raw = None
+
+    def flush() -> None:
+        if block:
+            joined = "".join(block)
+            out.append(inert_prose(joined, urls=False) if html else inert_markdown(joined))
+            block.clear()
+
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if raw:
+            block.append(line)
+            if raw.search(line):
+                raw = None
+        elif not line.strip():
+            flush()
+            out.append(line)
+            html = False
+        elif not html and (end := fence_end(lines, i)) is not None:
+            flush()
+            out.append("".join(lines[i:end + 1]))
+            i = end
+        else:
+            bare = OWN.sub("", line)
+            if not html and HTML_START.match(bare):
+                flush()
+                html = True
+            started = RAW_START.match(bare) if html else None
+            if started:
+                kind = next(name for name in RAW_END if started.group(name) is not None)
+                if not RAW_END[kind].search(line):
+                    raw = RAW_END[kind]
+            block.append(line)
+        i += 1
+    flush()
+    return "".join(out)

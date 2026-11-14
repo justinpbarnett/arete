@@ -29,7 +29,7 @@ def built(flow, first):
     while not outcome.passed and n < reviews:
         if outcome.feedback:
             step(flow, "implement", tree=ws, round=round_name(REVIEW_FIX, n), feedback=outcome.feedback)
-            if not (checked := step(flow, "checks", tree=ws, after="the review fixes")).passed:
+            if not (checked := checked_after(flow, ws, "the review fixes", n)).passed:
                 return finish(flow, "failed", why="the checks failed after the review fixes", detail=checked.feedback)
             step(flow, "verify", tree=ws)
         n += 1
@@ -43,6 +43,17 @@ def built(flow, first):
         if not (outcome := step(flow, name, **kw)).passed:
             break
     return ended(flow, outcome)
+
+
+def checked_after(flow, ws, after, n):
+    tries = flow.ctx.run.settings(CHECK_REPAIR).tries
+    outcome, attempt = step(flow, "checks", tree=ws, after=after), 1
+    while not outcome.passed and attempt < tries:
+        attempt += 1
+        step(flow, "implement", tree=ws, round=f"{CHECK_REPAIR}{n}_{attempt}", feedback=outcome.feedback,
+             attempt=attempt, tries=tries)
+        outcome = step(flow, "checks", tree=ws, after=after)
+    return outcome
 
 
 if __name__ == "__main__":
