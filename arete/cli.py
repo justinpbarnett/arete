@@ -362,6 +362,16 @@ def cmd_guard(args) -> int:
     return guard.main()
 
 
+def cmd_upload_guard(args) -> int:
+    try:
+        from . import uploads
+
+        return uploads.main()
+    except Exception:
+        print("Arete's upload guard failed, so it refused the upload.", file=sys.stderr)
+        return 2
+
+
 def scratch_hook(p) -> None:
     p.add_argument("--scratch", default="", help="the verification attempt's scratch folder, set by arete")
     p.add_argument("--scratch-id", default="", help="selector for protected harness authority; never proves ownership")
@@ -1622,6 +1632,10 @@ def main(argv: list[str] | None = None) -> int:
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
     scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
+
+    p = sub.add_parser("upload-guard", help="PreToolUse hook for the verifier's browser_file_upload: allows only files "
+                                            "in the run's evidence or browser folder (reads a payload on stdin)")
+    p.set_defaults(fn=cmd_upload_guard)
 
     p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
                                            "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
