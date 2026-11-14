@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -685,6 +686,14 @@ oncall.ask_jev = fake
 print(json.dumps(oncall.scan(config.load())))
 """
 DECIDING = f'{ON}vision = "A payments service that must stay up"\nscope = "Bug fixes in the payment worker only"\n'
+RACING = """
+from arete import oncall as listing
+listed = listing.Policies.__init__
+def racing(self, cfg):
+    listed(self, cfg)
+    exec(RACE)
+listing.Policies.__init__ = racing
+"""
 FOUR = ["actionable", "injection", "scope", "vision"]
 TWO = ["actionable", "injection"]
 
@@ -696,8 +705,8 @@ class Decisions(Scratch):
         self.calls_file = Path(self.tmp.name) / "calls.jsonl"
         self.read = 0
 
-    def scanned(self, rules=None):
-        code = f"RULES = {rules or {}!r}\nCALLS = {str(self.calls_file)!r}\n{FAKE}"
+    def scanned(self, rules=None, race=""):
+        code = f"RULES = {rules or {}!r}\nCALLS = {str(self.calls_file)!r}\nRACE = {race!r}\n{RACING if race else ''}{FAKE}"
         res = self.py(code)
         self.assertEqual(res.returncode, 0, res.stderr)
         return json.loads(res.stdout.splitlines()[-1])
@@ -986,16 +995,20 @@ class Decisions(Scratch):
         self.baseline()
         columns = ("fingerprint, class, source, repo, signature, first_seen, last_seen, count, evidence, "
                    "decision, confidence, reason, decided_count")
-        policy = json.dumps([["A payments service that must stay up", "Bug fixes in the payment worker only"]])
-        self.sql(f"INSERT INTO incidents ({columns}, policies) VALUES ('old', 'unexpected', 'app.log', '', "
+        self.sql(f"INSERT INTO incidents ({columns}) VALUES ('old', 'unexpected', 'app.log', '', "
                  "'old undecided', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 1, 'OLD EVIDENCE worker died', "
-                 "'', 0.0, '', 0, ?)", policy)
+                 "'', 0.0, '', 0)")
         self.sql("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) "
                  f"INSERT INTO incidents ({columns}) SELECT 'n' || i, 'unexpected', 'app.log', '', 'newer ' || i, "
                  "?, ?, 1, 'e', 'wake', 0.9, 'r', 1 FROM n", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z")
-        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        code = f"RULES = {{}}\nCALLS = {str(self.calls_file)!r}\n{FAKE}".replace(
+            "oncall.scan(config.load())", "oncall.decide(config.load())")
+        res = self.py(code)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout.splitlines()[-1]), {"wake": 1})
         (batch,) = self.calls()
         self.assertEqual(len(batch), 1)
+        self.assertEqual(batch[0]["ids"], FOUR)
         self.assertIn("OLD EVIDENCE", batch[0]["text"])
         ((decision, reason),) = self.sql("SELECT decision, reason FROM incidents WHERE fingerprint = 'old'")
         self.assertEqual(decision, "wake")
@@ -1467,6 +1480,7 @@ class Decisions(Scratch):
 
     def test_an_incident_opened_before_its_set_was_recorded_is_unsure_and_takes_its_repeats(self):
         line = self.failure_line("payments ledger write failed: KeyError")
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{self.tmp.name}/other.log"\nscope = "Only the ledger"\n')
         self.opened_in_part_one(line)
         self.assertEqual(self.scanned({"ledger": {"scope": 0.03}})["decisions"], {"unsure": 1})
         self.assertEqual(self.ids(), [[TWO]])
@@ -1477,6 +1491,102 @@ class Decisions(Scratch):
         self.assertEqual((one["count"], one["decision"]), (2, "unsure"))
         self.assertEqual(json.loads(self.sql("SELECT policies FROM incidents")[0][0]),
                          [["A payments service that must stay up", "Bug fixes in the payment worker only"]])
+
+    def test_an_incident_opened_before_sets_were_recorded_is_decided_under_the_only_set_the_config_holds(self):
+        self.opened_in_part_one(self.failure_line("payments ledger write failed: KeyError"))
+        self.assertEqual(self.scanned({"ledger": {"scope": 0.03}})["decisions"], {"ignore": 1})
+        self.assertEqual(self.ids(), [[FOUR]])
+        self.assertEqual(self.only()["reason"], "the repair is outside the allowed scope")
+
+    def part_one_keys(self, *scopes):
+        rows = self.sql("SELECT id, class, signature FROM incidents ORDER BY id")
+        for (incident, kind, signature), scope in zip(rows, scopes, strict=True):
+            key = hashlib.sha1(f"{kind}\n{scope}\n{signature}".encode()).hexdigest()[:16]
+            self.sql("UPDATE incidents SET fingerprint = ?, repo = '', policies = NULL WHERE id = ?", key, incident)
+
+    def test_a_run_row_repeat_joins_the_incident_part_one_opened_for_its_repo_only(self):
+        (Path(self.tmp.name) / "shop").mkdir()
+        self.write_config(DECIDING + f'[[repo]]\nname = "shop"\npath = "{Path(self.tmp.name) / "shop"}"\n'
+                          f'[[repo]]\nname = "demo"\npath = "{self.tmp.name}"\n')
+        code = ("import os\nfrom arete import record\n"
+                "print(record.start('pipeline', repo='demo', issue=7, pid=os.getppid()))\n"
+                "print(record.start('pipeline', repo='shop', issue=8, pid=os.getppid()))")
+        runs = {run: self.state / "runs" / run / "run.jsonl" for run in self.py(code).stdout.split()}
+        for path in runs.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("")
+        self.scanned()
+        demo, shop = runs
+
+        def failed(run):
+            self.append(json.dumps({"ts": "2026-11-13T12:00:00Z", "run": run, "seq": 9, "event": "error",
+                                    "step": "build", "message": "build broke with exit 2"}), to=runs[run])
+        failed(demo)
+        self.scanned()
+        self.part_one_keys("arete")
+        failed(demo)
+        failed(shop)
+        self.scanned()
+        rows = self.sql("SELECT source, count, policies IS NULL FROM incidents ORDER BY id")
+        self.assertEqual(rows, [(str(runs[demo]), 2, 0), (str(runs[shop]), 1, 0)])
+
+    def test_a_repeat_from_a_file_under_two_entries_joins_the_incidents_part_one_opened(self):
+        app = self.two_logs()
+        mailer = app / "mailer.log"
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{mailer}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.append(line, to=mailer)
+        self.scanned()
+        self.part_one_keys(f"{app}/*.log", str(mailer))
+        self.append(line, to=mailer)
+        self.scanned()
+        self.assertEqual(self.sql("SELECT count, policies IS NULL FROM incidents ORDER BY id"), [(2, 0), (2, 0)])
+
+    def recreated_after_the_scan_listed_files(self, app, entries=""):
+        mailer = app / "mailer.log"
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\nscope = "Only the mailer module"\n'
+                          + entries)
+        self.scanned()
+        self.calls()
+        mailer.rename(app / "mailer.log.1")
+        line = self.failure_line("payments ledger write failed: KeyError")
+        return self.scanned(race=f"open({str(mailer)!r}, 'w').write({line + chr(10)!r})")["decisions"]
+
+    def test_a_file_re_created_after_the_scan_listed_files_is_read_once_under_its_own_entry(self):
+        app = self.two_logs()
+        self.assertEqual(self.recreated_after_the_scan_listed_files(app), {"wake": 1})
+        (batch,) = self.calls()
+        self.assertIn("Only the mailer module", batch[0]["instructions"]["scope"])
+        self.assertEqual(json.loads(self.sql("SELECT policies FROM incidents")[0][0]),
+                         [["A payments service that must stay up", "Only the mailer module"]])
+        self.assertEqual(self.scanned()["opened"], 0)
+        self.assertEqual(self.sql("SELECT count FROM incidents"), [(1,)])
+
+    def test_a_symlinked_file_re_created_after_the_scan_listed_files_stays_under_both_policies(self):
+        app = self.two_logs()
+        link = Path(self.tmp.name) / "current.log"
+        link.symlink_to(app / "mailer.log")
+        decisions = self.recreated_after_the_scan_listed_files(
+            app, f'[[oncall.source]]\npath = "{link}"\nscope = "Only the uploader"\n')
+        self.assertEqual(decisions, {"unsure": 2})
+        self.assertEqual(self.ids(), [[TWO, TWO]])
+
+    def test_a_file_no_glob_lists_any_more_is_never_decided_under_the_oncall_text(self):
+        app = self.two_logs()
+        mailer = app / "mailer.log"
+        if not (app / "MAILER.LOG").exists():
+            self.skipTest("this file system tells letter case apart")
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        self.calls()
+        self.append("2026-11-13T10:06:30Z INFO mailer context",
+                    self.failure_line("payments ledger write failed: KeyError"), to=mailer)
+        mailer.rename(app / "mailer.LOG")
+        self.assertEqual(self.scanned({"mailer context": {"scope": 0.03}})["decisions"], {"unsure": 1})
+        self.assertEqual(self.ids(), [[TWO]])
+        self.assertIn("no [[oncall.source]] glob lists it", self.only()["reason"])
 
     def test_a_repeat_records_its_set_on_an_undecided_incident_opened_before_sets_were_recorded(self):
         line = self.failure_line("payments ledger write failed: KeyError")

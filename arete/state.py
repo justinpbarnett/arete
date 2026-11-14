@@ -875,11 +875,11 @@ def incidents_to_decide() -> list[dict]:
 
 def known_fingerprints() -> dict[str, dict]:
     with db() as c:
-        held = {r[0]: {"source": r[1], "policies": r[2]} for r in c.execute(
-            "SELECT a.fingerprint, i.source, i.policies FROM incident_aliases a JOIN incidents i "
+        held = {r[0]: {"source": r[1], "repo": r[2], "policies": r[3]} for r in c.execute(
+            "SELECT a.fingerprint, i.source, i.repo, i.policies FROM incident_aliases a JOIN incidents i "
             "ON i.id = a.incident WHERE i.state = 'open'")}
-        held.update((r[0], {"source": r[1], "policies": r[2]}) for r in c.execute(
-            "SELECT fingerprint, source, policies FROM incidents WHERE state = 'open'"))
+        held.update((r[0], {"source": r[1], "repo": r[2], "policies": r[3]}) for r in c.execute(
+            "SELECT fingerprint, source, repo, policies FROM incidents WHERE state = 'open'"))
         return held
 
 

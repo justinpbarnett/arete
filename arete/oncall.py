@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 
 from . import config, control, jev, lines, outbound, paths, record, sources, state, util
@@ -63,6 +64,7 @@ class Origin:
     repo: str = ""
     pattern: re.Pattern = FAILURE
     folder: bool = False
+    listed: bool = False
 
 
 @dataclass
@@ -75,6 +77,7 @@ class Event:
     window: list[str]
     count: int = 1
     rule: frozenset[tuple[str, str]] = frozenset()
+    legacy: str = ""
 
 
 def digest(name: str, end: int) -> str | None:
@@ -344,18 +347,27 @@ def identity(name: str) -> tuple[int, int] | None:
     return info.st_dev, info.st_ino
 
 
+def source_files(entry: config.OncallSource) -> list[str]:
+    return sorted(glob.glob(str(paths.expand(entry.path))))
+
+
+def snapshot(cfg: config.Config) -> tuple[list, dict, dict]:
+    files = [(s, source_files(s)) for s in cfg.oncall.sources]
+    named: dict[str, tuple[int, int] | str] = {}
+    entries: dict[tuple[int, int] | str, list[config.OncallSource]] = {}
+    for entry, names in files:
+        for name in names:
+            entries.setdefault(named.setdefault(name, identity(name) or name), []).append(entry)
+        for copy in glob.glob(str(paths.expand(entry.path)) + ".1"):
+            if (key := identity(copy)) is not None:
+                entries.setdefault(key, []).append(entry)
+    return files, named, entries
+
+
 class Policies:
     def __init__(self, cfg: config.Config) -> None:
         self.cfg = cfg
-        self.files = [(s, sorted(glob.glob(str(paths.expand(s.path))))) for s in cfg.oncall.sources]
-        self.named: dict[str, tuple[int, int] | str] = {}
-        self.entries: dict[tuple[int, int] | str, list[config.OncallSource]] = {}
-        for entry, files in self.files:
-            for name in files:
-                self.entries.setdefault(self.named.setdefault(name, identity(name) or name), []).append(entry)
-            for copy in glob.glob(str(paths.expand(entry.path)) + ".1"):
-                if (key := identity(copy)) is not None:
-                    self.entries.setdefault(key, []).append(entry)
+        self.files, self.named, self.entries = snapshot(cfg)
         self.every = frozenset({entry_policy(cfg), *(entry_policy(cfg, s) for s in cfg.oncall.sources)})
 
     def under(self, found: list[config.OncallSource]) -> frozenset[tuple[str, str]]:
@@ -364,16 +376,25 @@ class Policies:
     def untold(self) -> frozenset[tuple[str, str]]:
         return self.every if len(self.every) == 1 else frozenset()
 
-    def of_file(self, name: str) -> frozenset[tuple[str, str]]:
-        key = self.named.get(name) or identity(name)
-        return self.untold() if key is None else self.under(self.entries.get(key, []))
+    def key(self, name: str, listed: bool) -> tuple[int, int] | str | None:
+        now = identity(name)
+        if listed and self.named.get(name) != (now or name):
+            _, self.named, self.entries = snapshot(self.cfg)
+        return self.named.get(name) or now
 
-    def of_copy(self, name: str) -> frozenset[tuple[str, str]]:
-        key = self.named.get(name) or identity(name)
+    def matched(self, found: list[config.OncallSource], listed: bool) -> frozenset[tuple[str, str]]:
+        return self.untold() if listed and not found else self.under(found)
+
+    def of_file(self, name: str, listed: bool = False) -> frozenset[tuple[str, str]]:
+        key = self.key(name, listed)
+        return self.untold() if key is None else self.matched(self.entries.get(key, []), listed)
+
+    def of_copy(self, name: str, listed: bool = False) -> frozenset[tuple[str, str]]:
+        key = self.key(name, listed)
         if key is None:
             return self.untold()
         copy = identity(name + ".1")
-        return self.under([*self.entries.get(key, []), *(self.entries.get(copy, []) if copy else [])])
+        return self.matched([*self.entries.get(key, []), *(self.entries.get(copy, []) if copy else [])], listed)
 
     def of(self, source: str) -> frozenset[tuple[str, str]]:
         if os.path.isabs(source) or source in self.named or identity(source):
@@ -384,8 +405,12 @@ class Policies:
         now, rule = self.of(row["source"]), recorded(row)
         return now if rule is None or rule == now else None
 
-    def judged(self, row: dict) -> tuple[str, str] | None:
+    def read_under(self, row: dict) -> frozenset[tuple[str, str]] | None:
         rule = recorded(row)
+        return self.every if rule is None and len(self.every) == 1 else rule
+
+    def judged(self, row: dict) -> tuple[str, str] | None:
+        rule = self.read_under(row)
         return next(iter(rule)) if rule is not None and len(rule) == 1 and rule <= self.every else None
 
 
@@ -474,12 +499,14 @@ def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, policies: Polici
         if not a.sure(line):
             return UNSURE, a.confidence, f"{name} is uncertain ({a.note()})", answers, 0
     least = min(a.confidence for a in got.values())
-    rule = recorded(row)
+    rule = policies.read_under(row)
     if rule is None:
-        why = "it was opened before incidents recorded the vision and scope their lines were read under; the owner decides"
+        why = ("it was opened before incidents recorded the vision and scope their lines were read under, and the "
+               "config holds more than one; the owner decides")
         return UNSURE, least, why, answers, 0
     if not rule:
-        why = "its file is gone, so which [[oncall.source]] vision and scope apply cannot be told; the owner decides"
+        why = ("its file is gone or no [[oncall.source]] glob lists it, so which vision and scope apply cannot be "
+               "told; the owner decides")
         return UNSURE, least, why, answers, 0
     if not rule <= policies.every:
         why = "the vision or scope its file was under when read is no longer in the config, so the owner decides"
@@ -539,7 +566,8 @@ def settle(row: dict, outcome: tuple[str, float, str, dict, int]) -> None:
                           shapes=json.dumps(kept))
 
 
-def decide(cfg: config.Config, policies: Policies, budget: int = MAX_ASKS) -> dict:
+def decide(cfg: config.Config, policies: Policies | None = None, budget: int = MAX_ASKS) -> dict:
+    policies = policies or Policies(cfg)
     counts: dict[str, int] = {}
     now = util.iso()
     ask = []
@@ -628,13 +656,13 @@ class Watch:
         self.cursors: list[tuple[str, str, bool, str]] = []
 
     def add(self, kind: str, scope: str, text: str, source: str, repo: str, window: list[str],
-            count: int = 1, rule: frozenset[tuple[str, str]] | None = None) -> None:
+            count: int = 1, rule: frozenset[tuple[str, str]] | None = None, legacy: str = "") -> None:
         key = (kind, scope, sources.signature(text))
         if key in self.found:
             self.found[key].count += count
         else:
             read = self.policies.of(source) if rule is None else rule
-            self.found[key] = Event(kind, scope, text, source, repo, window, count, read)
+            self.found[key] = Event(kind, scope, text, source, repo, window, count, read, legacy or scope)
 
     def consider(self, name: str, rows: list[str], origin: Origin, rule: frozenset[tuple[str, str]]) -> None:
         self.lines += len(rows)
@@ -665,19 +693,21 @@ class Watch:
                 repo = (state.run_get(str(row["run"])) or {}).get("repo") or ""
                 if repo:
                     scope = f"{policy_scope}:{repo}"
-            self.add(classify(text, row), scope, text, name, repo, window, rule=rule)
+            self.add(classify(text, row), scope, text, name, repo, window, rule=rule, legacy=origin.scope)
 
-    def follow(self, group: str, watched: list[str], origin: Origin) -> None:
+    def follow(self, group: str, watched: list[str], origin: Origin, relist=None) -> None:
         stored, marks = cursor_value(PREFIX + group)
         marks = marks or {}
         for name in dict.fromkeys([*watched, *marks]):
             older, rows, marks[name] = fresh(name, marks.get(name), stored is None)
             if older:
-                self.consider(name, older, origin, self.policies.of_copy(name))
+                self.consider(name, older, origin, self.policies.of_copy(name, origin.listed))
             if rows:
-                self.consider(name, rows, origin, self.policies.of_file(name))
+                self.consider(name, rows, origin, self.policies.of_file(name, origin.listed))
         kept = {name: mark for name, mark in marks.items()
                 if mark is not None and (name in watched or undrained(name, mark))}
+        if relist and (dropped := {name for name, mark in marks.items() if mark is not None} - kept.keys()):
+            kept |= {name: marks[name] for name in dropped.intersection(relist())}
         self.defer(group, json.dumps(kept), util.count(len(watched), "file"))
         self.sources += len(watched)
 
@@ -746,6 +776,9 @@ class Watch:
             evidence = outbound.redact(record.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
             scope = e.scope
             fingerprint = fingerprint_of(e.kind, scope, signature)
+            older = fingerprint_of(e.kind, e.legacy, signature)
+            if fingerprint not in held and older in held and self.inherits(held[older], e):
+                fingerprint = older
             while fingerprint in held and self.policies.standing(held[fingerprint]) != e.rule:
                 scope = bounded(scope, e.rule)
                 fingerprint = fingerprint_of(e.kind, scope, signature)
@@ -753,6 +786,10 @@ class Watch:
         matched, marks, self.asks = known_twins(self.cfg, self.policies, rows, held)
         opened = sum(state.commit_scan(rows, self.cursors, matched, marks))
         return opened, len(events) - opened, len(self.found) - len(events)
+
+    def inherits(self, row: dict, e: Event) -> bool:
+        return (row["policies"] is None and self.policies.standing(row) == e.rule
+                and origin_repo(row["source"], row["repo"]) == origin_repo(e.source, e.repo))
 
 
 def said(summary: dict) -> str:
@@ -764,18 +801,22 @@ def said(summary: dict) -> str:
     return text
 
 
+def arete_logs() -> list[str]:
+    return [str(p) for p in sorted(paths.LOG_DIR.glob("*.log"))]
+
+
 def scan_once(cfg: config.Config) -> dict:
     _, previous = cursor_value(SCAN)
     started = util.iso()
     watch = Watch(cfg)
     everywhere = frozenset({entry_policy(cfg)})
-    logs = [str(p) for p in sorted(paths.LOG_DIR.glob("*.log"))]
-    watch.follow("logs", logs, Origin("arete", everywhere, folder=True))
+    watch.follow("logs", arete_logs(), Origin("arete", everywhere, folder=True), arete_logs)
     watch.follow("runs", watch.run_files((previous or {}).get("since")), Origin("arete", everywhere))
     for source, files in watch.policies.files:
         pattern = re.compile(source.pattern or sources.LOG_PATTERN)
         own = frozenset({entry_policy(cfg, source)})
-        watch.follow(f"path:{source.path}", files, Origin(source.path, own, source.repo, pattern))
+        watch.follow(f"path:{source.path}", files, Origin(source.path, own, source.repo, pattern, listed=True),
+                      partial(source_files, source))
     watch.heartbeat()
     watch.serve()
     watch.stalls()
