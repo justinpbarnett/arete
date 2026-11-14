@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
+from string import Template
 
 from . import config, control, jev, lines, outbound, paths, record, sources, state, util
 
@@ -55,6 +56,8 @@ URL_ONLY_END = re.compile(r"\] done: failed https?://\S+$")
 TRACEBACK = "Traceback (most recent call last):"
 CHAINED = re.compile(r"During handling of the above exception|The above exception was the direct cause")
 REPAIR_STEPS = ("check_repair", "review_repair", "ci_repair")
+OWN_SOURCES = ("heartbeat", "serve")
+RUN_PREFIX = re.compile(r"\[(\S+) (t-[0-9a-f]+)\]")
 
 
 @dataclass(frozen=True)
@@ -311,6 +314,18 @@ def cursor_value(name: str):
 
 def ask_jev(items, cfg) -> list[jev.Reply]:
     return jev.ask_many(items, cfg, trace=("", "oncall jev"))
+
+
+def start_task(repo: str, prompt: str = "", title: str = "", ticket: str = "") -> dict:
+    from . import tasks
+
+    return tasks.start(repo, prompt, title, "fix", ticket)
+
+
+def route_outlook(cfg: config.Config, repo: config.Repo, setting) -> list:
+    from . import routing
+
+    return routing.outlook(cfg, repo, "local", setting.model, setting.runner, list(setting.tools), setting.denied)
 
 
 def fenced(data) -> str:
@@ -654,6 +669,22 @@ class Watch:
         self.found: dict[tuple, Event] = {}
         self.sources = self.lines = self.asks = 0
         self.cursors: list[tuple[str, str, bool, str]] = []
+        self.owned = {(r["repo"], r["task"]): r["incident"] for r in state.incident_repairs() if r["task"]}
+        self.runs: dict[str, dict] = {}
+        self.quiet: dict[int, int] = {}
+
+    def repairing(self, run_id: str) -> int:
+        if not self.owned:
+            return 0
+        if run_id not in self.runs:
+            self.runs[run_id] = state.run_get(run_id) or {}
+        found = self.runs[run_id]
+        return self.owned.get((found.get("repo"), found.get("issue")), 0)
+
+    def hushed(self, incident: int) -> bool:
+        if incident:
+            self.quiet[incident] = self.quiet.get(incident, 0) + 1
+        return bool(incident)
 
     def add(self, kind: str, scope: str, text: str, source: str, repo: str, window: list[str],
             count: int = 1, rule: frozenset[tuple[str, str]] | None = None, legacy: str = "") -> None:
@@ -677,9 +708,13 @@ class Watch:
             if row:
                 if not run_failure(row) or (origin.folder and lines.path(str(row["run"])).exists()):
                     continue
+                if self.hushed(self.repairing(str(row["run"]))):
+                    continue
                 text = run_text(row)
             elif (origin.pattern.search(line) or EXPECTED_TEXT.search(line)
                   or (origin.folder and ORCHESTRATION_TEXT.search(line))):
+                if (own := RUN_PREFIX.search(line)) and self.hushed(self.owned.get(own.groups(), 0)):
+                    continue
                 text = line
                 if TRACEBACK in line:
                     last, final = traceback_end(rows, begin)
@@ -759,7 +794,7 @@ class Watch:
             if not why:
                 continue
             stalled.append(row["id"])
-            if row["id"] not in flagged:
+            if row["id"] not in flagged and not self.hushed(self.owned.get((row.get("repo"), row.get("issue")), 0)):
                 head = f"run {row['id']} ({row.get('repo') or '-'}#{row.get('issue') or '-'}) stalled: {why}"
                 self.add(STALLED, f"run:{row['id']}", f"run stalled: {why}", f"run {row['id']}", "", [head, *texts])
         self.defer("stalls", json.dumps(stalled), f"{len(stalled)} stalled")
@@ -785,11 +820,182 @@ class Watch:
             rows.append((fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence, packed(e.rule)))
         matched, marks, self.asks = known_twins(self.cfg, self.policies, rows, held)
         opened = sum(state.commit_scan(rows, self.cursors, matched, marks))
+        for incident, n in self.quiet.items():
+            state.add_incident_note(incident, f"its repair wrote {util.count(n, 'failure line')}; none opened an incident")
         return opened, len(events) - opened, len(self.found) - len(events)
 
     def inherits(self, row: dict, e: Event) -> bool:
         return (row["policies"] is None and self.policies.standing(row) == e.rule
                 and origin_repo(row["source"], row["repo"]) == origin_repo(e.source, e.repo))
+
+
+def own_source(source: str) -> bool:
+    inside = [paths.LOG_DIR, paths.RUNS_DIR]
+    return source in OWN_SOURCES or source.startswith("run ") or any(Path(source).is_relative_to(p) for p in inside)
+
+
+def repair_repo(cfg: config.Config, row: dict) -> str:
+    return cfg.arete_repo if own_source(row["source"]) else row["repo"]
+
+
+def repair_title(incident_id: int) -> str:
+    return f"On-call incident {incident_id}: repair"
+
+
+def attempts(row: dict) -> list[dict]:
+    return [r for r in row["repairs"] if r["task"]]
+
+
+def moved(row: dict, phase: str, waiting: str = "", note: str = "", **fields) -> None:
+    if (row["phase"], row["waiting"]) == (phase, waiting) and not fields:
+        return
+    state.update_incident(row["id"], note or (f"{phase}: {waiting}" if waiting else phase),
+                          phase=phase, waiting=waiting, **fields)
+
+
+def cooling(cfg: config.Config, row: dict) -> str:
+    ended = max((r["ended"] for r in row["repairs"] if r["ended"]), default="")
+    if not ended:
+        return ""
+    until = util.iso(util.parse_iso(ended) + timedelta(minutes=cfg.oncall.cooldown_minutes))
+    return until if until > util.iso() else ""
+
+
+def spent(cfg: config.Config, repairs: list[dict]) -> float:
+    ids = [r["id"] for x in repairs if x["task"] for r in state.ticket_runs(x["repo"], x["task"], limit=50)]
+    return sum(state.paid_by_run(ids, local_providers=cfg.local_providers).values())
+
+
+def last_run_id(repair: dict) -> str:
+    return next((r["id"] for r in state.ticket_runs(repair["repo"], repair["task"], limit=1)), "-")
+
+
+def repair_line(row: dict) -> str:
+    made = len([r for r in row.get("repairs", []) if r["task"]])
+    parts = [row["phase"] or "", row["waiting"], f"{made} attempt{'' if made == 1 else 's'}" if made else ""]
+    if last := next((r for r in reversed(row.get("repairs", [])) if r["task"]), None):
+        parts.append(f"task {last['task']}")
+    return "; ".join(p for p in parts if p)
+
+
+def route_refusal(cfg: config.Config, repo: config.Repo) -> str:
+    from . import devices, routing, runner, steps
+
+    try:
+        layer = config.load_layer(repo.layer_dir)
+        modes = routing.modes_for(cfg, repo)
+        for role in ("plan", "build", *(("verify",) if layer.verify else ()), "review", *REPAIR_STEPS):
+            setting = steps.resolve(cfg, layer, role, "fix")
+            which, name = runner.chosen(setting.model, setting.runner, cfg)
+            if which == runner.REPLAY:
+                continue
+            request = runner.request_for(cfg, repo, which, name, None, True,
+                                         {"tools": list(setting.tools), "disallowed_tools": list(setting.denied)})
+            if why := routing.fit_refusal(request, devices.LOCAL, modes):
+                return f"{role}: {why}"
+            routes = route_outlook(cfg, repo, setting)
+            if any(c.state == "ready" for c in routes):
+                continue
+            if words := routing.held_words(routes):
+                return f"{role}: {words}"
+            if blocked := next((c for c in routes if c.state == "policy"), None):
+                return f"{role}: {blocked.detail}"
+            if routing.budget_blocked(routes):
+                return f"{role}: {next(c.detail for c in routes if c.state == 'budget_spent')}"
+            details = "; ".join(sorted({c.detail for c in routes if c.detail})) or "no route was found"
+            return f"{role}: {util.first_line(details, 200)}"
+    except (ValueError, TypeError, OSError) as e:
+        return util.first_line(str(e), 200)
+    return ""
+
+
+def repair_prompt(row: dict, repairs: list[dict], limit: int) -> str:
+    earlier = "".join(f"- attempt {n}: task {r['task']}, run {last_run_id(r)}, ended {r['outcome'] or 'unfinished'}\n"
+                      for n, r in enumerate(repairs, 1))
+    return Template((paths.PROMPTS_DIR / "oncall_repair.md").read_text()).safe_substitute(
+        incident=row["id"], kind=row["class"], source=outbound.plain(row["source"], 200), count=row["count"],
+        first_seen=row["first_seen"], last_seen=row["last_seen"], attempt=len(repairs) + 1,
+        max_attempts=limit, earlier=f"Earlier attempts:\n{earlier}" if earlier else "", evidence=subject(row))
+
+
+def wake(cfg: config.Config, row: dict) -> bool:
+    limits = cfg.oncall
+    mine = attempts(row)
+    if len(mine) >= limits.max_attempts:
+        moved(row, "blocked", f"{len(mine)} of {limits.max_attempts} attempts used")
+        return False
+    if (money := spent(cfg, mine)) >= limits.incident_budget_usd:
+        moved(row, "blocked", f"{money:.2f} of {limits.incident_budget_usd:.2f} USD spent on it")
+        return False
+    if until := cooling(cfg, row):
+        moved(row, "waiting", f"cooling down until {until}")
+        return False
+    if owner := owner_run(row):
+        moved(row, "waiting", f"run {owner} owns it and is still live")
+        return False
+    name = repair_repo(cfg, row)
+    repo = next((r for r in cfg.repos if r.name == name), None)
+    if repo is None:
+        moved(row, "waiting", f"{name!r} is not a [[repo]] to repair in" if name else "it has no repo to repair in")
+        return False
+    every = state.incident_repairs()
+    day = [r for r in every if r["started"] >= util.iso(util.now() - timedelta(days=1))]
+    if (money := spent(cfg, day)) >= limits.daily_budget_usd:
+        moved(row, "waiting", f"{money:.2f} of {limits.daily_budget_usd:.2f} USD spent on repairs today")
+        return False
+    if len([r for r in every if not r["ended"]]) >= limits.max_repairs:
+        moved(row, "waiting", f"{limits.max_repairs} repairs are already running")
+        return False
+    if len([r for r in every if r["started"] >= util.iso(util.now() - timedelta(hours=1))]) >= limits.wakes_per_hour:
+        moved(row, "waiting", f"{limits.wakes_per_hour} wakes in the last hour is the limit")
+        return False
+    if why := route_refusal(cfg, repo):
+        moved(row, "waiting", why)
+        return False
+    repair = state.add_repair(row["id"], name)
+    try:
+        started = start_task(name, repair_prompt(row, mine, limits.max_attempts), repair_title(row["id"]))
+    except (control.Refused, control.NotFound) as e:
+        made = next(r for r in state.incident(row["id"])["repairs"] if r["id"] == repair)
+        why = outbound.sanitize(str(e), 160)
+        if task := created_task(made):
+            state.set_repair(repair, task=task)
+            moved(row, "repairing", note=f"woke repair attempt {len(mine) + 1} of {limits.max_attempts}: "
+                  f"task {task} in {name}; its first run did not start: {why}")
+            return True
+        state.set_repair(repair, ended=util.iso(), outcome="not started")
+        moved(row, "waiting", f"the repair task would not start: {why}")
+        return False
+    state.set_repair(repair, task=started["task"])
+    moved(row, "repairing", note=f"woke repair attempt {len(mine) + 1} of {limits.max_attempts}: task "
+          f"{started['task']} in {name}, run {started.get('run') or '-'}")
+    return True
+
+
+def created_task(repair: dict) -> str:
+    found = next((t for t in state.tasks(repair["repo"]) if t["title"] == repair_title(repair["incident"])
+                  and t["created"] >= repair["started"]), None)
+    return found["id"] if found else ""
+
+
+def adopt_unfinished() -> None:
+    for repair in state.incident_repairs():
+        if repair["ended"] or repair["task"]:
+            continue
+        if task := created_task(repair):
+            state.set_repair(repair["id"], task=task)
+        else:
+            state.set_repair(repair["id"], ended=util.iso(), outcome="not started")
+
+
+def tend(cfg: config.Config) -> dict:
+    woken = 0
+    for listed in state.woken_incidents():
+        row = state.incident(listed["id"])
+        if any(not r["ended"] for r in row["repairs"]):
+            continue
+        woken += wake(cfg, row)
+    return {"woken": woken} if woken else {}
 
 
 def said(summary: dict) -> str:
@@ -798,6 +1004,8 @@ def said(summary: dict) -> str:
             f"{summary['expected']} expected")
     if decisions := summary.get("decisions"):
         text += "; decided: " + ", ".join(f"{n} {name}" for name, n in decisions.items())
+    if repairs := summary.get("repairs"):
+        text += "; repairs: " + ", ".join(f"{n} {name}" for name, n in repairs.items())
     return text
 
 
@@ -808,6 +1016,7 @@ def arete_logs() -> list[str]:
 def scan_once(cfg: config.Config) -> dict:
     _, previous = cursor_value(SCAN)
     started = util.iso()
+    adopt_unfinished()
     watch = Watch(cfg)
     everywhere = frozenset({entry_policy(cfg)})
     watch.follow("logs", arete_logs(), Origin("arete", everywhere, folder=True), arete_logs)
@@ -822,8 +1031,10 @@ def scan_once(cfg: config.Config) -> dict:
     watch.stalls()
     opened, updated, expected = watch.store()
     decisions = decide(cfg, watch.policies, MAX_ASKS - watch.asks)
+    repairs = tend(cfg)
     summary = {"sources": watch.sources, "lines": watch.lines, "events": len(watch.found), "opened": opened,
-               "updated": updated, "expected": expected, "decisions": decisions}
+               "updated": updated, "expected": expected, "decisions": decisions,
+               "repairs": repairs}
     total = (previous or {}).get("expected", 0) + expected
     state.set_cursor(SCAN, json.dumps({"expected": total, "last": summary, "since": started}), True, said(summary))
     return summary
