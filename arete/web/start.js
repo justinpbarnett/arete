@@ -2,6 +2,8 @@
 
 function wireForms() {
   document.getElementById("settings-form").addEventListener("submit", saveSettings);
+  document.getElementById("push-allow").addEventListener("click", allowPush);
+  document.getElementById("push-test").addEventListener("click", testPush);
   document.getElementById("settings-undo").addEventListener("click", () => {
     if (settingsData) drawSettings(settingsData);
     document.getElementById("settings-result").hidden = true;
@@ -123,6 +125,9 @@ document.addEventListener("visibilitychange", () => {
 
 document.addEventListener("DOMContentLoaded", () => {
   if ("serviceWorker" in navigator && window.isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});
+  navigator.serviceWorker?.addEventListener("message", (event) => {
+    if (typeof event.data?.ask === "string") location.hash = `ask/${encodeURIComponent(event.data.ask)}`;
+  });
 });
 
 document.addEventListener("DOMContentLoaded", () => {

@@ -40,8 +40,9 @@ const LOADERS = {
     return () => drawHealth(data);
   },
   settings: async () => {
-    const fresh = await call("/api/settings");
+    const [fresh, push] = await Promise.all([call("/api/settings"), call("/api/push").catch(() => null)]);
     return () => {
+      if (push) drawPush(push);
       if (settingsData && Object.keys(settingsChanges()).length) return HELD;
       drawSettings(fresh);
       return SLOW_MS;
