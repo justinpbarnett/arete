@@ -610,6 +610,10 @@ def refuse_empty_file() -> None:
                            f"`arete backup --restore {newest}` instead of starting over with an empty file")
 
 
+def columns(conn, table) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
 @contextmanager
 def db():
     paths.ensure_dirs()
@@ -619,8 +623,12 @@ def db():
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
         for table, column, sql in MIGRATIONS:
-            if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
-                conn.execute(sql)
+            if column not in columns(conn, table):
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    if column not in columns(conn, table):
+                        raise
         yield conn
         conn.commit()
     finally:
