@@ -629,12 +629,14 @@ A proposal for arete or a public repo that names another repository, ticket, run
 
 ### Retention
 
-The hourly prune in `arete serve` deletes records oldest first until both `[retention]` limits hold: `days` (default 30, counted from the record's last write) and `max_gb` (default 20, decimal GB, `10^9` bytes).
-A record stays while it is pinned, while a pending proposal cites its run (as its own run or as a run id in its evidence) until the proposal is merged, rejected, skipped or filed, while its run is running, and for an hour after its last write.
-Only the `record/` folder of a run is removed; `run.log`, `run.jsonl` and the other files stay.
+The hourly prune in `arete serve` removes zero-cost command-loop firing rows, feed entries and run folders after 14 days. Folder deletions are queued in the database and retried after a filesystem failure. Old rowless folders are removed only when their contents match the legacy firing shape: `run.log`, optionally `events.json`, an empty `scratch/`, and `record/` containing only `steps.jsonl.gz`.
+Raw `record/` folders go oldest first after `[retention] days` (default 30, counted from the record's last write), or while all files in `runs/` exceed `max_gb` (default 20, decimal GB, `10^9` bytes).
+A record stays while pinned, cited by a proposal other than rejected, skipped or filed, running, or written in the last hour. Merged proposals keep their cited records until the run folder expires.
+Run folders, including logs, evidence and continuation files, go after `lines_days` (default 90, counted from finish or, if unfinished, start). Their runs, feed and steps history rows stay, with a file-removal date; resume then asks you to start the ticket again with `POST /api/tasks`. A folder stays while its run is running, pr or needs-info, pinned, has an open or answered but untaken ask, is cited by a proposal other than merged, rejected, skipped or filed, or shares a repo and ticket with a run started inside `lines_days`.
 `arete record pin RUN_ID` keeps a record; `arete record unpin RUN_ID` lets it age out like any other.
 `arete status` shows a `records:` line with the size of the store, its oldest record and the number of pins.
-When every record left is kept and the store is still over `max_gb`, the serve log says so on that hour's prune.
+Protected records and bytes outside `record/` can keep `runs/` over budget; the serve log reports this. `lines_days` must be at least `days`; both allow positive fractions.
+Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `lines_days` ago are removed.
 
 ## Backups
 
@@ -817,7 +819,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[routing]` | `fallback` (default true) and `payment_modes` (a list of `subscription`, `api_key` and `local`; default all three). The engine's and a repo layer's `fallback` are combined with AND, so either can turn it off; a layer's `payment_modes` can only restrict the engine's. `arete steps` shows the result, and runs act on it. `capabilities` (per-route tables) and `floors` (named model lists) feed the step requirements. See [Steps](#steps). |
 | `[chat]` | `context_tokens` (default 40000, at least 100) is how many tokens of the chat's saved messages go into each turn before older ones are folded into a saved summary (the new message is not counted). `summary_model` (default `haiku`) writes that summary. `max_sessions` (default 2, at least 1) is the most task sessions one chat has running. `budget_usd` (default 10) is the dollars one chat may spend on its replies and its sessions. |
 | `[capture]` | `vision` (default none): the name of a file in the config folder, such as `vision.md`, that says what the app is for. The feedback composer's vision check reads it; a path that is absolute, holds `..` or leaves the folder is refused at load. With no key, no file or an empty file, that check holds and says what to add. `evidence_branch` (default `feedback-evidence`): the branch that holds uploaded evidence, a plain branch name with no `..`. `public_evidence` (default false): a public repo, or one whose visibility cannot be read, holds delivery of a request with evidence unless this is true. |
-| `[retention]` | `days` (default 30) and `max_gb` (default 20): records older than `days`, or the oldest ones beyond `max_gb` in total, are deleted by the hourly prune; pinned, cited, running and just-written records stay. Fractions are allowed. See [Records](#records). |
+| `[retention]` | `days` (default 30) expires raw records; `max_gb` (default 20) counts all run-folder bytes and removes eligible records oldest first; `lines_days` (default 90, at least `days`) expires run folders while keeping history rows. Protected data stays. Positive fractions are allowed. See [Retention](#retention). |
 | `[replay]` | `all` (default false, sends every agent call to the replay runner) and `dir` (the folder of answers; `ARETE_REPLAY_DIR` wins over it). See [Replay](#replay). |
 | `[environment]` | `pass`, the names of more server variables that local agents and the commands that run a repo's code get, each an exact name, a prefix ending in `*`, or `"*"` for all. `[environment.providers]` maps a pi provider to more names its agents get, such as `amazon-bedrock = ["AWS_*"]`. See [An agent's environment](#an-agents-environment). |
 

@@ -1008,7 +1008,9 @@ class RecordRetentionTests(Isolated):
     def test_retention_table(self):
         self.assertEqual(config.retention_table({}), config.Retention(30, 20))
         self.assertEqual(config.retention_table({"days": 0.5}), config.Retention(0.5, 20))
-        for bad in ({"days": 0}, {"max_gb": "x"}, {"days": True}, {"weeks": 1}):
+        self.assertEqual(config.retention_table({"days": 0.5, "lines_days": 0.5}), config.Retention(0.5, 20, 0.5))
+        for bad in ({"days": 0}, {"max_gb": "x"}, {"days": True}, {"weeks": 1}, {"days": 91},
+                    *({"lines_days": v} for v in (0, -1, True, float("inf"), float("nan"), "90", 29))):
             with self.assertRaises(ValueError):
                 config.retention_table(bad)
 
@@ -1028,7 +1030,7 @@ class RecordRetentionTests(Isolated):
         server = serve.Server()
         with patch.object(state, "prune") as pruned:
             server.prune()
-        pruned.assert_called_once_with(keep_days=server.cfg.oncall.keep_days)
+        pruned.assert_called_once_with(lines_days=90, keep_days=server.cfg.oncall.keep_days)
         self.assertFalse(old.exists())
         self.assertEqual(len(list((paths.DB_FILE.parent / "backups").glob("arete-*.db"))), 1)
         self.assertTrue((paths.DB_FILE.parent / "backups" / "last.json").exists())
@@ -1039,6 +1041,7 @@ class RecordRetentionTests(Isolated):
         record.pin("pip-b")
         found = record.store()
         self.assertEqual((found["bytes"], found["records"], found["pins"]), (1500, 2, 1))
+        self.assertEqual(found["runs_bytes"], 1508)
         self.assertEqual(found["oldest"]["run_id"], "pip-a")
         self.assertEqual(record.size_text(1500), "1.5 KB")
 

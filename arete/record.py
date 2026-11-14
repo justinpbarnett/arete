@@ -882,10 +882,81 @@ def stored() -> list[Stored]:
     return sorted(found, key=lambda s: (s.written, s.run_id))
 
 
+def run_folders() -> list[Path]:
+    if not paths.RUNS_DIR.exists():
+        return []
+    return sorted(p for p in paths.RUNS_DIR.iterdir() if not p.is_symlink() and p.is_dir())
+
+
+def runs_bytes() -> int:
+    return sum(scanned(p.name, p).size for p in run_folders())
+
+
+@dataclass(frozen=True)
+class Purged:
+    folders: int
+    size: int
+    errors: tuple[str, ...]
+
+
+def legacy_firing(folder: Path) -> bool:
+    entries = {p.name: p for p in folder.iterdir()}
+    if "run.log" not in entries or set(entries) - {"run.log", "events.json", "scratch", "record"}:
+        return False
+    if any(p.is_symlink() for p in entries.values()):
+        return False
+    log = entries["run.log"]
+    if not log.is_file() or log.stat().st_mtime >= time.time() - 14 * 86400:
+        return False
+    if "events.json" in entries and not entries["events.json"].is_file():
+        return False
+    if "scratch" in entries and (not entries["scratch"].is_dir() or any(entries["scratch"].iterdir())):
+        return False
+    if "record" in entries:
+        if not entries["record"].is_dir():
+            return False
+        contents = list(entries["record"].iterdir())
+        if any(p.name != "steps.jsonl.gz" or p.is_symlink() or not p.is_file() for p in contents):
+            return False
+    return True
+
+
+def purge_folders() -> Purged:
+    with state.db() as c:
+        queued = {r["run_id"] for r in c.execute("SELECT run_id FROM run_purges")}
+        known = {r["id"] for r in c.execute("SELECT id FROM runs")}
+    folders, size, errors = 0, 0, []
+    for run_id in sorted(queued):
+        folder = paths.RUNS_DIR / run_id
+        try:
+            if not one_component(run_id) or folder.is_symlink():
+                raise ValueError(f"unsafe run folder {run_id}")
+            if folder.exists():
+                measured = scanned(run_id, folder).size
+                shutil.rmtree(folder)
+                folders, size = folders + 1, size + measured
+            if not folder.exists():
+                with state.db() as c:
+                    c.execute("DELETE FROM run_purges WHERE run_id = ?", (run_id,))
+        except (OSError, ValueError) as e:
+            errors.append(f"{run_id}: {type(e).__name__}: {e}")
+    for folder in run_folders():
+        if folder.name in known or folder.name in queued:
+            continue
+        try:
+            if legacy_firing(folder):
+                measured = scanned(folder.name, folder).size
+                shutil.rmtree(folder)
+                folders, size = folders + 1, size + measured
+        except OSError as e:
+            errors.append(f"{folder.name}: {type(e).__name__}: {e}")
+    return Purged(folders, size, tuple(errors))
+
+
 def kept(records: Sequence[Stored]) -> set[str]:
     ids = [r.run_id for r in records]
     recent = time.time() - LIVE_SECONDS
-    return (state.record_pins() | state.runs_cited_by_pending_proposals(ids)
+    return (state.record_pins() | state.runs_cited_by_kept_proposals(ids)
             | {r["id"] for r in state.runs_marked_running()} | {r.run_id for r in records if r.written > recent})
 
 
@@ -894,7 +965,7 @@ def prune(days: float, max_gb: float) -> Pruned:
     protected = kept(records)
     limit = max_gb * GB
     oldest_allowed = time.time() - days * 86400
-    left_bytes, left, removed = sum(r.size for r in records), len(records), []
+    left_bytes, left, removed = runs_bytes(), len(records), []
     for r in records:
         if r.run_id in protected or not (r.written < oldest_allowed or left_bytes > limit):
             continue
@@ -904,8 +975,6 @@ def prune(days: float, max_gb: float) -> Pruned:
             continue
         removed.append(r)
         left, left_bytes = left - 1, left_bytes - r.size
-        with contextlib.suppress(OSError):
-            folder.parent.rmdir()
     return Pruned(tuple(removed), left, left_bytes, left_bytes > limit)
 
 
@@ -927,7 +996,7 @@ def unpin(run_id: str) -> None:
 def store() -> dict:
     records = stored()
     oldest = records[0] if records else None
-    return {"bytes": sum(r.size for r in records), "records": len(records),
+    return {"bytes": sum(r.size for r in records), "runs_bytes": runs_bytes(), "records": len(records),
             "oldest": {"run_id": oldest.run_id, "written": util.iso(datetime.fromtimestamp(oldest.written, UTC))}
             if oldest else None,
             "pins": len(state.record_pins())}

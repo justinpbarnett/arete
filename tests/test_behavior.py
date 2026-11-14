@@ -7814,5 +7814,289 @@ class CutOffTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("seen before") for line in facts["hunted"]["log"]))
 
 
+class RetentionTests(unittest.TestCase):
+    scratch = MinerRecordedRunTests.scratch
+    PRELUDE = r'''
+import io, json, os, sys, time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest import mock
+from arete import backup, config, control, heartbeat, hook, paths, record, replay, serve, state, tasks, util
+root = Path(sys.argv[1])
+paths.CONFIG_FILE.write_text("\n".join(replay.sample(root / "sample")))
+state.ensure_schema()
+server = serve.Server()
+messages = []
+server.say = messages.append
+def age(days):
+    return util.iso(util.now() - timedelta(days=days))
+def backdate(folder, days):
+    at = time.time() - days * 86400
+    for p in folder.rglob("*"):
+        if not p.is_symlink():
+            os.utime(p, (at, at))
+def made(tag, days, status="failed", kind="pipeline", raw=True, issue=None):
+    rid = record.start(kind, tag=tag, repo="replay-sample", issue=issue or tag,
+                       **({"loop_kind": "command"} if kind == "loop" else {}))
+    if raw:
+        with record.Recorder(rid, "build", {"runner": "claude", "model": "m"}, ()) as rec:
+            rec.line(json.dumps({"type": "text", "text": tag}))
+            rec.end({"ok": True, "error": "", "seconds": 1})
+    record.settle(rid, status, end_line=tag)
+    folder = paths.RUNS_DIR / rid
+    (folder / "run.log").write_text(tag)
+    (folder / "run.jsonl").write_text('{}\n')
+    with state.db() as c:
+        c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (age(days), age(days), rid))
+        c.execute("INSERT INTO steps (run_id, step, ok) VALUES (?, 'build', 1)", (rid,))
+    backdate(folder, days)
+    return rid
+def folder(rid):
+    return paths.RUNS_DIR / rid
+def queued(rid):
+    with state.db() as c:
+        return c.execute("SELECT 1 FROM run_purges WHERE run_id = ?", (rid,)).fetchone() is not None
+def proposal(rid, status):
+    state.add_proposal(rid, {"layer": "repo", "repo": "replay-sample", "file": "f", "change": "c",
+                                  "why": "w", "evidence": [rid], "confidence": 0.9}, "hand")
+    pid = state.proposals()[0]["id"]
+    state.move_proposal(pid, ("hand",), status)
+def result(**fields):
+    print("BEHAVIOR_RESULT=" + json.dumps(fields))
+'''
+
+    def test_firing_rows_folders_and_queue_are_removed_together(self):
+        found = self.scratch(r'''
+old, young = [made(str(d), d, "done", "loop", raw=False) for d in (15, 13)]
+for rid in (old, young):
+    (folder(rid) / "run.jsonl").unlink()
+    (folder(rid) / "scratch").mkdir()
+server.prune()
+with state.db() as c:
+    feed = [c.execute("SELECT COUNT(*) FROM feed WHERE run_id = ?", (rid,)).fetchone()[0] for rid in (old, young)]
+snap = backup.newest_snapshot()
+checked = backup.inspect(snap)
+result(rows=[state.run_get(r) is not None for r in (old, young)],
+       folders=[folder(r).exists() for r in (old, young)], feed=feed,
+       queues=[queued(r) for r in (old, young)], snapshot=bool(snap),
+       checked=checked["quick_check"] == "ok" and checked["counts"]["runs"] == 2)
+''')
+        self.assertEqual(found["rows"], [False, True])
+        self.assertEqual(found["folders"], [False, True])
+        self.assertEqual(found["feed"], [0, 1])
+        self.assertEqual(found["queues"], [False, False])
+        self.assertTrue(found["snapshot"] and found["checked"])
+
+    def test_folder_failure_retries_and_does_not_skip_records(self):
+        found = self.scratch(r'''
+rid = made("firing", 15, "done", "loop", raw=False)
+old = made("raw", 40)
+with mock.patch.object(record, "purge_folders", side_effect=OSError("disk busy")):
+    server.prune()
+first = [state.run_get(rid) is None, folder(rid).exists(), queued(rid), not paths.record_dir(old).exists()]
+server.prune()
+result(first=first, retried=not folder(rid).exists() and not queued(rid), messages=messages)
+''')
+        self.assertEqual(found["first"], [True] * 4)
+        self.assertTrue(found["retried"])
+        self.assertTrue(any("folder purge failed: OSError: disk busy" in m for m in found["messages"]))
+
+    def test_folder_expiry_keeps_history_and_refuses_resume(self):
+        found = self.scratch(r'''
+old = made("old", 91, "merged")
+young = made("young", 89, "merged")
+failed = made("failed", 91)
+recent_finish = made("recent-finish", 100)
+with state.db() as c:
+    c.execute("UPDATE runs SET finished = ? WHERE id = ?", (age(2), recent_finish))
+server.prune()
+row = state.run_get(failed)
+try:
+    tasks.resume(failed)
+except control.Refused as e:
+    refusal = str(e)
+with state.db() as c:
+    steps = c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ?", (old,)).fetchone()[0]
+with mock.patch.object(tasks, "script_path", return_value="feature"), mock.patch.object(tasks, "launch", return_value={"ok": True}):
+    resumed = tasks.resume(recent_finish)
+result(folders=[folder(r).exists() for r in (old, young, failed, recent_finish)],
+       young_record=paths.record_dir(young).exists(), history=bool(state.run_get(old)), steps=steps,
+       purged=state.run_get(old)["files_purged"], refusal=refusal, date=row["files_purged"], resumed=resumed)
+''')
+        self.assertEqual(found["folders"], [False, True, False, True])
+        self.assertFalse(found["young_record"])
+        self.assertTrue(found["history"] and found["purged"])
+        self.assertEqual(found["steps"], 1)
+        self.assertIn(found["date"], found["refusal"])
+        self.assertIn("POST /api/tasks", found["refusal"])
+        self.assertEqual(found["resumed"], {"ok": True})
+
+    def test_folder_protections(self):
+        found = self.scratch(r'''
+ids = {tag: made(tag, 91, status) for tag, status in
+       [("ticket", "failed"), ("open", "failed"), ("answered", "failed"), ("pin", "failed"),
+        ("cited", "failed"), ("evidence", "failed"), ("running", "running"), ("pr", "pr"), ("info", "needs-info")]}
+made("new", 10, issue="ticket")
+record.pin(ids["pin"])
+proposal(ids["cited"], "pending")
+proposal(ids["evidence"], "pending")
+with state.db() as c:
+    c.execute("UPDATE proposals SET run_id = 'miner', status = NULL WHERE run_id = ?", (ids["evidence"],))
+    for status in ("open", "answered"):
+        c.execute("INSERT INTO asks (id, run, repo, ticket, step, questions, status, asked) "
+                  "VALUES (?, ?, 'replay-sample', '1', 'build', '[]', ?, ?)",
+                  (status, ids[status], status, age(91)))
+    c.execute("UPDATE runs SET finished = NULL WHERE id = ?", (ids["running"],))
+server.prune()
+result(kept={tag: folder(rid).exists() and state.run_get(rid)["files_purged"] is None for tag, rid in ids.items()})
+''')
+        self.assertTrue(all(found["kept"].values()), found)
+
+    def test_cap_counts_evidence_and_store_counts_both_sizes(self):
+        found = self.scratch(r'''
+ids = [made(str(d), d) for d in (3, 2)]
+for rid in ids:
+    evidence = folder(rid) / "evidence"
+    evidence.mkdir()
+    (evidence / "proof").write_bytes(b"x" * 3000)
+total = record.runs_bytes()
+old_size = record.scanned(ids[0], paths.record_dir(ids[0])).size
+server.cfg = replace(server.cfg, retention=config.Retention(30, (total - old_size / 2) / record.GB))
+server.prune()
+store = record.store()
+first = [paths.record_dir(r).exists() for r in ids]
+newer_size = record.scanned(ids[1], paths.record_dir(ids[1])).size
+first_messages = list(messages)
+server.cfg = replace(server.cfg, retention=config.Retention(30, 1 / record.GB))
+server.prune()
+result(first=first,
+       total=store["runs_bytes"], expected=total-old_size, raw=store["bytes"],
+       newer=newer_size, first_messages=first_messages, messages=messages,
+       evidence=[(folder(r) / "evidence/proof").stat().st_size for r in ids])
+''')
+        self.assertEqual(found["total"], found["expected"])
+        self.assertEqual(found["raw"], found["newer"])
+        self.assertEqual(found["first"], [False, True])
+        self.assertEqual(found["evidence"], [3000, 3000])
+        self.assertFalse(any("over max_gb" in m for m in found["first_messages"]))
+        self.assertTrue(any("over max_gb" in m for m in found["messages"]))
+
+    def test_merged_citations_keep_records_until_folder_expiry(self):
+        found = self.scratch(r'''
+merged, rejected = [made(s, 40) for s in ("merged", "rejected")]
+proposal(merged, "merged"); proposal(rejected, "rejected")
+server.prune()
+first = [paths.record_dir(r).exists() for r in (merged, rejected)]
+with state.db() as c:
+    c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (age(91), age(91), merged))
+server.prune()
+result(first=first, folder=folder(merged).exists(), history=bool(state.run_get(merged)), proposals=len(state.proposals()))
+''')
+        self.assertEqual(found["first"], [True, False])
+        self.assertFalse(found["folder"])
+        self.assertTrue(found["history"])
+        self.assertEqual(found["proposals"], 2)
+
+    def test_events_rotate_read_archives_and_heartbeat(self):
+        found = self.scratch(r'''
+old = {"ts": age(40), "kind": "old"}; new = {"ts": age(0), "kind": "new"}
+paths.EVENTS_FILE.write_text(json.dumps(old) + '\ninvalid\n' + json.dumps(new) + '\n')
+expired = paths.EVENTS_FILE.with_name("events-200001.jsonl")
+expired.write_text('{}\n')
+at = time.time() - 100 * 86400
+os.utime(expired, (at, at))
+server.prune()
+archive = paths.EVENTS_FILE.with_name('events-' + datetime.fromisoformat(old["ts"]).strftime('%Y%m') + '.jsonl')
+paths.CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+paths.CLAUDE_SETTINGS.write_text(json.dumps({"hooks": {"test": "arete hook"}}))
+checks = heartbeat.check_hook()
+first = [e["kind"] for e in hook.read_events(24)]
+both = [e["kind"] for e in hook.read_events(24 * 45)]
+with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Skill", "tool_input": {"skill": "test"}}))):
+    hook.main()
+active = paths.EVENTS_FILE.exists()
+paths.EVENTS_FILE.write_text(json.dumps(old) + '\n')
+before = archive.read_bytes()
+server.prune()
+result(first=first, both=both, archive=archive.exists(), expired=expired.exists(), active=active,
+       heartbeat=all(c.ok for c in checks), collision=archive.read_bytes() == before,
+       messages=messages)
+''')
+        self.assertEqual(found["first"], ["new"])
+        self.assertEqual(found["both"], ["old", "new"])
+        for key in ("archive", "active", "heartbeat", "collision"):
+            self.assertTrue(found[key], key)
+        self.assertFalse(found["expired"])
+        self.assertTrue(any("event rotation failed: FileExistsError" in m for m in found["messages"]))
+
+    def test_read_events_survives_rotation_between_discovery_and_open(self):
+        found = self.scratch(r'''
+old = {"ts": age(40), "kind": "old"}; new = {"ts": age(0), "kind": "new"}
+paths.EVENTS_FILE.write_text(json.dumps(old) + '\n' + json.dumps(new) + '\n')
+real = hook.event_stats
+calls = []
+def racing():
+    stats = real()
+    if not calls:
+        calls.append(1)
+        hook.rotate_events(365)
+    return stats
+with mock.patch.object(hook, "event_stats", racing):
+    kinds = [e["kind"] for e in hook.read_events(24 * 45)]
+result(kinds=kinds, calls=len(calls))
+''')
+        self.assertEqual(found["kinds"], ["old", "new"])
+        self.assertEqual(found["calls"], 1)
+
+    def test_only_exact_legacy_orphans_and_safe_queued_paths_are_removed(self):
+        found = self.scratch(r'''
+for name, files in {"plain": ["run.log"], "timeline": ["run.log", "record/steps.jsonl.gz"],
+                    "chat": ["record/x"], "eva-x-prompts": ["main/x", "pr/x"],
+                    "min-x": ["prompt.md", "result.json"],
+                    "nested": ["run.log", "scratch/keep/x"], "linked": ["run.log"]}.items():
+    for file in files:
+        p = folder(name) / file
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("keep")
+    backdate(folder(name), 100 if name == "eva-x-prompts" else 20)
+(folder("plain") / "scratch").mkdir()
+sentinel = root / "sentinel"
+sentinel.mkdir(); (sentinel / "keep").write_text("safe")
+(folder("linked") / "record").symlink_to(sentinel, target_is_directory=True)
+folder("alias").symlink_to(sentinel, target_is_directory=True)
+with state.db() as c:
+    for rid in ("../sentinel", "alias", "missing"):
+        c.execute("INSERT INTO run_purges VALUES (?, 'lines', ?)", (rid, age(0)))
+server.prune()
+result(removed=[not folder(r).exists() for r in ("plain", "timeline")],
+       kept=[folder(r).exists() for r in ("chat", "eva-x-prompts", "min-x", "nested", "linked", "alias")],
+       sentinel=(sentinel / "keep").read_text(), missing=queued("missing"),
+       unsafe=[queued(r) for r in ("../sentinel", "alias")])
+''')
+        self.assertEqual(found["removed"], [True, True])
+        self.assertTrue(all(found["kept"]))
+        self.assertEqual(found["sentinel"], "safe")
+        self.assertFalse(found["missing"])
+        self.assertEqual(found["unsafe"], [True, True])
+
+    def test_phase_failures_continue_and_snapshot_failure_stops_deletions(self):
+        found = self.scratch(r'''
+old = made("old", 40)
+with mock.patch.object(state, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(hook, "rotate_events", wraps=hook.rotate_events) as rotate:
+    server.prune()
+    continued = purge.call_count == rotate.call_count == 1 and not paths.record_dir(old).exists()
+with mock.patch.object(record, "prune", side_effect=OSError("record unavailable")), mock.patch.object(hook, "rotate_events") as rotate:
+    server.prune()
+    rotated = rotate.call_count == 1
+with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(state, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(hook, "rotate_events") as rotate:
+    server.prune()
+    stopped = not any(f.called for f in (state_prune, purge, records, rotate))
+result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)
+''')
+        self.assertTrue(found["continued"] and found["rotated"] and found["stopped"])
+        self.assertTrue(any("state prune failed: OSError: state unavailable" in m for m in found["messages"]))
+
+
 if __name__ == "__main__":
     unittest.main()
