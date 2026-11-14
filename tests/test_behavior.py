@@ -670,8 +670,93 @@ with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], origin) if len(branches) == 1 else ""
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
+if scenario.startswith("learn-"):
+    import subprocess
+    paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace("max_parallel=1", "max_parallel=2").replace(
+        "[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+    layer_dir = root / "sample/layer"
+    (layer_dir / "config.toml").write_text((layer_dir / "config.toml").read_text().replace("grep -q kumquat", "grep -q quince"))
+    answers = root / "sample/replay"
+    (answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    (answers / "fix2.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+    LESSON_A, LESSON_B = "- `notes.txt`: lesson A from the first run.", "- `notes.txt`: lesson B from the second run."
+    def learning(*lessons):
+        added = [l.split(": ", 1)[1] for l in lessons]
+        return json.dumps({"text": "Learned.", "structured": {"expertise": "# Expertise\n\n## Notes\n" + "\n".join(lessons),
+                                                              "added": added, "removed": []}})
+    other_answers = root / "sample/replay-b"
+    import shutil
+    shutil.copytree(answers, other_answers)
+    (answers / "learn.json").write_text(learning(LESSON_A))
+    (other_answers / "learn.json").write_text(learning(LESSON_B))
+    overlapping = scenario.startswith("learn-overlap")
+    if scenario == "learn-overlap":
+        (answers / "learn2.json").write_text(learning(LESSON_A, LESSON_B))
+    elif scenario == "learn-unrelated-file":
+        pipeline.git(["init", "-q"], layer_dir)
+        pipeline.git(["add", "config.toml"], layer_dir)
+        pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "layer"], layer_dir)
+        with (layer_dir / "config.toml").open("a") as out:
+            out.write("\n# edited by hand\n")
+        (layer_dir / "config.toml.bak").write_text("backup\n")
+    other, child = None, []
+    if overlapping:
+        other = state.task_add("replay-sample", "Add kumquat again", "Add kumquat again", "feat")
+        second_run = """
+import runpy, sys, urllib.request
+from pathlib import Path
+from arete import accounts, factory, gh, paths
+def forbidden(*args, **kwargs):
+    raise AssertionError("offline workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+gh.gh = forbidden
+import importlib.util
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = Path(sys.argv[1]) / "authority-parent/verification-authority"
+feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+try:
+    factory.main(feature, sys.argv[2:])
+except SystemExit:
+    pass
+"""
+        source = str(Path(pipeline.__file__).resolve().parent.parent)
+        real_launch, started = runner.run, []
+        def overlapping_launch(prompt, cwd, **kw):
+            trace = kw.get("trace") or ()
+            if not started and len(trace) > 1 and trace[1] == "learn":
+                started.append(True)
+                done = subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{source!r});" + second_run,
+                                       str(root), "replay-sample", other, "--force"],
+                                      env={**os.environ, "ARETE_REPLAY_DIR": str(other_answers)}, timeout=90,
+                                      capture_output=True, text=True)
+                child.append(done.stderr[-2000:] if done.returncode else "")
+            return real_launch(prompt, cwd, **kw)
+        runner.run = overlapping_launch
+    row = forced()
+    gitlog = lambda *args: pipeline.git(["log", *args], layer_dir) if (layer_dir / ".git").exists() else ""
+    result = {"status": row["status"], "child": child, "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
+              "expertise": (layer_dir / "expertise.md").read_text() if (layer_dir / "expertise.md").exists() else "",
+              "run_expertise": (paths.RUNS_DIR / row["id"] / "expertise.md").read_text() if (paths.RUNS_DIR / row["id"] / "expertise.md").exists() else "",
+              "subjects": gitlog("--format=%s").splitlines(), "names": gitlog("--format=", "--name-only").split(),
+              "head": pipeline.git(["rev-parse", "HEAD"], layer_dir).strip() if (layer_dir / ".git").exists() else "",
+              "recorded": (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").read_text().strip()
+                          if (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").exists() else "",
+              "other": state.ticket_runs("replay-sample", other, whole=True)[0]["status"] if other else "",
+              "learn2_prompt": ""}
+    for file in record.record_files(row["id"]):
+        if "learn2" in file.name:
+            result["learn2_prompt"] = str(json.loads(next(record.raw_lines(file))).get("prompt"))
+    if scenario == "learn-unrelated-file":
+        result["last_commit"] = pipeline.git(["show", "--name-only", "--format=", "HEAD"], layer_dir).split()
+        result["status_short"] = pipeline.git(["status", "--short"], layer_dir).splitlines()
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
 row = forced("--dry-run") if scenario == "review-notes-dry-run" else forced()
-events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+events =[json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
                 if e.get("event") == "step_end" and e.get("step") == "verify"]
 result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
@@ -713,6 +798,35 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
                            if line.startswith("BEHAVIOR_RESULT=")), None)
             self.assertIsNotNone(output, result.stdout + result.stderr)
             return json.loads(output)
+
+    def test_overlapping_runs_keep_each_others_lessons(self):
+        result = self.workflow("learn-overlap")
+        self.assertEqual(result["child"], [""])
+        self.assertEqual((result["status"], result["other"]), ("done", "done"), result["log"])
+        self.assertIn("lesson A", result["expertise"])
+        self.assertIn("lesson B", result["expertise"])
+        self.assertIn("lesson B", result["learn2_prompt"])
+        self.assertIn("so the learn step runs again", result["log"])
+        self.assertEqual(len([s for s in result["subjects"] if "learn from" in s]), 2)
+        self.assertEqual(set(result["names"]), {"expertise.md"})
+        self.assertEqual(result["recorded"], result["head"])
+
+    def test_overlapping_run_whose_second_learn_pass_fails_writes_nothing_of_its_own(self):
+        result = self.workflow("learn-overlap-no-second-answer")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertIn("lesson B", result["expertise"])
+        self.assertNotIn("lesson A", result["expertise"])
+        self.assertIn("saved in the run, not applied", result["log"])
+        self.assertIn("lesson A", result["run_expertise"])
+        self.assertEqual(len([s for s in result["subjects"] if "learn from" in s]), 1)
+
+    def test_learn_commit_leaves_unrelated_layer_files_out(self):
+        result = self.workflow("learn-unrelated-file")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["last_commit"], ["expertise.md"])
+        self.assertIn(" M config.toml", result["status_short"])
+        self.assertIn("?? config.toml.bak", result["status_short"])
+        self.assertIn("lesson A", result["expertise"])
 
     def test_complete_local_workflow_publishes_verified_change(self):
         result = self.workflow("pass")
