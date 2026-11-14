@@ -6959,5 +6959,220 @@ finally:
                 self.assertNotIn(banned, source)
 
 
+CHILD_PRELUDE = r'''
+import json, os, shlex, signal, sqlite3, subprocess, sys, time
+from datetime import timedelta
+from pathlib import Path
+from unittest import mock
+from arete import board, cli, config, delivery, engine, loops, paths, push, sources, state, util
+root = Path(sys.argv[1])
+def verdicts():
+    with state.db() as c:
+        return [dict(r) for r in c.execute("SELECT kind, outcome, approval FROM verdicts")]
+def set_check(command):
+    with state.db() as c:
+        emit = json.loads(c.execute("SELECT emit FROM approvals WHERE id = 1").fetchone()["emit"])
+        emit["item"]["check"] = command
+        c.execute("UPDATE approvals SET emit = ? WHERE id = 1", (json.dumps(emit),))
+def report(**facts):
+    print("RESULT " + json.dumps(facts, default=str), flush=True)
+def no_wake():
+    util.last_wake = lambda: 0.0
+def later(seconds):
+    real = util.now
+    util.now = lambda: real() + timedelta(seconds=seconds)
+SEED = r"""
+paths.CONFIG_FILE.write_text("[jev]\nenabled=false\n")
+item = {"repo": "clone", "workdir": str(root / "clone"), "branch": "fix", "base": "main", "check": "true", "env": {},
+        "timeout": 60, "lines": 1, "files": ["fix.txt"], "deleted": [], "title": "fix", "report": "", "about": "fix",
+        "story": "", "patch": "", "proof": None}
+state.add_verdict("run-1", "push", "push", "fix", {}, "", "waiting")
+state.add_approval("fixer", "run-1", {"type": "push", "item": item, "batch": [], "held": "a person lands it"},
+                   "push fix to main")
+"""
+'''
+HUNT = ('import json; print(json.dumps({"title": "leak", "fingerprint": "fp-1"}))')
+LOOPS = {"hunt": 'kind = "command"\n[run]\ncommand = {command}\n[[emit]]\ntype = "loop"\nloop = "fix"\n',
+         "fix": 'kind = "command"\n[run]\ncommand = ["true"]\n[trigger]\nevent = ["finding"]\n'}
+
+
+class CutOffTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        for name in ("config", "state", "logs", "worktrees", "tmp", "home"):
+            (self.root / name).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
+        self.env.update(ARETE_CONFIG_DIR=str(self.root / "config"), ARETE_STATE_DIR=str(self.root / "state"),
+                        ARETE_LOG_DIR=str(self.root / "logs"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
+                        TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"), GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+                        GIT_CONFIG_VALUE_0=os.devnull, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.origin, self.clone = self.root / "origin.git", self.root / "clone"
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, capture_output=True, text=True, check=True,
+                              timeout=60).stdout
+
+    def held_push(self):
+        self.git("init", "-q", "--bare", "-b", "main", str(self.origin))
+        self.git("clone", "-q", str(self.origin), str(self.clone))
+        self.git("checkout", "-q", "-b", "main", cwd=self.clone)
+        (self.clone / "base.txt").write_text("base\n")
+        self.git("add", ".", cwd=self.clone)
+        self.git("commit", "-q", "-m", "base", cwd=self.clone)
+        self.git("push", "-q", "origin", "main", cwd=self.clone)
+        self.git("checkout", "-q", "-b", "fix", cwd=self.clone)
+        (self.clone / "fix.txt").write_text("fix\n")
+        self.git("add", ".", cwd=self.clone)
+        self.git("commit", "-q", "-m", "fix commit", cwd=self.clone)
+        self.git("checkout", "-q", "main", cwd=self.clone)
+        self.child("exec(SEED)")
+
+    def command(self, code):
+        return [sys.executable, "-c", CHILD_PRELUDE + code, str(self.root)]
+
+    def child(self, code, timeout=120):
+        return subprocess.run(self.command(code), env=self.env, capture_output=True, text=True, timeout=timeout)
+
+    def facts(self, done):
+        lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
+        self.assertTrue(lines, f"{done.args[-2][-400:]}\n{done.stdout}\n{done.stderr}")
+        return json.loads(lines[-1][len("RESULT "):])
+
+    def on_origin(self):
+        return self.git("--git-dir", str(self.origin), "log", "main", "--format=%s").splitlines().count("fix commit")
+
+    def approve_again(self):
+        done = self.child('set_check("true")\nrc = cli.main(["approve", "1"])\n'
+                          'report(rc=rc, row=state.approval(1), verdicts=verdicts())')
+        facts = self.facts(done)
+        self.assertEqual(facts["rc"], 0, done.stderr)
+        self.assertEqual(facts["row"]["status"], "done")
+        self.assertEqual({(v["outcome"], v["approval"]) for v in facts["verdicts"]}, {("approved", 1)})
+        self.assertEqual(self.on_origin(), 1)
+
+    def cut_off(self, code):
+        done = self.child(code)
+        self.assertNotEqual(done.returncode, 0)
+        return done
+
+    def listed(self):
+        return self.facts(self.child("report(waiting=delivery.waiting(), verdicts=verdicts(), decisions=["
+                                     "board.push_decision(v) for v in verdicts()], row=state.approval(1))"))
+
+    def test_sigint_in_the_check_lists_the_approval_as_failed_and_approving_again_lands_once(self):
+        self.held_push()
+        self.cut_off("set_check(f\"{shlex.quote(sys.executable)} -c 'import os, signal, time; "
+                     "os.kill({os.getpid()}, signal.SIGINT); time.sleep(5)'\")\ncli.main(['approve', '1'])")
+        facts = self.listed()
+        self.assertEqual([w["id"] for w in facts["waiting"]], [1])
+        self.assertIn("the send was cut off (KeyboardInterrupt) and may have landed", facts["waiting"][0]["failed"])
+        self.assertNotIn("approved", facts["decisions"])
+        self.assertEqual(self.on_origin(), 0)
+        self.approve_again()
+
+    def test_sigterm_after_the_push_leaves_it_failed_with_the_fix_on_origin(self):
+        self.held_push()
+        done = self.cut_off("state.set_verdict_sha = lambda run_id, sha: os.kill(os.getpid(), signal.SIGTERM)\n"
+                            "cli.main(['approve', '1'])")
+        self.assertEqual(done.returncode, 143)
+        facts = self.listed()
+        self.assertEqual(facts["row"]["status"], "failed")
+        self.assertIn("the send was cut off (SystemExit)", facts["row"]["result"])
+        self.assertNotIn("approved", facts["decisions"])
+        self.assertEqual(self.on_origin(), 1)
+        self.approve_again()
+
+    def test_sigkill_keeps_the_row_sending_until_its_claim_lapses(self):
+        self.held_push()
+        killed = self.cut_off("push.Push.execute = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)\n"
+                              "cli.main(['approve', '1'])")
+        self.assertEqual(killed.returncode, -signal.SIGKILL)
+        for flags in ([], ["--reject"]):
+            refused = self.child(f"print(cli.main({['approve', '1', *flags]!r}))")
+            self.assertEqual(refused.stdout.strip(), "1")
+            self.assertIn("still sending", refused.stderr)
+        facts = self.facts(self.child(
+            "no_wake()\nbefore = delivery.release_lapsed()\nstayed = state.approval(1)['status']\nlater(300)\n"
+            "util.last_wake = lambda: util.now().timestamp() - 10\nawake_briefly = delivery.release_lapsed()\n"
+            "util.last_wake = lambda: 0.0\nreleased = delivery.release_lapsed()\nagain = delivery.release_lapsed()\n"
+            "report(before=before, stayed=stayed, awake_briefly=awake_briefly, released=released, again=again, "
+            "row=state.approval(1))"))
+        self.assertEqual((facts["before"], facts["stayed"], facts["awake_briefly"]), ([], "approved", []))
+        self.assertEqual((facts["released"], facts["again"], facts["row"]["status"]), ([1], [], "failed"))
+        self.assertIn("claim expired", facts["row"]["result"])
+        self.assertEqual([w["id"] for w in self.listed()["waiting"]], [1])
+        self.approve_again()
+
+    def test_a_claim_is_renewed_while_a_slow_send_runs(self):
+        self.held_push()
+        approving = subprocess.Popen(self.command(
+            "delivery.CLAIM_SECONDS = 2\nreal = push.Push.execute\n"
+            "def slow(self, *a, **k):\n    print('ENTERED', flush=True)\n    time.sleep(8)\n    return real(self, *a, **k)\n"
+            "push.Push.execute = slow\nset_check('true')\nreport(rc=cli.main(['approve', '1']))"),
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(approving.kill)
+        self.assertEqual(approving.stdout.readline().strip(), "ENTERED")
+        entered, seen = time.monotonic(), []
+        for at in (3, 6):
+            time.sleep(max(0, entered + at - time.monotonic()))
+            seen.append(self.facts(self.child("delivery.CLAIM_SECONDS = 2\nno_wake()\nreleased = delivery.release_lapsed()"
+                                              "\nreport(released=released, row=state.approval(1))")))
+        out, err = approving.communicate(timeout=90)
+        self.assertEqual([s["released"] for s in seen], [[], []], err)
+        self.assertEqual([s["row"]["status"] for s in seen], ["approved", "approved"])
+        self.assertGreater(seen[1]["row"]["claimed_until"], seen[0]["row"]["claimed_until"])
+        self.assertEqual(seen[0]["row"]["decided"], seen[1]["row"]["decided"])
+        self.assertEqual(json.loads(out.splitlines()[-1][len("RESULT "):])["rc"], 0)
+        self.assertEqual(self.listed()["row"]["status"], "done")
+        self.assertEqual(self.on_origin(), 1)
+
+    def write_loops(self):
+        command = json.dumps([sys.executable, "-c", HUNT])
+        for name, text in LOOPS.items():
+            folder = self.root / "config" / "loops" / name
+            folder.mkdir(parents=True)
+            (folder / "loop.toml").write_text(text.format(command=command))
+
+    HUNTS = ("def hunt():\n    run = engine.launch('hunt', detach=False)\n"
+             "    with state.db() as c:\n"
+             "        queued = [r['key'] if 'key' in r.keys() else r['payload'] for r in "
+             "c.execute(\"SELECT * FROM queue WHERE loop = 'fix'\")]\n"
+             "    return {'status': run['status'], 'queued': queued, 'finding': state.findings('hunt'), "
+             "'log': [f['text'] for f in state.feed(run['id'])]}\n")
+
+    def test_a_hunt_stopped_during_delivery_hands_its_finding_on_at_the_next_run(self):
+        self.write_loops()
+        facts = self.facts(self.child(
+            self.HUNTS + "with mock.patch.object(sources, 'fire', side_effect=engine.Stopped):\n    first = hunt()\n"
+            "second, third = hunt(), hunt()\nreport(first=first, second=second, third=third)"))
+        first, second, third = facts["first"], facts["second"], facts["third"]
+        self.assertEqual(first["status"], "stopped")
+        self.assertEqual([f["emitted"] for f in first["finding"]], [""])
+        self.assertTrue(any(line.startswith("new: leak") for line in second["log"]))
+        self.assertEqual(len(second["queued"]), 1)
+        self.assertEqual(second["finding"][0]["emitted"], second["finding"][0]["run_id"])
+        self.assertTrue(any(line.startswith("seen before: leak") for line in third["log"]))
+        self.assertEqual(len(third["queued"]), 1)
+
+    def test_a_finding_from_before_the_emitted_column_counts_as_handed_on(self):
+        self.write_loops()
+        facts = self.facts(self.child(
+            self.HUNTS + "db = sqlite3.connect(paths.DB_FILE)\n"
+            "db.execute('CREATE TABLE findings (loop TEXT NOT NULL, fingerprint TEXT NOT NULL, fingerprint_text TEXT "
+            "DEFAULT \"\", title TEXT, url TEXT, run_id TEXT, seen INTEGER DEFAULT 1, first_seen TEXT, last_seen TEXT, "
+            "PRIMARY KEY (loop, fingerprint))')\n"
+            "key = engine.fingerprint_key(loops.find('hunt'), {'title': 'leak', 'fingerprint': 'fp-1'})\n"
+            "db.execute(\"INSERT INTO findings (loop, fingerprint, title, url, run_id) VALUES ('hunt', ?, 'leak', '', "
+            "'old')\", (key,))\ndb.commit()\ndb.close()\n"
+            "report(rows=state.findings('hunt'), hunted=hunt())"))
+        self.assertEqual([f["emitted"] for f in facts["rows"]], ["legacy"])
+        self.assertEqual(facts["hunted"]["queued"], [])
+        self.assertTrue(any(line.startswith("seen before") for line in facts["hunted"]["log"]))
+
+
 if __name__ == "__main__":
     unittest.main()

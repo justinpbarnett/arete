@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS findings (
     seen INTEGER DEFAULT 1,
     first_seen TEXT,
     last_seen TEXT,
+    emitted TEXT DEFAULT 'legacy',
     PRIMARY KEY (loop, fingerprint)
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -157,7 +158,9 @@ CREATE TABLE IF NOT EXISTS approvals (
     plain_summary TEXT DEFAULT '',
     plain_summary_tried TEXT DEFAULT '',
     review TEXT DEFAULT '',
-    review_tried TEXT DEFAULT ''
+    review_tried TEXT DEFAULT '',
+    claimed_by TEXT DEFAULT '',
+    claimed_until TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -563,7 +566,9 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                 for col in ("ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")],
               ("triage", "closed", "ALTER TABLE triage ADD COLUMN closed TEXT DEFAULT ''"),
               *[("approvals", col, f"ALTER TABLE approvals ADD COLUMN {col} TEXT DEFAULT ''")
-                for col in ("plain_summary", "plain_summary_tried", "review", "review_tried")],
+                for col in ("plain_summary", "plain_summary_tried", "review", "review_tried", "claimed_by",
+                            "claimed_until")],
+              ("findings", "emitted", "ALTER TABLE findings ADD COLUMN emitted TEXT DEFAULT 'legacy'"),
               ("findings", "fingerprint_text", "ALTER TABLE findings ADD COLUMN fingerprint_text TEXT DEFAULT ''"),
               ("alerts", "repo", "ALTER TABLE alerts ADD COLUMN repo TEXT DEFAULT ''"),
               *[("runs", col, f"ALTER TABLE runs ADD COLUMN {col} {kind}") for col, kind in (
@@ -795,13 +800,22 @@ def record_finding(loop: str, fingerprint: str, fingerprint_text: str, title: st
     with db() as c:
         before = c.total_changes
         c.execute("INSERT OR IGNORE INTO findings (loop, fingerprint, fingerprint_text, title, url, run_id, first_seen, "
-                  "last_seen) VALUES (?,?,?,?,?,?,?,?)",
+                  "last_seen, emitted) VALUES (?,?,?,?,?,?,?,?,'')",
                   (loop, fingerprint, fingerprint_text, title, url, run_id, util.iso(), util.iso()))
-        fresh = c.total_changes > before
-        if not fresh:
-            c.execute("UPDATE findings SET seen = seen + 1, last_seen = ? WHERE loop = ? AND fingerprint = ?",
-                      (util.iso(), loop, fingerprint))
-        return fresh
+        if c.total_changes > before:
+            return True
+        c.execute("UPDATE findings SET run_id = ? WHERE loop = ? AND fingerprint = ? AND emitted = '' "
+                  "AND COALESCE(url, '') = '' AND COALESCE(run_id, '') != ?", (run_id, loop, fingerprint, run_id))
+        taken_over = c.total_changes > before
+        c.execute("UPDATE findings SET seen = seen + 1, last_seen = ? WHERE loop = ? AND fingerprint = ?",
+                  (util.iso(), loop, fingerprint))
+        return taken_over
+
+
+def mark_emitted(loop: str, fingerprints: list[str], run_id: str) -> None:
+    with db() as c:
+        c.executemany("UPDATE findings SET emitted = ? WHERE loop = ? AND fingerprint = ? AND run_id = ? "
+                      "AND emitted = ''", [(run_id, loop, fingerprint, run_id) for fingerprint in fingerprints])
 
 
 def set_finding_url(loop: str, fingerprint: str, url: str) -> None:
@@ -1138,13 +1152,48 @@ def approval_of(row) -> dict:
     return {**dict(row), "emit": json.loads(row["emit"] or "{}"), "review": json.loads(row["review"] or "{}")}
 
 
-def decide_approval(approval_id: int, status: str, result: str = "", came_from: tuple[str, ...] = DECIDABLE) -> bool:
-    came_from = ("approved",) if status in ("done", "failed") else came_from
+def claim_approval(approval_id: int, until: str, came_from: tuple[str, ...] = DECIDABLE) -> str:
+    token = secrets.token_hex(8)
     with db() as c:
         before = c.total_changes
-        c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ? WHERE id = ? AND status IN "
-                  f"({','.join('?' * len(came_from))})", (status, result[:1000], util.iso(), approval_id, *came_from))
+        c.execute(f"UPDATE approvals SET status = 'approved', result = '', decided = ?, claimed_by = ?, "
+                  f"claimed_until = ? WHERE id = ? AND status IN ({','.join('?' * len(came_from))})",
+                  (util.iso(), token, until, approval_id, *came_from))
+        return token if c.total_changes > before else ""
+
+
+def renew_claim(approval_id: int, token: str, until: str) -> bool:
+    with db() as c:
+        before = c.total_changes
+        c.execute("UPDATE approvals SET claimed_until = ? WHERE id = ? AND status = 'approved' AND claimed_by = ?",
+                  (until, approval_id, token))
         return c.total_changes > before
+
+
+def lapsed_claims() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT id, claimed_by, claimed_until FROM approvals "
+                                           "WHERE status = 'approved' AND claimed_until < ? ORDER BY id", (util.iso(),))]
+
+
+def settle_approval(approval_id: int, status: str, outcome: str, result: str = "", *, judged: bool,
+                    came_from: tuple[str, ...] = ("approved",), token: str | None = None,
+                    until: str | None = None) -> bool:
+    held = [f"status IN ({','.join('?' * len(came_from))})", *(["claimed_by = ?"] if token is not None else []),
+            *(["claimed_until = ?"] if until is not None else [])]
+    args = [*came_from, *(a for a in (token, until) if a is not None)]
+    with db() as c:
+        before = c.total_changes
+        c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ?, claimed_by = '', claimed_until = '' "
+                  f"WHERE id = ? AND {' AND '.join(held)}", (status, result[:1000], util.iso(), approval_id, *args))
+        if c.total_changes == before:
+            return False
+        if judged:
+            c.execute("UPDATE verdicts SET outcome = ?, outcome_at = ?, approval = ? WHERE kind IN ('push', 'proof') "
+                      "AND outcome IN ('waiting', 'failed', 'approved') "
+                      "AND run_id = (SELECT run_id FROM approvals WHERE id = ?)",
+                      (outcome, util.iso(), approval_id, approval_id))
+        return True
 
 
 def add_verdict(run_id: str, kind: str, subject: str, about: str, answers: dict, held: str,

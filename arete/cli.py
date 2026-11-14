@@ -5,6 +5,7 @@ import dataclasses
 import json
 import os
 import shutil
+import signal
 import sys
 import textwrap
 from collections import Counter
@@ -1148,6 +1149,10 @@ def approval_notes(a: dict) -> list[str]:
                                 f"review by {review['by']}: {review['said']}" if review else "") if note)]
 
 
+def stop_on_sigterm(signum, frame) -> NoReturn:
+    raise SystemExit(128 + signal.SIGTERM)
+
+
 def cmd_approve(args) -> int:
     from . import control, delivery
 
@@ -1164,7 +1169,11 @@ def cmd_approve(args) -> int:
             if not pending:
                 print("nothing waiting for approval")
             return 0
-        print(json.dumps(control.decide(args.id, not args.reject)))
+        before = signal.signal(signal.SIGTERM, stop_on_sigterm)
+        try:
+            print(json.dumps(control.decide(args.id, not args.reject)))
+        finally:
+            signal.signal(signal.SIGTERM, before)
         return 0
     except (control.NotFound, control.Refused) as e:
         return refused(e)

@@ -51,6 +51,9 @@ A `push` emit lands a climb or search change on the default branch with no PR.
 It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path.
 With `reviewer` in that table, a model such as opus reviews each held push first, and a push it approves with high confidence lands, unless the trust level, a path the repo denies or a listed path keeps it for a person.
 A push that fails to land stays as a failed approval.
+An approval cut off mid send, by Ctrl+C, a stop or a crash, comes back as failed with a note that it may have landed.
+A hard kill or a power loss leaves it marked as still sending until `arete serve` finds its claim lapsed, which takes about two minutes of the machine being awake, so it does not come back at once after a sleep.
+Approving a push again is safe, because it rebases onto origin first and a commit already there drops out; check a ticket on GitHub or Jira before approving it again.
 A `loop` emit hands each finding to another loop, so one loop can find and another can fix.
 [arete/loops/README.md](arete/loops/README.md) has the rules for both.
 A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
