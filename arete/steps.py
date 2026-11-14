@@ -16,12 +16,15 @@ BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(runn
             "research_search": {"timeout_minutes": 10, "tries": 2, "tools": runner.WEB_TOOLS},
             "research_synthesis": {"timeout_minutes": 10, "tries": 2},
             "research_audit": {"timeout_minutes": 10, "tries": 2, "tools": (*runner.READ_TOOLS, "WebFetch")},
-            "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()}}
+            "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()},
+            "capture_evidence": {"timeout_minutes": 3, "tries": 1, "tools": ("Read",), "instructions": (),
+                                 "modalities": ("image",), "structured_output": True, "budget_usd": 0.25}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
 KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "research_search", "research_synthesis",
-                    "research_audit", "document")
-READ_ONLY = ("research_plan", "research_search", "research_synthesis", "research_audit", "document")
+                    "research_audit", "document", "capture_evidence")
+READ_ONLY = ("research_plan", "research_search", "research_synthesis", "research_audit", "document",
+             "capture_evidence")
 SEARCHES = ("research_search",)
 FETCHES = ("research_audit",)
 NO_WEB = ("research_synthesis",)

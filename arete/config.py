@@ -11,10 +11,11 @@ from . import outbound, paths
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
                "classify", "loop", "session", "research", "research_plan", "research_search",
-               "research_synthesis", "research_audit", "explain", "document")
+               "research_synthesis", "research_audit", "explain", "document", "capture_evidence")
 MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
                    "research": "opus", "research_plan": "opus", "research_search": "sonnet",
-                   "research_synthesis": "opus", "research_audit": "opus", "explain": "haiku"}
+                   "research_synthesis": "opus", "research_audit": "opus", "explain": "haiku",
+                   "capture_evidence": "sonnet"}
 STEP_ALIASES = {"implement": "build"}
 INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify"}
 STEP_ROLES = (*MODEL_ROLES, *INHERITS)
