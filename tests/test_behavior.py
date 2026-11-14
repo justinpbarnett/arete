@@ -391,6 +391,72 @@ if scenario.startswith("held-scratch"):
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git") if len(branches) == 1 else ""
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
+if scenario.startswith("fix-ask"):
+    from arete import alerts, asks, tasks
+    alerts.notify = lambda title, message: None
+    src, origin, answers = root / "sample/repo", root / "sample/origin.git", root / "sample/replay"
+    paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace("[steps.check_repair]\ntries=1", "[steps.check_repair]\ntries=2"))
+    layer = root / "sample/layer/config.toml"
+    layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && test -f moved.txt"))
+    question = {"questions": [{"header": "Fix", "question": "Does main fix it?", "kind": "text"}],
+                "why": "The check needs a file.", "tried": "Read the check."}
+    (answers / "fix2.json").write_text(json.dumps({"text": "Asked.", "ok": True, "tool_calls": [{"name": "ask_owner", "input": question}]}))
+    parked = forced()
+    ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
+    kept_head = pipeline.git(["rev-parse", "HEAD"], ws).strip()
+    first = [json.loads(line) for line in (paths.RUNS_DIR / parked["id"] / "run.jsonl").read_text().splitlines()]
+    waiting = state.asks_of(parked["id"], "open")
+    def commit_on_main(name, text, message):
+        pipeline.git(["checkout", "-q", "main"], src)
+        with (src / name).open("a") as out:
+            out.write(text)
+        pipeline.git(["add", name], src)
+        pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message], src)
+        pipeline.git(["push", "-q", "origin", "HEAD:main"], src)
+    if scenario == "fix-ask-moved":
+        commit_on_main("moved.txt", "moved\n", "move main")
+    if scenario == "fix-ask-conflict":
+        commit_on_main("notes.txt", "quince\n", "conflict on main")
+    if scenario == "fix-ask-still":
+        (answers / "fix2.patch").write_text("--- /dev/null\n+++ b/moved.txt\n@@ -0,0 +1 @@\n+moved\n")
+    for ask in waiting:
+        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Main now has the fix."))
+    (answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_repair_cycles=5)):
+        try:
+            factory.main(feature, ["replay-sample", task, "--force", "--continue", parked["id"]])
+        except SystemExit:
+            pass
+    row = state.ticket_runs("replay-sample", task, whole=True)[0]
+    events = [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
+    marks = [json.loads(line) for line in record.raw_lines(paths.record_dir(row["id"]) / record.TIMELINE)]
+    merges = [m for m in marks if m.get("kind") == "base_merge"]
+    kinds = [(m.get("kind"), m.get("step")) for m in marks]
+    merged_first = ("base_merge", None) in kinds and ("agent", "fix2") in kinds and kinds.index(("base_merge", None)) < kinds.index(("agent", "fix2"))
+    session = lambda read: next((e["session"]["id"] for e in read if e.get("event") == "step_end" and e.get("step") == "implement" and e.get("session")), "")
+    headers = [f for f in record.record_files(row["id"]) if "fix2" in f.name]
+    prompt = str(json.loads(next(record.raw_lines(headers[-1]))).get("prompt")) if headers else ""
+    result = {"parked": parked["status"], "status": row["status"], "id": row["id"], "summary": row["summary"],
+              "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
+              "skipped": next((e["skipped"] for e in events if e.get("event") == "route" and "skipped" in e), None),
+              "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
+              "merges": [{k: m.get(k) for k in ("outcome", "error")} for m in merges], "merged_first": merged_first,
+              "same_session": bool(session(first)) and session(first) == session(events),
+              "answered": "Main now has the fix." in prompt,
+              "taken": [a["taken_by"] for a in state.asks_of(parked["id"])]}
+    branches = [b for b in pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], origin).splitlines() if b != "refs/heads/main"]
+    if branches:
+        show = lambda name: pipeline.git(["show", f"{branches[0]}:{name}"], origin, check=False)
+        result |= {"notes": show("notes.txt"), "moved_file": show("moved.txt"),
+                   "parents": len(pipeline.git(["log", "-1", "--format=%P", branches[0]], origin).split()),
+                   "trailers": pipeline.git(["log", "-1", "--format=%B", branches[0]], origin)}
+    if scenario == "fix-ask-conflict":
+        result |= {"kept_head": kept_head, "head": pipeline.git(["rev-parse", "HEAD"], ws).strip(),
+                   "dirty": pipeline.git(["status", "--short"], ws).strip()}
+        with mock.patch.object(tasks, "launch", side_effect=lambda cfg, repo, tid, command, ahead=False: command):
+            result["resume"] = tasks.resume(row["id"])
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+    raise SystemExit(0)
 if scenario.startswith("asked"):
     from arete import alerts, asks
     notices = []
@@ -593,6 +659,41 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertTrue(result["answered"])
         self.assertEqual(result["taken"], [True])
         self.assertIn("kumquat", result["published"])
+
+    def test_answered_run_merges_a_moved_base_before_the_asking_step_resumes(self):
+        result = self.workflow("fix-ask-moved")
+        self.assertEqual(result["parked"], "needs-info")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["skipped"], 4)
+        self.assertEqual(result["renewed"], [])
+        self.assertEqual([m["outcome"] for m in result["merges"]], ["clean"])
+        self.assertTrue(result["merged_first"])
+        self.assertTrue(result["same_session"])
+        self.assertTrue(result["answered"])
+        self.assertEqual(result["taken"], [result["id"]])
+        self.assertIn("kumquat", result["notes"])
+        self.assertEqual(result["moved_file"].strip(), "moved")
+
+    def test_answered_run_with_an_unmoved_base_writes_no_base_merge(self):
+        result = self.workflow("fix-ask-still")
+        self.assertEqual(result["status"], "done", result["log"])
+        self.assertEqual(result["merges"], [])
+        self.assertEqual(result["skipped"], 4)
+        self.assertTrue(result["same_session"])
+        self.assertEqual(result["taken"], [result["id"]])
+
+    def test_answered_run_that_cannot_merge_a_moved_base_fails_and_keeps_the_answers(self):
+        result = self.workflow("fix-ask-conflict")
+        self.assertEqual(result["status"], "failed", result["log"])
+        self.assertIn("origin/main", result["summary"])
+        self.assertIn("notes.txt", result["summary"])
+        self.assertEqual(len(result["merges"]), 1)
+        self.assertTrue(result["merges"][0]["error"])
+        self.assertEqual(result["taken"], [""])
+        self.assertEqual(result["head"], result["kept_head"])
+        self.assertEqual(result["dirty"], "")
+        at = result["resume"].index("--continue")
+        self.assertEqual(result["resume"][at:at + 2], ["--continue", result["id"]])
 
     def test_edits_made_before_an_ask_are_kept_while_it_waits_and_published_after_the_answer(self):
         result = self.workflow("asked-edited")

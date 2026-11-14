@@ -407,6 +407,7 @@ class Run(AgentRun):
     workspace: tuple[Path, list[Checkout]] | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
+    base_note: str = ""
 
     @property
     def ref(self) -> str:
@@ -429,7 +430,7 @@ class Run(AgentRun):
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
         if due and kw["resume"].id and not res.ok and asks.session_gone(res.error):
             self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
-            res = super().agent(step, f"{plain}\n\n{asks.fresh_note(due)}", cwd, role, ask_owner=True,
+            res = super().agent(step, self.fresh_text(plain, due), cwd, role, ask_owner=True,
                                 **{**kw, "resume": NO_SESSION})
         if due and res.ok:
             state.asks_taken([a["id"] for a in due], self.id)
@@ -446,11 +447,15 @@ class Run(AgentRun):
         here = [a for a in self.answers_due if a["step"] == seam]
         return [a for a in here if a["call"] == call] or here
 
+    def fresh_text(self, text: str, due: list[dict]) -> str:
+        return "\n\n".join(part for part in (text, asks.fresh_note(due), self.base_note) if part)
+
     def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
-        fresh = f"{text}\n\n{asks.fresh_note(due)}"
+        fresh = self.fresh_text(text, due)
         if session.id and kw.get("persist", True):
-            return asks.answers_message(due), {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
+            message = "\n\n".join(part for part in (asks.answers_message(due), self.base_note) if part)
+            return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
         return fresh, {**kw, "resume": NO_SESSION}
 
     def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
@@ -2318,20 +2323,70 @@ def note_fresh_bases(checkouts: list[Checkout]) -> None:
             c.base_commit = git(["rev-parse", c.origin_base if c.onto else "HEAD"], c.wt).strip()
 
 
-def settle_starts(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
-                  branch: str) -> None:
-    moved = [c for c in checkouts if c.kept]
+def note_kept_head(c: Checkout) -> None:
+    c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
+
+
+def commit_edits_before_merge(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer,
+                              committed: Callable[[Checkout], None] = lambda c: None) -> None:
     try:
-        for c in moved:
+        for c in checkouts:
             drop_untracked_bytecode(c.wt)
             if uncommitted(c.wt):
                 commit_kept(run.id, c, layer)
-                c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
+                committed(c)
                 if left := uncommitted(c.wt):
                     raise RunFailed(f"{c.github} holds edits to protected paths that arete does not keep "
                                     f"({', '.join(left[:5])}), so it merged nothing into them and left them as they are")
     except RuntimeError as e:
         raise RunFailed(f"the commit of the kept edits failed, so arete merged nothing into them: {e}") from e
+
+
+class ConflictUnresolved(RunFailed):
+    def __init__(self, why: str, detail: str, paths: list[str]):
+        super().__init__(why, detail)
+        self.paths = paths
+
+
+def merge_base_into_kept(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer,
+                         ticket: tracker.Ticket) -> list[Checkout]:
+    merged = []
+    for c in checkouts:
+        try:
+            fetch(c.src, c.base)
+        except RuntimeError as e:
+            run.log(f"could not fetch `{c.origin_base}` in {c.github}, so the step resumes on the base it has: {e}")
+            continue
+        try:
+            commit_edits_before_merge(run, [c], layer)
+            merged += merge_moved_bases(run, [c], layer, ticket,
+                                        reason="since the base moved while the run waited for its answer")
+        except RunFailed as e:
+            files = f" in {', '.join(e.paths)}" if isinstance(e, ConflictUnresolved) else ""
+            raise RunFailed(f"merging `{c.origin_base}` into the edits kept in {c.github} failed{files}: {e.why}. "
+                            f"The worktree is back at the kept commit and the answers are kept, so "
+                            f"`arete resume {run.id}` continues with them", e.detail) from e
+    for c in merged:
+        if not c.resumes:
+            c.onto = c.base_commit
+    return merged
+
+
+def base_merge_note(merged: list[Checkout]) -> str:
+    if not merged:
+        return ""
+    names = ", ".join(f"`{c.origin_base}` into `{c.prefix or './'}`" for c in merged)
+    fixed = "".join(f" Arete resolved merge conflicts in {', '.join(f'`{p}`' for p in c.resolved)} of "
+                    f"`{c.prefix or './'}`." for c in merged if c.resolved)
+    return (f"Before this step arete merged {names}, since the base moved while the run waited for the owner's "
+            f"answer.{fixed} The worktree now holds the base's changes, so read a file again before relying on what "
+            "it held.")
+
+
+def settle_starts(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
+                  branch: str) -> None:
+    moved = [c for c in checkouts if c.kept]
+    commit_edits_before_merge(run, moved, layer, note_kept_head)
     try:
         for c in moved:
             git(["reset", "-q", "--hard", start_of(c, branch)], c.wt)
@@ -2372,7 +2427,7 @@ def merge_as_run(run_id: str, c: Checkout, commit: str, named: str) -> None:
 
 
 def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
-                      log_prefix: str = "") -> list[Checkout]:
+                      log_prefix: str = "", reason: str = "since the base moved after the last push") -> list[Checkout]:
     merged = []
     for c in checkouts:
         c.base_commit = git(["rev-parse", c.origin_base], c.wt).strip()
@@ -2392,7 +2447,10 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
                     if not conflicts:
                         raise RunFailed(f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}")
                     rec["conflicts"] = conflicts
-                    resolve_conflicts(run, c, conflicts, layer, ticket)
+                    try:
+                        resolve_conflicts(run, c, conflicts, layer, ticket)
+                    except RunFailed as e:
+                        raise ConflictUnresolved(e.why, e.detail, conflicts) from e
                 else:
                     conflicts = []
                 rec["outcome"] = "resolved" if conflicts else "clean"
@@ -2404,7 +2462,7 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
         c.resolved_lines = resolution_diff(c).lines
         run.log(f"{log_prefix}merged `{c.origin_base}` into the branch in {c.github}, "
                 + (f"and resolved conflicts in {', '.join(conflicts)}" if conflicts
-                   else "since the base moved after the last push"))
+                   else reason))
         merged.append(c)
     return merged
 
