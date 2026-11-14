@@ -614,7 +614,7 @@ A run with open review feedback takes the revise flow (`adws/revise.py`); any ot
 | `publish` | With a `github` name, moves the ticket to `pr`, posts the PR comment (or answers the review comments in a revise run), marks a draft PR it pushed to, checked again or found open ready when nothing holds it, and applies the triage hold, the risk hold and the merge. Without one, moves the task to `done`. |
 | `respond` | Ends the run as the classic run would: the failure comment, the question (and its `question` line), the nothing to build comment, the review answers, or the `pr` or `done` ending. |
 
-A dry run ends after `learn` (after `document` when it is on) with the status `dry-run`: it saves `diff.patch` and `pr_body.md`, the PR body with private strings screened, keeps the worktree and runs no `pr` step. It makes its worktree locally, so it skips the check for closed PRs on the branch; a revise dry run still reads the PR and its body.
+A dry run ends after `learn` (after `document` when it is on) with the status `dry-run`: it saves `diff.patch` and `pr_body.md`, the PR body with private strings screened and mentions and closing keywords made inert, keeps the worktree and runs no `pr` step. It makes its worktree locally, so it skips the check for closed PRs on the branch; a revise dry run still reads the PR and its body.
 
 Each step's `data` holds what a later step needs, so a run that restarts after an interrupted adw run continues it: it takes every passing step whose worktree is unchanged from the stored outcomes and runs the rest. A run interrupted in the CI watch never opens a second PR: it goes on at `ci`, and the CI round count starts again. The run's `report` line comes from `flow.respond`. The statuses `pr` and `done` count as success; the summary of `done` names the pushed branch.
 
@@ -1209,6 +1209,17 @@ Every GitHub write (`issue_create`, `pr_create`, comments, replies, closing comm
 - `/Users/NAME` and `/home/NAME` with `~`.
 
 Public links such as `https://github.com/o/r/pull/1` and the local tracker are not touched.
+
+Every GitHub write also makes the text inert, so model text can neither notify people nor close issues:
+
+- `@user` and `@org/team` go into `<code>…</code>`, so nobody is notified. An email address stays as it is, and so does a URL written as `http://` or `https://` plus a plain host (letters, digits, dots, hyphens); a mention in any other address, after a `|` table separator or after `_` emphasis marks goes into `<code>`;
+- the reference after a closing keyword (close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved, in any case, with or without a colon), whether `#N`, `owner/repo#N`, `GH-N` or an issue URL, goes into `<code>…</code>`, so it neither links nor closes. A plain `#N` with no keyword stays as it is;
+- fenced code blocks and backtick spans stay as they are when they are certainly code. Arete treats as prose a span that runs over a line end or holds `|`, any span after a `<` or inside an open link destination in the same paragraph, everything in an HTML block, and an indented fence that is not closed or whose lines fall back to the margin. There a `<code>` tag can show inside code. Only the `<code>` elements Arete itself wrote are left alone;
+- arete's own `Closes #N` or `Part of #N` line is passed apart from the text and stays live;
+- a PR body that arete reads back and writes again passes the same step whole, so a mention or closing keyword a person typed into it goes inert too; its first line stays live only when it is the ticket's own link line;
+- `gh.gh` refuses text that did not pass `gh.outgoing`, also through `-b`, `-c`, `-f`, `-F`, `--body-file PATH` and `--input PATH` (only `-` is allowed), and the `--flag=value` and attached `-bTEXT` forms.
+
+Titles get the private string screen only. Commit messages and Jira comments are not changed.
 
 ### Compare writers
 

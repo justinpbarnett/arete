@@ -122,7 +122,8 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
     branch = f"arete/{key}"
     subject = tk.pr_title(fill_template(h.layer.subject, config.RepoLayer.subject, kind="docs(research)", id=t.id,
                                         title=r["title"]), t)
-    body = (f"{tk.pr_link(t, whole=True)}\n\n**Summary:** {report['summary']}\n\n"
+    link = tk.pr_link(t, whole=True)
+    body = (f"**Summary:** {report['summary']}\n\n"
             f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
             "When the ticket changes, arete researches it again and pushes the new report here.")
     base = h.base
@@ -136,9 +137,9 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
         util.git_as_owner(["commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
         util.git(["push", "-q", "--force", "-u", "origin", branch], wt)
         if url := gh.open_pr_url(h.repo.github, branch):
-            gh.pr_edit_body(url, body)
+            gh.pr_edit_body(url, body, link=link)
             return url
-        return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt)
+        return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt, link=link)
     finally:
         remove_worktree(h.repo, wt)
 

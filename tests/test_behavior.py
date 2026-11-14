@@ -19,7 +19,7 @@ import urllib.error
 from unittest import mock
 
 import arete
-from arete import config, control, devices, gh, paths, pi, pipeline, scratch, sessions, state, util, verify
+from arete import config, control, devices, gh, outbound, paths, pi, pipeline, scratch, sessions, state, util, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 PYTHON = shlex.quote(sys.executable)
@@ -3299,7 +3299,7 @@ class PushedPrDraftTests(unittest.TestCase):
                                     from_base=False, committed_lines=0, staged=pipeline.Staged(),
                                     push=lambda branch, message: None)
         with mock.patch.multiple(pipeline, evidence_images=lambda *a, **k: {}, report_body=lambda *a, **k: "report",
-                                 synced_pr_body=lambda run, url, body, t, left: body,
+                                 synced_pr_body=lambda run, url, body, t, left: ("", body),
                                  answer_feedback=lambda *a, **k: None):
             out = flows.pr(SimpleNamespace(ctx=job), str(wt))
             stored = {k: v for k, v in out.data.items() if k not in ("found", "drafted", "ci_stopped")}
@@ -3882,6 +3882,213 @@ result(counts=counts, before=before, summary=last["summary"], prompt=prompt, las
         self.assertGreater(found["kept"], 0)
         self.assertLessEqual(found["size"], 100)
         self.assertEqual(found["last"], "Reply 6.")
+
+
+FAKE_GH ='''#!{python}
+import json, os, sys
+argv = sys.argv[1:]
+stdin = ""
+if any(a in ("--body-file", "--input") and i + 1 < len(argv) and argv[i + 1] == "-" for i, a in enumerate(argv)):
+    stdin = sys.stdin.read()
+with open(os.environ["GH_LOG"], "a") as log:
+    log.write(json.dumps({{"args": argv, "input": stdin}}) + "\\n")
+last = os.environ["GH_LOG"] + ".body"
+head = argv[:2]
+if head in (["pr", "create"], ["pr", "edit"]):
+    open(last, "w").write(stdin)
+if head == ["issue", "view"]:
+    print(json.dumps({{"number": 5, "title": "Add kumquat", "body": "Add kumquat to the fixture notes",
+                      "labels": [{{"name": "agent"}}], "state": "OPEN", "author": {{"login": "fixture"}},
+                      "comments": [], "url": "https://github.com/fixture/repo/issues/5",
+                      "updatedAt": "2026-01-01T00:00:00Z"}}))
+elif head == ["pr", "create"]:
+    print("https://github.com/fixture/repo/pull/7")
+elif head == ["issue", "create"]:
+    print("https://github.com/fixture/repo/issues/9")
+elif head == ["pr", "view"]:
+    body = open(last).read() if os.path.exists(last) else ""
+    print(json.dumps({{"body": body, "isDraft": False, "headRefOid": "0" * 40, "mergeStateStatus": "BLOCKED",
+                      "mergeable": "MERGEABLE", "number": 7, "url": "https://github.com/fixture/repo/pull/7",
+                      "state": "OPEN", "headRefName": "x", "statusCheckRollup": []}}))
+elif head == ["pr", "list"] or argv[:1] == ["api"]:
+    print("[]")
+'''
+
+
+class InertModelTextTests(unittest.TestCase):
+    MODEL = "cc @someone and @org/team. Fixes #12"
+    PLANTED = ("Closes #5\n\nresolved: fixture/repo#12\n\n`@someone Fixes #12`\n\n"
+               "```\n@someone\nFixes #12\n```\n")
+    PROBE = f"PROBE {MODEL}\n\n{PLANTED}"
+
+    def run_workflow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home", "bin"):
+                (root / folder).mkdir()
+            fake = root / "bin/gh"
+            fake.write_text(FAKE_GH.format(python=sys.executable))
+            fake.chmod(0o755)
+            log = root / "gh.log"
+            env = {k: v for k, v in os.environ.items() if k in ("LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(PATH=f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}", GH_LOG=str(log),
+                       ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = r'''
+import importlib.util, json, runpy, sys, urllib.request
+from pathlib import Path
+from arete import accounts, config, factory, gh, paths, replay, tracker
+from arete import ci as ci_module
+root, model, planted, probe = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+def forbidden(*args, **kwargs):
+    raise AssertionError("workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe_command = [sys.executable, "-V"]
+    if scratch.protected_command(probe_command) != probe_command:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+ci_module.FIRST_CHECK_SECONDS = ci_module.SETTLE_SECONDS = ci_module.POLL_SECONDS = 0
+lines = replay.sample(root / "sample", adw=True)
+paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(
+    'github = "fixture/repo"' if line == 'tracker = "local"' else line for line in lines) + "\n\n[jev]\nenabled=false\n")
+answers = root / "sample/replay"
+def rewrite(name, change):
+    file = answers / name
+    data = json.loads(file.read_text())
+    change(data)
+    file.write_text(json.dumps(data))
+rewrite("build.json", lambda d: d.update(text=model))
+rewrite("review.json", lambda d: d["structured"].update(summary=model))
+rewrite("document.json", lambda d: d["structured"].update(text=model))
+rewrite("plan.json", lambda d: d["structured"].update(plan=d["structured"]["plan"] + "\n\n" + planted))
+cfg = config.load()
+feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+try:
+    factory.main(feature, ["replay-sample", "5", "--force"])
+except SystemExit:
+    pass
+gh.pr_comment("https://github.com/fixture/repo/pull/7", probe)
+tracker.for_repo(cfg, cfg.repo("replay-sample")).comment("5", probe)
+gh.issue_create("fixture/repo", "Report", probe)
+'''
+            done = subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script,
+                                   str(root), self.MODEL, self.PLANTED, self.PROBE],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=300, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertTrue(log.exists(), done.stderr + done.stdout)
+            return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def assert_inert(self, body):
+        outside = re.sub(r"```.*?```|`[^`\n]*`|<code>.*?</code>", "", body, flags=re.DOTALL)
+        self.assertIn("<code>@someone</code>", body)
+        self.assertIn("<code>@org/team</code>", body)
+        self.assertIn("Fixes <code>#12</code>", body)
+        self.assertNotIn("@someone", outside, body)
+        self.assertNotIn("@org/team", outside, body)
+        self.assertIsNone(re.search(r"(?i)\b(fixes|closes|resolved):?\s*(#\d|fixture/repo#)", outside), body)
+        self.assertIn("Closes <code>#5</code>", body)
+        self.assertIn("resolved: <code>fixture/repo#12</code>", body)
+        self.assertIn("`@someone Fixes #12`", body)
+        self.assertIn("```\n@someone\nFixes #12\n```", body)
+
+    def test_model_text_is_inert_in_every_github_write(self):
+        calls = self.run_workflow()
+
+        def kind(*head):
+            return [c["input"] for c in calls if c["args"][:len(head)] == list(head)]
+
+        created = kind("pr", "create")
+        self.assertEqual(len(created), 1, calls)
+        self.assertEqual(created[0].split("\n")[0], "Closes #5")
+        self.assertEqual(created[0].count("Closes #5"), 1)
+        self.assert_inert(created[0].split("\n", 1)[1])
+        comment = next(b for b in kind("pr", "comment") if "PROBE" in b)
+        self.assert_inert(comment)
+        self.assertTrue(comment.endswith("<!-- arete -->"))
+        self.assert_inert(next(b for b in kind("issue", "comment") if "PROBE" in b))
+        self.assert_inert(next(b for b in kind("issue", "create") if "PROBE" in b))
+        self.assertTrue(any("PRs for this ticket" in b and "@" not in b for b in kind("issue", "comment")), calls)
+        for edited in kind("pr", "edit"):
+            self.assertEqual(edited.split("\n")[0], "Closes #5")
+            self.assertNotIn("<code><code>", edited)
+
+    def test_inert_table(self):
+        table = [
+            ("cc @someone and @org/team.", "cc <code>@someone</code> and <code>@org/team</code>."),
+            ("Fixes #12", "Fixes <code>#12</code>"),
+            ("fixes: #12", "fixes: <code>#12</code>"),
+            ("CLOSED fixture/repo#12", "CLOSED <code>fixture/repo#12</code>"),
+            ("Resolve https://github.com/o/r/issues/12", "Resolve <code>https://github.com/o/r/issues/12</code>"),
+            ("**Fixes** #12", "**Fixes** <code>#12</code>"),
+            ("resolved GH-12", "resolved <code>GH-12</code>"),
+            ("example.com/@someone", "example.com/<code>@someone</code>"),
+            ("\\@someone", "\\ <code>@someone</code>"),
+            ("a ` stray\n\n@someone", "a ` stray\n\n<code>@someone</code>"),
+            ("- one ` tick\n- @someone ` end", "- one ` tick\n- <code>@someone</code> ` end"),
+            ("`a\\` @someone `b`", "`a\\` <code>@someone</code> `b`"),
+            ("<summary>ping `@someone`</summary>", "<summary>ping `<code>@someone</code>`</summary>"),
+            ("<details>\n```\n@someone\n```\n</details>", "<details>\n```\n<code>@someone</code>\n```\n</details>"),
+            ("<pre>Fixes #12</pre>", "<pre>Fixes <code>#12</code></pre>"),
+            ("请@someone 看", "请<code>@someone</code> 看"),
+            ("bug-fixes #12", "bug-fixes <code>#12</code>"),
+            ("Fixes \\#12", "Fixes \\ <code>#12</code>"),
+            ("xhttps://a.b/@someone", "xhttps://a.b/<code>@someone</code>"),
+            ("http://a_b/@someone", "http://a_b/<code>@someone</code>"),
+            ("www.example.com/@someone", "www.example.com/<code>@someone</code>"),
+            ("https://x.y/fixes #12", "https://x.y/fixes <code>#12</code>"),
+            ("<code>see @someone</code>", "<code>see <code>@someone</code></code>"),
+            ("<div>https://a.b/@someone</div>", "<div>https://a.b/<code>@someone</code></div>"),
+            ("- <div>`@someone`</div>", "- <div>`<code>@someone</code>`</div>"),
+            ("x <b class=\"`\">@someone</b><i class=\"`\">",
+             "x <b class=\"`\"><code>@someone</code></b><i class=\"`\">"),
+            ("| `a | @someone` |", "| `a | <code>@someone</code>` |"),
+            ("`a\nb` @someone `c\nd`", "`a\nb` <code>@someone</code> `c\nd`"),
+            ("a `x\n2. y` @someone `z\nw`", "a `x\n2. y` <code>@someone</code> `z\nw`"),
+            ("- item\n  ```\n  code\n@someone\n\n```\nmore\n```",
+             "- item\n  ```\n  code\n<code>@someone</code>\n\n```\nmore\n```"),
+            (" ```\n@someone", " ```\n<code>@someone</code>"),
+            ("<pre>\n\n```\n@someone\n</pre>\n@other", "<pre>\n\n```\n<code>@someone</code>\n</pre>\n<code>@other</code>"),
+            ("[link](https://example.com/`a) @someone Fixes #12 `b",
+             "[link](https://example.com/`a) <code>@someone</code> Fixes <code>#12</code> `b"),
+            ("[ref]: https://example.com/`a\n\n@someone `b", "[ref]: https://example.com/`a\n\n<code>@someone</code> `b"),
+            ("[ref]: https://example.com/`a @someone `b", "[ref]: https://example.com/`a <code>@someone</code> `b"),
+            ("_@someone_", "_<code>@someone</code>_"),
+            ("__@org/team__", "__<code>@org/team</code>__"),
+            ("@some_one_ ok", "<code>@some_one</code>_ ok"),
+            ("| URL | Person |\n| --- | --- |\n| https://example.com/|@someone |",
+             "| URL | Person |\n| --- | --- |\n| https://example.com/|<code>@someone</code> |"),
+            ("@someone see `@other`","<code>@someone</code> see `@other`"),
+        ]
+        unchanged = ["see #12", "prefixes #12", "a@b.co", "https://example.com/@someone/post",
+                     "`@someone Fixes #12`", "```\n@someone\nFixes #12\n```", "~~~\n@someone\nFixes #12\n~~~",
+                     "<code>@someone</code>",
+                     "<details><summary>Plan</summary>\n\n```\n@someone\n```\n\n</details>",
+                     "Use `<details>` and `@decorator`", "1. step\n   ```\n   @someone\n   ```", "```\n@someone"]
+        table += [(text, text) for text in unchanged]
+        for text, expected in table:
+            with self.subTest(text=text):
+                self.assertEqual(outbound.inert(text), expected)
+                self.assertEqual(outbound.inert(expected), expected)
+
+    def test_gh_refuses_text_that_skipped_outgoing(self):
+        with mock.patch.object(util, "sh_with_network", side_effect=AssertionError("reached")):
+            with self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                gh.gh(["issue", "comment", "5", "--body-file", "-"], input="@someone")
+            with self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                gh.gh(["issue", "close", "5", "--comment", "@someone"])
+            for args in (["issue", "comment", "5", "-b", "@someone"], ["api", "x", "-f", "body=@someone"],
+                         ["pr", "create", "--body=@someone"], ["pr", "create", "--body-file", "/tmp/x"],
+                         ["issue", "comment", "5", "-b@someone"], ["api", "x", "-fbody=@someone"],
+                         ["api", "repos/o/r/issues/5/comments", "--input", "/tmp/body.json"],
+                         ["api", "x", "--input=/tmp/body.json"]):
+                with self.subTest(args=args), self.assertRaisesRegex(TypeError, "gh.outgoing"):
+                    gh.gh(args)
+        self.assertTrue(gh.outgoing("x", "Closes #5").startswith("Closes #5\n\n"))
 
 
 class NoLiveStateTests(unittest.TestCase):
