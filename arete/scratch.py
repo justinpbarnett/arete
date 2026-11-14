@@ -380,7 +380,7 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
             raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt"
                           + (f" held by {held}" if held else ""))
         selector, token = secrets.token_hex(32), secrets.token_hex(8)
-        root = ws / f"{PREFIX}{token}"
+        root = ws / f"{PREFIX}{token}{paths.SCRATCH_SUFFIX}"
         directories, files = {}, {}
         a = Attempt(selector, token, run_id, step, str(ws), str(root), str(rd), directories, files)
         with paths.directory_fd(rd) as run_fd:

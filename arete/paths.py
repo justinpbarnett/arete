@@ -13,8 +13,9 @@ from pathlib import Path
 HOME = Path.home()
 ON_MAC = sys.platform == "darwin"
 SCRATCH_PREFIX = ".arete-scratch-"
+SCRATCH_SUFFIX = ".noindex"
 SCRATCH_ENV = "ARETE_VERIFY_SCRATCH"
-SCRATCH_TOKEN = re.compile(r"[0-9a-f]{16}")
+SCRATCH_TOKEN = re.compile(r"[0-9a-f]{16}(?:" + re.escape(SCRATCH_SUFFIX) + ")?")
 SEARCH_ONLY = getattr(os, "O_SEARCH", 0)
 NOWHERE = Path("/var/empty/arete-isolated")
 CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|^access$|^refresh$", re.IGNORECASE)
