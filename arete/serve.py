@@ -192,6 +192,8 @@ class Server:
         self.watch_oncall()
         self.loaded = True
         self.dispatch({x.name: x for x in reversed(every_loop)})
+        for released in delivery.release_lapsed():
+            self.say(f"approval #{released}: {delivery.cut_off('claim expired')}")
         self.start_approval_jobs()
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             self.prune()

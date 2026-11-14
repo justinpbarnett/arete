@@ -423,6 +423,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
                **({"value": value} if value is not None else {})}
     if loop.emits:
         delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+    hand_on(run, fresh)
     return "done", took + (f", {util.count(len(fresh), 'new finding')}" if found else "")
 
 
@@ -497,11 +498,14 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
     twins = known_twins(run, [f for f in found if not state.finding_seen(run.loop.name, f["fingerprint_key"])])
     for f in found:
         if twin := twins.get(id(f)):
-            if not run.trial:
-                state.record_finding(run.loop.name, twin["fingerprint"], twin.get("fingerprint_text") or "",
-                                     twin["title"], twin.get("url") or "", run.id)
-            continue
-        if run.trial:
+            if run.trial:
+                continue
+            f["fingerprint_key"] = twin["fingerprint"]
+            is_new = state.record_finding(run.loop.name, twin["fingerprint"], twin.get("fingerprint_text") or "",
+                                          twin["title"], twin.get("url") or "", run.id)
+            if not is_new:
+                continue
+        elif run.trial:
             is_new = not state.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
             is_new = state.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
@@ -510,6 +514,11 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
         if is_new:
             fresh.append(f)
     return fresh
+
+
+def hand_on(run: LoopRun, fresh: list[dict]) -> None:
+    if fresh and not run.trial:
+        state.mark_emitted(run.loop.name, [f["fingerprint_key"] for f in fresh], run.id)
 
 
 def watch_input(run: LoopRun) -> list[dict]:
@@ -631,6 +640,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events)}
     if fresh or any(e["type"] == "metric" for e in loop.emits):
         delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
+    hand_on(run, fresh)
     return "done", f"{summary} ({util.count(len(fresh), 'new finding')}, {len(found) - len(fresh)} seen before)"
 
 

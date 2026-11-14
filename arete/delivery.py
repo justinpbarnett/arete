@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import sqlite3
+import threading
 import traceback
+from contextlib import contextmanager, suppress
+from datetime import timedelta
 
 from . import config, state, util
 from .emits import Digest, Emit, Metric, Notify, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
 
+CLAIM_SECONDS = 120
 RETRIED = ("screen", "proof")
 SAYS_WHY = (RuntimeError, OSError, ValueError)
 EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(), "loop": ToLoop(),
@@ -146,6 +151,53 @@ def repo_of(approval: dict) -> str:
     return emit_of(approval).target_repo(approval["emit"]["item"]) or approval["run_repo"]
 
 
+def cut_off(why: str) -> str:
+    return f"the send was cut off ({why}) and may have landed; check before approving again"
+
+
+def claim_deadline() -> str:
+    return util.iso(util.now() + timedelta(seconds=CLAIM_SECONDS))
+
+
+def already_decided(approval_id: int) -> AlreadyDecided:
+    row = state.approval(approval_id)
+    if row["status"] == "approved":
+        return AlreadyDecided(f"approval #{approval_id} is still sending since {row['decided']}; it returns to the "
+                              f"approval list within {CLAIM_SECONDS} seconds of the send stopping")
+    return AlreadyDecided(f"approval #{approval_id} is already {row['status']}")
+
+
+@contextmanager
+def renewed(approval_id: int, token: str):
+    stopped = threading.Event()
+
+    def renew() -> None:
+        while not stopped.wait(CLAIM_SECONDS / 4):
+            with suppress(sqlite3.Error):
+                state.renew_claim(approval_id, token, claim_deadline())
+
+    thread = threading.Thread(target=renew, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        thread.join()
+
+
+def release_lapsed() -> list[int]:
+    lapsed = state.lapsed_claims()
+    if not lapsed or util.now().timestamp() - util.last_wake() <= CLAIM_SECONDS:
+        return []
+    released = []
+    for claim in lapsed:
+        row = state.approval(claim["id"])
+        if state.settle_approval(claim["id"], "failed", "failed", cut_off("claim expired"),
+                                 judged=emit_of(row).judged, token=claim["claimed_by"], until=claim["claimed_until"]):
+            released.append(claim["id"])
+    return released
+
+
 def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...] = state.DECIDABLE) -> str:
     row = state.approval(approval_id)
     if not row:
@@ -153,37 +205,44 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
     delivery, verb = row["emit"], "approved" if yes else "rejected"
     emit = EMITS[delivery["type"]]
     cfg = config.load() if yes else None
-    if not state.decide_approval(approval_id, verb, came_from=came_from):
-        raise AlreadyDecided(f"approval #{approval_id} is already {state.approval(approval_id)['status']}")
 
     def log(kind: str, text: str) -> None:
         if row["run_id"]:
             state.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
 
-    settle_judged(emit, row["run_id"], verb, approval_id, ("waiting", "failed", "approved"))
     if not yes:
+        if not state.settle_approval(approval_id, "rejected", "rejected", judged=emit.judged, came_from=came_from):
+            raise already_decided(approval_id)
         emit.rejected(delivery["item"])
         log("emit", f"nothing sent: {row['summary']}")
         return "rejected"
+    token = state.claim_approval(approval_id, claim_deadline(), came_from)
+    if not token:
+        raise already_decided(approval_id)
 
-    def settle_as(status: str, why: str) -> None:
-        state.decide_approval(approval_id, status, why, came_from=("approved",))
-        settle_judged(emit, row["run_id"], status, approval_id, ("approved",))
+    def settle_as(status: str, outcome: str, why: str) -> bool:
+        return state.settle_approval(approval_id, status, outcome, why, judged=emit.judged, token=token)
 
-    try:
-        done = send(delivery, row["loop"], row["run_id"], cfg, wrap_crashes=True)
-    except Failed as e:
-        if e.kept_by(emit):
-            settle_as("failed", str(e))
-            e.log_to(log)
-            raise KeptFailure(str(e), e.cause) from e.cause
-        why = f"{e}. Trying again would fail the same way, so it is rejected"
-        settle_as("rejected", why)
-        emit.rejected(delivery["item"])
-        e.log_to(log)
-        log("emit", "rejected, because trying again would fail the same way")
-        raise Failed(why, e.cause) from e.cause
-    state.decide_approval(approval_id, "done", done)
+    with renewed(approval_id, token):
+        try:
+            done = send(delivery, row["loop"], row["run_id"], cfg, wrap_crashes=True)
+            landed = settle_as("done", "approved", done)
+        except Failed as e:
+            if e.kept_by(emit):
+                settle_as("failed", "failed", str(e))
+                e.log_to(log)
+                raise KeptFailure(str(e), e.cause) from e.cause
+            why = f"{e}. Trying again would fail the same way, so it is rejected"
+            if settle_as("rejected", "rejected", why):
+                emit.rejected(delivery["item"])
+                e.log_to(log)
+                log("emit", "rejected, because trying again would fail the same way")
+            raise Failed(why, e.cause) from e.cause
+        except BaseException as e:
+            settle_as("failed", "failed", cut_off(type(e).__name__))
+            raise
+    if not landed:
+        raise already_decided(approval_id)
     emit.landed(delivery.get("batch") or [], row["loop"], done)
     log("emit", f"{delivery['type']}: {done}")
     return done
