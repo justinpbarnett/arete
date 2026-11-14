@@ -795,8 +795,8 @@ def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signa
                     "(SELECT incident FROM incident_aliases WHERE fingerprint = ?)) ORDER BY fingerprint = ? DESC "
                     "LIMIT 1", (fingerprint, fingerprint, fingerprint)).fetchone()
     if row:
-        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ? WHERE id = ?",
-                  (count, now, evidence, row["id"]))
+        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ?, "
+                  "policies = COALESCE(policies, ?) WHERE id = ?", (count, now, evidence, policies, row["id"]))
         note = f"seen again: {count} more from {source}, {row['count'] + count} in all"
         opened, incident_id = False, row["id"]
     else:

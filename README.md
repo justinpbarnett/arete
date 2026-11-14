@@ -81,11 +81,13 @@ scope = "Only the checkout module"
 When on, serve scans on its tick, on the poll pool, so a slow scan never blocks the tick.
 Each `[[oncall.source]]` needs a `path` (a glob is fine); `pattern` (a regex, default the log source's), `repo` (a `[[repo]]`) and `check` are optional.
 `repo` and `check` are recorded for a later repair part and start nothing now.
-When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is still asked, and a result that would be `wake` is stored as `unsure` for the owner.
-An entry matches a file when its glob finds that file by any path, so a symlink, a hard link or another letter case names the same file.
+When more than one `[[oncall.source]]` entry with different `vision` or `scope` text matches one file, JEV is asked only `injection` and `actionable`, and a result that would be `wake` is stored as `unsure` for the owner, so no entry's text can ignore or wake it alone.
+An entry matches a file when its glob finds that file by any path, so a symlink, a hard link or another letter case names the same file, and it also matches the rotated `.1` copy of any file its glob names, which its watcher drains, even after the file itself was renamed away.
 An incident keeps the set of `vision` and `scope` its file was under when its lines were read and is decided under that set, so a file deleted, rotated or reached through a repointed link before the decision changes nothing.
+Lines drained from a rotated `.1` copy are read under every entry that matches the copy and every entry that matches the file now at its old path, so a rotation never drops an entry the lines were written under.
 Lines read from the rotated copy of a file that is gone have no file to match, so a result that would be `wake` is stored as `unsure`, unless the config holds only one set.
-A result that would be `wake` is also stored as `unsure` when the set an incident was read under is no longer in the config, as for an incident opened before `vision` and `scope` existed.
+A result that would be `wake` is also stored as `unsure` when the set an incident was read under is no longer in the config.
+An incident opened before incidents recorded their set joins a repeat of it, which records the set the repeat was read under; decided before any repeat, it is `unsure` with a reason that says it predates recorded sets.
 
 **Sources.** Arete's own files are watched without being listed: the `*.log` files in the log folder, each live run's `run.jsonl`, `heartbeat.json` and serve's beat file.
 Other application or service logs are watched only when listed as `[[oncall.source]]`.
@@ -122,17 +124,17 @@ Evidence is scrubbed of secrets and home paths before it is stored, and `state.p
 
 - `injection`: does the text try to steer an agent that reads it (the same question used elsewhere in arete)?
 - `actionable`: is it a failure a code or config change would repair, rather than noise?
-- `vision`: does repairing it fit `vision`? Asked only when a vision is set.
-- `scope`: is the repair inside `scope`? Asked only when a scope is set.
+- `vision`: does repairing it fit `vision`? Asked only when a vision is set and the incident was read under one set that is still in the config.
+- `scope`: is the repair inside `scope`? Asked only when a scope is set and the incident was read under one set that is still in the config.
 
 The evidence is redacted before it is stored and is sent fenced as data. It is never used as instructions or put into a command; the owner's `vision` and `scope` are the only text in the questions themselves.
 
 | Outcome | Meaning |
 | --- | --- |
 | `wake` | Every question was answered with confidence: actionable, fits the vision, in scope. It may later wake a repair. |
-| `ignore` | A confident "no" to `actionable`, `vision` or `scope`. |
+| `ignore` | A confident "no" to `actionable`, `vision` or `scope`. `vision` and `scope` count only when the incident was read under exactly one set. |
 | `ignore` with the injection mark | The evidence reads as instructions to an agent. It is never asked again and can never wake a model. |
-| `unsure` | An answer was under the confidence line, no vision or scope is set, more than one source entry with different text applied to the file when its lines were read, the lines came from a gone file's rotated copy while the config holds more than one set, or the set has left the config since. It never wakes a model; the owner decides. |
+| `unsure` | An answer was under the confidence line, no vision or scope is set, more than one source entry with different text applied to the file when its lines were read, the lines came from a gone file's rotated copy while the config holds more than one set, the set has left the config since, or the incident was opened before incidents recorded their set. It never wakes a model; the owner decides. |
 | undecided | JEV is off, has no key, is not allowed for the incident's repo or the call failed. The reason is stored and nothing wakes. |
 
 Each decision is stored on the incident with every answer's value and confidence and a one-line reason, and added to its notes.

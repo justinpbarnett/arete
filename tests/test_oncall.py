@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -685,6 +686,7 @@ print(json.dumps(oncall.scan(config.load())))
 """
 DECIDING = f'{ON}vision = "A payments service that must stay up"\nscope = "Bug fixes in the payment worker only"\n'
 FOUR = ["actionable", "injection", "scope", "vision"]
+TWO = ["actionable", "injection"]
 
 
 class Decisions(Scratch):
@@ -1133,7 +1135,7 @@ class Decisions(Scratch):
         self.calls()
         self.append(self.failure_line("payments ledger write failed: KeyError"), to=mailer)
         self.assertEqual(self.scanned()["decisions"], {"unsure": 2})
-        self.assertEqual(self.ids(), [[FOUR, FOUR]])
+        self.assertEqual(self.ids(), [[TWO, TWO]])
         rows = self.sql("SELECT decision, reason FROM incidents")
         self.assertEqual(len(rows), 2)
         for decision, reason in rows:
@@ -1155,7 +1157,7 @@ class Decisions(Scratch):
         self.calls()
         self.append("2026-11-13T10:06:00Z INFO mailer context", line, to=mailer)
         self.assertEqual(self.scanned()["decisions"], {"unsure": 2})
-        self.assertEqual(self.ids(), [[FOUR, FOUR]])
+        self.assertEqual(self.ids(), [[TWO, TWO]])
         rows = self.sql("SELECT source, decision, count, evidence FROM incidents ORDER BY id")
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0][:3], (str(worker), "wake", 1))
@@ -1353,6 +1355,95 @@ class Decisions(Scratch):
         for (reason,) in self.sql("SELECT reason FROM incidents"):
             self.assertIn("more than one", reason)
 
+    def mailer_failing_under(self, app, alias_entry):
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{alias_entry}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        self.append("2026-11-13T10:06:30Z INFO mailer context",
+                    self.failure_line("payments ledger write failed: KeyError"), to=app / "mailer.log")
+
+    def hard_link(self, app):
+        alias = Path(self.tmp.name) / "alias"
+        alias.mkdir()
+        os.link(app / "mailer.log", alias / "mailer.log")
+        return alias / "mailer.log"
+
+    def rotated_before_the_first_read(self, app, alias_entry):
+        mailer = app / "mailer.log"
+        self.mailer_failing_under(app, alias_entry)
+        mailer.rename(app / "mailer.log.1")
+        mailer.write_text("2026-11-13T10:08:00Z INFO reopened\n")
+        decisions = self.scanned()["decisions"]
+        for (reason,) in self.sql("SELECT reason FROM incidents"):
+            self.assertIn("more than one", reason)
+        return decisions
+
+    def test_a_hard_linked_file_rotated_before_its_first_read_stays_under_both_policies(self):
+        app = self.two_logs()
+        self.assertEqual(self.rotated_before_the_first_read(app, self.hard_link(app)), {"unsure": 2})
+
+    def test_a_symlinked_file_rotated_before_its_first_read_stays_under_both_policies(self):
+        app = self.two_logs()
+        link = Path(self.tmp.name) / "current.log"
+        link.symlink_to(app / "mailer.log")
+        self.assertEqual(self.rotated_before_the_first_read(app, link), {"unsure": 1})
+
+    def test_a_hard_linked_file_renamed_away_before_its_first_read_stays_under_both_policies(self):
+        app = self.two_logs()
+        alias = self.hard_link(app)
+        self.mailer_failing_under(app, alias)
+        (app / "mailer.log").rename(app / "mailer.log.1")
+        self.assertEqual(self.scanned()["decisions"], {"unsure": 2})
+        ((reason,),) = self.sql("SELECT reason FROM incidents WHERE source = ?", str(alias))
+        self.assertIn("more than one", reason)
+
+    def test_a_hard_linked_file_copied_and_truncated_before_its_first_read_stays_under_both_policies(self):
+        app = self.two_logs()
+        self.mailer_failing_under(app, self.hard_link(app))
+        shutil.copyfile(app / "mailer.log", app / "mailer.log.1")
+        with open(app / "mailer.log", "r+") as f:
+            f.truncate(0)
+        self.assertEqual(self.scanned()["decisions"], {"unsure": 1})
+        self.assertIn("more than one", self.only()["reason"])
+
+    def test_a_file_rotated_before_its_first_read_under_one_policy_still_wakes(self):
+        app = self.two_logs()
+        worker = app / "worker.log"
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{app / "mailer.log"}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        self.append(self.failure_line("payments ledger write failed: KeyError"), to=worker)
+        worker.rename(app / "worker.log.1")
+        worker.write_text("2026-11-13T10:08:00Z INFO reopened\n")
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        self.assertEqual(self.ids(), [[FOUR]])
+
+    def test_a_file_under_two_policies_is_never_ignored_under_one_of_them(self):
+        app = self.two_logs()
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\n'
+                          f'[[oncall.source]]\npath = "{app / "mailer.log"}"\nscope = "Only the mailer module"\n')
+        self.scanned()
+        self.calls()
+        self.append("2026-11-13T10:06:30Z INFO mailer context",
+                    self.failure_line("mailer bounce queue write failed: KeyError"), to=app / "mailer.log")
+        self.assertEqual(self.scanned({"mailer context": {"scope": 0.03, "vision": 0.03}})["decisions"],
+                         {"unsure": 2})
+        self.assertEqual(self.ids(), [[TWO, TWO]])
+
+    def test_a_gone_file_whose_set_cannot_be_told_is_never_ignored_under_the_oncall_text(self):
+        app = self.two_logs()
+        mailer = app / "mailer.log"
+        self.write_config(DECIDING + f'[[oncall.source]]\npath = "{app}/*.log"\nscope = "Only the mailer module"\n'
+                          f'[[oncall.source]]\npath = "{app}/other.txt"\nscope = "Only the ledger"\n')
+        self.scanned()
+        self.calls()
+        self.append("2026-11-13T10:06:30Z INFO mailer context",
+                    self.failure_line("mailer bounce queue write failed: KeyError"), to=mailer)
+        mailer.rename(app / "mailer.log.1")
+        self.assertEqual(self.scanned({"mailer context": {"scope": 0.03}})["decisions"], {"unsure": 1})
+        self.assertEqual(self.ids(), [[TWO]])
+        self.assertIn("its file is gone", self.only()["reason"])
+
     def test_a_symlink_repointed_after_its_lines_were_read_stays_under_both_policies(self):
         app = self.two_logs()
         other = Path(self.tmp.name) / "other.log"
@@ -1367,13 +1458,33 @@ class Decisions(Scratch):
             link.symlink_to(other)
         self.assertEqual(self.undecided_then_changed(app / "mailer.log", repointed, 2), {"unsure": 2})
 
-    def test_an_incident_opened_before_vision_and_scope_existed_is_unsure(self):
+    def opened_in_part_one(self, line):
         self.baseline()
-        self.sql("INSERT INTO incidents (fingerprint, class, source, first_seen, last_seen, evidence) VALUES "
-                 "('old', 'unexpected', ?, '2026-11-13T10:00:00Z', '2026-11-13T10:00:00Z', 'worker died')",
-                 str(self.log))
-        self.assertEqual(self.scanned()["decisions"], {"unsure": 1})
-        self.assertIn("no longer in the config", self.only()["reason"])
+        self.append(line)
+        self.scanned({"ledger": {"error": "HTTP 503"}})
+        self.sql("UPDATE incidents SET policies = NULL, retry_at = '', reason = '', tries = 0")
+        self.calls()
+
+    def test_an_incident_opened_before_its_set_was_recorded_is_unsure_and_takes_its_repeats(self):
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.opened_in_part_one(line)
+        self.assertEqual(self.scanned({"ledger": {"scope": 0.03}})["decisions"], {"unsure": 1})
+        self.assertEqual(self.ids(), [[TWO]])
+        self.assertIn("opened before incidents recorded", self.only()["reason"])
+        self.append(line)
+        self.assertEqual(self.scanned()["decisions"], {})
+        one = self.only()
+        self.assertEqual((one["count"], one["decision"]), (2, "unsure"))
+        self.assertEqual(json.loads(self.sql("SELECT policies FROM incidents")[0][0]),
+                         [["A payments service that must stay up", "Bug fixes in the payment worker only"]])
+
+    def test_a_repeat_records_its_set_on_an_undecided_incident_opened_before_sets_were_recorded(self):
+        line = self.failure_line("payments ledger write failed: KeyError")
+        self.opened_in_part_one(line)
+        self.append(line)
+        self.assertEqual(self.scanned()["decisions"], {"wake": 1})
+        self.assertEqual(self.ids(), [[FOUR]])
+        self.assertEqual(self.only()["count"], 2)
 
     def test_an_incident_whose_scope_left_the_config_before_its_decision_is_unsure(self):
         self.append("2026-11-13T10:00:00Z INFO started")

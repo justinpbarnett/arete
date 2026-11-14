@@ -54,7 +54,6 @@ URL_ONLY_END = re.compile(r"\] done: failed https?://\S+$")
 TRACEBACK = "Traceback (most recent call last):"
 CHAINED = re.compile(r"During handling of the above exception|The above exception was the direct cause")
 REPAIR_STEPS = ("check_repair", "review_repair", "ci_repair")
-NO_TEXT = frozenset({("", "")})
 
 
 @dataclass(frozen=True)
@@ -143,9 +142,9 @@ def parts(mark: list, now: list | None) -> tuple[list | None, list | None]:
     return (mark[3] if len(mark) > 3 else None), (mark[4] if len(mark) > 4 else now)
 
 
-def gone(name: str, mark: list | None) -> tuple[list[str], list | None]:
+def gone(name: str, mark: list | None) -> tuple[list[str], list[str], list | None]:
     if mark is None:
-        return [], mark
+        return [], [], mark
     now = stamp(name)
     pending, seen = parts(mark, now)
     if not pending and now:
@@ -156,10 +155,10 @@ def gone(name: str, mark: list | None) -> tuple[list[str], list | None]:
         if remainder:
             pending, mark = [mark[0], mark[2]], [0, mark[1], "", None]
     older, pending = drain(name, pending) if pending else ([], None)
-    return older, [mark[0], mark[1], mark[2], pending, now]
+    return older, [], [mark[0], mark[1], mark[2], pending, now]
 
 
-def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list | None]:
+def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list[str], list | None]:
     try:
         info = os.stat(name)
     except OSError:
@@ -167,7 +166,7 @@ def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list
     size, inode = info.st_size, info.st_ino
     now = stamp(name)
     if baseline:
-        return [], [size, inode, digest(name, size) or "", None, now]
+        return [], [], [size, inode, digest(name, size) or "", None, now]
     offset, pending, seen, noted = 0, None, now, now
     if mark is not None:
         offset = mark[0]
@@ -182,12 +181,12 @@ def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list
                 pending, offset = [offset, mark[2]], 0
     end = min(size, offset + MAX_READ)
     if (got := sources.read_lines(name, offset, end)) is None:
-        return [], mark
+        return [], [], mark
     rows, upto = got
     if upto is None:
         upto = end if end - offset >= MAX_READ else offset
     older, pending = drain(name, pending) if pending else ([], None)
-    return older + rows, [upto, inode, digest(name, upto) or "", pending, noted]
+    return older, rows, [upto, inode, digest(name, upto) or "", pending, noted]
 
 
 def undrained(name: str, mark: list) -> bool:
@@ -354,28 +353,40 @@ class Policies:
         for entry, files in self.files:
             for name in files:
                 self.entries.setdefault(self.named.setdefault(name, identity(name) or name), []).append(entry)
+            for copy in glob.glob(str(paths.expand(entry.path)) + ".1"):
+                if (key := identity(copy)) is not None:
+                    self.entries.setdefault(key, []).append(entry)
         self.every = frozenset({entry_policy(cfg), *(entry_policy(cfg, s) for s in cfg.oncall.sources)})
+
+    def under(self, found: list[config.OncallSource]) -> frozenset[tuple[str, str]]:
+        return frozenset({entry_policy(self.cfg, s) for s in found} or {entry_policy(self.cfg)})
+
+    def untold(self) -> frozenset[tuple[str, str]]:
+        return self.every if len(self.every) == 1 else frozenset()
 
     def of_file(self, name: str) -> frozenset[tuple[str, str]]:
         key = self.named.get(name) or identity(name)
+        return self.untold() if key is None else self.under(self.entries.get(key, []))
+
+    def of_copy(self, name: str) -> frozenset[tuple[str, str]]:
+        key = self.named.get(name) or identity(name)
         if key is None:
-            return self.every if len(self.every) == 1 else frozenset()
-        return frozenset({entry_policy(self.cfg, s) for s in self.entries.get(key, [])} or {entry_policy(self.cfg)})
+            return self.untold()
+        copy = identity(name + ".1")
+        return self.under([*self.entries.get(key, []), *(self.entries.get(copy, []) if copy else [])])
 
     def of(self, source: str) -> frozenset[tuple[str, str]]:
         if os.path.isabs(source) or source in self.named or identity(source):
             return self.of_file(source)
         return frozenset({entry_policy(self.cfg)})
 
-    def opened(self, row: dict) -> frozenset[tuple[str, str]]:
-        return NO_TEXT if row.get("policies") is None else unpacked(row["policies"])
-
     def standing(self, row: dict) -> frozenset[tuple[str, str]] | None:
-        rule = self.opened(row)
-        return rule if self.of(row["source"]) == rule else None
+        now, rule = self.of(row["source"]), recorded(row)
+        return now if rule is None or rule == now else None
 
-    def text(self, row: dict) -> tuple[str, str]:
-        return min(self.opened(row), default=entry_policy(self.cfg))
+    def judged(self, row: dict) -> tuple[str, str] | None:
+        rule = recorded(row)
+        return next(iter(rule)) if rule is not None and len(rule) == 1 and rule <= self.every else None
 
 
 def packed(rule: frozenset[tuple[str, str]]) -> str:
@@ -384,6 +395,10 @@ def packed(rule: frozenset[tuple[str, str]]) -> str:
 
 def unpacked(text: str) -> frozenset[tuple[str, str]]:
     return frozenset((str(vision), str(scope)) for vision, scope in json.loads(text))
+
+
+def recorded(row: dict) -> frozenset[tuple[str, str]] | None:
+    return None if row.get("policies") is None else unpacked(row["policies"])
 
 
 def bounded(scope: str, rule: frozenset[tuple[str, str]]) -> str:
@@ -395,7 +410,7 @@ def fingerprint_of(kind: str, scope: str, signature: str) -> str:
 
 
 def questions(policies: Policies, incident: dict) -> dict[str, dict]:
-    vision, scope = policies.text(incident)
+    vision, scope = policies.judged(incident) or ("", "")
     asking = {"injection": jev.yes_no(jev.INJECTION), "actionable": jev.yes_no(ACTIONABLE)}
     if vision:
         asking["vision"] = jev.yes_no(VISION.format(text=vision))
@@ -459,19 +474,22 @@ def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, policies: Polici
         if not a.sure(line):
             return UNSURE, a.confidence, f"{name} is uncertain ({a.note()})", answers, 0
     least = min(a.confidence for a in got.values())
-    rule = policies.opened(row)
+    rule = recorded(row)
+    if rule is None:
+        why = "it was opened before incidents recorded the vision and scope their lines were read under; the owner decides"
+        return UNSURE, least, why, answers, 0
     if not rule:
         why = "its file is gone, so which [[oncall.source]] vision and scope apply cannot be told; the owner decides"
         return UNSURE, least, why, answers, 0
     if not rule <= policies.every:
         why = "the vision or scope its file was under when read is no longer in the config, so the owner decides"
         return UNSURE, least, why, answers, 0
-    for name, text in zip(("vision", "scope"), policies.text(row), strict=True):
-        if not text:
-            return UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0
     if len(rule) > 1:
         why = "more than one [[oncall.source]] vision or scope applies to this file, so the owner decides"
         return UNSURE, least, why, answers, 0
+    for name, text in zip(("vision", "scope"), next(iter(rule)), strict=True):
+        if not text:
+            return UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0
     return WAKE, least, "actionable, fits the vision and is in scope", answers, 0
 
 
@@ -618,9 +636,8 @@ class Watch:
             read = self.policies.of(source) if rule is None else rule
             self.found[key] = Event(kind, scope, text, source, repo, window, count, read)
 
-    def consider(self, name: str, rows: list[str], origin: Origin) -> None:
+    def consider(self, name: str, rows: list[str], origin: Origin, rule: frozenset[tuple[str, str]]) -> None:
         self.lines += len(rows)
-        rule = self.policies.of_file(name)
         policy_scope = origin.scope if rule == origin.home else bounded(origin.scope, rule)
         i = 0
         while i < len(rows):
@@ -654,9 +671,11 @@ class Watch:
         stored, marks = cursor_value(PREFIX + group)
         marks = marks or {}
         for name in dict.fromkeys([*watched, *marks]):
-            rows, marks[name] = fresh(name, marks.get(name), stored is None)
+            older, rows, marks[name] = fresh(name, marks.get(name), stored is None)
+            if older:
+                self.consider(name, older, origin, self.policies.of_copy(name))
             if rows:
-                self.consider(name, rows, origin)
+                self.consider(name, rows, origin, self.policies.of_file(name))
         kept = {name: mark for name, mark in marks.items()
                 if mark is not None and (name in watched or undrained(name, mark))}
         self.defer(group, json.dumps(kept), util.count(len(watched), "file"))
