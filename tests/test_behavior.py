@@ -3762,7 +3762,7 @@ class PushedPrDraftTests(unittest.TestCase):
         self.draft, self.remote_head, self.score, self.fail = True, self.head, 0.1, False
         self.body, self.listed = "", True
         self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=self.root), repairs="", feedback=[],
-                                   log=self.logs.append)
+                                   facts={}, log=self.logs.append)
         self.layer = SimpleNamespace(trust_level="automerge")
         self.cfg = config.Config()
         self.c = pipeline.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
