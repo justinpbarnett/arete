@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from string import Template
-from typing import TextIO
+from typing import NamedTuple, TextIO
 
 from . import (
     alerts,
@@ -481,9 +481,19 @@ class Run(AgentRun):
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
         fresh = self.fresh_text(text, due)
         if session.id and kw.get("persist", True):
-            message = "\n\n".join(part for part in (asks.answers_message(due), self.base_note) if part)
+            parts = (asks.answers_message(due), self.base_note, self.moved_folder_note(due[0]["run"]))
+            message = "\n\n".join(part for part in parts if part)
             return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
         return fresh, {**kw, "resume": NO_SESSION}
+
+    def moved_folder_note(self, asking_run: str) -> str:
+        if not asking_run or asking_run == self.id:
+            return ""
+        script = self.dir / CHECKS_SCRIPT
+        checks = f", for example `{script} NAME` for a check" if script.exists() else ""
+        return (f"This run's folder is `{self.dir}`, not the one of the run that started this session. Commands from "
+                f"earlier in the conversation that name the earlier run's folder no longer run: use the same commands "
+                f"under this run's folder{checks}.")
 
     def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
         ask_ids = [f"{self.id}-a{self.asks_made + n}" for n in range(1, len(sent) + 1)]
@@ -1199,7 +1209,6 @@ class TicketWork:
 class Build(TicketWork):
     tools: list[str]
     deny: list[str]
-    expertise: str
     report: str = ""
     staged: Staged = field(default_factory=Staged)
     committed_lines: int = 0
@@ -1847,7 +1856,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         not_checked = NOT_CHECKED_LEFT_FOR_A_PERSON + left_for_a_person
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
     b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=layer.timeout_minutes * 60,
-              workspace=workspace, attachments=attachments, tools=build_rules, deny=deny, expertise=expertise,
+              workspace=workspace, attachments=attachments, tools=build_rules, deny=deny,
               left_for_a_person=left_for_a_person, check_commands=runs_checks,
               plan_text=plan_text, build_summary=build_summary)
 
@@ -1863,7 +1872,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     record.note(run.id, attempts=attempts)
     if not ok:
         run.story.append("Checks still failing after the last attempt.")
-        _learn(run, ws, layer.expertise_file, t.title, expertise, apply=False)
+        _learn(run, ws, layer.expertise_file, t.title, apply=False)
         return _fail(run, f"checks still failing after {attempts} attempts")
 
     b.require_valid_diff("the build and its fixes", f" (the plan estimated {estimate})" if estimate else "")
@@ -1886,7 +1895,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     draft_why = draft_reason(review, verified, n)
     note_review(run, review, verified)
     run.facts["held"] = draft_why
-    _learn(run, ws, layer.expertise_file, t.title, expertise, apply=True)
+    _learn(run, ws, layer.expertise_file, t.title, apply=True)
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
     outcome = f"{size}, review {review.get('verdict')}, in use {verified.verdict}"
@@ -2835,7 +2844,6 @@ def review_problems(listed) -> list[dict]:
             for p in listed if isinstance(p, dict)]
 
 
-@runlimits.verification
 def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     if not b.layer.verify:
         b.run.log("verify: the layer has no [verify] section, so nothing checks the change in use")
@@ -2848,16 +2856,22 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         b.run.story.append(f"The check in use failed on attempt {attempt}:\n{util.tail(verified.markdown(), 2500)}")
         if attempt == tries:
             break
-        b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt + 1, max_attempts=tries,
-                                                   failures=verified.markdown(), checks=b.check_commands),
-                 role="check_repair")
+        repair_in_use(b, attempt + 1, tries, verified)
         b.recheck("fixing what the check in use found")
     b.run.story.append("Still failing in use after the last attempt.")
-    _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, b.expertise, apply=False)
+    _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, apply=False)
     raise RunFailed(f"it still does not work in use after {util.count(tries, 'attempt')}",
                     verified.markdown())
 
 
+@runlimits.verification
+def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified) -> None:
+    b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt, max_attempts=tries,
+                                               failures=verified.markdown(), checks=b.check_commands),
+             role="check_repair")
+
+
+@runlimits.verification
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
                        diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT))
@@ -3064,50 +3078,108 @@ def cut_at_end(text: str, limit: int) -> str:
     return head[:at].rstrip() + CUT_MARK
 
 
-def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, expertise: str, apply: bool) -> None:
-    if not run.story:
-        run.log("learn: clean run, nothing to learn")
-        return
-    res = run.agent("learn", prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
-                                     story="\n\n".join(run.story), expertise=expertise,
-                                     max_lines=EXPERTISE_MAX_LINES),
-                    wt, role="learn", json_schema=LEARN_SCHEMA, persist=False)
+class Learned(NamedTuple):
+    rewrite: str
+    report: str
+    added: int
+    removed: int
+
+
+def layer_lock(layer_dir: Path) -> str:
+    return "layer-" + hashlib.sha256(str(layer_dir.resolve()).encode()).hexdigest()[:16]
+
+
+def expertise_now(expertise_file: Path) -> str:
+    return expertise_file.read_text().strip() if expertise_file.exists() else ""
+
+
+def learned(run: AgentRun, wt: Path, title: str, expertise: str, call: str, **kw) -> Learned | None:
+    res = run.agent(call, prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
+                                  story="\n\n".join(run.story), expertise=expertise or "(none yet)",
+                                  max_lines=EXPERTISE_MAX_LINES),
+                    wt, role="learn", json_schema=LEARN_SCHEMA, persist=False, **kw)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     rewrite = found.get("expertise", "").strip()
     line_count = len(rewrite.splitlines())
     if not rewrite:
         run.log("learn: no expertise file came back, kept the old one")
-        return
+        return None
     if line_count > EXPERTISE_MAX_LINES:
         run.log(f"learn: the rewrite has {line_count} lines, over the {EXPERTISE_MAX_LINES} line cap; kept the old file")
-        return
+        return None
     added = [a.strip() for a in found.get("added", []) if a.strip()]
     removed = [r for r in found.get("removed", []) if r.get("lesson", "").strip()]
-    if (expertise_file.read_text().strip() if expertise_file.exists() else "") == rewrite:
-        run.log("learn: expertise unchanged")
-        return
     report = "\n".join([f"+ {a}" for a in added] + [f"- {r['lesson']} ({r['why']})" for r in removed])
-    run.save("expertise-report.md", report)
+    return Learned(rewrite, report, len(added), len(removed))
+
+
+def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, apply: bool) -> str:
+    if not run.story:
+        run.log("learn: clean run, nothing to learn")
+        return ""
+    base = expertise_now(expertise_file)
+    first = learned(run, wt, title, base, "learn")
+    if first is None:
+        return ""
     if not apply:
-        run.save("expertise.md", rewrite + "\n")
-        run.log(f"learn: rewrite saved in the run, not applied ({len(added)} added, {len(removed)} removed)")
-        return
-    expertise_file.parent.mkdir(parents=True, exist_ok=True)
-    expertise_file.write_text(rewrite + "\n")
-    run.log(f"learn: {len(added)} added, {len(removed)} removed, {line_count} lines in {paths.short_path(expertise_file)}")
-    if run.repo.layer:
+        if first.rewrite == expertise_now(expertise_file):
+            run.log("learn: expertise unchanged")
+            return ""
+        run.save("expertise-report.md", first.report)
+        run.save("expertise.md", first.rewrite + "\n")
+        run.log(f"learn: rewrite saved in the run, not applied ({first.added} added, {first.removed} removed)")
+        return ""
+    return apply_learned(run, wt, expertise_file, title, base, first)
+
+
+def apply_learned(run: AgentRun, wt: Path, expertise_file: Path, title: str, base: str, first: Learned) -> str:
+    with util.lock(layer_lock(expertise_file.parent), wait=True):
+        current = expertise_now(expertise_file)
+        chosen = first
+        if current != base:
+            run.log("learn: expertise.md changed since this run read it, so the learn step runs again on the current file")
+            chosen = learned(run, wt, title, current, round_name("learn", 2), wait_out_limits=False)
+            if chosen is None:
+                run.save("expertise-report.md", first.report)
+                run.save("expertise.md", first.rewrite + "\n")
+                run.log("learn: the second pass gave no usable file, so the first rewrite is saved in the run, not applied")
+                return ""
+        if chosen.rewrite == current:
+            run.log("learn: expertise unchanged")
+            return ""
+        run.save("expertise-report.md", chosen.report)
+        expertise_file.parent.mkdir(parents=True, exist_ok=True)
+        expertise_file.write_text(chosen.rewrite + "\n")
+        run.log(f"learn: {chosen.added} added, {chosen.removed} removed, {len(chosen.rewrite.splitlines())} lines in "
+                f"{paths.short_path(expertise_file)}")
+        if not run.repo.layer:
+            return ""
         try:
-            commit_layer(expertise_file.parent, f"{run.repo.name}: learn from {run.ref} ({run.id})\n\n{report}")
+            sha = commit_written(expertise_file.parent, f"{run.repo.name}: learn from {run.ref} ({run.id})\n\n{chosen.report}",
+                                 [expertise_file])
         except RuntimeError as e:
             run.log(f"learn: wrote the file but the layer commit failed: {util.first_line(str(e), 300)}")
+            return ""
+        if sha:
+            run.save("expertise-commit.txt", sha + "\n")
+            run.log(f"learn: committed {sha[:12]} in {paths.short_path(expertise_file.parent)}")
+        return sha
 
 
-def commit_layer(layer_dir: Path, message: str) -> None:
+def commit_written(layer_dir: Path, message: str, written: list[Path]) -> str:
     if git(["rev-parse", "--is-inside-work-tree"], layer_dir, check=False).strip() != "true":
         git(["init", "-q"], layer_dir)
-    git(["add", "-A", "--", "."], layer_dir)
-    if util.sh(["git", "diff", "--cached", "--quiet", "--", "."], cwd=layer_dir).returncode:
-        util.git_as_owner(["commit", "-q", "-m", message, "--", "."], layer_dir)
+    names = [str(p.relative_to(layer_dir)) for p in written]
+    git(["add", "--", *names], layer_dir)
+    if not util.sh(["git", "diff", "--cached", "--quiet", "--", *names], cwd=layer_dir).returncode:
+        return ""
+    util.git_as_owner(["commit", "-q", "-m", message, "--", *names], layer_dir)
+    return git(["rev-parse", "HEAD"], layer_dir).strip()
+
+
+def commit_layer(layer_dir: Path, message: str, written: list[Path]) -> str:
+    with util.lock(layer_lock(layer_dir), wait=True):
+        return commit_written(layer_dir, message, written)
 
 
 def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[dict]:
