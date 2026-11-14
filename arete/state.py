@@ -379,6 +379,7 @@ CREATE TABLE IF NOT EXISTS task_comments (
     ts TEXT
 );
 CREATE INDEX IF NOT EXISTS task_comments_task ON task_comments (task);
+CREATE TABLE IF NOT EXISTS reports (run_id TEXT PRIMARY KEY, saved TEXT NOT NULL, report TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS passed_over (
     repo TEXT NOT NULL,
     issue TEXT NOT NULL,
@@ -588,6 +589,22 @@ def run_get(run_id: str, connect=db) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(r) if r else None
+
+
+def save_report(run_id: str, report: dict, connect=db) -> None:
+    with connect() as c:
+        c.execute("INSERT OR REPLACE INTO reports (run_id, saved, report) VALUES (?, ?, ?)",
+                  (run_id, util.iso(), json.dumps(report)))
+
+
+def report(run_id: str, connect=db) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT report FROM reports WHERE run_id = ?", (run_id,)).fetchone()
+    try:
+        found = json.loads(r["report"]) if r else None
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
 
 
 def steps(run_id: str, connect=db) -> list[dict]:
