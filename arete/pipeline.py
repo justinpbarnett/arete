@@ -3606,8 +3606,16 @@ def live_pipeline_runs() -> list[dict]:
     return holding(state.runs_marked_running(), "pipeline")
 
 
-def runs_in_slots() -> list[dict]:
-    return holding(state.runs_marked_running(), "slot", SLOT_KINDS)
+def chat_sessions_going(running: list[dict]) -> list[dict]:
+    linked = {link["run_id"] for link in state.chat_sessions()}
+    return [r for r in running if r["kind"] == "session" and r["id"] in linked
+            and ((util.now() - util.parse_iso(r["started"])).total_seconds() < record.SETTLE_GRACE_SECONDS
+                 or (r["lock"] and util.lock_is_held(r["lock"])))]
+
+
+def runs_in_slots(running: list[dict] | None = None) -> list[dict]:
+    running = state.runs_marked_running() if running is None else running
+    return [*holding(running, "slot", SLOT_KINDS), *chat_sessions_going(running)]
 
 
 def runs_waiting_for_a_slot() -> list[dict]:
