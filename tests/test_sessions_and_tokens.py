@@ -189,9 +189,9 @@ class RemoteSessionTests(unittest.TestCase):
         value = "fake-clone-value-0001"
         device = devices.Device("box", "ssh", host="dev@box.test")
         said = subprocess.CompletedProcess([], 1, "", "fatal: " + "x" * 280 + value)
-        with mock.patch.object(devices.util, "sh", return_value=said), \
+        with mock.patch.object(sessions.util, "sh", return_value=said), \
                 self.assertRaises(devices.DeviceError) as caught:
-            devices.run_script(device, "true", "cloning", value)
+            sessions.run_script(device, "true", "cloning", value)
         self.assertNotIn("fake-c", str(caught.exception))
         self.assertIn("***", str(caught.exception))
 
@@ -295,7 +295,7 @@ class TokenHelperTests(unittest.TestCase):
                    "GIT_TERMINAL_PROMPT": "0"}
             if token is not None:
                 env["ARETE_GIT_TOKEN"] = token
-            return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + devices.TOKEN_HELPER,
+            return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + sessions.TOKEN_HELPER,
                                    "credential", "fill"], cwd=home, env=env, capture_output=True, text=True,
                                   input=f"protocol={protocol}\nhost={host}\n\n", check=False)
 

@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import posixpath
+import shlex
 import signal
 import tempfile
 import time
@@ -25,11 +26,22 @@ from . import (
     routing,
     runner,
     settings,
+    ssh,
     state,
     util,
     vault,
 )
 from .agent import EDIT_TOOLS, NO_SESSION, Session
+
+TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
+                'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
+                'test "$p" = https && test "$h" = github.com && test -n "$ARETE_GIT_TOKEN" || return 0; '
+                'echo username=x-access-token; echo "password=$ARETE_GIT_TOKEN"; }; f')
+GIT_NO_HOOKS = "git -c core.hooksPath=/dev/null"
+GIT_WITH_TOKEN = ('ARETE_GIT_TOKEN="$arete_token" GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= '
+                  + shlex.join(["git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=",
+                                "-c", "credential.helper=" + TOKEN_HELPER]))
+CLONE_SECONDS = 900
 
 SESSIONS_DIR = paths.STATE_DIR / "sessions"
 SESSION_TOOLS = [*EDIT_TOOLS, "Bash"]
@@ -171,7 +183,7 @@ def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> N
         spec.deny = diffguard.denied_paths(config.load_layer(repo.layer_dir))
         spec.cloned = published_baseline(repo)
     with record.timed(spec.id, "worktree", repo=repo.name, branch=spec.branch, path=str(wt)):
-        util.git(["worktree", "add", "-q", "-b", spec.branch, str(wt), "HEAD"], repo.path)
+        util.add_worktree(repo.path, wt, spec.branch, "HEAD")
     spec.cwd = str(wt)
     if spec.task:
         spec.fetched = util.git(["rev-parse", "HEAD"], wt).strip()
@@ -332,10 +344,57 @@ def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     return res.session if res.ok and res.session.id else resume
 
 
+def run_script(device: ssh.Device | str, script: str, what: str, token: str = "", timeout: float = 300) -> str:
+    d = devices.resolve(device)
+    if not d.remote:
+        raise ssh.DeviceError(f"{what} runs only on a remote device, not on {d.name}")
+    if token:
+        script = f"IFS= read -r arete_token && {script}"
+    res = util.sh([*ssh.ssh_argv(d), script], input=f"{token}\n" if token else "", timeout=timeout)
+    if res.returncode != 0:
+        output = res.stderr or res.stdout
+        said = util.git_error(output.replace(token, "***") if token else output) or f"exit {res.returncode}"
+        raise ssh.DeviceError(f"{d.name}: {what} failed: {said}")
+    return res.stdout
+
+
+def github_url(github: str) -> str:
+    return f"https://github.com/{github}.git"
+
+
+def clone(device: ssh.Device | str, github: str, base: str, branch: str, folder: str, token: str) -> str:
+    q, where = shlex.quote, ssh.remote_dir(folder)
+    steps = [f"{GIT_WITH_TOKEN} clone -q --no-checkout --template= --branch {q(base)} {q(github_url(github))} {where}",
+             "unset arete_token", f"cd {where}",
+             f"GIT_LFS_SKIP_SMUDGE=1 {GIT_NO_HOOKS} checkout -q -f -b {q(branch)}",
+             "{ git config user.email >/dev/null || { git config user.name arete && git config user.email arete@localhost; }; }",
+             "git rev-parse HEAD"]
+    return util.last_line(run_script(device, " && ".join(steps), f"cloning {github}", token, CLONE_SECONDS))
+
+
+def commit_all(device: ssh.Device | str, folder: str, message: str, deny: list[str]) -> tuple[str, list[str]]:
+    excluded = shlex.join([*diffguard.NEVER_STAGED, *(f":(exclude,glob){p}" for p in deny)])
+    listed = shlex.join(f":(glob){p}" for p in deny)
+    steps = [f"cd {ssh.remote_dir(folder)}", "git reset -q", f"git add -A -- . {excluded}",
+             f"{{ git diff --cached --quiet || {GIT_NO_HOOKS} commit -q -m {shlex.quote(message)}; }}"]
+    if deny:
+        steps.append(f"git status --porcelain --untracked-files=all -- {listed}")
+    steps.append("git rev-parse HEAD")
+    *left_out, head = run_script(device, " && ".join(steps), "committing the session's work").splitlines() or [""]
+    return head.strip(), [line[3:] for line in left_out if line.strip()]
+
+
+def bundle(device: ssh.Device | str, folder: str, branch: str, since: str) -> str:
+    q = shlex.quote
+    script = (f"cd {ssh.remote_dir(folder)} && f=$(mktemp) && {{ git bundle create -q \"$f\" {q(f'refs/heads/{branch}')} "
+              f"--not {q(since)}; s=$?; if [ $s -eq 0 ]; then base64 < \"$f\"; s=$?; fi; rm -f \"$f\"; exit $s; }}")
+    return run_script(device, script, f"bundling {branch}", timeout=CLONE_SECONDS)
+
+
 def clone_repo(spec: Spec, cfg: config.Config, device: devices.Device) -> str:
     repo = cfg.repo(spec.repo)
     token = gh.clone_token(cfg.github_app, spec.github)
-    head = devices.clone(device, spec.github, spec.base, spec.branch, spec.cwd, token)
+    head = clone(device, spec.github, spec.base, spec.branch, spec.cwd, token)
     with util.repo_lock(repo.path):
         util.git(["fetch", "-q", "origin", spec.base], repo.path, timeout=600)
         util.git(["cat-file", "-e", f"{head}^{{commit}}"], repo.path)
@@ -347,7 +406,7 @@ def clone_repo(spec: Spec, cfg: config.Config, device: devices.Device) -> str:
 
 def fetch_back(spec: Spec, repo: config.Repo, device: devices.Device, head: str) -> None:
     ref = f"refs/heads/{spec.branch}"
-    text = devices.bundle(device, spec.cwd, spec.branch, spec.fetched)
+    text = bundle(device, spec.cwd, spec.branch, spec.fetched)
     with tempfile.TemporaryDirectory() as tmp:
         file = Path(tmp) / "work.bundle"
         file.write_bytes(base64.b64decode(text))
@@ -401,7 +460,7 @@ def return_work(spec: Spec, cfg: config.Config, device: devices.Device, message:
 
 
 def bring_back(spec: Spec, repo: config.Repo, device: devices.Device, message: str) -> None:
-    head, left_out = devices.commit_all(device, spec.cwd, message, spec.deny)
+    head, left_out = commit_all(device, spec.cwd, message, spec.deny)
     for path in left_out:
         log_line(spec, "device", f"left {path} out of the commit: a denied path")
     if head != spec.fetched:

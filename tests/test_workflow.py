@@ -27,6 +27,209 @@ def setUpModule():
     support.isolate_live_state()
 
 
+class WorktreeLifecycleTests(unittest.TestCase):
+    PRELUDE = (SCRIPTS / "worktree_prelude.py").read_text()
+
+    def run_body(self, body):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            make_folders(root, "home", "config", "state", "logs", "worktrees", "tmp", "authority-parent")
+            env = scratch_env(root, HOME=str(root / "home"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            done = run_script(self.PRELUDE + body + '\nprint("ok")\n', root, str(root), env=env, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertEqual(done.stdout.strip().splitlines()[-1:], ["ok"], done.stdout)
+
+    def test_config_lock_does_not_prevent_loop_or_pipeline_add(self):
+        self.run_body('''
+lock = src / '.git' / 'config.lock'
+before = (src / '.git' / 'config').read_bytes()
+lock.touch()
+ws = loop_run.open_workspace(run)
+wt = pipeline.make_worktree(repo, 'main', 'arete/probe', 'probe')
+for folder, branch in ((ws.wt, 'loop/probe'), (wt, 'arete/probe')):
+    assert git('-C', folder, 'branch', '--show-current').stdout.strip() == branch
+    for key in ('merge', 'remote'):
+        assert git('config', '--get', f'branch.{branch}.{key}').returncode == 1
+assert (src / '.git' / 'config').read_bytes() == before
+assert lock.exists()
+assert git('worktree', 'list', '--porcelain').stdout.count('worktree ') == 3
+''')
+
+    def test_loop_initialization_failure_removes_branch_and_worktree(self):
+        self.run_body('''
+with patch.object(loop_run.diffguard, 'denied_paths', side_effect=RuntimeError('probe denied_paths')):
+    try:
+        loop_run.open_workspace(run)
+    except RuntimeError as error:
+        assert 'probe denied_paths' in str(error)
+    else:
+        raise AssertionError('expected initialization failure')
+assert_no_loop()
+''')
+
+    def test_failed_hook_rolls_back_without_nested_lock(self):
+        self.run_body(r'''
+hooks = root / 'hooks'
+hooks.mkdir()
+hook = hooks / 'post-checkout'
+hook.write_text('#!/bin/sh\nexit 1\n')
+hook.chmod(0o700)
+os.environ['GIT_CONFIG_VALUE_0'] = str(hooks)
+try:
+    loop_run.open_workspace(run)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('expected hook failure')
+assert_no_loop()
+''')
+
+    def test_occupied_worktree_and_untracked_file_survive_failed_add(self):
+        self.run_body('''
+held = paths.WORKTREES_DIR / 'held'
+util.add_worktree(src, held, 'held', 'origin/main')
+(held / 'untracked.txt').write_text('preserve me')
+c = pipeline.Checkout('', '', src, held, 'main')
+try:
+    pipeline.add_worktree(c, 'arete/new', 'origin/main')
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('expected occupied-path failure')
+assert (held / 'untracked.txt').read_text() == 'preserve me'
+assert git('-C', held, 'branch', '--show-current').stdout.strip() == 'held'
+assert git('rev-parse', '--verify', 'refs/heads/held').returncode == 0
+assert git('rev-parse', '--verify', 'refs/heads/arete/new').returncode != 0
+assert git('worktree', 'list', '--porcelain').stdout.count('worktree ') == 2
+assert sorted(p.name for p in paths.WORKTREES_DIR.iterdir()) == ['held']
+''')
+
+    def test_delete_retries_tracking_cleanup_after_config_lock(self):
+        self.run_body('''
+assert git('branch', 'kept', 'origin/main').returncode == 0
+assert git('config', '--get', 'branch.kept.merge').returncode == 0
+original = util.git
+lock = src / '.git' / 'config.lock'
+timers = []
+def racing_git(args, cwd, **kw):
+    if args[:2] == ['branch', '-D']:
+        lock.touch()
+        timer = threading.Timer(0.15, lambda: lock.unlink(missing_ok=True))
+        timers.append(timer)
+        timer.start()
+    return original(args, cwd, **kw)
+ws = loop_run.Workspace(src, paths.WORKTREES_DIR / 'absent', 'kept', 'main', '',
+                      git('rev-parse', 'HEAD').stdout.strip(), [], 1000, False)
+with patch.object(util, 'git', racing_git):
+    loop_run.close_workspace(ws, keep_branch=False)
+for timer in timers:
+    timer.join()
+assert len(timers) == 1
+assert git('rev-parse', '--verify', 'refs/heads/kept').returncode != 0
+for key in ('merge', 'remote'):
+    assert git('config', '--get', f'branch.kept.{key}').returncode == 1
+''')
+
+    def test_rejected_push_preserves_checked_out_branch_configuration(self):
+        self.run_body('''
+from arete.push import Push
+
+assert git('branch', 'loop/kept', 'origin/main').returncode == 0
+assert git('config', 'branch.loop/kept.description', 'owner settings').returncode == 0
+assert git('checkout', 'loop/kept').returncode == 0
+before = (src / '.git/config').read_bytes()
+tip = git('rev-parse', 'refs/heads/loop/kept').stdout
+Push().rejected({'workdir': str(src), 'branch': 'loop/kept'})
+assert git('rev-parse', 'refs/heads/loop/kept').stdout == tip
+assert git('branch', '--show-current').stdout.strip() == 'loop/kept'
+assert (src / '.git/config').read_bytes() == before
+assert git('config', '--get', 'branch.loop/kept.merge').stdout.strip() == 'refs/heads/main'
+assert git('config', '--get', 'branch.loop/kept.remote').stdout.strip() == 'origin'
+assert git('config', '--get', 'branch.loop/kept.description').stdout.strip() == 'owner settings'
+''')
+
+    def test_stopped_after_add_rolls_back_new_branch(self):
+        self.run_body('''
+original = util.git
+stopped = pipeline.Stopped()
+def stopping_git(args, cwd, **kw):
+    result = original(args, cwd, **kw)
+    if args[:2] == ['worktree', 'add']:
+        raise stopped
+    return result
+with patch.object(util, 'git', stopping_git):
+    try:
+        util.add_worktree(src, paths.WORKTREES_DIR / 'loop-probe', 'loop/probe', 'origin/main')
+    except pipeline.Stopped as error:
+        assert error is stopped
+    else:
+        raise AssertionError('expected stop')
+assert_no_loop()
+''')
+
+    def test_failed_reset_preserves_existing_branch(self):
+        self.run_body(r'''
+assert git('branch', '--no-track', 'arete/kept', 'origin/main').returncode == 0
+before = git('rev-parse', 'arete/kept').stdout.strip()
+hooks = root / 'hooks'
+hooks.mkdir()
+hook = hooks / 'post-checkout'
+hook.write_text('#!/bin/sh\nexit 1\n')
+hook.chmod(0o700)
+os.environ['GIT_CONFIG_VALUE_0'] = str(hooks)
+c = pipeline.Checkout('', '', src, paths.WORKTREES_DIR / 'failed-reset', 'main')
+try:
+    pipeline.add_worktree(c, 'arete/kept', 'origin/main')
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('expected hook failure')
+assert git('rev-parse', 'arete/kept').stdout.strip() == before
+assert git('worktree', 'list', '--porcelain').stdout.count('worktree ') == 1
+assert not list(paths.WORKTREES_DIR.iterdir())
+''')
+
+    def test_existing_pipeline_branch_and_kept_loop_branch(self):
+        self.run_body('''
+assert git('branch', '--no-track', 'arete/reset', 'origin/main').returncode == 0
+wt = pipeline.make_worktree(repo, 'main', 'arete/reset', 'reset')
+assert git('-C', wt, 'rev-parse', 'HEAD').stdout == git('rev-parse', 'origin/main').stdout
+assert git('-C', wt, 'branch', '--show-current').stdout.strip() == 'arete/reset'
+ws = loop_run.open_workspace(run)
+loop_run.close_workspace(ws, keep_branch=True)
+assert git('rev-parse', '--verify', 'refs/heads/loop/probe').returncode == 0
+assert not ws.wt.exists()
+''')
+
+    def test_branch_mutations_use_shared_helpers(self):
+        self.run_body('''
+import ast
+import arete
+adds, drops = [], []
+for path in Path(arete.__file__).parent.glob('*.py'):
+    tree = ast.parse(path.read_text())
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call) or not node.args or not isinstance(node.args[0], ast.List):
+                continue
+            items = node.args[0].elts
+            values = [item.value for item in items if isinstance(item, ast.Constant)]
+            choices = {child.value for item in items for child in ast.walk(item)
+                       if isinstance(child, ast.Constant) and isinstance(child.value, str)}
+            if values[:2] == ['worktree', 'add'] and choices.intersection({'-b', '-B'}):
+                adds.append((path.name, function.name))
+                assert '--no-track' in values
+            if values[:2] == ['branch', '-D']:
+                drops.append((path.name, function.name))
+assert adds == [('util.py', 'add_worktree')], adds
+assert drops == [('util.py', '_drop_branch')], drops
+''')
+
+
 class VerificationPreflightTests(unittest.TestCase):
     def test_missing_requirement_blocks_before_model_or_app_start(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -282,6 +485,16 @@ class OfflineWorkflowTests(unittest.TestCase):
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
+
+    def test_doctor_reads_clean_after_a_replay_run(self):
+        result = self.workflow("doctor-clean")
+        self.assertEqual(result["status"], "done")
+        self.assertIn("kumquat", result["published"])
+        self.assertEqual(result["doctor_code"], 0, result["doctor_output"])
+        lines = result["doctor_output"].splitlines()
+        self.assertEqual([line.split()[:3] for line in lines],
+                         [["OK", name, "0"] for name in ("cost", "orphans", "chat", "folders", "stuck", "store", "backup")])
+        self.assertTrue(result["doctor_unchanged"])
 
     def test_record_of_another_version_does_not_stop_a_replay(self):
         result = self.workflow("foreign-version-record")

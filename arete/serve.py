@@ -26,6 +26,7 @@ from . import (
     environment,
     explain,
     hold_review,
+    install,
     loop_run,
     loops,
     oncall,
@@ -45,6 +46,7 @@ from .loops import Loop
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
+ROTATE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
 CLOSED_SECONDS = 300
@@ -203,7 +205,7 @@ class Server:
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
-        self.pruned = self.swept = 0.0
+        self.pruned = self.swept = self.rotated = 0.0
         self.checked_closed = 0.0
         self.ticks = 0
         self.reloaded = restarted_with is not None
@@ -227,6 +229,10 @@ class Server:
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
+
+    def rotate(self) -> None:
+        for note in install.rotate_logs():
+            self.say(note)
 
     def read_config(self) -> None:
         self.cfg, self.config_problem = config.load_or_problem()
@@ -301,6 +307,7 @@ class Server:
         self.guard("stage:oncall", self.watch_oncall)
         self.guard("stage:dispatch", self.dispatch, {x.name: x for x in reversed(self.every_loop)})
         self.guard("stage:approvals", self.approvals)
+        self.guard("stage:rotate", self.rotate_when_due)
         self.guard("stage:prune", self.prune_when_due)
         self.guard("stage:sweep", self.sweep_when_due)
         self.guard("stage:asks", self.expire_asks)
@@ -321,6 +328,11 @@ class Server:
         for released in delivery.release_lapsed():
             self.say(f"approval #{released}: {delivery.cut_off('claim expired')}")
         self.start_approval_jobs()
+
+    def rotate_when_due(self) -> None:
+        if time.monotonic() - self.rotated > ROTATE_SECONDS:
+            self.rotated = time.monotonic()
+            self.rotate()
 
     def prune_when_due(self) -> None:
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
@@ -750,6 +762,7 @@ def start_notes(cfg: config.Config) -> list[str]:
 
 
 def run(with_dashboard: bool = True) -> NoReturn:
+    rotation_notes = install.rotate_own_log()
     held = take_serve_lock()
     try:
         beat = util.read_json(control.BEAT_FILE, {})
@@ -767,6 +780,8 @@ def run(with_dashboard: bool = True) -> NoReturn:
         held.close()
         raise
     server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
+    for note in rotation_notes:
+        server.say(note)
     server.report_config()
     for note in start_notes(server.cfg):
         server.say(note)

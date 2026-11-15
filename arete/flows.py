@@ -342,6 +342,7 @@ class Job:
     def merge_moved_base(self, name: str) -> None:
         moved, self.moved_base = self.moved_base, ""
         held = [c for c in self.checkouts if c.onto]
+        self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
         if not moved or not held:
             return
         self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits that "
