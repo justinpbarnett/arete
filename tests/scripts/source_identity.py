@@ -4,6 +4,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 from arete import config, jira, loops, paths, serve, sources, state, util
+state.migrate()
 root = Path(os.environ["IDENT_ROOT"])
 cfg = config.load()
 server = serve.Server()

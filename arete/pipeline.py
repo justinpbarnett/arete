@@ -3504,7 +3504,8 @@ def sync_outcomes(cfg: config.Config) -> None:
             continue
         for url, pr in zip(urls, prs):
             state.close_feedback(url, pr["state"])
-        closed_at = max(pr.get("closedAt") or "" for pr in prs) or util.iso()
+        closed_at = max((util.iso(util.parse_iso(pr["closedAt"]).astimezone(UTC))
+                         for pr in prs if pr.get("closedAt")), default=util.iso())
         record.move(r["id"], "merged" if merged else "rejected", expect=(r["status"],), finished=closed_at)
     util.write_json(PR_SEEN_FILE, fresh)
     for repo in cfg.repos:

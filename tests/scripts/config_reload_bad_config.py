@@ -7,6 +7,8 @@ def fake_sh(argv, **kw):
         return subprocess.CompletedProcess(argv, 0, "", "")
     if argv[-1] == serve.CONFIG_CHECK:
         return subprocess.CompletedProcess(argv, mode["config"], "", "ValueError: cannot read")
+    if argv == control.command(["migrate", "--no-contracts"]):
+        return subprocess.CompletedProcess(argv, 0, "", "")
     return subprocess.CompletedProcess(argv, 1, "", "")
 changed = frozenset({("changed", 1, 1)})
 def reload_server():

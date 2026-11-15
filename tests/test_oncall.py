@@ -986,14 +986,17 @@ class Decisions(Scratch):
         self.assertEqual({i["decision"] for i in self.incidents()}, {"wake"})
 
     def test_a_database_with_the_part_one_columns_gains_the_new_ones(self):
-        self.baseline()
-        self.append(self.error(1))
-        self.scan()
-        self.sql("DROP TABLE incidents")
+        self.state = Path(self.tmp.name) / "legacy-state"
+        self.state.mkdir()
+        self.env["ARETE_STATE_DIR"] = str(self.state)
         self.sql("CREATE TABLE incidents (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT NOT NULL, "
                  "class TEXT NOT NULL, source TEXT NOT NULL, repo TEXT DEFAULT '', signature TEXT DEFAULT '', "
                  "state TEXT NOT NULL DEFAULT 'open', first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, "
                  "count INTEGER DEFAULT 1, evidence TEXT DEFAULT '')")
+        done = self.py("from arete import state; state.migrate()")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue({"decision", "policies"} <= {r[1] for r in self.sql("PRAGMA table_info(incidents)")})
+        self.baseline()
         self.append(self.error(2))
         self.scanned()
         one = self.only()

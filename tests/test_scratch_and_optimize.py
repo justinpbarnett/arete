@@ -330,6 +330,7 @@ class EvalLineageTests(unittest.TestCase):
 
     def test_board_uses_only_baselines(self):
         r = self.script(r'''
+state.migrate()
 state.add_eval("a", "mixed", "one", True, 0, 0, "worktree")
 state.add_eval("b", "mixed", "two", False, 0, 0, "worktree with prompts edited")
 state.add_eval("c", "prompt-only", "three", False, 0, 0, "worktree with prompts edited")
