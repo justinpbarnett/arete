@@ -5,7 +5,6 @@ import sys
 import tempfile
 import tomllib
 import unittest
-import arete
 
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env
@@ -484,6 +483,8 @@ class OptimizeTests(unittest.TestCase):
         self.assertGreater(r["final"], r["ran"], shown)
 
 
+@unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
+                     "needs macOS confinement")
 class AuthorityRotationTests(unittest.TestCase):
     STATES = ("initializing", "prepared", "active", "pending", "retained", "done")
     SCRIPT = (SCRIPTS / "authority_rotation.py").read_text()
@@ -589,4 +590,3 @@ class AuthorityRotationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

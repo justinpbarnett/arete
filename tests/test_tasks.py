@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from arete import config, control, scratch, sessions, state
+from arete import config, control, sessions, state
 
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env
@@ -414,4 +414,3 @@ result(ok=True)
 
 if __name__ == "__main__":
     unittest.main()
-

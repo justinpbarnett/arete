@@ -3,7 +3,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-import arete
 
 from arete import config
 
@@ -411,4 +410,3 @@ class StagedResearchAuditTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

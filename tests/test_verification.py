@@ -1,20 +1,19 @@
 import fcntl
 import hmac
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import secrets
-import subprocess
 import sys
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
-import arete
 
-from arete import config, gh, outbound, paths, pi, pipeline, scratch, util, verify, runner
+from arete import config, gh, outbound, paths, pi, pipeline, scratch, verify
 
 from tests import support
 
@@ -23,6 +22,7 @@ def setUpModule():
     support.isolate_live_state()
 
 
+@unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
 class WriterRegressionTests(unittest.TestCase):
     def write(self, brief, answer, *, voice=""):
         from arete import document, outbound
@@ -463,10 +463,6 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertTrue(Path(a.root).exists())
 
 
-@unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
-                     "needs macOS confinement")
-
-
 class EvidenceLinkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -530,4 +526,3 @@ class EvidenceLinkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

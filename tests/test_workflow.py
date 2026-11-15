@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 from datetime import timedelta
@@ -886,9 +885,6 @@ class FailedPrepareHistoryTests(unittest.TestCase):
         self.assertTrue(flow.takable(flow.earlier[1]))
 
 
-@unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
-
-
 class CodeIdentityTests(unittest.TestCase):
     CLAIM = (SCRIPTS / "code_identity_claim.py").read_text()
     HEADERS = (SCRIPTS / "code_identity_headers.py").read_text()
@@ -1317,4 +1313,3 @@ class ServeReloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

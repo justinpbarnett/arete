@@ -5,12 +5,10 @@ from datetime import timedelta
 from pathlib import Path
 import subprocess
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 import urllib.error
 from unittest import mock
-import arete
 
 from arete import config, gh, outbound, paths, state, util
 
@@ -486,4 +484,3 @@ class AlertWriteRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

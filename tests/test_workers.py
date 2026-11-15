@@ -9,9 +9,8 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-import arete
 
-from arete import scratch, runner
+from arete import runner
 
 from tests import support
 from tests.harness import behavior_result, inherited_env, make_folders, run_script, scratch_env
@@ -1151,4 +1150,3 @@ result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)
 
 if __name__ == "__main__":
     unittest.main()
-

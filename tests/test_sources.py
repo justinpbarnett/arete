@@ -473,4 +473,3 @@ print("RESULT:" + json.dumps(out))
 
 if __name__ == "__main__":
     unittest.main()
-

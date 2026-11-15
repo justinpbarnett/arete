@@ -22,4 +22,3 @@ def isolate_live_state():
                     for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
         patch.start()
         unittest.addModuleCleanup(patch.stop)
-

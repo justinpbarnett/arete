@@ -9,9 +9,8 @@ from types import SimpleNamespace
 import unittest
 import urllib.error
 from unittest import mock
-import arete
 
-from arete import config, control, devices, gh, pipeline, sessions, state, util, verify
+from arete import config, control, devices, gh, pipeline, sessions, verify
 
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env
@@ -591,4 +590,3 @@ class PushedPrDraftTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

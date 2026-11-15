@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from arete import gh, outbound, paths, pipeline, scratch, util, verify, cli, codex, guard, runner, uploads
+from arete import gh, outbound, paths, pipeline, util, verify, cli, codex, guard, runner, uploads
 
 from tests import support
 from tests.harness import make_folders, run_script, scratch_env
@@ -322,4 +322,3 @@ class UploadGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
