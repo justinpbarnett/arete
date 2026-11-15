@@ -23,4 +23,3 @@ def assert_no_loop():
     assert git('worktree', 'list', '--porcelain').stdout.count('worktree ') == 1
     assert not (paths.WORKTREES_DIR / 'loop-probe').exists()
     assert not list(paths.WORKTREES_DIR.iterdir())
-
