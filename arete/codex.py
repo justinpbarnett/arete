@@ -265,14 +265,14 @@ def both(p: Path | str) -> list[str]:
     return list(dict.fromkeys([str(Path(p).absolute()), str(Path(p).resolve())]))
 
 
-def kept_out(roots: list[Path], hidden: list[Path | str]) -> dict[str, str]:
+def kept_out(roots: list[Path], hidden: list[Path | str], floor: guard.Floor | None = None) -> dict[str, str]:
+    floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), roots[0] if roots else Path.cwd(), roots[1:])
     denied = {f"{root.rstrip('/')}/**/{name}": "deny" for r in [Path('/'), *roots, paths.HOME] for root in both(r)
               for name in (*guard.SECRET_NAMES, *sorted(guard.SECRET_DIRS))}
     denied |= {f"{p}/**": "deny" for p in denied if Path(p).name in guard.SECRET_DIRS}
     denied |= {path: "deny" for p in hidden for path in both(p)}
     denied |= {str(paths.HOME / d): "deny" for d in sorted(guard.SECRET_DIRS)}
-    denied |= {p: "deny" for d in (home(), paths.CONFIG_DIR, paths.HOME / ".config" / "arete",
-                                   paths.HOME / ".claude", paths.HOME / ".pi") for p in both(d)}
+    denied |= {p: "deny" for d in (*floor.closed, *floor.files) for p in both(d)}
     if gh := shutil.which("gh"):
         denied |= {p: "deny" for p in both(gh)}
     return denied
@@ -305,7 +305,8 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
 
 
 def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | str],
-            allowed_tools: list[str] | None = None) -> list[str]:
+            allowed_tools: list[str] | None = None, *, floor: guard.Floor | None = None) -> list[str]:
+    floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     name = WRITE_PROFILE if writing else READ_PROFILE
     granted = {path: "write" if writing else "read" for path in both(cwd)}
     if writing:
@@ -316,7 +317,7 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
     table = {"extends": PROFILE_BASE[name], "filesystem": {**granted, **metadata,
-             **kept_out([cwd, *add_dirs], [*hidden, verification_scratch.AUTHORITY]),
+             **kept_out([cwd, *add_dirs], [*hidden, verification_scratch.AUTHORITY], floor),
              **executables(allowed_tools, [*hidden, verification_scratch.AUTHORITY])},
              "network": {"enabled": False}}
     return [*setting("default_permissions", name), "-c", f"permissions.{name}={toml_value(table)}"]
@@ -338,9 +339,10 @@ def owner_hooks_off() -> dict[str, dict]:
     return off
 
 
-def guard_hook(judge: bool, scratch: tuple[str, ...] = ()) -> list[str]:
+def guard_hook(judge: bool, scratch: tuple[str, ...] = (), opened=()) -> list[str]:
     entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); from arete.cli import main; raise SystemExit(main())"
-    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else []), *scratch])
+    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else []),
+                       *(arg for path in opened for arg in ("--open", str(path))), *scratch])
     entry = [{"matcher": "*", "hooks": [{"type": "command", "command": hook, "timeout": guard.HOOK_TIMEOUT_SECONDS}]}]
     off = owner_hooks_off()
     return [*setting("hooks.PreToolUse", entry), *(setting("hooks.state", off) if off else [])]
@@ -422,6 +424,7 @@ def command(
     extra_env: dict[str, str] | None = None,
     hidden: list[Path | str] = (),
     scratch: tuple[str, ...] = (),
+    floor: guard.Floor | None = None,
 ) -> list[str]:
     try:
         if any((home() / name).exists() for name in ("AGENTS.override.md", "AGENTS.md")):
@@ -429,6 +432,7 @@ def command(
     except OSError as e:
         raise ValueError(OWNER_INSTRUCTIONS_REFUSAL) from e
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
+    floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     servers = (json.loads(mcp_config).get("mcpServers") or {}) if mcp_config else {}
     resume = resume if resume.runner == "codex" else NO_SESSION
     cmd = [binary(), "exec", *(["resume", resume.id] if resume.id else []), "--json", *ALWAYS]
@@ -444,7 +448,7 @@ def command(
         cmd += ["--disable", feature]
     for key, value in SETTINGS.items():
         cmd += setting(key, value)
-    cmd += profile(cwd, add_dirs, writes(tools, allowed_tools), list(hidden), allowed_tools)
+    cmd += profile(cwd, add_dirs, writes(tools, allowed_tools), list(hidden), allowed_tools, floor=floor)
     cmd += setting("shell_environment_policy", {"inherit": "all", "ignore_default_excludes": True,
                                                 "include_only": sorted(set(command_names(passing or [], extra_env)) -
                                                     {k for server in servers.values() for k in (server.get("env") or {})})})
@@ -453,7 +457,7 @@ def command(
         system = "\n\n".join(filter(None, [system, repo_instructions(cwd)]))
     if system:
         cmd += setting("developer_instructions", system)
-    cmd += guard_hook(judge, scratch)
+    cmd += guard_hook(judge, scratch, floor.open)
     cmd += mcp_settings(mcp_config, allowed_tools)
     return [*cmd, "-"]
 
@@ -517,6 +521,7 @@ def _run(
     on_line: Callable[[str], None] = lambda line: None,
     auth: accounts.Auth | None = None,
     scratch: tuple[str, ...] = (),
+    floor: guard.Floor | None = None,
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth()
     resume = resume if resume.runner == "codex" else NO_SESSION
@@ -543,7 +548,7 @@ def _run(
     try:
         cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                       system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, instructions=instructions,
-                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch)
+                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch, floor=floor)
     except (ValueError, OSError) as e:
         return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
     if json_schema:
@@ -767,7 +772,7 @@ def reads_git(sub: str, args: list[str]) -> bool:
     return sub in GIT_READS or (bool(args) and args[0] in GIT_READ_FORMS.get(sub, ()))
 
 
-def guard_reason(payload: dict, judge: bool, rules: list[str]) -> str:
+def guard_reason(payload: dict, judge: bool, rules: list[str], opened=()) -> str:
     tool = str(payload.get("tool_name") or "").rsplit(".", 1)[-1]
     if tool.endswith(uploads.NAME):
         return uploads.CODEX_REFUSAL
@@ -784,25 +789,25 @@ def guard_reason(payload: dict, judge: bool, rules: list[str]) -> str:
     tool = "Bash" if tool in SHELL_TOOLS else tool
     cwd = str(payload.get("cwd") or args.get("cwd") or args.get("workdir") or os.getcwd())
     payload = {**payload, "tool_name": tool, "tool_input": {**args, "command": text}, "cwd": cwd}
+    floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, opened)
     if tool == "apply_patch":
         return next(filter(None, (guard.decide({"tool_name": "Write", "cwd": cwd,
-                                               "tool_input": {"file_path": p.strip()}})
+                                               "tool_input": {"file_path": p.strip()}}, judge, floor)
                                   for p in PATCH_PATHS.findall(text))), "")
     if tool != "Bash" or not text.strip():
         return ""
+    if reason := guard.decide(payload, False, floor):
+        return reason
     if re.search(r"(?:auth\.json|(?:\$CODEX_HOME|\$\{CODEX_HOME\}|~[/\\]\.codex))", text):
         return "Arete keeps Codex login files out of agent tools"
     if found := git_write(text, rules):
         return KEPT_OUT_OF_GIT.format(found)
-    if judge:
-        return guard.decide(payload)
-    secret = guard.secret_named(text, str(payload.get("cwd") or os.getcwd()))
-    return guard.kept_out(tool, secret) if secret else ""
+    return guard.decide(payload, True, floor) if judge else ""
 
 
-def guard_main(judge: bool, rules: list[str]) -> int:
+def guard_main(judge: bool, rules: list[str], opened=()) -> int:
     try:
-        reason = guard_reason(json.load(sys.stdin), judge, rules)
+        reason = guard_reason(json.load(sys.stdin), judge, rules, opened)
     except Exception:
         return 0
     if reason:

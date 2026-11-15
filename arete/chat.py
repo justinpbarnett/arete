@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import tempfile
 import threading
 
-from . import board, config, control, gh, paths, pipeline, record, routing, runner, sessions, state, util
+from . import board, config, control, gh, paths, pipeline, record, routing, runner, sessions, settings, state, util
 from .agent import Result
 
-CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
+CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
 OLD_CHAT_FILE = paths.STATE_DIR / "chat.json"
 MOVED_CHAT_FILE = paths.STATE_DIR / "chat.json.moved"
 BUDGET_USD = 2
@@ -268,12 +269,13 @@ def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config,
     for batch in batches_of(old, cfg.chat.context_tokens):
         if allowance - cost <= 0:
             return "", cost, paid
-        res = runner.run(
-            pipeline.prompt("chat_summary", summary=summary or "(none yet)", messages=render_all(batch)),
-            paths.STATE_DIR, model=cfg.chat.summary_model, tools=[], persist=False,
-            timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=min(SUMMARY_BUDGET_USD, allowance - cost),
-            hard_cap=True, wait_out_limits=False,
-            trace=("chat", f"chat {chat_id} summary"), cfg=cfg)
+        with tempfile.TemporaryDirectory() as cwd:
+            res = runner.run(
+                pipeline.prompt("chat_summary", summary=summary or "(none yet)", messages=render_all(batch)),
+                cwd, model=cfg.chat.summary_model, tools=[], persist=False,
+                timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=min(SUMMARY_BUDGET_USD, allowance - cost),
+                hard_cap=True, wait_out_limits=False,
+                trace=("chat", f"chat {chat_id} summary"), cfg=cfg)
         cost, paid = cost + res.cost_usd, paid + res.paid_usd
         summary = capped(res.text.strip(), summary_limit(cfg)) if res.ok else ""
         if not summary:
@@ -513,7 +515,8 @@ def session_rules(chat_id: int) -> list[str]:
 
 def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd: float = BUDGET_USD) -> Result:
     model = cfg.model("chat")
-    util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends()})
+    util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends(), "settings": settings.current()})
+    (paths.STATE_DIR / "dashboard.json").unlink(missing_ok=True)
     arete = arete_repo(cfg)
     work = cfg.repo(project) if project else arete
     github = arete.github
@@ -527,10 +530,10 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
         model=model,
         tools=[*runner.READ_TOOLS, "Bash"],
         allowed_tools=[*runner.READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",
+                       "Bash(arete record*)", "Bash(arete lines*)",
                        "Bash(git show*)", *reads_issues, *session_rules(chat_id)],
         json_schema=REPLY_SCHEMA,
-        system=pipeline.prompt("chat", code=arete.path, workdir=work.path, config=paths.CONFIG_FILE,
-                               state=paths.STATE_DIR, context=CONTEXT_FILE, logs=paths.LOG_DIR,
+        system=pipeline.prompt("chat", code=arete.path, workdir=work.path, context=CONTEXT_FILE,
                                github=github or "(no GitHub repo set)", chat=chat_id,
                                max_sessions=cfg.chat.max_sessions, budget=f"{cfg.chat.budget_usd:g}",
                                project=project_section(work) if project else ""),
@@ -539,5 +542,5 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
         needs_server=True,
         timeout=TIMEOUT_SECONDS,
         wait_out_limits=False,
-        add_dirs=[paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR, *([arete.path] if project else [])],
+        add_dirs=[CONTEXT_FILE.parent, *([arete.path] if project else [])],
     )

@@ -1,0 +1,142 @@
+*** Begin Patch
+*** Update File: arete/guard.py
+@@
++from dataclasses import dataclass
+ from fnmatch import fnmatch
+@@
+-from . import config, jev, record, scratch, util
++from . import config, jev, paths, record, scratch, util
+@@
+-FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit")
++FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS")
+@@
+-def settings() -> dict:
+-    command = shlex.join([sys.executable, "-I", "-m", "arete.cli", "guard"])
++LOGIN_FOLDERS = tuple(dict.fromkeys([
++    *(paths.HOME / p for p in (".pi", ".claude", ".codex", ".gemini", ".ssh", ".aws", ".docker", ".kube",
++                               ".gnupg", ".password-store", ".config/gh", ".config/gcloud", ".config/opencode",
++                               ".local/share/opencode", ".config/arete")),
++    *(Path(os.environ[p]) for p in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR")
++      if os.environ.get(p)),
++]))
++LOGIN_FILES = tuple(paths.HOME / p for p in (
++    ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".claude/.credentials.json", ".codex/auth.json",
++    ".gemini/oauth_creds.json", ".aws/credentials", ".config/gh/hosts.yml",
++    ".config/gcloud/application_default_credentials.json", ".config/opencode/auth.json",
++    ".local/share/opencode/auth.json"))
++
++
++@dataclass(frozen=True)
++class Floor:
++    closed: tuple[Path, ...]
++    files: tuple[Path, ...]
++    open: tuple[Path, ...]
++
++    def denies(self, path: Path | str) -> bool:
++        roots = tuple(p for root in self.closed for p in (root.absolute(), root.resolve()))
++        opened = tuple(p for root in self.open for p in (root.absolute(), root.resolve()))
++        files = {p for file in self.files for p in (file.absolute(), file.resolve())}
++        for candidate in (Path(path).absolute(), Path(path).resolve()):
++            if candidate in files:
++                return True
++            closed_depth = max((len(p.parts) for p in roots if candidate.is_relative_to(p)), default=-1)
++            open_depth = max((len(p.parts) for p in opened if candidate.is_relative_to(p)), default=-1)
++            if closed_depth >= 0 and closed_depth >= open_depth:
++                return True
++        return False
++
++
++def run_folders(run_id: str) -> tuple[Path, ...]:
++    from . import sessions
++
++    if not run_id or Path(run_id).name != run_id or run_id in (".", ".."):
++        return ()
++    return (paths.RUNS_DIR / run_id, sessions.SESSIONS_DIR / run_id)
++
++
++def floor(run_id: str, cwd: Path | str, add_dirs) -> Floor:
++    from . import codex
++
++    closed = (paths.CONFIG_DIR, paths.STATE_DIR, paths.WORKTREES_DIR, paths.LOG_DIR, paths.CLIENT_DIR,
++              *LOGIN_FOLDERS, codex.home(), Path(os.environ.get("CLAUDE_CONFIG_DIR") or paths.HOME / ".claude"))
++    return Floor(tuple(dict.fromkeys(Path(p).absolute() for p in closed)),
++                 (*LOGIN_FILES, paths.PI_KEYS_FILE),
++                 tuple(dict.fromkeys(Path(p).absolute() for p in (*run_folders(run_id), cwd, *add_dirs))))
++
++
++def launch_refusal(run_id: str, cwd: Path | str, add_dirs) -> str:
++    boundary = floor(run_id, cwd, add_dirs)
++    own = run_folders(run_id)
++    for target in (cwd, *add_dirs):
++        for candidate in (Path(target).absolute(), Path(target).resolve()):
++            for root in boundary.closed:
++                for closed in (root.absolute(), root.resolve()):
++                    if not candidate.is_relative_to(closed):
++                        continue
++                    allowed = any(candidate.is_relative_to(p) for folder in own
++                                  for p in (folder.absolute(), folder.resolve()))
++                    allowed = allowed or candidate.parent in (paths.WORKTREES_DIR.absolute(),
++                                                               paths.WORKTREES_DIR.resolve())
++                    if not allowed:
++                        return reach(str(target))
++    return ""
++
++
++def reach(target: str) -> str:
++    return f"Arete keeps {target} outside the agent's reach: its worktree and its run folder."
++
++
++def settings(judge: bool = False, opened=()) -> dict:
++    entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); from arete.cli import main; raise SystemExit(main())"
++    command = shlex.join([sys.executable, "-I", "-c", entrypoint, "guard", *(["--judge"] if judge else []),
++                          *(arg for path in opened for arg in ("--open", str(path)))])
+@@
+-def main() -> int:
++def main(judge: bool = False, opened=()) -> int:
+     try:
+-        reason = decide(json.load(sys.stdin))
++        payload = json.load(sys.stdin)
++        boundary = floor(os.environ.get("ARETE_RUN_ID", ""), payload.get("cwd") or os.getcwd(), opened)
++        reason = decide(payload, judge, boundary)
+@@
+-def decide(payload: dict) -> str:
++def decide(payload: dict, judge: bool = False, boundary: Floor | None = None) -> str:
+@@
+     cwd = str(payload.get("cwd") or os.getcwd())
++    boundary = boundary or floor(os.environ.get("ARETE_RUN_ID", ""), cwd, [])
+     if tool in FILE_TOOLS:
+-        target = str(args.get("file_path") or args.get("notebook_path") or "")
++        target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or "")
++        if tool == "Glob" and not target:
++            pattern = str(args.get("pattern") or "")
++            if Path(pattern).is_absolute():
++                prefix = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
++                target = prefix if prefix.endswith("/") or prefix == pattern else str(Path(prefix).parent)
++        if not target and tool in ("Glob", "Grep", "LS"):
++            target = cwd
++        path = Path(paths.expand(target))
++        path = path if path.is_absolute() else Path(cwd) / path
++        if target and boundary.denies(path):
++            return reach(target)
+         return kept_out(tool, target) if target and secret_path(target) else ""
+@@
+     if not command:
+         return ""
++    try:
++        words = shlex.split(command)
++    except ValueError:
++        words = command.split()
++    keychain_reads = {"find-generic-password", "find-internet-password", "dump-keychain", "export"}
++    if any(Path(word).name == "security" and any(w in keychain_reads for w in words[i + 1:])
++           for i, word in enumerate(words)):
++        return reach("security keychain items")
++    for part in (p for word in words for p in re.split(r"[=<>;|&()`]", word) if p):
++        path = Path(paths.expand(part))
++        path = path if path.is_absolute() else Path(cwd) / path
++        if boundary.denies(path):
++            return reach(part)
+     if secret := secret_named(command, cwd):
+@@
+-    return judged(command, cwd, config.load())
++    return judged(command, cwd, config.load()) if judge else ""
+*** End Patch

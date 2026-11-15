@@ -139,7 +139,7 @@ def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: confi
     if not (cfg.jev.guard and jev.ready(cfg, [repo])) or jev.key(claude.agent_env(passing)):
         return ""
     return (f"the guard has no judge: JEV's key is only in the server's environment, which an agent no longer gets, so "
-            f"the guard judges no command and keeps only its secret file rules; put {jev.KEY_NAME} in "
+            f"the guard judges no command; its directory floor and secret file rules remain active; put {jev.KEY_NAME} in "
             f"{paths.short_path(pi.KEYS_FILE)}")
 
 
@@ -319,6 +319,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     prior = route
     chosen_by = {"launch": 1, "selection": prior} if prior else None
     atom = settings.step if settings else ""
+    refusal = refusal or guard.launch_refusal(trace[0], cwd, kw.get("add_dirs") or [])
     if refusal:
         return refused(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind,
                        chosen_by, try_no, refusal, atom)
@@ -377,7 +378,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             return with_spent(done, limited)
         chosen_route = picked.candidate
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
-        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say)
+        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd)
         final_size = routing_size(text, settings, launch_kw)
         measured = max(measured, final_size)
         if (trip.request.requires.declared and final_size > trip.request.size
@@ -757,10 +758,11 @@ def reserved(name: str) -> str:
 
 
 def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str], ask_jev: bool,
-                  say: Callable[[str], None]) -> dict:
+                  say: Callable[[str], None], *, cwd: Path | str | None = None) -> dict:
     kw = {k: list(v) if isinstance(v, list) else v for k, v in base.items()}
     cfg, repo, target = trip.cfg, trip.repo, trip.target
     which = picked.candidate.runner
+    floor = None if target.remote else guard.floor(trace[0], cwd or Path.cwd(), kw.get("add_dirs") or [])
     kw["effort"] = picked.candidate.effort
     kw["instructions"] = list(picked.candidate.instructions)
     asking = bool(kw.pop("ask_owner", False)) and not target.remote
@@ -831,17 +833,18 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         else:
             kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook)
+            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook, floor=floor)
     elif which == "codex":
         kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_codex(kw, cfg, trace[0], say, repo, hook)
+            kw = local_codex(kw, cfg, trace[0], say, repo, hook, floor=floor)
     elif which == "pi":
         kw["price"] = lambda reply: priced(reply, cfg)
         kw["max_budget_usd"] = picked.budget
         kw["selected"] = picked.selected
         if not target.remote:
             kw["providers"] = cfg.environment.providers
+            kw["floor"] = floor
     if uploads.granted(kw.get("allowed_tools")) and (which != "claude" or target.remote):
         kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
         kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), uploads.WITHHELD]))
@@ -902,6 +905,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                                                 ("openai" if auth.mode == "api_key" else "chatgpt")
                                                 if which == "codex" else ""),
               "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
+              "add_dirs": [str(p) for p in kw.get("add_dirs") or []],
               "allowed_tools": kw.get("allowed_tools"), "disallowed_tools": kw.get("disallowed_tools"),
               "json_schema": kw.get("json_schema"), "budget_usd": kw.get("max_budget_usd"),
               "mcp_servers": described_servers(kw.get("mcp_config", "")),
@@ -1054,10 +1058,10 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
 
 
 def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: Callable[[str], None],
-                 repo: config.Repo | None, scratch: tuple[str, ...] = ()) -> dict:
+                 repo: config.Repo | None, scratch: tuple[str, ...] = (), *, floor: guard.Floor) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
-    if cfg.jev.guard and guard.wanted(kw.get("tools")):
-        kw["settings"] = guard.settings()
+    if guard.wanted(kw.get("tools")):
+        kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
         if scratch:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:
@@ -1073,12 +1077,13 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
 
 
 def local_codex(kw: dict, cfg: config.Config, run_id: str, say: Callable[[str], None],
-                repo: config.Repo | None, scratch: tuple[str, ...] = ()) -> dict:
+                repo: config.Repo | None, scratch: tuple[str, ...] = (), *, floor: guard.Floor) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
+    kw["floor"] = floor
+    kw["judge"] = cfg.jev.guard
+    if scratch:
+        kw["scratch"] = tuple(scratch)
     if cfg.jev.guard and guard.wanted(kw.get("tools")):
-        kw["judge"] = True
-        if scratch:
-            kw["scratch"] = tuple(scratch)
         if note := judge_note(cfg, kw["passing"], repo):
             say(note)
     return kw
