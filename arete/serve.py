@@ -46,6 +46,7 @@ TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
+CLOSED_SECONDS = 300
 POLL_THREADS = 8
 
 
@@ -202,6 +203,7 @@ class Server:
         self.loaded = restarted_with is not None
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
         self.pruned = self.swept = 0.0
+        self.checked_closed = 0.0
         self.ticks = 0
         self.reloaded = restarted_with is not None
         self.failing: dict[str, dict] = {}
@@ -293,6 +295,7 @@ class Server:
         self.guard("stage:prune", self.prune_when_due)
         self.guard("stage:sweep", self.sweep_when_due)
         self.guard("stage:asks", self.expire_asks)
+        self.guard("stage:closed", self.release_closed_when_due)
         self.guard("stage:remind", self.remind)
 
     def reap(self) -> None:
@@ -323,6 +326,12 @@ class Server:
     def expire_asks(self) -> None:
         for note in tasks.expire_asks(self.cfg):
             self.say(note)
+
+    def release_closed_when_due(self) -> None:
+        if time.monotonic() - self.checked_closed > CLOSED_SECONDS:
+            self.checked_closed = time.monotonic()
+            for note in tasks.release_closed(self.cfg):
+                self.say(note)
 
     def remind(self) -> None:
         for note in webpush.remind(self.cfg):
