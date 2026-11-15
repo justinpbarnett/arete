@@ -230,6 +230,95 @@ class ChatContextTests(unittest.TestCase):
             return behavior_result(done)
 
     FRUITS = (SCRIPTS / "chat_context_fruits.py").read_text()
+
+    def test_chat_context_grants_only_its_snapshot_folder(self):
+        self.scratch(r'''
+old = paths.STATE_DIR / "dashboard.json"
+old.write_text("old context")
+kept = paths.STATE_DIR / "keep.json"
+kept.write_text("keep")
+put("chat-1", reply("Ready."))
+take(1, "Show current settings")
+h = header("chat-1")
+context = paths.RUNS_DIR / "chat/context/dashboard.json"
+assert str(context.parent) in h["add_dirs"]
+for target in map(Path, h["add_dirs"]):
+    for closed in (paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR):
+        assert not target.is_relative_to(closed) or target == context.parent, target
+system = h["system"].replace(str(context), "CONTEXT")
+for closed in (paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR):
+    assert str(closed) not in system
+assert {"snapshot", "trends", "settings"} <= json.loads(context.read_text()).keys()
+assert not old.exists() and kept.read_text() == "keep"
+assert "Bash(arete record*)" in h["allowed_tools"]
+assert "Bash(arete lines*)" in h["allowed_tools"]
+result(ok=True)
+''')
+
+    def test_summaries_use_empty_temporary_folders_without_tools(self):
+        self.scratch(self.FRUITS + r'''
+from arete import explain, guard, runner
+for n in range(1, 5):
+    put(answer_of(n), reply(f"Reply {n}."))
+put(summary_answer_of(1), {"text": "SUMMARYMARK earlier fruit questions."})
+for text in fruits:
+    last = take(1, text)
+assert last["summary"].startswith("SUMMARYMARK")
+assert "PEAR" in header(record_of(4))["prompt"]
+cfg = config.load()
+closed = guard.floor("", root, []).closed
+h = summary_header(1)
+assert h["tools"] == []
+assert not any(Path(h["cwd"]).is_relative_to(p) for p in closed)
+assert not Path(h["cwd"]).exists()
+put("plain-summary-9", {"structured": {"summary": "The check needs review."}})
+approval = {"id": 9, "loop": "test", "summary": "review", "emit": {"item": {}}}
+from types import SimpleNamespace
+with mock.patch.object(explain.delivery, "repo_of", return_value=""), \
+     mock.patch.object(explain.delivery, "repo_for", return_value=None), \
+     mock.patch.object(explain.delivery, "emit_of", return_value=SimpleNamespace(briefing=lambda item: "Review")):
+    assert explain.plain_summary(approval, cfg) == "The check needs review."
+headers = [next(record.lines(p)) for p in paths.RUNS_DIR.glob(f"call*/record/*{record.RECORD_SUFFIX}")
+           if p.name != record.TIMELINE]
+h = next(h for h in headers if h["tools"] == [])
+assert not any(Path(h["cwd"]).is_relative_to(p) for p in closed)
+assert not Path(h["cwd"]).exists()
+result(ok=True)
+''')
+
+    def test_no_repo_research_and_triage_use_temporary_working_folders(self):
+        self.scratch(r'''
+from types import SimpleNamespace
+from arete import guard, research, runner, triage
+cfg = config.load()
+closed = guard.floor("", root, []).closed
+src = SimpleNamespace(repos=[], repos_text=lambda: "none", repo_rule=lambda: "No repo",
+                      ticket=lambda c: SimpleNamespace(text="Facts", said=lambda title: "Facts"))
+candidate = triage.Candidate("synthetic#1", "1", "Question", "", "")
+put("triage-synthetic-1", {"structured": {"kind": "research", "why": "Read facts"}})
+answer, _, why = triage.triage_one(cfg, src, candidate, "Facts")
+assert answer and not why
+assert triage.record_file(candidate.ref).is_file()
+row = {"ref": candidate.ref, "source": "synthetic", "title": "Question", "url": "", "updated": "",
+       "repos": [], "tracker": "github", "closed": True}
+put("research-synthetic-1", {"structured": {"report": "A useful report.", "summary": "Useful"}})
+with mock.patch.object(research, "source_of", return_value=src), \
+     mock.patch.object(research, "tickets", return_value=[]), \
+     mock.patch.object(research, "home_of", return_value=None), \
+     mock.patch.object(research, "related", return_value="none"), \
+     mock.patch.object(research, "move"), mock.patch.object(research, "settle_status"):
+    status, why = research.research(cfg, row, force=True)
+assert status == research.DONE, why
+assert "A useful report." in research.report_file(candidate.ref).read_text()
+headers = [next(record.lines(p)) for p in paths.RUNS_DIR.glob(f"call*/record/*{record.RECORD_SUFFIX}")
+           if p.name != record.TIMELINE]
+assert len(headers) == 2, headers
+for h in headers:
+    assert not any(Path(h["cwd"]).is_relative_to(p) for p in closed), h
+    assert not Path(h["cwd"]).exists()
+result(ok=True)
+''')
+
     LIVE_REPLAY_ANSWER = (SCRIPTS / "chat_live_replay_answer.py").read_text()
     FEEDBACK_RECOVERY = (SCRIPTS / "chat_feedback_recovery.py").read_text()
     ANSWERER_RECOVERY = (SCRIPTS / "chat_answerer_recovery.py").read_text()

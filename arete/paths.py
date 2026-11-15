@@ -203,6 +203,7 @@ def drop_credentials() -> None:
 
 CONFIG_DIR = Path(os.environ.get("ARETE_CONFIG_DIR", HOME / ".config" / "arete"))
 STATE_DIR = Path(os.environ.get("ARETE_STATE_DIR", HOME / ".local" / "share" / "arete"))
+CLIENT_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "arete-client"
 GUARD_HOOK = sys.argv[1:2] in (["guard"], ["codex-guard"])
 ISOLATED = not GUARD_HOOK and (bool(os.environ.get(SCRATCH_ENV)) or inside_scratch(CONFIG_DIR)
                                or inside_scratch(STATE_DIR))
@@ -266,7 +267,7 @@ def record_dir(run_id: str) -> Path:
 
 
 def draft_dir(run_id: str) -> Path:
-    return STATE_DIR / "drafts" / run_id
+    return RUNS_DIR / run_id / "draft"
 
 
 def ensure_dirs() -> None:

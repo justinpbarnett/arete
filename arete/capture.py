@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -493,19 +494,16 @@ def judged(res, row: dict, print_: str) -> dict:
 
 
 def look_at(row: dict, draft_id: int, s: steps.Settings, print_: str, cfg: config.Config) -> tuple[dict, float]:
-    folder = CAPTURES_DIR / str(draft_id)
-    viewable = folder / f"{row['sha256']}.{EXTENSIONS[row['type']]}"
+    name = f"{row['sha256']}.{EXTENSIONS[row['type']]}"
     kept = tuple(m for m in s.requires.modalities if m not in MEDIA)
     settings = replace(s, requires=replace(s.requires, modalities=(*kept, row["kind"]), structured_output=True))
-    text = pipeline.prompt("capture_evidence", file=viewable.name, kind=row["kind"])
-    try:
-        shutil.copyfile(folder / row["sha256"], viewable)
-        res = runner.run(text, folder, **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
+    text = pipeline.prompt("capture_evidence", file=name, kind=row["kind"])
+    with tempfile.TemporaryDirectory(prefix="arete-capture-") as room:
+        shutil.copyfile(CAPTURES_DIR / str(draft_id) / row["sha256"], Path(room) / name)
+        res = runner.run(text, Path(room), **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
                          instructions=list(s.instructions), json_schema=EVIDENCE_SCHEMA, persist=False,
                          wait_out_limits=False, hard_cap=True, tier=s.tier,
                          trace=("", f"capture_evidence {row['sha256'][:12]}"), cfg=cfg, settings=settings)
-    finally:
-        viewable.unlink(missing_ok=True)
     return judged(res, row, print_), res.paid_usd
 
 

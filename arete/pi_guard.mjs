@@ -68,9 +68,10 @@ function walk(path, visit, seen = new Set()) {
 
 export default function (pi) {
     const metadata = JSON.parse(process.env.ARETE_PI_GUARD_PATHS ?? "null");
+    if (metadata && metadata.open === undefined) metadata.open = [];
     if (!metadata || !Array.isArray(metadata.roots) || !metadata.roots.length
-        || [metadata.files, metadata.write_roots, metadata.write_files].some(paths => !Array.isArray(paths))
-        || [...metadata.roots, ...metadata.files, ...metadata.write_roots, ...metadata.write_files]
+        || [metadata.open, metadata.files, metadata.write_roots, metadata.write_files].some(paths => !Array.isArray(paths))
+        || [...metadata.open, ...metadata.roots, ...metadata.files, ...metadata.write_roots, ...metadata.write_files]
             .some(path => typeof path !== "string" || !isAbsolute(path))) {
         throw new Error("Arete's credential boundary requires absolute protected paths");
     }
@@ -135,16 +136,26 @@ export default function (pi) {
             const writing = event.toolName === "edit" || event.toolName === "write";
             const directories = [...metadata.roots, ...(writing ? metadata.write_roots : [])];
             const files = [...metadata.files, ...(writing ? metadata.write_files : [])];
-            const roots = [...directories, ...files].flatMap(path => [resolve(path), canonical(path)]);
-            const directoryInodes = new Set(directories.map(info).filter(stat => stat?.isDirectory()).map(identity));
+            const roots = directories.flatMap(path => [resolve(path), canonical(path)]);
+            const protectedFiles = files.flatMap(path => [resolve(path), canonical(path)]);
+            const opened = metadata.open.flatMap(path => [resolve(path), canonical(path)]);
+            const depth = (paths, path) => Math.max(-1, ...paths.filter(root => within(root, path))
+                .map(root => root.split(sep).length));
+            const closed = path => depth(roots, path) >= 0 && depth(roots, path) >= depth(opened, path);
+            const directoryInodes = new Map(directories.filter(path => info(path)?.isDirectory())
+                .map(path => [identity(info(path)), canonical(path)]));
             metadata.files.forEach(path => remember(path));
             if (writing) rememberWrites();
             const blocked = (path, stat = info(path)) => {
                 const real = canonical(path);
-                if (roots.some(root => within(root, path) || within(root, real))) return true;
+                if (writing && metadata.write_roots.some(root => within(resolve(root), path)
+                    || within(canonical(root), real))) return true;
+                if (protectedFiles.some(file => within(file, path) || within(file, real))) return true;
+                if (closed(path) || closed(real)) return true;
                 for (let parent = dirname(real);; parent = dirname(parent)) {
                     const ancestor = info(parent);
-                    if (ancestor && directoryInodes.has(identity(ancestor))) return true;
+                    const root = ancestor && directoryInodes.get(identity(ancestor));
+                    if (root && closed(join(root, real.slice(parent.length)))) return true;
                     if (dirname(parent) === parent) break;
                 }
                 return stat && (inodes.has(identity(stat)) || (writing && writeInodes.has(identity(stat))));
@@ -155,7 +166,9 @@ export default function (pi) {
             if (blocked(path)) return { block: true, reason };
             if (searches.has(event.toolName)) {
                 const real = canonical(path);
-                if (roots.some(root => within(path, root) || within(real, root))) return { block: true, reason };
+                if ([...roots, ...protectedFiles].some(root => within(path, root) || within(real, root))) {
+                    return { block: true, reason };
+                }
                 let found = false;
                 walk(path, (entry, stat) => {
                     if (blocked(entry, stat)) {

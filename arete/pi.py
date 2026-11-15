@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import accounts, asks, claude, config, devices, environment, paths, scratch, state, util
 from .agent import (
@@ -30,6 +31,9 @@ from .agent import (
     provider_reset,
     usage_totals,
 )
+
+if TYPE_CHECKING:
+    from . import guard
 
 TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": ("ls",), "Edit": ("edit",),
             "MultiEdit": ("edit",), "Write": ("write",), "Bash": ("bash",)}
@@ -527,36 +531,32 @@ def launch_env_names(route: Route) -> list[str]:
     return sorted({*route.env, "PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", *controls})
 
 
-def guard_env(auth_paths: list[Path] | None = None, secret_paths: tuple[Path, ...] = ()) -> dict[str, str]:
+def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
+              secret_paths: tuple[Path, ...] = ()) -> dict[str, str]:
     sources = {PI_HOME / "agent", owner_dir(), *(path.parent for path in auth_paths or [])}
-    roots = [PI_HOME, *sorted(sources), AGENT_DIR, LOGIN_DIR, KEY_DIR, paths.CONFIG_DIR,
-             *(paths.HOME / p for p in (".claude", ".codex", ".gemini", ".ssh", ".aws", ".docker", ".kube",
-                                       ".gnupg", ".password-store", ".config/gh", ".config/gcloud",
-                                       ".config/opencode", ".local/share/opencode")),
-             *(Path(os.environ[p]) for p in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR")
-               if os.environ.get(p)),
+    roots = [*floor.closed, PI_HOME, *sorted(sources), AGENT_DIR, LOGIN_DIR, KEY_DIR,
              Path("/proc"), Path("/dev")]
     auth = [PI_HOME / "agent" / "auth.json", owner_dir() / "auth.json", AGENT_DIR / "auth.json",
             *(auth_paths or [])]
-    files = [KEYS_FILE, paths.CONFIG_FILE,
-             *(paths.HOME / p for p in (".netrc", ".npmrc", ".pypirc", ".git-credentials")),
-             *(source / name for source in sorted(sources) for name in ("models.json", "settings.json")),
-             paths.HOME / ".claude" / ".credentials.json",
-             paths.HOME / ".codex" / "auth.json", paths.HOME / ".gemini" / "oauth_creds.json",
-             paths.HOME / ".aws" / "credentials", paths.HOME / ".config" / "gh" / "hosts.yml",
-             paths.HOME / ".config" / "gcloud" / "application_default_credentials.json",
-             paths.HOME / ".config" / "opencode" / "auth.json",
-             paths.HOME / ".local" / "share" / "opencode" / "auth.json"]
+    files = [*floor.files, KEYS_FILE, paths.CONFIG_FILE,
+             *(source / name for source in sorted(sources) for name in ("models.json", "settings.json"))]
     for path in auth:
         files.extend((path, path.resolve(), Path(str(path) + ".lock"), Path(str(path.resolve()) + ".lock")))
     files.extend(path for source in secret_paths for path in (source, source.resolve()))
     return {"ARETE_PI_GUARD_PATHS": json.dumps({"roots": list(map(str, roots)), "files": list(map(str, files)),
+                                              "open": list(map(str, floor.open)),
                                               "write_roots": [str(paths.PACKAGE_DIR)],
                                               "write_files": [str(GUARD_FILE), str(ASK_FILE)]})}
 
 
 def can_confine(remote: bool) -> bool:
     return not remote and sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK)
+
+
+def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: Route | None) -> list[str]:
+    return write_confinement(cwd, add_dirs, selected.owner if selected and selected.using_login else None,
+                             state=(paths.STATE_DIR, (*floor.open, SESSIONS_DIR, AGENT_DIR, LOGIN_DIR, KEY_DIR)),
+                             hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR), peers=paths.WORKTREES_DIR)
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
@@ -902,6 +902,7 @@ def _run(
     selected: Route | None = None,
     extra_env: dict[str, str] | None = None,
     ask_owner: bool = False,
+    floor: guard.Floor | None = None,
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -912,6 +913,10 @@ def _run(
                                       "step on claude or set instructions = []", session=resume, runner="pi", model=model)
     cwd = Path(cwd).absolute()
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
+    if floor is None:
+        from . import guard
+
+        floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     names = [name for name in tool_names(tools, allowed_tools, disallowed_tools) if name in GUARDED_TOOLS]
     if persist or resume.id:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -927,15 +932,15 @@ def _run(
         if not can_confine(False):
             return Result(ok=False, error=f"{NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
                           session=resume, runner="pi", model=model)
-        cmd = write_confinement(cwd, add_dirs, selected.owner if selected and selected.using_login else None) + cmd
+        cmd = confinement(cwd, add_dirs, floor, selected) + cmd
         confined = True
     if selected and selected.using_login and not confined and can_confine(False):
-        cmd = write_confinement(cwd, add_dirs, selected.owner) + cmd
+        cmd = confinement(cwd, add_dirs, floor, selected) + cmd
 
     cmd = [*cmd, "--", prompt]
     folder = selected.view
     env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
-           **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files),
+           **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files),
            **({"ARETE_ASK_TOOL": json.dumps(asks.pi_tool())} if ask_owner else {})}
     try:
         with refresh_channel(selected, env) as descriptors:
