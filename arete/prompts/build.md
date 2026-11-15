@@ -29,8 +29,8 @@ $expertise
   part and say exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits and opens the PR after you finish,
   and deletes the `__pycache__` your commands leave, so do not mention it.
-- Stay under $max_lines changed lines, lockfiles not counted; the planner estimated $estimate. Arete rejects a
-  bigger diff after the checks, so spend lines on the change, not on churn.
+- Stay under $max_lines changed lines, lockfiles and lines moved verbatim not counted; the planner estimated
+  $estimate. Arete rejects a bigger diff after the checks, so spend lines on the change, not on churn.
 - Keep the diff small and on topic. No drive by refactors, no formatting churn, no new dependencies unless the plan calls for them.
 - Never edit `.agents/`, CI workflows, or env files.
 - If you find the plan is wrong, fix the approach and say why in your final message.

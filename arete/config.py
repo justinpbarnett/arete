@@ -226,6 +226,21 @@ class OncallConfig:
     keep_days: float = 30.0
 
 
+@dataclass(frozen=True)
+class PaidRoutes:
+    providers: tuple[str, ...] | None = None
+    max_input: float | None = None
+    max_output: float | None = None
+
+    @property
+    def limited(self) -> bool:
+        return self.providers is not None or self.max_input is not None or self.max_output is not None
+
+    @property
+    def capped(self) -> bool:
+        return self.max_input is not None or self.max_output is not None
+
+
 @dataclass
 class Config:
     alert_repo: str = ""
@@ -259,6 +274,7 @@ class Config:
     capabilities: dict[str, dict] = field(default_factory=dict)
     floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
     payment_modes: tuple[str, ...] = PAYMENT_MODES
+    paid: PaidRoutes = PaidRoutes()
     adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
@@ -473,6 +489,7 @@ class Routing:
     capabilities: dict[str, dict] = field(default_factory=dict)
     floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
     payment_modes: tuple[str, ...] | None = None
+    paid: PaidRoutes = PaidRoutes()
 
 
 def capability_table(key: str, table) -> dict:
@@ -492,10 +509,36 @@ def capability_table(key: str, table) -> dict:
     return {**table, **({"modalities": tuple(dict.fromkeys(found))} if "modalities" in table else {})}
 
 
+def paid_table(data) -> PaidRoutes:
+    table = table_of(data, "routing.paid")
+    if bad := sorted(set(table) - {"providers", "max_input", "max_output"}):
+        raise ValueError(f"[routing.paid]: unknown key {', '.join(bad)}; use providers, max_input, max_output")
+    providers = table.get("providers")
+    if providers is not None:
+        if not (isinstance(providers, list) and all(isinstance(p, str) and p for p in providers)):
+            raise ValueError(f"[routing.paid] providers must be a list of provider names, not {providers!r}")
+        providers = tuple(dict.fromkeys(providers))
+    return PaidRoutes(providers, *(price_rate(table[key], f"[routing.paid] {key}") if key in table else None
+                                   for key in ("max_input", "max_output")))
+
+
+def tighter(a: float | None, b: float | None) -> float | None:
+    return b if a is None else a if b is None else min(a, b)
+
+
+def allowed_paid_routes(cfg: Config, layer: RepoLayer | None = None) -> PaidRoutes:
+    own = layer.paid if layer else PaidRoutes()
+    providers = (own.providers if cfg.paid.providers is None else cfg.paid.providers if own.providers is None
+                 else tuple(p for p in cfg.paid.providers if p in own.providers))
+    return PaidRoutes(providers, tighter(cfg.paid.max_input, own.max_input),
+                      tighter(cfg.paid.max_output, own.max_output))
+
+
 def routing_table(data) -> Routing:
     table = table_of(data, "routing")
-    if bad := sorted(set(table) - {"fallback", "payment_modes", "capabilities", "floors"}):
-        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; use fallback, payment_modes, capabilities, floors")
+    if bad := sorted(set(table) - {"fallback", "payment_modes", "capabilities", "floors", "paid"}):
+        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; "
+                         "use fallback, payment_modes, capabilities, floors, paid")
     value = table.get("fallback", True)
     if type(value) is not bool:
         raise ValueError(f"[routing] fallback must be true or false, not {value!r}")
@@ -514,7 +557,7 @@ def routing_table(data) -> Routing:
             raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
                              f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
         modes = tuple(modes)
-    return Routing(value, capabilities, floors, modes)
+    return Routing(value, capabilities, floors, modes, paid_table(table.get("paid", {})))
 
 
 def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[str, ...]:
@@ -871,6 +914,7 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
     found = routing_table(data.get("routing", {}))
     cfg.routing_fallback, cfg.capabilities, cfg.floors = found.fallback, found.capabilities, found.floors
     cfg.payment_modes = found.payment_modes or PAYMENT_MODES
+    cfg.paid = found.paid
     j = data.get("jira", {})
     cfg.jira = JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
@@ -1054,6 +1098,7 @@ class RepoLayer:
     capabilities: dict[str, dict] = field(default_factory=dict)
     floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
     payment_modes: tuple[str, ...] | None = None
+    paid: PaidRoutes = PaidRoutes()
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
@@ -1128,6 +1173,7 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
     found = routing_table(section(data, "routing"))
     layer.routing_fallback, layer.capabilities, layer.floors = found.fallback, found.capabilities, found.floors
     layer.payment_modes = found.payment_modes
+    layer.paid = found.paid
     layer.steps = step_tables(section(data, "steps"), "steps", ignored)
     layer.kinds = kind_tables(section(data, "kinds"), "kinds", ignored)
     layer.ab = ab_tables(section(data, "ab"))

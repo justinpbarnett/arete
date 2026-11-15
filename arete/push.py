@@ -44,7 +44,7 @@ class Push(Emit):
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         src = Path(outcome["workdir"])
         start, branch = outcome["start"], outcome["branch"]
-        diff = diffguard.between(src, start, branch)
+        diff = diffguard.between(src, start, branch, moves=True)
         deleted = util.git_records(["diff", "--name-only", "--no-renames", "--diff-filter=D", start, branch], src)
         public = outcome.get("public", True)
         return {"repo": loop.repo, "workdir": str(src), "branch": branch, "base": outcome["base"],
