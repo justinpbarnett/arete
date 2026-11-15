@@ -24,7 +24,7 @@ from . import (
     state,
     tracker,
     util,
-    verifiers,
+    verifier_suites,
 )
 from .pipeline import AgentRun, Checkout, TicketWork, use_product
 
@@ -39,7 +39,7 @@ class Blocked(ValueError):
 
 
 def loop_dir() -> Path:
-    return Path(os.environ.get("ARETE_LOOP_DIR") or loops.ENGINE_DIR / "merge-check")
+    return Path(os.environ.get("ARETE_LOOP_DIR") or loops.BUNDLED_LOOPS_DIR / "merge-check")
 
 
 def builtin(loop: loops.Loop) -> bool:
@@ -382,7 +382,7 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> list[int]:
             return failed
         finally:
             if made:
-                if (folder / "verify-retained.json").exists() or verifiers.held(folder, p.worktree, "verify"):
+                if (folder / "verify-retained.json").exists() or verifier_suites.held(folder, p.worktree, "verify"):
                     print(f"merge-check: retained {p.worktree}; scratch ownership is unresolved", file=sys.stderr)
                     raise Blocked("verification scratch ownership is unresolved; workspace retained")
                 else:

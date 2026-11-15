@@ -20,7 +20,7 @@ from unittest import mock
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CHECKOUT))
-from arete import backup, cli, control, dashboard, engine, migrations, paths, record, serve, state, util
+from arete import backup, cli, control, dashboard, loop_run, migrations, paths, record, serve, state, util
 
 TRACE = []
 
@@ -450,11 +450,11 @@ def test_runs_name_their_schema():
     with mock.patch.object(state, "LATEST", 1):
         rid = record.start("loop", pid=None, loop="fixture")
     run = SimpleNamespace(events_file=paths.STATE_DIR / "missing.json")
-    with mock.patch.object(state, "LATEST", 2), mock.patch.object(engine, "LoopRun", return_value=run), \
-            mock.patch.object(engine.loops, "find"), mock.patch.object(engine, "carry", return_value="done"):
-        engine.carry_opened(rid)
+    with mock.patch.object(state, "LATEST", 2), mock.patch.object(loop_run, "LoopRun", return_value=run), \
+            mock.patch.object(loop_run.loops, "find"), mock.patch.object(loop_run, "carry", return_value="done"):
+        loop_run.carry_opened(rid)
     row = state.run_get(rid)
-    assert row["schema_version"] == 2 and row["engine_sha"] == engine.codebase.STAMP, row
+    assert row["schema_version"] == 2 and row["engine_sha"] == loop_run.codebase.STAMP, row
     record.move(rid, "done", ("running",), finished=util.iso())
     (paths.STATE_DIR.parent / "authority-parent").mkdir()
     from tests import offline_workflow

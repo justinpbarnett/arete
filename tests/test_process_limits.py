@@ -25,7 +25,7 @@ from arete import (
     factory,
     flows,
     gh,
-    lines,
+    run_lines,
     paths,
     pi,
     pipeline,
@@ -327,7 +327,7 @@ class BudgetTests(Isolated):
 
     def test_repair_usage_is_durable_even_when_audit_event_cannot_be_written(self):
         first = self.made_run()
-        with patch.object(lines, "write", return_value={}):
+        with patch.object(run_lines, "write", return_value={}):
             first.budget.charge("review_fix1", "review_repair")
             first.budget.charge("verify_fix1", "build")
         record.settle(first.id, "failed")
@@ -341,7 +341,7 @@ class BudgetTests(Isolated):
             "EVENTS_FILE", "WORKTREES_DIR")}
         before = util.iso(util.now() - timedelta(minutes=21))
         code = (f"import os,sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete import config,paths,pipeline,record,runlimits,tracker,util,lines;"
+                "from pathlib import Path;from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines;"
                 f"overrides={overrides!r};"
                 "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
                 f"util.now=lambda:util.parse_iso({before!r});"
@@ -350,7 +350,7 @@ class BudgetTests(Isolated):
                 "folder=paths.RUNS_DIR/rid;folder.mkdir();local=tracker.LocalTracker(repo);"
                 "run=pipeline.Run(rid,repo,folder,tracker=local,tid=tid);"
                 "budget=runlimits.Budget(run,runlimits.Policy(),'',local.get(tid));"
-                "lines.write=lambda *a,**k:{};"
+                "run_lines.write=lambda *a,**k:{};"
                 "\nfrom types import SimpleNamespace\n"
                 "clock=[0.0];runlimits.time=SimpleNamespace(monotonic=lambda:clock[0]);"
                 "budget.started=0.0;budget.deadline=3600;"
@@ -370,9 +370,9 @@ class BudgetTests(Isolated):
 
     def test_legacy_nested_announcements_count_one_cycle(self):
         rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
-        lines.write(rid, "step_start", step="implement", atom="review_repair", **{"try": 2})
-        lines.write(rid, "step_start", step="implement", call="review_fix1", atom="review_repair", **{"try": 2})
-        lines.write(rid, "step_start", step="verify", call="verify2", **{"try": 2})
+        run_lines.write(rid, "step_start", step="implement", atom="review_repair", **{"try": 2})
+        run_lines.write(rid, "step_start", step="implement", call="review_fix1", atom="review_repair", **{"try": 2})
+        run_lines.write(rid, "step_start", step="verify", call="verify2", **{"try": 2})
         self.assertEqual(runlimits.repair_count(rid), 1)
 
     def test_cumulative_time_survives_continuation(self):
@@ -418,9 +418,9 @@ class BudgetTests(Isolated):
         record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
         for cause, since, until in waits:
             if until is None:
-                lines.wait_start(first.id, cause, util.iso(util.now() - timedelta(minutes=since)))
+                run_lines.wait_start(first.id, cause, util.iso(util.now() - timedelta(minutes=since)))
             else:
-                lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
+                run_lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
                              util.iso(util.now() - timedelta(minutes=until)))
         record.settle(first.id, "interrupted")
         return first, self.made_run(first.id)
@@ -461,7 +461,7 @@ class BudgetTests(Isolated):
         before = util.now() - timedelta(minutes=21)
         with patch.object(util, "now", return_value=before):
             first = self.made_run()
-            lines.write(first.id, "budget_verify_start")
+            run_lines.write(first.id, "budget_verify_start")
             saved = runlimits.metadata(first.id, "budget.json")
             saved.pop("verification_open_seconds")
             util.write_json(first.dir / "budget.json", saved)
@@ -545,10 +545,10 @@ class BudgetTests(Isolated):
         rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
         if recorded:
             ticket = self.local.get(self.ticket)
-            lines.write(rid, "step_end", step="prepare", result="pass",
+            run_lines.write(rid, "step_end", step="prepare", result="pass",
                         data={"ticket": {"title": ticket.title, "body": ticket.body}})
         for n in (1, 2, 3):
-            lines.write(rid, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
+            run_lines.write(rid, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
         record.settle(rid, status)
         return rid
 
@@ -695,7 +695,7 @@ class QueueTests(Isolated):
         source = self.made_run()
         record.settle(source.id, "pr")
         current = self.made_run(source.id)
-        lines.write(current.id, "repair", source=source.id)
+        run_lines.write(current.id, "repair", source=source.id)
         record.settle(current.id, "interrupted")
         return current
 
@@ -1020,9 +1020,9 @@ class KeptEditsTests(Isolated):
             util.git(["init", "-q", "-b", "main"], container / part)
         earlier = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
         listed = [{"wt": str(container / part)} for part in ("a", "b")]
-        lines.write(earlier, "step_end", step="prepare", result="pass", tree=str(container), fingerprint="",
+        run_lines.write(earlier, "step_end", step="prepare", result="pass", tree=str(container), fingerprint="",
                     data={"checkouts": listed})
-        lines.write(earlier, "step_end", step="plan", result="pass", data={"plan": "p"})
+        run_lines.write(earlier, "step_end", step="plan", result="pass", data={"plan": "p"})
         made = []
         fakes = {"prepare": lambda flow, tree: factory.Outcome("pass"),
                  "plan": lambda flow: made.append("plan") or factory.Outcome("pass")}
@@ -1032,7 +1032,7 @@ class KeptEditsTests(Isolated):
             carried = flow.step("plan")
         self.assertTrue(carried.passed)
         self.assertEqual(made, [])
-        self.assertTrue(any(line.get("carried") == earlier for line in lines.read("later")))
+        self.assertTrue(any(line.get("carried") == earlier for line in run_lines.read("later")))
 
     def test_conflicting_move_with_a_failed_resolver_leaves_the_kept_commit(self):
         _, first = self.parked_edit("shared.txt", "mine\n")

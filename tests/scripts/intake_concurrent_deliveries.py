@@ -1,7 +1,7 @@
 
 loop = make_loop(webhook=True)
 state.migrate()
-hooks.secret("intake")
+webhooks.secret("intake")
 server = web()
 body = b'{"title": "race"}'
 codes = []

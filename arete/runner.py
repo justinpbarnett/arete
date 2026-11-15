@@ -14,8 +14,6 @@ from pathlib import Path
 
 from . import (
     accounts,
-    ask,
-    asks,
     claude,
     codex,
     config,
@@ -23,6 +21,8 @@ from . import (
     environment,
     guard,
     jev,
+    jev_ask,
+    owner_asks,
     paths,
     pi,
     prices,
@@ -855,12 +855,12 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
                 kw["mcp_config"] = config_json
         kw["verification_attempt"] = trip.scratch
     if asking and hook:
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.WITHHELD]))
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), owner_asks.WITHHELD]))
     elif asking:
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), asks.NOTE]))
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), owner_asks.NOTE]))
         if which in ("claude", "codex"):
-            kw["mcp_config"] = asks.with_server(kw.get("mcp_config") or "")
-            kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), asks.RULE]
+            kw["mcp_config"] = owner_asks.with_server(kw.get("mcp_config") or "")
+            kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), owner_asks.RULE]
         elif which == "pi":
             kw["ask_owner"] = True
     if trip.tokens is not None:
@@ -1108,8 +1108,8 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
         if runs_bash(kw) and (note := judge_note(cfg, kw["passing"], repo)):
             say(note)
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
-        kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), ask.rule()]
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), ask.note()]))
+        kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), jev_ask.rule()]
+        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), jev_ask.note()]))
     if uploads.granted(kw.get("allowed_tools")):
         kw["settings"] = uploads.with_hook(kw.get("settings"))
     return kw

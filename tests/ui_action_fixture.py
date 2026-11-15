@@ -71,17 +71,17 @@ def add_usage(run_id, step, tokens_in, tokens_out, cost):
 
 
 def step_events(run_id, steps, report=None):
-    from arete import lines
+    from arete import run_lines
 
     for name, attempt, result, error in steps:
-        lines.write(run_id, "step_start", step=name, model="sonnet", runner="claude", **{"try": attempt})
+        run_lines.write(run_id, "step_start", step=name, model="sonnet", runner="claude", **{"try": attempt})
         if result:
-            lines.write(run_id, "step_end", step=name, model="sonnet", runner="claude", result=result, ok=result == "pass", cost_usd=0.12,
+            run_lines.write(run_id, "step_end", step=name, model="sonnet", runner="claude", result=result, ok=result == "pass", cost_usd=0.12,
                         tokens_in=1200, tokens_out=300, turns=3, seconds=12.5, error=error, **{"try": attempt})
         if error and result == "fail":
-            lines.write(run_id, "error", step=name, message=error)
+            run_lines.write(run_id, "error", step=name, message=error)
     if report:
-        lines.write(run_id, "report", status=report)
+        run_lines.write(run_id, "report", status=report)
 
 
 def seed_runs(instance):

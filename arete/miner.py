@@ -15,13 +15,13 @@ from . import (
     diffguard,
     evals,
     gh,
-    hook,
     jev,
     paths,
     record,
     runlimits,
     runner,
     state,
+    tool_events,
     util,
 )
 from .heartbeat import mark_loop
@@ -376,7 +376,7 @@ def render_digest(cfg: config.Config, sessions: list[dict], limit: int) -> tuple
 
 
 def render_events(cfg: config.Config, since: datetime, until: datetime) -> str:
-    evs = [e for e in hook.read_events(since_ts=since.timestamp(), until_ts=until.timestamp()) if not e.get("agent")]
+    evs = [e for e in tool_events.read_events(since_ts=since.timestamp(), until_ts=until.timestamp()) if not e.get("agent")]
     if not evs:
         return "## Tool failure stats\n\n(no hook events recorded in this window)"
     by = Counter()

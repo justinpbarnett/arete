@@ -23,11 +23,10 @@ from . import (
     dashboard,
     delivery,
     devices,
-    engine,
     environment,
     explain,
     hold_review,
-    hook,
+    loop_run,
     loops,
     oncall,
     paths,
@@ -37,6 +36,7 @@ from . import (
     sources,
     state,
     tasks,
+    tool_events,
     util,
     webpush,
 )
@@ -58,7 +58,7 @@ def mergecheck_reset(loop: Loop, item: dict) -> str:
     return max((mergecheck.held_until(loop.dir, name) for name in names), default="")
 
 
-IMPORT_CHECK = "from arete import codebase; codebase.load()"
+IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.loop_run; from arete import codebase; codebase.load()"
 CONFIG_CHECK = "from arete import config; config.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 SERVE_LOCK = "serve"
@@ -423,7 +423,7 @@ class Server:
                          "left are pinned, cited by a kept proposal, running or written in the last hour; "
                          "bytes outside record/ stay until folder expiry")
         try:
-            hook.rotate_events(limits.lines_days)
+            tool_events.rotate_events(limits.lines_days)
         except Exception as e:
             self.say(f"event rotation failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
@@ -570,7 +570,7 @@ class Server:
     def dispatch_item(self, item: dict, loop: Loop, slots: QueueSlots) -> str | None:
         if why := slots.why_full(item, loop, self.cfg):
             return why
-        if spent := engine.spent_limit(loop, self.cfg):
+        if spent := loop_run.spent_limit(loop, self.cfg):
             return f"its {spent} is spent"
         if held := loop.usage_hold(self.cfg):
             return held
@@ -578,11 +578,11 @@ class Server:
                 and (reset := mergecheck_reset(loop, item))):
             return f"merge-check quota hold until {reset}"
         try:
-            run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)
+            run = loop_run.launch(loop.name, item=item["id"], cfg=self.cfg)
         except control.Busy as e:
             slots.busy.add(loop.name)
             return str(e)
-        except engine.NeverBegan as e:
+        except loop_run.NeverBegan as e:
             self.retry_once(item, str(e))
             return None
         except (control.NotFound, control.Refused):

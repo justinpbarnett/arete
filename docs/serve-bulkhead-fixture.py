@@ -41,14 +41,14 @@ def scenario(name):
 class Rig:
     def __init__(self, oncall=False, real_launch=False, build=True):
         from unittest import mock
-        from arete import config, engine, explain, loops, paths, runner, state, tasks, util, webpush, alerts
+        from arete import config, loop_run, explain, loops, paths, runner, state, tasks, util, webpush, alerts
         self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
         state.ensure_schema()
         self.config_text = GOOD + ("\n[oncall]\nenabled = true\n" if oncall else "")
         paths.CONFIG_FILE.write_text(self.config_text)
-        loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.ENGINE_DIR.iterdir() if p.is_dir()}))
+        loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
         self.log = paths.LOG_DIR / "serve.log"
         sys.stdout = self.log.open("w", buffering=1)
         self.beats, self.launched, self.claims, self.alert_calls, self.asks, self.faults, self.errors = [], [], [], [], [], [], []
@@ -61,10 +61,10 @@ class Rig:
             mock.patch.object(tasks, "expire_asks", self.spy_asks),
             mock.patch.object(alerts, "raise_alert", self.fake_raise), mock.patch.object(alerts, "clear_alert", self.fake_clear)]
         if not real_launch:
-            self.patches.append(mock.patch.object(engine, "launch", self.fake_launch))
+            self.patches.append(mock.patch.object(loop_run, "launch", self.fake_launch))
         for p in self.patches:
             p.start()
-        self.engine = engine
+        self.loop_run = loop_run
         self.pending_faults = []
         for name in ("aaa", "bbb"):
             self.make_loop(name)
@@ -99,7 +99,7 @@ class Rig:
             self.pending_faults.remove(fault)
             raise fault
         if not self.state.take_queue_item(item, f"r-{item}"):
-            raise self.engine.control.NotFound("taken")
+            raise self.loop_run.control.NotFound("taken")
         self.launched.append(name)
         self.claims.append({"item": item, "loop": name, "run": f"r-{item}"})
         return {"id": f"r-{item}"}
@@ -312,7 +312,7 @@ def waits(passes):
     r.step(due=False)
     out["group"] = {"launches": r.launched.count("aaa"), "wait_lines": [x for x in r.log_lines() if f"queue item {two} waits, group g takes one at a time" in x]}
     clear()
-    for fault in (r.engine.NeverBegan("did not begin"), control.Refused("not now")):
+    for fault in (r.loop_run.NeverBegan("did not begin"), control.Refused("not now")):
         one, two = queued("g", "g")
         r.pending_faults.append(fault)
         r.step(due=False)
@@ -341,7 +341,7 @@ def waits(passes):
 
     def never(self, cfg, connect=None):
         raise AssertionError("usage_hold asked after a spent limit")
-    with r.mock.patch.object(r.engine, "spent_limit", lambda loop, cfg: "daily budget"), r.mock.patch.object(loops.Loop, "usage_hold", never):
+    with r.mock.patch.object(r.loop_run, "spent_limit", lambda loop, cfg: "daily budget"), r.mock.patch.object(loops.Loop, "usage_hold", never):
         beat = r.step(due=False)
     out["spent_before_usage_hold"] = {"lines": [x for x in r.log_lines() if f"queue item {item} waits, its daily budget is spent" in x], "failing": list(beat["failing"])}
     clear()

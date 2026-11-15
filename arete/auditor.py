@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
-from . import alerts, config, doctor, hook, paths, state, tracker, util
+from . import alerts, config, doctor, paths, state, tool_events, tracker, util
 from .heartbeat import mark_loop
 
 AUDIT_DIR = paths.STATE_DIR / "audit"
@@ -215,7 +215,7 @@ def check_repos(cfg: config.Config) -> list[Finding]:
 
 def check_events(cfg: config.Config, skill_names: list[str]) -> list[Finding]:
     out = []
-    week = [e for e in hook.read_events(24 * 7) if not e.get("agent")]
+    week = [e for e in tool_events.read_events(24 * 7) if not e.get("agent")]
     fails = Counter(e.get("detail") for e in week if e.get("kind") == "skill" and e.get("cls") == "failure")
     for name, n in fails.most_common():
         out.append(Finding("failures", "warn", f"skill {name}", f"failed {n} times this week"))
@@ -228,7 +228,7 @@ def check_events(cfg: config.Config, skill_names: list[str]) -> list[Finding]:
     for (repo, tool, cls, detail), n in rep.most_common(10):
         if n >= 3:
             out.append(Finding("failures", "warn", f"{repo} {tool}", f"{cls} {n} times this week: {detail}"))
-    month = hook.read_events(24 * 30)
+    month = tool_events.read_events(24 * 30)
     if month:
         span = (util.now() - util.parse_iso(month[0]["ts"])).days
         if span >= 21:
