@@ -1,4 +1,6 @@
 import base64
+import fcntl
+import hmac
 import importlib.util
 import io
 import json
@@ -354,6 +356,22 @@ if importlib.util.find_spec("arete.scratch"):
     probe = [sys.executable, "-V"]
     if scratch.protected_command(probe) != probe:
         scratch.AUTHORITY = root / "authority-parent/verification-authority"
+foreign = foreign_bytes = None
+if scenario == "foreign-version-record" and scratch.AUTHORITY.parent == root / "authority-parent":
+    import hmac
+    scratch.AUTHORITY = root.resolve() / "authority-parent/verification-authority"
+    scratch.AUTHORITY.mkdir(mode=0o700)
+    key = os.urandom(32)
+    secret = os.open(scratch.AUTHORITY / "signing.secret", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(secret, key)
+    os.close(secret)
+    selector = "ab" * 32
+    elsewhere = str(root / "elsewhere")
+    data = {"version": 3, "attempt": {"selector": selector, "workspace": elsewhere, "root": elsewhere + "/.arete-scratch-x"},
+            "state": "prepared"}
+    foreign_bytes = scratch.encoded({"data": data, "signature": hmac.digest(key, scratch.encoded(data), "sha256").hex()})
+    foreign = scratch.AUTHORITY / (selector + ".json")
+    foreign.write_bytes(foreign_bytes)
 lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
     "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
@@ -1121,6 +1139,8 @@ if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git")
+if scenario == "foreign-version-record":
+    result["foreign_unchanged"] = None if foreign is None else foreign.read_bytes() == foreign_bytes
 print("BEHAVIOR_RESULT=" + json.dumps(result))
 '''
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
@@ -1402,6 +1422,13 @@ print("BEHAVIOR_RESULT=" + json.dumps({"scenario": scenario, "runs": snaps,
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
+
+    def test_record_of_another_version_does_not_stop_a_replay(self):
+        result = self.workflow("foreign-version-record")
+        if result["foreign_unchanged"] is None:
+            self.skipTest("the authority store is not redirected on this host")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertTrue(result["foreign_unchanged"])
 
     def test_run_that_asks_parks_with_its_folder_and_resumes_its_session(self):
         result = self.workflow("asked")
@@ -2523,7 +2550,7 @@ c = pipeline.Checkout("", "o/r", src, ws, "main")
     def test_replay_of_the_incident_clears_after_note_made(self):
         self.run_body(r'''
 done = [{"state": "done", "attempt": {"workspace": str(ws), "root": str(ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8)))}} for i in range(5)]
-scratch.records = lambda strict=False: done
+scratch.survey = lambda: scratch.View(done, [], False)
 made = []
 for i in range(25):
     root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
@@ -2555,7 +2582,7 @@ look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 for d in (root, look):
     d.mkdir(mode=0o700)
     (d / "fixture.txt").write_text("fake")
-scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(spelled), "root": str(spelled / root.name)}, "diagnostic": {"replacement_retained": str(spelled / root.name)}}]
+scratch.survey = lambda: scratch.View([{"state": "done", "attempt": {"workspace": str(spelled), "root": str(spelled / root.name)}, "diagnostic": {"replacement_retained": str(spelled / root.name)}}], [], False)
 assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
 assert pipeline.scratch_left(spelled, [pipeline.Checkout("", "o/r", src, spelled, "main")]) == [spelled / root.name]
 assert pipeline.scratch_left(link, [lc]) == [link]
@@ -2578,11 +2605,9 @@ print("ok")
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look.mkdir(mode=0o700)
 (look / "fixture.txt").write_text("fake")
-def unreadable(strict=False):
-    if strict:
-        raise OSError("authority store unreadable")
-    return []
-scratch.records = unreadable
+def unreadable():
+    raise OSError("authority store unreadable")
+scratch.survey = unreadable
 assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
 pipeline.note_made(ws, [c])
 made = json.loads(pipeline.made_record(ws).read_text())
@@ -2598,7 +2623,7 @@ print("ok")
 
     def test_look_alike_changed_after_note_made_is_named_and_kept(self):
         self.run_body(r'''
-scratch.records = lambda strict=False: []
+scratch.survey = lambda: scratch.View([], [], False)
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look.mkdir(mode=0o700)
 (look / ".gitignore").write_text("*\n")
@@ -2619,19 +2644,19 @@ print("ok")
 root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 root.mkdir(mode=0o700)
 reads = []
-def late(strict=False):
-    reads.append(strict)
-    return [] if len(reads) == 1 else [{"state": "done", "attempt": {"workspace": str(ws), "root": str(root)}}]
-scratch.records = late
+def late():
+    reads.append(True)
+    return scratch.View([] if len(reads) == 1 else [{"state": "done", "attempt": {"workspace": str(ws), "root": str(root)}}], [], False)
+scratch.survey = late
 assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
 print("ok")
 ''')
 
     def test_unreadable_folder_inside_a_look_alike_keeps_the_workspace(self):
         self.run_body(r'''
-scratch.records = lambda strict=False: []
+scratch.survey = lambda: scratch.View([], [], False)
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
-locked = look / "locked"
+locked =look / "locked"
 locked.mkdir(parents=True)
 locked.chmod(0)
 try:
@@ -2647,6 +2672,49 @@ assert locked.is_dir()
 print("ok")
 ''')
 
+    def test_truncated_record_is_named(self):
+        if not (sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0):
+            self.skipTest("needs macOS confinement")
+        self.run_body(r'''
+import contextlib, io
+from arete import heartbeat
+scratch.holders = lambda *a, **k: []
+run_dir = t / "runs" / "run-a"
+run_dir.mkdir(parents=True)
+scratch.RUN_BASELINES["run-a"] = {}
+a = scratch.make("run-a", "verify", ws, run_dir)
+scratch.end(a, run_dir)
+record = scratch.AUTHORITY / (a.selector + ".json")
+raw = record.read_bytes()
+record.write_bytes(raw[: len(raw) // 2])
+other = t / "worktrees" / "other"
+other.mkdir()
+try:
+    pipeline.kept_or_cleared(other, [pipeline.Checkout("", "o/r", src, other, "main")], src, [], "branch")
+    raise SystemExit("kept a workspace beside an unreadable record")
+except pipeline.RunFailed as e:
+    assert str(record) in e.why, e.why
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    pipeline.retry_scratch(30)
+assert str(record) in out.getvalue(), out.getvalue()
+checks = heartbeat.check_scratch()
+assert any(not c.ok and str(record) in c.detail for c in checks), checks
+print("ok")
+''')
+
+    def test_no_store_frees_look_alikes(self):
+        self.run_body(r'''
+from arete import pi
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look.mkdir(mode=0o700)
+pi.can_confine = lambda *a, **k: False
+assert pipeline.scratch_left(ws, [c]) == [], pipeline.scratch_left(ws, [c])
+pi.can_confine = lambda *a, **k: True
+assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
+print("ok")
+''')
+
     def test_cleanup_removes_only_stale_folders_with_no_file_and_no_recorded_root(self):
         self.run_body(r'''
 empty, recorded, full = (paths.WORKTREES_DIR / n for n in ("empty", "recorded", "full"))
@@ -2654,7 +2722,7 @@ look, root, kept = (d / (paths.SCRATCH_PREFIX + secrets.token_hex(8)) for d in (
 for d in (look, root, kept):
     d.mkdir(parents=True)
 (kept / "fixture.txt").write_text("fake")
-scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(recorded), "root": str(root)}}]
+scratch.survey = lambda: scratch.View([{"state": "done", "attempt": {"workspace": str(recorded), "root": str(root)}}], [], False)
 old = time.time() - 8 * 86400
 for d in (empty, recorded, full):
     os.utime(d, (old, old))
@@ -4777,6 +4845,173 @@ class WriterRegressionTests(unittest.TestCase):
                 self.assertEqual(len(sent), 1)
                 self.assertNotIn(candidate, sent[0])
                 self.assertIn("Enabled offline checks.", sent[0])
+
+
+@unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
+                     "needs macOS confinement")
+class AuthorityScopeTests(unittest.TestCase):
+    def setUp(self):
+        from arete import scratch
+        self.scratch = scratch
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        if scratch.filesystem(os.open(self.root, os.O_RDONLY)) != "apfs":
+            self.skipTest("needs APFS")
+        (self.root / "home").mkdir()
+        for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
+                      mock.patch.object(scratch, "holders", return_value=[])):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.ws, self.other = self.root / "worktrees/a", self.root / "worktrees/b"
+        self.ws.mkdir(parents=True)
+        self.other.mkdir()
+        self.made = []
+        self.addCleanup(self.release)
+
+    def release(self):
+        for a in self.made:
+            fd = self.scratch.LEASES.pop(a.selector, None)
+            if fd is not None:
+                os.close(fd)
+            self.scratch.RUN_BASELINES.pop(a.run_id, None)
+
+    def attempt(self, ws=None):
+        run_id = f"run-{len(self.made)}"
+        run_dir = self.root / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        self.scratch.RUN_BASELINES[run_id] = {}
+        a = self.scratch.make(run_id, "verify", ws or self.ws, run_dir)
+        self.made.append(a)
+        return a
+
+    def finish(self, a):
+        self.scratch.end(a, Path(a.run_dir))
+
+    def file(self, a):
+        return self.scratch.AUTHORITY / (a.selector + ".json")
+
+    def sign(self, a, key, change=lambda data: None):
+        envelope = json.loads(self.file(a).read_bytes())
+        change(envelope["data"])
+        envelope["signature"] = hmac.digest(key, self.scratch.encoded(envelope["data"]), "sha256").hex()
+        self.file(a).write_bytes(self.scratch.encoded(envelope))
+
+    def key(self, name="signing.secret"):
+        return (self.scratch.AUTHORITY / name).read_bytes()
+
+    def test_other_version_holds_only_its_workspace(self):
+        a = self.attempt()
+        self.sign(a, self.key(), lambda data: data.update(version=3))
+        self.assertTrue(self.scratch.pending(self.ws))
+        self.assertFalse(self.scratch.pending(self.other))
+        self.attempt(self.other)
+        (unreadable,) = self.scratch.survey().unreadable
+        self.assertEqual((unreadable.path, unreadable.authenticated), (str(self.file(a)), True))
+        with self.assertRaises(OSError) as raised:
+            self.attempt()
+        self.assertIn(str(self.file(a)), str(raised.exception))
+
+    def test_record_without_a_usable_signature_still_holds_only_its_workspace(self):
+        a = self.attempt()
+        for signature in (None, 7):
+            envelope = json.loads(self.file(a).read_bytes())
+            envelope.pop("signature", None)
+            if signature is not None:
+                envelope["signature"] = signature
+            self.file(a).write_bytes(self.scratch.encoded(envelope))
+            self.assertTrue(self.scratch.pending(self.ws))
+            self.assertFalse(self.scratch.pending(self.other))
+
+    def test_record_with_an_invalid_selector_name_holds_even_when_it_claims_done(self):
+        envelope = {"data": {"version": 2, "state": "done", "source_mutations": False,
+                             "attempt": {"selector": "x", "workspace": str(self.ws), "root": str(self.ws / ".gone")}},
+                    "signature": "0"}
+        self.finish(self.attempt(self.other))
+        (self.scratch.AUTHORITY / "x.json").write_bytes(self.scratch.encoded(envelope))
+        self.assertTrue(self.scratch.pending(self.ws))
+        self.assertFalse(self.scratch.pending(self.other))
+
+    def test_lost_signing_secret_scopes_holds(self):
+        self.finish(self.attempt())
+        self.attempt()
+        (self.scratch.AUTHORITY / "signing.secret").unlink()
+        with self.assertRaises(PermissionError) as raised:
+            self.attempt(self.other)
+        self.assertIn(str(self.scratch.AUTHORITY), str(raised.exception))
+        self.assertIn("2 records", str(raised.exception))
+        self.assertFalse((self.scratch.AUTHORITY / "signing.secret").exists())
+        self.assertFalse(self.scratch.pending(self.other))
+        self.assertTrue(self.scratch.pending(self.ws))
+
+    def test_interrupted_rotation_is_named(self):
+        self.finish(self.attempt())
+        b = self.attempt(self.other)
+        following = secrets.token_bytes(32)
+        (self.scratch.AUTHORITY / "signing.secret.next").write_bytes(following)
+        (self.scratch.AUTHORITY / "signing.secret.next").chmod(0o600)
+        self.sign(b, following)
+        self.assertFalse(self.scratch.pending(self.ws))
+        self.assertTrue(self.scratch.pending(self.other))
+        (unreadable,) = self.scratch.survey().unreadable
+        self.assertIn("arete rotate-authority", unreadable.reason)
+        self.assertIn("again", unreadable.reason)
+
+    def test_store_on_host_that_cannot_confine(self):
+        a = self.attempt()
+        with mock.patch.object(pi, "can_confine", return_value=False):
+            self.assertFalse(self.scratch.pending(self.other))
+            self.assertTrue(self.scratch.pending(self.ws))
+            self.assertIn(Path(a.root).name, self.scratch.root_names())
+
+    def test_oversized_record_is_refused(self):
+        a = self.attempt()
+        before = self.file(a).read_bytes()
+        with self.scratch.registry() as (fd, key):
+            data = self.scratch.load(fd, key, a.selector)
+            data["diagnostic"] = "x" * (self.scratch.MAX_RECORD_BYTES + 1)
+            with self.assertRaises(ValueError):
+                self.scratch.store(fd, key, data)
+            self.assertEqual(self.scratch.load(fd, key, a.selector)["state"], "prepared")
+        self.assertEqual(self.file(a).read_bytes(), before)
+
+    def test_settle_moves_then_prunes(self):
+        done = []
+        for _ in range(3):
+            done.append(self.attempt())
+            self.finish(done[-1])
+        locked = self.attempt()
+        self.finish(locked)
+        kept = self.attempt()
+        old = time.time() - 7200
+        for a in (*done, locked, kept):
+            os.utime(self.file(a), (old, old))
+        holder = os.open(self.scratch.AUTHORITY / (locked.selector + ".lease"), os.O_RDWR)
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.scratch.settle(30), [])
+        finally:
+            os.close(holder)
+        settled = self.scratch.AUTHORITY / "settled"
+        self.assertEqual(sorted(p.name for p in settled.iterdir()), sorted(a.selector + ".json" for a in done))
+        self.assertTrue(self.file(locked).exists() and self.file(kept).exists())
+        self.assertEqual({r["attempt"]["selector"] for r in self.scratch.records()}, {locked.selector, kept.selector})
+        self.assertTrue(self.scratch.pending(self.ws))
+        expired = done[0]
+        sentinel = self.root / "sentinel"
+        sentinel.mkdir()
+        (sentinel / "keep.txt").write_text("keep")
+        evidence = self.scratch.AUTHORITY / expired.selector
+        self.assertTrue(any(p.stat().st_mode & 0o777 == 0o500 for p in evidence.rglob("*") if p.is_dir()))
+        os.symlink(sentinel, evidence / "link")
+        long_ago = time.time() - 31 * 86400
+        os.utime(settled / (expired.selector + ".json"), (long_ago, long_ago))
+        self.assertEqual(self.scratch.settle(30), [])
+        self.assertFalse((settled / (expired.selector + ".json")).exists())
+        self.assertFalse(evidence.exists() or (self.scratch.AUTHORITY / (expired.selector + ".lease")).exists())
+        self.assertEqual((sentinel / "keep.txt").read_text(), "keep")
+        self.assertTrue((settled / (done[1].selector + ".json")).exists())
+        self.assertTrue((self.scratch.AUTHORITY / done[1].selector).exists())
 
 
 @unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
