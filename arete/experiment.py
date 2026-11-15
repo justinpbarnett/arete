@@ -16,9 +16,10 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import TextIO
 
-from . import config, evals, paths, pipeline, record, replay, runner, state, steps, util
+from . import config, evals, paths, pipeline, prices, record, replay, runner, state, steps, util
 from . import lines as run_lines
 from .diffguard import denied_paths
+from .util import engine_commit
 
 ATOMS = ("plan", "build", "check_repair")
 FIXED_GRADERS = ("verify", "eval_grade")
@@ -138,6 +139,13 @@ def sha(*parts: bytes | str) -> str:
 
 def sha_json(value) -> str:
     return sha(json.dumps(value, sort_keys=True))
+
+
+def engine_code(root: Path = paths.PACKAGE_DIR) -> str:
+    files = sorted(p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.relative_to(root).parts
+                   and (p.suffix in (".py", ".mjs")
+                        or (p.suffix == ".md" and p.relative_to(root).parts[0] == "prompts")))
+    return sha(*(part for p in files for part in (p.relative_to(root).as_posix(), p.read_bytes())))
 
 
 def content(src: evals.Source, rel: str) -> bytes:
@@ -395,11 +403,42 @@ def designed(data: dict, carried: Totals | None = None, follow: bool = False) ->
                    "settings": effective(cfg, grader), "verify": sha_json(asdict(layer.verify)) if layer.verify else "",
                    "prompt": sha((paths.PROMPTS_DIR / "grade.md").read_bytes())},
         "fingerprints": shared,
+        "engine": engine_code(),
+        "money": {"prices": (prices.load() or {}).get("version", ""),
+                  "local_providers": sorted(cfg.local_providers)},
         **({HEADROOM: limits[HEADROOM]} if HEADROOM in limits else {}),
     }
     digest = sha_json(design)[:12]
     return Experiment(name, cfg, repo, layer, atom, repeats, cache_policy, given, settings, tasks, splits, accept,
                       limits, frozen, design, digest, extras, carried or Totals(), follow, codex=routes)
+
+
+def observed(exp: Experiment, arm: str) -> dict:
+    invalid = False
+    try:
+        layer = config.load_layer(exp.repo.layer_dir)
+    except (ValueError, TypeError, OSError):
+        layer, invalid = exp.layer, True
+    extra = exp.extras.get(arm, {})
+    base = fingerprints(exp.repo, layer, Path(extra.get("prompts", paths.PROMPTS_DIR)), extra.get("context", ""))
+    found = arm_fingerprints(base, exp.cfg, exp.settings[arm])
+    if invalid:
+        found["context"] = "unreadable layer"
+    return {"fingerprints": found, "grader": sha((paths.PROMPTS_DIR / "grade.md").read_bytes()),
+            "engine": engine_code(), "prices": (prices.load() or {}).get("version", "")}
+
+
+def drift(exp: Experiment, arm: str, seen: dict) -> list[str]:
+    changed = [k for k in ("prompt", "context", "tools")
+               if seen["fingerprints"][k] != exp.design["arms"][arm]["fingerprints"][k]]
+    return changed + [k for k, expected in (("grader", exp.design["grader"]["prompt"]),
+                                           ("engine", exp.design["engine"]),
+                                           ("prices", exp.design["money"]["prices"])) if seen[k] != expected]
+
+
+def drift_reason(changed: list[str]) -> str:
+    return (f"the {', '.join(changed)} changed since the design; "
+            "restore them to continue or pass --out for a new file")
 
 
 def default_path(name: str) -> Path:
@@ -560,14 +599,16 @@ def usage(exp: Experiment, arm: str, run_id: str) -> dict:
 
 
 def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: float, accepted: bool = False,
-               failures: list[str] | None = None, repairs: int = 0, outcomes: dict | None = None) -> dict:
+               failures: list[str] | None = None, repairs: int = 0, outcomes: dict | None = None,
+               seen: dict | None = None) -> dict:
     task, arm = begun["task"], begun["arm"]
+    seen = seen if seen is not None else begun["seen"]
     used = usage(exp, arm, begun["run"])
     used["wait_seconds"] = round(used["wait_seconds"] + slot_seconds(events(path), begun), 2)
     return {"event": "trial", "at": util.iso(), "task": task, "split": exp.splits[task],
             "base": exp.tasks[task].base, "arm": arm, "repeat": begun["repeat"], "attempt": begun["attempt"],
             "run": begun["run"], "status": status, "accepted": accepted, "failures": failures or [],
-            "repairs": repairs, "fingerprints": exp.design["arms"][arm]["fingerprints"],
+            "repairs": repairs, "fingerprints": seen["fingerprints"], "engine": seen["engine"],
             **(outcomes or {}), **used, "wall_seconds": round(wall, 2)}
 
 
@@ -746,7 +787,7 @@ def overrun(limits: dict, used: Totals) -> dict:
     return {"overrun": {"tokens": max(0, tokens), "spend_usd": round(max(0.0, spend), 6)}}
 
 
-def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, used: Totals) -> str:
+def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, used: Totals, seen: dict) -> str:
     found = events(path)
     attempt = 1 + max((e["attempt"] for e in found if e.get("event") == "start" and key_of(e) == (task, arm, repeat)),
                       default=0)
@@ -756,8 +797,12 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
         with record.failed_on_crash(run_id):
             if since:
                 run_lines.waited(run_id, "slot", since, util.iso())
-            begun = {"event": "start", "task": task, "arm": arm, "repeat": repeat, "attempt": attempt,
-                     "run": run_id, "at": util.iso()}
+            seen = observed(exp, arm)
+            if changed := drift(exp, arm, seen):
+                record.settle(run_id, "stopped", summary=drift_reason(changed))
+                return drift_reason(changed)
+            begun ={"event": "start", "task": task, "arm": arm, "repeat": repeat, "attempt": attempt,
+                     "run": run_id, "at": util.iso(), "seen": seen}
             append(path, begun)
             started = time.monotonic()
             given = {"id": run_id, "repo": exp.repo, "dir": paths.RUNS_DIR / run_id, "cfg": exp.cfg, "task": task,
@@ -773,22 +818,27 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                         if "prompts" in extra else evals.Prompts()
                     result = evals.run_task(exp.cfg, exp.repo, evals.Source(exp.repo, extra.get("context", "")),
                                             exp.tasks[task], run_id, False, prompts, run=trial)
+                seen = observed(exp, arm)
             except (KeyboardInterrupt, pipeline.Stopped):
                 record.settle(run_id, "stopped", summary=record.STOPPED)
                 append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started,
                                         outcomes=trial.outcomes()))
                 raise
             failures = result["failures"] or ([result["why"]] if result["why"] else [])
-            stopped_by = trial.stopped_by or reached(exp.limits, trial.used(), launching=False)
+            changed = drift(exp, arm, seen)
+            stopped_by = drift_reason(changed) if changed else trial.stopped_by or reached(
+                exp.limits, trial.used(), launching=False)
             record.settle(run_id, "stopped" if stopped_by else "done",
                           summary=stopped_by if stopped_by else "accepted" if result["passed"]
                           else f"not accepted: {util.first_line(result['why'], 200)}")
-            append(path, trial_line(exp, path, begun, "capped" if stopped_by else "done", time.monotonic() - started,
+            append(path, trial_line(exp, path, begun, "drifted" if changed else "capped" if stopped_by else "done",
+                                    time.monotonic() - started,
                                     result["passed"] and not stopped_by, failures, result["repairs"],
                                     {"checks": result["checks"], "verify": result["verify"],
                                      "hidden_check": result["hidden"], "blocking_findings": result["blocking"],
                                      **trial.outcomes(),
-                                     **(overrun(exp.limits, trial.used()) if stopped_by else {})}))
+                                     **({"drift": changed} if changed else {}),
+                                     **(overrun(exp.limits, trial.used()) if stopped_by else {})}, seen=seen))
             return stopped_by
     finally:
         held.close()
@@ -803,7 +853,10 @@ def work(exp: Experiment, path: Path) -> int:
         try:
             if why := reached(exp.limits, used):
                 raise Capped(why)
-            why = run_trial(exp, path, task, arm, repeat, used)
+            seen = observed(exp, arm)
+            if changed := drift(exp, arm, seen):
+                raise Capped(drift_reason(changed))
+            why = run_trial(exp, path, task, arm, repeat, used, seen)
         except Capped as e:
             why = str(e)
         if why:
@@ -827,8 +880,9 @@ def drive(exp: Experiment, path: Path) -> int:
     found = events(path)
     check_design(exp, path, found)
     if not any(e.get("event") == "manifest" for e in found):
-        append(path, {"event": "manifest", "digest": exp.digest, "design": exp.design})
-    append(path, {"event": "session", "at": util.iso(), "limits": exp.limits, "pid": os.getpid()})
+        append(path, {"event": "manifest", "digest": exp.digest, "design": exp.design, "engine": engine_commit()})
+    append(path, {"event": "session", "at": util.iso(), "limits": exp.limits, "pid": os.getpid(),
+                  "engine": engine_commit()})
     settle_interrupted(exp, path)
     if done := len(completed(events(path))):
         print(f"{done} of {len(schedule(exp))} trials already done in {paths.short_path(path)}", flush=True)
@@ -991,7 +1045,7 @@ def summary(path: Path) -> dict:
     verdicts = {p["candidate"]: judge(p, accept) for p in pairs[accept["split"]]}
     planned = len(design["tasks"]) * design["repeats"] * len(design["arms"])
     return {"name": design["name"], "digest": manifest["digest"], "atom": design["atom"], "accept": accept,
-            "planned": planned, "done": len(done),
+            "planned": planned, "done": len(done), "drifted": sum(t.get("status") == "drifted" for t in trials),
             "arms": {arm: arm_summary(arm, trials, accept["confidence"]) for arm in design["arms"]},
             "pairs": pairs, "verdict": {"split": accept["split"], "candidates": verdicts,
                                         "text": overall(verdicts, baseline)}}
@@ -1045,7 +1099,8 @@ def render(found: dict) -> str:
     accept = found["accept"]
     baseline, confidence = accept["baseline"], accept["confidence"]
     out = [f"experiment {found['name']} (design {found['digest']}), atom {found['atom']}",
-           f"{found['done']} of {found['planned']} trials done"]
+           f"{found['done']} of {found['planned']} trials done",
+           f"{util.count(found['drifted'], 'drifted trial')} left out of rates and pairs"]
     for a in found["arms"].values():
         out += render_arm(a, confidence, baseline)
     for split, pairs in found["pairs"].items():
