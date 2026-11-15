@@ -452,6 +452,7 @@ class Run(AgentRun):
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
+    kept_note: str = ""
 
     @property
     def ref(self) -> str:
@@ -496,13 +497,15 @@ class Run(AgentRun):
         return [a for a in here if a["call"] == call] or here
 
     def fresh_text(self, text: str, due: list[dict]) -> str:
-        return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.base_note) if part)
+        return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.kept_note, self.base_note)
+                           if part)
 
     def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
         fresh = self.fresh_text(text, due)
         if session.id and kw.get("persist", True):
-            parts = (owner_asks.answers_message(due), self.base_note, self.moved_folder_note(due[0]["run"]))
+            parts = (owner_asks.answers_message(due), self.kept_note, self.base_note,
+                     self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
             return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
         return fresh, {**kw, "resume": NO_SESSION}
@@ -2629,6 +2632,17 @@ def merge_base_into_kept(run: AgentRun, checkouts: list[Checkout], layer: config
         if not c.resumes:
             c.onto = c.base_commit
     return merged
+
+
+def kept_edits_note(held: list[Checkout]) -> str:
+    if not held:
+        return ""
+    ranges = ", ".join(f"`{c.onto[:12]}..HEAD` in `{c.prefix or './'}`" for c in held)
+    return (f"When the run stopped to wait for the answer, arete committed the edits made so far, so `git status` "
+            f"lists none of them and `HEAD` is that commit: `git log` and `git diff` over {ranges} show them. "
+            "The owner made no edits in the worktree, since arete refuses edits it did not make there. To put a "
+            "file back as it was before those edits, read it with `git show` at the commit before the range and "
+            "write it yourself.")
 
 
 def base_merge_note(merged: list[Checkout]) -> str:
