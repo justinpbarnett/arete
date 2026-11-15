@@ -250,6 +250,8 @@ def delete_branch(src: Path, branch: str) -> None:
 
 def _drop_branch(src: Path, branch: str) -> None:
     git(["branch", "-D", branch], src, check=False)
+    if git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).strip():
+        return
     for attempt in range(5):
         if not any(git(["config", "--get", f"branch.{branch}.{key}"], src, check=False).strip()
                    for key in ("merge", "remote")):

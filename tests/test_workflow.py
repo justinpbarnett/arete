@@ -133,6 +133,24 @@ for key in ('merge', 'remote'):
     assert git('config', '--get', f'branch.kept.{key}').returncode == 1
 ''')
 
+    def test_rejected_push_preserves_checked_out_branch_configuration(self):
+        self.run_body('''
+from arete.push import Push
+
+assert git('branch', 'loop/kept', 'origin/main').returncode == 0
+assert git('config', 'branch.loop/kept.description', 'owner settings').returncode == 0
+assert git('checkout', 'loop/kept').returncode == 0
+before = (src / '.git/config').read_bytes()
+tip = git('rev-parse', 'refs/heads/loop/kept').stdout
+Push().rejected({'workdir': str(src), 'branch': 'loop/kept'})
+assert git('rev-parse', 'refs/heads/loop/kept').stdout == tip
+assert git('branch', '--show-current').stdout.strip() == 'loop/kept'
+assert (src / '.git/config').read_bytes() == before
+assert git('config', '--get', 'branch.loop/kept.merge').stdout.strip() == 'refs/heads/main'
+assert git('config', '--get', 'branch.loop/kept.remote').stdout.strip() == 'origin'
+assert git('config', '--get', 'branch.loop/kept.description').stdout.strip() == 'owner settings'
+''')
+
     def test_stopped_after_add_rolls_back_new_branch(self):
         self.run_body('''
 original = util.git
