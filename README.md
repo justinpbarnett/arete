@@ -21,7 +21,7 @@ So a push to arete's own main, followed by a fast forward of the checkout serve 
 
 ## Loops
 
-A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the four kinds (command, watch, climb, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
+A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the three kinds (command, watch, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
 
 | Loop | Kind | When | What it does |
 |------|------|------|--------------|
@@ -49,9 +49,9 @@ Every run of every kind, pipeline, loop, session, chat and draft, is a row in on
 Successful and ordinary skipped loop runs consume their queued input. Failed runs, requested stops, and a budget exceeded during a run keep event input as dead items. A killed run or an unsolicited signal gets one automatic retry; the second interruption keeps the input dead. The retry count survives serve restarts. `arete loop list` shows dead counts, `arete loop status NAME` lists their queue IDs, runs and reasons, and `arete loop requeue ID` resets a dead item for another attempt with the same events. Dead items are retained for 56 days. Empty schedule inputs are deleted on failure and coalesced with a waiting fire of the same trigger during recovery. A budget hold before execution leaves input waiting without using a recovery retry.
 
 An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it.
-A ticket, PR, push or digest that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
+A ticket, PR or push that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
 Try again on the dashboard, or `arete approve ID`, delivers it again, so a finding whose ticket hits a GitHub outage is filed then instead of being lost.
-A `push` emit lands a climb or search change on the default branch with no PR.
+A `push` emit lands a search change on the default branch with no PR.
 It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path.
 With `reviewer` in that table, a model such as opus reviews each held push first, and a push it approves with high confidence lands, unless the trust level, a path the repo denies or a listed path keeps it for a person.
 A push that fails to land stays as a failed approval.
@@ -776,7 +776,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/`, loop digests and backups. Process files: `serve.json`, `server.json`, `dashboard-proxy-<port>.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`, `dashboard-proxy-<port>.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -1900,7 +1900,7 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
 - Sessions: the sessions, newest first.
   New session starts one on a device, model, runner, tool set, repo and budget, and a session's page follows its feed and takes your messages.
 - Loops: every loop with its switch, kind, trigger, last run, next fire and what it paid in the last 24 hours, and a broken loop with what is wrong.
-  A loop's page shows its facts, runs, findings, sources, memory, digests and metrics.
+  A loop's page shows its facts, runs, findings, sources and memory.
   Start runs it now and follows its live feed, where Stop ends the run.
   Try runs it the way `arete loop try NAME` does, so its feed shows what each emit would do and sends none.
   New loop drafts a loop from a sentence the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
@@ -1948,7 +1948,6 @@ A saved message longer than the budget is summarized in pieces.
 If the summary cannot be written, that turn leaves the older messages out and the next turn tries again.
 The chat's own tool calls and their results are saved as short `Tool` messages, so a later turn knows what the chat already did.
 Each chat waits on its own answer, so several chats can wait at once.
-On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
 
 The Feedback button and `f` open a composer over any view without changing the URL; on a phone it fills the screen.
 Write an Idea (the default), an Adjustment or a Bug in one text box of up to 4,000 characters; a Bug also shows optional Expected, Actual and Steps boxes of up to 2,000 characters each.
@@ -2076,6 +2075,140 @@ A failed command prints one line with `error` and no `event`, with `code` when t
 `arete run REPO TICKET` asks the server to start the run, as `POST /api/tasks` with `"force"` set by `--force`, prints the answer, then prints the run's lines until its `report` line. It exits 0 when the report's status counts as success, as before, and when the server queued the ticket instead of starting a run. Ctrl-c detaches and leaves the run going. With `--local` or `--dry-run`, or when no server works on its state, it runs in its own process as before. The server and the poller start a classic run with `--local`.
 
 The `justfile` at the top of this checkout wraps these commands in `adw` recipes, one `uv run arete` call each; `just --list` lists them. [adws/README.md](adws/README.md) is the guide for an agent that steers runs with them.
+
+## Merged base use checks
+
+The disabled `merge-check` command loop uses the merged base after pipeline PRs land.
+`arete merged --since-cursor` discovers merged pipeline PRs; `arete merge-check [REPO]` uses their
+saved verification steps against a detached checkout pinned to `origin/<base>`, including an earlier
+overlapping check. `arete merge-check REPO --dry-run` plans without starting anything.
+Run `arete loop try merge-check` to preview held tickets before enabling it
+with `arete loop enable merge-check`. See [the loop guide](arete/loops/README.md#merged-base-use-checks)
+for checkpoints, UTC quotas, blocked-input recovery, the `$finding.repo` ticket selector and queue capacity.
+
+## Offline merge-check fixture
+
+Use a disposable checkout and the verification sandbox. The helper creates only scratch configuration,
+state, two local bare origins, two deliberately stale local main branches, a small local HTTP product
+and replay answers. It never contacts a tracker or provider. Keep the shipped loop disabled. Every
+delivery below uses trial mode, which holds both tickets and metrics. Do not run these commands
+against normal state. Start from an empty fixture directory; retain it for inspection afterward.
+
+```sh
+SB="$HOME/Library/Developer/arete/verification-runtime/harness/sandbox"
+"$SB" python docs/merge-check-fixture.py setup
+"$SB" arete merged --help
+"$SB" arete merge-check --help
+"$SB" arete loop list
+"$SB" arete loop status merge-check
+"$SB" arete merge-check arete-placeholder-missing --dry-run
+"$SB" arete merged --since-cursor
+"$SB" python docs/merge-check-fixture.py check --dry-run
+"$SB" arete loop try merge-check
+"$SB" python docs/merge-check-fixture.py inspect
+```
+
+The unknown repo exits nonzero with one diagnostic. Empty-history discovery prints nothing; try
+finishes skipped with zero model calls. `inspect` shows no quota, checked identities or product starts.
+The fixture helper's `check` action sets `ARETE_LOOP_DIR` to its disposable loop folder. For the
+public command, use `"$SB" env ARETE_LOOP_DIR="$PWD/.arete-sandbox/merge-check-fixture/loop"
+arete merge-check fixture` with the same stdin (on one shell line).
+
+Establish the source baseline with an older neighbour, then add two merges. Polling uses the existing
+engine source transaction. `--at` accepts a recorded UTC timestamp, so equal timestamps and late
+discoveries can be reproduced without changing clocks.
+
+```sh
+"$SB" python docs/merge-check-fixture.py add --pr 1 --at 2026-01-01T00:00:00+00:00
+"$SB" python docs/merge-check-fixture.py poll
+"$SB" python docs/merge-check-fixture.py add --pr 2
+"$SB" python docs/merge-check-fixture.py add --pr 3
+"$SB" python docs/merge-check-fixture.py add --pr 90 --kind nonpipeline
+"$SB" python docs/merge-check-fixture.py add --pr 91 --kind open
+"$SB" python docs/merge-check-fixture.py add --pr 92 --kind no-pr
+"$SB" arete merged --since-cursor
+"$SB" python docs/merge-check-fixture.py poll
+"$SB" python docs/merge-check-fixture.py poll
+"$SB" arete loop try merge-check
+"$SB" arete loop try merge-check
+"$SB" python docs/merge-check-fixture.py event --pr 2 > .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py answer
+"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py inspect
+```
+
+Baseline enqueues no old input. The next poll enqueues the two new PRs once; repeated polling is
+empty. Excluded rows never appear. Try shows origin/main, start and URL templates, the two recent
+PRs, numbered checks and the older neighbour with `version` as the shared file. Try changes no
+consumer state. The first check prints only `{"value":1}`; the redundant event prints nothing.
+Inspect run folders under `.arete-sandbox/state/runs/merge-check-*`: `manifest.json` records the
+pinned SHA, worktree and steps; `result.json`, `verify.md` and `record/` preserve evidence.
+The disposable worktree is released and the server stops. `inspect` extracts START lines from the saved
+server logs to list the actual serving directories.
+
+For a failure add PR 4, select `answer --verdict fail`, supply its event and check again. The answer
+contains PRIVATE markers in its summary, How and Saw; none may appear in emitted findings. The
+finding names the manifest's failed steps, including the neighbour, followed by metric 0. Repeat
+with `--repo fixture-two` on add, event, answer and check to inspect routing to the second repo.
+`arete loop try merge-check` previews the sample failure through the held dynamic ticket emit.
+For an ordinary fixed target and explicit numeric metric, run:
+
+```sh
+"$SB" python docs/merge-check-fixture.py emit
+"$SB" python docs/merge-check-fixture.py emit-dynamic --repo fixture-two
+"$SB" python docs/merge-check-fixture.py emit-dynamic --repo unknown
+"$SB" python docs/merge-check-fixture.py emit-dynamic --repo ''
+```
+
+For late delivery add PR 5 using the same `--at` as PR 4, then poll; add PR 6 with an earlier `--at`
+and poll again. Both keys must be observed once despite their timestamps. `poll --scope-change`
+changes command scope without changing its output; catch-up uses `data.at` and retains old seen
+identities. For an ordinary command source, use the same `sources.poll` helper with a different
+source name/command that prints a constant JSON key: run `poll-ordinary` twice (baseline, then empty),
+then `poll-ordinary --id another` (new scope, recent catch-up follows the ordinary command rules).
+
+For arrivals during a check use `answer --seconds 20`, start `check` in one terminal, and add another
+PR in a second terminal while the server runs. Fetch `/version` at the address in `verify-server.log`:
+it must read `origin-new`, even though local main reads `local-old`. After the first result, create a
+new answer and dispatch the new event: only the next batch includes that merge. Two concurrent
+helper `check` processes serialize on the consumer lock. Run `dispatch` to claim the next polled queue
+item through `engine.carry`, with every ticket held. A second concurrent dispatch reports busy;
+repeated dispatch after quota is capped reports a hold without a subprocess. This uses the existing
+queue and claim recovery while keeping the shipped loop off. The server uses the same queue with
+`merge-check = 1`, so at most one product serves at once.
+
+For prerequisites and incomplete verification add a new PR, then use `fault --pr N --fault report`,
+`malformed`, `diff`, `verify`, `preflight` or `start`. Each saves a `.bak` alongside the affected
+fixture file; `fault --pr N --fault restore` restores it. Missing reports/diffs, malformed checks,
+absent verify configuration and failed preflight must block with no metric or ticket and leave
+the batch unchecked. Failed preflight starts no service or verifier. A product startup crash emits a
+regression finding and metric 0, naming the checks it prevented; sandbox and confinement failures
+remain blocked. `answer --verdict unavailable`,
+`incomplete` or `unknown` exercises unavailable or unaccounted-for results. Restore prerequisites,
+select a passing answer and retry the same event; for scheduler dead input, inspect `arete loop status
+merge-check` and use `arete loop requeue ID` on the scratch server.
+
+Use `answer --verdict limit` for 45 replay actions: the hard cutoff interrupts the call at 40, keeps
+usage/evidence, and blocks without repair. Use a delayed answer and SIGTERM the check process
+to inspect interruption cleanup; a timeout uses the same cleanup path. Unresolved ownership must
+retain and report the worktree, and never advance checked history.
+
+```sh
+"$SB" python docs/merge-check-fixture.py quota
+"$SB" python docs/merge-check-fixture.py check --dry-run
+"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py quota --yesterday
+```
+
+With a new pending PR, quota exits 75 (held), starting nothing and recording no result. Scheduler
+dispatch releases the claimed input and consults the persisted reset before attempting again.
+Dry-run displays the hold without reserving. Moving the scratch quota to yesterday makes one
+new check eligible. For no overlap use `add --file unrelated.txt` on an otherwise fresh history;
+the preview must explicitly say no applicable neighbour. For a continuation use `add --pr N
+--continues fixture-fixture-1`: the latest run owns the merge but the earlier run owns its report.
+To reproduce duplicate publication, record the same PR again with a distinct `--id`; discovery keeps
+one canonical URL. Delete nothing from real state to reset a fixture; use a fresh disposable workspace.
 
 ## Rules
 
