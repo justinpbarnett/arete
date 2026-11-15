@@ -31,7 +31,7 @@ A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work
 |------|------|------|--------------|
 | `heartbeat` | command | hourly, and when serve starts | Checks serve's beat, the loops, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
 | `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, plus arete's own recorded runs that failed, needed a retry, hit a budget or ran long, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
-| `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
+| `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used, and the [doctor](#doctor)'s read of arete's own state. |
 | `poll` | command | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. `arete run REPO TICKET` runs one ticket by hand. |
 | `eval` | command | weekly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `arete eval mine` writes new tasks from merged arete PRs. |
 | `triage` | command | every 15 min | Reads your open tickets that do not have the `agent` label yet and sorts each one: a fix or a feature with its repo, size, plan and assumptions, a research ticket, or work for a person. With `[jira] auto` it sends ready Jira tickets in the sprint to the pipeline. See [Triage](#triage). |
@@ -680,6 +680,22 @@ copy_to = "host:/backups/arete/"
 ```
 
 A failed copy is tried again at the next snapshot until one succeeds that day. **Until the owner sets `copy_to`, no copy of the database or config leaves this machine**, and `arete heartbeat` shows `backup:offsite` as a warning that says so. `backup:db` fails when serve is installed and the newest snapshot is over 3 awake hours old or fails its check, and `backup:offsite` fails when the last good copy is over 48 awake hours old.
+
+## Doctor
+
+`arete doctor` compares the places arete keeps the same facts and prints one line per check, passing ones too. It exits 1 when a check fails. It reads `arete.db` through a read only connection in one transaction plus the files under `runs/`; it makes no network call, writes nothing and never repairs, because each repair belongs to the change that owns the cause.
+
+| Check | Fails when |
+| --- | --- |
+| `cost` | a run's `cost_usd` differs from the sum of its steps by more than 0.000001, a run with cost and no steps included. |
+| `orphans` | steps, evals, feed or verdicts rows name a run id that has no `runs` row. |
+| `chat` | informational: steps filed under the pseudo run `chat`, which has no row. |
+| `folders` | a `runs/` folder has no row (except `runs/chat` and `eva-*-prompts`), a row other than a session has no folder, or a row's `log` file is missing. Folders and rows under 10 minutes old, and rows whose files were purged, are skipped. |
+| `stuck` | a chat has been busy over 20 minutes, a queue row is claimed by a run that is missing or not running, or an approval has stayed `approved` for over an hour. |
+| `store` | `PRAGMA quick_check` reports a problem. |
+| `backup` | the newest snapshot is over 3 hours old or its recorded check is not `ok`; with no snapshot it is informational until serve is installed. |
+
+Each line gives the count and up to five ids. The nightly `audit` runs the doctor and raises one `audit:doctor:<name>` alert per failing check; a `cost` or `backup` fault that the heartbeat's `costs:drift` or `backup:db` already alerts on is a warning instead. The miner does not read doctor lines.
 
 ## Run lines
 
