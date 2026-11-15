@@ -27,7 +27,11 @@ import arete
 from arete import config, control, devices, gh, outbound, paths, pi, pipeline, scratch, sessions, state, util, verify
 from arete import cli, codex, guard, runner, uploads
 
-SOURCE = Path(arete.__file__).resolve().parent.parent
+from tests.harness import (
+    SOURCE, behavior_result, bootstrap, inherited_env, make_folders, run_script, scratch_env, state_env,
+)
+
+SCRIPTS = Path(__file__).resolve().parent / "scripts"
 PYTHON = shlex.quote(sys.executable)
 
 
@@ -130,140 +134,20 @@ class AskConfigTests(unittest.TestCase):
 
 
 class TrackerLabelCatchUpTests(unittest.TestCase):
-    SCRIPT = r'''
-import json, os, subprocess, sys, time, urllib.request
-from pathlib import Path
-from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker, util
-root, scenario = Path(sys.argv[1]), sys.argv[2]
-def forbidden(*args, **kwargs):
-    raise AssertionError("offline workflow attempted an external transport or credential lookup")
-urllib.request.urlopen = forbidden
-accounts.read = forbidden
-gh.gh = forbidden
-lines = replay.sample(root / "sample", adw=True)
-paths.CONFIG_FILE.write_text("\n".join(lines).replace('tracker = "local"', 'tracker = "github"\ngithub = "fixture/repo"')
-                             + "\n\n[jev]\nenabled=false\n")
-cfg = config.load()
-REPO = "replay-sample"
-ISSUES, EDITS, REFUSE = {}, [], set()
-def issue_labels(repo, number, add=(), remove=()):
-    EDITS.append((number, list(add), list(remove)))
-    if REFUSE & set(add):
-        raise gh.GhError("HTTP 502: Bad Gateway")
-    ISSUES[number] = (ISSUES[number] - set(remove)) | set(add)
-gh.issue_labels = issue_labels
-gh.issues = lambda repo, label="", **kw: [
-    {"number": n, "title": f"t{n}", "body": "", "url": "", "createdAt": f"2026-01-0{n}T00:00:00Z", "author": {"login": "fixture"},
-     "labels": [{"name": x} for x in sorted(names)]} for n, names in sorted(ISSUES.items()) if not label or label in names]
-def row(issue, status, pending, started="2026-01-01T00:00:00Z"):
-    run = record.start("pipeline", repo=REPO, issue=issue, started=started)
-    if pending is not None:
-        record.note(run, label_pending=pending)
-    if status != "running":
-        record.settle(run, status)
-    return run
-def pending(run):
-    return state.run_get(run)["label_pending"]
-result = {}
-if scenario == "catch-up":
-    ISSUES[5] = {"agent", "agent:running"}
-    run = row(5, "pr", "pr")
-    result["before"] = [state.pending_label(REPO, 5)]
-    pipeline.sync_labels(cfg)
-    result |= {"labels": sorted(ISSUES[5]), "pending": pending(run), "edits": len(EDITS)}
-    pipeline.sync_labels(cfg)
-    result["again"] = len(EDITS)
-    ISSUES[5].discard("agent:pr")
-    pipeline.sync_labels(cfg)
-    result["after_removal"] = len(EDITS)
-elif scenario == "blocks-next-ticket":
-    ISSUES[5] = {"agent"}
-    run = row(5, "pr", "pr")
-    skips = pipeline.SkipLog({})
-    repo = cfg.repo(REPO)
-    result["first"] = pipeline.next_ticket(repo, tracker.for_repo(cfg, repo), skips) is None
-    result["skips"] = json.dumps(skips.current)
-    pipeline.sync_labels(cfg)
-    result["labels"] = sorted(ISSUES[5])
-    ISSUES[5].discard("agent:pr")
-    result["released"] = pipeline.next_ticket(repo, tracker.for_repo(cfg, repo), pipeline.SkipLog({})) is None
-elif scenario == "retains-debt":
-    ISSUES[5], ISSUES[6] = {"agent", "agent:running"}, {"agent", "agent:running"}
-    REFUSE.add("agent:failed")
-    first, second = row(5, "failed", "failed"), row(6, "pr", "pr")
-    pipeline.sync_labels(cfg)
-    result |= {"debt": pending(first), "other": pending(second), "labels": sorted(ISSUES[6])}
-    REFUSE.clear()
-    pipeline.sync_labels(cfg)
-    result |= {"later": pending(first), "failed": sorted(ISSUES[5])}
-elif scenario == "no-edit":
-    ISSUES[5], ISSUES[6], ISSUES[7] = {"agent"}, {"agent"}, {"agent"}
-    legacy, delivered, interrupted = row(5, "pr", None), row(6, "pr", ""), row(7, "interrupted", "running")
-    live = row(8, "running", "pr")
-    ISSUES[8] = {"agent"}
-    pipeline.sync_labels(cfg)
-    result |= {"edits": len(EDITS), "legacy": pending(legacy), "interrupted": pending(interrupted), "live": pending(live)}
-elif scenario == "latest-marker-governs":
-    ISSUES[5] = {"agent"}
-    row(5, "failed", "failed", "2026-01-01T00:00:00Z")
-    row(5, "pr", "", "2026-01-02T00:00:00Z")
-    row(5, "pr", None, "2026-01-03T00:00:00Z")
-    result["pending"] = state.pending_label(REPO, 5)
-    pipeline.sync_labels(cfg)
-    result["edits"] = len(EDITS)
-elif scenario == "ties-and-unknown-repo":
-    ISSUES[5] = {"agent"}
-    row(5, "failed", "failed", "2026-01-01T00:00:00Z")
-    row(5, "pr", "pr", "2026-01-01T00:00:00Z")
-    gone = record.start("pipeline", repo="gone", issue=9)
-    record.note(gone, label_pending="pr")
-    record.settle(gone, "pr")
-    result["pending"] = state.pending_label(REPO, 5)
-    pipeline.sync_labels(cfg)
-    result |= {"labels": sorted(ISSUES[5]), "edits": len(EDITS)}
-elif scenario == "local-task":
-    task = state.task_add(REPO, "Local", "Local body", "feat")
-    run = row(task, "pr", "pr")
-    pipeline.sync_labels(cfg)
-    result |= {"state": state.task_get(task)["state"], "pending": pending(run), "edits": len(EDITS)}
-elif scenario == "held-lock":
-    ISSUES[5] = {"agent"}
-    run = row(5, "pr", "pr")
-    ready = root / "ready"
-    holder = subprocess.Popen([sys.executable, "-I", "-c",
-        "import sys,time;from pathlib import Path;from arete import state, util\n"
-        "with util.lock(state.run_lock('pipeline', sys.argv[1], 5)):\n"
-        "    Path(sys.argv[2]).write_text('x')\n"
-        "    sys.stdin.readline()", REPO, str(ready)], stdin=subprocess.PIPE, text=True)
-    deadline = time.monotonic() + 30
-    while not ready.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert ready.exists()
-    pipeline.sync_labels(cfg)
-    result |= {"held_edits": len(EDITS), "held_pending": pending(run)}
-    holder.communicate("\n", timeout=30)
-    pipeline.sync_labels(cfg)
-    result |= {"edits": len(EDITS), "pending": pending(run), "labels": sorted(ISSUES[5])}
-print("BEHAVIOR_RESULT=" + json.dumps(result))
-'''
+    SCRIPT = (SCRIPTS / "tracker_label_catch_up.py").read_text()
 
     def run_scenario(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario],
-                                  cwd=root, env=env, text=True, capture_output=True, timeout=120)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            done = run_script(self.SCRIPT, root, str(root), scenario, env=env, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            line = next(x for x in done.stdout.splitlines() if x.startswith("BEHAVIOR_RESULT="))
-            return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+            return behavior_result(done)
 
     def test_owed_label_lands_once_and_a_manual_removal_stays(self):
         r = self.run_scenario("catch-up")
@@ -305,14 +189,12 @@ class OfflineWorkflowTests(unittest.TestCase):
     def workflow(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent", "home")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
 import importlib.util, json, os, runpy, sys, urllib.request
 from pathlib import Path
@@ -467,8 +349,8 @@ if scenario == "edited-after-held-pr":
         lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
     record.settle(old, "pr")
     with state.db() as connection:
-        connection.execute("UPDATE tasks SET body = ? WHERE id = ?",
-                           ("Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", task))
+        from tests.harness import set_task_body
+        set_task_body(task, "Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", connection=connection)
 feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
 def forced(*extra):
     try:
@@ -513,7 +395,8 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
         pipeline.git(["push", "-q", "origin", ref], src)
     def edit_spec(text):
         with state.db() as c:
-            c.execute("UPDATE tasks SET body = ? WHERE id = ?", (text, task))
+            from tests.harness import set_task_body
+            set_task_body(task, text, connection=c)
     def seed_origin_branch():
         pipeline.git(["checkout", "-q", "--detach"], src)
         commit_in_src("seed.txt", "seed", f"HEAD:refs/heads/{branch}")
@@ -706,7 +589,8 @@ if scenario.startswith("held-scratch"):
               "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")],
               "left": [p.name for p in pipeline.scratch_left(ws, [])]}
     with state.db() as c:
-        c.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Add kumquat on a last line of its own", task))
+        from tests.harness import set_task_body
+        set_task_body(task, "Add kumquat on a last line of its own", connection=c)
     refused = forced()
     result["while_held"] = refused["summary"]
     result["record_kept"] = pipeline.made_record(ws).read_text() == saved
@@ -1143,14 +1027,9 @@ if scenario == "foreign-version-record":
     result["foreign_unchanged"] = None if foreign is None else foreign.read_bytes() == foreign_bytes
 print("BEHAVIOR_RESULT=" + json.dumps(result))
 '''
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
-            result = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario],
-                                    cwd=root, env=env, text=True, capture_output=True, timeout=120)
+            result = run_script(script, root, str(root), scenario, env=env, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in result.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, result.stdout + result.stderr)
-            return json.loads(output)
+            return behavior_result(result)
 
     PR_DRIVER = r"""
 import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
@@ -1319,22 +1198,17 @@ print("BEHAVIOR_RESULT=" + json.dumps({"scenario": scenario, "runs": snaps,
     def pr_workflow(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent", "home")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             (root / "driver.py").write_text(f"import sys;sys.path.insert(0,{str(SOURCE)!r})\n" + self.PR_DRIVER)
             result = subprocess.run([sys.executable, "-I", str(root / "driver.py"), str(root), scenario, "parent"],
                                     cwd=root, env=env, text=True, capture_output=True, timeout=300)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in result.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, result.stdout + result.stderr)
-            return json.loads(output)
+            return behavior_result(result)
 
     def test_pr_survives_every_ending_after_it_opens(self):
         url = "https://github.com/octo/widgets/pull/7"
@@ -1997,128 +1871,22 @@ print("BEHAVIOR_RESULT=" + json.dumps({"scenario": scenario, "runs": snaps,
 
 
 class ResearchRetentionTests(unittest.TestCase):
-    SCRIPT = r'''
-import json, sys
-from pathlib import Path
-from arete import config, paths, research, runner, state, triage, util
-root = Path(sys.argv[1])
-paths.ensure_dirs()
-cfg = config.load()
-calls = []
-real = runner.run
-def spy(*args, **kwargs):
-    calls.append(kwargs["trace"][1])
-    return real(*args, **kwargs)
-runner.run = spy
-def put(name, structured, cost=0):
-    (root / "replay" / f"{name}.json").write_text(json.dumps({"structured": structured, "cost_usd": cost}))
-for n in range(1, 52):
-    put(f"triage-T-{n}", {"kind": "research", "ready": False, "questions": [], "assumptions": [],
-        "size": "S", "repos": [], "plan": [], "why": "Find the answer in a report."})
-put("research-T-1", {"summary": "The answer.", "report": "A durable report body."}, .75)
-def candidate(n, updated=None):
-    ref = f"T-{n}"
-    return triage.Candidate(ref, ref, f"Title {n}", f"https://example.test/{ref}",
-                            updated or f"2026-11-08T20:10:{n:02d}Z")
-class FakeSource(triage.JiraSource):
-    def candidates(self):
-        return sorted(items, key=lambda c: triage.moment(c.updated), reverse=True)[:triage.PER_SOURCE]
-    def ticket(self, c):
-        return triage.TicketText("Status: Open", "Find the answer and write a detailed report.", "", c.updated)
-src = FakeSource("T")
-items = [candidate(1)]
-active = [src]
-triage.sources = lambda cfg: active
-triage.publish = lambda *args: "not posted (test)"
-def refresh():
-    assert triage.refresh(cfg, False) == 0
-def tidy():
-    with util.lock("research", wait=True):
-        research.tidy()
-def run(**kwargs):
-    with util.lock("research", wait=True):
-        return research.research(cfg, triage.board_row("T-1"), **kwargs)[0]
-def cli(ref):
-    import subprocess
-    p = subprocess.run([sys.executable, "-m", "arete.cli", "research", ref],
-                       capture_output=True, text=True, timeout=30)
-    return [p.returncode, p.stdout + p.stderr]
-out = {}
-refresh()
-out["first"] = run(force=True)
-original = state.research_get("T-1")
-text = research.report_file("T-1").read_text()
-out["initial_cli"] = cli("T-1")
-items = [candidate(n) for n in range(1, 52)]
-refresh()
-with util.lock("research", wait=True):
-    state.research_set("T-3", status=research.ANSWERED, answered_by="T-1", error="already answered")
-tidy()
-out["window"] = {"absent": triage.board_row("T-1") is None,
-    "same_row": state.research_get("T-1") == original, "row": state.research_get("T-1"),
-    "shown": research.shown("T-1"), "linked": research.shown("T-3"), "text": text,
-    "listing": research.listing(), "cli": cli("T-1"), "linked_cli": cli("T-3")}
-items = [candidate(1)]
-refresh()
-out["return"] = {"due": [r["ref"] for r in research.due()], "outcome": run()}
-items = [candidate(1, "2026-11-09T20:10:01Z")]
-refresh()
-out["changed_stamp"] = run()
-active = []
-refresh()
-before_off = state.research_rows()
-tidy()
-out["off"] = {"board": state.triage_rows(), "same_rows": before_off == state.research_rows(),
-              "refs": [r["ref"] for r in state.research_rows()]}
-checkpoint = len(calls)
-active = [src]
-refresh()
-out["on"] = {"calls": calls[checkpoint:], "due": [r["ref"] for r in research.due()],
-             "shown": research.shown("T-1"), "cli": cli("T-1")}
-files = {
-    "T-9": "# T-9: Title\n\nhttps://example.test/T-9\n\nResearched 2026-11-08T20:10:55Z for $0.50.\n\n**Summary:** S\n\nOld body.\n",
-    "T-10": "# T-10: Current\n\nhttps://example.test/T-10\n\nResearched 2026-11-08T20:10:55Z ($0.40 paid).\n\n**Summary:** New\n\nNew body.\n",
-    "T-11": "# T-11: Free\n\nhttps://example.test/T-11\n\nResearched today (nothing paid).\n\nFree body.\n",
-    "T-12": "# T-12: Sparse\n\nBody only.\n",
-    "notes": "# Notes\n\nNot a report.\n",
-    "T-8": "# T-7: Wrong file\n\nBody.\n",
-    "T-13": "# Home report title\n\nFiled body.\n",
-}
-for ref, body in files.items():
-    (research.REPORTS_DIR / f"{ref}.md").write_text(body)
-with util.lock("research", wait=True):
-    state.research_set("T-20", status=research.RUNNING)
-tidy()
-adopted = {ref: state.research_get(ref) for ref in files}
-out["orphans"] = {"files": files, "rows": adopted, "wrong_ref": state.research_get("T-7"),
-    "shown": research.shown("T-9"), "running": state.research_get("T-20"),
-    "cli": cli("T-9"), "current_cli": cli("T-10"), "unknown_cli": cli("T-99")}
-before = state.research_rows()
-tidy()
-out["idempotent"] = before == state.research_rows()
-out["calls"] = calls
-print("RESULT" + json.dumps(out))
-'''
+    SCRIPT = (SCRIPTS / "research_retention.py").read_text()
 
     @classmethod
     def setUpClass(cls):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "replay", "home"):
-                (root / folder).mkdir()
+            make_folders(root, "config", "state", "logs", "replay", "home")
             (root / "config/config.toml").write_text('[replay]\nall = true\n\n[jev]\nenabled = false\n')
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
-                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_REPLAY_DIR=str(root / "replay"),
+                              TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
             done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
                                   capture_output=True, text=True, timeout=120, check=False)
             if done.returncode:
                 raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
-            line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
-            if not line:
-                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
-            cls.out = json.loads(line[len("RESULT"):])
+            cls.out = behavior_result(done, marker="RESULT")
 
     def test_window_eviction_keeps_report_cost_metadata_and_answered_link(self):
         self.assertEqual(self.out["first"], "done")
@@ -2181,90 +1949,7 @@ print("RESULT" + json.dumps(out))
 
 
 class StagedResearchSynthesisTests(unittest.TestCase):
-    SCRIPT = r'''
-import json, os, sys, time
-from pathlib import Path
-from arete import config, paths, research, runner, steps
-root = Path(sys.argv[1])
-replay = root / "replay"
-paths.ensure_dirs()
-calls = []
-real = runner.run
-def spy(*args, **kwargs):
-    calls.append([kwargs["trace"][1], list(kwargs.get("tools") or [])])
-    return real(*args, **kwargs)
-runner.run = spy
-def put(name, structured, cost=0):
-    (replay / f"{name}.json").write_text(json.dumps({"structured": structured, "cost_usd": cost}))
-def source(url, claim):
-    return {"question": "q", "url": url, "title": "Page " + url[-1], "published": "2025-01-02", "event_date": "",
-            "passage": claim, "uncertainty": "none"}
-def found(*sources):
-    return {"sources": list(sources), "notes": ""}
-def task(goal):
-    return {"goal": goal, "queries": ["general terms"], "max_sources": 3}
-def seed(ref, cost=0, search=True):
-    put(f"research-{ref}-plan", {"needs_search": True, "covered_by": [], "questions": ["What is the limit?"],
-        "tasks": [task("one"), task("two"), task("three")], "source_criteria": ["primary"],
-        "claims": ["The limit is known"]})
-    put(f"research-{ref}-task-1-search", found(source("https://example.org/a", "limit is 10"),
-                                              source("https://example.net/b", "limit is 20")), cost)
-    put(f"research-{ref}-task-2-search", found(), cost)
-    put(f"research-{ref}-task-3-search", found(source("https://example.com/c", "limit is documented")), cost)
-def answer(**kw):
-    base = {"summary": "Short.", "name": "", "answer": "The limit is disputed [S1].", "conclusions": [],
-            "inferences": [], "contradictions": [], "gaps": [], "searches": []}
-    return {**base, **kw}
-def good(**kw):
-    return answer(**{"conclusions": [{"claim": "Documented", "sources": ["S3"], "critical": True}], **kw})
-def ask(goal):
-    return {"goal": goal, "queries": ["more general terms"], "max_sources": 2}
-def drive(ref, run_id, cfg):
-    os.environ["ARETE_RUN_ID"] = run_id
-    values = {"ref": ref, "title": "Invented", "ticket": "Find the limit.", "related": "none", "repos": "none"}
-    start = len(calls)
-    res, paid = research.staged(cfg, ref, values, research.filing(None, ""), research.REPORTS_DIR, [], [],
-                                time.monotonic(), False)
-    evidence = research.research_search.evidence_file(ref)
-    return {"ok": res.ok, "error": res.error, "structured": res.structured, "paid": paid,
-            "calls": calls[start:], "evidence": json.loads(evidence.read_text()) if evidence.exists() else {}}
-cfg = config.load()
-out = {}
-seed("A")
-put("research-A-synthesis", good(answer="The limit is 10 [S1]; see [the note](\f//outside.example/).",
-                                 conclusions=[{"claim": "Bad", "sources": ["S9"], "critical": True}]))
-put("research-A-synthesis2", good(contradictions=[{"issue": "Limit differs", "sources": ["S1", "S2"]}],
-                                  searches=[ask("resolve")]))
-put("research-A-task-4-search", found(source("https://example.org/a/?utm_source=x", "limit is 10 again"),
-                                      source("https://example.org/d", "limit is 15")))
-put("research-A-gap-1-synthesis", good(answer="Resolved [S4]. Cited [S1].", conclusions=[
-    {"claim": "Found", "sources": ["S3", "S4"], "critical": True}],
-    contradictions=[{"issue": "Limit differs", "sources": ["S1", "S2"]}]))
-out["a"] = drive("A", "run-a", cfg)
-seed("B")
-for n in ("synthesis", "gap-1-synthesis", "gap-2-synthesis"):
-    put(f"research-B-{n}", good(searches=[ask(f"more {n}")]))
-put("research-B-task-4-search", found(source("https://example.org/e", "e")))
-put("research-B-task-5-search", found(source("https://example.org/f", "f")))
-out["b"] = drive("B", "run-b", cfg)
-seed("C", cost=0.9)
-put("research-C-synthesis", good(searches=[ask("late")]), 1.298)
-out["c"] = drive("C", "run-c", cfg)
-seed("D")
-put("research-D-report", {"summary": "S", "report": "Plain report."})
-cfg.research_synthesis = False
-out["d"] = drive("D", "run-d", cfg)
-config.CONFIG_FILE = paths.CONFIG_FILE
-with paths.CONFIG_FILE.open("a") as f:
-    f.write('\n[steps.research_synthesis]\ntools = ["Read", "Glob", "Grep", "WebSearch"]\n')
-try:
-    steps.resolve(config.load(), None, "research_synthesis")
-    out["web"] = ""
-except ValueError as e:
-    out["web"] = str(e)
-out["home"] = os.environ.get("HOME", "")
-print("RESULT" + json.dumps(out))
-'''
+    SCRIPT = (SCRIPTS / "staged_research_synthesis.py").read_text()
 
     @classmethod
     def setUpClass(cls):
@@ -2272,21 +1957,16 @@ print("RESULT" + json.dumps(out))
         had_gh_state = gh_state.exists()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "replay", "home"):
-                (root / folder).mkdir()
+            make_folders(root, "config", "state", "logs", "replay", "home")
             (root / "config/config.toml").write_text(
                 '[replay]\nall = true\n\n[research]\nplanner = true\nsearch = true\nsynthesis = true\n\n'
                 '[jev]\nenabled = false\n')
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
-                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_REPLAY_DIR=str(root / "replay"),
+                              TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
             done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
                                   capture_output=True, text=True, timeout=120, check=False)
-            line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
-            if not line:
-                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
-            cls.out = json.loads(line[len("RESULT"):])
+            cls.out = behavior_result(done, marker="RESULT")
             cls.home = str(root / "home")
         cls.wrote_gh_state = not had_gh_state and gh_state.exists()
 
@@ -2445,115 +2125,7 @@ print("RESULT" + json.dumps(out))
 
 
 class StagedResearchAuditTests(unittest.TestCase):
-    SCRIPT = r'''
-import json, os, sys, time
-from pathlib import Path
-from arete import config, paths, research, research_audit, runner, steps
-root = Path(sys.argv[1])
-replay = root / "replay"
-paths.ensure_dirs()
-calls = []
-real = runner.run
-def spy(*args, **kwargs):
-    calls.append([kwargs["trace"][1], list(kwargs.get("tools") or []), list(kwargs.get("allowed_tools") or [])])
-    return real(*args, **kwargs)
-runner.run = spy
-def put(name, structured, cost=0):
-    (replay / f"{name}.json").write_text(json.dumps({"structured": structured, "cost_usd": cost}))
-OLD = "As of March 2021 the limit is 10 requests per second."
-NEW = "The limit was raised to 20 requests per second in June 2025."
-BETA = "Customers reported occasional throttling during the beta."
-def src(url, published, passage):
-    return {"question": "What is the limit?", "url": url, "title": "Page", "published": published,
-            "event_date": "", "passage": passage, "uncertainty": "none"}
-def task(goal):
-    return {"goal": goal, "queries": ["general terms"], "max_sources": 3}
-def concl(claim, sid, critical=False):
-    return {"claim": claim, "sources": [sid], "critical": critical}
-def chk(c, verdict, sources, quote="", note="", correction=""):
-    return {"claim": c, "verdict": verdict, "sources": sources, "quote": quote, "fetched": [], "note": note,
-            "correction": correction}
-def batch1(c3_quote=BETA):
-    return {"checks": [
-        chk("C1", "contradicted", ["S1", "S2"], NEW, "The 2021 page is outdated and the June 2025 page states 20.",
-            "The limit was 10 requests per second as of March 2021, and a June 2025 page states 20 [S1] [S2]."),
-        chk("C2", "unverifiable", ["S3"], "", "The passage reports throttling during the beta and says nothing of a fix."),
-        chk("C3", "supported", ["S3"], c3_quote),
-        chk("C4", "inference", ["S2"], "", "The page states one raise and announces no further one."),
-        chk("C5", "supported", ["S2"], NEW)],
-        "disagreements": [{"issue": "The 2021 page states 10 requests per second and the 2025 page states 20.",
-                           "sources": ["S1", "S2"]}]}
-BATCH2 = {"checks": [chk("C6", "supported", ["S2"], NEW)], "disagreements": []}
-def seed(ref, synthesis=None):
-    put(f"research-{ref}-plan", {"needs_search": True, "covered_by": [], "questions": ["What is the limit?"],
-        "tasks": [task("one"), task("two"), task("three")], "source_criteria": ["primary"],
-        "claims": ["The limit is known"]})
-    put(f"research-{ref}-task-1-search", {"sources": [src("https://example.org/old", "2021-03-01", OLD),
-                                                      src("https://example.net/new", "2025-06-01", NEW)], "notes": ""})
-    put(f"research-{ref}-task-2-search", {"sources": [], "notes": ""})
-    put(f"research-{ref}-task-3-search", {"sources": [src("https://example.com/beta", "2024-11-05", BETA)], "notes": ""})
-    put(f"research-{ref}-synthesis", synthesis or {"summary": "The limit is 10 requests per second.", "name": "",
-        "answer": "The limit is 10 requests per second [S1].",
-        "conclusions": [concl("The limit is 10 requests per second.", "S1", True),
-                        concl("Throttling is fully resolved.", "S3", True),
-                        concl("Customers reported throttling during the beta.", "S3"),
-                        concl("The vendor will raise the limit again.", "S2"),
-                        concl("The limit was raised in June 2025.", "S2")],
-        "inferences": [{"claim": "Capacity planning should assume 20 requests per second.",
-                        "basis": "The newer page states 20.", "sources": ["S2"], "critical": False}],
-        "contradictions": [], "gaps": [], "searches": []})
-def drive(ref, cfg):
-    os.environ["ARETE_RUN_ID"] = f"run-{ref}"
-    values = {"ref": ref, "title": "Invented", "ticket": "Find the limit.", "related": "none", "repos": "none"}
-    start = len(calls)
-    res, paid = research.staged(cfg, ref, values, research.filing(None, ""), research.REPORTS_DIR, [], [],
-                                time.monotonic(), False)
-    evidence = research.research_search.evidence_file(ref)
-    return {"ok": res.ok, "error": res.error, "structured": res.structured, "calls": calls[start:],
-            "evidence": json.loads(evidence.read_text()) if evidence.exists() else {}}
-cfg = config.load()
-out = {}
-seed("A")
-put("research-A-batch-1-audit", batch1("Throttling was fully resolved during the beta."))
-put("research-A-batch-1-audit2", batch1())
-put("research-A-batch-2-audit", BATCH2)
-out["a"] = drive("A", cfg)
-seed("B")
-put("research-B-batch-1-audit", batch1(), 4.996)
-put("research-B-batch-2-audit", BATCH2)
-out["b"] = drive("B", cfg)
-seed("C")
-for name in ("research-C-batch-1-audit", "research-C-batch-1-audit2"):
-    put(name, {"checks": [{"claim": "C1", "verdict": "fine"}]})
-put("research-C-batch-2-audit", BATCH2)
-out["c"] = drive("C", cfg)
-seed("D")
-cfg.research_audit = False
-out["d"] = drive("D", cfg)
-cfg.research_audit = True
-seed("E", {"summary": "The limit was raised in June 2025 and the vendor guarantees 99.99 percent uptime.", "name": "",
-           "answer": "The vendor guarantees 99.99 percent uptime [S2].",
-           "conclusions": [concl("The limit was raised in June 2025.", "S2", True),
-                           concl("Customers reported throttling during the beta.", "S3")],
-           "inferences": [], "contradictions": [], "gaps": [], "searches": []})
-put("research-E-batch-1-audit", {"checks": [chk("C1", "supported", ["S2"], NEW), chk("C2", "supported", ["S3"], BETA)],
-                                 "disagreements": []})
-out["e"] = drive("E", cfg)
-config.CONFIG_FILE = paths.CONFIG_FILE
-s = steps.resolve(config.load(), None, "research_audit")
-known = {f"S{n}": {"url": u} for n, u in enumerate(
-    ("https://localhost/a", "https://example.org/b", "https://10.0.0.1/c", "https://exa_mple.org/d",
-     "https://foo.local/e"), 1)}
-out["hosts"] = research_audit.hosts(s, [{"cited": list(known)}], known)
-with paths.CONFIG_FILE.open("a") as f:
-    f.write('\n[steps.research_audit]\ntools = ["Read", "Glob", "Grep", "WebSearch"]\n')
-try:
-    steps.resolve(config.load(), None, "research_audit")
-    out["web"] = ""
-except ValueError as e:
-    out["web"] = str(e)
-print("RESULT" + json.dumps(out))
-'''
+    SCRIPT = (SCRIPTS / "staged_research_audit.py").read_text()
 
     @classmethod
     def setUpClass(cls):
@@ -2561,21 +2133,16 @@ print("RESULT" + json.dumps(out))
         had_gh_state = gh_state.exists()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "replay", "home"):
-                (root / folder).mkdir()
+            make_folders(root, "config", "state", "logs", "replay", "home")
             (root / "config/config.toml").write_text(
                 '[replay]\nall = true\n\n[research]\nplanner = true\nsearch = true\nsynthesis = true\naudit = true\n\n'
                 '[jev]\nenabled = false\n')
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
-                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_REPLAY_DIR=str(root / "replay"),
+                              TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
             done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
                                   capture_output=True, text=True, timeout=120, check=False)
-            line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
-            if not line:
-                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
-            cls.out = json.loads(line[len("RESULT"):])
+            cls.out = behavior_result(done, marker="RESULT")
         cls.wrote_gh_state = not had_gh_state and gh_state.exists()
 
     def names(self, which):
@@ -2696,38 +2263,17 @@ print("RESULT" + json.dumps(out))
 
 
 class ScratchLookAlikeTests(unittest.TestCase):
-    PRELUDE = r'''
-import json, os, secrets, subprocess, sys, time
-from pathlib import Path
-t = Path(sys.argv[1])
-from arete import pipeline, scratch, paths
-scratch.AUTHORITY = t / "authority"
-'''
-    REPO = r'''
-src, ws = t / "src", t / "worktrees" / ("ws-" + secrets.token_hex(4))
-src.mkdir()
-git = lambda *a: subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *a], cwd=src, check=True, capture_output=True)
-git("init", "-q", "-b", "main")
-(src / "a.txt").write_text("a")
-git("add", "a.txt")
-git("commit", "-qm", "a")
-git("worktree", "add", "-q", str(ws), "HEAD")
-c = pipeline.Checkout("", "o/r", src, ws, "main")
-'''
+    PRELUDE = (SCRIPTS / "scratch_look_alike_prelude.py").read_text()
+    REPO = (SCRIPTS / "scratch_look_alike_repo.py").read_text()
 
     def run_body(self, body, repo=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            for folder in ("config", "state", "logs", "worktrees", "tmp"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-            bootstrap = (f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE +
-                         (self.REPO if repo else "") + body)
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
-                                  cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            done = run_script(self.PRELUDE + (self.REPO if repo else "") + body, root, str(root), env=env, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
             self.assertEqual(done.stdout.strip().splitlines()[-1:], ["ok"], done.stdout)
 
@@ -2927,13 +2473,11 @@ class CodexHeadroomTests(unittest.TestCase):
     def test_codex_runs_under_a_headroom_and_is_capped_by_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
 import contextlib, importlib.util, io, json, shutil, sys
 from pathlib import Path
@@ -3006,14 +2550,9 @@ r["plain_design"] = lines("plain.jsonl", "manifest")[0]["design"]
 r["search_dry"] = call("experiment", "optimize", str(root / "sample/plan.toml"), "--dry-run")
 print("BEHAVIOR_RESULT=" + json.dumps(r))
 '''
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
-                                  capture_output=True, timeout=900, check=False)
+            done = run_script(script, root, str(root), env=env, timeout=900)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            r = json.loads(output)
+            r = behavior_result(done)
         shown = json.dumps(r, indent=1)
         refusal = ("arm codex: codex reports usage only when its turn ends, so it cannot stop a call at a token or "
                    "spend limit")
@@ -3250,16 +2789,12 @@ print("LINEAGE_OK")
     def scenario(self, mode):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), mode], cwd=root, env=env,
-                                  text=True, capture_output=True, timeout=600, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            done = run_script(self.SCRIPT, root, str(root), mode, env=env, timeout=600)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
             self.assertIn("LINEAGE_OK", done.stdout)
 
@@ -3282,14 +2817,12 @@ class EvalLineageTests(unittest.TestCase):
     def script(self, body):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "home", "authority-parent"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"), GIT_CONFIG_NOSYSTEM="1",
-                       GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
-                       GIT_CONFIG_VALUE_0=os.devnull)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home", "authority-parent")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"), GIT_CONFIG_NOSYSTEM="1",
+                              GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+                              GIT_CONFIG_VALUE_0=os.devnull)
             prefix = r'''
 import contextlib, io, json, os, shutil, sqlite3, sys
 from pathlib import Path
@@ -3317,14 +2850,9 @@ def latest():
     with state.db() as c:
         return c.execute("SELECT run_id FROM evals WHERE repo = 'replay-sample' ORDER BY rowid DESC").fetchone()[0]
 '''
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + prefix + body
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env,
-                                  text=True, capture_output=True, timeout=600, check=False)
+            done = run_script(prefix + body, root, str(root), env=env, timeout=600)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            return json.loads(output)
+            return behavior_result(done)
 
     def test_replay_lineage_regression_compare_and_step_ranges(self):
         r = self.script(r'''
@@ -3524,6 +3052,9 @@ print("BEHAVIOR_RESULT=" + json.dumps({"contexts": len(set(digests))}))
 
 
 class OptimizeTests(unittest.TestCase):
+    SEARCH_SCRIPT = (SCRIPTS / "optimize_search.py").read_text()
+    PROMPT_DRIFT_SCRIPT = (SCRIPTS / "optimize_prompt_drift.py").read_text()
+
     slow = True
 
     def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
@@ -3592,74 +3123,15 @@ class OptimizeTests(unittest.TestCase):
     def test_the_sample_search_promotes_applies_and_rolls_back_one_line(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
-            script = r'''
-import contextlib, importlib.util, io, json, os, shutil, sys
-from pathlib import Path
-from arete import cli, experiment, optimize, paths
-root = Path(sys.argv[1])
-if importlib.util.find_spec("arete.scratch"):
-    from arete import scratch
-    probe = [sys.executable, "-V"]
-    if scratch.protected_command(probe) != probe:
-        scratch.AUTHORITY = root / "authority-parent/verification-authority"
-def call(*argv):
-    out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = cli.main(list(argv))
-    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
-paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
-plan, config_file = str(root / "sample/plan.toml"), paths.CONFIG_FILE
-experiment.MIN_PAIRS = 3
-smaller = Path(plan).read_text()
-for old, new in (("repeats = 6", "repeats = 3"), ("min_pairs = 6", "min_pairs = 3\nconfidence = 0.7")):
-    if smaller.count(old) != 1:
-        raise SystemExit(f"the sample plan no longer holds {old!r} once")
-    smaller = smaller.replace(old, new)
-Path(plan).write_text(smaller)
-shutil.rmtree(root / "sample/replay/cheap/word-validation/3")
-before = config_file.read_bytes()
-folder = paths.STATE_DIR / "experiments" / "sample-search"
-trail = lambda: [json.loads(line) for line in (folder / "trail.jsonl").read_text().splitlines()]
-holdout = lambda: sum('"event": "trial"' in line for line in (folder / "holdout.jsonl").read_text().splitlines())
-r = {"prices": call("prices", "import", str(root / "sample/prices.json"))["code"]}
-r["dry"] = call("experiment", "optimize", plan, "--dry-run")
-r["dry_wrote"] = (paths.STATE_DIR / "experiments").exists()
-r["search"] = call("experiment", "optimize", plan)
-r["holdout"] = holdout()
-r["again"] = call("experiment", "optimize", plan)
-r["holdout_again"] = holdout()
-r["preview"] = call("experiment", "promote", str(folder))
-r["preview_same"] = config_file.read_bytes() == before
-os.chmod(config_file.parent, 0o500)
-r["failed"] = call("experiment", "promote", str(folder), "--apply")
-os.chmod(config_file.parent, 0o700)
-r["failed_same"] = config_file.read_bytes() == before
-r["failed_events"] = [e.get("status") for e in trail() if e["event"] == "apply"]
-r["apply"] = call("experiment", "promote", str(folder), "--apply")
-after = config_file.read_text().splitlines()
-r["changed"] = [[a, b] for a, b in zip(before.decode().splitlines(), after) if a != b]
-r["same_length"] = len(after) == len(before.decode().splitlines())
-r["apply_again"] = call("experiment", "promote", str(folder), "--apply")
-r["rollback"] = call("experiment", "promote", str(folder), "--rollback")
-r["rolled_back"] = config_file.read_bytes() == before
-r["rollback_again"] = call("experiment", "promote", str(folder), "--rollback")
-print("BEHAVIOR_RESULT=" + json.dumps(r))
-'''
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
-                                  capture_output=True, timeout=600, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = self.SEARCH_SCRIPT
+            done = run_script(script, root, str(root), env=env, timeout=600)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            r = json.loads(output)
+            r = behavior_result(done)
         shown = json.dumps(r, indent=1)
         self.assertEqual(r["prices"], 0, shown)
         self.assertEqual((r["dry"]["code"], r["dry_wrote"]), (0, False), shown)
@@ -3695,90 +3167,15 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
     def test_a_changed_winning_prompt_is_refused_before_any_trial_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
-            script = r"""
-import contextlib, importlib.util, io, json, shutil, sys
-from pathlib import Path
-from arete import cli, experiment, optimize, paths, util
-root = Path(sys.argv[1])
-if importlib.util.find_spec("arete.scratch"):
-    from arete import scratch
-    probe = [sys.executable, "-V"]
-    if scratch.protected_command(probe) != probe:
-        scratch.AUTHORITY = root / "authority-parent/verification-authority"
-def call(*argv):
-    out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = cli.main(list(argv))
-    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
-experiment.MIN_PAIRS = 3
-paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
-sample = root / "sample"
-call("prices", "import", str(sample / "prices.json"))
-for name in ("tuned", "tuned2"):
-    shutil.copytree(sample / "replay" / "stronger", sample / "replay" / name)
-    shutil.copytree(paths.PROMPTS_DIR, root / name)
-text = (sample / "plan.toml").read_text()
-head, tail = text.split("[[rounds]]")[0], "[tasks." + text.split("\n[tasks.", 1)[1]
-rounds = ('[[rounds]]\nvary = "effort"\n[rounds.candidates.cheap]\neffort = "low"\n\n'
-          f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned]\nprompts = "{root / "tuned"}"\n\n'
-          f'[[rounds]]\nvary = "prompt"\n[rounds.candidates.tuned2]\nprompts = "{root / "tuned2"}"\n\n')
-plan = sample / "plan.toml"
-smaller = (head.replace("repeats = 6", "repeats = 3") + rounds
-           + tail.replace("rounds = 2", "rounds = 3").replace("min_pairs = 6", "min_pairs = 3\nconfidence = 0.7"))
-if "repeats = 3" not in smaller or "confidence = 0.7" not in smaller:
-    raise SystemExit("the sample plan no longer holds repeats = 6 and min_pairs = 6")
-plan.write_text(smaller)
-s = optimize.load(plan)
-folder = paths.STATE_DIR / "experiments" / "sample-search"
-folder.mkdir(parents=True)
-trail = folder / "trail.jsonl"
-trials = lambda: sum(line.count('"event": "trial"') for f in folder.glob("*.jsonl") for line in f.read_text().splitlines())
-optimize.append(trail, {"event": "search", "digest": s.digest, "design": s.design, "baseline": s.snapshot, "at": util.iso()})
-champion = {"name": optimize.BASELINE, "overrides": {}, "settings": s.snapshot["settings"],
-            "inheritors": s.snapshot["inheritors"], "round": 0}
-for n in (1, 2):
-    result = optimize.play(s, folder, n, s.rounds[n - 1], champion)
-    optimize.append(trail, result)
-    champion = result["champion"]
-r = {"champion": champion["name"], "recorded": bool(champion.get("fingerprints")), "ran": trials()}
-build = root / "tuned" / "build.md"
-original = build.read_text()
-build.write_text(original + "\nPrefer another approach.\n")
-def refused(action):
-    try:
-        action()
-    except experiment.Refused as e:
-        return str(e)
-    return ""
-r["next_round"] = refused(lambda: optimize.play(s, folder, 3, s.rounds[2], champion))
-r["holdout"] = refused(lambda: optimize.score_holdout(s, folder, champion))
-r["resume"] = call("experiment", "optimize", str(plan))
-r["after_refusals"] = trials()
-build.write_text(original)
-engine_code = experiment.engine_code
-experiment.engine_code = lambda: "changed engine"
-r["engine"] = refused(lambda: optimize.play(s, folder, 3, s.rounds[2], champion))
-r["after_engine"] = trials()
-experiment.engine_code = engine_code
-r["proceed"] = call("experiment", "optimize", str(plan))
-r["final"] = trials()
-print("BEHAVIOR_RESULT=" + json.dumps(r))
-"""
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env, text=True,
-                                  capture_output=True, timeout=600, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            script = self.PROMPT_DRIFT_SCRIPT
+            done = run_script(script, root, str(root), env=env, timeout=600)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            r = json.loads(output)
+            r = behavior_result(done)
         shown = json.dumps(r, indent=1)
         self.assertEqual((r["champion"], r["recorded"]), ("tuned", True), shown)
         self.assertIn("candidate tuned changed since it was selected", r["next_round"], shown)
@@ -4050,16 +3447,12 @@ print("RECOVERY_OK")
     def run_modes(self, *modes):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            for name in ("config", "state", "logs", "tmp", "home", "worktrees", "authority-parent"):
-                (root / name).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
-            script = f"import sys; sys.path.insert(0, {str(SOURCE)!r});" + self.SCRIPT
+            make_folders(root, "config", "state", "logs", "tmp", "home", "worktrees", "authority-parent")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
             for mode in modes:
-                done = subprocess.run([sys.executable, "-I", "-c", script, str(root), mode], cwd=root,
-                                      env=env, capture_output=True, text=True, timeout=180, check=False)
+                done = run_script(self.SCRIPT, root, str(root), mode, env=env, timeout=180)
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
                 self.assertIn("RECOVERY_OK", done.stdout)
 
@@ -4164,21 +3557,15 @@ def finish(result):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        for folder in ("home", "config", "state", "logs", "tmp"):
-            (self.root / folder).mkdir()
-        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-        self.env.update(HOME=str(self.root / "home"), ARETE_CONFIG_DIR=str(self.root / "config"),
-                        ARETE_STATE_DIR=str(self.root / "state"), ARETE_LOG_DIR=str(self.root / "logs"),
-                        TMPDIR=str(self.root / "tmp"), INTAKE_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1",
-                        GIT_CONFIG_GLOBAL=os.devnull)
+        make_folders(self.root, "home", "config", "state", "logs", "tmp")
+        self.env = scratch_env(self.root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                               HOME=str(self.root / "home"), TMPDIR=str(self.root / "tmp"),
+                               INTAKE_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
 
     def run_script(self, body):
-        code = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
-        done = subprocess.run([sys.executable, "-I", "-c", code], cwd=self.root, env=self.env, text=True,
-                              capture_output=True, timeout=300, check=False)
-        output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                       if line.startswith("BEHAVIOR_RESULT=")), None)
-        return done, json.loads(output) if output else None
+        done = run_script(self.PRELUDE + body, self.root, env=self.env, timeout=300)
+        return done, behavior_result(done) if any(
+            line.startswith("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()) else None
 
     def result(self, body):
         done, found = self.run_script(body)
@@ -4688,23 +4075,15 @@ print("BEHAVIOR_RESULT=" + json.dumps(out))
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        for folder in ("home", "config", "state", "logs", "tmp"):
-            (self.root / folder).mkdir()
-        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-        self.env.update(HOME=str(self.root / "home"), ARETE_CONFIG_DIR=str(self.root / "config"),
-                        ARETE_STATE_DIR=str(self.root / "state"), ARETE_LOG_DIR=str(self.root / "logs"),
-                        TMPDIR=str(self.root / "tmp"), IDENT_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1",
-                        GIT_CONFIG_GLOBAL=os.devnull)
+        make_folders(self.root, "home", "config", "state", "logs", "tmp")
+        self.env = scratch_env(self.root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                               HOME=str(self.root / "home"), TMPDIR=str(self.root / "tmp"),
+                               IDENT_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
 
     def found(self):
-        code = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
-        done = subprocess.run([sys.executable, "-I", "-c", code], cwd=self.root, env=self.env, text=True,
-                              capture_output=True, timeout=300, check=False)
+        done = run_script(self.SCRIPT, self.root, env=self.env, timeout=300)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                       if line.startswith("BEHAVIOR_RESULT=")), None)
-        self.assertIsNotNone(output, done.stdout + done.stderr)
-        return json.loads(output)
+        return behavior_result(done)
 
     def said(self, got, text):
         return [line for line in got["lines"] if text in line]
@@ -4854,17 +4233,13 @@ def result():
     def run_costs(self, body, modes=("run",)):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            for folder in ("home", "config", "state", "logs", "worktrees", "tmp"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(HOME=str(root / "home"), ARETE_CONFIG_DIR=str(root / "config"),
-                       ARETE_STATE_DIR=str(root / "state"), ARETE_LOG_DIR=str(root / "logs"),
-                       ARETE_WORKTREES_DIR=str(root / "worktrees"), TMPDIR=str(root / "tmp"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+            make_folders(root, "home", "config", "state", "logs", "worktrees", "tmp")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              HOME=str(root / "home"), ARETE_WORKTREES_DIR=str(root / "worktrees"), TMPDIR=str(root / "tmp"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            program = self.PRELUDE + body
             for mode in modes:
-                done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), mode],
-                                      cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
+                done = run_script(program, root, str(root), mode, env=env, timeout=120)
                 self.assertEqual(done.returncode, 9 if mode == "kill" else 0, done.stderr + done.stdout)
 
     def test_commit_precedes_timeline_even_when_finish_kills_the_process(self):
@@ -5183,23 +4558,17 @@ print("BEHAVIOR_RESULT=" + json.dumps({"run": ran, "trials": trials, "report": w
     def test_a_run_killed_mid_trial_keeps_every_launch_and_never_prices_a_dead_call_as_free(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            program = self.SCRIPT
             codes = []
             for mode in ("setup", "1", "5", "finish"):
-                done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), mode], cwd=root, env=env,
-                                      text=True, capture_output=True, timeout=600, check=False)
+                done = run_script(program, root, str(root), mode, env=env, timeout=600)
                 codes.append(done.returncode)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            r = json.loads(output)
+            r = behavior_result(done)
         shown = json.dumps(r, indent=1)
         self.assertEqual(codes, [0, 9, 9, 0], shown)
         self.assertEqual(r["run"]["code"], 0, shown)
@@ -5263,7 +4632,8 @@ def made(tag, status="done", minutes=2, repo="replay-sample", kind="pipeline", p
     if settled:
         record.settle(rid, status, summary=tag + " summary")
     with state.db() as c:
-        c.execute("UPDATE runs SET started = ? WHERE id = ?", (util.iso(util.now() - timedelta(minutes=minutes)), rid))
+        from tests.harness import age_run
+        age_run(rid, started=util.iso(util.now() - timedelta(minutes=minutes)), connection=c)
     if parked:
         util.write_json(paths.RUNS_DIR / rid / "parked.json", {"reason": parked})
     return rid
@@ -5294,21 +4664,14 @@ def result(**fields):
     def scratch(self, body, jev_on=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), str(SOURCE),
-                                   "true" if jev_on else "false"],
-                                  cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
+            done = run_script(self.PRELUDE + body, root, str(root), str(SOURCE), "true" if jev_on else "false",
+                              env=env, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            return json.loads(output)
+            return behavior_result(done)
 
     def test_pr_poll_and_supersede_preserve_the_winning_status(self):
         found = self.scratch(r'''
@@ -5592,7 +4955,8 @@ spanning = made("spanning", minutes=90)
 running = made("running", minutes=90, settled=False)
 old = made("old", minutes=300)
 with state.db() as c:
-    c.execute("UPDATE runs SET finished = ? WHERE id = ?", (since(200), old))
+    from tests.harness import age_run
+    age_run(old, finished=since(200), connection=c)
 result(listed=[r["id"] for r in record.runs_since(since(60))], spanning=spanning, running=running, old=old)
 ''')
         self.assertIn(found["spanning"], found["listed"])
@@ -6261,23 +5625,18 @@ elif mode == "report":
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name).resolve()
-        for name in ("home", "config", "state", "logs", "worktrees"):
-            (self.root / name).mkdir()
-        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
-        self.env.update(ARETE_CONFIG_DIR=str(self.root / "config"), ARETE_STATE_DIR=str(self.root / "state"),
-                        ARETE_LOG_DIR=str(self.root / "logs"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"))
+        make_folders(self.root, "home", "config", "state", "logs", "worktrees")
+        self.env = scratch_env(self.root, keep=("PATH", "LANG", "LC_ALL"),
+                          ARETE_WORKTREES_DIR=str(self.root / "worktrees"))
         self.authority = self.root / "home/verification-authority"
         self.hook = self.root / "config/hooks/demo.secret"
         self.run_mode("seed", ",".join(self.STATES))
         self.old = self.secret()
 
     def run_mode(self, mode, *extra):
-        bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
-        done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(self.root), mode, *extra], cwd=self.root,
-                              env=self.env, text=True, capture_output=True, timeout=300, check=False)
-        found = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                      if line.startswith("BEHAVIOR_RESULT=")), None)
-        result = json.loads(found) if found else {}
+        done = run_script(self.SCRIPT, self.root, str(self.root), mode, *extra, env=self.env, timeout=300)
+        result = behavior_result(done) if any(
+            line.startswith("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()) else {}
         result["exit"] = done.returncode
         result["stderr"] = done.stderr
         return result
@@ -6579,18 +5938,14 @@ print(json.dumps({"status": status, "hub": ref_in(hub), "tip": tip, "asked": ask
     def session(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SESSION
-            run = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario], cwd=root, env=env,
-                                 capture_output=True, text=True, timeout=120, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            run = run_script(self.SESSION, root, str(root), scenario, env=env, timeout=120)
             self.assertEqual(run.returncode, 0, run.stderr[-2000:])
-            return json.loads(run.stdout.strip().splitlines()[-1])
+            return behavior_result(run, marker="")
 
     @staticmethod
     def subcommand(args):
@@ -7537,18 +6892,14 @@ print(json.dumps({"status": status, "report": state.report(spec.id), "row": stat
     def run_task(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
-            run = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario], cwd=root, env=env,
-                                 capture_output=True, text=True, timeout=120, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            run = run_script(self.SCRIPT, root, str(root), scenario, env=env, timeout=120)
             self.assertEqual(run.returncode, 0, run.stderr[-2000:])
-            return json.loads(run.stdout.strip().splitlines()[-1])
+            return behavior_result(run, marker="")
 
     def test_a_report_with_no_summary_fails_the_session_and_opens_no_draft_pr(self):
         for scenario in ("empty", "blank", "draft-empty", "draft-blank"):
@@ -7791,22 +7142,15 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
     def run_script(self, scenario):
         with tempfile.TemporaryDirectory(suffix=".noindex") as directory:
             root = Path(directory).resolve()
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home"):
-                (root / folder).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario, self.SETUP],
-                                  cwd=root, env=env, text=True, capture_output=True, timeout=180, check=False)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent", "home")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            done = run_script(self.SCRIPT, root, str(root), scenario, self.SETUP, env=env, timeout=180)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            return json.loads(output)
+            return behavior_result(done)
 
     def test_a_ticket_that_ends_in_a_pr_leaves_no_workspace_behind(self):
         out = self.run_script("pr")
@@ -7982,21 +7326,14 @@ assert chat.new("")["id"] == 1
     def scratch(self, body):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "replay", "home", "tmp"):
-                (root / folder).mkdir()
+            make_folders(root, "config", "state", "logs", "replay", "home", "tmp")
             (root / "config/config.toml").write_text(
                 f'[replay]\nall = true\ndir = "{root / "replay"}"\n\n[chat]\ncontext_tokens = 100\n\n[jev]\nenabled = false\n')
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
-            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
-            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)],
-                                  cwd=root, env=env, text=True, capture_output=True, timeout=180, check=False)
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
+            done = run_script(self.PRELUDE + body, root, str(root), env=env, timeout=180)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
-                           if line.startswith("BEHAVIOR_RESULT=")), None)
-            self.assertIsNotNone(output, done.stdout + done.stderr)
-            return json.loads(output)
+            return behavior_result(done)
 
     FRUITS = r'''
 fruits = ["APRICOT" + " word" * 18, "PLUM" + " word" * 18, "PEAR" + " word" * 18, "And now?"]
@@ -8268,6 +7605,7 @@ class ServeLockTests(unittest.TestCase):
 import json, sys, time
 from pathlib import Path
 from arete import paths, state
+from tests.harness import inherited_env, state_env
 root = Path(sys.argv[1])
 state.ensure_schema()
 def result(**fields):
@@ -8286,7 +7624,7 @@ try:
     assert str(paths.STATE_DIR) in outputs[plain].read_text()
     assert str(p.pid) in refused()
     other = child('from arete import serve; held = serve.take_serve_lock(); print("OTHER")',
-                  env={**os.environ, "ARETE_STATE_DIR": str(root / "other-state")})
+                  env=inherited_env(**state_env(root / "other-state")))
     assert other.wait(30) == 0
     assert "OTHER" in outputs[other].read_text()
 finally:
@@ -8438,7 +7776,7 @@ class ParallelSuiteTests(unittest.TestCase):
         scratch_temp = tempfile.TemporaryDirectory()
         self.addCleanup(scratch_temp.cleanup)
         Path(folder.name, "test_sample.py").write_text(source)
-        return folder.name, {**os.environ, "TMPDIR": scratch_temp.name}
+        return folder.name, inherited_env(TMPDIR=scratch_temp.name)
 
     def command(self, folder: str, *extra: str):
         return [sys.executable, "-m", "tests.parallel", "-s", folder, *extra]
@@ -8616,19 +7954,17 @@ class InertModelTextTests(unittest.TestCase):
     def run_workflow(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home", "bin"):
-                (root / folder).mkdir()
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "authority-parent", "home", "bin")
             fake = root / "bin/gh"
             fake.write_text(FAKE_GH.format(python=sys.executable))
             fake.chmod(0o755)
             log = root / "gh.log"
-            env = {k: v for k, v in os.environ.items() if k in ("LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(PATH=f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}", GH_LOG=str(log),
-                       ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            env = scratch_env(root, keep=("LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              PATH=f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}", GH_LOG=str(log),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
             script = r'''
 import importlib.util, json, runpy, sys, urllib.request
 from pathlib import Path
@@ -8668,9 +8004,7 @@ gh.pr_comment("https://github.com/fixture/repo/pull/7", probe)
 tracker.for_repo(cfg, cfg.repo("replay-sample")).comment("5", probe)
 gh.issue_create("fixture/repo", "Report", probe)
 '''
-            done = subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script,
-                                   str(root), self.MODEL, self.PLANTED, self.PROBE],
-                                  cwd=root, env=env, text=True, capture_output=True, timeout=300, check=False)
+            done = run_script(script, root, str(root), self.MODEL, self.PLANTED, self.PROBE, env=env, timeout=300)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
             self.assertTrue(log.exists(), done.stderr + done.stdout)
             return [json.loads(line) for line in log.read_text().splitlines()]
@@ -9372,24 +8706,19 @@ class BackupTests(unittest.TestCase):
     def script(self, name, config_text=""):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
-                (root / folder).mkdir()
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
             if config_text:
                 (root / "config/config.toml").write_text(config_text)
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
-            code = (f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + BACKUP_PRELUDE + BACKUP_SCRIPTS[name]
-                    + "\nprint('BACKUP_RESULT=' + json.dumps(out, default=str))")
-            result = subprocess.run([sys.executable, "-I", "-c", code, str(root)], cwd=root, env=env, text=True,
-                                    capture_output=True, timeout=240)
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            program = (BACKUP_PRELUDE + BACKUP_SCRIPTS[name]
+                       + "\nprint('BACKUP_RESULT=' + json.dumps(out, default=str))")
+            result = run_script(program, root, str(root), env=env, timeout=240)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-            line = next((x for x in result.stdout.splitlines() if x.startswith("BACKUP_RESULT=")), None)
-            self.assertIsNotNone(line, result.stdout + result.stderr)
-            return json.loads(line.removeprefix("BACKUP_RESULT="))
+            return behavior_result(result, marker="BACKUP_RESULT=")
 
     def test_prune_keeps_what_it_should_and_snapshots_first(self):
         r = self.script("prune-keeps")
@@ -9515,13 +8844,11 @@ class CodeIdentityTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name).resolve()
-        for name in ("config", "state", "logs", "worktrees", "tmp", "home"):
-            (self.root / name).mkdir()
-        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-        self.env.update(ARETE_CONFIG_DIR=str(self.root / "config"), ARETE_STATE_DIR=str(self.root / "state"),
-                        ARETE_LOG_DIR=str(self.root / "logs"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
-                        TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"),
-                        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        make_folders(self.root, "config", "state", "logs", "worktrees", "tmp", "home")
+        self.env = scratch_env(self.root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                          ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
+                          TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"),
+                          GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
 
     def tree(self, name="tree") -> Path:
         copy = self.root / name
@@ -10076,9 +9403,8 @@ class AlertWriteRecoveryTests(unittest.TestCase):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         root = Path(self.folder.name)
-        for name in ("home", "state", "config", "logs", "worktrees"):
-            (root / name).mkdir()
-        for patch in (mock.patch.dict(os.environ, HOME=str(root / "home"), ARETE_STATE_DIR=str(root / "state")),
+        make_folders(root, "home", "state", "config", "logs", "worktrees")
+        for patch in (mock.patch.dict(os.environ, state_env(root / "state", HOME=str(root / "home"))),
                       mock.patch.object(paths, "STATE_DIR", root / "state"),
                       mock.patch.object(paths, "RUNS_DIR", root / "state" / "runs"),
                       mock.patch.object(paths, "LOCKS_DIR", root / "state" / "locks"),
@@ -10239,11 +9565,10 @@ finally:
 '''
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            env = {key: value for key, value in os.environ.items() if key in ("PATH", "LANG", "LC_ALL")}
-            for name in ("config", "state", "log", "worktrees"):
-                (root / name).mkdir()
-                env[f"ARETE_{name.upper()}_DIR"] = str(root / name)
-            command = [sys.executable, "-I", "-B", "-c", f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script]
+            make_folders(root, "config", "state", "log", "worktrees")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL"),
+                              ARETE_LOG_DIR=str(root / "log"), ARETE_WORKTREES_DIR=str(root / "worktrees"))
+            command = [sys.executable, "-I", "-B", "-c", bootstrap(script)]
             done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=45)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
 
@@ -11259,12 +10584,10 @@ finally:
     def test_shell_and_declared_assets_are_served_with_page_policy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("config", "state", "logs", "worktrees", "tmp"):
-                (root / name).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
             script = r'''
 import json, re, threading, unittest, urllib.request
 from html.parser import HTMLParser
@@ -11329,7 +10652,7 @@ finally:
     thread.join(timeout=5)
     server.server_close()
 '''
-            command = [sys.executable, "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(SOURCE)!r});" + script]
+            command = [sys.executable, "-I", "-B", "-c", bootstrap(script)]
             done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=45)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
 
@@ -11389,15 +10712,13 @@ class CutOffTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name).resolve()
-        for name in ("config", "state", "logs", "worktrees", "tmp", "home"):
-            (self.root / name).mkdir()
-        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
-        self.env.update(ARETE_CONFIG_DIR=str(self.root / "config"), ARETE_STATE_DIR=str(self.root / "state"),
-                        ARETE_LOG_DIR=str(self.root / "logs"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
-                        TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"), GIT_CONFIG_NOSYSTEM="1",
-                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
-                        GIT_CONFIG_VALUE_0=os.devnull, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
-                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        make_folders(self.root, "config", "state", "logs", "worktrees", "tmp", "home")
+        self.env = scratch_env(self.root, keep=("PATH", "LANG", "LC_ALL"),
+                          ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
+                          TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"), GIT_CONFIG_NOSYSTEM="1",
+                          GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+                          GIT_CONFIG_VALUE_0=os.devnull, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                          GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
         self.origin, self.clone = self.root / "origin.git", self.root / "clone"
 
     def git(self, *args, cwd=None):
@@ -11426,9 +10747,7 @@ class CutOffTests(unittest.TestCase):
         return subprocess.run(self.command(code), env=self.env, capture_output=True, text=True, timeout=timeout)
 
     def facts(self, done):
-        lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
-        self.assertTrue(lines, f"{done.args[-2][-400:]}\n{done.stdout}\n{done.stderr}")
-        return json.loads(lines[-1][len("RESULT "):])
+        return behavior_result(done, marker="RESULT ", last=True)
 
     def on_origin(self):
         return self.git("--git-dir", str(self.origin), "log", "main", "--format=%s").splitlines().count("fix commit")
@@ -11514,7 +10833,7 @@ class CutOffTests(unittest.TestCase):
         self.assertEqual([s["row"]["status"] for s in seen], ["approved", "approved"])
         self.assertGreater(seen[1]["row"]["claimed_until"], seen[0]["row"]["claimed_until"])
         self.assertEqual(seen[0]["row"]["decided"], seen[1]["row"]["decided"])
-        self.assertEqual(json.loads(out.splitlines()[-1][len("RESULT "):])["rc"], 0)
+        self.assertEqual(behavior_result(SimpleNamespace(stdout=out, stderr=err), marker="RESULT ", last=True)["rc"], 0)
         self.assertEqual(self.listed()["row"]["status"], "done")
         self.assertEqual(self.on_origin(), 1)
 
@@ -11596,7 +10915,8 @@ def made(tag, days, status="failed", kind="pipeline", raw=True, issue=None):
     (folder / "run.log").write_text(tag)
     (folder / "run.jsonl").write_text('{}\n')
     with state.db() as c:
-        c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (age(days), age(days), rid))
+        from tests.harness import age_run
+        age_run(rid, started=age(days), finished=age(days), connection=c)
         c.execute("INSERT INTO steps (run_id, step, ok) VALUES (?, 'build', 1)", (rid,))
     backdate(folder, days)
     return rid
@@ -11657,7 +10977,8 @@ young = made("young", 89, "merged")
 failed = made("failed", 91)
 recent_finish = made("recent-finish", 100)
 with state.db() as c:
-    c.execute("UPDATE runs SET finished = ? WHERE id = ?", (age(2), recent_finish))
+    from tests.harness import age_run
+    age_run(recent_finish, finished=age(2), connection=c)
 server.prune()
 row = state.run_get(failed)
 try:
@@ -11695,7 +11016,8 @@ with state.db() as c:
         c.execute("INSERT INTO asks (id, run, repo, ticket, step, questions, status, asked) "
                   "VALUES (?, ?, 'replay-sample', '1', 'build', '[]', ?, ?)",
                   (status, ids[status], status, age(91)))
-    c.execute("UPDATE runs SET finished = NULL WHERE id = ?", (ids["running"],))
+    from tests.harness import age_run
+    age_run(ids["running"], finished=None, connection=c)
 server.prune()
 result(kept={tag: folder(rid).exists() and state.run_get(rid)["files_purged"] is None for tag, rid in ids.items()})
 ''')
@@ -11737,7 +11059,8 @@ proposal(merged, "merged"); proposal(rejected, "rejected")
 server.prune()
 first = [paths.record_dir(r).exists() for r in (merged, rejected)]
 with state.db() as c:
-    c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (age(91), age(91), merged))
+    from tests.harness import age_run
+    age_run(merged, started=age(91), finished=age(91), connection=c)
 server.prune()
 result(first=first, folder=folder(merged).exists(), history=bool(state.run_get(merged)), proposals=len(state.proposals()))
 ''')
@@ -11901,18 +11224,16 @@ write(GOOD)
 '''
 
     def environment(self, root):
-        for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
-            (root / folder).mkdir()
-        env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-        env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                   ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                   TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
-                   GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                   GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+        make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
+        env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                          ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                          TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                          GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                          GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
         return env
 
     def program(self, body):
-        return f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+        return bootstrap(self.PRELUDE + body)
 
     def case(self, body, timeout=120):
         with tempfile.TemporaryDirectory() as directory:
@@ -11921,8 +11242,7 @@ write(GOOD)
             done = subprocess.run([sys.executable, "-I", "-c", self.program(body), str(root)],
                                   cwd=root, env=env, text=True, capture_output=True, timeout=timeout)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            line = next(x for x in done.stdout.splitlines() if x.startswith("BEHAVIOR_RESULT="))
-            return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+            return behavior_result(done)
 
     def test_names_from_a_newer_engine_are_ignored_once(self):
         found = self.case(r'''
@@ -12555,19 +11875,17 @@ from arete import board, config, heartbeat, paths, pipeline, record, state, util
     def session(self, body, setup=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            for name in ("config", "state", "logs", "worktrees", "tmp", "home"):
-                (root / name).mkdir()
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
             (root / "config" / "config.toml").write_text("[replay]\nall = true\n")
-            env = {k: v for k, v in os.environ.items() if k != "ARETE_LOOP"}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+            env = inherited_env(drop=("ARETE_LOOP",), **state_env(root / "state"),
+                       ARETE_CONFIG_DIR=str(root / "config"),
                        ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
                        TMPDIR=str(root / "tmp"), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
             script = self.PRELUDE + ("state.ensure_schema()\n" if setup else "") + body
             done = subprocess.run([sys.executable, "-c", script, str(root)], env=env, cwd=SOURCE,
                                   capture_output=True, text=True, timeout=300)
             self.assertEqual(done.returncode, 0, done.stderr)
-            line = next(x for x in done.stdout.splitlines() if x.startswith(self.MARKER))
-            return json.loads(line[len(self.MARKER):])
+            return behavior_result(done, marker=self.MARKER)
 
     def test_two_loops_marking_together_keep_both_marks(self):
         found = self.session(r'''

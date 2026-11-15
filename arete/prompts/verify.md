@@ -31,6 +31,7 @@ $diff
 ## How to check
 
 Arete already ran the repo's checks, and they pass: $checks. Do not run them again.
+Keep each shell command short enough to finish inside the step budget. Do not wait with chained sleeps; poll a background run with a single short command at a time.
 
 $surface
 
@@ -45,6 +46,7 @@ $scratch
 - Do what the user does: the commands they type, the requests their clients send, the clicks they make. Read
   the real output, not the code that makes it.
 - Shell commands you may run: $commands. Others are refused.
+- A refused command is an environment problem, not a product problem. Do not get the same result another way (another interpreter, cat, sed, head, or a heredoc that writes a file). Record the check with `passed` false and `cause` `environment`, and name the command in `blocked_by`.
 - Arete's guard stops a command it reads as showing a credential or as harm git cannot undo. When a command needs a
   key or token you were not given, give it a value that starts `arete-placeholder`, such as
   `API_KEY=arete-placeholder-1 <command>`, so it carries no credential. A request to localhost, 127.0.0.1 or [::1]
