@@ -73,11 +73,11 @@ def draft_prompt(request: DraftRequest, cfg: config.Config, taken: set[str]) -> 
         f"Devices: {', '.join(d.name for d in devices.known())}.",
         f"Loop names already taken: {', '.join(sorted(taken)) or 'none'}.",
         ("Pick the simplest kind that does the job: a command loop when a script can decide on its own, a watch "
-         "loop when it needs judgment, climb or search only to change code. Put `enabled = false` at the top. Give "
+         "loop when it needs judgment, search only to change code. Put `enabled = false` at the top. Give "
          "an agent loop whose model runs on pi a run budget_usd, and a daily_budget_usd when it fires more than "
          "once a day; a loop that runs on claude takes no budget, since the subscription carries it. Set "
-         "stale_hours on a scheduled loop. Prefer emits that need no approval only for digest, notify and metric; "
-         "a ticket or pr emit on a repo you cannot see should set approve = true."),
+         "stale_hours on a scheduled loop. "
+         "A ticket or pr emit on a repo you cannot see should set approve = true."),
     ]
     if request.name:
         parts.append(f"Name the loop `{request.name}`.")
@@ -246,6 +246,8 @@ def try_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
         return taken
     if refusals:
         raise control.Refused(f"{loop.name}'s sources hold events, but its trigger {refusals[-1]}")
+    if loop.name == "merge-check" and loop.command == ["arete", "merge-check"]:
+        return []
     raise control.Refused(f"{loop.name} found no events to try on yet")
 
 

@@ -845,16 +845,16 @@ class CutOffTests(unittest.TestCase):
     def test_a_claim_is_renewed_while_a_slow_send_runs(self):
         self.held_push()
         approving = subprocess.Popen(self.command(
-            "delivery.CLAIM_SECONDS = 2\nreal = push.Push.execute\n"
-            "def slow(self, *a, **k):\n    print('ENTERED', flush=True)\n    time.sleep(8)\n    return real(self, *a, **k)\n"
+            "delivery.CLAIM_SECONDS = 6\nreal = push.Push.execute\n"
+            "def slow(self, *a, **k):\n    print('ENTERED', flush=True)\n    time.sleep(18)\n    return real(self, *a, **k)\n"
             "push.Push.execute = slow\nset_check('true')\nreport(rc=cli.main(['approve', '1']))"),
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(approving.kill)
         self.assertEqual(approving.stdout.readline().strip(), "ENTERED")
         entered, seen = time.monotonic(), []
-        for at in (3, 6):
+        for at in (8, 13):
             time.sleep(max(0, entered + at - time.monotonic()))
-            seen.append(self.facts(self.child("delivery.CLAIM_SECONDS = 2\nno_wake()\nreleased = delivery.release_lapsed()"
+            seen.append(self.facts(self.child("delivery.CLAIM_SECONDS = 6\nno_wake()\nreleased = delivery.release_lapsed()"
                                               "\nreport(released=released, row=state.approval(1))")))
         out, err = approving.communicate(timeout=90)
         self.assertEqual([s["released"] for s in seen], [[], []], err)

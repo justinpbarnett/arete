@@ -176,7 +176,7 @@ def auth_hold(auth: accounts.Auth, model: str, connect=state.db, unknown: str = 
     if not (auth.identity or auth.credential or unknown):
         return None
     scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
-    found = [h for h in state.holds(connect, include_indefinite=True) if h["scope"] in scopes]
+    found = [h for h in state.holds(connect) if h["scope"] in scopes]
     return next((h for h in found if not h["until"]), found[-1] if found else None)
 
 
@@ -307,8 +307,10 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
         hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
-        **kw) -> Result:
+        max_steps: int | None = None, **kw) -> Result:
     cfg = cfg or config.load()
+    if max_steps is not None:
+        kw["action_limit"] = ActionLimit(max_steps)
     run_with = runner or (resume.runner if not model else "")
     which, name = chosen(model, run_with, cfg)
     kept = resume if resume.runner == which else NO_SESSION
@@ -459,18 +461,54 @@ class Trip:
 
 
 @dataclass
+class ActionLimit:
+    limit: int
+    used: int = 0
+    seen: set = field(default_factory=set)
+
+    def watch(self, event: dict, scope: str) -> None:
+        if event.get("kind") != "tool_call":
+            return
+        identity = (scope, event["id"]) if event.get("id") else None
+        if identity is not None and identity in self.seen:
+            return
+        if identity is not None:
+            self.seen.add(identity)
+        self.used += 1
+        if self.used >= self.limit:
+            raise Cut(f"blocked: hard action limit of {self.limit} reached")
+
+
+@dataclass
 class Meter:
     tokens: int | None
     usd: float | None
     charged: Callable[[Result], float]
     seen: Result
     ids: dict = field(default_factory=dict)
+    actions: ActionLimit | None = None
+    reader: Callable | None = None
+    action_scope: str = field(default_factory=lambda: secrets.token_hex(8))
 
     def watching(self, on_line: Callable[[str], None]) -> Callable[[str], None]:
         def watched(line: str) -> None:
             on_line(line)
             if turn := streamed_turn(line, self.ids):
                 self.add(turn)
+            if self.actions and self.reader:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    return
+                if not isinstance(event, dict):
+                    return
+                for normalized in self.reader(event):
+                    if normalized.get("kind") == "usage" and event.get("type") == "turn.completed":
+                        self.seen.tokens_in = normalized.get("tokens_in", 0)
+                        self.seen.tokens_out = normalized.get("tokens_out", 0)
+                    self.actions.watch(normalized, self.action_scope)
+                if event.get("type") == "tool_execution_start":
+                    self.actions.watch({"kind": "tool_call", "id": event.get("toolCallId")}, self.action_scope)
 
         return watched
 
@@ -969,7 +1007,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
 
     meter = Meter(max_tokens, kw.get("max_budget_usd") if max_tokens is not None else None,
                   lambda r: priced(r, cfg),
-                  Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode))
+                  Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode),
+                  actions=kw.pop("action_limit", None), reader=record.READERS[which](header))
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
         try:
             budget_error = kw.pop("budget_error", "")
@@ -979,8 +1018,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                 res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"))
             elif which == "codex":
                 protected = [verification_scratch.AUTHORITY, paths.WORKTREES_DIR]
-                res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line,
-                                hidden=[*found, *protected], auth=auth, **kw)
+                res = meter.guard(codex.run, prompt, cwd, model=name, resume=resume,
+                                  on_line=meter.watching(rec.line), hidden=[*found, *protected], auth=auth, **kw)
             else:
                 res = meter.guard(pi.run if which == "pi" else claude.run, prompt, cwd, model=name, resume=resume,
                                   on_line=meter.watching(safe_line if selected else rec.line), auth=auth, **kw)

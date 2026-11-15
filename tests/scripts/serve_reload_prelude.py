@@ -19,9 +19,9 @@ def fake_notify(item, batch, loop, run, cfg):
     if not gate.wait(20):
         raise TimeoutError("fixture gate never opened")
     return "sent"
-delivery.EMITS["notify"].execute = fake_notify
+delivery.EMITS["ticket"].execute = fake_notify
 def approval():
-    return state.add_approval("demo", "", {"type": "notify", "item": {"title": "t", "message": "m"}}, "summary")
+    return state.add_approval("demo", "", {"type": "ticket", "item": {"title": "t", "message": "m"}}, "summary")
 def status_of(n):
     return state.approval(n)["status"]
 def post(n, body=b'{"approve": true}', host="127.0.0.1", port=None, header=("X-Arete", "1"), extra=None):

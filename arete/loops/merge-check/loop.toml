@@ -1,0 +1,29 @@
+kind = "command"
+enabled = false
+description = "Use the merged base branch after pipeline PRs land and file a ticket when the features break together"
+
+[trigger]
+group = "repo"
+trust = "internal"
+
+[[source]]
+name = "merged"
+type = "command"
+command = "arete merged --since-cursor"
+every = "5m"
+timeout = 120
+trust = "internal"
+
+[run]
+command = "arete merge-check"
+try_command = "arete merge-check --dry-run"
+timeout_minutes = 30
+stale_hours = 24
+queue = "merge-check"
+
+[[emit]]
+type = "ticket"
+repo = "$finding.repo"
+labels = ["agent"]
+prefix = "[merge-check] "
+approve = false

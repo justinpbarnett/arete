@@ -14,10 +14,8 @@ from . import config, cron, devices, paths, runner, state, util
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
 TRIES = 5
-METRIC_RULE = re.compile(r"^\s*([\w.\-/]+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?)\s*$")
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
-CLIMB_GOALS = {"max": True, "higher": True, "up": True, "min": False, "lower": False, "down": False}
 FINDING_EVENT = "finding"
 GITHUB_REMOTE = re.compile(r"github\.com(?::\d+)?[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
 
@@ -29,7 +27,6 @@ class Trigger:
     run_at_load: bool = False
     events: list[str] = field(default_factory=list)
     webhook: bool = False
-    metric: tuple[str, str, float] | None = None
     group: str = ""
     trust: str = "untrusted"
 
@@ -40,7 +37,7 @@ class Trigger:
         return str(e.get(self.group) or (data.get(self.group) if isinstance(data, dict) else "") or "")
 
     def refusal(self, e: dict) -> str:
-        takes = [*self.events, *(["metric"] if self.metric else [])]
+        takes = self.events
         if self.events and e.get("type") not in takes:
             return f"takes only {', '.join(takes)} events, and this one is {e.get('type')}"
         if trust_rank(e.get("trust")) < trust_rank(self.trust):
@@ -62,8 +59,6 @@ class Trigger:
             parts.append("serve start")
         if self.events:
             parts.append(" ".join(self.events))
-        if self.metric:
-            parts.append("metric " + " ".join(map(str, self.metric)))
         if self.webhook:
             parts.append("webhook")
         return ", ".join(parts)
@@ -221,7 +216,6 @@ class Kind:
 KINDS = {kind.name: kind for kind in (
     Kind("command", table="run", needs="command", agent=False),
     Kind("watch"),
-    Kind("climb", table="climb", needs="measure", needs_hint="a command that prints a number", worktree=True),
     Kind("search", table="search", needs="check", needs_hint="a command that exits 0 on a hit", worktree=True),
 )}
 
@@ -345,7 +339,6 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         run_at_load=bool(trig.get("run_at_load", False)),
         events=as_list(trig.get("event")),
         webhook=bool(trig.get("webhook", False)),
-        metric=metric_rule(trig["metric"]) if trig.get("metric") else None,
         group=str(trig.get("group", "")),
         trust=str(trig.get("trust", "untrusted")),
     )
@@ -359,21 +352,10 @@ def as_argv(value) -> list[str]:
     return shlex.split(value) if isinstance(value, str) else [str(v) for v in value]
 
 
-def climb_goal(spec: dict) -> str:
-    return str(spec.get("goal", "max")).strip().lower()
-
-
 def as_list(value) -> list[str]:
     if not value:
         return []
     return [value] if isinstance(value, str) else [str(v) for v in value]
-
-
-def metric_rule(text: str) -> tuple[str, str, float]:
-    m = METRIC_RULE.match(text)
-    if not m:
-        raise LoopError(f"metric trigger '{text}' must look like `name < 0.8`")
-    return m.group(1), m.group(2), float(m.group(3))
 
 
 def proof_problems(loop: Loop) -> list[str]:
@@ -423,7 +405,7 @@ def source_name_problems(loop: Loop) -> list[str]:
 def validate(loop: Loop, cfg: config.Config) -> None:
     from . import routing
     from .delivery import EMITS
-    from .sources import SOURCES, metric_event
+    from .sources import SOURCES
 
     problems = []
     kind = KINDS.get(loop.kind)
@@ -437,12 +419,8 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("[trigger] takes cron or every, not both")
     if loop.trigger.trust not in TRUST_ORDER:
         problems.append(f"[trigger] trust '{loop.trigger.trust}' is not one of {', '.join(TRUST_ORDER)}")
-    elif loop.trigger.metric and (why := loop.trigger.refusal(metric_event(loop, 0))):
-        problems.append(f"[trigger] metric would never fire: the loop {why}")
     if kind:
         problems += kind.problems(loop, device.remote)
-    if loop.kind == "climb" and (goal := climb_goal(loop.spec)) not in CLIMB_GOALS:
-        problems.append(f"[climb] goal '{goal}' is not one of {', '.join(CLIMB_GOALS)}")
     if loop.kind == "search" and "proof" in loop.spec:
         problems += proof_problems(loop)
     problems += runner.agent_problems(loop.runner, loop.tools)

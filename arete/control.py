@@ -14,7 +14,6 @@ from . import (
     config,
     delivery,
     devices,
-    emits,
     loops,
     paths,
     record,
@@ -37,9 +36,6 @@ COST_DAYS = 7
 COST_GROUPS = ("step", "kind", "model", "route")
 STEP_FIELD_OF = {"step": "step", "kind": "task_kind", "model": "model"}
 TOKEN_FIELDS = ("tokens_in", "cache_read", "cache_write", "tokens_out")
-DIGEST_DAYS = 3
-DIGEST_CHARS = 20000
-METRIC_DAYS = 30
 
 
 class NotFound(LookupError):
@@ -187,24 +183,8 @@ def loop_detail(name: str, connect=state.db) -> dict:
                      for i in state.dead_items(connect) if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
             "webhook_path": webhooks.hook_path(loop.name) if loop.trigger.webhook else "",
-            "digests": digests(loop), "metrics": loop_metrics(loop, connect),
             "model": loop.model_for(cfg) if loop.agent and not loop.error else "",
             "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
-
-
-def digests(loop: Loop) -> list[dict]:
-    folder = emits.digest_folder(loop.name)
-    files = sorted(folder.glob("*.md"), reverse=True)[:DIGEST_DAYS] if folder.is_dir() else []
-    return [{"day": f.stem, "text": f.read_text()[-DIGEST_CHARS:]} for f in files]
-
-
-def loop_metrics(loop: Loop, connect=state.db) -> list[dict]:
-    latest: dict[str, dict] = {}
-    for m in state.metrics_since(util.iso(util.now() - timedelta(days=METRIC_DAYS)), connect):
-        if m["loop"] == loop.name:
-            seen = latest.setdefault(m["name"], {"name": m["name"], "points": 0})
-            seen.update(value=m["value"], ts=m["ts"], points=seen["points"] + 1)
-    return sorted(latest.values(), key=lambda m: m["name"])
 
 
 def switch(name: str, enabled: bool) -> dict:
