@@ -21,7 +21,7 @@ So a push to arete's own main, followed by a fast forward of the checkout serve 
 
 ## Loops
 
-A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the four kinds (command, watch, climb, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
+A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the three kinds (command, watch, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
 
 | Loop | Kind | When | What it does |
 |------|------|------|--------------|
@@ -49,9 +49,9 @@ Every run of every kind, pipeline, loop, session, chat and draft, is a row in on
 Successful and ordinary skipped loop runs consume their queued input. Failed runs, requested stops, and a budget exceeded during a run keep event input as dead items. A killed run or an unsolicited signal gets one automatic retry; the second interruption keeps the input dead. The retry count survives serve restarts. `arete loop list` shows dead counts, `arete loop status NAME` lists their queue IDs, runs and reasons, and `arete loop requeue ID` resets a dead item for another attempt with the same events. Dead items are retained for 56 days. Empty schedule inputs are deleted on failure and coalesced with a waiting fire of the same trigger during recovery. A budget hold before execution leaves input waiting without using a recovery retry.
 
 An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it.
-A ticket, PR, push or digest that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
+A ticket, PR or push that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
 Try again on the dashboard, or `arete approve ID`, delivers it again, so a finding whose ticket hits a GitHub outage is filed then instead of being lost.
-A `push` emit lands a climb or search change on the default branch with no PR.
+A `push` emit lands a search change on the default branch with no PR.
 It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path.
 With `reviewer` in that table, a model such as opus reviews each held push first, and a push it approves with high confidence lands, unless the trust level, a path the repo denies or a listed path keeps it for a person.
 A push that fails to land stays as a failed approval.
@@ -694,7 +694,7 @@ A last line cut short by a dying process is ended as a garbage line by the next 
 | `heartbeat` | `step`, `seconds` so far; every 30 seconds while a step works (`lines.HEARTBEAT_SECONDS`) |
 | `step_end` | the start fields plus `ok`, `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `seconds`, `error`, `try`, `cache_read`, `cache_write`, `api_seconds`; the cost counts an attempt the network dropped. `tokens_in` includes the cache reads and writes. `try` is the number of this call of the step name in the run, counted per call and not per provider launch, so a call that fell back across two routes is still one try and the next call of `build` is try 2, and every `steps` row of one call carries that `try`; a seam step's `try` goes on from the runs it continues, while the `try` in the `steps` rows counts the calls of that agent step name within the run's own id, so a continued run's first `build` call has seam try 2 and row try 1; a step the pipeline numbers itself (`fix1`, `fix2`) starts at 1 under each name. `api_seconds` is the time the model's API calls took (0 on pi, which reports none), so `seconds` minus `api_seconds` is the time spent in tools. A seam step's line has `step`, `try`, `result`, `ok` (true for `pass` alone), `next`, `feedback`, `data`, `session`, then its agent calls' `runner`, `model`, `effort`, `tier`, `kind` and `atom` (the distinct values joined with `, `) and their summed `cost_usd`, `tokens_in`, `tokens_out`, `turns`, `cache_read`, `cache_write` and `api_seconds`, then `seconds`, `error`, and `tree` and `fingerprint` for a step called with `tree`. An agent call inside a seam step writes a `step_start` per launch but no `step_end` of its own; its row in the `steps` table stays |
 | `route` | `continues` (the run this one continues), `after` (the last step it took from that run), `skipped` (how many steps it took), `redone` (how many steps at the start the run ran again itself before taking stored ones, 1 only after a failed `prepare`; such a run writes the full line once before that `prepare` with `skipped` 0, and the last full line counts), `only`, `again` (the step `--from` names, or empty), `renew` (`prepare` when the base moved and the flow prepares again, else empty). A step carried forward from the run it continues is written again as a `step_end` with `carried` set to that run and no cost. A continuing or `only` flow writes it twice: an opening line with `continues`, `only` and `again` when the flow starts, so a run that dies before its first step still names the run it continues, then the full line when it starts running steps |
-| `wait` | `cause` (`limit`, `ci`, `slot` or `person`), `phase` (`start` or `end`), `at`; the end line adds `since` and `minutes`. `limit` is a usage limit or credit hold with no usable route left, `ci` the watch on CI, `slot` the wait for a free run slot: after the CI watch, and before the run started, from the first poll that passed the ready ticket over (for `max_parallel` or `max_parallel_per_repo`). `person` runs from the asking run's `question` line to the start of the run the reply starts, or to the first pass-over if there was one. The `slot` and `person` lines are the run's first lines. A wait whose end line never came is not counted |
+| `wait` | `cause` (`limit`, `ci`, `slot` or `person`), `phase` (`start` or `end`), `at`; the end line adds `since` and `minutes`. `limit` is a usage limit or credit hold with no usable route left, `ci` the watch on CI, `slot` the wait for a free run slot: after the CI watch, and before the run started, from the first poll that passed the ready ticket over (for `max_parallel` or `max_parallel_per_repo`), and the wait for a free check lane (for `max_parallel_checks`, or another run's serialized checks). `person` runs from the asking run's `question` line to the start of the run the reply starts, or to the first pass-over if there was one. The `slot` and `person` lines are the run's first lines. A wait whose end line never came is not counted |
 | `question` | `question` (the comment), `summary`; when the run asks the ticket's author |
 | `error` | `step` (the last step started, or empty), `message`; for a failed or interrupted run, not for a stop by request, and right after the `step_end` of a seam step that raised or returned something it may not |
 | `report` | `task` (the ticket's id), `status` as the `runs` table holds it (`step` for a run of one step alone), `prs`, `summary`, `requirements` (each check in use: `what`, `passed`, and `evidence`, the path of its screenshot or of the verify step's `.md` report), `assumptions` (what the plan decided where the ticket left it open), `left_for_a_person`, `review` (`verdict`, derived from the problems: `request_changes` only when a blocker is open; `summary`; `problems`, the open blockers, each with `file`, `text`, `severity` and `category`; and `notes`, the problems that do not block, with the same fields), `question` (the summary of what the run asked), `steps` (for each step name in the run's `step_end` lines, its `tries`, `minutes` and `cost_usd`), `minutes`, `cost_usd`, `wait_minutes` (minutes by cause, for the causes the run waited on only, also kept on the run's row). A classic run and a seam run write the same fields, and a field the run never reached is empty (`""`, `[]`, or a `review` with empty fields), never absent. `requirements` and `review` are the last check in use and review. Always the last line, and the poll writes it for a run whose process died. `flow.respond` writes `status`, the fields it is given and `steps` |
@@ -788,7 +788,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/`, loop digests and backups. Process files: `serve.json`, `server.json`, `dashboard-proxy-<port>.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`, `dashboard-proxy-<port>.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -818,6 +818,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `arete_repo` | Name of the `[[repo]]` that is this checkout. Its step prompts are harness files the miner may change. Default `arete`. |
 | `max_parallel` | Most pipeline runs at once on the machine; the task sessions a dashboard chat started count too. Default 1. |
 | `max_parallel_per_repo` | Most pipeline runs poll keeps going in one repo, runs in their CI wait included. Default 1. |
+| `max_parallel_checks` | Most check suites at once on the machine from repos with `parallel_checks = true`. A run waits for a free lane, and the wait is left out of its run budget. Default 2. |
 | `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `research_plan` (the planner of a staged research run), `research_search` (the search workers of a staged run), `research_synthesis` (the collator of a staged run; opus when left out), `research_audit` (the auditor of a staged run; opus when left out), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you), `document` (the concise writer of PR text, tickets and messages), `capture_evidence` (reads staged feedback screenshots and recordings; sonnet when left out). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop`, `session`, `research_search` and `capture_evidence`, which use sonnet, and `research`, `research_plan` and `chat`, which use opus. `arete status` lists each role's model. |
 | `[steps]`, `[kinds]`, `[tiers]`, `[factory]` | Each pipeline step's model, runner, effort, timeout, tries, tools, MCP servers, instructions and session. See [Steps](#steps). `[factory] adws` is the folder the adw scripts come from, default `adws/` in this checkout; see [The adw scripts](#the-adw-scripts). |
 | `[mcp.<name>]` | An MCP server a step can name in its `mcp` list: `command` with optional `args`, or `url` for an HTTP server. Servers are defined here only, not in a layer. |
@@ -978,7 +979,7 @@ path = "classic"
 | `setup.commands` | Run in each fresh worktree before the agent starts. |
 | `setup.copy` | Files copied from the main checkout into each worktree. |
 | `checks` | Every check must exit 0 before review. The agent may run them while it builds. |
-| `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), the timeout of each step and of the checks, and cumulative `max_repair_cycles`, `max_run_minutes` and `max_verify_minutes` process budgets. These budgets must be positive integers. `max_run_minutes` leaves out `limit` and `slot` waits. Checks remain serialized by default; `parallel_checks = true` explicitly allows a repo whose checks use isolated resources to overlap them across worktrees. `max_attempts` and `timeout_minutes` are the defaults for each step's `tries` and `timeout_minutes`, which [Steps](#steps) can set apart. Code enforces the diff size and the paths after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. The PR shows it under "Left for a person", and a rerun on an open PR writes, rewrites or removes that section to match its plan. The verifier and the reviewer are told that a person makes it, so its absence never fails the run. The CI fix step counts a red check that only that change fixes as not caused by the PR. |
+| `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), the timeout of each step and of the checks, and cumulative `max_repair_cycles`, `max_run_minutes` and `max_verify_minutes` process budgets. These budgets must be positive integers. `max_run_minutes` leaves out `limit` and `slot` waits. Checks remain serialized by default; `parallel_checks = true` explicitly allows a repo whose checks use isolated resources to overlap them across worktrees, up to the machine's `max_parallel_checks`. `max_attempts` and `timeout_minutes` are the defaults for each step's `tries` and `timeout_minutes`, which [Steps](#steps) can set apart. Code enforces the diff size and the paths after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. The PR shows it under "Left for a person", and a rerun on an open PR writes, rewrites or removes that section to match its plan. The verifier and the reviewer are told that a person makes it, so its absence never fails the run. The CI fix step counts a red check that only that change fixes as not caused by the PR. |
 | `agent.allow_bash` | Bash patterns the agent may run, on top of read only git and file commands. |
 | `trust.level` | `pr`, or `automerge` once earned. |
 | `trust.automerge_after` | Merged PRs in a row before arete opens a PR proposing automerge. |
@@ -1910,7 +1911,7 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
 - Sessions: the sessions, newest first.
   New session starts one on a device, model, runner, tool set, repo and budget, and a session's page follows its feed and takes your messages.
 - Loops: every loop with its switch, kind, trigger, last run, next fire and what it paid in the last 24 hours, and a broken loop with what is wrong.
-  A loop's page shows its facts, runs, findings, sources, memory, digests and metrics.
+  A loop's page shows its facts, runs, findings, sources and memory.
   Start runs it now and follows its live feed, where Stop ends the run.
   Try runs it the way `arete loop try NAME` does, so its feed shows what each emit would do and sends none.
   New loop drafts a loop from a sentence the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
@@ -1958,7 +1959,6 @@ A saved message longer than the budget is summarized in pieces.
 If the summary cannot be written, that turn leaves the older messages out and the next turn tries again.
 The chat's own tool calls and their results are saved as short `Tool` messages, so a later turn knows what the chat already did.
 Each chat waits on its own answer, so several chats can wait at once.
-On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
 
 The Feedback button and `f` open a composer over any view without changing the URL; on a phone it fills the screen.
 Write an Idea (the default), an Adjustment or a Bug in one text box of up to 4,000 characters; a Bug also shows optional Expected, Actual and Steps boxes of up to 2,000 characters each.
@@ -2086,6 +2086,140 @@ A failed command prints one line with `error` and no `event`, with `code` when t
 `arete run REPO TICKET` asks the server to start the run, as `POST /api/tasks` with `"force"` set by `--force`, prints the answer, then prints the run's lines until its `report` line. It exits 0 when the report's status counts as success, as before, and when the server queued the ticket instead of starting a run. Ctrl-c detaches and leaves the run going. With `--local` or `--dry-run`, or when no server works on its state, it runs in its own process as before. The server and the poller start a classic run with `--local`.
 
 The `justfile` at the top of this checkout wraps these commands in `adw` recipes, one `uv run arete` call each; `just --list` lists them. [adws/README.md](adws/README.md) is the guide for an agent that steers runs with them.
+
+## Merged base use checks
+
+The disabled `merge-check` command loop uses the merged base after pipeline PRs land.
+`arete merged --since-cursor` discovers merged pipeline PRs; `arete merge-check [REPO]` uses their
+saved verification steps against a detached checkout pinned to `origin/<base>`, including an earlier
+overlapping check. `arete merge-check REPO --dry-run` plans without starting anything.
+Run `arete loop try merge-check` to preview held tickets before enabling it
+with `arete loop enable merge-check`. See [the loop guide](arete/loops/README.md#merged-base-use-checks)
+for checkpoints, UTC quotas, blocked-input recovery, the `$finding.repo` ticket selector and queue capacity.
+
+## Offline merge-check fixture
+
+Use a disposable checkout and the verification sandbox. The helper creates only scratch configuration,
+state, two local bare origins, two deliberately stale local main branches, a small local HTTP product
+and replay answers. It never contacts a tracker or provider. Keep the shipped loop disabled. Every
+delivery below uses trial mode, which holds both tickets and metrics. Do not run these commands
+against normal state. Start from an empty fixture directory; retain it for inspection afterward.
+
+```sh
+SB="$HOME/Library/Developer/arete/verification-runtime/harness/sandbox"
+"$SB" python docs/merge-check-fixture.py setup
+"$SB" arete merged --help
+"$SB" arete merge-check --help
+"$SB" arete loop list
+"$SB" arete loop status merge-check
+"$SB" arete merge-check arete-placeholder-missing --dry-run
+"$SB" arete merged --since-cursor
+"$SB" python docs/merge-check-fixture.py check --dry-run
+"$SB" arete loop try merge-check
+"$SB" python docs/merge-check-fixture.py inspect
+```
+
+The unknown repo exits nonzero with one diagnostic. Empty-history discovery prints nothing; try
+finishes skipped with zero model calls. `inspect` shows no quota, checked identities or product starts.
+The fixture helper's `check` action sets `ARETE_LOOP_DIR` to its disposable loop folder. For the
+public command, use `"$SB" env ARETE_LOOP_DIR="$PWD/.arete-sandbox/merge-check-fixture/loop"
+arete merge-check fixture` with the same stdin (on one shell line).
+
+Establish the source baseline with an older neighbour, then add two merges. Polling uses the existing
+engine source transaction. `--at` accepts a recorded UTC timestamp, so equal timestamps and late
+discoveries can be reproduced without changing clocks.
+
+```sh
+"$SB" python docs/merge-check-fixture.py add --pr 1 --at 2026-01-01T00:00:00+00:00
+"$SB" python docs/merge-check-fixture.py poll
+"$SB" python docs/merge-check-fixture.py add --pr 2
+"$SB" python docs/merge-check-fixture.py add --pr 3
+"$SB" python docs/merge-check-fixture.py add --pr 90 --kind nonpipeline
+"$SB" python docs/merge-check-fixture.py add --pr 91 --kind open
+"$SB" python docs/merge-check-fixture.py add --pr 92 --kind no-pr
+"$SB" arete merged --since-cursor
+"$SB" python docs/merge-check-fixture.py poll
+"$SB" python docs/merge-check-fixture.py poll
+"$SB" arete loop try merge-check
+"$SB" arete loop try merge-check
+"$SB" python docs/merge-check-fixture.py event --pr 2 > .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py answer
+"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py inspect
+```
+
+Baseline enqueues no old input. The next poll enqueues the two new PRs once; repeated polling is
+empty. Excluded rows never appear. Try shows origin/main, start and URL templates, the two recent
+PRs, numbered checks and the older neighbour with `version` as the shared file. Try changes no
+consumer state. The first check prints only `{"value":1}`; the redundant event prints nothing.
+Inspect run folders under `.arete-sandbox/state/runs/merge-check-*`: `manifest.json` records the
+pinned SHA, worktree and steps; `result.json`, `verify.md` and `record/` preserve evidence.
+The disposable worktree is released and the server stops. `inspect` extracts START lines from the saved
+server logs to list the actual serving directories.
+
+For a failure add PR 4, select `answer --verdict fail`, supply its event and check again. The answer
+contains PRIVATE markers in its summary, How and Saw; none may appear in emitted findings. The
+finding names the manifest's failed steps, including the neighbour, followed by metric 0. Repeat
+with `--repo fixture-two` on add, event, answer and check to inspect routing to the second repo.
+`arete loop try merge-check` previews the sample failure through the held dynamic ticket emit.
+For an ordinary fixed target and explicit numeric metric, run:
+
+```sh
+"$SB" python docs/merge-check-fixture.py emit
+"$SB" python docs/merge-check-fixture.py emit-dynamic --repo fixture-two
+"$SB" python docs/merge-check-fixture.py emit-dynamic --repo unknown
+"$SB" python docs/merge-check-fixture.py emit-dynamic --repo ''
+```
+
+For late delivery add PR 5 using the same `--at` as PR 4, then poll; add PR 6 with an earlier `--at`
+and poll again. Both keys must be observed once despite their timestamps. `poll --scope-change`
+changes command scope without changing its output; catch-up uses `data.at` and retains old seen
+identities. For an ordinary command source, use the same `sources.poll` helper with a different
+source name/command that prints a constant JSON key: run `poll-ordinary` twice (baseline, then empty),
+then `poll-ordinary --id another` (new scope, recent catch-up follows the ordinary command rules).
+
+For arrivals during a check use `answer --seconds 20`, start `check` in one terminal, and add another
+PR in a second terminal while the server runs. Fetch `/version` at the address in `verify-server.log`:
+it must read `origin-new`, even though local main reads `local-old`. After the first result, create a
+new answer and dispatch the new event: only the next batch includes that merge. Two concurrent
+helper `check` processes serialize on the consumer lock. Run `dispatch` to claim the next polled queue
+item through `engine.carry`, with every ticket held. A second concurrent dispatch reports busy;
+repeated dispatch after quota is capped reports a hold without a subprocess. This uses the existing
+queue and claim recovery while keeping the shipped loop off. The server uses the same queue with
+`merge-check = 1`, so at most one product serves at once.
+
+For prerequisites and incomplete verification add a new PR, then use `fault --pr N --fault report`,
+`malformed`, `diff`, `verify`, `preflight` or `start`. Each saves a `.bak` alongside the affected
+fixture file; `fault --pr N --fault restore` restores it. Missing reports/diffs, malformed checks,
+absent verify configuration and failed preflight must block with no metric or ticket and leave
+the batch unchecked. Failed preflight starts no service or verifier. A product startup crash emits a
+regression finding and metric 0, naming the checks it prevented; sandbox and confinement failures
+remain blocked. `answer --verdict unavailable`,
+`incomplete` or `unknown` exercises unavailable or unaccounted-for results. Restore prerequisites,
+select a passing answer and retry the same event; for scheduler dead input, inspect `arete loop status
+merge-check` and use `arete loop requeue ID` on the scratch server.
+
+Use `answer --verdict limit` for 45 replay actions: the hard cutoff interrupts the call at 40, keeps
+usage/evidence, and blocks without repair. Use a delayed answer and SIGTERM the check process
+to inspect interruption cleanup; a timeout uses the same cleanup path. Unresolved ownership must
+retain and report the worktree, and never advance checked history.
+
+```sh
+"$SB" python docs/merge-check-fixture.py quota
+"$SB" python docs/merge-check-fixture.py check --dry-run
+"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
+"$SB" python docs/merge-check-fixture.py quota --yesterday
+```
+
+With a new pending PR, quota exits 75 (held), starting nothing and recording no result. Scheduler
+dispatch releases the claimed input and consults the persisted reset before attempting again.
+Dry-run displays the hold without reserving. Moving the scratch quota to yesterday makes one
+new check eligible. For no overlap use `add --file unrelated.txt` on an otherwise fresh history;
+the preview must explicitly say no applicable neighbour. For a continuation use `add --pr N
+--continues fixture-fixture-1`: the latest run owns the merge but the earlier run owns its report.
+To reproduce duplicate publication, record the same PR again with a distinct `--id`; discovery keeps
+one canonical URL. Delete nothing from real state to reset a fixture; use a fresh disposable workspace.
 
 ## Rules
 

@@ -17,7 +17,8 @@ def folder(name, code):
                                json.dumps([sys.executable, "-c", code]) + '\n')
 folder("fail", "raise SystemExit(1)")
 folder("ok", "import sys; from pathlib import Path; Path(" + repr(str(root / "received")) +
-       ").write_text(sys.stdin.read())")
+       ").write_text(sys.stdin.read()); print('received input')")
+folder("silent", "pass")
 folder("slow", "import os,time; from pathlib import Path; Path(" + repr(str(root / "ready")) +
        ").write_text(str(os.getpid())); time.sleep(60)")
 def enqueue(name="fail", payload=None, trigger="event"):
@@ -76,7 +77,7 @@ if mode == "outcomes":
     for invalid in (str(item), "9999999", "bad"):
         assert call("requeue", invalid)[0] != 0
     folder("fail", "import sys; from pathlib import Path; Path(" + repr(str(root / "requeued")) +
-           ").write_text(sys.stdin.read())")
+           ").write_text(sys.stdin.read()); print('received requeued input')")
     assert engine.launch("fail", item=item, detach=False)["status"] == "done"
     assert json.loads((root / "requeued").read_text()) == event
     folder("fail", "raise SystemExit(1)")
@@ -88,6 +89,12 @@ if mode == "outcomes":
     engine.launch("fail", item=item, detach=False)
     assert state.queue_item(item) is None
     assert engine.launch("ok", detach=False)["status"] == "done"
+    item = enqueue("silent")
+    with mock.patch.object(engine.delivery, "deliver", side_effect=AssertionError("silent command delivered")), \
+            mock.patch.object(engine.runner, "run", side_effect=AssertionError("silent command called a model")):
+        silent = engine.launch("silent", item=item, detach=False)
+    assert silent["status"] == "skipped" and "no output" in silent["summary"], silent
+    assert state.queue_item(item) is None
     item = enqueue("ok")
     assert state.take_queue_item(item, "first") is True
     assert state.take_queue_item(item, "second") is False

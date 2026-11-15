@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import operator
 import os
 import sys
 import threading
@@ -47,13 +46,21 @@ PRUNE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
 POLL_THREADS = 8
+
+
+def mergecheck_reset(loop: Loop, item: dict) -> str:
+    from . import mergecheck
+
+    payload = state.queue_item(item["id"])
+    names = {e.get("repo", "") for e in payload["payload"]} if payload else set()
+    return max((mergecheck.held_until(loop.dir, name) for name in names), default="")
+
+
 IMPORT_CHECK = "from arete import codebase; codebase.load()"
 CONFIG_CHECK = "from arete import config; config.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 SERVE_LOCK = "serve"
 SERVE_LOCK_FD = "ARETE_SERVE_LOCK_FD"
-COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
-           "!=": operator.ne}
 
 
 @dataclass(frozen=True)
@@ -217,7 +224,6 @@ class Server:
         for loop in live:
             st = states.get(loop.name) or {}
             self.schedule(loop, st, now)
-            self.watch_metric(loop, st)
             self.poll(loop)
         self.forget_unpolled_errors(live)
         self.watch_oncall()
@@ -316,21 +322,6 @@ class Server:
         queued = sources.fire(loop, trigger)
         state.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
         self.say(f"{loop.name}: fired by {trigger}" if queued else f"{loop.name}: {trigger} fire joins the one that waits")
-
-    def watch_metric(self, loop: Loop, st: dict) -> None:
-        if not loop.trigger.metric:
-            return
-        name, op, threshold = loop.trigger.metric
-        value = state.latest_metric(name)
-        if value is None:
-            return
-        on = COMPARE[op](value, threshold)
-        if on and not st.get("metric_on"):
-            if sources.fire(loop, "metric", [sources.metric_event(loop, value)]):
-                self.say(f"{loop.name}: fired by metric {name} = {value:g}")
-            state.set_loop_state(loop.name, metric_on=1)
-        elif not on and st.get("metric_on"):
-            state.set_loop_state(loop.name, metric_on=0)
 
     def poll(self, loop: Loop) -> None:
         for i, source in enumerate(loop.sources):
@@ -439,6 +430,9 @@ class Server:
                 why = f"its {spent} is spent"
             elif held := loop.usage_hold(self.cfg):
                 why = held
+            elif (loop.name == "merge-check" and loop.command == ["arete", "merge-check"]
+                  and (reset := mergecheck_reset(loop, item))):
+                why = f"merge-check quota hold until {reset}"
             else:
                 try:
                     run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)

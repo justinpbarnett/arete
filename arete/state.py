@@ -305,6 +305,18 @@ def paid_by_run(run_ids: list[str], connect=db, local_providers=None) -> dict[st
     return {k: round(v, 6) for k, v in paid.items()}
 
 
+def merged_runs(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "
+            "AND COALESCE(pr_url, '') != '' ORDER BY finished, id")]
+
+
+def source_seen(source: str, connect=db) -> set[str]:
+    with connect() as c:
+        return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
+
+
 def runs_since(since: str, connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
@@ -465,12 +477,6 @@ def add_event(loop: str, e: dict, connect=db) -> int:
                         (loop, e.get("type"), e.get("source"), str(e.get("key")), e.get("repo"), e.get("title"),
                          e.get("url"), e.get("trust"), json.dumps(e.get("data") or {}, default=str)[:20000], util.iso()))
         return cur.lastrowid
-
-
-def recent_events(limit: int = 50, connect=db) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT id, loop, type, source, key, repo, title, url, trust, ts FROM events "
-                                           "ORDER BY id DESC LIMIT ?", (limit,))]
 
 
 def claim_seen(source: str, keys: list[str], connect=db) -> list[str]:
@@ -804,23 +810,6 @@ def incident(incident_id: int, connect=db, last_notes: int = 0) -> dict | None:
                 "repairs": [dict(x) for x in repairs]}
 
 
-def add_metric(name: str, value: float, loop: str = "", run_id: str = "") -> None:
-    with db() as c:
-        c.execute("INSERT INTO metrics (name, value, loop, run_id, ts) VALUES (?,?,?,?,?)",
-                  (name, value, loop, run_id, util.iso()))
-
-
-def latest_metric(name: str) -> float | None:
-    with db() as c:
-        r = c.execute("SELECT value FROM metrics WHERE name = ? ORDER BY ts DESC LIMIT 1", (name,)).fetchone()
-        return r[0] if r else None
-
-
-def metrics_since(since: str, connect=db) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM metrics WHERE ts >= ? ORDER BY ts", (since,))]
-
-
 def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str = "") -> int:
     with db() as c:
         cur = c.execute("INSERT INTO approvals (loop, run_id, emit, summary, status, result, created) "
@@ -945,8 +934,6 @@ def take_messages(run_id: str) -> list[str]:
         return [r["text"] for r in rows]
 
 
-CHAT_COLUMNS = ("title", "project", "created", "updated", "spent", "busy", "session", "session_spent", "runner",
-                "draft_title", "draft_body")
 CHAT_USAGE = ("(SELECT COALESCE(SUM(m.paid_usd), 0) FROM chat_messages m WHERE m.chat_id = chats.id) AS paid_usd, "
               "(SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = chats.id "
               "AND m.paid_usd IS NULL AND m.cost != 0) AS unclassified_messages")
@@ -1067,14 +1054,6 @@ def busy_chats() -> list[int]:
         return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
 
 
-def chat_import(chat: dict, messages: list[tuple]) -> int:
-    with db() as c:
-        chat_id = c.execute(insert_sql("chats", CHAT_COLUMNS), tuple(chat.get(k) for k in CHAT_COLUMNS)).lastrowid
-        c.executemany("INSERT INTO chat_messages (chat_id, sender, text, cost, ts) VALUES (?,?,?,?,?)",
-                      [(chat_id, *m) for m in messages])
-        return chat_id
-
-
 def local_step(step: dict, local_providers) -> bool:
     mode, model = step.get("auth_mode") or "", step.get("model") or ""
     provider = step.get("provider") or (model.partition("/")[0] if "/" in model else "")
@@ -1115,25 +1094,11 @@ def save_hold(c, scope: str, until: str, why: str, ts: str) -> None:
               "THEN excluded.why ELSE holds.why END, ts = max(holds.ts, excluded.ts)", (scope, until, why, ts))
 
 
-def holds(connect=db, include_indefinite: bool = False) -> list[dict]:
+def holds(connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM holds WHERE scope NOT LIKE ? "
-                                           "AND (until > ? OR (? AND until = '')) ORDER BY until",
-                                           (REFRESH_SCOPE + "%", util.iso(), include_indefinite))]
-
-
-def active_hold(scope: str, connect=db, include_indefinite: bool = True) -> dict | None:
-    if scope.startswith(REFRESH_SCOPE):
-        return None
-    with connect() as c:
-        r = c.execute("SELECT * FROM holds WHERE scope = ? AND (until > ? OR (? AND until = ''))",
-                      (scope, util.iso(), include_indefinite)).fetchone()
-    return dict(r) if r else None
-
-
-def hold_until(scope: str, connect=db) -> str:
-    found = active_hold(scope, connect, include_indefinite=False)
-    return found["until"] if found else ""
+                                           "AND (until > ? OR until = '') ORDER BY until",
+                                           (REFRESH_SCOPE + "%", util.iso()))]
 
 
 def clear_holds(scopes: list[str], set_before: str, connect=db) -> None:
@@ -1206,17 +1171,6 @@ def record_refresh(before: str, after: str, previous: str, latest: str, connect=
         for row in rows:
             for scope in linked_scopes(row["scope"], links) - {row["scope"]}:
                 save_hold(c, scope, row["until"], row["why"], row["ts"])
-
-
-def carry_holds(previous: str, latest: str, connect=db) -> None:
-    if not previous or not latest or previous == latest:
-        return
-    with connect() as c:
-        rows = c.execute("SELECT * FROM holds WHERE substr(scope, 1, ?) = ? AND (until = '' OR until > ?)",
-                         (len(previous), previous, util.iso())).fetchall()
-        for row in rows:
-            scope = latest + row["scope"][len(previous):]
-            save_hold(c, scope, row["until"], row["why"], row["ts"])
 
 
 def pass_over(repo: str, issue: str) -> None:
