@@ -573,7 +573,7 @@ def execute(session_id: str) -> str:
             return "busy"
         if (ended := (state.run_get(session_id) or {}).get("status", "gone")) != "running":
             return ended
-        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP)
+        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
         signal.signal(signal.SIGTERM, stop_on_term)
         status, summary = "done", ""
         try:

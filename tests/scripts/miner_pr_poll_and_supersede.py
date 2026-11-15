@@ -10,7 +10,7 @@ second = made("second", "pr", minutes=2, repo=repo.name, issue=run.tid)
 record.note(first, pr_url="one two")
 record.note(second, pr_url="three")
 finished = state.run_get(first)["finished"]
-closed = "2099-01-01T00:00:00+00:00"
+closed = "2099-01-01T00:00:00-05:00"
 def view(url):
     if url == "two":
         pipeline.supersede_older_runs(run, ["one", "two"])
@@ -33,5 +33,6 @@ with mock.patch.object(state, "open_runs", side_effect=snapshot), \
         mock.patch.object(pipeline, "record_feedback"):
     pipeline.supersede_older_runs(run, ["three"])
 assert state.run_get(third)["status"] == "merged"
+assert state.run_get(third)["finished"] == "2099-01-01T05:00:00Z"
 assert not logs, logs
 result(status=row["status"], finished=row["finished"], logs=logs)

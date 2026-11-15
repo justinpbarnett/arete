@@ -2,7 +2,7 @@
 import json, threading, urllib.request, urllib.error
 from arete import codebase, control, dashboard, paths, serve, state, util
 codebase.load()
-state.ensure_schema()
+state.migrate()
 beating = serve.Server()
 beating.beat()
 beating.pool.shutdown()

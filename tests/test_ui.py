@@ -104,7 +104,7 @@ class NewUIShellTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(paths, "STATE_DIR", Path(folder)), \
                 mock.patch.object(paths, "DB_FILE", Path(folder) / "arete.db"), \
                 mock.patch.object(util, "iso", return_value="2026-01-02T03:04:05Z"):
-            state.ensure_schema()
+            state.migrate()
 
             def stored(body):
                 capture.add_context(body, "code123")

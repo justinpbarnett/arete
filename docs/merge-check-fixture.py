@@ -11,13 +11,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from arete import config, control, delivery, engine, lines, loops, mergecheck, paths, record, sources, state, util
+from arete import config, control, delivery, loop_run, loops, mergecheck, paths, record, run_lines, sources, state, util
 
 ROOT = Path(__file__).resolve().parents[1] / ".arete-sandbox" / "merge-check-fixture"
 
 
 def fixture_loop(cfg):
-    loop = loops.load(loops.ENGINE_DIR / "merge-check", "arete", "", cfg)
+    loop = loops.load(loops.BUNDLED_LOOPS_DIR / "merge-check", "arete", "", cfg)
     source = {**loop.sources[0], "command": control.command(["merged", "--since-cursor"])}
     return replace(loop, dir=ROOT / "loop", sources=[source])
 
@@ -62,7 +62,7 @@ def setup():
                  f'layer = {json.dumps(str(ROOT / (name + "-layer")))}\n'
                  f'github = "offline/{name}"\npipeline = true\ntracker = "local"\njev = false\n')
     paths.CONFIG_FILE.write_text(text)
-    shutil.copyfile(loops.ENGINE_DIR / "merge-check" / "loop.toml", ROOT / "loop" / "loop.toml")
+    shutil.copyfile(loops.BUNDLED_LOOPS_DIR / "merge-check" / "loop.toml", ROOT / "loop" / "loop.toml")
     print(ROOT)
 
 
@@ -82,7 +82,7 @@ def add(args):
         "  - How: Open /version and check that it reads origin-new.\n  - Saw: PRIVATE_OLD_SAW\n")
     (folder / "diff.patch").write_text(f"--- a/{args.file}\n+++ b/{args.file}\n@@ -1 +1 @@\n-old\n+new\n")
     if args.continues:
-        lines.write(run_id, "route", continues=args.continues)
+        run_lines.write(run_id, "route", continues=args.continues)
         (folder / "verify.md").unlink()
         (folder / "diff.patch").unlink()
     print(run_id)
@@ -179,8 +179,8 @@ def main():
             record.start("loop", run_id=run_id, loop=loop.name, loop_kind="command", queue="merge-check")
             if not state.take_queue_item(item["id"], run_id):
                 raise ValueError("queue item already claimed")
-            run = engine.LoopRun(loop, run_id, cfg, events=item["payload"])
-            print(engine.carry(run))
+            run = loop_run.LoopRun(loop, run_id, cfg, events=item["payload"])
+            print(loop_run.carry(run))
     elif args.action == "quota":
         folder = ROOT / "loop" / ".state"
         with mergecheck.locked(folder):

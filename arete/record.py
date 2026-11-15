@@ -20,8 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, codebase, gh, paths, state, util, vault
-from . import lines as run_lines
+from . import agent, codebase, gh, paths, run_lines, state, util, vault
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -54,7 +53,7 @@ def new_id(prefix: str, tag: str = "") -> str:
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
-           "engine_sha": codebase.STAMP, **fields}
+           "engine_sha": codebase.STAMP, "schema_version": state.LATEST, **fields}
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)

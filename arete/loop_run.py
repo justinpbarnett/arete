@@ -329,7 +329,7 @@ def carry_opened(run_id: str) -> str:
     cfg = config.load()
     run = LoopRun(loops.find(r["loop"], cfg), run_id, cfg, trial=r["trigger"] == "try", trigger=r["trigger"])
     run.events = util.read_json(run.events_file, [])
-    record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP)
+    record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
     return carry(run)
 
 

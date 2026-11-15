@@ -1,7 +1,7 @@
 
 seed()
 folder = paths.backups_dir()
-folder.mkdir(parents=True)
+folder.mkdir(parents=True, exist_ok=True)
 today = util.now().date()
 planted = []
 for d in range(1, 21):

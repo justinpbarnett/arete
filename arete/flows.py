@@ -6,17 +6,17 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import (
-    asks,
     config,
     diffguard,
     document,
     factory,
     gh,
-    lines,
+    owner_asks,
     paths,
     pipeline,
     record,
     repairs,
+    run_lines,
     runner,
     state,
     tracker,
@@ -60,7 +60,7 @@ def has_origin(repo: config.Repo) -> bool:
 
 def ran_on_seam(run_id: str) -> bool:
     return any(line.get("event") == "route" or (line.get("event") == "step_start" and line.get("step") == "prepare")
-               for line in lines.read(run_id))
+               for line in run_lines.read(run_id))
 
 
 def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: pipeline.RunSlot | None = None,
@@ -169,7 +169,7 @@ def step_runs(run_id: str) -> dict[str, list[dict]]:
     for other in reversed(state.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ)):
         if not other.get("only_step") or other["id"] in known:
             continue
-        read = lines.read(other["id"])
+        read = run_lines.read(other["id"])
         if str(factory.first(read, "route").get("continues") or "") in known:
             known.add(other["id"])
             found[other["id"]] = read
@@ -561,14 +561,14 @@ class Job:
 
 
 def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
-    lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=run.repo.name, title=t.title,
+    run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=run.repo.name, title=t.title,
                 **({"path": run.path} if run.path else {}))
     if run.answers_due:
         for ask in run.answers_due:
-            lines.write(run.id, "answer", asked_in=ask["run"], ask_id=ask["id"], step=ask["step"],
+            run_lines.write(run.id, "answer", asked_in=ask["run"], ask_id=ask["id"], step=ask["step"],
                         answers=ask["answers"])
     elif run.answering:
-        lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
+        run_lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
                     text=pipeline.answer_text(run.answering["id"]))
 
 
@@ -689,7 +689,7 @@ def plan(flow: factory.Flow) -> Outcome:
     estimate = int(found.get("estimated_lines") or 0)
     if found.get("ambiguous") and found.get("question"):
         run.log("plan: ambiguous, asking the author")
-        raise run.owner_ask("plan", [asks.text_ask(str(found["question"]))], res.session)
+        raise run.owner_ask("plan", [owner_asks.text_ask(str(found["question"]))], res.session)
     if estimate > limit:
         split = [s for s in found.get("split") or [] if isinstance(s, dict) and s.get("title")]
         run.log(f"plan: about {estimate} lines, over the {limit} line limit; proposing a {len(split)} part split")
@@ -1142,11 +1142,11 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
         return drive(flow)
     except pipeline.RunFailed as e:
         return finish(flow, "failed", why=e.why, detail=e.detail)
-    except asks.Asked as e:
+    except owner_asks.Asked as e:
         reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
         parks = e.limit is None
-        return finish(flow, "ask", summary=reached + asks.summary(e.sent),
-                      comment=asks.comment(e.sent, flow.ctx.run.tracker.label_name("needs-info"), e.limit,
+        return finish(flow, "ask", summary=reached + owner_asks.summary(e.sent),
+                      comment=owner_asks.comment(e.sent, flow.ctx.run.tracker.label_name("needs-info"), e.limit,
                                            run_id=flow.run_id if parks else ""),
                       asked=[{"ask_id": ask_id, "step": e.step, "call": e.call, "why": ask["why"],
                               "tried": ask.get("tried", ""), "questions": ask["questions"]}
@@ -1155,7 +1155,7 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
 
 
 def alone(flow: factory.Flow) -> tuple[str, str, bool]:
-    found = [line for line in factory.ends(lines.read(flow.run_id)) if line.get("step") == flow.only]
+    found = [line for line in factory.ends(run_lines.read(flow.run_id)) if line.get("step") == flow.only]
     if not found:
         return "failed", f"the script never ran {flow.only}", False
     said = util.first_line(str(found[-1].get("error") or found[-1].get("feedback") or ""), 300)

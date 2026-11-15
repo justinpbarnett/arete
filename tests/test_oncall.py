@@ -25,6 +25,8 @@ class Scratch(unittest.TestCase):
                     "ARETE_STATE_DIR": str(self.state), "ARETE_CONFIG_DIR": str(self.config),
                     "ARETE_LOG_DIR": str(self.logs), "ARETE_WORKTREES_DIR": str(self.wt)}
         self.write_config(ON)
+        done = self.py("from arete import state; state.migrate()")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.log = self.logs / "app.log"
 
     def write_config(self, text):
@@ -515,12 +517,12 @@ class Backlogs(Scratch):
     def test_a_run_that_starts_and_ends_during_a_slow_scan_is_read_by_the_next(self):
         self.baseline()
         code = ("import time\n"
-                "from arete import config, lines, oncall, record, state\n"
+                "from arete import config, run_lines, oncall, record, state\n"
                 "original = oncall.Watch.run_files\n"
                 "def slow(self, since):\n"
                 "    found = original(self, since)\n"
                 "    run = record.start('pipeline', repo='demo', issue=9)\n"
-                "    lines.write(run, 'error', step='build', message='boom during the scan')\n"
+                "    run_lines.write(run, 'error', step='build', message='boom during the scan')\n"
                 "    with state.db() as c:\n"
                 "        c.execute(\"UPDATE runs SET status = 'failed' WHERE id = ?\", (run,))\n"
                 "    time.sleep(1.2)\n"
@@ -984,14 +986,17 @@ class Decisions(Scratch):
         self.assertEqual({i["decision"] for i in self.incidents()}, {"wake"})
 
     def test_a_database_with_the_part_one_columns_gains_the_new_ones(self):
-        self.baseline()
-        self.append(self.error(1))
-        self.scan()
-        self.sql("DROP TABLE incidents")
+        self.state = Path(self.tmp.name) / "legacy-state"
+        self.state.mkdir()
+        self.env["ARETE_STATE_DIR"] = str(self.state)
         self.sql("CREATE TABLE incidents (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT NOT NULL, "
                  "class TEXT NOT NULL, source TEXT NOT NULL, repo TEXT DEFAULT '', signature TEXT DEFAULT '', "
                  "state TEXT NOT NULL DEFAULT 'open', first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, "
                  "count INTEGER DEFAULT 1, evidence TEXT DEFAULT '')")
+        done = self.py("from arete import state; state.migrate()")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue({"decision", "policies"} <= {r[1] for r in self.sql("PRAGMA table_info(incidents)")})
+        self.baseline()
         self.append(self.error(2))
         self.scanned()
         one = self.only()
@@ -2100,7 +2105,7 @@ SERVER = '''
 import json, os, threading, urllib.error, urllib.request
 from datetime import timedelta
 from arete import board, dashboard, oncall, record, state, util
-state.ensure_schema()
+state.migrate()
 ALERTS = []
 oncall.raise_alert = lambda *a: ALERTS.append(a)
 

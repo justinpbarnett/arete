@@ -1,8 +1,9 @@
 
 import contextlib, fcntl, hmac, io, json, os, sys
 from pathlib import Path
-from arete import browser, cli, hooks, record, scratch, util
+from arete import browser, cli, webhooks, record, scratch, state, util
 root, mode = Path(sys.argv[1]), sys.argv[2]
+state.migrate()
 scratch.AUTHORITY = root / "home/verification-authority"
 A = scratch.AUTHORITY
 def rotate():
@@ -16,7 +17,7 @@ if mode == "seed":
             scratch.store(fd, key, {"version": 2, "attempt": {"selector": f"{i:064x}"}, "state": s,
                                     "source_mutations": False})
     browser.write_pin({"@playwright/mcp": {"version": "0.0.0", "integrity": "sha512-demo"}})
-    hooks.secret("demo")
+    webhooks.secret("demo")
 elif mode == "rotate":
     rotate()
 elif mode == "kill-first-note":

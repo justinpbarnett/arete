@@ -9,7 +9,6 @@ from datetime import timedelta
 from pathlib import Path
 
 from . import (
-    asks,
     chat,
     config,
     control,
@@ -17,11 +16,12 @@ from . import (
     flows,
     gh,
     jira,
-    lines,
+    owner_asks,
     paths,
     pipeline,
     record,
     repairs,
+    run_lines,
     runlimits,
     runner,
     state,
@@ -32,10 +32,11 @@ from . import (
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
-STEER_LOCK = asks.STEER_LOCK
+STEER_LOCK = owner_asks.STEER_LOCK
 POLLER_LATER = "the poller starts it when a slot frees"
 RESUMABLE = ("interrupted", "stopped", "failed")
 MAX_ANSWER_CHARS = 20000
+TICKET_CLOSED = "its ticket closed while it waited for an answer"
 
 
 class TrackerFailed(RuntimeError):
@@ -246,7 +247,7 @@ def store_answer(cfg: config.Config, repo: config.Repo, tid: str, text: str) -> 
 
 
 def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: list[dict], text: str) -> dict:
-    if any(asks.has_secret(a["questions"]) for a in waiting):
+    if any(owner_asks.has_secret(a["questions"]) for a in waiting):
         raise control.Refused(f"run {row['id']} asks a secret question, which a text reply cannot answer; answer it "
                               f"on the dashboard or with `arete answer {row['id']}`")
     tid = str(row["issue"])
@@ -254,7 +255,7 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
     command = continuing(cfg, repo, row)
     kept = store_answer(cfg, repo, tid, text)
     for a in waiting:
-        state.ask_close(a["id"], "answered", asks.text_answers(a, text))
+        state.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
     started = continue_asked(cfg, repo, row, command)
     return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 
@@ -283,10 +284,10 @@ def answer_ask(ask_id: str, body) -> dict:
                 raise control.Refused('To stop the run, send {"stop": true} alone')
             return let_go(cfg, repo, row, "stopped")
         try:
-            answers = asks.answers_for(ask, body)
+            answers = owner_asks.answers_for(ask, body)
         except (ValueError, TypeError) as e:
             raise control.Refused(str(e)) from None
-        given = asks.secret_values(ask, body)
+        given = owner_asks.secret_values(ask, body)
         if problems := [f"{name}: {why}" for name, value in given.items()
                         if (why := runner.reserved(name) or vault.unfit(value))]:
             raise control.Refused("; ".join(problems) + "; nothing was stored")
@@ -365,10 +366,15 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
             raise control.Busy(f"a run of {name}")
         if status == "stopped" and not record.move(run_id, "stopped", expect=("needs-info",), summary=record.STOPPED):
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
-        state.asks_retire(run_id, status)
+        if status == "closed" and not record.move(run_id, "stopped", expect=("needs-info",), summary=TICKET_CLOSED):
+            raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
+        state.asks_retire(run_id, "stopped" if status == "closed" else status)
         latest = not state.later_run(repo.name, tid, run_id)
         removed = latest and kept_folder_removed(repo, tid, run_id)
         folder = "its work folder is removed" if removed else "its work folder was left in place"
+        if status == "closed":
+            pipeline.write_report(state.run_get(run_id) or row)
+            return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped because {name} closed; {folder}")
         run = pipeline.Run(run_id, repo, paths.RUNS_DIR / run_id, tracker=tracker.for_ticket(cfg, repo, tid), tid=tid)
         run.dir.mkdir(parents=True, exist_ok=True)
         if status == "stopped":
@@ -401,6 +407,30 @@ def expire_asks(cfg: config.Config) -> list[str]:
             try:
                 notes.append(let_go(cfg, repo, row, "expired")["why"])
             except control.Busy:
+                continue
+    return notes
+
+
+def release_closed(cfg: config.Config) -> list[str]:
+    notes = []
+    for run_id in dict.fromkeys(a["run"] for a in state.open_asks()):
+        try:
+            _, repo, row = run_of(run_id)
+        except (control.NotFound, control.Refused):
+            continue
+        tid = str(row["issue"])
+        if row["status"] != "needs-info" or state.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid):
+            continue
+        if not pipeline.ticket_closed(cfg, repo.name, tid, row["status"]):
+            continue
+        with util.lock(STEER_LOCK, wait=True):
+            row = state.run_get(run_id) or row
+            if (not state.asks_of(run_id, "open") or row["status"] != "needs-info"
+                    or state.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid)):
+                continue
+            try:
+                notes.append(let_go(cfg, repo, row, "closed")["why"])
+            except (control.Busy, control.Refused):
                 continue
     return notes
 
@@ -501,7 +531,7 @@ def removed_tree(run_id: str, step: str) -> str:
 
 
 def last_report(run_id: str) -> dict:
-    return next((line for line in reversed(lines.read(run_id)) if line.get("event") == lines.END), {})
+    return next((line for line in reversed(run_lines.read(run_id)) if line.get("event") == run_lines.END), {})
 
 
 def view(task_id: str, repo_name: str = "") -> dict:

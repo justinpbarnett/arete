@@ -2,7 +2,8 @@
 import hashlib, hmac, json, os, signal, sqlite3, sys, threading, urllib.error, urllib.request
 from datetime import timedelta
 from pathlib import Path
-from arete import config, dashboard, hooks, loops, paths, serve, sources, state, util
+from arete import config, dashboard, webhooks, loops, paths, serve, sources, state, util
+state.migrate()
 root = Path(os.environ["INTAKE_ROOT"])
 rows = root / "rows.jsonl"
 def make_loop(name="intake", trigger="", webhook=False):
@@ -69,10 +70,10 @@ def post(server, name, body, headers):
     with got:
         return got.code, json.loads(got.read() or b"{}")
 def signed(name, body, delivery):
-    key = hooks.secret(name)
+    key = webhooks.secret(name)
     return {"X-GitHub-Delivery": delivery,
             "X-Hub-Signature-256": "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()}
 def token(name, **more):
-    return {"X-Arete-Token": hooks.secret(name), **more}
+    return {"X-Arete-Token": webhooks.secret(name), **more}
 def finish(result):
     print("BEHAVIOR_RESULT=" + json.dumps(result))

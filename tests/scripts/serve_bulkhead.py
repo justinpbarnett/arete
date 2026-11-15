@@ -3,16 +3,16 @@ from concurrent.futures import wait
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
-from arete import alerts, board, cli, config, control, engine, explain, heartbeat, loops, oncall, paths, runner, serve, state, tasks, util, webpush
+from arete import alerts, board, cli, config, control, loop_run, explain, heartbeat, loops, oncall, paths, runner, serve, state, tasks, util, webpush
 
 root, mode = Path(sys.argv[1]), sys.argv[2]
 real_out = sys.stdout
 LOG = paths.LOG_DIR / "serve.log"
 GOOD = '[replay]\nall = true\n\n[jev]\nenabled = false\n'
 paths.ensure_dirs()
-state.ensure_schema()
+state.migrate()
 paths.CONFIG_FILE.write_text(GOOD + ('\n[oncall]\nenabled = true\n' if mode == "oncall" else ''))
-loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.ENGINE_DIR.iterdir() if p.is_dir()}))
+loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
 EVENT = {"type": "test", "title": "item", "data": {"value": 1}, "trust": "internal"}
 launched, calls = [], []
 
@@ -88,7 +88,7 @@ for name in ("aaa", "bbb"):
     make_loop(name)
 sys.stdout = LOG.open("a", buffering=1)
 server = new_server()
-patches = [mock.patch.object(engine, "launch", fake_launch), mock.patch.object(runner, "usage_hold", lambda *a, **k: ""),
+patches = [mock.patch.object(loop_run, "launch", fake_launch), mock.patch.object(runner, "usage_hold", lambda *a, **k: ""),
            mock.patch.object(webpush, "remind", lambda cfg: []), mock.patch.object(state, "release_settled_claims", lambda: None)]
 for p in patches:
     p.start()
@@ -188,7 +188,7 @@ elif mode == "waits":
     out["group"] = [launched.count("aaa"), len([x for x in log_lines() if f"queue item {two} waits, group g takes one at a time" in x])]
     clear()
     launched.clear()
-    for fault in (engine.NeverBegan("did not begin"), control.Refused("not now")):
+    for fault in (loop_run.NeverBegan("did not begin"), control.Refused("not now")):
         one, two = queued("g", "g")
         calls.append(fault)
         run(server, due=False)
@@ -205,7 +205,7 @@ elif mode == "waits":
 
     def never(self, cfg, connect=None):
         raise AssertionError("usage_hold asked after a spent limit")
-    with mock.patch.object(engine, "spent_limit", lambda loop, cfg: "daily budget"), mock.patch.object(loops.Loop, "usage_hold", never):
+    with mock.patch.object(loop_run, "spent_limit", lambda loop, cfg: "daily budget"), mock.patch.object(loops.Loop, "usage_hold", never):
         beat = run(server, due=False)
     out["spent"] = [len([x for x in log_lines() if f"queue item {item} waits, its daily budget is spent" in x]), list(beat["failing"])]
     clear()
