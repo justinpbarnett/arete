@@ -48,15 +48,16 @@ def metric_event(loop: Loop, value: float) -> dict:
                  trust="internal", data={"metric": name, "value": value, "rule": f"{op} {threshold:g}"})
 
 
-def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
+def fire(loop: Loop, how: str, events: list[dict] | None = None, connect=state.db) -> list[int]:
     if events is None:
-        return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how)) else []
+        return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how, connect=connect)) else []
     batches: dict[str, list[dict]] = {}
     for e in events:
         if not loop.trigger.refusal(e):
-            state.add_event(loop.name, e)
+            state.add_event(loop.name, e, connect)
             batches.setdefault(loop.trigger.group_of(e), []).append(e)
-    return [state.enqueue(loop.name, loop.queue_name, group, how, batch) for group, batch in batches.items()]
+    return [state.enqueue(loop.name, loop.queue_name, group, how, batch, connect)
+            for group, batch in batches.items()]
 
 
 def github_name(cfg: config.Config, name: str) -> str:
@@ -67,20 +68,22 @@ def github_name(cfg: config.Config, name: str) -> str:
     return cfg.repo(name).github
 
 
-def poll(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
+def poll(loop: Loop, index: int, cfg: config.Config) -> tuple[list[dict], list[int]]:
     source = loop.sources[index]
     sid = source_id(loop, index)
     owner = fingerprint(source)
     known = state.cursor(sid)
     first = known is None or state.source_owner(sid) not in (None, owner)
     found, value = SOURCES[source["type"]].fetch(loop, source, cfg, sid, None if first else known["value"])
-    seen = state.seen_keys(sid)
-    fresh = [e for e in found if e["key"] not in seen]
-    fresh = list({e["key"]: e for e in fresh}.values())
-    state.mark_seen(sid, [e["key"] for e in fresh])
-    state.set_cursor(sid, value, True, f"{len(found)} read, {len(fresh)} new{' (baseline)' if first else ''}")
-    state.set_source_owner(sid, owner)
-    return [] if first else fresh
+    unique = {e["key"]: e for e in found}
+    with state.transaction() as connect:
+        claimed = set(state.claim_seen(sid, list(unique), connect))
+        fresh = [e for k, e in unique.items() if k in claimed]
+        items = [] if first else fire(loop, "event", fresh, connect)
+        state.set_cursor(sid, value, True, f"{len(found)} read, {len(fresh)} new{' (baseline)' if first else ''}",
+                         connect)
+        state.set_source_owner(sid, owner, connect)
+    return ([], []) if first else (fresh, items)
 
 
 def peek(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
