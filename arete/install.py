@@ -4,6 +4,7 @@ import os
 import plistlib
 import re
 import shutil
+import sys
 from pathlib import Path
 
 from . import config, paths, tracker, util
@@ -191,11 +192,84 @@ def uninstall() -> int:
     return 0
 
 
-def rotate_logs(max_bytes: int = 5_000_000) -> None:
-    for f in paths.LOG_DIR.glob("*.log"):
+SERVE_LOG = "serve.log"
+
+
+def check_keep(keep: int) -> None:
+    if keep < 1:
+        raise ValueError(f"keep must be at least 1, not {keep}")
+
+
+def archive_name(f: Path, n: int) -> Path:
+    return f.with_name(f"{f.name}.{n}")
+
+
+def rotate_by_rename(f: Path, keep: int) -> list[str]:
+    step = "shift"
+    try:
+        for n in range(keep - 1, 0, -1):
+            try:
+                os.replace(archive_name(f, n), archive_name(f, n + 1))
+            except FileNotFoundError:
+                continue
+        step = "rename"
+        os.replace(f, archive_name(f, 1))
+    except OSError as e:
+        return [f"{f.name}: {step} failed: {e}"]
+    return []
+
+
+def rotate_logs(max_bytes: int = 5_000_000, keep: int = 5) -> list[str]:
+    check_keep(keep)
+    notes: list[str] = []
+    with util.lock("rotate-logs", wait=False) as held:
+        if not held:
+            return ["another rotation holds the rotate-logs lock, so no log was rotated"]
         try:
-            if f.stat().st_size > max_bytes:
-                shutil.copyfile(f, f.with_suffix(".log.1"))
-                os.truncate(f, 0)
-        except OSError:
-            pass
+            found = sorted(paths.LOG_DIR.glob("*.log"))
+        except OSError as e:
+            return [f"{paths.LOG_DIR.name}: list failed: {e}"]
+        for f in found:
+            if f.name == SERVE_LOG:
+                continue
+            try:
+                size = f.stat().st_size
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                notes.append(f"{f.name}: inspect failed: {e}")
+                continue
+            if size > max_bytes:
+                notes.extend(rotate_by_rename(f, keep))
+    return notes
+
+
+def rotate_own_log(max_bytes: int = 5_000_000, keep: int = 5) -> list[str]:
+    check_keep(keep)
+    f = paths.LOG_DIR / SERVE_LOG
+    try:
+        mine = os.fstat(1)
+        current = f.stat()
+    except OSError:
+        return []
+    if (mine.st_dev, mine.st_ino) != (current.st_dev, current.st_ino) or current.st_size <= max_bytes:
+        return []
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except (OSError, ValueError) as e:
+        return [f"{f.name}: flush failed: {e}"]
+    if notes := rotate_by_rename(f, keep):
+        return notes
+    try:
+        fd = os.open(f, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    except OSError as e:
+        return [f"{f.name}: open failed: {e}"]
+    try:
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+    except OSError as e:
+        return [f"{f.name}: dup2 failed: {e}"]
+    finally:
+        os.close(fd)
+    return []
