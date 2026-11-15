@@ -272,6 +272,7 @@ CREATE TABLE IF NOT EXISTS triage (
     kind TEXT DEFAULT '',
     repos TEXT DEFAULT '[]',
     assumptions TEXT DEFAULT '[]',
+    checks TEXT DEFAULT '[]',
     in_sprint INTEGER DEFAULT 0,
     parent TEXT DEFAULT '',
     closed TEXT DEFAULT ''         -- delivery time of a research ticket shown for 7 days after it left the open ones
@@ -286,6 +287,7 @@ CREATE TABLE IF NOT EXISTS triage_approvals (
     size TEXT,
     plan TEXT,
     assumptions TEXT,
+    checks TEXT DEFAULT '[]',
     why TEXT,
     ts TEXT,
     tracker TEXT DEFAULT 'jira',
@@ -584,6 +586,8 @@ MIGRATIONS = [("cursors", "last_ok", "ALTER TABLE cursors ADD COLUMN last_ok TEX
               ("triage", "kind", "ALTER TABLE triage ADD COLUMN kind TEXT DEFAULT ''"),
               ("triage", "repos", "ALTER TABLE triage ADD COLUMN repos TEXT DEFAULT '[]'"),
               ("triage", "assumptions", "ALTER TABLE triage ADD COLUMN assumptions TEXT DEFAULT '[]'"),
+              ("triage", "checks", "ALTER TABLE triage ADD COLUMN checks TEXT DEFAULT '[]'"),
+              ("triage_approvals", "checks", "ALTER TABLE triage_approvals ADD COLUMN checks TEXT DEFAULT '[]'"),
               ("triage", "in_sprint", "ALTER TABLE triage ADD COLUMN in_sprint INTEGER DEFAULT 0"),
               ("triage", "parent", "ALTER TABLE triage ADD COLUMN parent TEXT DEFAULT ''"),
               ("feedback", "asks", "ALTER TABLE feedback ADD COLUMN asks REAL"),
@@ -2119,11 +2123,11 @@ def mined_urls() -> set[str]:
 
 TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
                   "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint", "parent",
-                  "closed")
-TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions")
+                  "closed", "checks")
+TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions", "checks")
 APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "plan", "assumptions", "why", "ts", "tracker",
-                    "sent_by")
-APPROVAL_LISTS = ("plan", "assumptions")
+                    "sent_by", "checks")
+APPROVAL_LISTS = ("plan", "assumptions", "checks")
 RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
                     "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")
 
