@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -10,7 +11,22 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, environment, gh, paths, record, runner, scratch, state, tracker, util, vault, verify
+from . import (
+    codebase,
+    config,
+    environment,
+    gh,
+    paths,
+    record,
+    runner,
+    scratch,
+    state,
+    steps,
+    tracker,
+    util,
+    vault,
+    verify,
+)
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
@@ -66,6 +82,7 @@ class EvalRun(AgentRun):
     trial: str = ""
     reviews: bool = False
     checks_required: bool = False
+    harness_paths: list[str] = field(default_factory=list)
 
     @property
     def ref(self) -> str:
@@ -89,12 +106,48 @@ class EvalRun(AgentRun):
 class Prompts:
     dir: Path = paths.PROMPTS_DIR
     label: str = ""
+    commit: str = ""
 
     def missing(self) -> list[str]:
         return [f"{name}.md" for name in BUILDER_PROMPTS if not (self.dir / f"{name}.md").is_file()]
 
     def applied_to(self, harness: str) -> str:
         return f"{harness} with prompts {self.label}" if self.label else harness
+
+
+def prompts_digest(prompts: Prompts) -> str:
+    files = {p.name: p for p in paths.PROMPTS_DIR.glob("*.md")}
+    files.update({f"{name}.md": prompts.dir / f"{name}.md" for name in BUILDER_PROMPTS})
+    return util.digest(*(part for name, p in sorted(files.items()) for part in (name, p.read_bytes())))
+
+
+def prompts_from(prompts: Prompts) -> str:
+    if prompts.commit:
+        return f"{prompts.label}@{prompts.commit[:12]} {prompts.dir.relative_to(paths.RUNS_DIR).as_posix()}"
+    return str(prompts.dir) if prompts.dir != paths.PROMPTS_DIR else ""
+
+
+def lineage_changes(before: dict, after: dict, skip=()) -> list[str]:
+    changed = []
+    for key, name in (("engine_sha", "Arete"), ("prompts_sha", "prompts"),
+                      ("base_commit", "base"), ("context_sha", "harness")):
+        if name not in skip and before.get(key, "") != after.get(key, ""):
+            changed.append(f"Arete {before.get(key, '')} to {after.get(key, '')}" if name == "Arete" else name)
+    old, new = (json.loads(row.get("settings") or "{}") for row in (before, after))
+    for key in sorted(old.keys() | new.keys()):
+        if key == "models":
+            a, b = old.get(key, {}), new.get(key, {})
+            for role in sorted(a.keys() | b.keys()):
+                name = f"{role} model"
+                if name not in skip and a.get(role) != b.get(role):
+                    changed.append(f"{name} {a.get(role, '')} to {b.get(role, '')}")
+        elif key not in skip and old.get(key) != new.get(key):
+            changed.append(key.replace("_", " "))
+    return changed
+
+
+def has_lineage(row: dict) -> bool:
+    return any(row.get(k) for k in state.EVAL_LINEAGE[:6])
 
 
 @dataclass
@@ -292,7 +345,7 @@ def base_without_evals(repo_path: Path, sha: str, beside: Path) -> Base:
     return made
 
 
-def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> None:
+def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> str:
     shutil.rmtree(dest, ignore_errors=True)
     sha = git(["rev-parse", f"{base}^{{commit}}"], repo_path).strip()
     dest.mkdir(parents=True)
@@ -302,6 +355,7 @@ def checkout_without_origin_refs(repo_path: Path, base: str, dest: Path) -> None
         git(["fetch", "-q", "--no-tags", str(made.path), made.snapshot], dest, timeout=600)
     write_files_through_repo(made.git_dir, made.snapshot, dest)
     git(["checkout", "-q", "-B", "main", "FETCH_HEAD"], dest)
+    return sha
 
 
 def commit_overlay(wt: Path) -> None:
@@ -317,6 +371,7 @@ def fetch_origin(repo: config.Repo) -> None:
 
 def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.RepoLayer:
     copied = overlay_harness(src, wt)
+    run.harness_paths = copied
     run.log(f"harness from {src.label} ({len(copied)} files)")
     layer = config.load_layer(repo.layer or wt / ".agents")
     for c in layer.copy:
@@ -351,6 +406,25 @@ def step_call(cfg: config.Config, run: EvalRun, role: str, tools: list[str], rul
     if run.trial:
         return {"role": role, "allowed_tools": rules}
     return {"model": cfg.model(config.INHERITS.get(role, role)), "allowed_tools": tools + rules}
+
+
+def context_digest(src: Source, repo: config.Repo, run: EvalRun, expertise: str) -> str:
+    parts = []
+    for name in sorted(run.harness_paths):
+        link = src.link(name)
+        parts.extend((name, link.encode() if link is not None else src.read(name)))
+    if repo.layer and (repo.layer / "config.toml").exists():
+        parts.extend(("layer/config.toml", (repo.layer / "config.toml").read_bytes()))
+    return util.digest(*parts, "expertise", expertise)
+
+
+def eval_settings(cfg: config.Config, layer: config.RepoLayer) -> str:
+    grade = steps.resolve(cfg, layer, "eval_grade")
+    models = {role: cfg.model(config.INHERITS.get(role, role)) for role in ("plan", "build", "check_repair")}
+    models.update(review=steps.resolve(cfg, layer, "review").model, eval_grade=grade.model)
+    return json.dumps({"models": models, "runner": grade.runner, "effort": grade.effort, "tier": grade.tier,
+                       "builder_bash": layer.builder_bash, "checks": layer.checks,
+                       "denied_paths": denied_paths(layer)}, sort_keys=True)
 
 
 def switched_prompt(which: str, wt: Path, task: Task, plan: str, summary: str, feedback: str) -> str:
@@ -392,13 +466,14 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
     wt = paths.WORKTREES_DIR / "-".join(filter(None, ["eval", repo.name, task.name, run.trial]))
     started = time.time()
     result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "paid": 0.0, "seconds": 0.0,
-              "repairs": 0, "failures": [], "checks": "", "verify": "", "hidden": "", "blocking": None}
+              "repairs": 0, "failures": [], "checks": "", "verify": "", "hidden": "", "blocking": None,
+              "base_commit": "", "context_sha": "", "settings": ""}
     try:
         if not task.check and not task.verify:
             raise RunFailed("the task has neither `check` nor `verify`")
         fetch_origin(repo)
-        checkout_without_origin_refs(repo.path, base, wt)
-        run.log(f"checkout at {base}")
+        result["base_commit"] = checkout_without_origin_refs(repo.path, base, wt)
+        run.log(f"checkout at {base} ({result['base_commit'][:12]})")
         layer = prepare(repo, src, wt, run)
         if run.trial:
             run.cfg, run.layer = cfg, layer
@@ -408,6 +483,8 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
             raise RunFailed("the task has `verify` steps but the layer has no `[verify]` section")
 
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
+        result["context_sha"] = context_digest(src, repo, run, expertise)
+        result["settings"] = eval_settings(cfg, layer)
         checks = check_list(layer)
         timeout = task.timeout_minutes * 60
         check_commands, check_rules = check_script(run_dir, layer, wt)
@@ -532,14 +609,22 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False, pr
 def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Task], tag: str,
               prompts: Prompts) -> Arm:
     label = prompts.applied_to(src.label)
+    engine = codebase.load()
+    lineage = {"engine_sha": engine, "prompts_sha": prompts_digest(prompts), "prompts_from": prompts_from(prompts)}
     run_id = record.start("eval", tag=tag, lock=state.run_lock("eval", repo.name), repo=repo.name)
     results = []
     with record.failed_on_crash(run_id):
         for t in tasks:
             prior = state.task_history(repo.name, t.name, 3)
+            after_step = state.last_step_id(run_id)
             r = run_task(cfg, repo, src, t, run_id, False, prompts)
-            state.add_eval(run_id, repo.name, t.name, r["passed"], r["seconds"], r["cost"], label)
-            r["regressed"] = len(prior) == 3 and all(prior) and not r["passed"]
+            current = {**lineage, **{k: r[k] for k in ("base_commit", "context_sha", "settings")},
+                       "after_step": after_step, "last_step": state.last_step_id(run_id)}
+            state.add_eval(run_id, repo.name, t.name, r["passed"], r["seconds"], r["cost"], label, current)
+            r["regressed"] = len(prior) == 3 and all(p["passed"] for p in prior) and not r["passed"]
+            if r["regressed"]:
+                r["changed"] = (lineage_changes(prior[0], current) or ["nothing recorded changed"]
+                                if has_lineage(prior[0]) else ["the last pass predates lineage"])
             results.append(r)
         arm = Arm(run_id, results)
         summary = f"{arm.score} passed on {label}"
@@ -547,7 +632,7 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
     print(f"{repo.name}: {summary}, {util.paid_note(record.metered_spent(run_id))}")
     for r in results:
         print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s {util.paid_note(r['paid']):>12} {r['why']}"
-              + ("  REGRESSED" if r["regressed"] else ""))
+              + (f"  REGRESSED: {', '.join(r['changed'])}" if r["regressed"] else ""))
     (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, label, results))
     return arm
 
@@ -557,10 +642,11 @@ def results_md(repo: str, source: str, results: list[dict]) -> str:
     lines = [f"Evals for {repo} on `{source}`: {passed}/{len(results)} passed.", "",
              "| task | result | time | paid |", "|---|---|---|---|"]
     for r in results:
-        why = r["why"].replace("|", "\\|")
+        why = r["why"]
         res = "pass" if r["passed"] else f"fail ({why})"
         if r.get("regressed"):
-            res += ", passed the three runs before"
+            res += f", passed the three runs before; REGRESSED: {', '.join(r['changed'])}"
+        res = res.replace("|", "\\|")
         lines.append(f"| {r['task']} | {res} | {r['seconds']:.0f}s | ${r['paid']:.2f} |")
     return "\n".join(lines) + "\n"
 
@@ -592,6 +678,14 @@ def compare(repo_name: str, ref: str) -> str:
     line = f"Evals on this branch: {a['passed']}/{a['total']} passed"
     if base:
         line += f"; the last baseline run (`{base['source']}`, {base['ts'][:10]}) passed {base['passed']}/{base['total']}"
+        baseline = {r["task"]: r for r in state.eval_rows(base["run_id"])}
+        changes = []
+        for row in state.eval_rows(a["run_id"]):
+            if prior := baseline.get(row["task"]):
+                changes.extend(lineage_changes(prior, row, skip=("harness",)) if has_lineage(prior)
+                               else ["the baseline predates lineage"])
+        if changes:
+            line += f"; since that run: {', '.join(dict.fromkeys(changes))}"
     table = (paths.RUNS_DIR / a["run_id"] / "results.md")
     return (line + ".\n\n" + (table.read_text() if table.exists() else "")
             + "\nThe repo's eval tasks, run with this branch's harness.\n")
@@ -614,6 +708,8 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
     root = paths.RUNS_DIR / record.new_id("eva", "prompts")
     arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
             "pr": Prompts(root / "pr", f"origin/{branch}")}
+    for p in arms.values():
+        p.commit = git(["rev-parse", f"{p.label}^{{commit}}"], arete.path).strip()
     _, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
     fork = git(["merge-base", arms["main"].label, arms["pr"].label], arete.path).strip()
     before = export_prompts(arete, fork, root / "fork")

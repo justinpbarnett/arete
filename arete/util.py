@@ -22,6 +22,15 @@ PROBE_GRACE_SECONDS = 0.2
 TIMED_OUT = 124
 
 
+def digest(*parts: bytes | str) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        data = part.encode() if isinstance(part, str) else part
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
 def engine_commit() -> str:
     from . import codebase
 
