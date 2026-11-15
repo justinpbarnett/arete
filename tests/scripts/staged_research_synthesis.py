@@ -1,5 +1,5 @@
 
-import json, os, sys, time
+import json, os, sys, tempfile, time
 from pathlib import Path
 from arete import config, paths, research, runner, steps
 root = Path(sys.argv[1])
@@ -40,7 +40,7 @@ def drive(ref, run_id, cfg):
     os.environ["ARETE_RUN_ID"] = run_id
     values = {"ref": ref, "title": "Invented", "ticket": "Find the limit.", "related": "none", "repos": "none"}
     start = len(calls)
-    res, paid = research.staged(cfg, ref, values, research.filing(None, ""), research.REPORTS_DIR, [], [],
+    res, paid = research.staged(cfg, ref, values, research.filing(None, ""), tempfile.mkdtemp(), [], [],
                                 time.monotonic(), False)
     evidence = research.research_search.evidence_file(ref)
     return {"ok": res.ok, "error": res.error, "structured": res.structured, "paid": paid,

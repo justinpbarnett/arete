@@ -1083,9 +1083,8 @@ def local_codex(kw: dict, cfg: config.Config, run_id: str, say: Callable[[str], 
     kw["judge"] = cfg.jev.guard
     if scratch:
         kw["scratch"] = tuple(scratch)
-    if cfg.jev.guard and guard.wanted(kw.get("tools")):
-        if note := judge_note(cfg, kw["passing"], repo):
-            say(note)
+    if cfg.jev.guard and guard.wanted(kw.get("tools")) and (note := judge_note(cfg, kw["passing"], repo)):
+        say(note)
     return kw
 
 

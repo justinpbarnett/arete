@@ -271,7 +271,7 @@ def record_dir(run_id: str) -> Path:
 
 
 def draft_dir(run_id: str) -> Path:
-    return STATE_DIR / "drafts" / run_id
+    return RUNS_DIR / run_id / "draft"
 
 
 def ensure_dirs() -> None:

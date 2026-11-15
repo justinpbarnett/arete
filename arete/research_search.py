@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -345,8 +346,6 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
     stage_deadline = time.monotonic() + cap_seconds if room else 0.0
     say(ref, f"{head}searching: {util.count(len(tasks), 'task')}, {size} workers, {s.runner} {s.model}, "
              f"tools {', '.join(s.tools)}, cap {util.money(float(cap))} and {round(cap_seconds / 60) if room else 0} minutes")
-    cwd = FOLDER / "search" / tracker.safe_filename(ref)
-    cwd.mkdir(parents=True, exist_ok=True)
     outcomes: dict[int, Outcome] = {}
     allowances: dict[int, Decimal] = {}
     pending = list(range(first, first + len(tasks)))
@@ -354,7 +353,7 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
     spent = committed = Decimal(0)
     status, stop = ("done", "") if room else ("capped", "planning left no room for search")
     floor = dec(runner.BUDGET_FLOOR_USD)
-    with ThreadPoolExecutor(size) as pool:
+    with tempfile.TemporaryDirectory(prefix="arete-search-") as cwd, ThreadPoolExecutor(size) as pool:
         while room and (pending or running):
             while pending and not stop and len(running) < size:
                 allowance = (cap - spent - committed) / min(size - len(running), len(pending))
