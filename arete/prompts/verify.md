@@ -24,6 +24,8 @@ $summary
 
 ## Diff
 
+This change is staged in the checkout and is not committed until Arete publishes it. `HEAD` and any `...HEAD` range miss it, so compare the working tree with the base the PRs target: `git diff origin/<base>`, with no range.
+
 ```diff
 $diff
 ```
