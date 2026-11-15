@@ -1,9 +1,10 @@
 
 import importlib.util, json, runpy, sys, urllib.request
 from pathlib import Path
-from arete import accounts, config, factory, gh, paths, replay, tracker
+from arete import accounts, config, factory, gh, paths, replay, state, tracker
 from arete import ci as ci_module
 root, model, planted, probe = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+state.migrate()
 def forbidden(*args, **kwargs):
     raise AssertionError("workflow attempted an external transport or credential lookup")
 urllib.request.urlopen = forbidden

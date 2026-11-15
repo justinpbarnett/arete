@@ -1,5 +1,6 @@
 import hashlib
 import re
+import runpy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,8 +38,7 @@ def load(folder=None):
         if n in found:
             raise Refused(f"{found[n].name}, {path.name}: repeated migration {n}")
         data = path.read_bytes()
-        namespace = {"__file__": str(path), "__name__": f"arete.migrations.{path.stem}"}
-        exec(compile(data, str(path), "exec"), namespace)
+        namespace = runpy.run_path(str(path), run_name=f"arete.migrations.{path.stem}")
         phase, sql, apply = namespace.get("PHASE"), namespace.get("SQL"), namespace.get("apply")
         if phase not in PHASES:
             raise Refused(f"{path.name}: unknown phase {phase!r}")

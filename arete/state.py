@@ -12,8 +12,10 @@ from datetime import timedelta
 
 from . import migrations, paths, util
 from .agent import KEY_PROVIDERS, SUBSCRIPTION_RUNNERS
-from .migrations.m0002_foundation_time_shape import TIME_COLUMNS as TIME_COLUMNS
-from .migrations.m0002_foundation_time_shape import TIME_GLOB as TIME_GLOB
+from .migrations import m0002_foundation_time_shape as time_shape
+
+TIME_COLUMNS = time_shape.TIME_COLUMNS
+TIME_GLOB = time_shape.TIME_GLOB
 
 _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n

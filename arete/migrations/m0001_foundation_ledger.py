@@ -636,8 +636,8 @@ def identity():
             raise ValueError(f"{target}: malformed instance identity")
         return found
     instance_id = secrets.token_hex(16)
-    found = dict(instance_id=instance_id, instance_tag=instance_id[:8], instance_name=getpass.getuser(),
-                 instance_created=util.iso())
+    found = {"instance_id": instance_id, "instance_tag": instance_id[:8], "instance_name": getpass.getuser(),
+             "instance_created": util.iso()}
     target.parent.mkdir(parents=True, exist_ok=True)
     util.write_json(target, found)
     util.flush_file(target)
