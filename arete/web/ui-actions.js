@@ -63,7 +63,7 @@ export async function dispatch(action, context = {}, reason = "") {
       restore: context.restore ?? (() => { if (hash != null) location.hash = hash; }) });
     replay = request;
     last = { action, reason, compatible: context.compatible };
-    succeeded(action.explanation && action.name !== "checks" ? `${label} (cannot be undone)` : label);
+    succeeded(action.explanation && action.name !== "checks" ? `${label} (cannot be undone)` : label, !(action.explanation && action.name !== "checks"));
     return true;
   } catch (error) {
     if (error.conflict) context.stale?.(error.current);
