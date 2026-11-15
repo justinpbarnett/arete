@@ -27,7 +27,3 @@ repo = "$finding.repo"
 labels = ["agent"]
 prefix = "[merge-check] "
 approve = false
-
-[[emit]]
-type = "metric"
-name = "merge_check_pass"

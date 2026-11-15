@@ -18,8 +18,6 @@ folder("fail", "raise SystemExit(1)")
 folder("ok", "import sys; from pathlib import Path; Path(" + repr(str(root / "received")) +
        ").write_text(sys.stdin.read()); print('received input')")
 folder("silent", "pass")
-with (paths.CONFIG_DIR / "loops/silent/loop.toml").open("a") as f:
-    f.write('\n[[emit]]\ntype = "metric"\nname = "silent_count"\n')
 folder("slow", "import os,time; from pathlib import Path; Path(" + repr(str(root / "ready")) +
        ").write_text(str(os.getpid())); time.sleep(60)")
 def enqueue(name="fail", payload=None, trigger="event"):
@@ -97,7 +95,6 @@ if mode == "outcomes":
         silent = engine.launch("silent", item=item, detach=False)
     assert silent["status"] == "skipped" and "no output" in silent["summary"], silent
     assert state.queue_item(item) is None
-    assert state.latest_metric("silent_count") is None
     item = enqueue("ok")
     assert state.take_queue_item(item, "first") is True
     assert state.take_queue_item(item, "second") is False

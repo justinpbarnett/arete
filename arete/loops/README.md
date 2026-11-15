@@ -223,7 +223,7 @@ the workspace and blocks the verdict.
 Ticket emits can explicitly select `repo = "$finding.repo"` with internal-or-higher trigger trust.
 Each finding must name a configured repository; missing and unknown repos are refused before
 rendering or sending. Fixed repo emits keep their existing behavior. The shipped loop uses this
-selector, prefix `[merge-check] `, label `agent`, and metric `merge_check_pass`.
+selector, prefix `[merge-check] ` and label `agent`.
 
 The named queue defaults to capacity one. Its explicit equivalent in private configuration is:
 

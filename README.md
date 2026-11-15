@@ -2080,7 +2080,7 @@ The disabled `merge-check` command loop uses the merged base after pipeline PRs 
 `arete merged --since-cursor` discovers merged pipeline PRs; `arete merge-check [REPO]` uses their
 saved verification steps against a detached checkout pinned to `origin/<base>`, including an earlier
 overlapping check. `arete merge-check REPO --dry-run` plans without starting anything.
-Run `arete loop try merge-check` to preview held tickets and `merge_check_pass` before enabling it
+Run `arete loop try merge-check` to preview held tickets before enabling it
 with `arete loop enable merge-check`. See [the loop guide](arete/loops/README.md#merged-base-use-checks)
 for checkpoints, UTC quotas, blocked-input recovery, the `$finding.repo` ticket selector and queue capacity.
 
