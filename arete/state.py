@@ -10,7 +10,7 @@ from datetime import timedelta
 from . import paths, util
 from .agent import KEY_PROVIDERS, SUBSCRIPTION_RUNNERS
 
-OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
+OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
 PAID_STEP = (f"(CASE steps.auth_mode WHEN 'subscription' THEN 0 WHEN 'local' THEN 0 WHEN 'api_key' THEN 1 ELSE "

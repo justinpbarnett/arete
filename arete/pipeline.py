@@ -1706,6 +1706,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 flow.route()
             if not lines.ended_in_error(run_id, reply="respond" if flow else ""):
                 lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
+        pr_url = pr_url or str((state.run_get(run_id) or {}).get("pr_url") or "")
         run.log(f"done: {status} {pr_url or summary}")
         record.settle(run_id, status, summary=summary, pr_url=pr_url)
         write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow, run)
@@ -2072,11 +2073,13 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), pr_report,
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
             opened.append(c)
+            note_prs(run, branch, [x for x in checkouts if x.pr])
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
             run.log(f"pushed to {c.pr}")
     pushed = [c for c in staged.changed if c not in opened]
     with_prs = [c for c in checkouts if c.pr]
+    note_prs(run, branch, with_prs)
     ci_stopped: list[Checkout] = []
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
@@ -2280,6 +2283,10 @@ def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
     supersede_older_runs(run, urls)
     record.note(run.id, branch=branch)
     return " ".join(urls)
+
+
+def note_prs(run: Run, branch: str, with_prs: list[Checkout]) -> None:
+    record.note(run.id, branch=branch, pr_url=" ".join(c.pr for c in with_prs))
 
 
 def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
