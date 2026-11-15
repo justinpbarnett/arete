@@ -43,7 +43,20 @@ REVIEW_ROUNDS = {
     "review-problems-missing": [{"verdict": "approve", "summary": "Fine."}],
     "review-earlier-omitted": [{"summary": "B1 open.", "problems": [BLOCKER]},
                                {"summary": "Looks fine.", "problems": []}],
+    "review-multiple-fixes": [{"summary": "B1 open.", "problems": [BLOCKER]},
+                              {"summary": "B1 fixed, B2 open.", "problems": [REGRESSION], "earlier": [FIXED]},
+                              {"summary": "B2 fixed.", "problems": [], "earlier": [FIXED]}],
+    "review-final-verify-fails": [{"summary": "B1 open.", "problems": [BLOCKER]},
+                                  {"summary": "B1 fixed.", "problems": [], "earlier": [FIXED]}],
+    "review-final-verify-recovers": [{"summary": "B1 open.", "problems": [BLOCKER]},
+                                     {"summary": "B1 fixed.", "problems": [], "earlier": [FIXED]}],
+    "review-no-fix-feedback": [{"verdict": "request_changes", "summary": "Not yet.", "problems": []},
+                               {"verdict": "request_changes", "summary": "Still not.", "problems": []},
+                               {"summary": "Fine.", "problems": []}],
+    "refactor-review-fixes": [{"summary": "B1 open.", "problems": [BLOCKER]},
+                              {"summary": "B1 fixed.", "problems": [], "earlier": [FIXED]}],
 }
+REFACTOR = ("refactor-pass", "refactor-review-fixes", "refactor-dry-run")
 BLOCKED_CHECKS = {"blocked-check-environment": "Target page, context or browser has been closed",
                   "blocked-check-guard": "The JEV guard refused the command"}
 QUINCE = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n"
@@ -157,7 +170,7 @@ def create_replay_config(fx):
     sample_lines = fx.replay.sample(root / "sample", adw=True)
     paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(sample_lines) +
         "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
-        ("2" if scenario == "edited-after-held-pr" or scenario in REVIEW_ROUNDS else "1") + "\n")
+        str(max(2, len(REVIEW_ROUNDS.get(scenario, ()))) if scenario == "edited-after-held-pr" or scenario in REVIEW_ROUNDS else 1) + "\n")
     fx.marker = "arete117-marker-value-9f3k2"
     if scenario == "secret-in-patch":
         fx.vault.put("replay-sample", "REPLAY_SECRET", fx.marker)
@@ -182,6 +195,8 @@ def modify_replay(fx):
         review_rounds_replay(fx)
     elif scenario in BLOCKED_CHECKS:
         blocked_check_replay(fx)
+    elif scenario == "no-verify-config":
+        without_verify_section(fx)
 
 
 def failed_check_replay(fx):
@@ -258,12 +273,47 @@ def review_rounds_replay(fx):
         (replays / "verify2.json").write_text((replays / "verify.json").read_text())
         (replays / "review_fix.json").write_text(json.dumps({"text": "B1 fixed: quince is listed after kumquat.", "ok": True}))
         (replays / "review_fix.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
+    (replays / "verify3.json").write_text((replays / "verify.json").read_text())
+    if scenario == "review-multiple-fixes":
+        (replays / "review_fix2.json").write_text((replays / "review_fix.json").read_text())
+        (replays / "review_fix2.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,4 @@\n A small file for replay checks.\n kumquat\n quince\n+mango\n")
+    if scenario.startswith("review-final-verify"):
+        final_verify_replay(fx)
     if scenario == "review-fix-breaks-check":
         two_repair_tries(fx)
         layer = root / "sample/layer/config.toml"
         layer.write_text(layer.read_text().replace("grep -q kumquat notes.txt", "grep -q kumquat notes.txt && ! grep -q quince notes.txt"))
         (replays / "check_repair1_2.json").write_text(json.dumps({"text": "Removed quince.", "ok": True}))
         (replays / "check_repair1_2.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,2 @@\n A small file for replay checks.\n kumquat\n-quince\n")
+
+
+def final_verify_replay(fx):
+    replays = fx.root / "sample/replay"
+    passing = json.loads((replays / "verify.json").read_text())
+    failing = {**passing, "structured": {"verdict": "fail", "summary": "The final check failed.", "checks": [
+        {"what": "notes.txt holds kumquat", "how": "grep", "saw": "final tree is wrong", "passed": False,
+         "cause": "change"}]}}
+    (replays / "verify2.json").write_text(json.dumps(failing))
+    (replays / "verify3.json").write_text(json.dumps(failing if fx.scenario == "review-final-verify-fails" else passing))
+    (replays / "verify_fix.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
+    fx.paths.CONFIG_FILE.write_text(fx.paths.CONFIG_FILE.read_text() + "\n[steps.verify]\ntries=2\n")
+
+
+def without_verify_section(fx):
+    layer = fx.root / "sample/layer/config.toml"
+    head, rest = layer.read_text().split("[verify]\n")
+    layer.write_text(head + rest.split("\n\n", 1)[1])
+
+
+def label_refactor(fx):
+    from arete import tracker
+    real = tracker.task_ticket
+    mock.patch.object(tracker, "task_ticket", lambda *a, **kw: replace_labels(real(*a, **kw))).start()
+
+
+def replace_labels(ticket):
+    ticket.labels = ["agent", "refactor"]
+    return ticket
 
 
 def blocked_check_replay(fx):
@@ -279,6 +329,8 @@ def create_task(fx):
     fx.task = fx.state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
     if fx.scenario == "edited-after-held-pr":
         add_held_pr_history(fx)
+    if fx.scenario in REFACTOR:
+        label_refactor(fx)
     fx.feature = runpy.run_path(str(fx.paths.ADWS_DIR / "feature.py"))["feature"]
 
 
@@ -1036,7 +1088,8 @@ def ordinary(fx):
     scenario, paths, pipeline, state = fx.scenario, fx.paths, fx.pipeline, fx.state
     if scenario == "future-step-appended":
         instrument_future_step(fx)
-    row = forced(fx, "--dry-run") if scenario == "review-notes-dry-run" else forced(fx)
+    dry = scenario in ("review-notes-dry-run", "refactor-dry-run")
+    row = forced(fx, "--dry-run") if dry else forced(fx)
     events = run_events(fx, row["id"])
     verification = [e.get("data", {}).get("verified") for e in events
                     if e.get("event") == "step_end" and e.get("step") == "verify"]
@@ -1055,8 +1108,28 @@ def ordinary(fx):
         result["budget"] = json.loads((paths.RUNS_DIR / row["id"] / "budget.json").read_text())
     if scenario in REVIEW_ROUNDS:
         review_result(fx, row, events, result)
+    inspection(fx, row, events, result)
     ordinary_extras(fx, row, events, result)
     return result
+
+
+def inspection(fx, row, events, result):
+    from arete import tracker
+    run_dir = fx.paths.RUNS_DIR / row["id"]
+    prompts = {}
+    for file in fx.record.record_files(row["id"]):
+        if file.name.startswith(("verify", "review")):
+            prompts[file.name] = str(json.loads(next(fx.record.raw_lines(file))).get("prompt"))
+    prepared = [e["data"]["ticket"] for e in events if e.get("event") == "step_end" and e.get("step") == "prepare"
+                and e.get("data")]
+    result |= {"run_dir": str(run_dir), "prompts": prompts, "prepared_labels": [t.get("labels") for t in prepared],
+               "seam": [e["step"] for e in events if e.get("event") == "step_start" and "call" not in e],
+               "pr_body": (run_dir / "pr_body.md").read_text() if (run_dir / "pr_body.md").exists() else "",
+               "verify_text": [e["data"]["verified"]["summary"] for e in events
+                               if e.get("event") == "step_end" and e.get("step") == "verify" and e.get("data")]}
+    if fx.scenario == "no-verify-config":
+        old = {k: getattr(tracker.Ticket("t", "t", "T"), k) for k in fx.flows.TICKET_FIELDS if k != "labels"}
+        result["old_payload_labels"] = tracker.Ticket(**old).labels
 
 
 def review_result(fx, row, events, result):
@@ -1173,4 +1246,12 @@ SCENARIOS = {
     "code-identity": ordinary,
     "future-step-baseline": ordinary,
     "future-step-appended": ordinary,
+    "refactor-pass": ordinary,
+    "refactor-review-fixes": ordinary,
+    "refactor-dry-run": ordinary,
+    "review-multiple-fixes": ordinary,
+    "review-final-verify-fails": ordinary,
+    "review-final-verify-recovers": ordinary,
+    "review-no-fix-feedback": ordinary,
+    "no-verify-config": ordinary,
 }
