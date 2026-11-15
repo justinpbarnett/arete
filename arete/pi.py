@@ -16,8 +16,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from . import accounts, asks, claude, config, devices, environment, guard, paths, scratch, state, util
+from . import accounts, asks, claude, config, devices, environment, paths, scratch, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -30,6 +31,9 @@ from .agent import (
     provider_reset,
     usage_totals,
 )
+
+if TYPE_CHECKING:
+    from . import guard
 
 TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": ("ls",), "Edit": ("edit",),
             "MultiEdit": ("edit",), "Write": ("write",), "Bash": ("bash",)}
@@ -927,7 +931,10 @@ def _run(
                                       "step on claude or set instructions = []", session=resume, runner="pi", model=model)
     cwd = cwd if remote else Path(cwd).absolute()
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
-    floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
+    if floor is None:
+        from . import guard
+
+        floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     sandboxed = bool(remote and remote.exe_sandbox)
     if sandboxed:
         disallowed_tools = rules_for_throwaway_sandbox_without_git_credentials(disallowed_tools)
