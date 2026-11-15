@@ -32,13 +32,13 @@ export function applyRuns(runs) {
 const askParts = [["approvals", "Approvals"], ["skipped", "Skipped"], ["proposals", "Proposals"], ["ready", "Ready"]];
 const askSize = (part) => Array.isArray(part?.rows) ? part.rows.length : Object.values(part?.rows ?? {}).reduce((sum, rows) => sum + rows.length, 0);
 
-function queueBody({ route, snapshot, retry, page }) {
+function queueBody({ route, snapshot, retry, page, demo }) {
   const asks = route.screen === "triage" ? snapshot.asks : null;
   const fault = readFault(route.screen, snapshot);
   const cached = route.screen === "floor" ? snapshot.runs != null : snapshot.live != null;
   const missing = route.screen === "floor" ? "No running work" : route.screen === "triage" ? "Nothing needs you" : `No ${page.queue.toLowerCase()} to show`;
-  const empty = route.screen === "floor" ? false : route.screen === "triage" ? asks != null && snapshot.needsYou === 0 : true;
-  const body = route.screen === "floor" ? html`<${List} id="floor-runs" controller=${floorRuns} queue=${true} />`
+  const empty = demo ? false : route.screen === "floor" ? false : route.screen === "triage" ? asks != null && snapshot.needsYou === 0 : true;
+  const body = demo ? demo : route.screen === "floor" ? html`<${List} id="floor-runs" controller=${floorRuns} queue=${true} />`
     : asks ? html`<p class="ui-summary">${askParts.map(([name, label]) => `${label} ${askSize(asks[name])}`).join(" · ")}</p>` : null;
   const beside = fault && cached;
   return html`${beside ? html`<${Fault} what=${page.queue} fault=${fault} retry=${retry} />` : null}
@@ -87,12 +87,16 @@ export function Shell({ route, snapshot, now, retry }) {
   const page = data[route.screen](route);
   const health = route.screen === "settings" && route.path[0] === "health";
   const slots = route.screen === "floor" ? html`<p class="slots mono">Slots <span>${snapshot.slots}</span> / <span>${snapshot.capacity}</span></p>` : null;
-  const healthGate = (body, what) => html`<${Gate} pending=${snapshot.pending && snapshot.live == null}
-    fault=${snapshot.live == null ? readFault(route.screen, snapshot) : null} what=${what} retry=${retry}>${body}<//>`;
+  const healthFocus = (body, what) => {
+    const fault = readFault(route.screen, snapshot);
+    const cached = snapshot.live != null;
+    return html`${fault && cached ? html`<${Fault} what=${what} fault=${fault} retry=${retry} />` : null}
+      <${Gate} pending=${snapshot.pending && !cached} fault=${cached ? null : fault} what=${what} retry=${retry}>${body}<//>`;
+  };
   const nothing = (label) => html`<${Empty} what=${`No ${label.toLowerCase()} selected`} />`;
   const extra = page.extra ? html`<${Pane} name="auxiliary" label=${page.extra}>${nothing(page.extra)}<//>` : null;
   const queue = actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />`
-    : health ? healthGate(html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />`, page.queue) : queueBody({ route, snapshot, retry, page });
+    : queueBody({ route, snapshot, retry, page, demo: health ? html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />` : null });
   return html`<div class="ui-app" data-screen=${route.screen} data-health-demo=${health ? "" : undefined}>
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
@@ -106,7 +110,7 @@ export function Shell({ route, snapshot, now, retry }) {
       <div class="pane-grid">
         <${Pane} name="queue" label=${page.queue}>${slots}${queue}<//>
         ${route.screen === "run" ? html`<div class="run-focus"><${Pane} name="focus" label=${page.focus}>${nothing(page.focus)}<//>${extra}</div>`
-          : html`<${Pane} name="focus" label=${page.focus}>${health ? healthGate(html`<${List} id="health-focus" controller=${demoFocus} />`, page.focus) : nothing(page.focus)}<//>${extra}`}
+          : html`<${Pane} name="focus" label=${page.focus}>${health ? healthFocus(html`<${List} id="health-focus" controller=${demoFocus} />`, page.focus) : nothing(page.focus)}<//>${extra}`}
       </div>
       <${KeyBar} />
       ${actionList ? html`<button class="fixture-replay" type="button" onClick=${replayLast}>Replay last request</button>` : null}
