@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from . import paths
+from . import paths, sandbox
 
 PROBE_GRACE_SECONDS = 0.2
 TIMED_OUT = 124
@@ -80,9 +80,7 @@ def sh(
     keeps: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
-    from . import scratch
-
-    command = scratch.protected_command(cmd, cwd, keeps)
+    command = sandbox.protected_command(cmd, cwd, keeps)
     try:
         res = run_whole_tree(
             command,

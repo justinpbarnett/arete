@@ -6,20 +6,14 @@ import re
 import shlex
 import sys
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from pathlib import Path
 
-from . import config, jev, paths, record, scratch, util
+from . import config, jev, paths, record, sandbox, scratch, util
 from .agent import Result
 
 FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS")
 MATCHER = "|".join(("Bash", *FILE_TOOLS))
 HOOK_TIMEOUT_SECONDS = 60
-SECRET_NAMES = (".env", ".env.*", "*.env", ".envrc", ".netrc", ".pgpass", ".npmrc", ".pypirc", "id_rsa*", "id_dsa*",
-                "id_ecdsa*", "id_ed25519*", "*.pem", "*.p12", "*.pfx", "*.key", "credentials", "credentials.json",
-                "*.secret", "*.secrets", "secrets.toml", "secrets.json")
-SAFE_NAMES = ("*.example", "*.sample", "*.template", "*.dist")
-SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".password-store"})
 PLACEHOLDER = re.compile(
     r"(?<![$\w{])(?:export\s+)?[A-Za-z_]\w*=(['\"]?)arete-placeholder[\w.-]*\1(?=\s|[;|&]|$)\s*;?\s*")
 EFFECT = "What does running this shell command do, given the working directory it runs in?"
@@ -127,14 +121,6 @@ def wanted(tools: list[str] | None) -> bool:
     return tools is None or any(t == "Bash" or t in FILE_TOOLS for t in tools)
 
 
-def secret_path(p: Path | str) -> bool:
-    p = Path(p)
-    if SECRET_DIRS & set(p.parts[:-1]):
-        return True
-    name = p.name
-    return any(fnmatch(name, n) for n in SECRET_NAMES) and not any(fnmatch(name, n) for n in SAFE_NAMES)
-
-
 def secret_named(command: str, cwd: str) -> str:
     try:
         words = shlex.split(command)
@@ -142,7 +128,7 @@ def secret_named(command: str, cwd: str) -> str:
         words = command.split()
     for part in (p for w in words for p in re.split(r"[=<>;|&()`]", w) if p):
         path = Path(os.path.expanduser(part))
-        if secret_path(path) and (path if path.is_absolute() else Path(cwd) / path).exists():
+        if sandbox.secret_path(path) and (path if path.is_absolute() else Path(cwd) / path).exists():
             return part
     return ""
 
@@ -178,7 +164,7 @@ def decide(payload: dict, judge: bool = False, boundary: Floor | None = None) ->
         path = path if path.is_absolute() else Path(cwd) / path
         if target and boundary.denies(path):
             return reach(target)
-        return kept_out(tool, target) if target and secret_path(target) else ""
+        return kept_out(tool, target) if target and sandbox.secret_path(target) else ""
     command = str(args.get("command") or "").strip() if tool == "Bash" else ""
     if not command:
         return ""

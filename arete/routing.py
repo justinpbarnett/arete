@@ -7,7 +7,22 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import UTC, timedelta
 
-from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, record, runner, state, util
+from . import (
+    accounts,
+    claude,
+    codex,
+    config,
+    devices,
+    environment,
+    paths,
+    pi,
+    prices,
+    runner,
+    sandbox,
+    scrub,
+    state,
+    util,
+)
 from .agent import model_scope
 
 CLAUDE_PI_MODELS = {"fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
@@ -206,8 +221,8 @@ def incompatible(way: Way, settings, device: devices.Device) -> str:
             return f"mcp {', '.join(settings.mcp)} cannot load on pi, which runs with --no-mcp"
         if settings.instructions_on("pi"):
             return f"instructions {', '.join(settings.instructions_on('pi'))} cannot load on pi"
-        if runner.WRITING_TOOLS & set(settings.tools) and not pi.can_confine(False):
-            return pi.NO_CONFINEMENT_REASON
+        if runner.WRITING_TOOLS & set(settings.tools) and not sandbox.can_confine(False):
+            return sandbox.NO_CONFINEMENT_REASON
     fallback = not (way.link.requested and way.runner == way.link.runner)
     if way.runner == "pi" and fallback and "Bash" in settings.tools and not device.exe_sandbox:
         return runner.PI_HOLDS_NO_BASH_RULES
@@ -575,14 +590,14 @@ class Discovery:
         if way.runner == "pi":
             selected = self.probe(way.model, way.mode)
             if selected.token_error:
-                return "refused", record.scrub(selected.token_error, selected.hidden), ""
+                return "refused", scrub.scrub(selected.token_error, selected.hidden), ""
             if way.mode == "login" and not selected.login_available:
                 return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store", ""
             if way.mode == "api_key" and not selected.key_available:
                 found = f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
                 return "missing_key", found, ""
             if selected.error:
-                return "unavailable", record.scrub(selected.error, selected.hidden), ""
+                return "unavailable", scrub.scrub(selected.error, selected.hidden), ""
             auth, model = selected.auth, selected.model
         elif way.runner == "codex":
             auth, model = self.codex_auth(), way.model
