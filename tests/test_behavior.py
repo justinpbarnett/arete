@@ -458,16 +458,17 @@ def forced(*extra):
     except SystemExit:
         pass
     return state.ticket_runs("replay-sample", task, whole=True)[0]
-if "limit-wait" in scenario or scenario == "work-over-budget":
+if "limit-wait" in scenario or scenario in ("work-over-budget", "failed-again-prepare-sleep"):
     import time as real_time
     from datetime import timedelta
     from types import SimpleNamespace
     ahead, real_now, real_launch = [0.0], pipeline.util.now, runner.run
     pipeline.util.now = lambda: real_now() + timedelta(seconds=ahead[0])
-    runlimits.time = SimpleNamespace(monotonic=lambda: real_time.monotonic() + ahead[0])
+    if scenario != "failed-again-prepare-sleep":
+        runlimits.time = SimpleNamespace(monotonic=lambda: real_time.monotonic() + ahead[0])
     def jumping(prompt, cwd, **kw):
         if kw.get("waits") and not ahead[0]:
-            if scenario == "work-over-budget":
+            if scenario in ("work-over-budget", "failed-again-prepare-sleep"):
                 ahead[0] = 600.0
             else:
                 with kw["waits"]("limit"):
@@ -500,14 +501,49 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
         commit_in_src("seed.txt", "seed", f"HEAD:refs/heads/{branch}")
         pipeline.git(["checkout", "-q", "main"], src)
     if scenario.startswith(("failed-resume", "failed-again")):
-        layer.write_text(plain if "late" in scenario else plain.replace("grep -q kumquat", "grep -q quince"))
+        layer.write_text(plain if "late" in scenario or "killed" in scenario else plain.replace("grep -q kumquat", "grep -q quince"))
         if "pushed" in scenario:
             seed_origin_branch()
         if "late" in scenario:
             from arete import flows
             real_publish = factory.STEPS["publish"]
             factory.STEPS["publish"] = lambda flow: flows.end_as("fail", "failed", why="publishing failed after the push")
-        failed = forced()
+        if "killed" in scenario:
+            import select, signal, time
+            from datetime import timedelta
+            mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=1, max_verify_minutes=1)).start()
+            ready, notify = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(ready)
+                def pause_at_verify(prompt, cwd, **kw):
+                    if kw.get("trace", ("", ""))[1] == "verify":
+                        os.write(notify, b"ready")
+                        while True:
+                            time.sleep(1)
+                    return real_run(prompt, cwd, **kw)
+                runner.run = pause_at_verify
+                forced()
+                os._exit(3)
+            os.close(notify)
+            try:
+                assert select.select([ready], [], [], 30)[0], "verify never started"
+                assert os.read(ready, 5) == b"ready"
+            finally:
+                os.kill(child, signal.SIGKILL)
+                os.waitpid(child, 0)
+                os.close(ready)
+            real_now = pipeline.util.now
+            pipeline.util.now = lambda: real_now() + timedelta(seconds=600)
+            failed = state.ticket_runs("replay-sample", task, whole=True)[0]
+            record.interrupt(failed)
+            failed = state.run_get(failed["id"])
+            pipeline.git(["add", "-A"], ws)
+            pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m",
+                                        f"wip: edits of arete run {failed['id']}, kept when it ended before pushing\n\nArete-Run: {failed['id']}"], ws)
+            pipeline.note_made(ws, [pipeline.Checkout("", "octo/widgets", src, ws, "main")])
+        else:
+            failed = forced()
         if "late" in scenario:
             factory.STEPS["publish"] = real_publish
         layer.write_text(plain)
@@ -568,7 +604,11 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
                   "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
                   "steps": [s["step"] for s in state.steps(row["id"])],
                   "started": [l["step"] for l in __import__("arete.lines", fromlist=["read"]).read(row["id"]) if l.get("event") == "step_start"],
-                  "failed_id": failed["id"],
+                  "failed_id": failed["id"], "failed_status": failed["status"],
+                  "failed_span": (pipeline.util.parse_iso(failed["finished"]) - pipeline.util.parse_iso(failed["started"])).total_seconds(),
+                  "failed_budget": runlimits.metadata(failed["id"], "budget.json"),
+                  "inherited_run": runlimits.active_seconds(failed["id"], failed),
+                  "inherited_verify": runlimits.verification_seconds(failed["id"], failed),
                   "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved", "head", "later")},
                   "stepped_published": published and bool(mid.get("head")) and pipeline.util.sh(["git", "merge-base", "--is-ancestor", mid["head"], branch], cwd=origin).returncode == 0,
                   "seed": og("show", f"{branch}:seed.txt") if "pushed" in scenario and published else "",
@@ -1756,6 +1796,31 @@ print("BEHAVIOR_RESULT=" + json.dumps({"scenario": scenario, "runs": snaps,
         self.assertAlmostEqual(result["budget"]["earlier_wait_minutes_left_out"]["limit"], 10, delta=0.1)
         self.assertIn("kumquat", result["published"])
         self.assertIn("quince", result["published"])
+
+    def test_a_continuation_is_not_charged_for_a_machine_sleep_inside_the_earlier_run(self):
+        result = self.workflow("failed-again-prepare-sleep")
+        self.assertEqual(result["failed_status"], "failed")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertGreater(result["failed_span"], 600)
+        self.assertLess(result["failed_budget"]["run_seconds"], 60)
+        self.assertEqual(result["failed_budget"]["wait_minutes_left_out"], {"limit": 0, "slot": 0})
+        self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires fork and SIGKILL")
+    def test_a_killed_verification_is_not_charged_until_reaped_after_sleep(self):
+        result = self.workflow("failed-resume-killed")
+        self.assertEqual(result["failed_status"], "interrupted")
+        self.assertGreater(result["failed_span"], 600)
+        self.assertIsNotNone(result["failed_budget"]["verification_active_since"])
+        self.assertGreaterEqual(result["failed_budget"]["verification_open_seconds"], 0)
+        self.assertLess(result["inherited_run"], 60)
+        self.assertLess(result["inherited_verify"], 60)
+        self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("kumquat", result["published"])
 
     def test_preparing_again_over_a_chain_commit_with_no_kept_record_is_still_held(self):
         result = self.workflow("failed-again-prepare-unrecorded")

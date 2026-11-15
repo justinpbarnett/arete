@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,101 @@ class Isolated(unittest.TestCase):
 
 
 class BudgetTests(Isolated):
+    def test_measured_usage_rejects_corruption_and_zero_overrides_wall_time(self):
+        run = self.made_run()
+        record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
+        record.settle(run.id, "interrupted")
+        row = state.run_get(run.id)
+        saved = runlimits.metadata(run.id, "budget.json")
+        saved["verification_active_since"] = row["started"]
+        for field, read in (("run_seconds", runlimits.active_seconds),
+                            ("verification_open_seconds", runlimits.verification_seconds)):
+            for bad in (-1, float("nan"), float("inf"), -float("inf"), True, "1", None):
+                with self.subTest(field=field, bad=bad):
+                    util.write_json(run.dir / "budget.json", {**saved, field: bad})
+                    with self.assertRaisesRegex(ValueError, run.id):
+                        read(run.id, row)
+            util.write_json(run.dir / "budget.json", {**saved, field: 0})
+            self.assertEqual(read(run.id, row), 0)
+        saved.pop("verification_open_seconds")
+        util.write_json(run.dir / "budget.json", saved)
+        self.assertGreater(runlimits.verification_seconds(run.id, row), 89 * 60)
+
+    def test_measured_recovery_and_nested_open_idle_waits(self):
+        clock = [100.0]
+        with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+            run = self.made_run()
+            clock[0] += 10
+            for cause in ("limit", "slot"):
+                with run.budget.idling(cause):
+                    clock[0] += 20
+                    with run.budget.idling("slot"):
+                        clock[0] += 30
+                        run.budget.checkpoint()
+                        self.assertEqual(run.budget.run_seconds(), 10)
+                    clock[0] += 10
+                self.assertEqual(run.budget.run_seconds(), 10)
+            self.assertEqual(run.budget.idled, 120)
+            resumed = runlimits.Budget(run, run.budget.policy, "")
+            self.assertEqual(resumed.run_seconds(), 10)
+            clock[0] += 5
+            self.assertEqual(resumed.run_seconds(), 15)
+
+    def test_periodic_checkpoints_stop_and_flush_on_normal_and_exceptional_exit(self):
+        for exceptional in (False, True):
+            run = self.made_run()
+            observed = threading.Event()
+            original = run.budget.checkpoint
+            snapshots = []
+            def checkpoint():
+                original()
+                snapshots.append(runlimits.metadata(run.id, "budget.json"))
+                observed.set()
+            with patch.object(runlimits, "CHECKPOINT_SECONDS", .01), \
+                    patch.object(run.budget, "checkpoint", side_effect=checkpoint):
+                try:
+                    with run.budget.watching(), run.budget.verifying(), run.budget.idling("limit"):
+                        self.assertTrue(observed.wait(5))
+                        if exceptional:
+                            raise RuntimeError("stop watching")
+                except RuntimeError:
+                    self.assertTrue(exceptional)
+            self.assertGreaterEqual(len(snapshots), 2)
+            self.assertGreaterEqual(snapshots[-1]["run_seconds"], snapshots[0]["run_seconds"])
+            self.assertGreater(snapshots[0]["verification_open_seconds"], 0)
+            self.assertEqual(snapshots[-1]["verification_open_seconds"], 0)
+            self.assertFalse(any(t.name == f"budget-{run.id}" for t in threading.enumerate()))
+
+    def test_checkpoint_tracks_open_verification_without_charging_open_idle_time(self):
+        clock = [100.0]
+        with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+            run = self.made_run()
+            clock[0] += 10
+            with run.budget.verifying(), run.budget.idling("limit"):
+                clock[0] += 20
+                run.budget.checkpoint()
+                first = runlimits.metadata(run.id, "budget.json")
+                clock[0] += 30
+                run.budget.checkpoint()
+                second = runlimits.metadata(run.id, "budget.json")
+            self.assertEqual(first["run_seconds"], second["run_seconds"])
+            self.assertEqual(second["verification_open_seconds"] - first["verification_open_seconds"], 30)
+            saved = runlimits.metadata(run.id, "budget.json")
+            self.assertEqual(saved["verification_seconds"], 50)
+            self.assertEqual(saved["verification_open_seconds"], 0)
+            self.assertEqual(saved["run_seconds"], 10)
+
+    def test_failed_final_checkpoint_restores_signal_and_stops_worker(self):
+        run = self.made_run()
+        handler = signal.getsignal(signal.SIGALRM)
+        with patch.object(run.budget, "checkpoint", side_effect=OSError("checkpoint failed")):
+            with self.assertRaisesRegex(OSError, "checkpoint failed"):
+                with run.budget.watching():
+                    pass
+        self.assertIs(signal.getsignal(signal.SIGALRM), handler)
+        self.assertFalse(run.budget.watched)
+        self.assertFalse(any(t.name == f"budget-{run.id}" for t in threading.enumerate()))
+
     def delayed_start(self, concurrent, drive):
         before_lock, finished = threading.Event(), threading.Event()
         original_lock, failures = util.lock, []
@@ -252,7 +348,11 @@ class BudgetTests(Isolated):
                 "run=pipeline.Run(rid,repo,folder,tracker=local,tid=tid);"
                 "budget=runlimits.Budget(run,runlimits.Policy(),'',local.get(tid));"
                 "lines.write=lambda *a,**k:{};"
-                "\nwith budget.watching(),budget.verifying():os._exit(0)")
+                "\nfrom types import SimpleNamespace\n"
+                "clock=[0.0];runlimits.time=SimpleNamespace(monotonic=lambda:clock[0]);"
+                "budget.started=0.0;budget.deadline=3600;"
+                "\nwith budget.watching(),budget.verifying():"
+                "\n clock[0]+=21*60;budget.checkpoint();os._exit(0)")
         done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
                               cwd=str(self.root),
                               env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
@@ -273,13 +373,21 @@ class BudgetTests(Isolated):
         self.assertEqual(runlimits.repair_count(rid), 1)
 
     def test_cumulative_time_survives_continuation(self):
-        first = self.made_run()
-        record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
-        record.settle(first.id, "interrupted")
-        second = self.made_run(first.id)
-        with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
-            with second.budget.watching():
-                self.fail("an exhausted chain must not run")
+        for measured in (False, True):
+            with self.subTest(measured=measured):
+                first = self.made_run()
+                saved = runlimits.metadata(first.id, "budget.json")
+                if measured:
+                    saved["run_seconds"] = 61 * 60
+                else:
+                    saved.pop("run_seconds")
+                    record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
+                util.write_json(first.dir / "budget.json", saved)
+                record.settle(first.id, "interrupted")
+                second = self.made_run(first.id)
+                with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
+                    with second.budget.watching():
+                        self.fail("an exhausted chain must not run")
 
     def test_idle_waits_move_the_deadline_and_other_waits_do_not(self):
         for cause in ("limit", "slot"):
@@ -301,6 +409,9 @@ class BudgetTests(Isolated):
 
     def chained_after(self, *waits):
         first = self.made_run()
+        saved = runlimits.metadata(first.id, "budget.json")
+        saved.pop("run_seconds")
+        util.write_json(first.dir / "budget.json", saved)
         record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
         for cause, since, until in waits:
             if until is None:
@@ -348,6 +459,9 @@ class BudgetTests(Isolated):
         with patch.object(util, "now", return_value=before):
             first = self.made_run()
             lines.write(first.id, "budget_verify_start")
+            saved = runlimits.metadata(first.id, "budget.json")
+            saved.pop("verification_open_seconds")
+            util.write_json(first.dir / "budget.json", saved)
         record.settle(first.id, "interrupted")
         second = self.made_run(first.id)
         with self.assertRaisesRegex(runlimits.Parked, "verification"):
@@ -495,7 +609,8 @@ class BudgetTests(Isolated):
             saved = runlimits.metadata(old.id, "budget.json")
             util.write_json(paths.RUNS_DIR / old.id / "budget.json", {**saved, **budget})
         else:
-            record.note(old.id, started=util.iso(util.now() - timedelta(minutes=61)))
+            saved = runlimits.metadata(old.id, "budget.json")
+            util.write_json(old.dir / "budget.json", {**saved, "run_seconds": 61 * 60})
         record.settle(old.id, "pr")
         return old
 
