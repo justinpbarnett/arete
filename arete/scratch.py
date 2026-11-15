@@ -599,8 +599,9 @@ def prune_settled(fd: int, settled: int, name: str) -> None:
         raise OSError(errno.ESTALE, "settled record is not a plain file of this user")
     source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=settled)
     with os.fdopen(source, "rb") as inp:
-        if json.loads(inp.read(MAX_RECORD_BYTES + 1))["data"]["attempt"]["selector"] != name[:-5]:
-            raise ValueError("settled record names another attempt")
+        record = claimed(str(AUTHORITY / SETTLED / name), "", inp.read(MAX_RECORD_BYTES + 1), None, name)
+    if not record.shaped or record.state != "done":
+        raise ValueError("settled record is malformed or not done, left as it is")
     prune_evidence(fd, name[:-5])
     with suppress(FileNotFoundError):
         os.unlink(name[:-5] + ".lease", dir_fd=fd)
