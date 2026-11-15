@@ -137,10 +137,10 @@ class FixtureConnection(sqlite3.Connection):
             self.handles.close()
 
 
-def connect_db(p: Path, readonly: bool = False) -> sqlite3.Connection:
+def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3.Connection:
     if not ISOLATED:
-        target = f"{p.absolute().as_uri()}?mode=ro" if readonly else p
-        return sqlite3.connect(target, uri=readonly, timeout=30)
+        mode = "ro" if readonly else "rwc" if create else "rw"
+        return sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30)
     if not ON_MAC or confined(p) is None:
         raise PermissionError("isolated state requires a supported confined database path")
     if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30):
@@ -166,7 +166,7 @@ def connect_db(p: Path, readonly: bool = False) -> sqlite3.Connection:
             except FileNotFoundError:
                 continue
             raise PermissionError("existing isolated database sidecar refused")
-        flags = os.O_RDONLY if readonly else os.O_RDWR | os.O_CREAT
+        flags = os.O_RDONLY if readonly else os.O_RDWR | (os.O_CREAT if create else 0)
         fd = os.open(p.name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
         handles.callback(os.close, fd)
         st = os.fstat(fd)

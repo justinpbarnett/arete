@@ -8,6 +8,7 @@ if scratch.protected_command(probe) != probe:
     scratch.AUTHORITY = root / "authority-parent/verification-authority"
 paths.ensure_dirs()
 def sample():
+    state.migrate()
     text = "\n".join(optimize.sample(root / "sample"))
     paths.CONFIG_FILE.write_text(text.replace("[models]", '[models]\nbuild = "scratch-a"'))
     replies = root / "sample/replay"

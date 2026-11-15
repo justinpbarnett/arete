@@ -25,6 +25,8 @@ class Scratch(unittest.TestCase):
                     "ARETE_STATE_DIR": str(self.state), "ARETE_CONFIG_DIR": str(self.config),
                     "ARETE_LOG_DIR": str(self.logs), "ARETE_WORKTREES_DIR": str(self.wt)}
         self.write_config(ON)
+        done = self.py("from arete import state; state.migrate()")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.log = self.logs / "app.log"
 
     def write_config(self, text):
@@ -2100,7 +2102,7 @@ SERVER = '''
 import json, os, threading, urllib.error, urllib.request
 from datetime import timedelta
 from arete import board, dashboard, oncall, record, state, util
-state.ensure_schema()
+state.migrate()
 ALERTS = []
 oncall.raise_alert = lambda *a: ALERTS.append(a)
 

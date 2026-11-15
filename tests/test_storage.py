@@ -1,4 +1,7 @@
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -113,7 +116,7 @@ with contextlib.ExitStack() as stack:
     for name, value in {"STATE_DIR": b, "RUNS_DIR": b / "runs", "DB_FILE": b / "arete.db", "LOCKS_DIR": b / "locks",
                         "WORKTREES_DIR": b / "worktrees", "EVENTS_FILE": b / "events.jsonl"}.items():
         stack.enter_context(mock.patch.object(paths, name, value))
-    state.ensure_schema()
+    state.migrate()
     out["b_db"] = (b / "arete.db").exists()
     prune()
     out["b_files"] = listing(b)
@@ -142,11 +145,11 @@ out["snaps"] = len(backup.snapshots())
 ''',
 "fresh": r'''
 out["none"] = backup.snapshot("hand")
-state.ensure_schema()
+state.migrate()
 out["created"] = paths.DB_FILE.exists()
 with mock.patch.object(paths, "ISOLATED", True):
     out["isolated"] = backup.snapshot("hand")
-out["no_folder"] = not paths.backups_dir().exists()
+out["no_folder"] = not backup.snapshots()
 out["taken"] = backup.snapshot("hand").name
 ''',
 "retention": (SCRIPTS / "backup_retention.py").read_text(),
@@ -313,6 +316,84 @@ class BackupTests(unittest.TestCase):
         self.assertEqual((r["loaded"], r["refused"], r["unchanged"], r["events"]), (3, 2, True, []))
         self.assertEqual((r["mode"], r["left"], r["copy_to"]), (0o640, ["config.toml"], "h:/x"))
         self.assertEqual((r["bad"], r["default"]), (4, ""))
+
+
+class SchemaLedgerTests(unittest.TestCase):
+    def scenario(self):
+        with tempfile.TemporaryDirectory(prefix="arete-ledger-") as directory:
+            root = Path(directory).resolve()
+            make_folders(root, "home", "config", "state", "logs", "worktrees", "tmp", "checkout")
+            source = support.SOURCE
+            checkout = root / "checkout"
+            for name in ("arete", "adws", "tests"):
+                shutil.copytree(source / name, checkout / name,
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            history = checkout / "migration-history"
+            history.mkdir()
+            for path in (source / "arete/migrations").glob("m*.py"):
+                relative = path.relative_to(source).as_posix()
+                added = subprocess.run(["git", "log", "--diff-filter=A", "--format=%H", "--", relative],
+                                       cwd=source, text=True, capture_output=True, check=True).stdout.splitlines()
+                if added:
+                    content = subprocess.run(["git", "show", f"{added[-1]}:{relative}"],
+                                             cwd=source, capture_output=True, check=True).stdout
+                else:
+                    content = path.read_bytes()
+                (history / path.name).write_bytes(content)
+            env = scratch_env(root, HOME=str(root / "home"), TMPDIR=str(root / "tmp"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            (root / "config/config.toml").write_text("max_parallel = 1\n[dashboard]\nhttps = false\n")
+            script = checkout / "tests/scripts/schema_ledger.py"
+            done = subprocess.run([sys.executable, "-I", str(script), self._testMethodName],
+                                  cwd=checkout, env=env, text=True, capture_output=True, timeout=180)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("SCHEMA_LEDGER_OK", done.stdout)
+
+    def test_an_old_db_waits_for_serve(self):
+        self.scenario()
+
+    def test_eight_openers_and_serve_migrate_once(self):
+        self.scenario()
+
+    def test_add_feed_issues_no_ddl(self):
+        self.scenario()
+
+    def test_no_serve_makes_no_file(self):
+        self.scenario()
+
+    def test_a_deleted_db_stops_serve(self):
+        self.scenario()
+
+    def test_the_migration_snapshot_is_kept(self):
+        self.scenario()
+
+    def test_a_second_serve_waits_its_turn(self):
+        self.scenario()
+
+    def test_load_new_code_migrates_before_busy(self):
+        self.scenario()
+
+    def test_a_contract_waits_for_an_older_child(self):
+        self.scenario()
+
+    def test_runs_name_their_schema(self):
+        self.scenario()
+
+    def test_the_instance_keeps_its_name(self):
+        self.scenario()
+
+    def test_the_chain_equals_a_fresh_db(self):
+        self.scenario()
+
+    def test_bad_folders_are_refused(self):
+        self.scenario()
+
+    def test_parallel_migrations_conflict(self):
+        self.scenario()
+
+    def test_times_have_one_shape(self):
+        self.scenario()
 
 
 if __name__ == "__main__":

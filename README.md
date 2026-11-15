@@ -13,7 +13,7 @@ A killed loop's queued input gets one automatic recovery retry when serve reaps 
 Only one serve can hold a state folder on this machine. A second invocation exits naming the holder's PID and state folder. A separate `arete dashboard` beside serve leaves its live chats and feedback checks alone.
 
 Serve restarts itself when its own code changes, keeping ownership of the state folder across the restart.
-On each tick it looks at the `.py` files of the arete package and the dashboard's web files, and once a change has held still for one tick and serve has no source poll, dashboard request or chat message of its own in flight, it checks that the new code imports. It then answers new dashboard and API writes with 503 and `Retry-After: 3` for that moment (reads keep working), checks again that nothing is in flight, and only then replaces itself with a fresh serve in the same process; if something started meanwhile, it opens writes again and waits.
+On each tick it looks at the `.py` files of the arete package and the dashboard's web files. Once a change has held still for one tick, it checks that the new code imports and reads the config, then runs `arete migrate --no-contracts` once for that code stamp, before waiting for its source polls, dashboard requests and chat messages to finish. A failed import or migration keeps the current code and prints the last error line. It then answers new dashboard and API writes with 503 and `Retry-After: 3` for that moment (reads keep working), checks again that nothing is in flight, and only then replaces itself with a fresh serve in the same process; if something started meanwhile, it opens writes again and waits.
 Runs and sessions are processes of their own, so they keep going across the restart, and the fresh serve reaps each one when it ends.
 New code that does not import is named in the serve log, and serve keeps the code it started with.
 A self restart is not a start, so loops with `run_at_load` do not fire again.
@@ -644,6 +644,18 @@ Protected records and bytes outside `record/` can keep `runs/` over budget; the 
 Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `lines_days` ago are removed.
 
 ## Backups
+
+### Schema
+
+`arete serve` owns schema changes. After taking the serve lock it runs the same migrator as `arete migrate`, before starting workers or the dashboard. An ordinary writer never creates the database or changes its schema. If it finds an older schema, it prints `schema 2 waits for schema 3; run arete serve or arete migrate` once, then waits up to 60 seconds for serve. A missing database names those commands; if a snapshot exists, it instead names the newest snapshot and `arete backup --restore FILE`. A deleted database stops serve.
+
+Each immutable migration lives in `arete/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas are foundation, work, runs, config, connections, secrets, devices and outbox. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
+
+The phases are `expand` (compatible additions), `backfill` (data conversion) and `contract` (removals or incompatible changes). `arete migrate --no-contracts` stops before the first contract. A contract waits for live runs and serve processes that name an older schema, including runs without a schema stamp. Serve retries a waiting contract on each tick. Each migration and its ledger row commit together, with `user_version`, duration and the snapshot filename. A failure rolls back that migration and preserves earlier successful versions. Retention also keeps the snapshot named by the newest migration.
+
+A column, status, run.jsonl event or step_end data-key rename needs an earlier expand whose reader accepts both names. Writers use the new name only after the contract row applies; every later removal goes through this gate. Timestamp columns are listed in `state.TIME_COLUMNS` and use `state.TIME_GLOB`, the UTC shape emitted by `util.iso()`. Migration 2 normalizes legacy offsets and adds triggers rejecting malformed nonempty values. When adding a time column to an existing table, update the mapping and replace that table's triggers in the new migration; new tables declare a CHECK. Tracker equality stamps such as triage.updated and research.updated keep their original format.
+
+`schema_meta` stores the instance id, short tag, name and creation time, plus schema version and oldest compatible writer. The initial name is the operating-system user. `GET /api/meta` returns these instance and schema blocks through the existing authenticated dashboard. Identity is also persisted in `backups/instance.json`, so restoring a snapshot from before the ledger keeps the same name and id.
 
 `arete serve` takes a snapshot of `arete.db` before every prune (the first tick after each restart, then hourly) with `VACUUM INTO`, flushes it, checks it with `PRAGMA quick_check` and keeps it in `backups/` beside the database as `arete-<UTC stamp>-<reason>.db`, with the outcome in `backups/last.json`.
 When a snapshot cannot be taken or fails its check, serve says why and prunes nothing.

@@ -902,6 +902,17 @@ def latest_run(name_or_run: str) -> str:
     return last["id"]
 
 
+def cmd_migrate(args) -> int:
+    try:
+        from . import state
+
+        state.migrate(contracts=not args.no_contracts)
+    except Exception as e:
+        print(f"arete migrate: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_serve(args) -> int:
     from . import serve
 
@@ -1896,6 +1907,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("uninstall", help="stop arete serve and remove its agent or unit")
     p.set_defaults(fn=cmd_uninstall)
+
+    p = sub.add_parser("migrate", help="apply pending database migrations")
+    p.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
+    p.set_defaults(fn=cmd_migrate)
 
     p = sub.add_parser("serve", help="the daemon: fire loops on their triggers, run the queues, serve the dashboard")
     p.add_argument("--no-dashboard", action="store_true")

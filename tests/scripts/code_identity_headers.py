@@ -2,7 +2,7 @@
 import json, threading, urllib.request, urllib.error
 from arete import codebase, control, dashboard, paths, serve, state, util
 codebase.load()
-state.ensure_schema()
+state.migrate()
 serve.Server().beat([], [])
 node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
 class Owner:

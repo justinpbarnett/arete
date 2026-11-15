@@ -411,7 +411,7 @@ class AlertWriteRecoveryTests(unittest.TestCase):
                       mock.patch.object(util, "wait_for_network", return_value=True)):
             patch.start()
             self.addCleanup(patch.stop)
-        state.ensure_schema()
+        state.migrate()
 
     def test_heartbeats_adopt_lost_create_and_clear_once(self):
         from arete import alerts
