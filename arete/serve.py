@@ -7,13 +7,14 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NoReturn, TextIO
 
 from . import (
+    alerts,
     backup,
     capture,
     chat,
@@ -52,6 +53,9 @@ CONFIG_CHECK = "from arete import config; config.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 SERVE_LOCK = "serve"
 SERVE_LOCK_FD = "ARETE_SERVE_LOCK_FD"
+ALERT_TICKS = 9
+ALERT_KEY = "serve:tick"
+ALERT_STAGES = ("tick", "tick:load", "stage:dispatch")
 COMPARE = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge, "==": operator.eq,
            "!=": operator.ne}
 
@@ -149,6 +153,29 @@ def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     return loop.trigger.cron.next_fire(last) <= now.astimezone()
 
 
+class QueueSlots:
+    def __init__(self, marked_running: list[dict]) -> None:
+        running = [r for r in marked_running if r["kind"] == "loop"]
+        self.per_queue = Counter(r["queue"] or r["loop"] for r in running)
+        self.held_groups = {(r["queue"] or r["loop"], r["grp"]) for r in running if r["grp"]}
+        self.busy = {r["loop"] for r in running}
+
+    def why_full(self, item: dict, loop: Loop, cfg: config.Config) -> str:
+        queue = loop.queue_name
+        size = cfg.queues.get(queue, 1)
+        if item["grp"] and (queue, item["grp"]) in self.held_groups:
+            return f"group {item['grp']} takes one at a time"
+        if loop.name in self.busy:
+            return str(control.Busy(loop.name))
+        if self.per_queue[queue] >= size:
+            return f"queue {queue} is full at {util.count(size, 'run')}"
+        return ""
+
+    def took(self, loop: Loop, item: dict) -> None:
+        self.busy.add(loop.name)
+        self.per_queue[loop.queue_name] += 1
+
+
 class Server:
     def __init__(self) -> None:
         self.cfg, self.config_problem = config.load_or_problem()
@@ -169,6 +196,17 @@ class Server:
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
         self.pruned = self.swept = 0.0
         self.ticks = 0
+        self.reloaded = restarted_with is not None
+        self.failing: dict[str, dict] = {}
+        self.logged: dict[str, str] = {}
+        self.every_loop: list[Loop] = []
+        self.live: list[Loop] = []
+        self.config_good = False
+        self.last_ok: str | None = None
+        self.alerted: dict[str, str] = {}
+        self.alert_open = False
+        self.alert_checked = False
+        self.alert_last: Future | None = None
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
         self.job_pools = {job.note: ThreadPoolExecutor(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
@@ -194,50 +232,138 @@ class Server:
                          f"{', '.join(self.cfg.ignored)}")
             self.reported_ignored = self.cfg.ignored
 
+    def guard(self, key: str, fn: Callable, *args):
+        try:
+            result = fn(*args)
+        except Exception as e:
+            error = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
+            known = self.failing.get(key)
+            self.failing[key] = {"error": error, "since": known["since"] if known else util.iso(),
+                                 "ticks": (known["ticks"] if known else 0) + 1}
+            if self.logged.get(key) != error:
+                self.logged[key] = error
+                self.say(f"{key}: tick failed: {error}")
+            return None
+        if known := self.failing.pop(key, None):
+            self.logged.pop(key, None)
+            self.say(f"{key}: recovered after {known['ticks']} ticks")
+        return result
+
+    def settle(self, prefix: str, present: set[str]) -> None:
+        for key in [k for k in self.failing if k.startswith(prefix) and k[len(prefix):].split(":")[0] not in present]:
+            self.failing.pop(key)
+            self.logged.pop(key, None)
+
+    def load(self) -> bool:
+        cfg, problem = config.load_or_problem()
+        self.config_problem = problem
+        if not problem or not self.config_good:
+            self.cfg = cfg
+        self.report_config()
+        if problem:
+            raise ValueError(problem)
+        every_loop = loops.load_all(cfg)
+        self.every_loop = every_loop
+        self.live = [x for x in every_loop if x.enabled and not x.error]
+        self.config_good = True
+        return True
+
     def tick(self) -> None:
-        self.read_config()
-        if self.config_problem or self.code_problem:
-            self.ticks += 1
-            self.beat([], [])
+        if not self.guard("tick:load", self.load) or self.code_problem:
             return
-        every_loop = loops.load_all(self.cfg)
-        live = [x for x in every_loop if x.enabled and not x.error]
+        self.guard("stage:reap", self.reap)
+        states = self.guard("stage:states", state.loop_states)
+        if states is not None:
+            now = util.now()
+            for loop in self.live:
+                self.guard(f"loop:{loop.name}", self.step_loop, loop, states.get(loop.name) or {}, now)
+            self.settle("loop:", {x.name for x in self.live})
+            self.loaded = True
+        self.guard("stage:forget", self.forget_unpolled_errors, self.live)
+        self.guard("stage:oncall", self.watch_oncall)
+        self.guard("stage:dispatch", self.dispatch, {x.name: x for x in reversed(self.every_loop)})
+        self.guard("stage:approvals", self.approvals)
+        self.guard("stage:prune", self.prune_when_due)
+        self.guard("stage:sweep", self.sweep_when_due)
+        self.guard("stage:asks", self.expire_asks)
+        self.guard("stage:remind", self.remind)
+
+    def reap(self) -> None:
         for row in record.reap(tickets=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
             self.swept = 0.0
         sessions.tell_chats()
-        states = state.loop_states()
-        now = util.now()
-        for loop in live:
-            st = states.get(loop.name) or {}
-            self.schedule(loop, st, now)
-            self.watch_metric(loop, st)
-            self.poll(loop)
-        self.forget_unpolled_errors(live)
-        self.watch_oncall()
-        self.loaded = True
-        self.dispatch({x.name: x for x in reversed(every_loop)})
+
+    def step_loop(self, loop: Loop, st: dict, now: datetime) -> None:
+        self.schedule(loop, st, now)
+        self.watch_metric(loop, st)
+        self.poll(loop)
+
+    def approvals(self) -> None:
         for released in delivery.release_lapsed():
             self.say(f"approval #{released}: {delivery.cut_off('claim expired')}")
         self.start_approval_jobs()
+
+    def prune_when_due(self) -> None:
         if time.monotonic() - self.pruned > PRUNE_SECONDS:
             self.prune()
             self.pruned = time.monotonic()
+
+    def sweep_when_due(self) -> None:
         if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
             self.sweep = self.pool.submit(self.sweep_vms)
             self.swept = time.monotonic()
-        try:
-            for note in tasks.expire_asks(self.cfg):
-                self.say(note)
-        except Exception as e:
-            self.say(f"expiring asks: {type(e).__name__}: {e}")
-        try:
-            for note in webpush.remind(self.cfg):
-                self.say(note)
-        except Exception as e:
-            self.say(f"reminding of asks: {type(e).__name__}")
+
+    def expire_asks(self) -> None:
+        for note in tasks.expire_asks(self.cfg):
+            self.say(note)
+
+    def remind(self) -> None:
+        for note in webpush.remind(self.cfg):
+            self.say(note)
+
+    def run_pass(self) -> None:
+        self.guard("stage:code", self.load_new_code)
+        self.guard("tick", self.tick)
+        self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
-        self.beat(every_loop, live)
+        self.guard("stage:alerts", self.watch_alerts)
+        try:
+            self.beat()
+        except Exception as e:
+            self.say(f"beat failed: {type(e).__name__}: {e}")
+
+    def watch_alerts(self) -> None:
+        due = {k: v for k, v in self.failing.items()
+               if v["ticks"] >= ALERT_TICKS and (k in ALERT_STAGES or k.startswith("loop:"))}
+        self.alerted = {k: e for k, e in self.alerted.items() if k in self.failing}
+        fresh = [k for k, v in due.items() if self.alerted.get(k) != v["error"]]
+        if fresh:
+            self.alerted.update({k: due[k]["error"] for k in fresh})
+            self.alert_open = True
+            detail = "; ".join(f"{k}: {v['error']} (since {v['since']})" for k, v in sorted(due.items()))
+            self.send_alert(alerts.raise_alert, self.cfg.alert_repo, ALERT_KEY,
+                            "arete serve keeps failing a tick part", detail)
+        if self.failing or fresh:
+            return
+        if self.alert_open or not self.alert_checked:
+            was_open = self.alert_open or bool(state.alert_get(ALERT_KEY))
+            self.alert_open = False
+            self.alert_checked = True
+            if was_open:
+                self.send_alert(alerts.clear_alert, self.cfg.alert_repo, ALERT_KEY)
+
+    def send_alert(self, call: Callable, *args) -> None:
+        self.alert_last = self.pool.submit(self.alert_work, self.alert_last, call, *args)
+
+    def alert_work(self, prior: Future | None, call: Callable, *args) -> None:
+        if prior:
+            wait([prior])
+        try:
+            if said := call(*args):
+                self.say(said)
+        except Exception as e:
+            self.say(f"{ALERT_KEY}: alert failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
     def prune(self) -> None:
         try:
@@ -408,67 +534,70 @@ class Server:
             self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
-        running = [r for r in state.runs_marked_running() if r["kind"] == "loop"]
-        per_queue = Counter(r["queue"] or r["loop"] for r in running)
-        held_groups = {(r["queue"] or r["loop"], r["grp"]) for r in running if r["grp"]}
-        busy = {r["loop"] for r in running}
+        slots = QueueSlots(state.runs_marked_running())
         pending = state.pending()
-        self.waiting = {i: why for i, why in self.waiting.items() if i in {item["id"] for item in pending}}
+        ids = {item["id"] for item in pending}
+        self.waiting = {i: why for i, why in self.waiting.items() if i in ids}
+        self.settle("queue:", {str(i) for i in ids})
         for item in pending:
-            loop = by_name.get(item["loop"])
-            if not loop or not loop.enabled or loop.error:
-                state.drop_queue_item(item["id"])
-                self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
-                continue
-            queue = loop.queue_name
-            key = (queue, item["grp"])
-            size = self.cfg.queues.get(queue, 1)
-            if item["grp"] and key in held_groups:
-                why = f"group {item['grp']} takes one at a time"
-            elif loop.name in busy:
-                why = str(control.Busy(loop.name))
-            elif per_queue[queue] >= size:
-                why = f"queue {queue} is full at {util.count(size, 'run')}"
-            elif spent := engine.spent_limit(loop, self.cfg):
-                why = f"its {spent} is spent"
-            elif held := loop.usage_hold(self.cfg):
-                why = held
-            else:
-                try:
-                    run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)
-                except control.Busy as e:
-                    busy.add(loop.name)
-                    why = str(e)
-                except engine.NeverBegan as e:
-                    self.retry_once(item, str(e))
-                    continue
-                except (control.NotFound, control.Refused):
-                    continue
-                else:
-                    self.waiting.pop(item["id"], None)
-                    busy.add(loop.name)
-                    per_queue[queue] += 1
-                    why = ""
-                    self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
-            if item["grp"]:
-                held_groups.add(key)
-            if why and self.waiting.get(item["id"]) != why:
-                self.waiting[item["id"]] = why
-                self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
+            self.guard(f"queue:{item['id']}", self.dispatch_queued, item, by_name, slots)
+
+    def dispatch_queued(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
+        loop = by_name.get(item["loop"])
+        if not loop or not loop.enabled or loop.error:
+            state.drop_queue_item(item["id"])
+            self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
+            return
+        why = self.dispatch_item(item, loop, slots)
+        if why is None:
+            return
+        if item["grp"]:
+            slots.held_groups.add((loop.queue_name, item["grp"]))
+        if not why:
+            self.waiting.pop(item["id"], None)
+        elif self.waiting.get(item["id"]) != why:
+            self.waiting[item["id"]] = why
+            self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
+
+    def dispatch_item(self, item: dict, loop: Loop, slots: QueueSlots) -> str | None:
+        if why := slots.why_full(item, loop, self.cfg):
+            return why
+        if spent := engine.spent_limit(loop, self.cfg):
+            return f"its {spent} is spent"
+        if held := loop.usage_hold(self.cfg):
+            return held
+        try:
+            run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)
+        except control.Busy as e:
+            slots.busy.add(loop.name)
+            return str(e)
+        except engine.NeverBegan as e:
+            self.retry_once(item, str(e))
+            return None
+        except (control.NotFound, control.Refused):
+            return None
+        slots.took(loop, item)
+        self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
+        return ""
 
     def start_approval_jobs(self) -> None:
         retry_from = util.iso(util.now() - timedelta(seconds=APPROVAL_RETRY_SECONDS))
         decidable = state.approvals()
+        self.settle("approval:", {str(a["id"]) for a in decidable})
         for job in APPROVAL_JOBS:
             if self.job_running(job):
                 continue
-            due = (a for a in decidable if (model := job.model_for(a, self.cfg)) and not a[job.note]
-                   and a[f"{job.note}_tried"] <= retry_from and not runner.usage_hold(
-                       model, cfg=self.cfg, repo=delivery.repo_for(a, self.cfg), tools=list(job.tools),
-                       denied=list(job.denied)))
-            if approval := next(due, None):
-                state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
-                self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)
+            for approval in decidable:
+                if self.guard(f"approval:{approval['id']}:{job.note}", self.approval_due, job, approval, retry_from):
+                    state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
+                    self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)
+                    break
+
+    def approval_due(self, job: ApprovalJob, approval: dict, retry_from: str) -> bool:
+        model = job.model_for(approval, self.cfg)
+        return bool(model and not approval[job.note] and approval[f"{job.note}_tried"] <= retry_from
+                    and not runner.usage_hold(model, cfg=self.cfg, repo=delivery.repo_for(approval, self.cfg),
+                                              tools=list(job.tools), denied=list(job.denied)))
 
     def job_running(self, job: ApprovalJob) -> bool:
         return job.note in self.jobs and not self.jobs[job.note].done()
@@ -560,12 +689,26 @@ class Server:
             self.code_note = text
             self.say(text)
 
-    def beat(self, every_loop: list[Loop], live: list[Loop]) -> None:
+    def beat(self) -> None:
+        every_loop, live = self.every_loop, self.live
+        failing = {key: dict(found) for key, found in self.failing.items()}
+        at = util.iso()
+        if not failing:
+            self.last_ok = at
+        try:
+            pending = len(state.pending())
+        except Exception:
+            pending = None
+        try:
+            running = sum(r["kind"] == "loop" for r in state.runs_marked_running())
+        except Exception:
+            running = None
         util.write_json(control.BEAT_FILE, {
-            "pid": os.getpid(), "engine": codebase.STAMP, "at": util.iso(), "started": util.iso(self.started), "ticks": self.ticks,
+            "pid": os.getpid(), "engine": codebase.STAMP, "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
-            "broken": {x.name: x.error for x in every_loop if x.error}, "pending": len(state.pending()),
-            "running": sum(r["kind"] == "loop" for r in state.runs_marked_running()), "poll_errors": dict(self.errors),
+            "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
+            "running": running, "poll_errors": dict(self.errors),
+            "tick_ok": not failing, "last_ok": self.last_ok, "failing": failing, "reloaded": self.reloaded,
             "config_ignored": list(self.cfg.ignored),
             **({"config_problem": self.config_problem} if self.config_problem else {}),
             **({"code_problem": self.code_problem} if self.code_problem else {}),
@@ -601,10 +744,5 @@ def run(with_dashboard: bool = True) -> NoReturn:
         threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
     while True:
         started = time.monotonic()
-        try:
-            server.load_new_code()
-            server.tick()
-            server.reap_inherited()
-        except Exception as e:
-            server.say(f"tick failed: {type(e).__name__}: {e}")
+        server.run_pass()
         time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))

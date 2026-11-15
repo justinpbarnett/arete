@@ -11,8 +11,10 @@ function serveState(serve) {
   if (problem) return el("p", {}, stateChip("fault"), ` Serve is up but launches nothing: ${problem}`);
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
-  return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),
-    ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running} running, ${serve.pending} waiting.` +
+  const failing = Object.entries(serve.failing || {});
+  const tickFails = failing.map(([key, f]) => ` Serve is up but its tick fails at ${key}: ${f.error}.`).join("");
+  return el("p", {}, stateChip(serve.stuck ? "fault" : broken || errors || failing.length ? "caution" : "ok"),
+    ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running ?? "unknown"} running, ${serve.pending ?? "unknown"} waiting.` + tickFails +
     (broken ? ` ${count(broken, "loop does", "loops do")} not load.` : "") + (errors ? ` ${count(errors, "source fails", "sources fail")} to poll.` : ""));
 }
 

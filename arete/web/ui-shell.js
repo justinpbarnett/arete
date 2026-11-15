@@ -66,6 +66,7 @@ function Sidebar({ route, snapshot, now }) {
     })}</nav>
     <footer class="side-foot">
       <p><span class=${serve?.alive ? "serve-up" : "muted"}>serve ${serve?.alive ? "up" : "down"}</span> <span>${uptime}</span></p>
+      ${serve?.alive && Object.keys(serve.failing || {}).length ? html`<p class="serve-fails">tick fails at ${Object.entries(serve.failing).map(([key, f]) => `${key}: ${f.error}`).join("; ")}</p>` : null}
       <p>heartbeat <span>${age}</span></p>
       <p class="host">${location.host}</p>
       <p aria-label="Checks passed over total">checks <span></span> / <span></span></p>
