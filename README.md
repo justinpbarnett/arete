@@ -21,7 +21,7 @@ So a push to arete's own main, followed by a fast forward of the checkout serve 
 
 ## Loops
 
-A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the four kinds (command, watch, climb, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
+A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work, and any script it calls. [arete/loops/README.md](arete/loops/README.md) is the whole format: the three kinds (command, watch, search), triggers, sources, emits, budgets, the queue, the device it runs on, and the safety rules. Arete ships these:
 
 | Loop | Kind | When | What it does |
 |------|------|------|--------------|
@@ -49,9 +49,9 @@ Every run of every kind, pipeline, loop, session, chat and draft, is a row in on
 Successful and ordinary skipped loop runs consume their queued input. Failed runs, requested stops, and a budget exceeded during a run keep event input as dead items. A killed run or an unsolicited signal gets one automatic retry; the second interruption keeps the input dead. The retry count survives serve restarts. `arete loop list` shows dead counts, `arete loop status NAME` lists their queue IDs, runs and reasons, and `arete loop requeue ID` resets a dead item for another attempt with the same events. Dead items are retained for 56 days. Empty schedule inputs are deleted on failure and coalesced with a waiting fire of the same trigger during recovery. A budget hold before execution leaves input waiting without using a recovery retry.
 
 An emit that changes something outside arete, a ticket, a PR or a push, can wait for approval: `arete approve` lists what waits, and `arete approve ID` approves one and `arete approve ID --reject` drops it.
-A ticket, PR, push or digest that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
+A ticket, PR or push that fails to deliver stays listed with its error, and so does a finding handed to a loop that is off.
 Try again on the dashboard, or `arete approve ID`, delivers it again, so a finding whose ticket hits a GitHub outage is filed then instead of being lost.
-A `push` emit lands a climb or search change on the default branch with no PR.
+A `push` emit lands a search change on the default branch with no PR.
 It waits for a person while the repo's `trust.level` is `pr`, and under `automerge` it waits only when it touches a path the repo denies, or when its `approve` table says so: too many lines, a deleted file, or a listed path.
 With `reviewer` in that table, a model such as opus reviews each held push first, and a push it approves with high confidence lands, unless the trust level, a path the repo denies or a listed path keeps it for a person.
 A push that fails to land stays as a failed approval.
@@ -723,8 +723,8 @@ A run with open review feedback takes the revise flow (`adws/revise.py`); any ot
 | `repair` | Repair flow, in place of `plan` and `implement`. Reads the saved internal review of the run named by `--repair`, checks that the PR head holds a commit of that run, and changes the code for the findings as `review_repair`. It fails with nothing staged, so the findings stay unresolved. |
 | `implement` | The build (`build`), then a fix round after each failed check (`fix2` and up, `check_repair`), the review fixes (`review_fix`, `review_fix2`, `review_repair`), and inside `ci` the CI fix (`ci_fix` and up, `ci_repair`) with the red output. |
 | `checks` | Runs the layer's checks. A fail goes back to `implement` until the `check_repair` step's `tries` (build's, unless set) run out; then learn runs without applying and the run fails. |
-| `verify` | Checks the change in use, with its own rounds as in a classic run. |
-| `review` | Reviews. Only a blocker (`issue`, `regression`, `security` or `data_loss`, with the path a real caller takes) requests changes; majors and minors go on the PR under "Review notes (not blocking)". Later reviews get the earlier blockers, the fixer's reply and what changed since, check those and regressions first, and mark each earlier blocker fixed, open or waived (never waived for security or data loss; a missing status counts as open). `request_changes` goes back to `implement`, then `checks`, `verify` and `review` again, until the review step's `tries` reviews are used (`review`, `review2`, ...). The last review that still requests changes ends `fail`, and the run still publishes a held draft whose report keeps `review.unresolved` and `held`. |
+| `verify` | Checks the change in use, with its own rounds as in a classic run. A ticket labeled `refactor` skips it: the run records no verify step, and the review and the PR body say the check in use was skipped for the label. The review fixes do not start another check; the next review gets the earlier evidence with a line saying it predates the review fixes. When the review passes after at least one review fix, `verify` runs once more on the final tree before `learn`, with the same repair tries, and a failure ends the run as before. |
+| `review` | Reviews. Only a blocker (`issue`, `regression`, `security` or `data_loss`, with the path a real caller takes) requests changes; majors and minors go on the PR under "Review notes (not blocking)". Later reviews get the earlier blockers, the fixer's reply and what changed since, check those and regressions first, and mark each earlier blocker fixed, open or waived (never waived for security or data loss; a missing status counts as open). `request_changes` goes back to `implement`, then `checks` and `review` again, until the review step's `tries` reviews are used (`review`, `review2`, ...). The last review that still requests changes ends `fail`, and the run still publishes a held draft whose report keeps `review.unresolved` and `held`. |
 | `learn` | Rewrites `expertise.md` as a classic run does. Its outcome holds `applied` and `commit`. |
 | `document` | Only with `[document] enabled`: writes the PR `## Summary` text with a fresh writer (see [Document](#document)). Its outcome holds `text`, empty when the writer's text was refused. |
 | `pr` | Commits the staged change with `git.subject` and the ticket ref and pushes it. With a `github` name it opens each PR, or pushes to the open one, with the classic body, sibling section, labels and draft rule; its outcome holds the PR links. A ready PR the run pushed to, checked again with nothing new to push, or found open on its branch when the prepare outcome named no PR, turns into a draft when the run is held. A found PR gets the new report as its body and keeps a CI section that says an earlier CI watch stopped. Without a `github` name it notes the branch on the run. |
@@ -776,7 +776,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/`, loop digests and backups. Process files: `serve.json`, `server.json`, `dashboard-proxy-<port>.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`, `dashboard-proxy-<port>.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -1898,7 +1898,7 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
 - Sessions: the sessions, newest first.
   New session starts one on a device, model, runner, tool set, repo and budget, and a session's page follows its feed and takes your messages.
 - Loops: every loop with its switch, kind, trigger, last run, next fire and what it paid in the last 24 hours, and a broken loop with what is wrong.
-  A loop's page shows its facts, runs, findings, sources, memory, digests and metrics.
+  A loop's page shows its facts, runs, findings, sources and memory.
   Start runs it now and follows its live feed, where Stop ends the run.
   Try runs it the way `arete loop try NAME` does, so its feed shows what each emit would do and sends none.
   New loop drafts a loop from a sentence the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
@@ -1946,7 +1946,6 @@ A saved message longer than the budget is summarized in pieces.
 If the summary cannot be written, that turn leaves the older messages out and the next turn tries again.
 The chat's own tool calls and their results are saved as short `Tool` messages, so a later turn knows what the chat already did.
 Each chat waits on its own answer, so several chats can wait at once.
-On the first start of this version, the old `chat.json` moves into one chat and stays as `chat.json.moved`.
 
 The Feedback button and `f` open a composer over any view without changing the URL; on a phone it fills the screen.
 Write an Idea (the default), an Adjustment or a Bug in one text box of up to 4,000 characters; a Bug also shows optional Expected, Actual and Steps boxes of up to 2,000 characters each.

@@ -78,12 +78,6 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
             "url": url, "trust": trust, "data": data or {}}
 
 
-def metric_event(loop: Loop, value: float) -> dict:
-    name, op, threshold = loop.trigger.metric
-    return event("metric", f"{loop.name}#metric", f"{name}@{util.iso()}", f"{name} = {value:g}, {op} {threshold:g}",
-                 trust="internal", data={"metric": name, "value": value, "rule": f"{op} {threshold:g}"})
-
-
 def fire(loop: Loop, how: str, events: list[dict] | None = None, connect=state.db) -> list[int]:
     if events is None:
         return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how, connect=connect)) else []

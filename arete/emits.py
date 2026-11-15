@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import alerts, config, gh, jev, outbound, paths, sources, state, util
+from . import config, gh, jev, outbound, sources, state, util
 from .loops import FINDING_EVENT, Loop, as_list, find, trust_rank, worktree_kinds
 
-DIGESTS_DIR = paths.STATE_DIR / "digests"
 SEVERITIES = ("low", "medium", "high", "critical")
 FALL_BACK_TO_RUN_CONFIG_REPO = ""
 FINDING_SCHEMA = {
@@ -23,10 +22,6 @@ FINDING_SCHEMA = {
     },
     "required": ["title", "summary", "fingerprint"],
 }
-
-
-def digest_folder(loop_name: str) -> Path:
-    return DIGESTS_DIR / loop_name.replace("/", ".")
 
 
 SUMMARY_LIMIT = 20000
@@ -248,62 +243,3 @@ class ToLoop(Emit):
 
     def target_repo(self, item: dict) -> str:
         return item["event"].get("repo", "")
-
-
-class Digest(Emit):
-    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
-        lines = [f"## {util.now().astimezone().strftime('%H:%M')} {loop.name} ({run_id})", ""]
-        lines += [f"- **{outbound.plain(f['title'], 160)}** ({f.get('severity') or 'unrated'}): {outbound.plain(f.get('summary'), 600)}"
-                  + (f" [{outbound.plain(f.get('location'), 200)}]" if f.get("location") else "") for f in findings]
-        if outcome.get("summary"):
-            lines.append(f"- {outbound.plain(outcome['summary'], 600)}")
-        return {"file": str(digest_folder(loop.name) / f"{util.now().astimezone():%Y-%m-%d}.md"),
-                "text": "\n".join(lines) + "\n\n"}
-
-    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
-        p = Path(item["file"])
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as fh:
-            fh.write(item["text"])
-        return paths.short_path(p)
-
-    def describe(self, item: dict) -> str:
-        return f"add {util.count(item['text'].count(chr(10) + '- '), 'line')} to the digest {paths.short_path(item['file'])}"
-
-    def detail(self, item: dict) -> str:
-        return item["text"]
-
-
-class Notify(Emit):
-    kept_failures = ()
-
-    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
-        titles = "; ".join(outbound.plain(f["title"], 80) for f in findings[:3]) or outbound.plain(outcome.get("summary"), 160)
-        return {"title": f"arete: {loop.name}", "message": f"{len(findings)} found: {titles}" if findings else titles}
-
-    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
-        alerts.notify(item["title"], item["message"])
-        return "notified"
-
-    def describe(self, item: dict) -> str:
-        return f"notify: {item['message']}"
-
-
-class Metric(Emit):
-    kept_failures = ()
-
-    def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
-        return [] if spec.get("name") else ["a metric emit needs name"]
-
-    def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
-        return [findings]
-
-    def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
-        return {"name": spec["name"], "value": float(outcome.get("value", len(findings)))}
-
-    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
-        state.add_metric(item["name"], item["value"], loop_name, run_id)
-        return f"{item['name']} = {item['value']:g}"
-
-    def describe(self, item: dict) -> str:
-        return f"record metric {item['name']} = {item['value']:g}"
