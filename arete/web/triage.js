@@ -176,6 +176,7 @@ function drawTicket(groups, ref, researching) {
     r.questions.length && !answerable ? [subheading("Questions"), list(r.questions)] : null,
     r.send ? [subheading(answerable ? "Answer and send" : "Send"), sendForm(r)] : null,
     r.assumptions.length ? fold(`triage:a:${ref}`, "Show what the build assumes", list(r.assumptions)) : null,
+    r.checks.length ? fold(`triage:c:${ref}`, "Show what done means", list(r.checks)) : null,
     r.plan.length ? fold(`triage:p:${ref}`, "Show the plan", list(r.plan)) : null,
     r.report ? foldText(`triage:r:${ref}`, "Show the report", r.report) : null,
     researchOffer(r, researching));
