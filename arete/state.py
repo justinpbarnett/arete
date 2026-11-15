@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import sqlite3
 from collections.abc import Sequence
@@ -648,6 +649,62 @@ def transaction():
 def ensure_schema() -> None:
     with db():
         pass
+
+
+def backfill_legacy_cost(before: dict | None = None) -> int:
+    before = {} if before is None else before
+    if not isinstance(before, dict) or any(not isinstance(k, str) or isinstance(v, bool)
+                                         or not isinstance(v, (int, float))
+                                         for k, v in before.items()):
+        raise ValueError("before must map run IDs to finite dollar amounts")
+    try:
+        before = {k: float(v) for k, v in before.items()}
+    except OverflowError:
+        raise ValueError("before must map run IDs to finite dollar amounts") from None
+    if any(not math.isfinite(v) for v in before.values()):
+        raise ValueError("before must map run IDs to finite dollar amounts")
+    with db() as c:
+        missing = sorted(set(before) - {r[0] for r in c.execute("SELECT id FROM runs")})
+        if missing:
+            raise ValueError(f"no run: {missing[0]}")
+        c.execute("""
+            WITH totals AS MATERIALIZED (
+                SELECT run_id, SUM(cost_usd) AS usd, SUM(tokens_in) AS tin, SUM(tokens_out) AS tout
+                FROM steps GROUP BY run_id
+            ), eligible AS MATERIALIZED (
+                SELECT runs.id, runs.started, COALESCE(runs.cost_usd, 0) AS usd,
+                       COALESCE(totals.usd, 0) AS spent,
+                       COALESCE(runs.tokens_in, 0) - COALESCE(totals.tin, 0) AS tin,
+                       COALESCE(runs.tokens_out, 0) - COALESCE(totals.tout, 0) AS tout,
+                       edits.value AS old
+                FROM runs LEFT JOIN totals ON totals.run_id = runs.id
+                LEFT JOIN json_each(?) AS edits ON edits.key = runs.id
+                WHERE runs.started < (SELECT MIN(ts) FROM steps)
+                  AND COALESCE(runs.cost_usd, 0) != COALESCE(totals.usd, 0)
+            )
+            INSERT INTO steps (run_id, step, kind, runner, ok, auth_mode, ts,
+                               cost_usd, tokens_in, tokens_out, error)
+            SELECT id, 'legacy', 'legacy', 'legacy', 1, 'subscription', started,
+                   COALESCE(old, usd) - spent, tin, tout, '' FROM eligible
+            UNION ALL
+            SELECT id, 'correction', 'correction', 'correction', 1, 'subscription', started,
+                   usd - old, 0, 0, 'legacy repricing from supplied before value'
+            FROM eligible WHERE old IS NOT NULL AND usd != old
+        """, (json.dumps(before),))
+        return c.execute("SELECT changes()").fetchone()[0]
+
+
+def cost_drift() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("""
+            SELECT runs.id, COALESCE(runs.cost_usd, 0) AS run_usd,
+                   COALESCE(t.usd, 0) AS steps_usd,
+                   COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0) AS difference
+            FROM runs LEFT JOIN (SELECT run_id, SUM(cost_usd) AS usd FROM steps GROUP BY run_id) t
+            ON t.run_id = runs.id
+            WHERE ABS(COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0)) > 0.000001
+            ORDER BY runs.id
+        """)]
 
 
 @contextmanager

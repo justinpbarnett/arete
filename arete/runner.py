@@ -464,13 +464,9 @@ class Meter:
     usd: float | None
     charged: Callable[[Result], float]
     seen: Result
-    on_lost: Callable[[Result], None] = lambda seen: None
     ids: dict = field(default_factory=dict)
 
     def watching(self, on_line: Callable[[str], None]) -> Callable[[str], None]:
-        if self.tokens is None and self.usd is None:
-            return on_line
-
         def watched(line: str) -> None:
             on_line(line)
             if turn := streamed_turn(line, self.ids):
@@ -495,10 +491,6 @@ class Meter:
             res = call(*args, **kw)
         except Cut as cut:
             return replace(self.seen, error=str(cut))
-        except BaseException:
-            if self.seen.turns:
-                self.on_lost(replace(self.seen, error="interrupted"))
-            raise
         reported = res.tokens_in or res.tokens_out or res.cost_usd or res.calls
         if reported or not self.seen.turns:
             return res
@@ -955,60 +947,74 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     max_tokens = kw.pop("max_tokens", None)
     on_local = route.get("credential") == "local"
 
-    def keep_lost(seen: Result) -> None:
+    def persist(res: Result) -> None:
+        try:
+            if trace[0]:
+                record.steps(trace[0], trace[1],
+                             [(call, call.call_seconds if res.calls else time.monotonic() - started)
+                              for call in res.calls or [res]], effort=kw.get("effort", ""),
+                             tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "")
+        except BaseException as error:
+            rec.finish(replace(res, ok=False, error=record.scrub(
+                f"cost is not in steps: {record.failure(error)}; {res.error}", hidden)), time.monotonic() - started)
+            raise
+
+    def keep_lost(error: BaseException) -> None:
+        refresh_hidden()
+        seen = replace(meter.seen, provider=header["provider"],
+                       error=record.scrub(rec.exception_text(error), hidden))
         seen.cost_usd = 0.0 if on_local else priced(seen, cfg)
-        if trace[0]:
-            record.step(trace[0], trace[1], seen, time.monotonic() - started, effort=kw.get("effort", ""),
-                        tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "")
+        persist(seen)
+        rec.finish(seen, time.monotonic() - started)
 
     meter = Meter(max_tokens, kw.get("max_budget_usd") if max_tokens is not None else None,
                   lambda r: priced(r, cfg),
-                  Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode), keep_lost)
+                  Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode))
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
-        budget_error = kw.pop("budget_error", "")
-        if budget_error:
-            res = Result(ok=False, error=budget_error, session=resume, runner=which, model=name)
-        elif which == REPLAY:
-            res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"))
-        elif which == "codex":
-            protected = [verification_scratch.AUTHORITY, paths.WORKTREES_DIR]
-            res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line,
-                            hidden=[*found, *protected], auth=auth, **kw)
-        else:
-            res = meter.guard(pi.run if which == "pi" else claude.run, prompt, cwd, model=name, resume=resume,
-                              on_line=meter.watching(safe_line if selected else rec.line), auth=auth, **kw)
-        res.runner = which
-        res.model = res.model or name
-        res.provider = res.provider or provider_of(res.model)
-        if which != REPLAY:
-            res.auth_mode = auth.mode
-            if res.usage_limit and (res.usage_limit.scope not in limit_scopes(auth, name) or
-                                   res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
-                res.usage_limit = None
-        if res.calls:
+        try:
+            budget_error = kw.pop("budget_error", "")
+            if budget_error:
+                res = Result(ok=False, error=budget_error, session=resume, runner=which, model=name)
+            elif which == REPLAY:
+                res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"))
+            elif which == "codex":
+                protected = [verification_scratch.AUTHORITY, paths.WORKTREES_DIR]
+                res = codex.run(prompt, cwd, model=name, resume=resume, on_line=rec.line,
+                                hidden=[*found, *protected], auth=auth, **kw)
+            else:
+                res = meter.guard(pi.run if which == "pi" else claude.run, prompt, cwd, model=name, resume=resume,
+                                  on_line=meter.watching(safe_line if selected else rec.line), auth=auth, **kw)
+            res.runner = which
+            res.model = res.model or name
+            res.provider = res.provider or provider_of(res.model)
+            if which != REPLAY:
+                res.auth_mode = auth.mode
+                if res.usage_limit and (res.usage_limit.scope not in limit_scopes(auth, name) or
+                                       res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
+                    res.usage_limit = None
+            if res.calls:
+                for call in res.calls:
+                    call.cost_usd = 0.0 if on_local else priced(call, cfg)
+                res.cost_usd = sum(call.cost_usd for call in res.calls)
+                res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
+            else:
+                res.cost_usd = 0.0 if on_local else priced(res, cfg)
+            if not budget_error:
+                quote_calls(res, which, name, at)
+            refresh_hidden()
+            res.error = record.scrub(res.error, hidden)
+            res.text = record.scrub(res.text, hidden)
+            res.structured = record.scrub_value(res.structured, hidden)
             for call in res.calls:
-                call.cost_usd = 0.0 if on_local else priced(call, cfg)
-            res.cost_usd = sum(call.cost_usd for call in res.calls)
-            res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
-        else:
-            res.cost_usd = 0.0 if on_local else priced(res, cfg)
-        if not budget_error:
-            quote_calls(res, which, name, at)
-        refresh_hidden()
-        res.error = record.scrub(res.error, hidden)
-        res.text = record.scrub(res.text, hidden)
-        res.structured = record.scrub_value(res.structured, hidden)
-        for call in res.calls:
-            call.error = record.scrub(call.error, hidden)
-        res.effort, res.credential = kw.get("effort", ""), route.get("credential", "")
-        res.requested_effort, res.skipped = route.get("requested_effort", ""), route.get("skipped", [])
-        res.record = rec.path.name if rec.path else ""
+                call.error = record.scrub(call.error, hidden)
+            res.effort, res.credential = kw.get("effort", ""), route.get("credential", "")
+            res.requested_effort, res.skipped = route.get("requested_effort", ""), route.get("skipped", [])
+            res.record = rec.path.name if rec.path else ""
+        except BaseException as error:
+            keep_lost(error)
+            raise
+        persist(res)
         rec.finish(res, time.monotonic() - started)
-    if trace[0]:
-        for call in res.calls or [res]:
-            record.step(trace[0], trace[1], call, call.call_seconds if res.calls else time.monotonic() - started,
-                        effort=kw.get("effort", ""), tier=tier, kind=kind, try_no=try_no,
-                        auth_mode="local" if route.get("credential") == "local" else "")
     return res
 
 
