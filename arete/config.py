@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import re
 import tomllib
@@ -278,6 +279,7 @@ class Config:
     capture_public_evidence: bool = False
     oncall: OncallConfig = field(default_factory=OncallConfig)
     ab: dict[str, dict] = field(default_factory=dict)
+    ignored: tuple[str, ...] = ()
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -326,6 +328,14 @@ def table_of(value, where: str) -> dict:
     if not isinstance(value, dict):
         raise TypeError(f"[{where}] must be a table, not {value!r}")
     return value
+
+
+def known(table: dict, allowed, where: str, ignored: list[str] | None, noun: str = "key") -> dict:
+    if bad := sorted(set(table) - set(allowed)):
+        if ignored is None:
+            raise ValueError(f"[{where}]: unknown {noun} {', '.join(bad)}; use {', '.join(allowed)}")
+        ignored.extend(f"[{where}] {name}" for name in bad)
+    return {name: value for name, value in table.items() if name in allowed}
 
 
 def step_table(table, where: str) -> dict:
@@ -377,10 +387,8 @@ def mcp_tables(data) -> dict[str, dict]:
     return servers
 
 
-def step_tables(data, where: str) -> dict[str, dict]:
-    data = table_of(data, where)
-    if bad := sorted(set(data) - set(STEP_NAMES)):
-        raise ValueError(f"[{where}]: unknown step {', '.join(bad)}; use {', '.join(STEP_NAMES)}")
+def step_tables(data, where: str, ignored: list[str] | None = None) -> dict[str, dict]:
+    data = known(table_of(data, where), STEP_NAMES, where, ignored, "step")
     for alias, role in STEP_ALIASES.items():
         if alias in data and role in data:
             raise ValueError(f"[{where}.{alias}] and [{where}.{role}] are the same step; name the step once")
@@ -425,15 +433,12 @@ def ab_clash(tests: dict) -> None:
                                  + (f" for {kind} tickets" if kind else "") + "; keep one A/B per step and kind")
 
 
-def kind_tables(data, where: str) -> dict[str, dict[str, dict]]:
-    data = table_of(data, where)
-    if bad := sorted(set(data) - set(KINDS)):
-        raise ValueError(f"[{where}]: unknown kind {', '.join(bad)}; use {', '.join(KINDS)}")
+def kind_tables(data, where: str, ignored: list[str] | None = None) -> dict[str, dict[str, dict]]:
+    data = known(table_of(data, where), KINDS, where, ignored, "kind")
     kinds = {}
     for kind, table in data.items():
-        if bad := sorted(set(table_of(table, f"{where}.{kind}")) - {"steps"}):
-            raise ValueError(f"[{where}.{kind}]: unknown key {', '.join(bad)}; use steps")
-        kinds[kind] = step_tables(table.get("steps") or {}, f"{where}.{kind}.steps")
+        table = known(table_of(table, f"{where}.{kind}"), ("steps",), f"{where}.{kind}", ignored)
+        kinds[kind] = step_tables(table.get("steps") or {}, f"{where}.{kind}.steps", ignored)
     return kinds
 
 
@@ -527,17 +532,13 @@ def price_rate(value, where: str) -> float:
     return found
 
 
-def replay_table(data) -> ReplayConfig:
-    table = table_of(data, "replay")
-    if bad := sorted(set(table) - set(REPLAY_KEYS)):
-        raise ValueError(f"[replay]: unknown key {', '.join(bad)}; use {', '.join(REPLAY_KEYS)}")
+def replay_table(data, ignored: list[str] | None = None) -> ReplayConfig:
+    table = known(table_of(data, "replay"), REPLAY_KEYS, "replay", ignored)
     return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
 
 
-def ask_table(data) -> AskConfig:
-    table = table_of(data, "ask")
-    if bad := sorted(set(table) - set(ASK_KEYS)):
-        raise ValueError(f"[ask]: unknown key {', '.join(bad)}; use {', '.join(ASK_KEYS)}")
+def ask_table(data, ignored: list[str] | None = None) -> AskConfig:
+    table = known(table_of(data, "ask"), ASK_KEYS, "ask", ignored)
     limit, settle = table.get("max_per_run", 3), table.get("settle", True)
     if type(limit) is not int or limit < 0:
         raise ValueError(f"[ask] max_per_run must be a whole number of at least 0, not {limit!r}")
@@ -556,10 +557,8 @@ def ask_table(data) -> AskConfig:
     return AskConfig(max_per_run=limit, settle=settle, expire_days=days, remind_hours=hours, push_contact=contact)
 
 
-def retention_table(data) -> Retention:
-    table = table_of(data, "retention")
-    if bad := sorted(set(table) - set(RETENTION_KEYS)):
-        raise ValueError(f"[retention]: unknown key {', '.join(bad)}; use {', '.join(RETENTION_KEYS)}")
+def retention_table(data, ignored: list[str] | None = None) -> Retention:
+    table = known(table_of(data, "retention"), RETENTION_KEYS, "retention", ignored)
     found = {}
     for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb), ("lines_days", Retention.lines_days)):
         value = table.get(key, default)
@@ -581,10 +580,8 @@ def backup_table(data) -> BackupConfig:
     return BackupConfig(copy_to=copy_to)
 
 
-def chat_table(data) -> ChatConfig:
-    table = table_of(data, "chat")
-    if bad := sorted(set(table) - set(CHAT_KEYS)):
-        raise ValueError(f"[chat]: unknown key {', '.join(bad)}; use {', '.join(CHAT_KEYS)}")
+def chat_table(data, ignored: list[str] | None = None) -> ChatConfig:
+    table = known(table_of(data, "chat"), CHAT_KEYS, "chat", ignored)
     tokens = table.get("context_tokens", ChatConfig.context_tokens)
     if type(tokens) is not int or tokens < 100:
         raise ValueError(f"[chat] context_tokens must be a whole number of at least 100, not {tokens!r}")
@@ -600,11 +597,9 @@ def chat_table(data) -> ChatConfig:
     return ChatConfig(context_tokens=tokens, summary_model=model.strip(), max_sessions=most, budget_usd=float(budget))
 
 
-def research_table(data) -> dict:
-    table = table_of(data, "research")
+def research_table(data, ignored: list[str] | None = None) -> dict:
     keys = ("planner", "search", "synthesis", "audit", "search_workers", "search_share")
-    if bad := sorted(set(table) - set(keys)):
-        raise ValueError(f"[research]: unknown key {', '.join(bad)}; use {', '.join(keys)}")
+    table = known(table_of(data, "research"), keys, "research", ignored)
     planner = table.get("planner", False)
     if type(planner) is not bool:
         raise ValueError(f"[research] planner must be true or false, not {planner!r}")
@@ -766,10 +761,12 @@ def word_range(kind: str, value) -> tuple[int, int]:
     return value[0], value[1]
 
 
-def document_table(data, folder: Path) -> dict:
-    table = table_of(data, "document")
-    if bad := sorted(set(table) - set(DOCUMENT_KEYS)):
-        raise ValueError(f"[document]: unknown key {', '.join(bad)}; use {', '.join(DOCUMENT_KEYS)}")
+def jev_names(jv: dict, name: str, noun: str, ignored: list[str] | None) -> dict:
+    return known(jv.get(name) or {}, JevConfig().__dict__[name], f"jev.{name}", ignored, noun)
+
+
+def document_table(data, folder: Path, ignored: list[str] | None = None) -> dict:
+    table = known(table_of(data, "document"), DOCUMENT_KEYS, "document", ignored)
     found = {}
     if "enabled" in table:
         if type(table["enabled"]) is not bool:
@@ -812,8 +809,29 @@ def dashboard_https(value: object) -> bool:
     return value
 
 
-def load(path: Path | None = None) -> Config:
+def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
+    try:
+        return load(path), ""
+    except Exception as e:
+        problem = f"{type(e).__name__}: {e}"
+    fallback = Config()
+    try:
+        dashboard = tomllib.loads(paths.read_confined(path or paths.CONFIG_FILE).decode()).get("dashboard", {})
+        dashboard = dashboard if isinstance(dashboard, dict) else {}
+    except Exception:
+        return fallback, problem
+    with contextlib.suppress(Exception):
+        fallback.dashboard_port = int(dashboard.get("port", DASHBOARD_PORT))
+    with contextlib.suppress(Exception):
+        fallback.dashboard_https = dashboard_https(dashboard.get("https", False))
+    if isinstance(dashboard.get("owner", ""), str):
+        fallback.dashboard_owner = dashboard.get("owner", "")
+    return fallback, problem
+
+
+def load(path: Path | None = None, strict: bool = False) -> Config:
     path = path or paths.CONFIG_FILE
+    ignored: list[str] | None = None if strict else []
     try:
         data = tomllib.loads(paths.read_confined(path).decode())
     except FileNotFoundError:
@@ -837,8 +855,8 @@ def load(path: Path | None = None) -> Config:
         if not isinstance(adws, str):
             raise TypeError(f"[factory] adws must be a folder path, not {adws!r}")
         cfg.adws = path.parent / paths.expand(adws)
-    cfg.steps = step_tables(data.get("steps") or {}, "steps")
-    cfg.kinds = kind_tables(data.get("kinds") or {}, "kinds")
+    cfg.steps = step_tables(data.get("steps") or {}, "steps", ignored)
+    cfg.kinds = kind_tables(data.get("kinds") or {}, "kinds", ignored)
     serve = data.get("serve", {})
     if "loop_dirs" in serve:
         cfg.loop_dirs = [paths.expand(d) for d in serve["loop_dirs"]]
@@ -877,22 +895,17 @@ def load(path: Path | None = None) -> Config:
         secrets_hold=float(jv.get("secrets_hold", JevConfig.secrets_hold)),
         triage_skip=float(jv.get("triage_skip", JevConfig.triage_skip)),
         screen_lines={**JevConfig().screen_lines,
-                      **{str(k): float(v) for k, v in (jv.get("screen_lines") or {}).items()}},
+                      **{str(k): float(v) for k, v in jev_names(jv, "screen_lines", "question", ignored).items()}},
         proof_hold=float(jv.get("proof_hold", JevConfig.proof_hold)),
         fixed_skip=float(jv.get("fixed_skip", JevConfig.fixed_skip)),
         research_rerun=float(jv.get("research_rerun", JevConfig.research_rerun)),
         research_answered=float(jv.get("research_answered", JevConfig.research_answered)),
         feedback_skip=float(jv.get("feedback_skip", JevConfig.feedback_skip)),
-        risk_weights={**JevConfig().risk_weights, **{str(k): float(v) for k, v in (jv.get("risk_weights") or {}).items()}},
+        risk_weights={**JevConfig().risk_weights,
+                      **{str(k): float(v) for k, v in jev_names(jv, "risk_weights", "weight", ignored).items()}},
         guard=bool(jv.get("guard", True)),
         compact_tokens=int(jv.get("compact_tokens", JevConfig.compact_tokens)),
     )
-    if bad := sorted(set(cfg.jev.risk_weights) - set(JevConfig().risk_weights)):
-        raise ValueError(f"[jev.risk_weights]: unknown weight {', '.join(bad)}; use "
-                         f"{', '.join(JevConfig().risk_weights)}")
-    if bad := sorted(set(cfg.jev.screen_lines) - set(JevConfig().screen_lines)):
-        raise ValueError(f"[jev.screen_lines]: unknown question {', '.join(bad)}; use "
-                         f"{', '.join(JevConfig().screen_lines)}")
     app = section(data, "github_app")
     cfg.github_app = GithubApp(
         app_id=str(app.get("app_id", "")).strip(),
@@ -946,26 +959,27 @@ def load(path: Path | None = None) -> Config:
             )
         )
     cfg.oncall = oncall_table(data.get("oncall") or {}, cfg.repos)
-    cfg.replay = replay_table(data.get("replay") or {})
+    cfg.replay = replay_table(data.get("replay") or {}, ignored)
     cfg.mcp = mcp_tables(data.get("mcp") or {})
-    research = research_table(data.get("research") or {})
+    research = research_table(data.get("research") or {}, ignored)
     cfg.research_planner = research["planner"]
     cfg.research_search = research["search"]
     cfg.research_synthesis = research["synthesis"]
     cfg.research_audit = research["audit"]
     cfg.research_search_workers = research["search_workers"]
     cfg.research_search_share = research["search_share"]
-    cfg.ask = ask_table(data.get("ask") or {})
-    cfg.retention = retention_table(data.get("retention") or {})
+    cfg.ask = ask_table(data.get("ask") or {}, ignored)
+    cfg.retention = retention_table(data.get("retention") or {}, ignored)
     cfg.backup = backup_table(data.get("backup") or {})
-    cfg.chat = chat_table(data.get("chat") or {})
+    cfg.chat = chat_table(data.get("chat") or {}, ignored)
     cfg.environment = environment_table(data.get("environment") or {})
-    cfg.document = document_table(data.get("document") or {}, path.parent)
+    cfg.document = document_table(data.get("document") or {}, path.parent, ignored)
     cfg.capture_vision, cfg.capture_evidence_branch, cfg.capture_public_evidence = capture_table(
         data.get("capture") or {}, path.parent)
     cfg.ab = ab_tables(data.get("ab") or {})
     from . import steps
     steps.check(cfg, defer_tiers=True)
+    cfg.ignored = tuple(ignored or ())
     return cfg
 
 
@@ -1047,6 +1061,7 @@ class RepoLayer:
     passes: tuple[str, ...] = ()
     document: dict = field(default_factory=dict)
     ab: dict[str, dict] = field(default_factory=dict)
+    ignored: tuple[str, ...] = ()
 
     @property
     def builder_bash(self) -> list[str]:
@@ -1076,7 +1091,8 @@ def section(data: dict, name: str) -> dict:
         raise ValueError(f"[{name}] is not a table") from None
 
 
-def load_layer(layer_dir: Path) -> RepoLayer:
+def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
+    ignored: list[str] | None = None if strict else []
     layer = RepoLayer(dir=layer_dir)
     if not layer.config_file.exists():
         return layer
@@ -1112,15 +1128,15 @@ def load_layer(layer_dir: Path) -> RepoLayer:
     found = routing_table(section(data, "routing"))
     layer.routing_fallback, layer.capabilities, layer.floors = found.fallback, found.capabilities, found.floors
     layer.payment_modes = found.payment_modes
-    layer.steps = step_tables(section(data, "steps"), "steps")
-    layer.kinds = kind_tables(section(data, "kinds"), "kinds")
+    layer.steps = step_tables(section(data, "steps"), "steps", ignored)
+    layer.kinds = kind_tables(section(data, "kinds"), "kinds", ignored)
     layer.ab = ab_tables(section(data, "ab"))
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
     layer.tier_map = str(section(data, "factory").get("tier_map", "")).strip()
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     layer.passes = environment_table(section(data, "environment"), layer=True).passes
-    layer.document = document_table(section(data, "document"), layer_dir)
+    layer.document = document_table(section(data, "document"), layer_dir, ignored)
     if "verify" in data:
         v = section(data, "verify")
         publish_evidence = v.get("publish_evidence", True)
@@ -1138,4 +1154,5 @@ def load_layer(layer_dir: Path) -> RepoLayer:
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),
                               preflight=dict(preflight), preflight_seconds=float(seconds))
         outbound.keep_verify_private(layer.verify.url)
+    layer.ignored = tuple(ignored or ())
     return layer

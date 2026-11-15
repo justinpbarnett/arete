@@ -7,6 +7,8 @@ function serveState(serve) {
   if (!serve.alive) return el("p", {}, stateChip("fault"), serve.process_gone
     ? [" Serve's process is gone; it last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so no loop fires on its own until it runs again.`]
     : [" Serve's process is up, but it last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so it looks stuck and no loop fires on its own until it beats again.`]);
+  const problem = serve.config_problem || serve.code_problem;
+  if (problem) return el("p", {}, stateChip("fault"), ` Serve is up but launches nothing: ${problem}`);
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
   return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),

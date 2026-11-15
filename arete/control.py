@@ -147,7 +147,7 @@ def day_ago() -> str:
 
 
 def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]:
-    cfg = cfg or config.load()
+    cfg = cfg or config.load_or_problem()[0]
     every_loop = loops.load_all(cfg)
     states = state.loop_states(connect)
     running = {r["loop"]: r["id"] for r in state.runs_marked_running(connect) if r["kind"] == "loop"}
@@ -171,7 +171,7 @@ def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]
 
 
 def loop_detail(name: str, connect=state.db) -> dict:
-    cfg = config.load()
+    cfg = config.load_or_problem()[0]
     loop = find_loop(name, cfg)
     view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
     source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
@@ -275,7 +275,7 @@ def step_costs(by: str, days: float | None = None, connect=state.db, cfg: config
     if by not in COST_GROUPS:
         raise Refused(f"cannot group costs by {by}; pick one of {', '.join(COST_GROUPS)}")
     days, since = cost_window(days)
-    cfg = cfg or config.load()
+    cfg = cfg or config.load_or_problem()[0]
     groups: dict[str, dict] = {}
     paid = subscribed = 0.0
     for s in state.steps_since(since, connect):
@@ -363,7 +363,7 @@ def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, conne
 
 def ab_report(name: str = "", days: float | None = None, connect=state.db, cfg: config.Config | None = None) -> list[dict]:
     days, since = cost_window(AB_DAYS if days is None else days)
-    cfg = cfg or config.load()
+    cfg = cfg or config.load_or_problem()[0]
     placed: dict[str, dict] = {}
     for p in state.ab_placements(since, name, connect):
         test = placed.setdefault(p["ab"], {"step": p["atom"], "arm": set(), "baseline": set()})
@@ -385,7 +385,7 @@ def ab_report(name: str = "", days: float | None = None, connect=state.db, cfg: 
 def paid_since(since: str, connect=state.db, cfg: config.Config | None = None) -> dict:
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
-    cfg = cfg or config.load()
+    cfg = cfg or config.load_or_problem()[0]
     for s in state.steps_since(since, connect, paid_only=True):
         if billing_of(s, cfg) in ("local", "replay"):
             continue

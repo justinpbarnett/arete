@@ -19,7 +19,7 @@ class Refused(ValueError):
 
 
 def current() -> dict:
-    cfg = config.load()
+    cfg, _ = config.load_or_problem()
     return {**{key: getattr(cfg, key) for key in RUN_LIMITS}, "parallel_max": PARALLEL_MAX, "aliases": MODEL_ALIASES,
             "models": {role: cfg.models.get(role, "") for role in config.MODEL_ROLES},
             "defaults": {role: config.MODEL_FALLBACKS.get(role, "") for role in config.MODEL_ROLES}}
@@ -78,7 +78,7 @@ def replace_config(text: str, wanted_limits: dict[str, int], wanted_models: dict
 def write_checked(text: str, refusal) -> None:
     def check(draft):
         try:
-            cfg = config.load(draft)
+            cfg = config.load(draft, strict=True)
         except Exception as e:
             raise Refused(f"The new config would not load ({util.first_line(str(e), 120)}), so config.toml is unchanged.") from e
         if why := refusal(cfg):
