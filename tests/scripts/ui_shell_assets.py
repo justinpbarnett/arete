@@ -41,9 +41,9 @@ try:
     check.assertEqual(assets.scripts, {
         "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js", "/ui-keys.js", "/ui-keybar.js", "/ui-hooks.js", "/ui-list.js", "/ui-menu.js",
         "/ui-palette.js", "/ui-fuzzy.js", "/ui-feedback.js",
-        "/ui-actions.js", "/ui-undo.js", "/ui-notice.js", "/ui-write.js", "/ui-live.js", "/ui-states.js",
+        "/ui-actions.js", "/ui-undo.js", "/ui-notice.js", "/ui-write.js", "/ui-live.js", "/ui-states.js", "/ui-run.js",
         "/vendor-preact.js", "/vendor-htm.js", "/vendor-signals.js"})
-    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css", "/ui-feedback.css"})
+    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css", "/ui-feedback.css", "/ui-run.css"})
     check.assertIn("/icon-192.png", assets.declared)
     for path in sorted(assets.declared):
         with opener.open(base + path, timeout=5) as response:

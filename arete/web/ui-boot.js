@@ -3,7 +3,8 @@ import { signal, effect } from "./vendor-signals.js";
 import { Shell, applyRuns } from "./ui-shell.js";
 import { current, listen } from "./ui-router.js";
 import { visit } from "./ui-data.js";
-import { live, connectivity, readFault } from "./ui-live.js";
+import { live, connectivity, readFault, runView } from "./ui-live.js";
+import { applyQueue } from "./ui-run.js";
 import { startKeys, marks, screenKeys, pending, sheet, mode, connection, readRetry } from "./ui-keys.js";
 import { configurePalette, globalCommands } from "./ui-palette.js";
 import { actions, dispatch } from "./ui-actions.js";
@@ -13,7 +14,7 @@ import { feedbackCommand, startFeedback } from "./ui-feedback.js";
 import { normalizePrimary } from "./ui-list.js";
 
 const route = signal(current());
-let feed = live(route.value.screen);
+let feed = live(route.value.screen, route.value.path[0]);
 const snapshot = feed.snapshot;
 const now = signal(Date.now());
 const tab = [...crypto.getRandomValues(new Uint8Array(8))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -36,13 +37,16 @@ function finish() {
 const retry = () => feed.retry();
 
 effect(() => applyRuns(snapshot.value.runs));
+effect(() => applyQueue(runView.value));
 
 effect(() => {
   const selected = route.value;
   const latest = snapshot.value;
+  const runs = runView.value;
+  const runFault = selected.screen === "run" && (runs.queueError || runs.detailError);
   connection.value = connectivity(latest, now.value);
-  readRetry.value = readFault(selected.screen, latest) ? retry : null;
-  render(h(Shell, { route: selected, snapshot: latest, now: now.value, retry }), document.getElementById("app"));
+  readRetry.value = readFault(selected.screen, latest) || runFault ? retry : null;
+  render(h(Shell, { route: selected, snapshot: latest, now: now.value, retry, runs }), document.getElementById("app"));
   marks();
   normalizePrimary();
   document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "My work" : selected.screen}`;
@@ -51,7 +55,7 @@ effect(() => {
 listen((selected) => {
   if (selected.hash === route.value.hash) return;
   finish();
-  feed = live(selected.screen);
+  feed = live(selected.screen, selected.path[0]);
   route.value = selected;
   start(via);
   via = "hash";

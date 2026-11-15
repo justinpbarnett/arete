@@ -189,7 +189,8 @@ function neighbour(delta) {
   const list = lists("queue").find((el) => listRows(el).length);
   if (!list) return;
   const rows = listRows(list);
-  const row = rows[Math.max(0, Math.min(rows.length - 1, currentIndex(list) + delta))];
+  const shown = rows.findIndex((row) => row.getAttribute("aria-current") === "page");
+  const row = rows[Math.max(0, Math.min(rows.length - 1, (shown >= 0 ? shown : currentIndex(list)) + delta))];
   place(list, row);
   openRow(row);
 }
@@ -256,7 +257,7 @@ function chord(key) {
   if (prefix === "g" && key === "g") { move(0, false); return true; }
   if (prefix === "g" && key === "t") { tab(1); return true; }
   if (prefix === "g" && key === "T") { tab(-1); return true; }
-  if (prefix === "g" && key === "x") return true;
+  if (prefix === "g" && key === "x") { actionContext()?.run?.open?.(); return true; }
   if (prefix === "d" && key === "d") { destructive(); return true; }
   return prefix === "z" && key === "z";
 }
@@ -274,7 +275,8 @@ function normal(event) {
   if (key === ".") { repeat(actionContext()); return true; }
   if (["s", "S", "R"].includes(key)) {
     const context = actionContext();
-    const action = context?.item && (context.setAside ?? actions[key === "s" ? "snooze" : key === "S" ? "shelve" : "repair"]);
+    const action = context?.run ? (key === "R" ? context.run.retry : null)
+      : context?.item && (context.setAside ?? actions[key === "s" ? "snooze" : key === "S" ? "shelve" : "repair"]);
     if (action) { perform(action, context); return true; }
     if (key === "R" && readRetry.peek()) { readRetry.peek()(); return true; }
   }
@@ -375,7 +377,9 @@ export function hints() {
   if (row && [...row.querySelectorAll("textarea, input, [contenteditable]")].some(writable)) found.push([["i"], "type"]);
   if (document.querySelector("[data-search]")) found.push([["/"], "search"]);
   if (document.querySelector(tabSelector)) found.push([["gt", "gT"], "tab"]);
-  if (list?.uiContext) found.push([["dd"], "act"], [["u"], "undo"], [["."], "repeat"]);
-  if (readRetry.value) found.push([["⇧r"], "retry"]);
+  const run = list?.uiContext ? actionContext()?.run : null;
+  if (run) found.push([["[", "]"], "run"], [["dd"], "stop"], [["gx"], "open"]);
+  else if (list?.uiContext) found.push([["dd"], "act"], [["u"], "undo"], [["."], "repeat"]);
+  if (run?.retry || readRetry.value) found.push([["⇧r"], "retry"]);
   return found;
 }

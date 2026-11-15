@@ -2,6 +2,7 @@ import { h, Component } from "./vendor-preact.js";
 import { signal, effect } from "./vendor-signals.js";
 import { prepareWrite, sendWrite } from "./ui-write.js";
 import { notice, succeeded, failed } from "./ui-notice.js";
+import { run as runRoutes } from "./ui-data.js";
 import { pushUndo } from "./ui-undo.js";
 
 export const reasonBox = signal(null);
@@ -62,7 +63,7 @@ export async function dispatch(action, context = {}, reason = "") {
       restore: context.restore ?? (() => { if (hash != null) location.hash = hash; }) });
     replay = request;
     last = { action, reason, compatible: context.compatible };
-    succeeded(action.explanation && action.name !== "checks" ? `${label} (cannot be undone)` : label);
+    succeeded(action.explanation && action.name !== "checks" ? `${label} (cannot be undone)` : label, !(action.explanation && action.name !== "checks"));
     return true;
   } catch (error) {
     if (error.conflict) context.stale?.(error.current);
@@ -72,10 +73,29 @@ export async function dispatch(action, context = {}, reason = "") {
 }
 
 export function runContext(item, verb, data = {}, step = "") {
-  const routes = ["stop", "answer", "resume", "repair", "steps"];
-  if (!routes.includes(verb) || (verb === "steps" && !step)) throw new Error("Unknown run action");
-  return { item, compatible: `run:${verb}`, request: () => ({
-    url: `/api/runs/${encodeURIComponent(item.id)}/${verb}${step ? `/${encodeURIComponent(step)}` : ""}`, data }),
+  const routes = runRoutes(item.id);
+  if (!["stop", "answer", "resume", "repair", "steps"].includes(verb) || (verb === "steps" && !step)) throw new Error("Unknown run action");
+  return { item, compatible: `run:${verb}`, request: () => ({ url: verb === "steps" ? routes.steps(step) : routes[verb], data }) };
+}
+
+export const retryRun = verb("retry", "Retry", "R");
+export const repairThisRun = verb("repair-run", "Repair run", "");
+
+const retryRoutes = { stop: "stop", retry: "resume", "repair-run": "repair" };
+
+export function runPageContext(run, { refresh, go, openLink }) {
+  const routes = runRoutes(run.id);
+  const target = (action) => routes[retryRoutes[action.name]];
+  const settled = (action, result) => {
+    refresh();
+    if (action.name !== "stop" && typeof result.run === "string" && result.run) go(result.run);
+    return { label: action.name === "stop" ? `Asked ${run.id} to stop` : `${action.label} ${run.id}` };
+  };
+  return {
+    item: { id: run.id, verb: "stop" }, compatible: `run-page:${run.id}`,
+    request: (action) => ({ url: target(action), data: {} }),
+    commit: settled,
+    run: { retry: ["failed", "interrupted", "stopped"].includes(run.status) ? retryRun : null, open: openLink },
   };
 }
 
