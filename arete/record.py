@@ -4,6 +4,7 @@ import contextlib
 import gzip
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -68,19 +69,36 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
 
 def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "",
          try_no: int = 0, auth_mode: str = "") -> None:
+    steps(run_id, name, [(res, seconds)], effort, tier, kind, try_no, auth_mode)
+
+
+def steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
+          try_no: int = 0, auth_mode: str = "") -> None:
     with state.db() as c:
-        c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
-                  " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
-                  " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                  "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
-                  "?,?,?,?,?)",
-                  (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                   res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                   res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                   res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
-        c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
-                  "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
-                  (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
+        for res, seconds in calls:
+            c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                      " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                      " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                      "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                      "?,?,?,?,?)",
+                      (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                       res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
+                       res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
+                       res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
+            c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
+                      "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
+                      (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
+
+
+def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") -> None:
+    if not math.isfinite(usd) or not why.strip():
+        raise ValueError("correction needs a finite amount and a reason")
+    if auth_mode not in ("subscription", "api_key", "local"):
+        raise ValueError("invalid auth mode")
+    if not state.run_get(run_id):
+        raise ValueError(f"no run: {run_id}")
+    step(run_id, "correction", agent.Result(ok=True, runner="correction", cost_usd=usd, error=why,
+                                           auth_mode=auth_mode), 0, kind="correction")
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
@@ -101,8 +119,20 @@ def metered_spent(run_id: str) -> float:
 
 
 def note(run_id: str, **fields) -> None:
+    if "status" in fields:
+        raise ValueError("use move to change a run's status")
     with state.db() as c:
         c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
+
+
+def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
+    if not expect:
+        return False
+    fields = {**fields, "status": to}
+    with state.db() as c:
+        return c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} "
+                         f"WHERE id = ? AND status IN ({','.join('?' * len(expect))})",
+                         (*fields.values(), run_id, *expect)).rowcount > 0
 
 
 def ask_stop(run_id: str) -> dict | None:
@@ -329,9 +359,12 @@ class Recorder:
 
     def __exit__(self, kind, error, trace) -> None:
         if error is not None:
-            why = STOPPED if self.stop_requested(error) else f"crashed: {failure(error)}"
+            why = self.exception_text(error)
             self.end({"ok": False, "error": why, "seconds": self.elapsed()})
         self.close()
+
+    def exception_text(self, error: BaseException) -> str:
+        return STOPPED if self.stop_requested(error) else f"crashed: {failure(error)}"
 
     def stop_requested(self, error: BaseException) -> bool:
         if isinstance(error, KeyboardInterrupt):
@@ -587,10 +620,11 @@ def numbered_events(path: Path) -> Iterator[dict]:
         yield {**event, "line": number}
 
 
-def runs_since(since: str) -> list[dict]:
+def runs_since(since: str, until: str = "9999") -> list[dict]:
     with state.db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status != 'running' "
-                                           "AND COALESCE(finished, started) >= ? ORDER BY started", (since,))]
+                                           "AND COALESCE(finished, started) >= ? AND COALESCE(finished, started) < ? "
+                                           "ORDER BY started", (since, until))]
 
 
 def read_run(run_id: str) -> dict | None:

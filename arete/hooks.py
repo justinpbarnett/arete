@@ -5,12 +5,14 @@ import hmac
 import json
 import os
 import secrets
+from datetime import timedelta
 from urllib.parse import parse_qs
 
 from . import loops, paths, sources, state, util
 
 HOOKS_DIR = paths.CONFIG_DIR / "hooks"
 HOOK_PATH = "/hook/"
+BODY_KEY_WINDOW = timedelta(minutes=10)
 MAX_HOOK_BODY = 1024 * 1024
 MAX_EVENT_BODY = 60_000
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
@@ -72,6 +74,10 @@ def body_text(headers, body: bytes) -> str:
     return (parse_qs(text).get("payload") or [text])[0]
 
 
+def delivery_id(headers) -> str:
+    return headers.get("X-GitHub-Delivery") or headers.get("X-Request-Id") or ""
+
+
 def event_of(name: str, headers, body: bytes) -> dict:
     text = body_text(headers, body)
     try:
@@ -84,7 +90,7 @@ def event_of(name: str, headers, body: bytes) -> dict:
     action = data.get("action", "") if isinstance(data.get("action"), str) else ""
     title = (f"GitHub {github_event}{' ' + action if action else ''}" if github_event
              else str(data.get("title") or data.get("summary") or data.get("text") or f"webhook for {name}"))
-    key = headers.get("X-GitHub-Delivery") or headers.get("X-Request-Id") or secrets.token_hex(10)
+    key = delivery_id(headers) or f"sha256:{hashlib.sha256(body).hexdigest()}"
     repo = ((data.get("repository") or {}).get("full_name", "") if isinstance(data.get("repository"), dict) else
             str(data.get("repo", "")))
     return sources.event("webhook" if not github_event else f"github.{github_event}", f"{name}#webhook", key, title,
@@ -102,8 +108,10 @@ def receive(name: str, headers, body: bytes) -> dict:
     e = event_of(name, headers, body)
     if why := loop.trigger.refusal(e):
         raise HookRefused(403, f"The loop {name} {why}.")
-    if e["key"] in state.seen_keys(e["source"]):
-        return {"queued": False, "why": "already received", "key": e["key"]}
-    state.mark_seen(e["source"], [e["key"]])
-    [item] = sources.fire(loop, "webhook", [e])
+    with state.transaction() as connect:
+        if not delivery_id(headers):
+            state.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW, connect)
+        if not state.claim_seen(e["source"], [e["key"]], connect):
+            return {"queued": False, "why": "already received", "key": e["key"]}
+        [item] = sources.fire(loop, "webhook", [e], connect)
     return {"queued": True, "item": item, "key": e["key"], "at": util.iso()}

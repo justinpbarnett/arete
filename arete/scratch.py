@@ -51,9 +51,14 @@ LEASES: dict[str, int] = {}
 RUN_BASELINES: dict[str, dict[int, int] | None] = {}
 RUN_LABELS: dict[str, dict | None] = {}
 MAX_RECORD_BYTES = 1024 * 1024
+REPLACED_RECORD_READS = 5
 SECRET = "signing.secret"
 NEXT_SECRET = "signing.secret.next"
 ROTATION_MARKER = "rotation.marker"
+SETTLED = "settled"
+SETTLE_AFTER_SECONDS = 3600
+MAX_INSPECTED_BYTES = 16 * 1024 * 1024
+SELECTOR_FILE = re.compile(r"^[0-9a-f]{64}\.json$")
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
 IN_GROUP = "in a producer group"
 ORPHAN = "orphan of a producer"
@@ -141,11 +146,7 @@ def read_secret(fd: int, name: str = SECRET) -> bytes:
 
 
 @contextmanager
-def registry(create: bool = False):
-    from . import pi
-
-    if not pi.can_confine(False) or os.getuid() == 0 or AUTHORITY == paths.NOWHERE:
-        raise ConfinementUnavailable("local producers cannot protect the scratch authority store")
+def authority_fd(create: bool = False):
     if create:
         with paths.directory_fd(AUTHORITY.parent) as parent:
             try:
@@ -156,20 +157,64 @@ def registry(create: bool = False):
         st = os.fstat(fd)
         if st.st_uid != os.getuid() or st.st_mode & 0o077:
             raise PermissionError("scratch authority is not private")
+        yield fd
+
+
+def stored_files(fd: int) -> list[str]:
+    names = [n for n in os.listdir(fd) if n.endswith(".json") or n == "browser-server.pin"]
+    try:
+        with paths.directory_fd(Path(SETTLED), fd) as settled:
+            names += [f"{SETTLED}/{n}" for n in os.listdir(settled)]
+    except FileNotFoundError:
+        pass
+    return sorted(names)
+
+
+def mint_secret(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        try:
+            os.stat(SECRET, dir_fd=fd, follow_symlinks=False)
+            return
+        except FileNotFoundError:
+            pass
+        if held := stored_files(fd):
+            listed = ", ".join(str(AUTHORITY / n) for n in held[:5])
+            raise PermissionError(
+                f"scratch authority {AUTHORITY} has no signing.secret but holds {len(held)} records ({listed}); "
+                f"restore signing.secret, or move the listed records into {AUTHORITY / 'orphaned'} once their "
+                "roots are gone")
+        create_secret(fd, SECRET)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def registry(create: bool = False):
+    from . import pi
+
+    if not pi.can_confine(False) or os.getuid() == 0 or AUTHORITY == paths.NOWHERE:
+        raise ConfinementUnavailable("local producers cannot protect the scratch authority store")
+    with authority_fd(create) as fd:
         if create:
-            with suppress(FileExistsError):
-                create_secret(fd, SECRET)
+            mint_secret(fd)
         yield fd, read_secret(fd)
 
 
 def load(fd: int, key: bytes, selector: str) -> dict:
     if len(selector) != 64 or any(c not in "0123456789abcdef" for c in selector):
         raise ValueError("invalid attempt selector")
-    source = os.open(selector + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-    with os.fdopen(source, "rb") as inp:
-        st = os.fstat(source)
-        checked(st, identity(st))
-        envelope = json.loads(inp.read(MAX_RECORD_BYTES + 1))
+    for _ in range(REPLACED_RECORD_READS):
+        source = os.open(selector + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(source, "rb") as inp:
+            st = os.fstat(source)
+            if stat.S_ISREG(st.st_mode) and st.st_nlink == 0:
+                continue
+            checked(st, identity(st))
+            envelope = json.loads(inp.read(MAX_RECORD_BYTES + 1))
+            break
+    else:
+        raise OSError(errno.ESTALE, "resource replaced or linked")
     data = envelope["data"]
     if not hmac.compare_digest(envelope["signature"], hmac.digest(key, encoded(data), "sha256").hex()):
         raise ValueError("unauthenticated scratch record")
@@ -191,7 +236,10 @@ def write_atomic(fd: int, name: str, payload: bytes) -> None:
 
 def store(fd: int, key: bytes, data: dict) -> None:
     signature = hmac.digest(key, encoded(data), "sha256").hex()
-    write_atomic(fd, data["attempt"]["selector"] + ".json", encoded({"data": data, "signature": signature}))
+    payload = encoded({"data": data, "signature": signature})
+    if len(payload) > MAX_RECORD_BYTES:
+        raise ValueError(f"scratch record is {len(payload)} bytes, over the {MAX_RECORD_BYTES} byte limit")
+    write_atomic(fd, data["attempt"]["selector"] + ".json", payload)
 
 
 class RotationRefused(RuntimeError):
@@ -345,19 +393,247 @@ def records(strict: bool = False) -> list[dict]:
     return found
 
 
+@dataclass(frozen=True)
+class Unreadable:
+    path: str
+    reason: str
+    version: int | None
+    workspace: str
+    root: str
+    state: str
+    authenticated: bool
+    shaped: bool = False
+    run_dir: str = ""
+
+
+@dataclass(frozen=True)
+class View:
+    good: list
+    unreadable: list
+    absent: bool
+
+
+def absolute_text(value) -> str:
+    return value if isinstance(value, str) and os.path.isabs(value) else ""
+
+
+def claimed(path: str, reason: str, raw: bytes | None, key: bytes | None, name: str) -> Unreadable:
+    try:
+        envelope = json.loads(raw)
+        data = envelope["data"]
+        attempt = data["attempt"]
+        version = data.get("version")
+        state = data.get("state")
+        try:
+            authenticated = key is not None and hmac.compare_digest(
+                envelope["signature"], hmac.digest(key, encoded(data), "sha256").hex())
+        except (ValueError, KeyError, TypeError):
+            authenticated = False
+        shaped = (SELECTOR_FILE.match(name) is not None and attempt.get("selector") == name[:-5] and isinstance(state, str)
+                  and data.get("source_mutations") is False and bool(absolute_text(attempt.get("root"))))
+        return Unreadable(path, reason, version if isinstance(version, int) and not isinstance(version, bool) else None,
+                          absolute_text(attempt.get("workspace")), absolute_text(attempt.get("root")),
+                          state if isinstance(state, str) else "", authenticated, shaped,
+                          absolute_text(attempt.get("run_dir")))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return Unreadable(path, reason, None, "", "", "", False)
+
+
+def inspected(fd: int, name: str) -> bytes | None:
+    try:
+        source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except OSError:
+        return None
+    with os.fdopen(source, "rb") as inp:
+        if not stat.S_ISREG(os.fstat(source).st_mode):
+            return None
+        raw = inp.read(MAX_INSPECTED_BYTES + 1)
+    return raw if len(raw) <= MAX_INSPECTED_BYTES else None
+
+
+def rejection(e: Exception, rotating: bool) -> str:
+    reason = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+    if rotating and str(e) == "unauthenticated scratch record":
+        reason += "; the key rotation is unfinished, run `arete rotate-authority` again"
+    return reason
+
+
+def survey() -> View:
+    try:
+        with authority_fd() as fd:
+            listing = os.listdir(fd)
+            try:
+                key = read_secret(fd)
+            except FileNotFoundError:
+                key = None
+            good, unreadable = [], []
+            for name in sorted(n for n in listing if n.endswith(".json")):
+                path = str(AUTHORITY / name)
+                if key is None:
+                    unreadable.append(claimed(path, "no signing secret", inspected(fd, name), key, name))
+                    continue
+                try:
+                    good.append(load(fd, key, name[:-5]))
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    unreadable.append(claimed(path, rejection(e, NEXT_SECRET in listing), inspected(fd, name),
+                                              key, name))
+            return View(good, unreadable, False)
+    except FileNotFoundError:
+        if os.path.lexists(AUTHORITY):
+            raise
+        return View([], [], True)
+
+
+def path_of(hold) -> str:
+    return hold.path if isinstance(hold, Unreadable) else str(AUTHORITY / (hold["attempt"]["selector"] + ".json"))
+
+
+def alive(u: Unreadable) -> bool:
+    if u.version == 2 and u.shaped and u.state == "done":
+        return os.path.lexists(u.root)
+    return True
+
+
+def holds(view: View, workspace: Path) -> list:
+    ws = workspace.resolve()
+    found = [d for d in view.good if d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), ws)]
+    return found + [u for u in view.unreadable
+                    if not u.workspace or (overlap(Path(u.workspace), ws) and alive(u))]
+
+
 def pending(workspace: Path) -> bool:
     try:
-        return any(d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), workspace.resolve())
-                   for d in records(True))
+        return bool(holds(survey(), workspace))
     except (OSError, ValueError, KeyError, TypeError):
         return os.path.lexists(AUTHORITY)
 
 
-def root_names() -> set[str] | None:
+def root_names(view: View | None = None) -> set[str] | None:
+    from . import pi
+
     try:
-        return {Path(d["attempt"]["root"]).name for d in records(True)}
+        view = survey() if view is None else view
+        if view.absent:
+            return None if pi.can_confine(False) else set()
+        if any(not u.root for u in view.unreadable):
+            return None
+        return {Path(d["attempt"]["root"]).name for d in view.good} | {Path(u.root).name for u in view.unreadable}
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def admitted(fd: int, key: bytes, name: str, now: float) -> bool:
+    if now - os.stat(name, dir_fd=fd, follow_symlinks=False).st_mtime <= SETTLE_AFTER_SECONDS:
+        return False
+    data = load(fd, key, name[:-5])
+    return data["state"] == "done" and not os.path.lexists(data["attempt"]["root"])
+
+
+def move_settled(fd: int, name: str) -> None:
+    with suppress(FileExistsError):
+        os.mkdir(SETTLED, 0o700, dir_fd=fd)
+    with paths.directory_fd(Path(SETTLED), fd) as settled:
+        st = os.fstat(settled)
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise PermissionError("settled records folder is not private")
+        os.rename(name, name, src_dir_fd=fd, dst_dir_fd=settled)
+
+
+def settle_hot(fd: int, key: bytes, failures: list[str]) -> None:
+    now = time.time()
+    for name in sorted(n for n in os.listdir(fd) if n.endswith(".json")):
+        try:
+            if not admitted(fd, key, name, now):
+                continue
+            lease = os.open(name[:-5] + ".lease", os.O_RDWR | os.O_NOFOLLOW, dir_fd=fd)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if admitted(fd, key, name, now):
+                move_settled(fd, name)
+        except BlockingIOError:
+            pass
+        except OSError as e:
+            failures.append(f"{AUTHORITY / name}: {type(e).__name__}: {e}")
+        finally:
+            os.close(lease)
+
+
+def open_up(directory: int, device: int) -> None:
+    os.fchmod(directory, 0o700)
+    for name in os.listdir(directory):
+        if stat.S_ISDIR(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                st = os.fstat(child)
+                if st.st_dev != device or st.st_uid != os.getuid():
+                    raise OSError(errno.ESTALE, "evidence folder crosses a device or owner")
+                open_up(child, device)
+            finally:
+                os.close(child)
+
+
+def prune_evidence(fd: int, selector: str) -> None:
+    try:
+        evidence = os.open(selector, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+    except FileNotFoundError:
+        return
+    try:
+        st = os.fstat(evidence)
+        if st.st_uid != os.getuid():
+            raise PermissionError("evidence folder is not owned by this user")
+        open_up(evidence, st.st_dev)
+        if identity(os.stat(selector, dir_fd=fd, follow_symlinks=False)) != identity(st):
+            raise OSError(errno.ESTALE, "evidence folder replaced")
+    finally:
+        os.close(evidence)
+    shutil.rmtree(selector, dir_fd=fd)
+
+
+def prune_settled(fd: int, settled: int, name: str) -> None:
+    st = os.stat(name, dir_fd=settled, follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(errno.ESTALE, "settled record is not a plain file of this user")
+    source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=settled)
+    with os.fdopen(source, "rb") as inp:
+        record = claimed(str(AUTHORITY / SETTLED / name), "", inp.read(MAX_RECORD_BYTES + 1), None, name)
+    if not record.shaped or record.state != "done":
+        raise ValueError("settled record is malformed or not done, left as it is")
+    prune_evidence(fd, name[:-5])
+    with suppress(FileNotFoundError):
+        os.unlink(name[:-5] + ".lease", dir_fd=fd)
+    os.unlink(name, dir_fd=settled)
+
+
+def prune_old(fd: int, days: float, failures: list[str]) -> None:
+    try:
+        with paths.directory_fd(Path(SETTLED), fd) as settled:
+            if os.fstat(settled).st_uid != os.getuid():
+                raise PermissionError("settled records folder is not owned by this user")
+            cutoff = time.time() - days * 86400
+            for name in sorted(os.listdir(settled)):
+                path = AUTHORITY / SETTLED / name
+                try:
+                    if not SELECTOR_FILE.match(name):
+                        failures.append(f"{path}: not a settled record, left as it is")
+                    elif os.stat(name, dir_fd=settled, follow_symlinks=False).st_mtime < cutoff:
+                        prune_settled(fd, settled, name)
+                except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+                    failures.append(f"{path}: {type(e).__name__}: {e}")
+    except FileNotFoundError:
+        pass
+
+
+def settle(days: float) -> list[str]:
+    failures: list[str] = []
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        settle_hot(fd, key, failures)
+        prune_old(fd, days, failures)
+    return failures
 
 
 def overlap(a: Path, b: Path) -> bool:
@@ -374,12 +650,13 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
         raise ValueError("scratch requires a pinned run and step")
     with registry(True) as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
-        unresolved = [d for d in records() if d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), ws)]
+        unresolved = holds(survey(), ws)
         if unresolved:
-            held = named_holders([h for d in unresolved if isinstance(d.get("diagnostic"), dict)
+            held = named_holders([h for d in unresolved if isinstance(d, dict) and isinstance(d.get("diagnostic"), dict)
                                   for h in d["diagnostic"].get("holders", [])])
+            files = ", ".join(u.path for u in unresolved if isinstance(u, Unreadable))
             raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt"
-                          + (f" held by {held}" if held else ""))
+                          + (f" held by {held}" if held else "") + (f" (unreadable record {files})" if files else ""))
         selector, token = secrets.token_hex(32), secrets.token_hex(8)
         root = ws / f"{PREFIX}{token}{paths.SCRATCH_SUFFIX}"
         directories, files = {}, {}

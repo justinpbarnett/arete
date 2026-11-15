@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import signal
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -13,6 +14,7 @@ from pathlib import Path
 from . import lines, paths, state, util
 
 IDLE_WAITS = ("limit", "slot")
+CHECKPOINT_SECONDS = 30
 REPAIRS = {"check_repair", "review_repair", "ci_repair"}
 REPAIR_NAMES = ("repair", "fix", "verify_fix", "review_fix", "ci_fix")
 RETRY = ("Change the ticket specification, published branch head, or budget settings, then retry with "
@@ -196,18 +198,32 @@ def idle_waits(run_id: str, row: dict) -> dict[str, float]:
 
 
 def active_seconds(run_id: str, row: dict) -> float:
+    saved = metadata(run_id, "budget.json")
+    if "run_seconds" in saved:
+        return measured_seconds(run_id, saved, "run_seconds")
     return max(0, elapsed(row) - sum(idle_waits(run_id, row).values()))
+
+
+def measured_seconds(run_id: str, saved: dict, field: str) -> float:
+    value = saved[field]
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"run {run_id} has invalid {field}")
+    return float(value)
 
 
 def verification_seconds(run_id: str, row: dict) -> float:
     read = lines.read(run_id)
     saved = metadata(run_id, "budget.json")
     active, spent = saved.get("verification_active_since"), saved.get("verification_seconds", 0)
+    opened = (measured_seconds(run_id, saved, "verification_open_seconds")
+              if "verification_open_seconds" in saved else None)
     if type(spent) not in (int, float) or not math.isfinite(spent) or spent < 0:
         raise ValueError(f"run {run_id} has invalid verification usage")
     if active is not None and (not isinstance(active, str) or not active):
         raise ValueError(f"run {run_id} has invalid active verification checkpoint")
-    if active or spent:
+    if active or spent or opened is not None:
+        if opened is not None:
+            return float(spent) + (opened if active else 0)
         return max(0, float(spent)) + (max(0, (util.parse_iso(row.get("finished") or util.iso()) -
                                              util.parse_iso(active)).total_seconds()) if active else 0)
     if saved:
@@ -251,12 +267,15 @@ class Budget:
         self.idle_since = None
         self.idle_cause = ""
         self.idle_depth = 0
+        self.idled = 0.0
+        self.lock = threading.RLock()
         self.watched = False
         self.verify_seconds = sum(verification_seconds(row["id"], row) for row in kept)
         self.prior_repairs = sum(repair_count(rid) for rid in self.parents)
         self.repair_calls = 0
         self.current_verification_seconds = 0.0
         self.verification_active_since = None
+        self.verify_started = None
         self.started = time.monotonic() - active_seconds(run.id, own_row)
         self.deadline = self.started + policy.max_run_minutes * 60 - self.prior_seconds
         self.verify_deadline = None
@@ -269,11 +288,24 @@ class Budget:
                     f"{util.count(len(left), 'earlier run')} because the ticket specification changed since they ran")
 
     def persist(self) -> None:
-        util.write_json(artifact(self.run.id, "budget.json"), {
-            "version": 1, "parents": self.parents, "left_out": self.left_out, "policy": asdict(self.policy),
-            "specification": self.specification, "repair_calls": self.repair_calls,
-            "verification_seconds": self.current_verification_seconds,
-            "verification_active_since": self.verification_active_since, **self.left_out_waits()})
+        with self.lock:
+            util.write_json(artifact(self.run.id, "budget.json"), {
+                "version": 1, "parents": self.parents, "left_out": self.left_out, "policy": asdict(self.policy),
+                "specification": self.specification, "repair_calls": self.repair_calls,
+                "run_seconds": self.run_seconds(), "run_seconds_at": util.iso(),
+                "verification_open_seconds": (max(0, time.monotonic() - self.verify_started)
+                                              if self.verify_started is not None else 0),
+                "verification_seconds": self.current_verification_seconds,
+                "verification_active_since": self.verification_active_since, **self.left_out_waits()})
+
+    def run_seconds(self) -> float:
+        with self.lock:
+            now = time.monotonic()
+            opened = now - self.idle_since if self.idle_since is not None else 0
+            return max(0, now - self.started - self.idled - opened)
+
+    def checkpoint(self) -> None:
+        self.persist()
 
     def left_out_waits(self) -> dict:
         current = dict(self.idle)
@@ -314,58 +346,76 @@ class Budget:
         previous = signal.signal(signal.SIGALRM, expire)
         previous_timer = signal.getitimer(signal.ITIMER_REAL)
         self.watched = True
+        stopped = threading.Event()
+
+        def checkpointing():
+            while not stopped.wait(CHECKPOINT_SECONDS):
+                self.checkpoint()
+
+        worker = threading.Thread(target=checkpointing, name=f"budget-{self.run.id}", daemon=True)
         try:
+            worker.start()
             self.arm()
             yield
         finally:
             self.watched = False
             signal.setitimer(signal.ITIMER_REAL, *previous_timer)
             signal.signal(signal.SIGALRM, previous)
+            stopped.set()
+            if worker.ident is not None:
+                worker.join()
+            self.checkpoint()
 
     @contextmanager
     def idling(self, cause: str):
         if cause not in IDLE_WAITS:
             yield
             return
-        self.idle_depth += 1
-        if self.idle_depth == 1:
-            self.idle_since, self.idle_cause = time.monotonic(), cause
-            self.arm()
+        with self.lock:
+            self.idle_depth += 1
+            if self.idle_depth == 1:
+                self.idle_since, self.idle_cause = time.monotonic(), cause
+                self.arm()
         try:
             yield
         finally:
-            self.idle_depth -= 1
-            if self.idle_depth == 0:
-                spent = time.monotonic() - self.idle_since
-                self.idle_since = None
-                self.deadline += spent
-                self.idle[cause] += spent
-                self.persist()
-                if self.watched:
-                    signal.setitimer(signal.ITIMER_REAL, 0)
-                    due = min(self.deadline, math.inf if self.verify_deadline is None else self.verify_deadline)
-                    if due > time.monotonic():
-                        self.arm()
+            with self.lock:
+                self.idle_depth -= 1
+                if self.idle_depth == 0:
+                    spent = time.monotonic() - self.idle_since
+                    self.idled += spent
+                    self.idle[self.idle_cause] += spent
+                    self.idle_since = None
+                    self.deadline += spent
+                    self.persist()
+                    if self.watched:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                        due = min(self.deadline, math.inf if self.verify_deadline is None else self.verify_deadline)
+                        if due > time.monotonic():
+                            self.arm()
 
     @contextmanager
     def verifying(self):
         remaining = self.policy.max_verify_minutes * 60 - self.verify_seconds
         if remaining <= 0:
             raise Parked(f"verification reached its cumulative {self.policy.max_verify_minutes:g} minute budget")
-        started = time.monotonic()
-        self.verify_deadline = started + remaining
-        self.verification_active_since = util.iso()
-        self.persist()
+        with self.lock:
+            self.verify_started = time.monotonic()
+            self.verify_deadline = self.verify_started + remaining
+            self.verification_active_since = util.iso()
+            self.persist()
         lines.write(self.run.id, "budget_verify_start")
         self.arm()
         try:
             yield
         finally:
-            spent = time.monotonic() - started
-            self.verify_seconds += spent
-            self.current_verification_seconds += spent
-            self.verification_active_since = None
-            self.persist()
+            with self.lock:
+                spent = time.monotonic() - self.verify_started
+                self.verify_seconds += spent
+                self.current_verification_seconds += spent
+                self.verify_started = None
+                self.verification_active_since = None
+                self.persist()
             lines.write(self.run.id, "budget_verify_end", seconds=spent)
             self.verify_deadline = None
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -377,6 +427,7 @@ class Budget:
                                                and time.monotonic() >= self.verify_deadline):
             raise Parked(self.reason())
         if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
+            self.checkpoint()
             return
         count = self.prior_repairs + self.repair_calls
         if count >= self.policy.max_repair_cycles:

@@ -113,7 +113,7 @@ def live(running: list[dict]) -> dict:
             "paid": paid.get(r["id"], 0), "stopping": bool(r["stop_asked"]),
         })
     return {"runs": rows, "slots": len(in_slots), "waiting": len(waiting_for_slot),
-            "max_parallel": config.load().max_parallel}
+            "max_parallel": config.load_or_problem()[0].max_parallel}
 
 
 def slot_note(r: dict, in_slots: set[str], waiting_for_slot: set[str]) -> str:
@@ -149,12 +149,12 @@ def checks() -> dict:
         "heartbeat": beat.get("ts", ""), "running": "heartbeat" in loops_running(),
         "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")}
                    for c in sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))],
-        "loops": [{"name": k, **v} for k, v in sorted(util.read_json(paths.LOOP_MARKS_FILE, {}).items())],
+        "loops": [{"name": k, **v} for k, v in sorted(state.loop_marks(connect=state.reader).items())],
     }
 
 
 def alerts() -> dict:
-    alert_repo = config.load().alert_repo
+    alert_repo = config.load_or_problem()[0].alert_repo
     return {
         "alerts": [{**a, "repo": opened_in(a, alert_repo), "url": issue_link(a, alert_repo)}
                    for a in state.alerts(connect=state.reader)],
@@ -164,7 +164,7 @@ def alerts() -> dict:
 
 def triage_board() -> dict:
     v = triage.view(connect=state.reader)
-    srcs = {s.name: s for s in triage.sources(config.load())}
+    srcs = {s.name: s for s in triage.sources(config.load_or_problem()[0])}
     meta = util.read_json(triage.META_FILE, {})
     running = loops_running()
     return {
@@ -242,7 +242,7 @@ def needs_you_count(asks: dict) -> int:
 
 
 def ready_in_one_click(v: dict) -> list[dict]:
-    srcs = {s.name: s for s in triage.sources(config.load())}
+    srcs = {s.name: s for s in triage.sources(config.load_or_problem()[0])}
     ready = [triage_entry(r, v, triage.READY, srcs) for r in triage.groups(v)[triage.READY] if not r.get("closed")]
     return [r for r in ready if r["send"] and not r["send"]["pick"]]
 
@@ -254,7 +254,8 @@ def checks_and_alerts() -> dict:
 
 def health_word(beat: dict, found: dict) -> str:
     c, a = found["checks"].get("rows"), found["alerts"].get("rows")
-    if c is None or a is None or not beat.get("alive") or a["alerts"] or any(x["state"] == "fault" for x in c["checks"]):
+    if (c is None or a is None or not beat.get("alive") or beat.get("config_problem") or beat.get("code_problem")
+            or a["alerts"] or any(x["state"] == "fault" for x in c["checks"])):
         return "fault"
     blocked = "incidents" in found and (found["incidents"].get("rows") is None or bool(found["incidents"]["rows"]))
     if (not c["heartbeat"] or beat.get("broken") or beat.get("poll_errors") or blocked
@@ -284,7 +285,7 @@ def incident_row(r: dict) -> dict:
 
 
 def incidents_board() -> dict:
-    cfg = config.load()
+    cfg = config.load_or_problem()[0]
     rows = state.incidents(connect=state.reader, open_first=True)
     return {"now": util.iso(), "watcher": watcher(cfg), "incidents": [incident_row(r) for r in rows]}
 
@@ -298,7 +299,7 @@ def incident_repair(repair: dict, number: int, runs: list[dict], paid: dict[str,
 
 
 def incident_board(text: str) -> dict:
-    cfg = config.load()
+    cfg = config.load_or_problem()[0]
     r = state.incident(incident_number(text), connect=state.reader, last_notes=INCIDENT_NOTES)
     if r is None:
         raise control.NotFound(f"no incident {text}")
@@ -377,7 +378,7 @@ def find() -> dict:
     v = triage.view(connect=state.reader)
     runs = state.runs(limit=RUNS_TO_FIND, connect=state.reader)
     return {
-        "loops": [{"name": loop.name, "description": loop.description} for loop in loops.load_all(config.load())],
+        "loops": [{"name": loop.name, "description": loop.description} for loop in loops.load_all(config.load_or_problem()[0])],
         "runs": [{"id": r["id"], "ticket": ticket(r), "kind": r["kind"], "status": r["status"]} for r in runs],
         "sessions": [{"id": s["id"], "prompt": s["prompt"], "status": s["status"]}
                      for s in sessions.views(limit=SESSIONS_TO_FIND, connect=state.reader)],
@@ -471,7 +472,8 @@ def trend_figures() -> dict:
 
     eval_repos: dict[str, list[dict]] = defaultdict(list)
     for e in evals:
-        eval_repos[e["repo"]].append(e)
+        if e["source"] == state.BASELINE_SOURCE:
+            eval_repos[e["repo"]].append(e)
     return {
         "since": since,
         "days": list(by_day.values()),

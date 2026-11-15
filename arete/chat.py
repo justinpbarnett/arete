@@ -68,7 +68,7 @@ def summary(row: dict) -> dict:
 
 def listing() -> dict:
     move_old_chat()
-    return {"chats": [summary(r) for r in state.chats()], "projects": [r.name for r in config.load().repos]}
+    return {"chats": [summary(r) for r in state.chats()], "projects": [r.name for r in config.load_or_problem()[0].repos]}
 
 
 def chat_row(chat_id: int) -> dict:
@@ -101,7 +101,7 @@ def draft_of(row: dict, cfg: config.Config) -> dict | None:
 
 def pulse() -> dict:
     row = state.chat_newest_draft()
-    return {"busy": any_busy(), "draft": draft_of(row, config.load()) if row else None}
+    return {"busy": any_busy(), "draft": draft_of(row, config.load_or_problem()[0]) if row else None}
 
 
 def folder(project: str) -> str:

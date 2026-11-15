@@ -306,8 +306,8 @@ class AgentRun:
             yield
 
     def save(self, name: str, data) -> None:
-        p = self.dir / name
-        p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
+        text = data if isinstance(data, str) else json.dumps(data, indent=2, default=str)
+        util.write_durably(self.dir / name, text.encode(), 0o600)
 
     @property
     def config(self) -> config.Config:
@@ -568,7 +568,9 @@ class Run(AgentRun):
         if self.dry_run:
             return
         others = [s for s in self.tracker.states if s != status]
-        labeled, moved = self.tracker.label(self.tid, add=[status], remove=others), self.tracker.move(self.tid, status)
+        labeled = self.tracker.label(self.tid, add=[status], remove=others)
+        record.note(self.id, label_pending=status if labeled else "")
+        moved = self.tracker.move(self.tid, status)
         for err in (labeled, moved):
             if err:
                 self.log(f"tracker: {util.first_line(err, 300)}")
@@ -681,12 +683,31 @@ def scratch_named(names: set[str] | None, name: str) -> bool:
     return name.startswith(paths.SCRATCH_PREFIX) and (names is None or name in names)
 
 
+def scratch_view() -> scratch.View | None:
+    try:
+        return scratch.survey()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def record_holds(view: scratch.View | None, d: Path) -> list[Path]:
+    if view is None:
+        return [d] if os.path.lexists(scratch.AUTHORITY) else []
+    return [Path(scratch.path_of(h)) for h in scratch.holds(view, d)]
+
+
+def held_words(left: list[Path]) -> str:
+    return ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
+
+
 def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     found, unproven = [], []
-    names = scratch.root_names()
-    for d in {ws, *(c.wt for c in checkouts)}:
-        if scratch.pending(d):
-            found.append(d)
+    view = scratch_view()
+    names = scratch.root_names(view) if view is not None else None
+    scanned = {ws, *(c.wt for c in checkouts)}
+    for d in scanned:
+        if records := record_holds(view, d):
+            found += [d, *records]
 
         def unreadable(e: OSError, d: Path = d, found: list[Path] = found) -> None:
             found.append(Path(e.filename) if e.filename else d)
@@ -707,8 +728,12 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
                 dirs[:] = [n for n in dirs if n != ".git" and n not in held]
         except OSError:
             found.append(d)
-    late = scratch.root_names()
-    return found + [p for p in unproven if scratch_named(late, p.name)]
+    late_view = scratch_view()
+    late = scratch.root_names(late_view) if late_view is not None else None
+    for d in scanned:
+        if records := record_holds(late_view, d):
+            found += [d, *records]
+    return list(dict.fromkeys(found + [p for p in unproven if scratch_named(late, p.name)]))
 
 
 def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
@@ -973,8 +998,8 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
     if left := scratch_held(ws, checkouts):
-        held = ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
-        raise RunFailed(f"unresolved or unknown scratch resources keep the existing workspace retained ({held})")
+        raise RunFailed(
+            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
     if why := kept_work(ws, checkouts, source, copies):
         raise RunFailed(why)
     if not remove_workspace(ws, checkouts):
@@ -1052,8 +1077,9 @@ def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str
 
 def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
                     branch: str) -> dict[str, str]:
-    if scratch_held(ws, checkouts):
-        raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
+    if left := scratch_held(ws, checkouts):
+        raise RunFailed(
+            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
     kept = kept_onto(ws, checkouts, branch)
     if not kept:
         clear_workspace(ws, checkouts, source, copies)
@@ -1103,7 +1129,9 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
 def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False) -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
     if not remove_workspace(c.wt, [c]):
-        raise RunFailed("worktree removal withheld to preserve existing resources")
+        left = scratch_left(c.wt, [c])
+        raise RunFailed("worktree removal withheld to preserve existing resources"
+                        + (f" ({held_words(left)})" if left else ""))
     fetch(c.src, base)
     if resume:
         fetch(c.src, branch)
@@ -1612,6 +1640,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     print(f"{name} was not started: {no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
+            settled = [done for dead_row in state.ticket_runs_marked_running(repo.name, tid)
+                       if (done := record.interrupt(dead_row))]
             earlier = [] if only else state.ticket_runs(repo.name, tid, limit=1, whole=True)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier[0]["id"] if restarting else ""))
@@ -1633,6 +1663,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if mending:
                 lines.write(run_id, "repair", source=mending)
                 run.log(f"repairing the review findings of run {mending}")
+        for done in settled:
+            if only and not dry_run:
+                tell_ticket_run_died(cfg, done)
+                continue
+            if done["status"] != "stopped":
+                lines.write(done["id"], "error", step=lines.last_step(done["id"]), message=done.get("summary") or "")
+            write_report(done)
         opening_waits(run_id, run.answering,
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
         if restarting:
@@ -1706,6 +1743,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 flow.route()
             if not lines.ended_in_error(run_id, reply="respond" if flow else ""):
                 lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
+        pr_url = pr_url or str((state.run_get(run_id) or {}).get("pr_url") or "")
         run.log(f"done: {status} {pr_url or summary}")
         record.settle(run_id, status, summary=summary, pr_url=pr_url)
         write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow, run)
@@ -2072,11 +2110,13 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
             c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), pr_report,
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
             opened.append(c)
+            note_prs(run, branch, [x for x in checkouts if x.pr])
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
             run.log(f"pushed to {c.pr}")
     pushed = [c for c in staged.changed if c not in opened]
     with_prs = [c for c in checkouts if c.pr]
+    note_prs(run, branch, with_prs)
     ci_stopped: list[Checkout] = []
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
@@ -2280,6 +2320,10 @@ def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
     supersede_older_runs(run, urls)
     record.note(run.id, branch=branch)
     return " ".join(urls)
+
+
+def note_prs(run: Run, branch: str, with_prs: list[Checkout]) -> None:
+    record.note(run.id, branch=branch, pr_url=" ".join(c.pr for c in with_prs))
 
 
 def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
@@ -2825,8 +2869,7 @@ def sibling_section(ref: str, c: Checkout, with_prs: list[Checkout]) -> str:
 def supersede_older_runs(run: Run, urls: list[str]) -> None:
     for r in state.open_runs(run.repo.name, run.tid):
         older = (r.get("pr_url") or "").split()
-        if older and set(older) <= set(urls):
-            record.note(r["id"], status="superseded")
+        if older and set(older) <= set(urls) and record.move(r["id"], "superseded", expect=(r["status"],)):
             run.log(f"run {r['id']} superseded: its PRs carry on in this run")
 
 
@@ -3128,7 +3171,10 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
     if not url:
         return ("Arete started no app for this repo. Run the commands its user runs, with real arguments, and read "
                 "the output and the exit code.")
-    return (f"Arete started the app with `{v.start}` and it answers at {url}. Arete stops it when you finish.\n\n"
+    return (f"Arete started the app with `{v.start}` and it answers at {url}. Arete stops it when you finish. The "
+            "browser opens only that address and refuses every other port, so a server you start yourself answers "
+            "curl but never loads in the browser: give a browser check the state it needs through the app at that "
+            "address.\n\n"
             "- Do in the browser what a person does in the browser, with these `mcp__playwright__` tools (load "
             f"them with ToolSearch first): {', '.join(f'`{t}`' for t in verify.PLAYWRIGHT_TOOLS)}. Read the page "
             "with `browser_snapshot`; no tool runs your own script in the page.\n"
@@ -3146,16 +3192,17 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
+    view = scratch_view()
     for d, name in untracked_added_since(untracked_before):
         f = d / name
-        if scratch.pending(d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
+        if record_holds(view, d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
             continue
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
             remove_untracked(d, name)
     for d in untracked_before:
-        if not scratch.pending(d):
+        if not record_holds(view, d):
             git(["checkout", "-q", "--", "."], d)
 
 
@@ -3428,14 +3475,14 @@ def sync_outcomes(cfg: config.Config) -> None:
         merged = all(pr.get("mergedAt") for pr in prs)
         if r["status"] == "rejected" and not merged:
             if not closed:
-                record.note(r["id"], status="pr")
+                record.move(r["id"], "pr", expect=("rejected",))
             continue
         if not closed:
             continue
         for url, pr in zip(urls, prs):
             state.close_feedback(url, pr["state"])
         closed_at = max(pr.get("closedAt") or "" for pr in prs) or util.iso()
-        record.note(r["id"], status="merged" if merged else "rejected", finished=closed_at)
+        record.move(r["id"], "merged" if merged else "rejected", expect=(r["status"],), finished=closed_at)
     util.write_json(PR_SEEN_FILE, fresh)
     for repo in cfg.repos:
         if repo.pipeline and repo.github and not repo.layer:
@@ -3480,12 +3527,50 @@ def sync_moves(cfg: config.Config) -> None:
                   + (f"not moved: {util.first_line(m.error, 300)}" if m.error else f"{status}, moved to {target}"))
 
 
+def sync_labels(cfg: config.Config) -> None:
+    seen: set[tuple[str, str]] = set()
+    for r in state.runs(kind="pipeline", limit=200):
+        if r.get("label_pending") is None:
+            continue
+        key = (r["repo"] or "", str(r["issue"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        want = r["label_pending"]
+        if not want or r["status"] == "running" or util.lock_is_held(state.run_lock("pipeline", *key)):
+            continue
+        if r["status"] == "interrupted":
+            record.note(r["id"], label_pending="")
+            continue
+        try:
+            repo = cfg.repo(r["repo"])
+        except KeyError:
+            continue
+        tk = tracker.for_ticket(cfg, repo, key[1])
+        err = tk.label(key[1], add=[want], remove=[s for s in tk.states if s != want])
+        if err:
+            print(f"{util.iso()} {tracker.run_ticket_name(r)}: could not label it {want}, trying next poll: "
+                  f"{util.first_line(err, 300)}")
+            continue
+        record.note(r["id"], label_pending="")
+        print(f"{util.iso()} {tracker.run_ticket_name(r)}: labeled {want}")
+
+
+def carried_by_newer(rows: list[dict], i: int) -> bool:
+    row = rows[i]
+    prs = set((row.get("pr_url") or "").split())
+    return bool(prs) and any(r["status"] == "merged" and r["repo"] == row["repo"] and r["issue"] == row["issue"]
+                             and prs <= set((r.get("pr_url") or "").split()) for r in rows[:i])
+
+
 def sync_landings(cfg: config.Config) -> None:
     branches = list(cfg.jira.landed)
     if not branches:
         return
-    for r in state.runs(kind="pipeline", limit=200):
-        if r["status"] != "merged" or not r.get("pr_url") or r.get("landed") == branches[-1]:
+    rows = state.runs(kind="pipeline", limit=200)
+    for i, r in enumerate(rows):
+        if (r["status"] != "merged" or not r.get("pr_url") or r.get("landed") == branches[-1]
+                or carried_by_newer(rows, i)):
             continue
         try:
             repo = cfg.repo(r["repo"])
@@ -3495,7 +3580,10 @@ def sync_landings(cfg: config.Config) -> None:
             continue
         try:
             reached = furthest_branch(branches, r["pr_url"].split(), str(r["issue"]))
-            already = branches.index(r["landed"]) if r.get("landed") in branches else -1
+            progress = [older.get("landed") for older in rows[i:]
+                        if older["status"] == "merged" and older["repo"] == r["repo"] and older["issue"] == r["issue"]
+                        and set((older.get("pr_url") or "").split()) == set(r["pr_url"].split())]
+            already = max((branches.index(b) for b in progress if b in branches), default=-1)
             if reached is None or branches.index(reached) <= already:
                 continue
             target = cfg.jira.landed[reached]
@@ -3569,8 +3657,10 @@ def branch_holds_work(repo: str, branch: str, merge_sha: str, key: str) -> bool:
 
 def streak(repo_name: str, since: str = "") -> int:
     n = 0
-    for r in state.runs(kind="pipeline", repo=repo_name, limit=100):
-        if r["status"] == "merged" and (not since or (r["finished"] or "") > since):
+    rows = state.runs(kind="pipeline", repo=repo_name, limit=100)
+    for i, r in enumerate(rows):
+        if (r["status"] == "merged" and (not since or (r["finished"] or "") > since)
+                and not carried_by_newer(rows, i)):
             n += 1
         elif r["status"] in ("rejected", "failed"):
             break
@@ -3809,13 +3899,25 @@ def retained_line(step: str, attempt: scratch.Attempt) -> str:
     return f"{line}; held by {held}" if held else line
 
 
-def retry_scratch() -> None:
+def retry_scratch(days: float = 30) -> None:
     for root in finalize_scratch():
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
         if data["state"] in ("pending", "retained", "preserved") and data["diagnostic"]:
             print("verification scratch retained: " + json.dumps({"run": data["attempt"]["run_id"],
                   "attempt": data["attempt"]["selector"], "diagnostic": data["diagnostic"]}, ensure_ascii=True))
+    try:
+        for u in scratch.survey().unreadable:
+            print(f"verification scratch record unreadable: {u.path}: {u.reason}")
+    except OSError as e:
+        print(f"verification scratch store unreadable: {e}")
+    try:
+        for failure in scratch.settle(days):
+            print(f"verification scratch settle failed: {failure}")
+    except scratch.ConfinementUnavailable:
+        pass
+    except OSError as e:
+        print(f"verification scratch settle failed: {e}")
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
@@ -3978,6 +4080,9 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
         for t in source.todo():
             if str(t.id) in excluded or other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
                 continue
+            if owed := state.pending_label(repo.name, t.id):
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
+                continue
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
@@ -4060,8 +4165,9 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
         return "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
     text = tk.reply_since(tid, waiting[0]["asked"])
     if text and not dry_run:
-        for a in waiting:
-            state.ask_close(a["id"], "answered", asks.text_answers(a, text))
+        with util.lock(asks.STEER_LOCK, wait=True):
+            for a in state.asks_of(newest[0]["id"], "open"):
+                state.ask_close(a["id"], "answered", asks.text_answers(a, text))
     return ""
 
 
@@ -4083,7 +4189,7 @@ def poll(dry_run: bool = False) -> int:
             print(f"{util.iso()} poll already running")
             return 0
         if not dry_run:
-            retry_scratch()
+            retry_scratch(cfg.retention.days)
         if any(r.parts or r.tracker != "local" for r in cfg.repos) and not network_up_or_skip("poll", dry_run):
             return 0
         errors: list[str] = []
@@ -4101,6 +4207,10 @@ def poll(dry_run: bool = False) -> int:
                 sync_outcomes(cfg)
             except Exception as e:
                 failed("syncing PR outcomes", e)
+            try:
+                sync_labels(cfg)
+            except Exception as e:
+                failed("labeling tickets", e)
         going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)
         starts = state.last_pipeline_starts()

@@ -37,12 +37,13 @@ enabled = false                # a draft starts off; `arete loop enable NAME` tu
 every = "1h"                   # or cron = "30 4 * * *" (minute hour day month weekday, local time); not both
 run_at_load = false            # also fire once when serve starts
 event = ["github.ci_red"]      # only these event types fire the loop, from a source or a webhook; all types when left out; "finding" takes findings from another loop's loop emit
-webhook = false                # POST /hook/<name> fires the loop as type github.<X-GitHub-Event>, else webhook; `arete webhook secret NAME` prints the token
+webhook = false                # POST /hook/<name> fires the loop as type github.<X-GitHub-Event>, else webhook; `arete webhook secret NAME` prints the token; a delivery counts once by its `X-GitHub-Delivery` or `X-Request-Id`, and a post with neither counts once per 10 minutes by the hash of its body
 metric = "pass_rate < 0.8"     # fire when the latest value of a metric crosses the rule; a metric event is internal and passes the event list
 group = "repo"                 # events that share this field wait in line one at a time
 trust = "untrusted"            # refuse events below this trust: untrusted | internal | owner; a refused webhook gets 403
 
 [[source]]                     # polled by serve; new events fire the loop; the first read only sets a baseline
+name = "issues"                # a source's history follows its name; needed on each source when a loop has more than one
 type = "github"                # github | jira | log | command
 repos = ["arete"]              # config repo names or owner/name; [run] repo when left out
 watch = ["ci_red", "issue", "advisory"]
@@ -99,6 +100,14 @@ approve = false                # true holds it until you approve it on the dashb
 # type = "notify": a desktop notification
 # type = "metric": name = "open_ci_red"; the value is the finding count or the command's `value`
 ```
+
+## Source history
+
+A source's history (which events it has seen, and where a log was read to) follows its `name`, or its position in the `[[source]]` list when it has none. A loop with more than one source needs a name on each: lowercase letters, digits and dashes, not only digits, not `webhook` or `metric`, and not repeated in the loop.
+
+The scope keys of a source say what it watches: github `repos`, `watch`, `label`, `branch`; jira `jql`, `on_update`; command `command`; log `path`, `pattern`. An edit to any other key (`every`, `timeout`, `trust`, `limit`, `repo`, `name`) keeps everything and the next poll carries on. An edit to a scope key keeps the seen keys, and the next poll fires the events stamped since the last good poll (less two minutes); older matches are taken as seen and named in serve.log. A log source keeps its offsets for files it read before and starts newly matched files at their end. A command row can carry `data.at` (an ISO time) so it can catch up across a command change; a row without a time is taken as seen.
+
+A new name starts from a baseline. Naming a source that has no name keeps its history only when its scope keys stay the same in that change, so put a name in a change of its own. Adding or reordering sources is safe once each has a name: a named source picks up the history of the unnamed source with the same scope keys.
 
 ## What a run can read
 

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+from datetime import UTC, datetime, timedelta
 
 from . import config, cron, gh, jira, paths, state, util
 from .loops import Loop, as_list, blank, github_remote
@@ -14,6 +15,8 @@ DEFAULT_EVERY = 300
 GITHUB_WATCH = ("ci_red", "issue", "advisory")
 LOG_PATTERN = r"ERROR|CRITICAL|FATAL|Exception|Traceback|panic:"
 MAX_LOG_READ = 2_000_000
+CATCH_UP_SLACK = timedelta(minutes=2)
+SHOWN_KEYS = 5
 SIGNATURE_NOISE = [
     (re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?"), "<time>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE), "<uuid>"),
@@ -23,13 +26,46 @@ SIGNATURE_NOISE = [
 ]
 
 
-def source_id(loop: Loop, index: int) -> str:
+def slot_id(loop: Loop, index: int) -> str:
     return f"{loop.name}#{index}"
 
 
+def source_id(loop: Loop, index: int) -> str:
+    name = loop.sources[index].get("name")
+    return f"{loop.name}#{name}" if name else slot_id(loop, index)
+
+
 def fingerprint(source: dict) -> str:
-    settings = json.dumps({k: v for k, v in source.items() if k != "every"}, sort_keys=True, default=str)
+    scope = {"type": source.get("type")} | {k: source.get(k) for k in SOURCES[source["type"]].scope}
+    return "scope:" + hashlib.sha256(json.dumps(scope, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def legacy_fingerprint(source: dict) -> str:
+    settings = json.dumps({k: v for k, v in source.items() if k not in ("every", "name")}, sort_keys=True,
+                          default=str)
     return hashlib.sha256(settings.encode()).hexdigest()
+
+
+def same_source(owner: str | None, source: dict) -> bool:
+    return owner is None or owner in (fingerprint(source), legacy_fingerprint(source))
+
+
+def scope_changed(owner: str | None, source: dict) -> bool:
+    return owner is not None and owner.startswith("scope:") and owner != fingerprint(source)
+
+
+def opaque(owner: str | None) -> bool:
+    return owner is not None and not owner.startswith("scope:")
+
+
+def arrived(e: dict) -> datetime | None:
+    data = e.get("data")
+    stamp = data.get("at") or data.get("updated") if isinstance(data, dict) else None
+    try:
+        moment = util.parse_iso(str(stamp))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
 def every(source: dict) -> float:
@@ -48,15 +84,16 @@ def metric_event(loop: Loop, value: float) -> dict:
                  trust="internal", data={"metric": name, "value": value, "rule": f"{op} {threshold:g}"})
 
 
-def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
+def fire(loop: Loop, how: str, events: list[dict] | None = None, connect=state.db) -> list[int]:
     if events is None:
-        return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how)) else []
+        return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how, connect=connect)) else []
     batches: dict[str, list[dict]] = {}
     for e in events:
         if not loop.trigger.refusal(e):
-            state.add_event(loop.name, e)
+            state.add_event(loop.name, e, connect)
             batches.setdefault(loop.trigger.group_of(e), []).append(e)
-    return [state.enqueue(loop.name, loop.queue_name, group, how, batch) for group, batch in batches.items()]
+    return [state.enqueue(loop.name, loop.queue_name, group, how, batch, connect)
+            for group, batch in batches.items()]
 
 
 def github_name(cfg: config.Config, name: str) -> str:
@@ -67,20 +104,80 @@ def github_name(cfg: config.Config, name: str) -> str:
     return cfg.repo(name).github
 
 
-def poll(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
+def is_slot(loop: Loop, sid: str) -> bool:
+    return re.fullmatch(re.escape(loop.name) + r"#\d+", sid) is not None
+
+
+def slot_cursors(loop: Loop) -> list[str]:
+    return [c["source"] for c in state.cursors() if is_slot(loop, c["source"])]
+
+
+def adopt_history(loop: Loop, index: int, source: dict, sid: str) -> None:
+    if not source.get("name") or state.cursor(sid):
+        return
+    own = slot_id(loop, index)
+    owner = state.source_owner(own)
+    if state.cursor(own) and (same_source(owner, source) or opaque(owner) and len(loop.sources) == 1):
+        state.adopt_source(own, sid)
+        return
+    for old in slot_cursors(loop):
+        if (owner := state.source_owner(old)) is not None and same_source(owner, source):
+            state.adopt_source(old, sid)
+            return
+
+
+def last_good_poll(known: dict) -> datetime | None:
+    stamp = known.get("last_ok") or (known.get("polled") if known.get("ok") else None)
+    if not stamp:
+        return None
+    moment = util.parse_iso(stamp)
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def shown(keys: list[str]) -> str:
+    return ", ".join(keys[:SHOWN_KEYS]) + (", ..." if len(keys) > SHOWN_KEYS else "")
+
+
+def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tuple[list[dict], list[int]]:
     source = loop.sources[index]
     sid = source_id(loop, index)
+    kind = SOURCES[source["type"]]
+    adopt_history(loop, index, source, sid)
+    started = util.iso()
     owner = fingerprint(source)
     known = state.cursor(sid)
-    first = known is None or state.source_owner(sid) not in (None, owner)
-    found, value = SOURCES[source["type"]].fetch(loop, source, cfg, sid, None if first else known["value"])
-    seen = state.seen_keys(sid)
-    fresh = [e for e in found if e["key"] not in seen]
-    fresh = list({e["key"]: e for e in fresh}.values())
-    state.mark_seen(sid, [e["key"] for e in fresh])
-    state.set_cursor(sid, value, True, f"{len(found)} read, {len(fresh)} new{' (baseline)' if first else ''}")
-    state.set_source_owner(sid, owner)
-    return [] if first else fresh
+    first = known is None
+    held = state.source_owner(sid)
+    changed = not first and scope_changed(held, source)
+    unsure = not first and not changed and not same_source(held, source)
+    cursor = None if first else kind.rescope(source, known["value"]) if changed or unsure else known["value"]
+    found, value = kind.fetch(loop, source, cfg, sid, cursor)
+    unique = {e["key"]: e for e in found}
+    with state.transaction() as connect:
+        claimed = set(state.claim_seen(sid, list(unique), connect))
+        fresh = [e for k, e in unique.items() if k in claimed]
+        if first:
+            forwarded, older = [], fresh
+        elif changed or unsure:
+            forwarded, older = kind.catch_up(fresh, last_good_poll(known), untimed=unsure)
+        else:
+            forwarded, older = fresh, []
+        told = changed or unsure and bool(older)
+        items = fire(loop, "event", forwarded, connect)
+        detail = f"{len(found)} read, {len(fresh)} new"
+        if first:
+            detail += " (baseline)"
+        elif told:
+            detail += f", settings changed, {len(older)} older taken as seen"
+        state.set_cursor(sid, value, True, detail, connect, started)
+        state.set_source_owner(sid, owner, connect)
+    if first:
+        say(f"{sid}: first read, {len(fresh)} existing events taken as the baseline"
+            + (f": {shown([e['key'] for e in fresh])}" if fresh else ""))
+    elif told:
+        say(f"{sid}: source settings changed; {len(forwarded)} events since the last good poll go on, "
+            f"{len(older)} older taken as seen" + (f": {shown([e['key'] for e in older])}" if older else ""))
+    return ([], []) if first else (forwarded, items)
 
 
 def peek(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
@@ -102,6 +199,15 @@ def repo_problems(cfg: config.Config, names: list, what: str) -> list[str]:
 
 class Source:
     needs = ""
+    scope: tuple[str, ...] = ()
+
+    def rescope(self, source: dict, cursor):
+        return cursor
+
+    def catch_up(self, fresh: list[dict], since: datetime | None, untimed: bool = False) -> tuple[list[dict], list[dict]]:
+        cutoff = since - CATCH_UP_SLACK if since else None
+        forwarded = [e for e in fresh if ((at := arrived(e)) is None and untimed) or (cutoff and at and at >= cutoff)]
+        return forwarded, [e for e in fresh if e not in forwarded]
 
     def problems(self, source: dict, loop: Loop, cfg: config.Config) -> list[str]:
         problems = [f"a {source['type']} source needs {self.needs}"] if self.needs and blank(source.get(self.needs)) \
@@ -117,6 +223,8 @@ class Source:
 
 
 class GitHub(Source):
+    scope = ("repos", "watch", "label", "branch")
+
     def repos(self, source: dict, loop: Loop) -> list[str]:
         return as_list(source.get("repos")) or ([loop.repo] if loop.repo else [])
 
@@ -150,14 +258,14 @@ class GitHub(Source):
                         for r in runs]
             if "issue" in watch:
                 args = ["issue", "list", "-R", repo, "--state", "open", "--limit", "30",
-                        "--json", "number,title,author,url,labels,body,createdAt"]
+                        "--json", "number,title,author,url,labels,body,createdAt,updatedAt"]
                 if source.get("label"):
                     args += ["--label", source["label"]]
                 for i in gh.gh_json(args) or []:
                     author = (i.get("author") or {}).get("login", "")
                     out.append(event("github.issue", sid, f"{repo}#{i['number']}", i["title"], repo=repo, url=i["url"],
                                      trust="owner" if author == me else "untrusted",
-                                     data={"number": i["number"], "author": author,
+                                     data={"number": i["number"], "author": author, "updated": i.get("updatedAt"),
                                            "body": (i.get("body") or "")[:6000],
                                            "labels": [label["name"] for label in i.get("labels", [])]}))
             if "advisory" in watch:
@@ -170,12 +278,14 @@ class GitHub(Source):
                                      data={"package": pkg, "severity": adv.get("severity"), "ghsa": adv.get("ghsa_id"),
                                            "manifest": dep.get("manifest_path"),
                                            "fixed_in": ((a.get("security_vulnerability") or {})
-                                                        .get("first_patched_version") or {}).get("identifier")}))
+                                                        .get("first_patched_version") or {}).get("identifier"),
+                                           "at": a.get("created_at")}))
         return out, None
 
 
 class Jira(Source):
     needs = "jql"
+    scope = ("jql", "on_update")
 
     def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
         client = jira.Client.from_env(cfg.jira.env_file)
@@ -196,6 +306,7 @@ class Jira(Source):
 
 class Command(Source):
     needs = "command"
+    scope = ("command",)
 
     def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
         argv = shlex.split(source["command"]) if isinstance(source["command"], str) else list(source["command"])
@@ -219,6 +330,23 @@ class Command(Source):
 
 class Log(Source):
     needs = "path"
+    scope = ("path", "pattern")
+
+    def rescope(self, source: dict, cursor):
+        if not cursor:
+            return cursor
+        offsets = json.loads(cursor)
+        for name in log_files(source):
+            if name not in offsets:
+                try:
+                    info = os.stat(name)
+                except OSError:
+                    continue
+                offsets[name] = [info.st_size, info.st_ino]
+        return json.dumps(offsets)
+
+    def catch_up(self, fresh: list[dict], since: datetime | None, untimed: bool = False) -> tuple[list[dict], list[dict]]:
+        return fresh, []
 
     def problems(self, source: dict, loop: Loop, cfg: config.Config) -> list[str]:
         problems = super().problems(source, loop, cfg)
@@ -231,7 +359,7 @@ class Log(Source):
     def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
         offsets: dict[str, list[int] | int] = json.loads(cursor) if cursor else {}
         pattern = re.compile(source.get("pattern") or LOG_PATTERN)
-        files = sorted(glob.glob(str(paths.expand(source["path"]))))
+        files = log_files(source)
         out: dict[str, dict] = {}
         for name in files:
             try:
@@ -260,6 +388,10 @@ class Log(Source):
                 out[key] = event("log.error", sid, key, sig, trust="untrusted",
                                  data={"file": name, "sample": raw.strip()[:1500], "signature": sig, "count": 1})
         return list(out.values()), json.dumps({k: v for k, v in offsets.items() if k in files})
+
+
+def log_files(source: dict) -> list[str]:
+    return sorted(glob.glob(str(paths.expand(source["path"]))))
 
 
 def log_start(mark, size: int, inode: int) -> int | None:

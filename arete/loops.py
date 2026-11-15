@@ -34,7 +34,10 @@ class Trigger:
     trust: str = "untrusted"
 
     def group_of(self, e: dict) -> str:
-        return str(e.get(self.group) or (e.get("data") or {}).get(self.group) or "") if self.group else ""
+        if not self.group:
+            return ""
+        data = e.get("data")
+        return str(e.get(self.group) or (data.get(self.group) if isinstance(data, dict) else "") or "")
 
     def refusal(self, e: dict) -> str:
         takes = [*self.events, *(["metric"] if self.metric else [])]
@@ -396,6 +399,27 @@ def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) 
     return min(limits, key=lambda x: x[1]) if limits else None
 
 
+RESERVED_SOURCE_NAMES = ("webhook", "metric")
+
+
+def source_name_problems(loop: Loop) -> list[str]:
+    problems = []
+    names = [s.get("name") for s in loop.sources]
+    if len(loop.sources) > 1 and any(n is None for n in names):
+        problems.append("a loop with more than one [[source]] needs a name on each, such as name = \"issues\"")
+    for name in (n for n in names if n is not None):
+        if not isinstance(name, str) or not NAME.fullmatch(name):
+            problems.append(f"source name {name!r} must be lowercase letters, digits and dashes")
+        elif name.isdigit():
+            problems.append(f"source name '{name}' cannot be only digits, it would collide with a position")
+        elif name in RESERVED_SOURCE_NAMES:
+            problems.append(f"source name '{name}' is reserved")
+    named = [n for n in names if isinstance(n, str)]
+    problems += [f"source name '{n}' is used by more than one [[source]]" for n in sorted(set(named))
+                 if named.count(n) > 1]
+    return problems
+
+
 def validate(loop: Loop, cfg: config.Config) -> None:
     from . import routing
     from .delivery import EMITS
@@ -440,6 +464,7 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append(f"a loop that takes findings from other loops and has the acting tools {', '.join(acting)} "
                         f"needs [trigger] trust = \"internal\" or above, so a finding from untrusted text never "
                         f"reaches it")
+    problems += source_name_problems(loop)
     for s in loop.sources:
         if s.get("type") not in SOURCES:
             problems.append(f"source type '{s.get('type')}' is not one of {', '.join(SOURCES)}")

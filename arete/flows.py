@@ -460,6 +460,8 @@ class Job:
         if stored:
             for c in self.picked(self.changed):
                 c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+            if self.with_prs:
+                pipeline.note_prs(self.run, self.branch, self.with_prs)
 
     def hold(self, name: str) -> str:
         if name != "prepare" or not self.pending or not self.only and kept_pending(self, self.continues):
@@ -974,12 +976,14 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), report_body,
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
             opened.append(c)
+            pipeline.note_prs(run, job.branch, job.with_prs)
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
             run.log(f"pushed to {c.pr}" if committed else f"checked {c.pr} again, nothing new to push")
     standing = [c for c in staged.changed if c not in opened]
     pushed = standing if committed else []
     with_prs = job.with_prs
+    pipeline.note_prs(run, job.branch, with_prs)
     ci_stopped = [c for c in found if stops[c.github]]
     for c in with_prs:
         others = pipeline.sibling_section(t.ref, c, with_prs)

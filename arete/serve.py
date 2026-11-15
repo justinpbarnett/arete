@@ -48,6 +48,7 @@ APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
 POLL_THREADS = 8
 IMPORT_CHECK = "from arete import codebase; codebase.load()"
+CONFIG_CHECK = "from arete import config; config.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 SERVE_LOCK = "serve"
 SERVE_LOCK_FD = "ARETE_SERVE_LOCK_FD"
@@ -150,7 +151,10 @@ def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
 
 class Server:
     def __init__(self) -> None:
-        self.cfg = config.load()
+        self.cfg, self.config_problem = config.load_or_problem()
+        self.code_problem = ""
+        self.reported_problem = ""
+        self.reported_ignored: tuple[str, ...] = ()
         self.started = util.now()
         self.polls: dict[str, Future] = {}
         self.sweep: Future | None = None
@@ -173,8 +177,29 @@ class Server:
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
 
+    def read_config(self) -> None:
+        self.cfg, self.config_problem = config.load_or_problem()
+        self.report_config()
+
+    def report_config(self) -> None:
+        if self.config_problem != self.reported_problem:
+            if self.config_problem:
+                self.say(f"config.toml does not load, so no loop fires until it does: {self.config_problem}")
+            else:
+                self.say("config.toml loads again")
+            self.reported_problem = self.config_problem
+        if self.cfg.ignored != self.reported_ignored:
+            if self.cfg.ignored:
+                self.say(f"config.toml has names this engine does not know, so it ignores them: "
+                         f"{', '.join(self.cfg.ignored)}")
+            self.reported_ignored = self.cfg.ignored
+
     def tick(self) -> None:
-        self.cfg = config.load()
+        self.read_config()
+        if self.config_problem or self.code_problem:
+            self.ticks += 1
+            self.beat([], [])
+            return
         every_loop = loops.load_all(self.cfg)
         live = [x for x in every_loop if x.enabled and not x.error]
         for row in record.reap(tickets=False):
@@ -307,10 +332,22 @@ class Server:
             running = self.polls.get(sid)
             if running and not running.done():
                 continue
+            if source.get("name") and self.slot_polling(loop):
+                continue
             if time.monotonic() - self.tried.get(sid, -1e9) < sources.every(source):
                 continue
             self.tried[sid] = time.monotonic()
-            self.polls[sid] = self.pool.submit(self.poll_source, loop, i)
+            self.polls[sid] = future = self.pool.submit(self.poll_source, loop, i)
+            future.add_done_callback(lambda done, sid=sid: self.poll_ended(sid, done))
+
+    def slot_polling(self, loop: Loop) -> bool:
+        return any(sources.is_slot(loop, sid) and not future.done() for sid, future in self.polls.items())
+
+    def poll_ended(self, sid: str, done: Future) -> None:
+        if done.cancelled():
+            return
+        if error := done.exception():
+            self.say(f"{sid}: poll failed: {type(error).__name__}: {util.first_line(str(error), 300)}")
 
     def forget_unpolled_errors(self, live: list[Loop]) -> None:
         polled = {sources.source_id(loop, i) for loop in live for i in range(len(loop.sources))}
@@ -357,7 +394,7 @@ class Server:
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
         try:
-            found = sources.poll(loop, index, self.cfg)
+            found, items = sources.poll(loop, index, self.cfg, say=self.say)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
             if (c := state.cursor(sid)) is not None:
@@ -367,7 +404,7 @@ class Server:
             self.errors[sid] = text
             return
         self.errors.pop(sid, None)
-        if items := sources.fire(loop, "event", found):
+        if items:
             self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
@@ -477,6 +514,8 @@ class Server:
     def load_new_code(self) -> None:
         stamp = code_stamp()
         steady, self.code_seen = stamp == self.code_seen, stamp
+        if stamp == self.code:
+            self.code_problem = ""
         if stamp == self.code or not steady:
             return
         if busy := self.busy_with():
@@ -487,20 +526,34 @@ class Server:
             self.note_once("new code does not import, so serve keeps the code it started with: "
                            + util.last_line(check.stderr or check.stdout, 300))
             return
-        reap_children()
-        still_running = child_pids()
-        self.say(f"new code: serve {os.getpid()} restarts itself" + (
-            f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
-        os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
-        fd = self.lock.fileno()
-        os.set_inheritable(fd, True)
-        os.environ[SERVE_LOCK_FD] = str(fd)
+        candidate = util.sh([sys.executable, "-c", CONFIG_CHECK], timeout=120)
+        if candidate.returncode != 0 and not config.load_or_problem()[1]:
+            self.code_problem = ("new code cannot read config.toml, so serve keeps the code it started with: "
+                                 + util.last_line(candidate.stderr or candidate.stdout, 300))
+            self.note_once(self.code_problem)
+            return
+        self.code_problem = ""
+        dashboard.POSTS_IN_FLIGHT.close()
         try:
-            os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
-        except BaseException:
-            os.set_inheritable(fd, False)
-            os.environ.pop(SERVE_LOCK_FD, None)
-            raise
+            if busy := self.busy_with():
+                self.note_once(f"new code waits to load: {busy}")
+                return
+            reap_children()
+            still_running = child_pids()
+            self.say(f"new code: serve {os.getpid()} restarts itself" + (
+                f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
+            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
+            fd = self.lock.fileno()
+            os.set_inheritable(fd, True)
+            os.environ[SERVE_LOCK_FD] = str(fd)
+            try:
+                os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+            except BaseException:
+                os.set_inheritable(fd, False)
+                os.environ.pop(SERVE_LOCK_FD, None)
+                raise
+        finally:
+            dashboard.POSTS_IN_FLIGHT.reopen()
 
     def note_once(self, text: str) -> None:
         if self.code_note != text:
@@ -513,6 +566,9 @@ class Server:
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": len(state.pending()),
             "running": sum(r["kind"] == "loop" for r in state.runs_marked_running()), "poll_errors": dict(self.errors),
+            "config_ignored": list(self.cfg.ignored),
+            **({"config_problem": self.config_problem} if self.config_problem else {}),
+            **({"code_problem": self.code_problem} if self.code_problem else {}),
         })
 
 
@@ -538,6 +594,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
         held.close()
         raise
     server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
+    server.report_config()
     for note in start_notes(server.cfg):
         server.say(note)
     if with_dashboard:

@@ -1,4 +1,6 @@
 import base64
+import fcntl
+import hmac
 import importlib.util
 import io
 import json
@@ -127,6 +129,178 @@ class AskConfigTests(unittest.TestCase):
         self.assertTrue(util.iso(util.now() - timedelta(days=longest)))
 
 
+class TrackerLabelCatchUpTests(unittest.TestCase):
+    SCRIPT = r'''
+import json, os, subprocess, sys, time, urllib.request
+from pathlib import Path
+from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker, util
+root, scenario = Path(sys.argv[1]), sys.argv[2]
+def forbidden(*args, **kwargs):
+    raise AssertionError("offline workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+gh.gh = forbidden
+lines = replay.sample(root / "sample", adw=True)
+paths.CONFIG_FILE.write_text("\n".join(lines).replace('tracker = "local"', 'tracker = "github"\ngithub = "fixture/repo"')
+                             + "\n\n[jev]\nenabled=false\n")
+cfg = config.load()
+REPO = "replay-sample"
+ISSUES, EDITS, REFUSE = {}, [], set()
+def issue_labels(repo, number, add=(), remove=()):
+    EDITS.append((number, list(add), list(remove)))
+    if REFUSE & set(add):
+        raise gh.GhError("HTTP 502: Bad Gateway")
+    ISSUES[number] = (ISSUES[number] - set(remove)) | set(add)
+gh.issue_labels = issue_labels
+gh.issues = lambda repo, label="", **kw: [
+    {"number": n, "title": f"t{n}", "body": "", "url": "", "createdAt": f"2026-01-0{n}T00:00:00Z", "author": {"login": "fixture"},
+     "labels": [{"name": x} for x in sorted(names)]} for n, names in sorted(ISSUES.items()) if not label or label in names]
+def row(issue, status, pending, started="2026-01-01T00:00:00Z"):
+    run = record.start("pipeline", repo=REPO, issue=issue, started=started)
+    if pending is not None:
+        record.note(run, label_pending=pending)
+    if status != "running":
+        record.settle(run, status)
+    return run
+def pending(run):
+    return state.run_get(run)["label_pending"]
+result = {}
+if scenario == "catch-up":
+    ISSUES[5] = {"agent", "agent:running"}
+    run = row(5, "pr", "pr")
+    result["before"] = [state.pending_label(REPO, 5)]
+    pipeline.sync_labels(cfg)
+    result |= {"labels": sorted(ISSUES[5]), "pending": pending(run), "edits": len(EDITS)}
+    pipeline.sync_labels(cfg)
+    result["again"] = len(EDITS)
+    ISSUES[5].discard("agent:pr")
+    pipeline.sync_labels(cfg)
+    result["after_removal"] = len(EDITS)
+elif scenario == "blocks-next-ticket":
+    ISSUES[5] = {"agent"}
+    run = row(5, "pr", "pr")
+    skips = pipeline.SkipLog({})
+    repo = cfg.repo(REPO)
+    result["first"] = pipeline.next_ticket(repo, tracker.for_repo(cfg, repo), skips) is None
+    result["skips"] = json.dumps(skips.current)
+    pipeline.sync_labels(cfg)
+    result["labels"] = sorted(ISSUES[5])
+    ISSUES[5].discard("agent:pr")
+    result["released"] = pipeline.next_ticket(repo, tracker.for_repo(cfg, repo), pipeline.SkipLog({})) is None
+elif scenario == "retains-debt":
+    ISSUES[5], ISSUES[6] = {"agent", "agent:running"}, {"agent", "agent:running"}
+    REFUSE.add("agent:failed")
+    first, second = row(5, "failed", "failed"), row(6, "pr", "pr")
+    pipeline.sync_labels(cfg)
+    result |= {"debt": pending(first), "other": pending(second), "labels": sorted(ISSUES[6])}
+    REFUSE.clear()
+    pipeline.sync_labels(cfg)
+    result |= {"later": pending(first), "failed": sorted(ISSUES[5])}
+elif scenario == "no-edit":
+    ISSUES[5], ISSUES[6], ISSUES[7] = {"agent"}, {"agent"}, {"agent"}
+    legacy, delivered, interrupted = row(5, "pr", None), row(6, "pr", ""), row(7, "interrupted", "running")
+    live = row(8, "running", "pr")
+    ISSUES[8] = {"agent"}
+    pipeline.sync_labels(cfg)
+    result |= {"edits": len(EDITS), "legacy": pending(legacy), "interrupted": pending(interrupted), "live": pending(live)}
+elif scenario == "latest-marker-governs":
+    ISSUES[5] = {"agent"}
+    row(5, "failed", "failed", "2026-01-01T00:00:00Z")
+    row(5, "pr", "", "2026-01-02T00:00:00Z")
+    row(5, "pr", None, "2026-01-03T00:00:00Z")
+    result["pending"] = state.pending_label(REPO, 5)
+    pipeline.sync_labels(cfg)
+    result["edits"] = len(EDITS)
+elif scenario == "ties-and-unknown-repo":
+    ISSUES[5] = {"agent"}
+    row(5, "failed", "failed", "2026-01-01T00:00:00Z")
+    row(5, "pr", "pr", "2026-01-01T00:00:00Z")
+    gone = record.start("pipeline", repo="gone", issue=9)
+    record.note(gone, label_pending="pr")
+    record.settle(gone, "pr")
+    result["pending"] = state.pending_label(REPO, 5)
+    pipeline.sync_labels(cfg)
+    result |= {"labels": sorted(ISSUES[5]), "edits": len(EDITS)}
+elif scenario == "local-task":
+    task = state.task_add(REPO, "Local", "Local body", "feat")
+    run = row(task, "pr", "pr")
+    pipeline.sync_labels(cfg)
+    result |= {"state": state.task_get(task)["state"], "pending": pending(run), "edits": len(EDITS)}
+elif scenario == "held-lock":
+    ISSUES[5] = {"agent"}
+    run = row(5, "pr", "pr")
+    ready = root / "ready"
+    holder = subprocess.Popen([sys.executable, "-I", "-c",
+        "import sys,time;from pathlib import Path;from arete import state, util\n"
+        "with util.lock(state.run_lock('pipeline', sys.argv[1], 5)):\n"
+        "    Path(sys.argv[2]).write_text('x')\n"
+        "    sys.stdin.readline()", REPO, str(ready)], stdin=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 30
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists()
+    pipeline.sync_labels(cfg)
+    result |= {"held_edits": len(EDITS), "held_pending": pending(run)}
+    holder.communicate("\n", timeout=30)
+    pipeline.sync_labels(cfg)
+    result |= {"edits": len(EDITS), "pending": pending(run), "labels": sorted(ISSUES[5])}
+print("BEHAVIOR_RESULT=" + json.dumps(result))
+'''
+
+    def run_scenario(self, scenario):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), scenario],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            line = next(x for x in done.stdout.splitlines() if x.startswith("BEHAVIOR_RESULT="))
+            return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+
+    def test_owed_label_lands_once_and_a_manual_removal_stays(self):
+        r = self.run_scenario("catch-up")
+        self.assertEqual(r["before"], ["pr"])
+        self.assertEqual(r["labels"], ["agent", "agent:pr"])
+        self.assertEqual((r["pending"], r["edits"], r["again"], r["after_removal"]), ("", 1, 1, 1))
+
+    def test_a_ticket_without_its_label_is_not_run_again_until_it_lands(self):
+        r = self.run_scenario("blocks-next-ticket")
+        self.assertTrue(r["first"])
+        self.assertIn("its pr label is not written yet", r["skips"])
+        self.assertEqual(r["labels"], ["agent", "agent:pr"])
+
+    def test_a_failed_write_keeps_its_debt_while_another_ticket_lands(self):
+        r = self.run_scenario("retains-debt")
+        self.assertEqual((r["debt"], r["other"]), ("failed", ""))
+        self.assertEqual(r["labels"], ["agent", "agent:pr"])
+        self.assertEqual((r["later"], r["failed"]), ("", ["agent", "agent:failed"]))
+
+    def test_nothing_is_written_for_legacy_delivered_interrupted_or_running_rows(self):
+        r = self.run_scenario("no-edit")
+        self.assertEqual((r["edits"], r["legacy"], r["interrupted"], r["live"]), (0, None, "", "pr"))
+
+    def test_the_newest_marker_governs(self):
+        self.assertEqual(self.run_scenario("latest-marker-governs"), {"pending": "", "edits": 0})
+        r = self.run_scenario("ties-and-unknown-repo")
+        self.assertEqual((r["pending"], r["labels"], r["edits"]), ("pr", ["agent", "agent:pr"], 1))
+
+    def test_a_local_task_gets_its_state(self):
+        self.assertEqual(self.run_scenario("local-task"), {"state": "pr", "pending": "", "edits": 0})
+
+    def test_a_held_run_lock_defers_the_write(self):
+        r = self.run_scenario("held-lock")
+        self.assertEqual((r["held_edits"], r["held_pending"]), (0, "pr"))
+        self.assertEqual((r["edits"], r["pending"], r["labels"]), (1, "", ["agent", "agent:pr"]))
+
+
 class OfflineWorkflowTests(unittest.TestCase):
     def workflow(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
@@ -182,6 +356,22 @@ if importlib.util.find_spec("arete.scratch"):
     probe = [sys.executable, "-V"]
     if scratch.protected_command(probe) != probe:
         scratch.AUTHORITY = root / "authority-parent/verification-authority"
+foreign = foreign_bytes = None
+if scenario == "foreign-version-record" and scratch.AUTHORITY.parent == root / "authority-parent":
+    import hmac
+    scratch.AUTHORITY = root.resolve() / "authority-parent/verification-authority"
+    scratch.AUTHORITY.mkdir(mode=0o700)
+    key = os.urandom(32)
+    secret = os.open(scratch.AUTHORITY / "signing.secret", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(secret, key)
+    os.close(secret)
+    selector = "ab" * 32
+    elsewhere = str(root / "elsewhere")
+    data = {"version": 3, "attempt": {"selector": selector, "workspace": elsewhere, "root": elsewhere + "/.arete-scratch-x"},
+            "state": "prepared"}
+    foreign_bytes = scratch.encoded({"data": data, "signature": hmac.digest(key, scratch.encoded(data), "sha256").hex()})
+    foreign = scratch.AUTHORITY / (selector + ".json")
+    foreign.write_bytes(foreign_bytes)
 lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines) +
     "\n\n[jev]\nenabled=false\n\n[steps.check_repair]\ntries=1\n\n[steps.review]\ntries=" +
@@ -286,16 +476,17 @@ def forced(*extra):
     except SystemExit:
         pass
     return state.ticket_runs("replay-sample", task, whole=True)[0]
-if "limit-wait" in scenario or scenario == "work-over-budget":
+if "limit-wait" in scenario or scenario in ("work-over-budget", "failed-again-prepare-sleep"):
     import time as real_time
     from datetime import timedelta
     from types import SimpleNamespace
     ahead, real_now, real_launch = [0.0], pipeline.util.now, runner.run
     pipeline.util.now = lambda: real_now() + timedelta(seconds=ahead[0])
-    runlimits.time = SimpleNamespace(monotonic=lambda: real_time.monotonic() + ahead[0])
+    if scenario != "failed-again-prepare-sleep":
+        runlimits.time = SimpleNamespace(monotonic=lambda: real_time.monotonic() + ahead[0])
     def jumping(prompt, cwd, **kw):
         if kw.get("waits") and not ahead[0]:
-            if scenario == "work-over-budget":
+            if scenario in ("work-over-budget", "failed-again-prepare-sleep"):
                 ahead[0] = 600.0
             else:
                 with kw["waits"]("limit"):
@@ -328,14 +519,49 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
         commit_in_src("seed.txt", "seed", f"HEAD:refs/heads/{branch}")
         pipeline.git(["checkout", "-q", "main"], src)
     if scenario.startswith(("failed-resume", "failed-again")):
-        layer.write_text(plain if "late" in scenario else plain.replace("grep -q kumquat", "grep -q quince"))
+        layer.write_text(plain if "late" in scenario or "killed" in scenario else plain.replace("grep -q kumquat", "grep -q quince"))
         if "pushed" in scenario:
             seed_origin_branch()
         if "late" in scenario:
             from arete import flows
             real_publish = factory.STEPS["publish"]
             factory.STEPS["publish"] = lambda flow: flows.end_as("fail", "failed", why="publishing failed after the push")
-        failed = forced()
+        if "killed" in scenario:
+            import select, signal, time
+            from datetime import timedelta
+            mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=1, max_verify_minutes=1)).start()
+            ready, notify = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(ready)
+                def pause_at_verify(prompt, cwd, **kw):
+                    if kw.get("trace", ("", ""))[1] == "verify":
+                        os.write(notify, b"ready")
+                        while True:
+                            time.sleep(1)
+                    return real_run(prompt, cwd, **kw)
+                runner.run = pause_at_verify
+                forced()
+                os._exit(3)
+            os.close(notify)
+            try:
+                assert select.select([ready], [], [], 30)[0], "verify never started"
+                assert os.read(ready, 5) == b"ready"
+            finally:
+                os.kill(child, signal.SIGKILL)
+                os.waitpid(child, 0)
+                os.close(ready)
+            real_now = pipeline.util.now
+            pipeline.util.now = lambda: real_now() + timedelta(seconds=600)
+            failed = state.ticket_runs("replay-sample", task, whole=True)[0]
+            record.interrupt(failed)
+            failed = state.run_get(failed["id"])
+            pipeline.git(["add", "-A"], ws)
+            pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m",
+                                        f"wip: edits of arete run {failed['id']}, kept when it ended before pushing\n\nArete-Run: {failed['id']}"], ws)
+            pipeline.note_made(ws, [pipeline.Checkout("", "octo/widgets", src, ws, "main")])
+        else:
+            failed = forced()
         if "late" in scenario:
             factory.STEPS["publish"] = real_publish
         layer.write_text(plain)
@@ -396,7 +622,11 @@ if scenario in ("kept-park", "kept-park-pushed", "kept-removed", "park-no-edits"
                   "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
                   "steps": [s["step"] for s in state.steps(row["id"])],
                   "started": [l["step"] for l in __import__("arete.lines", fromlist=["read"]).read(row["id"]) if l.get("event") == "step_start"],
-                  "failed_id": failed["id"],
+                  "failed_id": failed["id"], "failed_status": failed["status"],
+                  "failed_span": (pipeline.util.parse_iso(failed["finished"]) - pipeline.util.parse_iso(failed["started"])).total_seconds(),
+                  "failed_budget": runlimits.metadata(failed["id"], "budget.json"),
+                  "inherited_run": runlimits.active_seconds(failed["id"], failed),
+                  "inherited_verify": runlimits.verification_seconds(failed["id"], failed),
                   "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved", "head", "later")},
                   "stepped_published": published and bool(mid.get("head")) and pipeline.util.sh(["git", "merge-base", "--is-ancestor", mid["head"], branch], cwd=origin).returncode == 0,
                   "seed": og("show", f"{branch}:seed.txt") if "pushed" in scenario and published else "",
@@ -843,6 +1073,18 @@ except SystemExit:
         result["status_short"] = pipeline.git(["status", "--short"], layer_dir).splitlines()
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
+if scenario == "future-step-appended":
+    planned, appended, before_edit = [], [], runner.run
+    def edit_after_plan(prompt, cwd, **kw):
+        if planned and not appended:
+            appended.append(True)
+            with paths.CONFIG_FILE.open("a") as out:
+                out.write("\n[steps.future_step]\ntries=1\n")
+        done = before_edit(prompt, cwd, **kw)
+        if (kw.get("trace") or ("", ""))[1:2] == ("plan",):
+            planned.append(True)
+        return done
+    runner.run = edit_after_plan
 row = forced("--dry-run") if scenario == "review-notes-dry-run" else forced()
 events =[json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
@@ -891,10 +1133,14 @@ if scenario == "code-identity":
         "headers": [json.loads(next(record.raw_lines(f))).get("engine") for f in record.record_files(row["id"])],
         "later": [e.get("engine") for e in events[1:]],
         "second": [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()][-2:]}
+if scenario == "future-step-appended":
+    result["appended"] = bool(appended)
 if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
     result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], root / "sample/origin.git")
+if scenario == "foreign-version-record":
+    result["foreign_unchanged"] = None if foreign is None else foreign.read_bytes() == foreign_bytes
 print("BEHAVIOR_RESULT=" + json.dumps(result))
 '''
             bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + script
@@ -905,6 +1151,242 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
                            if line.startswith("BEHAVIOR_RESULT=")), None)
             self.assertIsNotNone(output, result.stdout + result.stderr)
             return json.loads(output)
+
+    PR_DRIVER = r"""
+import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from arete import accounts, agent, asks, config, control, factory, gh, lines, paths, pipeline, record, replay, runlimits, scratch, state, util
+root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+probe = [sys.executable, "-V"]
+if scratch.protected_command(probe) != probe:
+    scratch.AUTHORITY = root / "authority-parent/verification-authority"
+URL = "https://github.com/octo/widgets/pull/7"
+CALLS = root / "calls.jsonl"
+def forbidden(*args, **kwargs):
+    raise AssertionError("offline workflow attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+gh.gh = forbidden
+def fake(name, answer):
+    def call(*args, **kw):
+        with CALLS.open("a") as out:
+            out.write(json.dumps({"call": name, "args": [str(a) for a in args[:2]]}) + "\n")
+        return answer(*args, **kw)
+    setattr(gh, name, call)
+fake("pr_create", lambda repo, *a, **k: f"https://github.com/{repo}/pull/7")
+fake("open_pr_url", lambda repo, head: URL if (root / "found").exists() else "")
+fake("pr_view", lambda url: {"state": "MERGED" if (root / "merged").exists() else "OPEN",
+                             "mergedAt": "2026-01-01T00:00:00Z" if (root / "merged").exists() else None,
+                             "closedAt": "2026-01-01T00:00:00Z" if (root / "merged").exists() else None,
+                             "isDraft": False, "headRefOid": "", "reviews": [], "comments": []})
+for name in ("pr_edit_body", "pr_comment", "pr_set_draft"):
+    fake(name, lambda *a, **k: None)
+fake("pr_body", lambda url: "")
+fake("pr_draft_and_head", lambda url: (False, ""))
+fake("closed_pr_heads", lambda *a, **k: set())
+fake("commit_checks", lambda *a, **k: {})
+fake("branch_sha", lambda *a, **k: "")
+fake("me", lambda: "owner")
+fake("pr_discussion", lambda url: SimpleNamespace(reviews=[], line_comments=[], comments=[]))
+gh.default_branch = lambda r: "main"
+feature_of = lambda: runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
+ASKING = {"questions": [{"header": "Spelling", "question": "How is it spelled?", "kind": "text"}],
+          "why": "The CI fix needs it.", "tried": "Read the task."}
+def stopping(b, *a, **k):
+    thread = threading.Thread(target=control.stop_run, args=(b.run.id,))
+    thread.start()
+    thread.join()
+    time.sleep(30)
+    raise AssertionError("the stop never arrived")
+def parking(*a, **k):
+    raise runlimits.Parked("fixture limit")
+def asking(b, *a, **k):
+    b.run.owner_ask("implement", [ASKING], agent.NO_SESSION)
+def failing_ci(*a, **k):
+    raise pipeline.RunFailed("CI failed", "fixture detail")
+def raising(error):
+    def call(*a, **k):
+        raise error
+    return call
+def killing(*a, **k):
+    os.kill(os.getpid(), signal.SIGKILL)
+if role == "kill":
+    pipeline.watch_ci = killing
+    factory.main(feature_of(), ["replay-sample", sys.argv[4], "--force"])
+    raise SystemExit(0)
+lines_of_config = replay.sample(root / "sample", adw=True)
+paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines_of_config) + '\ngithub = "octo/widgets"\n\n[jev]\nenabled=false\n')
+record.SETTLE_GRACE_SECONDS = 0
+cfg = config.load()
+task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+feature = feature_of()
+pipeline.watch_ci = lambda *a, **k: "CI passed"
+def run_ticket(*extra):
+    try:
+        factory.main(feature, ["replay-sample", task, "--force", *extra])
+    except SystemExit:
+        pass
+    return state.ticket_runs("replay-sample", task, whole=True)[0]
+def killed_run():
+    subprocess.run([sys.executable, "-I", str(root / "driver.py"), str(root), scenario, "kill", task],
+                   env=os.environ, cwd=root, start_new_session=True, timeout=100)
+    pipeline.settle_abandoned_runs(cfg)
+    return state.ticket_runs("replay-sample", task, whole=True)[0]
+since = util.iso(util.now() - timedelta(days=30))
+def snapshot(row):
+    row = state.run_get(row["id"])
+    read = lines.read(row["id"])
+    reports = [e for e in read if e.get("event") == "report"]
+    routes = [e for e in read if e.get("event") == "route"]
+    return {"id": row["id"], "status": row["status"], "summary": row["summary"], "pr_url": row["pr_url"],
+            "report_prs": reports[-1]["prs"] if reports else None,
+            "reading": row["id"] in [r["id"] for r in state.runs_reading_pr_comments(since)],
+            "open": row["id"] in [r["id"] for r in state.open_runs("replay-sample", task)],
+            "skipped": routes[-1].get("skipped") if routes else None,
+            "started_steps": [e["step"] for e in read if e.get("event") == "step_start"]}
+snaps = []
+def take(row):
+    snaps.append(snapshot(row))
+    return row
+extra = {}
+if scenario in ("stop", "stopped-feedback", "repair-stop"):
+    pipeline.watch_ci = stopping
+elif scenario == "park":
+    pipeline.watch_ci = parking
+elif scenario == "automerge-gh-error":
+    pipeline.automerge = raising(gh.GhError("fixture gh failure"))
+elif scenario == "automerge-run-failed":
+    pipeline.automerge = raising(pipeline.RunFailed("fixture merge failure", "detail"))
+elif scenario in ("ask", "answer-stop"):
+    pipeline.watch_ci = asking
+elif scenario in ("ci-failure", "retry-stop"):
+    pipeline.watch_ci = failing_ci
+elif scenario == "partial-create-failure":
+    real_note = pipeline.note_prs
+    def note_then_refuse(run, branch, with_prs):
+        real_note(run, branch, with_prs)
+        raise gh.GhError("the second repository refused its PR")
+    pipeline.note_prs = note_then_refuse
+if scenario in ("kill", "kill-twice", "restart-stop"):
+    take(killed_run())
+    if scenario == "kill-twice":
+        take(killed_run())
+    if scenario == "restart-stop":
+        pipeline.watch_ci = stopping
+        take(run_ticket())
+elif scenario == "repair-stop":
+    branch = pipeline.fill_template(config.RepoLayer.branch, config.RepoLayer.branch, kind="feat", id=task,
+                                    slug=pipeline.slug("Add kumquat"))
+    older = record.start("pipeline", repo="replay-sample", issue=task)
+    record.note(older, branch=branch, pr_url=URL)
+    record.settle(older, "pr", summary="older", pr_url=URL)
+    pipeline.git(["push", "-q", "origin", f"HEAD:refs/heads/{branch}"], root / "sample/repo")
+    (root / "found").write_text("")
+    take(run_ticket())
+    extra["open_before"] = [r["id"] for r in state.open_runs("replay-sample", task)]
+    extra["older"] = older
+    extra["older_before"] = state.run_get(older)["status"]
+elif scenario == "answer-stop":
+    first = take(run_ticket())
+    for ask in state.asks_of(first["id"], "open"):
+        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K."))
+    pipeline.watch_ci = stopping
+    take(run_ticket("--continue", first["id"]))
+elif scenario == "retry-stop":
+    first = take(run_ticket())
+    pipeline.watch_ci = stopping
+    take(run_ticket("--continue", first["id"], "--from", "ci"))
+else:
+    take(run_ticket())
+if scenario in ("stop", "repair-stop"):
+    (root / "merged").write_text("")
+    pipeline.sync_outcomes(cfg)
+    extra["after_merge"] = {r["id"]: state.run_get(r["id"])["status"] for r in state.runs(kind="pipeline", limit=10)}
+    extra["streak"] = pipeline.streak("replay-sample")
+if scenario == "stopped-feedback":
+    comment = {"pr_url": URL, "kind": "comment", "gh_id": 11, "repo": "replay-sample", "issue": task,
+               "body": "Please rename it.", "at_once": 1, "created": util.iso(), "pr_state": "OPEN", "status": "new"}
+    extra["added"] = [state.add_feedback([comment]), state.add_feedback([comment])]
+    extra["feedback_due"] = state.feedback_due("replay-sample", util.iso())
+    extra["task"] = task
+calls = [json.loads(line) for line in CALLS.read_text().splitlines()] if CALLS.exists() else []
+print("BEHAVIOR_RESULT=" + json.dumps({"scenario": scenario, "runs": snaps,
+                                       "calls": [c["call"] for c in calls], **snaps[-1], **extra}))
+"""
+
+    def pr_workflow(self, scenario):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            (root / "driver.py").write_text(f"import sys;sys.path.insert(0,{str(SOURCE)!r})\n" + self.PR_DRIVER)
+            result = subprocess.run([sys.executable, "-I", str(root / "driver.py"), str(root), scenario, "parent"],
+                                    cwd=root, env=env, text=True, capture_output=True, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in result.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, result.stdout + result.stderr)
+            return json.loads(output)
+
+    def test_pr_survives_every_ending_after_it_opens(self):
+        url = "https://github.com/octo/widgets/pull/7"
+        for scenario, status, reading in (("stop", "stopped", True), ("park", "failed", True),
+                                          ("automerge-gh-error", "failed", True),
+                                          ("automerge-run-failed", "failed", True), ("ask", "needs-info", False),
+                                          ("clean", "pr", True), ("ci-failure", "failed", True),
+                                          ("partial-create-failure", "failed", True)):
+            with self.subTest(scenario):
+                got = self.pr_workflow(scenario)
+                self.assertEqual((got["status"], got["pr_url"], got["report_prs"], got["reading"]),
+                                 (status, url, [url], reading), got)
+        self.assertIn("parked", self.pr_workflow("park")["summary"])
+        stopped = self.pr_workflow("stop")
+        self.assertEqual(set(stopped["after_merge"].values()), {"merged"})
+        self.assertIn("pr_view", stopped["calls"])
+
+    def test_killed_run_keeps_its_pr_and_its_restart_lists_it(self):
+        url = "https://github.com/octo/widgets/pull/7"
+        killed = self.pr_workflow("kill")
+        self.assertEqual((killed["status"], killed["pr_url"], killed["report_prs"], killed["open"]),
+                         ("interrupted", url, [url], False))
+        twice = self.pr_workflow("kill-twice")
+        self.assertEqual([r["status"] for r in twice["runs"]], ["interrupted", "failed"])
+        self.assertEqual(twice["pr_url"], url)
+        restart = self.pr_workflow("restart-stop")
+        self.assertEqual([r["status"] for r in restart["runs"]], ["interrupted", "stopped"])
+        self.assertGreater(restart["skipped"], 0)
+        self.assertNotIn("pr", restart["started_steps"])
+        self.assertEqual((restart["pr_url"], restart["report_prs"], restart["reading"]), (url, [url], True))
+
+    def test_repair_stop_and_feedback_on_a_stopped_pr(self):
+        url = "https://github.com/octo/widgets/pull/7"
+        repair = self.pr_workflow("repair-stop")
+        self.assertEqual((repair["status"], repair["pr_url"], repair["report_prs"]), ("stopped", url, [url]))
+        self.assertEqual(set(repair["open_before"]), {repair["id"], repair["older"]})
+        self.assertEqual(repair["older_before"], "pr")
+        self.assertEqual(set(repair["after_merge"].values()), {"merged"})
+        self.assertEqual(repair["streak"], 1)
+        feedback = self.pr_workflow("stopped-feedback")
+        self.assertEqual((feedback["added"], feedback["feedback_due"]), ([1, 0], [feedback["task"]]))
+
+    def test_answered_and_retried_runs_take_the_stored_pr(self):
+        url = "https://github.com/octo/widgets/pull/7"
+        for scenario, first in (("answer-stop", "needs-info"), ("retry-stop", "failed")):
+            with self.subTest(scenario):
+                got = self.pr_workflow(scenario)
+                self.assertEqual([r["status"] for r in got["runs"]], [first, "stopped"])
+                self.assertEqual(got["runs"][0]["reading"], first == "failed")
+                self.assertGreater(got["skipped"], 0)
+                self.assertNotIn("pr", got["started_steps"])
+                self.assertEqual((got["pr_url"], got["report_prs"]), (url, [url]))
 
     def test_overlapping_runs_keep_each_others_lessons(self):
         result = self.workflow("learn-overlap")
@@ -940,6 +1422,13 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
+
+    def test_record_of_another_version_does_not_stop_a_replay(self):
+        result = self.workflow("foreign-version-record")
+        if result["foreign_unchanged"] is None:
+            self.skipTest("the authority store is not redirected on this host")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertTrue(result["foreign_unchanged"])
 
     def test_run_that_asks_parks_with_its_folder_and_resumes_its_session(self):
         result = self.workflow("asked")
@@ -1335,6 +1824,31 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         self.assertIn("kumquat", result["published"])
         self.assertIn("quince", result["published"])
 
+    def test_a_continuation_is_not_charged_for_a_machine_sleep_inside_the_earlier_run(self):
+        result = self.workflow("failed-again-prepare-sleep")
+        self.assertEqual(result["failed_status"], "failed")
+        self.assertIn("checks still failing", result["failed"])
+        self.assertGreater(result["failed_span"], 600)
+        self.assertLess(result["failed_budget"]["run_seconds"], 60)
+        self.assertEqual(result["failed_budget"]["wait_minutes_left_out"], {"limit": 0, "slot": 0})
+        self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("kumquat", result["published"])
+        self.assertIn("quince", result["published"])
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires fork and SIGKILL")
+    def test_a_killed_verification_is_not_charged_until_reaped_after_sleep(self):
+        result = self.workflow("failed-resume-killed")
+        self.assertEqual(result["failed_status"], "interrupted")
+        self.assertGreaterEqual(result["failed_span"], 600)
+        self.assertIsNotNone(result["failed_budget"]["verification_active_since"])
+        self.assertGreaterEqual(result["failed_budget"]["verification_open_seconds"], 0)
+        self.assertLess(result["inherited_run"], 60)
+        self.assertLess(result["inherited_verify"], 60)
+        self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertIn("kumquat", result["published"])
+
     def test_preparing_again_over_a_chain_commit_with_no_kept_record_is_still_held(self):
         result = self.workflow("failed-again-prepare-unrecorded")
         self.assertEqual(result["status"], "failed")
@@ -1480,6 +1994,190 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
         result = self.workflow("blocked-check-guard")
         self.assertEqual(result["status"], "failed")
         self.assertIn("blocked", result["summary"])
+
+
+class ResearchRetentionTests(unittest.TestCase):
+    SCRIPT = r'''
+import json, sys
+from pathlib import Path
+from arete import config, paths, research, runner, state, triage, util
+root = Path(sys.argv[1])
+paths.ensure_dirs()
+cfg = config.load()
+calls = []
+real = runner.run
+def spy(*args, **kwargs):
+    calls.append(kwargs["trace"][1])
+    return real(*args, **kwargs)
+runner.run = spy
+def put(name, structured, cost=0):
+    (root / "replay" / f"{name}.json").write_text(json.dumps({"structured": structured, "cost_usd": cost}))
+for n in range(1, 52):
+    put(f"triage-T-{n}", {"kind": "research", "ready": False, "questions": [], "assumptions": [],
+        "size": "S", "repos": [], "plan": [], "why": "Find the answer in a report."})
+put("research-T-1", {"summary": "The answer.", "report": "A durable report body."}, .75)
+def candidate(n, updated=None):
+    ref = f"T-{n}"
+    return triage.Candidate(ref, ref, f"Title {n}", f"https://example.test/{ref}",
+                            updated or f"2026-11-08T20:10:{n:02d}Z")
+class FakeSource(triage.JiraSource):
+    def candidates(self):
+        return sorted(items, key=lambda c: triage.moment(c.updated), reverse=True)[:triage.PER_SOURCE]
+    def ticket(self, c):
+        return triage.TicketText("Status: Open", "Find the answer and write a detailed report.", "", c.updated)
+src = FakeSource("T")
+items = [candidate(1)]
+active = [src]
+triage.sources = lambda cfg: active
+triage.publish = lambda *args: "not posted (test)"
+def refresh():
+    assert triage.refresh(cfg, False) == 0
+def tidy():
+    with util.lock("research", wait=True):
+        research.tidy()
+def run(**kwargs):
+    with util.lock("research", wait=True):
+        return research.research(cfg, triage.board_row("T-1"), **kwargs)[0]
+def cli(ref):
+    import subprocess
+    p = subprocess.run([sys.executable, "-m", "arete.cli", "research", ref],
+                       capture_output=True, text=True, timeout=30)
+    return [p.returncode, p.stdout + p.stderr]
+out = {}
+refresh()
+out["first"] = run(force=True)
+original = state.research_get("T-1")
+text = research.report_file("T-1").read_text()
+out["initial_cli"] = cli("T-1")
+items = [candidate(n) for n in range(1, 52)]
+refresh()
+with util.lock("research", wait=True):
+    state.research_set("T-3", status=research.ANSWERED, answered_by="T-1", error="already answered")
+tidy()
+out["window"] = {"absent": triage.board_row("T-1") is None,
+    "same_row": state.research_get("T-1") == original, "row": state.research_get("T-1"),
+    "shown": research.shown("T-1"), "linked": research.shown("T-3"), "text": text,
+    "listing": research.listing(), "cli": cli("T-1"), "linked_cli": cli("T-3")}
+items = [candidate(1)]
+refresh()
+out["return"] = {"due": [r["ref"] for r in research.due()], "outcome": run()}
+items = [candidate(1, "2026-11-09T20:10:01Z")]
+refresh()
+out["changed_stamp"] = run()
+active = []
+refresh()
+before_off = state.research_rows()
+tidy()
+out["off"] = {"board": state.triage_rows(), "same_rows": before_off == state.research_rows(),
+              "refs": [r["ref"] for r in state.research_rows()]}
+checkpoint = len(calls)
+active = [src]
+refresh()
+out["on"] = {"calls": calls[checkpoint:], "due": [r["ref"] for r in research.due()],
+             "shown": research.shown("T-1"), "cli": cli("T-1")}
+files = {
+    "T-9": "# T-9: Title\n\nhttps://example.test/T-9\n\nResearched 2026-11-08T20:10:55Z for $0.50.\n\n**Summary:** S\n\nOld body.\n",
+    "T-10": "# T-10: Current\n\nhttps://example.test/T-10\n\nResearched 2026-11-08T20:10:55Z ($0.40 paid).\n\n**Summary:** New\n\nNew body.\n",
+    "T-11": "# T-11: Free\n\nhttps://example.test/T-11\n\nResearched today (nothing paid).\n\nFree body.\n",
+    "T-12": "# T-12: Sparse\n\nBody only.\n",
+    "notes": "# Notes\n\nNot a report.\n",
+    "T-8": "# T-7: Wrong file\n\nBody.\n",
+    "T-13": "# Home report title\n\nFiled body.\n",
+}
+for ref, body in files.items():
+    (research.REPORTS_DIR / f"{ref}.md").write_text(body)
+with util.lock("research", wait=True):
+    state.research_set("T-20", status=research.RUNNING)
+tidy()
+adopted = {ref: state.research_get(ref) for ref in files}
+out["orphans"] = {"files": files, "rows": adopted, "wrong_ref": state.research_get("T-7"),
+    "shown": research.shown("T-9"), "running": state.research_get("T-20"),
+    "cli": cli("T-9"), "current_cli": cli("T-10"), "unknown_cli": cli("T-99")}
+before = state.research_rows()
+tidy()
+out["idempotent"] = before == state.research_rows()
+out["calls"] = calls
+print("RESULT" + json.dumps(out))
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "replay", "home"):
+                (root / folder).mkdir()
+            (root / "config/config.toml").write_text('[replay]\nall = true\n\n[jev]\nenabled = false\n')
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_REPLAY_DIR=str(root / "replay"),
+                       TMPDIR=str(root), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            done = subprocess.run([sys.executable, "-c", cls.SCRIPT, str(root)], env=env, cwd=SOURCE,
+                                  capture_output=True, text=True, timeout=120, check=False)
+            if done.returncode:
+                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
+            line = next((x for x in done.stdout.splitlines() if x.startswith("RESULT")), "")
+            if not line:
+                raise AssertionError(done.stdout[-2000:] + done.stderr[-3000:])
+            cls.out = json.loads(line[len("RESULT"):])
+
+    def test_window_eviction_keeps_report_cost_metadata_and_answered_link(self):
+        self.assertEqual(self.out["first"], "done")
+        w = self.out["window"]
+        self.assertTrue(w["absent"])
+        self.assertTrue(w["same_row"])
+        self.assertEqual(w["row"]["status"], "done")
+        self.assertEqual(w["row"]["cost"], .75)
+        self.assertEqual(w["shown"], w["text"])
+        self.assertIn(w["text"], w["linked"])
+        self.assertNotIn("T-1 ", w["listing"])
+        for result in (self.out["initial_cli"], w["cli"], w["linked_cli"]):
+            self.assertEqual(result[0], 0)
+            self.assertIn(w["text"], result[1])
+
+    def test_return_and_timestamp_change_keep_the_report_without_another_paid_call(self):
+        self.assertNotIn("T-1", self.out["return"]["due"])
+        self.assertEqual(self.out["return"]["outcome"], "kept")
+        self.assertEqual(self.out["changed_stamp"], "kept")
+        self.assertEqual(self.out["calls"].count("research T-1"), 1)
+
+    def test_source_removal_keeps_rows_and_restoration_rebuilds_only_triage(self):
+        self.assertEqual(self.out["off"]["board"], [])
+        self.assertTrue(self.out["off"]["same_rows"])
+        self.assertCountEqual(self.out["off"]["refs"], ["T-1", "T-3"])
+        self.assertEqual(self.out["on"]["calls"], ["triage T-1"])
+        self.assertNotIn("T-1", self.out["on"]["due"])
+        self.assertEqual(self.out["on"]["shown"], self.out["window"]["text"])
+        self.assertEqual(self.out["on"]["cli"][0], 0)
+        self.assertIn(self.out["window"]["text"], self.out["on"]["cli"][1])
+
+    def test_orphans_are_adopted_once_and_interrupted_runs_still_fail(self):
+        o = self.out["orphans"]
+        for ref, cost in (("T-9", .5), ("T-10", .4), ("T-11", 0), ("T-12", 0)):
+            row = o["rows"][ref]
+            self.assertEqual(row["status"], "done")
+            self.assertEqual(row["cost"], cost)
+            self.assertEqual(row["report"], o["files"][ref])
+            self.assertNotIn(None, row.values())
+            for field in ("updated", "source", "ticket", "basis", "answered_by", "filed_path", "filed_url",
+                          "moved", "delivered", "error", "run_id"):
+                self.assertEqual(row[field], "")
+        self.assertEqual(o["rows"]["T-9"]["title"], "Title")
+        self.assertEqual(o["rows"]["T-9"]["url"], "https://example.test/T-9")
+        self.assertEqual(o["rows"]["T-9"]["summary"], "S")
+        for field in ("url", "summary"):
+            self.assertEqual(o["rows"]["T-12"][field], "")
+        for ref in ("notes", "T-8", "T-13"):
+            self.assertIsNone(o["rows"][ref])
+        self.assertIsNone(o["wrong_ref"])
+        self.assertEqual(o["shown"], o["files"]["T-9"])
+        for result, ref in ((o["cli"], "T-9"), (o["current_cli"], "T-10")):
+            self.assertEqual(result[0], 0)
+            self.assertIn(o["files"][ref], result[1])
+        self.assertNotEqual(o["unknown_cli"][0], 0)
+        self.assertIn("no research", o["unknown_cli"][1])
+        self.assertEqual(o["running"]["status"], "failed")
+        self.assertEqual(o["running"]["error"], "the run stopped before it finished")
+        self.assertTrue(self.out["idempotent"])
 
 
 class StagedResearchSynthesisTests(unittest.TestCase):
@@ -2036,7 +2734,7 @@ c = pipeline.Checkout("", "o/r", src, ws, "main")
     def test_replay_of_the_incident_clears_after_note_made(self):
         self.run_body(r'''
 done = [{"state": "done", "attempt": {"workspace": str(ws), "root": str(ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8)))}} for i in range(5)]
-scratch.records = lambda strict=False: done
+scratch.survey = lambda: scratch.View(done, [], False)
 made = []
 for i in range(25):
     root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
@@ -2068,7 +2766,7 @@ look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 for d in (root, look):
     d.mkdir(mode=0o700)
     (d / "fixture.txt").write_text("fake")
-scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(spelled), "root": str(spelled / root.name)}, "diagnostic": {"replacement_retained": str(spelled / root.name)}}]
+scratch.survey = lambda: scratch.View([{"state": "done", "attempt": {"workspace": str(spelled), "root": str(spelled / root.name)}, "diagnostic": {"replacement_retained": str(spelled / root.name)}}], [], False)
 assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
 assert pipeline.scratch_left(spelled, [pipeline.Checkout("", "o/r", src, spelled, "main")]) == [spelled / root.name]
 assert pipeline.scratch_left(link, [lc]) == [link]
@@ -2091,11 +2789,9 @@ print("ok")
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look.mkdir(mode=0o700)
 (look / "fixture.txt").write_text("fake")
-def unreadable(strict=False):
-    if strict:
-        raise OSError("authority store unreadable")
-    return []
-scratch.records = unreadable
+def unreadable():
+    raise OSError("authority store unreadable")
+scratch.survey = unreadable
 assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
 pipeline.note_made(ws, [c])
 made = json.loads(pipeline.made_record(ws).read_text())
@@ -2111,7 +2807,7 @@ print("ok")
 
     def test_look_alike_changed_after_note_made_is_named_and_kept(self):
         self.run_body(r'''
-scratch.records = lambda strict=False: []
+scratch.survey = lambda: scratch.View([], [], False)
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look.mkdir(mode=0o700)
 (look / ".gitignore").write_text("*\n")
@@ -2132,19 +2828,19 @@ print("ok")
 root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 root.mkdir(mode=0o700)
 reads = []
-def late(strict=False):
-    reads.append(strict)
-    return [] if len(reads) == 1 else [{"state": "done", "attempt": {"workspace": str(ws), "root": str(root)}}]
-scratch.records = late
+def late():
+    reads.append(True)
+    return scratch.View([] if len(reads) == 1 else [{"state": "done", "attempt": {"workspace": str(ws), "root": str(root)}}], [], False)
+scratch.survey = late
 assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
 print("ok")
 ''')
 
     def test_unreadable_folder_inside_a_look_alike_keeps_the_workspace(self):
         self.run_body(r'''
-scratch.records = lambda strict=False: []
+scratch.survey = lambda: scratch.View([], [], False)
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
-locked = look / "locked"
+locked =look / "locked"
 locked.mkdir(parents=True)
 locked.chmod(0)
 try:
@@ -2160,6 +2856,49 @@ assert locked.is_dir()
 print("ok")
 ''')
 
+    def test_truncated_record_is_named(self):
+        if not (sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0):
+            self.skipTest("needs macOS confinement")
+        self.run_body(r'''
+import contextlib, io
+from arete import heartbeat
+scratch.holders = lambda *a, **k: []
+run_dir = t / "runs" / "run-a"
+run_dir.mkdir(parents=True)
+scratch.RUN_BASELINES["run-a"] = {}
+a = scratch.make("run-a", "verify", ws, run_dir)
+scratch.end(a, run_dir)
+record = scratch.AUTHORITY / (a.selector + ".json")
+raw = record.read_bytes()
+record.write_bytes(raw[: len(raw) // 2])
+other = t / "worktrees" / "other"
+other.mkdir()
+try:
+    pipeline.kept_or_cleared(other, [pipeline.Checkout("", "o/r", src, other, "main")], src, [], "branch")
+    raise SystemExit("kept a workspace beside an unreadable record")
+except pipeline.RunFailed as e:
+    assert str(record) in e.why, e.why
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    pipeline.retry_scratch(30)
+assert str(record) in out.getvalue(), out.getvalue()
+checks = heartbeat.check_scratch()
+assert any(not c.ok and str(record) in c.detail for c in checks), checks
+print("ok")
+''')
+
+    def test_no_store_frees_look_alikes(self):
+        self.run_body(r'''
+from arete import pi
+look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
+look.mkdir(mode=0o700)
+pi.can_confine = lambda *a, **k: False
+assert pipeline.scratch_left(ws, [c]) == [], pipeline.scratch_left(ws, [c])
+pi.can_confine = lambda *a, **k: True
+assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
+print("ok")
+''')
+
     def test_cleanup_removes_only_stale_folders_with_no_file_and_no_recorded_root(self):
         self.run_body(r'''
 empty, recorded, full = (paths.WORKTREES_DIR / n for n in ("empty", "recorded", "full"))
@@ -2167,7 +2906,7 @@ look, root, kept = (d / (paths.SCRATCH_PREFIX + secrets.token_hex(8)) for d in (
 for d in (look, root, kept):
     d.mkdir(parents=True)
 (kept / "fixture.txt").write_text("fake")
-scratch.records = lambda strict=False: [{"state": "done", "attempt": {"workspace": str(recorded), "root": str(root)}}]
+scratch.survey = lambda: scratch.View([{"state": "done", "attempt": {"workspace": str(recorded), "root": str(root)}}], [], False)
 old = time.time() - 8 * 86400
 for d in (empty, recorded, full):
     os.utime(d, (old, old))
@@ -2305,6 +3044,483 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
         self.assertEqual(r["raised"]["code"], 0, shown)
         self.assertNotIn("codex_headroom", r["plain_design"], shown)
         self.assertNotIn("codex", r["search_dry"]["out"], shown)
+
+
+class ExperimentLineageTests(unittest.TestCase):
+    slow = True
+    SCRIPT = r'''
+import contextlib, importlib.util, io, json, shutil, sys
+from pathlib import Path
+from unittest import mock
+from arete import cli, evals, experiment, optimize, paths, record, state, util
+root, mode = Path(sys.argv[1]), sys.argv[2]
+if importlib.util.find_spec("arete.scratch"):
+    from arete import scratch
+    probe = [sys.executable, "-V"]
+    if scratch.protected_command(probe) != probe:
+        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.main(list(argv))
+    return {"code": code, "out": out.getvalue(), "err": err.getvalue()}
+def expect(result, code, words=""):
+    assert result["code"] == code, result
+    assert words in result["out"] + result["err"], result
+paths.CONFIG_FILE.write_text("\n".join(optimize.sample(root / "sample")) + "\n")
+expect(call("prices", "import", str(root / "sample/prices.json")), 0)
+shutil.copytree(paths.PROMPTS_DIR, root / "tuned")
+head = util.git(["rev-parse", "HEAD"], root / "sample/repo").strip()
+manifest, result = root / "manifest.toml", root / "results.jsonl"
+manifest.write_text(f"""
+name = "lineage"
+repo = "replay-sample"
+atom = "build"
+repeats = 2
+[arms.baseline]
+model = "scratch-a"
+[arms.stronger]
+model = "scratch-b"
+prompts = "{root / 'tuned'}"
+[tasks.word-validation]
+base = "{head}"
+split = "validation"
+[accept]
+baseline = "baseline"
+[limits]
+spend_usd = 5
+minutes = 60
+calls = 2000
+tokens = 5000000
+""")
+build = root / "tuned/build.md"
+original = build.read_bytes()
+marker = b"\nLINEAGE_MARKER_264\n"
+def run():
+    return call("experiment", "run", str(manifest), "--out", str(result))
+def rows(event):
+    return [e for e in experiment.events(result) if e["event"] == event]
+def clean():
+    expect(run(), 0)
+    trials = rows("trial")
+    design = rows("manifest")[0]["design"]
+    assert len([t for t in trials if t["status"] == "done"]) == 4, trials
+    assert all(t["fingerprints"] == design["arms"][t["arm"]]["fingerprints"]
+               for t in trials if t["status"] == "done"), trials
+    assert all(t["engine"] == design["engine"] for t in trials if t["status"] == "done")
+    assert experiment.summary(result)["pairs"]["validation"][0]["pairs"] == 2
+    assert all("engine" in e for e in rows("manifest") + rows("session"))
+    expect(run(), 0, "4 of 4 trials already done")
+if mode == "between":
+    real = experiment.run_trial
+    def mutate(*args, **kw):
+        why = real(*args, **kw)
+        if len(rows("trial")) == 1:
+            build.write_bytes(original + marker)
+        return why
+    with mock.patch.object(experiment, "run_trial", mutate):
+        expect(run(), 3, "prompt changed since the design")
+    assert [(t["arm"], t["repeat"], t["status"]) for t in rows("trial")] == [("baseline", 1, "done")]
+    assert not any(e["arm"] == "stronger" for e in rows("start"))
+    assert "prompt" in rows("stop")[-1]["why"]
+    expect(run(), 1, "the design changed")
+    assert len(rows("trial")) == 1
+    build.write_bytes(original)
+    clean()
+elif mode == "during":
+    real = evals.run_task
+    def mutate(*args, **kw):
+        if kw["run"].trial.startswith("stronger-"):
+            build.write_bytes(original + marker)
+        return real(*args, **kw)
+    with mock.patch.object(evals, "run_task", mutate):
+        expect(run(), 3, "prompt changed since the design")
+    trial = next(t for t in rows("trial") if t["arm"] == "stronger")
+    assert trial["status"] == "drifted" and not trial["accepted"], trial
+    assert "prompt" in trial["drift"], trial
+    assert state.run_get(trial["run"])["status"] == "stopped"
+    assert trial["fingerprints"]["prompt"] != rows("manifest")[0]["design"]["arms"]["stronger"]["fingerprints"]["prompt"]
+    headers = [experiment.framed(f)[0] for f in record.record_files(trial["run"])]
+    assert any(marker.decode().strip() in h.get("prompt", "") for h in headers if h.get("atom") == "build"), headers
+    summary = experiment.summary(result)
+    assert summary["arms"]["stronger"]["done"] == 0 and summary["drifted"] == 1, summary
+    assert summary["pairs"]["validation"][0]["pairs"] == 0
+    expect(call("experiment", "summary", str(result)), 0, "1 drifted trial left out")
+    total = experiment.totals_of(experiment.events(result))
+    assert trial["calls"] > 0 and total.calls == sum(t["calls"] for t in rows("trial"))
+    assert total.tokens == sum(t["tokens_in"] + t["tokens_out"] for t in rows("trial"))
+    build.write_bytes(original)
+    clean()
+    assert len([t for t in rows("trial") if t["arm"] == "baseline" and t["repeat"] == 1]) == 1
+    assert [t["attempt"] for t in rows("trial") if t["arm"] == "stronger" and t["repeat"] == 1] == [1, 2]
+elif mode == "versions":
+    package = root / "package"
+    shutil.copytree(paths.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    def change(file):
+        before = experiment.engine_code(package)
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes((file.read_bytes() if file.exists() else b"") + b"\nchanged\n")
+        return before != experiment.engine_code(package)
+    assert change(package / "pipeline.py")
+    assert change(package / "lineage.mjs")
+    assert change(package / "prompts/build.md")
+    assert not change(package / "web/lineage.js")
+    assert not change(package / "__pycache__/ignored.py")
+    clean()
+    expect(call("experiment", "summary", str(result), "--json"), 0, '"drifted": 0')
+    with mock.patch.object(experiment, "engine_code", return_value="another engine"):
+        expect(run(), 1, "the design changed")
+    prices = root / "sample/prices.json"
+    changed = json.loads(prices.read_text())
+    changed["routes"][0]["rates"][0]["input"] += 1
+    other = root / "other-prices.json"
+    other.write_text(json.dumps(changed))
+    expect(call("prices", "import", str(other)), 0)
+    expect(run(), 1, "the design changed")
+    assert len(rows("trial")) == 4
+    expect(call("prices", "import", str(prices)), 0)
+    clean()
+elif mode == "boundaries":
+    exp = experiment.load(manifest)
+    layer_file = exp.layer.config_file
+    layer_bytes = layer_file.read_bytes()
+    layer_file.write_text("[invalid")
+    assert "context" in experiment.drift(exp, "stronger", experiment.observed(exp, "stronger"))
+    layer_file.write_bytes(layer_bytes)
+    grade_dir = root / "grade-prompts"
+    shutil.copytree(paths.PROMPTS_DIR, grade_dir)
+    (grade_dir / "grade.md").write_text("changed grader")
+    with mock.patch.object(paths, "PROMPTS_DIR", grade_dir):
+        assert "grader" in experiment.drift(exp, "stronger", experiment.observed(exp, "stronger"))
+    before = paths.CONFIG_FILE.read_text()
+    paths.CONFIG_FILE.write_text(before + '\n[pricing]\nlocal_providers = ["scratch"]\n')
+    assert experiment.load(manifest).digest != exp.digest
+    paths.CONFIG_FILE.write_text(before)
+    for key in ("context", "grader", "prices"):
+        result = root / f"{key}.jsonl"
+        real = experiment.run_trial
+        prompt_dir = paths.PROMPTS_DIR
+        price_file = root / "sample/prices.json"
+        def boundary(*args, **kw):
+            why = real(*args, **kw)
+            if key == "context":
+                layer_file.write_text("[invalid")
+            elif key == "grader":
+                paths.PROMPTS_DIR = grade_dir
+            else:
+                changed = json.loads(price_file.read_text())
+                changed["routes"][0]["rates"][0]["input"] += 1
+                other = root / "boundary-prices.json"
+                other.write_text(json.dumps(changed))
+                expect(call("prices", "import", str(other)), 0)
+            return why
+        try:
+            with mock.patch.object(experiment, "run_trial", boundary):
+                expect(run(), 3, f"the {key} changed")
+        finally:
+            layer_file.write_bytes(layer_bytes)
+            paths.PROMPTS_DIR = prompt_dir
+            expect(call("prices", "import", str(price_file)), 0)
+        assert len(rows("start")) == len(rows("trial")) == 1
+    result = root / "interrupted.jsonl"
+    real = evals.run_task
+    def interrupt(*args, **kw):
+        outcome = real(*args, **kw)
+        if kw["run"].trial.startswith("stronger-"):
+            build.write_bytes(original + marker)
+            raise KeyboardInterrupt
+        return outcome
+    with mock.patch.object(evals, "run_task", interrupt):
+        expect(run(), 130)
+    first = rows("trial")[-1]
+    assert first["status"] == "interrupted"
+    assert first["fingerprints"] == rows("start")[-1]["seen"]["fingerprints"]
+    result = root / "recovered.jsonl"
+    begun = [e for e in experiment.events(root / "interrupted.jsonl") if e["event"] == "start"][-1]
+    experiment.append(result, begun)
+    exp.design["arms"]["stronger"]["fingerprints"]["prompt"] = "changed design"
+    experiment.settle_interrupted(exp, result)
+    recovered = rows("trial")[0]
+    assert recovered["fingerprints"] == begun["seen"]["fingerprints"]
+    assert recovered["engine"] == begun["seen"]["engine"] and recovered["calls"] == first["calls"] > 0
+    assert not experiment.completed(experiment.events(result))
+print("LINEAGE_OK")
+'''
+
+    def scenario(self, mode):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), mode], cwd=root, env=env,
+                                  text=True, capture_output=True, timeout=600, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertIn("LINEAGE_OK", done.stdout)
+
+    def test_a_prompt_changed_between_trials_stops_before_the_next_trial(self):
+        self.scenario("between")
+
+    def test_a_prompt_changed_during_a_trial_is_drifted_and_left_out(self):
+        self.scenario("during")
+
+    def test_a_resume_after_an_engine_or_price_change_is_refused(self):
+        self.scenario("versions")
+
+    def test_boundary_changes_and_interrupted_observations_are_retained(self):
+        self.scenario("boundaries")
+
+
+class EvalLineageTests(unittest.TestCase):
+    slow = True
+
+    def script(self, body):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "home", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"), GIT_CONFIG_NOSYSTEM="1",
+                       GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+                       GIT_CONFIG_VALUE_0=os.devnull)
+            prefix = r'''
+import contextlib, io, json, os, shutil, sqlite3, sys
+from pathlib import Path
+from arete import board, codebase, config, evals, experiment, optimize, paths, scratch, state, util
+root = Path(sys.argv[1])
+probe = [sys.executable, "-V"]
+if scratch.protected_command(probe) != probe:
+    scratch.AUTHORITY = root / "authority-parent/verification-authority"
+paths.ensure_dirs()
+def sample():
+    text = "\n".join(optimize.sample(root / "sample"))
+    paths.CONFIG_FILE.write_text(text.replace("[models]", '[models]\nbuild = "scratch-a"'))
+    replies = root / "sample/replay"
+    for n in (2, 3):
+        for name in ("plan.json", "build.json", "build.patch"):
+            p = Path(name)
+            shutil.copyfile(replies / name, replies / f"{p.stem}{n}{p.suffix}")
+    return replies
+def call(*args, **kwargs):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = evals.run("replay-sample", *args, **kwargs)
+    return code, out.getvalue()
+def latest():
+    with state.db() as c:
+        return c.execute("SELECT run_id FROM evals WHERE repo = 'replay-sample' ORDER BY rowid DESC").fetchone()[0]
+'''
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + prefix + body
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env,
+                                  text=True, capture_output=True, timeout=600, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            return json.loads(output)
+
+    def test_replay_lineage_regression_compare_and_step_ranges(self):
+        r = self.script(r'''
+replies = sample()
+head = util.git(["rev-parse", "HEAD"], root / "sample/repo").strip()
+rows = []
+for _ in range(3):
+    code, out = call("word-train")
+    row = state.eval_rows(latest())[0]
+    assert row["passed"] and row["base_commit"] == head, (row, out)
+    assert head[:12] in out, out
+    with state.db() as c:
+        engine = c.execute("SELECT engine_sha FROM runs WHERE id = ?", (row["run_id"],)).fetchone()[0]
+    assert row["engine_sha"] == engine == codebase.STAMP
+    assert row["prompts_from"] == ""
+    rows.append(row)
+assert len({r["prompts_sha"] for r in rows}) == 1
+assert {json.loads(r["settings"])["models"]["build"] for r in rows} == {"scratch-a"}
+with state.db() as c:
+    c.execute("UPDATE evals SET context_sha = 'older harness' WHERE source = 'worktree'")
+comparison = evals.compare("replay-sample", "main")
+assert "since that run" not in comparison.splitlines()[0], comparison
+with state.db() as c:
+    for row in rows:
+        c.execute("UPDATE evals SET context_sha = ? WHERE run_id = ?", (row["context_sha"], row["run_id"]))
+text = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text(text.replace('build = "scratch-a"', 'build = "scratch-b"'))
+comparison = evals.compare("replay-sample", "main")
+assert "build model scratch-a to scratch-b" in comparison.splitlines()[0], comparison
+assert "harness" not in comparison.splitlines()[0], comparison
+folder = root / "edited"
+shutil.copytree(paths.PROMPTS_DIR, folder)
+with (folder / "build.md").open("a") as f:
+    f.write("\nAn edited builder prompt.\n")
+(replies / "build.patch").unlink()
+code, out = call("word-train", prompts=evals.Prompts(folder, "edited"))
+fourth = state.eval_rows(latest())[0]
+md = (paths.RUNS_DIR / latest() / "results.md").read_text()
+assert not fourth["passed"], (fourth, out)
+for phrase in ("REGRESSED", "build model scratch-a to scratch-b", "prompts"):
+    assert phrase in out and phrase in md, (out, md)
+assert fourth["prompts_from"] == str(folder)
+assert fourth["prompts_sha"] != rows[0]["prompts_sha"]
+assert json.loads(fourth["settings"])["models"]["build"] == "scratch-b"
+assert fourth["engine_sha"] == codebase.STAMP and fourth["base_commit"] == head
+assert evals.lineage_changes(fourth, fourth) == []
+assert evals.lineage_changes(fourth, {**fourth, "context_sha": "different"}, skip=("harness",)) == []
+paths.CONFIG_FILE.write_text(text)
+code, out = call("word-train")
+assert "nothing recorded changed" in out, out
+shutil.copyfile(replies / "build2.patch", replies / "build.patch")
+code, out = call()
+run_id = latest()
+suite = state.eval_rows(run_id)
+assert len(suite) == 3 and all(r["passed"] for r in suite), (suite, out)
+with state.db() as c:
+    steps = [dict(s) for s in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
+covered = []
+for row in suite:
+    own = [s for s in steps if row["after_step"] < s["id"] <= row["last_step"]]
+    assert {s["step"] for s in own} >= {"plan", "build"}, own
+    assert [s["step"] for s in own][:2] == ["plan", "build"], own
+    covered.extend(s["id"] for s in own)
+assert len(covered) == len(set(covered)) and sorted(covered) == [s["id"] for s in steps]
+try:
+    state.add_eval(run_id, suite[0]["repo"], suite[0]["task"], False, 0, 0)
+except sqlite3.IntegrityError:
+    pass
+else:
+    raise AssertionError("duplicate eval accepted")
+assert state.eval_rows(run_id) == suite
+history = state.eval_history("replay-sample")
+code, out = call("word-train", dry_run=True)
+assert "word-train" in out and state.eval_history("replay-sample") == history
+assert state.last_step_id(run_id) == steps[-1]["id"]
+print("BEHAVIOR_RESULT=" + json.dumps({"tasks": len(suite), "regression": md}))
+''')
+        self.assertEqual(r["tasks"], 3)
+        self.assertIn("REGRESSED", r["regression"])
+
+    def test_legacy_migration_and_explanations(self):
+        r = self.script(r'''
+with sqlite3.connect(paths.DB_FILE) as c:
+    c.execute("CREATE TABLE evals (run_id TEXT, repo TEXT, task TEXT, passed INTEGER, seconds REAL, "
+              "cost_usd REAL, ts TEXT, source TEXT DEFAULT '')")
+    for n in range(2):
+        c.execute("INSERT INTO evals VALUES (?, 'replay-sample', 'word-train', 1, 2, 3, ?, 'worktree')",
+                  (f"old-{n}", f"2020-01-0{n + 1}"))
+for _ in range(2):
+    with state.db() as c:
+        columns = {r[1] for r in c.execute("PRAGMA table_info(evals)")}
+        assert set(state.EVAL_LINEAGE) <= columns
+        assert "evals_key" in {r[1] for r in c.execute("PRAGMA index_list(evals)")}
+        old = [dict(r) for r in c.execute("SELECT * FROM evals")]
+        assert len(old) == 2
+        for row in old:
+            assert [row[k] for k in state.EVAL_LINEAGE] == [""] * 6 + [0, 0], row
+            assert row["passed"] == 1 and row["seconds"] == 2 and row["cost_usd"] == 3
+replies = sample()
+state.add_eval("old-2", "replay-sample", "word-train", True, 0, 0, "worktree")
+with state.db() as c:
+    c.execute("UPDATE evals SET ts = '2020-01-03' WHERE run_id = 'old-2'")
+comparison = evals.compare("replay-sample", "main")
+assert "the baseline predates lineage" in comparison, comparison
+(replies / "build.patch").unlink()
+code, out = call("word-train")
+assert "REGRESSED: the last pass predates lineage" in out, out
+print("BEHAVIOR_RESULT=" + json.dumps({"columns": sorted(columns)}))
+''')
+        self.assertIn("context_sha", r["columns"])
+
+    def test_board_uses_only_baselines(self):
+        r = self.script(r'''
+state.add_eval("a", "mixed", "one", True, 0, 0, "worktree")
+state.add_eval("b", "mixed", "two", False, 0, 0, "worktree with prompts edited")
+state.add_eval("c", "prompt-only", "three", False, 0, 0, "worktree with prompts edited")
+rows = board.trend_figures()["evals"]
+assert len(rows) == 1 and rows[0]["repo"] == "mixed", rows
+print("BEHAVIOR_RESULT=" + json.dumps(rows[0]))
+''')
+        self.assertEqual((r["pass_rate"], r["tasks"]), (1.0, 1))
+
+    def test_context_prompt_selection_and_early_failures(self):
+        r = self.script(r'''
+sample()
+cfg = config.load()
+repo = cfg.repo("replay-sample")
+src = evals.Source(repo)
+harness = repo.path / "CLAUDE.md"
+harness.write_text("first\n")
+link = repo.path / "AGENTS.md"
+link.symlink_to("CLAUDE.md")
+def context():
+    code, out = call("word-train")
+    row = state.eval_rows(latest())[0]
+    assert row["passed"], (row, out)
+    return row["context_sha"]
+digests = [context()]
+harness.write_text("second\n")
+digests.append(context())
+link.unlink()
+link.symlink_to("missing.md")
+digests.append(context())
+with (repo.layer / "config.toml").open("a") as f:
+    f.write("\n# changed layer\n")
+digests.append(context())
+layer = config.load_layer(repo.layer)
+layer.expertise_file.parent.mkdir(parents=True, exist_ok=True)
+layer.expertise_file.write_text("A learned fact.\n")
+digests.append(context())
+assert len(set(digests)) == len(digests), digests
+folder = root / "prompts"
+shutil.copytree(paths.PROMPTS_DIR, folder)
+p = evals.Prompts(folder, "folder")
+original = evals.prompts_digest(p)
+(folder / "review.md").write_text("unused override")
+assert evals.prompts_digest(p) == original
+with (folder / "fix.md").open("a") as f:
+    f.write("\nchanged\n")
+assert evals.prompts_digest(p) != original
+assert original == evals.prompts_digest(evals.Prompts())
+files = {p.name: p for p in paths.PROMPTS_DIR.glob("*.md")}
+assert original == util.digest(*(part for name, p in sorted(files.items()) for part in (name, p.read_bytes())))
+exported = evals.Prompts(paths.RUNS_DIR / "exported/main", "origin/main", "a" * 40)
+assert evals.prompts_from(exported) == "origin/main@aaaaaaaaaaaa exported/main"
+assert experiment.sha is util.digest
+assert experiment.sha("a", b"bc") == util.digest("a", b"bc")
+assert util.digest("a", "bc") != util.digest("ab", "c")
+assert util.digest("") != util.digest()
+table = evals.results_md("repo", "worktree", [{"passed": False, "why": "a|b", "task": "t", "seconds": 0,
+                                            "paid": 0, "regressed": True, "changed": ["build model a|b to c"]}])
+assert r"a\|b" in table and r"build model a\|b to c" in table, table
+task = evals.Task("no-check", "No check", "Nothing")
+result = evals.run_task(cfg, repo, src, task, "early", False, evals.Prompts())
+assert [result[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
+task = evals.Task("bad-base", "Bad base", "Nothing", check="true", base="does-not-exist")
+result = evals.run_task(cfg, repo, src, task, "bad-base", False, evals.Prompts())
+assert [result[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
+with (repo.layer / "config.toml").open("a") as f:
+    f.write('\n[setup]\ncommands = ["false"]\n')
+task = evals.Task("bad-setup", "Bad setup", "Nothing", check="true")
+result = evals.run_task(cfg, repo, src, task, "bad-setup", False, evals.Prompts())
+assert result["base_commit"] and result["context_sha"] == result["settings"] == "", result
+assert "setup" in result["why"], result
+(repo.layer / "evals/no-check.toml").write_text('title = "No check"\nprompt = "Nothing"\n')
+code, out = call("no-check")
+row = state.eval_rows(latest())[0]
+assert not row["passed"] and [row[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""]
+before = state.eval_history(repo.name)
+(folder / "build.md").unlink()
+code, out = call("word-train", prompts=p)
+assert code == 1 and "build.md" in out and "all need a prompt" in out, out
+assert state.eval_history(repo.name) == before
+print("BEHAVIOR_RESULT=" + json.dumps({"contexts": len(set(digests))}))
+''')
+        self.assertEqual(r["contexts"], 5)
 
 
 class OptimizeTests(unittest.TestCase):
@@ -2546,6 +3762,11 @@ r["holdout"] = refused(lambda: optimize.score_holdout(s, folder, champion))
 r["resume"] = call("experiment", "optimize", str(plan))
 r["after_refusals"] = trials()
 build.write_text(original)
+engine_code = experiment.engine_code
+experiment.engine_code = lambda: "changed engine"
+r["engine"] = refused(lambda: optimize.play(s, folder, 3, s.rounds[2], champion))
+r["after_engine"] = trials()
+experiment.engine_code = engine_code
 r["proceed"] = call("experiment", "optimize", str(plan))
 r["final"] = trials()
 print("BEHAVIOR_RESULT=" + json.dumps(r))
@@ -2565,6 +3786,8 @@ print("BEHAVIOR_RESULT=" + json.dumps(r))
         self.assertEqual(r["resume"]["code"], 1, shown)
         self.assertIn("candidate tuned changed since it was selected", r["resume"]["err"], shown)
         self.assertEqual(r["after_refusals"], r["ran"], shown)
+        self.assertIn("changed since the search began", r["engine"], shown)
+        self.assertEqual(r["after_engine"], r["ran"], shown)
         self.assertEqual(r["proceed"]["code"], 0, shown)
         self.assertIn("holdout (scored once): tuned", r["proceed"]["out"], shown)
         self.assertGreater(r["final"], r["ran"], shown)
@@ -2856,6 +4079,1071 @@ print("RECOVERY_OK")
         self.run_modes("race")
 
 
+class IntakeTests(unittest.TestCase):
+    PRELUDE = r'''
+import hashlib, hmac, json, os, signal, sqlite3, sys, threading, urllib.error, urllib.request
+from datetime import timedelta
+from pathlib import Path
+from arete import config, dashboard, hooks, loops, paths, serve, sources, state, util
+root = Path(os.environ["INTAKE_ROOT"])
+rows = root / "rows.jsonl"
+def make_loop(name="intake", trigger="", webhook=False):
+    folder = paths.CONFIG_DIR / "loops" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "loop.toml").write_text(
+        'kind = "command"\n[run]\ncommand = "true"\n[trigger]\n' + ("webhook = true\n" if webhook else "") + trigger +
+        f'[[source]]\ntype = "command"\ncommand = ["cat", "{rows}"]\nevery = "1m"\n')
+    return next(x for x in loops.load_all() if x.name == name)
+def write_rows(*items):
+    rows.write_text("".join(json.dumps(i) + "\n" for i in items))
+def issue(key, data=None):
+    return {"key": key, "title": f"issue {key}", "data": data or {"number": key}}
+def snap(sid="intake#0"):
+    with state.db() as c:
+        out = {t: c.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("seen", "events", "queue")}
+        out["queue_rows"] = [{"grp": r["grp"], "keys": [e["key"] for e in json.loads(r["payload"])]}
+                             for r in c.execute("SELECT grp, payload FROM queue ORDER BY id")]
+        cur = c.execute("SELECT value, ok, detail FROM cursors WHERE source = ?", (sid,)).fetchone()
+        out["cursor"] = dict(cur) if cur else None
+        owner = c.execute("SELECT fingerprint FROM source_owners WHERE source = ?", (sid,)).fetchone()
+        out["owner"] = owner[0] if owner else None
+    return out
+def make_server():
+    server = serve.Server()
+    server.lines, server.ended = [], threading.Event()
+    server.say = server.lines.append
+    original = server.poll_ended
+    def ended(sid, done):
+        original(sid, done)
+        server.ended.set()
+    server.poll_ended = ended
+    return server
+def poll(server, loop, sid="intake#0"):
+    server.tried.clear()
+    server.ended.clear()
+    server.poll(loop)
+    future = server.polls[sid]
+    error = future.exception(timeout=30)
+    assert server.ended.wait(30)
+    return error
+def failing_once(real):
+    left = [1]
+    def flaky(*a, **k):
+        if left:
+            left.pop()
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **k)
+    return flaky
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def web():
+    node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    owner = type("Owner", (), {"of": lambda self, address: "me@example.com"})()
+    server = dashboard.Server("127.0.0.1", 0, node, owner, False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+def post(server, name, body, headers):
+    request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/hook/{name}", data=body,
+                                     headers=headers, method="POST")
+    try:
+        got = OPENER.open(request, timeout=30)
+    except urllib.error.HTTPError as e:
+        got = e
+    with got:
+        return got.code, json.loads(got.read() or b"{}")
+def signed(name, body, delivery):
+    key = hooks.secret(name)
+    return {"X-GitHub-Delivery": delivery,
+            "X-Hub-Signature-256": "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()}
+def token(name, **more):
+    return {"X-Arete-Token": hooks.secret(name), **more}
+def finish(result):
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+'''
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for folder in ("home", "config", "state", "logs", "tmp"):
+            (self.root / folder).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+        self.env.update(HOME=str(self.root / "home"), ARETE_CONFIG_DIR=str(self.root / "config"),
+                        ARETE_STATE_DIR=str(self.root / "state"), ARETE_LOG_DIR=str(self.root / "logs"),
+                        TMPDIR=str(self.root / "tmp"), INTAKE_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull)
+
+    def run_script(self, body):
+        code = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+        done = subprocess.run([sys.executable, "-I", "-c", code], cwd=self.root, env=self.env, text=True,
+                              capture_output=True, timeout=300, check=False)
+        output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                       if line.startswith("BEHAVIOR_RESULT=")), None)
+        return done, json.loads(output) if output else None
+
+    def result(self, body):
+        done, found = self.run_script(body)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIsNotNone(found, done.stdout + done.stderr)
+        return found
+
+    BASELINE = '''
+loop = make_loop()
+write_rows()
+server = make_server()
+poll(server, loop)
+'''
+    THREE = 'write_rows(issue("a"), issue("b"), issue("c"))\n'
+
+    def test_a_poll_that_fails_before_queueing_keeps_its_events_for_the_next_try(self):
+        found = self.result(self.BASELINE + self.THREE + '''
+base = snap()
+state.enqueue = failing_once(state.enqueue)
+error = poll(server, loop)
+failed = snap()
+lines = list(server.lines)
+poll(server, loop)
+healed = snap()
+poll(server, loop)
+finish({"base": base, "failed": failed, "lines": lines, "healed": healed, "third": snap(),
+        "error": repr(error)})
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual((found["base"]["seen"], found["base"]["cursor"]["ok"]), (0, 1), shown)
+        self.assertEqual(found["error"], "None", shown)
+        failed = found["failed"]
+        self.assertEqual((failed["seen"], failed["events"], failed["queue"]), (0, 0, 0), shown)
+        self.assertEqual(failed["cursor"]["ok"], 0, shown)
+        self.assertIn("database is locked", failed["cursor"]["detail"], shown)
+        self.assertEqual(failed["cursor"]["value"], found["base"]["cursor"]["value"], shown)
+        self.assertEqual(failed["owner"], found["base"]["owner"], shown)
+        self.assertEqual(len([line for line in found["lines"] if "poll failed" in line]), 1, shown)
+        failure = next(line for line in found["lines"] if "poll failed" in line)
+        self.assertIn("intake#0: poll failed: OperationalError: database is locked", failure, shown)
+        healed = found["healed"]
+        self.assertEqual((healed["seen"], healed["events"], healed["queue"]), (3, 3, 1), shown)
+        self.assertEqual(healed["queue_rows"], [{"grp": "", "keys": ["a", "b", "c"]}], shown)
+        self.assertEqual(healed["cursor"]["ok"], 1, shown)
+        self.assertEqual(found["third"]["queue_rows"], healed["queue_rows"], shown)
+        self.assertEqual(found["third"]["events"], 3, shown)
+
+    def test_a_kill_inside_the_intake_transaction_loses_nothing(self):
+        self.result(self.BASELINE + 'finish({})\n')
+        done, _ = self.run_script('''
+loop = make_loop()
+''' + self.THREE + '''
+real = state.add_event
+def dies(*a, **k):
+    real(*a, **k)
+    os.kill(os.getpid(), signal.SIGKILL)
+state.add_event = dies
+server = make_server()
+server.poll(loop)
+server.polls["intake#0"].result(timeout=60)
+''')
+        self.assertEqual(done.returncode, -9, done.stdout + done.stderr)
+        after = self.result('finish(snap())\n')
+        shown = json.dumps(after, indent=1)
+        self.assertEqual((after["seen"], after["events"], after["queue"]), (0, 0, 0), shown)
+        self.assertEqual(after["cursor"]["detail"], "0 read, 0 new (baseline)", shown)
+        self.assertIsNotNone(after["owner"], shown)
+        again = self.result('''
+loop = make_loop()
+server = make_server()
+poll(server, loop)
+first = snap()
+poll(server, loop)
+finish({"first": first, "second": snap()})
+''')
+        self.assertEqual(again["first"]["queue_rows"], [{"grp": "", "keys": ["a", "b", "c"]}], str(again))
+        self.assertEqual(again["second"]["queue_rows"], again["first"]["queue_rows"], str(again))
+        self.assertEqual(again["second"]["events"], 3, str(again))
+
+    def test_an_error_while_reporting_a_failed_poll_is_still_said(self):
+        found = self.result(self.BASELINE + self.THREE + '''
+def no_enqueue(*a, **k):
+    raise sqlite3.OperationalError("enqueue is locked")
+def no_cursor(*a, **k):
+    raise sqlite3.OperationalError("cursor is locked")
+state.enqueue, state.set_cursor = no_enqueue, no_cursor
+error = poll(server, loop)
+finish({"error": str(error), "lines": server.lines})
+''')
+        self.assertEqual(found["error"], "cursor is locked", str(found))
+        failures = [line for line in found["lines"] if "poll failed" in line]
+        self.assertEqual(len(failures), 1, str(found))
+        self.assertIn("intake#0: poll failed: OperationalError: cursor is locked", failures[0], str(found))
+
+    def test_a_row_the_loop_cannot_group_does_not_stop_the_batch(self):
+        found = self.result('''
+loop = make_loop(trigger='group = "team"\\n')
+write_rows()
+server = make_server()
+poll(server, loop)
+write_rows(issue("one", {"team": "x"}), issue("two", ["x"]), issue("three", {"team": "y"}))
+poll(server, loop)
+finish({"snap": snap(), "lines": server.lines})
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual(found["snap"]["queue_rows"], [{"grp": "x", "keys": ["one"]}, {"grp": "", "keys": ["two"]},
+                                                       {"grp": "y", "keys": ["three"]}], shown)
+        self.assertEqual(found["snap"]["cursor"]["ok"], 1, shown)
+        self.assertFalse([line for line in found["lines"] if "poll failed" in line], shown)
+
+    def test_a_webhook_whose_fire_fails_queues_on_redelivery(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+body = b'{"title": "hello"}'
+state.enqueue = failing_once(state.enqueue)
+server = web()
+try:
+    out = []
+    for _ in range(3):
+        out.append(post(server, "intake", body, signed("intake", body, "abc")))
+        out.append(snap())
+finally:
+    server.shutdown()
+    server.server_close()
+finish(out)
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual([found[0][0], found[2][0], found[4][0]], [500, 202, 200], shown)
+        self.assertEqual(found[4][1]["why"], "already received", shown)
+        self.assertEqual((found[1]["seen"], found[1]["events"], found[1]["queue"]), (0, 0, 0), shown)
+        for later in (found[3], found[5]):
+            self.assertEqual((later["seen"], later["events"], later["queue"]), (1, 1, 1), shown)
+            self.assertEqual(later["queue_rows"], [{"grp": "", "keys": ["abc"]}], shown)
+
+    def test_concurrent_deliveries_of_one_id_queue_once(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+hooks.secret("intake")
+server = web()
+body = b'{"title": "race"}'
+codes = []
+try:
+    for n in range(50):
+        gate, got = threading.Barrier(2), []
+        headers = signed("intake", body, f"id-{n}")
+        def send():
+            gate.wait(30)
+            got.append(post(server, "intake", body, headers)[0])
+        threads = [threading.Thread(target=send) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        codes.append(sorted(got))
+finally:
+    server.shutdown()
+    server.server_close()
+finish({"codes": codes, "snap": snap()})
+''')
+        self.assertEqual(found["codes"], [[200, 202]] * 50)
+        self.assertEqual(found["snap"]["queue"], 50)
+        self.assertEqual(sorted(r["keys"][0] for r in found["snap"]["queue_rows"]),
+                         sorted(f"id-{n}" for n in range(50)))
+
+    def test_a_post_with_no_delivery_id_counts_once_per_ten_minutes_by_its_body(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+a, b = b'{"title": "a"}', b'{"title": "b"}'
+source = "intake#webhook"
+def age(key):
+    with state.db() as c:
+        c.execute("UPDATE seen SET ts = ? WHERE source = ? AND key = ?",
+                  (util.iso(util.now() - timedelta(minutes=11)), source, key))
+server = web()
+try:
+    out = {}
+    out["a"] = [post(server, "intake", a, token("intake")) for _ in range(2)]
+    out["b"] = post(server, "intake", b, token("intake"))
+    key = out["a"][0][1]["key"]
+    age(key)
+    out["a_aged"] = [post(server, "intake", a, token("intake")) for _ in range(2)]
+    out["id"] = [post(server, "intake", a, token("intake", **{"X-Request-Id": "req-1"}))[0]]
+    age("req-1")
+    out["id"].append(post(server, "intake", a, token("intake", **{"X-Request-Id": "req-1"}))[0])
+    out["bare"] = [post(server, "intake", a, token("intake", **{"X-Request-Id": "sha256:feed"}))[0]]
+    age("sha256:feed")
+    out["bare"].append(post(server, "intake", a, token("intake", **{"X-Request-Id": "sha256:feed"}))[0])
+    out["expected"] = "sha256:" + hashlib.sha256(a).hexdigest()
+    out["snap"] = snap()
+finally:
+    server.shutdown()
+    server.server_close()
+finish(out)
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual([r[0] for r in found["a"]], [202, 200], shown)
+        self.assertEqual(found["a"][0][1]["key"], found["expected"], shown)
+        self.assertEqual(found["b"][0], 202, shown)
+        self.assertEqual([r[0] for r in found["a_aged"]], [202, 200], shown)
+        self.assertEqual(found["id"], [202, 200], shown)
+        self.assertEqual(found["bare"], [202, 200], shown)
+        keys = [r["keys"][0] for r in found["snap"]["queue_rows"]]
+        self.assertEqual(keys.count(found["expected"]), 2, shown)
+        self.assertEqual(sorted(keys), sorted([found["expected"]] * 2 + [found["b"][1]["key"], "req-1", "sha256:feed"]),
+                         shown)
+
+    def test_a_refused_post_leaves_nothing_and_a_plain_fire_still_coalesces(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+hooks.secret("intake")
+server = web()
+try:
+    refused = post(server, "intake", b"{}", {"X-Arete-Token": "wrong"})[0]
+finally:
+    server.shutdown()
+    server.server_close()
+after_refusal = snap()
+sources.fire(loop, "manual")
+sources.fire(loop, "manual")
+finish({"refused": refused, "after_refusal": after_refusal, "snap": snap()})
+''')
+        self.assertEqual(found["refused"], 403, str(found))
+        self.assertEqual([found["after_refusal"][t] for t in ("seen", "events", "queue")], [0, 0, 0], str(found))
+        self.assertEqual(found["snap"]["queue_rows"], [{"grp": "", "keys": []}], str(found))
+
+
+class SourceIdentityTests(unittest.TestCase):
+    SCRIPT = r'''
+import contextlib, hashlib, io, json, os, sys, threading
+from datetime import timedelta
+from pathlib import Path
+from unittest import mock
+from arete import config, jira, loops, paths, serve, sources, state, util
+root = Path(os.environ["IDENT_ROOT"])
+cfg = config.load()
+server = serve.Server()
+returned = []
+real_poll = sources.poll
+def recording(*a, **k):
+    got = real_poll(*a, **k)
+    returned.append(got)
+    return got
+sources.poll = recording
+out = {}
+def block(target, **more):
+    lines = ["[[source]]", 'type = "command"', "command = " + json.dumps(["cat", str(target)])]
+    return "\n".join(lines + [f"{k} = {v}" for k, v in more.items()]) + "\n"
+def load(name, *blocks):
+    folder = paths.CONFIG_DIR / "loops" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "loop.toml").write_text('kind = "command"\n[run]\ncommand = "true"\n' + "".join(blocks))
+    return loops.load(folder, "private", "", cfg)
+def write(path, *rows):
+    Path(path).write_text("".join(json.dumps(r) + "\n" for r in rows))
+def row(key, at=None):
+    return {"key": key, "title": key, "data": {"at": at} if at else {}}
+def poll(loop, index=0):
+    returned.clear()
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        server.poll_source(loop, index)
+    events = returned[0][0] if returned else []
+    return {"ran": bool(returned), "keys": [e["key"] for e in events], "titles": [e["title"] for e in events],
+            "lines": buffer.getvalue().splitlines()}
+def sql(query, *args):
+    with state.db() as c:
+        return [tuple(r) for r in c.execute(query, args)]
+def seen(sid):
+    return sorted(r[0] for r in sql("SELECT key FROM seen WHERE source = ?", sid))
+def queued(loop):
+    return [[e["key"] for e in json.loads(r[0])] for r in sql("SELECT payload FROM queue WHERE loop = ? ORDER BY id", loop)]
+def rows_for(sid):
+    return {t: len(sql(f"SELECT 1 FROM {t} WHERE source = ?", sid)) for t in ("cursors", "seen", "source_owners")}
+def quoted(text):
+    return json.dumps(text)
+
+data = root / "plain.jsonl"
+write(data, row("p1"), row("p2"))
+loop = load("plain", block(data, timeout="60", trust=quoted("internal"), every=quoted("1m")))
+first = poll(loop)
+write(data, row("p1"), row("p2"), row("p3"))
+loop = load("plain", block(data, timeout="30", trust=quoted("owner"), every=quoted("10m")))
+edited = poll(loop)
+out["plain"] = {"first": first, "edited": edited, "again": poll(loop), "seen": seen("plain#0"),
+                "queued": queued("plain")}
+
+class Fake:
+    def __init__(self):
+        self.books = {}
+    def search(self, jql, fields, limit=50):
+        if jql not in self.books:
+            raise RuntimeError("Error in the JQL Query: " + jql)
+        return self.books[jql]
+    def browse_url(self, key):
+        return "https://jira.invalid/browse/" + key
+def ticket(key, updated):
+    return {"key": key, "fields": {"summary": key, "updated": updated, "status": {"name": "Ready"}}}
+def jira_block(jql):
+    return '[[source]]\ntype = "jira"\njql = ' + quoted(jql) + "\n"
+fake = Fake()
+with mock.patch.object(jira.Client, "from_env", lambda *a, **k: fake):
+    old = util.iso(util.now() - timedelta(days=2))
+    fake.books["status = Ready"] = [ticket("ABC-1", old)]
+    loop = load("outage", jira_block("status = Ready"))
+    base = poll(loop)
+    good, owner = state.cursor("outage#0"), state.source_owner("outage#0")
+    loop = load("outage", jira_block("status = Refused"))
+    failed = [poll(loop), poll(loop)]
+    bad, owner_after = state.cursor("outage#0"), state.source_owner("outage#0")
+    stamp = util.parse_iso(good["last_ok"])
+    after = util.iso(stamp + timedelta(seconds=30))
+    month = util.iso(stamp - timedelta(days=30))
+    fake.books["status = Fixed"] = ([ticket("ABC-1", old)] + [ticket(f"ABC-{n}", after) for n in range(2, 7)]
+                                    + [ticket("ABC-7", month)])
+    loop = load("outage", jira_block("status = Fixed"))
+    fixed = poll(loop)
+    out["outage"] = {"base": base, "failed": failed, "good": good, "bad": bad, "owner": owner,
+                     "owner_after": owner_after, "fixed": fixed,
+                     "further": poll(loop), "queued": queued("outage"), "seen": seen("outage#0")}
+
+data, other = root / "edge.jsonl", root / "edge2.jsonl"
+write(data, row("e0"))
+loop = load("edge", block(data))
+poll(loop)
+last = util.parse_iso(state.cursor("edge#0")["last_ok"])
+write(other, row("on-edge", util.iso(last - timedelta(minutes=2))),
+      row("just-before", util.iso(last - timedelta(minutes=2, seconds=1))))
+loop = load("edge", block(other))
+out["edge"] = poll(loop)
+
+data, other = root / "cmd.jsonl", root / "cmd2.jsonl"
+write(data, row("k0"))
+loop = load("cmdscope", block(data))
+poll(loop)
+write(other, row("untimed"), row("timed", util.iso()))
+loop = load("cmdscope", block(other))
+changed = poll(loop)
+out["cmdscope"] = {"changed": changed, "repeat": poll(loop), "seen": seen("cmdscope#0"), "queued": queued("cmdscope")}
+
+a, b = root / "a.jsonl", root / "b.jsonl"
+write(a, row("a1"))
+write(b, row("b1"))
+loop = load("demo", block(a, name=quoted("a")), block(b, name=quoted("b")))
+poll(loop, 0)
+poll(loop, 1)
+write(a, row("a1"), row("a5"))
+write(b, row("b1"), row("b2"))
+loop = load("demo", block(b, name=quoted("b")), block(a, name=quoted("a")))
+out["reorder"] = {"first": poll(loop, 0), "second": poll(loop, 1), "a": seen("demo#a"), "b": seen("demo#b"),
+                  "ids": [sources.source_id(loop, i) for i in range(2)], "slots": [rows_for("demo#0"), rows_for("demo#1")]}
+
+f, n = root / "f.jsonl", root / "n.jsonl"
+def adoption(name, below):
+    write(f, row("f1"), row("f2"))
+    write(n, row("n1"))
+    poll(load(name, block(f)))
+    write(f, row("f1"), row("f2"), row("f3"))
+    old_block, new_block = block(f, name=quoted("old")), block(n, name=quoted("fresh"))
+    loop = load(name, *((old_block, new_block) if below else (new_block, old_block)))
+    got = {}
+    for index in (0, 1):
+        got[sources.source_id(loop, index).split("#")[1]] = poll(loop, index)
+    return {"polls": got, "slot": rows_for(f"{name}#0"), "old_seen": seen(f"{name}#old"),
+            "fresh_seen": seen(f"{name}#fresh")}
+out["above"] = adoption("adopt", False)
+out["below"] = adoption("adoptlow", True)
+
+state.set_cursor("foreign#1", None, True, "old")
+state.claim_seen("foreign#1", ["z1"])
+solo = root / "solo.jsonl"
+write(solo, row("s1"))
+loop = load("foreign", block(solo, name=quoted("solo")))
+out["foreign"] = {"first": poll(loop), "slot": rows_for("foreign#1"), "foreign_seen": seen("foreign#1"),
+                  "solo_seen": seen("foreign#solo")}
+
+data = root / "rename.jsonl"
+write(data, row("r1"), row("r2"))
+poll(load("rename", block(data, name=quoted("old"))))
+loop = load("rename", block(data, name=quoted("new")))
+out["rename"] = {"renamed": poll(loop), "new_seen": seen("rename#new"), "old_seen": seen("rename#old")}
+
+watched = root / "watched"
+watched.mkdir()
+one, two = watched / "one.log", watched / "two.log"
+def log_block(path, pattern=None):
+    return '[[source]]\ntype = "log"\npath = ' + quoted(str(path)) + ("\npattern = " + quoted(pattern) if pattern else "") + "\n"
+one.write_text("INFO started\n")
+poll(load("logs", log_block(one)))
+with one.open("a") as handle:
+    handle.write("ERROR alpha widget exploded\n")
+two.write_text("ERROR old beta gadget\n")
+two_size = two.stat().st_size
+loop = load("logs", log_block(watched / "*.log", "ERROR"))
+scoped = poll(loop)
+offsets = json.loads(state.cursor("logs#0")["value"])
+with two.open("a") as handle:
+    handle.write("ERROR gamma sprocket fresh\n")
+out["logs"] = {"scoped": scoped, "offsets": offsets, "names": [str(one), str(two)], "two_size": two_size,
+               "later": poll(loop)}
+
+data = root / "legacy.jsonl"
+write(data, row("l1"), row("l2"))
+loop = load("legacy", block(data, timeout="60", every=quoted("1m")))
+old_owner = hashlib.sha256(json.dumps({k: v for k, v in loop.sources[0].items() if k != "every"}, sort_keys=True,
+                                      default=str).encode()).hexdigest()
+state.set_cursor("legacy#0", None, True, "1 read, 0 new")
+state.claim_seen("legacy#0", ["l1"])
+state.set_source_owner("legacy#0", old_owner)
+sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#0'")
+legacy = poll(loop)
+state.set_cursor("legacy#9", None, True, "x")
+sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#9'")
+state.set_cursor("legacy#9", None, False, "boom")
+kept = state.cursor("legacy#9")["last_ok"]
+state.ensure_schema()
+state.ensure_schema()
+out["legacy"] = {"poll": legacy, "owner": state.source_owner("legacy#0"), "kept": kept, "seen": seen("legacy#0"),
+                 "queued": queued("legacy"), "old_owner": old_owner}
+
+data = root / "legacy-edit.jsonl"
+write(data, row("a1"), row("a2"))
+old_settings = load("legacyedit", block(data, timeout="60"))
+legacy_owner = hashlib.sha256(json.dumps({k: v for k, v in old_settings.sources[0].items() if k != "every"},
+                                         sort_keys=True, default=str).encode()).hexdigest()
+state.set_cursor("legacyedit#0", None, True, "2 read, 0 new")
+state.claim_seen("legacyedit#0", ["a1", "a2"])
+state.set_source_owner("legacyedit#0", legacy_owner)
+write(data, row("a1"), row("a2"), row("a3"))
+loop = load("legacyedit", block(data, timeout="30"))
+out["legacy_edit"] = {"poll": poll(loop), "seen": seen("legacyedit#0"), "queued": queued("legacyedit")}
+
+def refused(name, *blocks):
+    try:
+        load(name, *blocks)
+    except loops.LoopError as e:
+        return str(e)
+    return None
+out["names"] = {
+    "unnamed": refused("check-one", block(a), block(b)),
+    "repeated": refused("check-two", block(a, name=quoted("x")), block(b, name=quoted("x"))),
+    "webhook": refused("check-three", block(a, name=quoted("webhook"))),
+    "metric": refused("check-four", block(a, name=quoted("metric"))),
+    "digits": refused("check-five", block(a, name=quoted("1"))),
+    "characters": refused("check-six", block(a, name=quoted("Bad Name"))),
+    "number": refused("check-seven", block(a, name="5")),
+    "single": refused("check-eight", block(a)),
+    "distinct": refused("check-nine", block(a, name=quoted("x")), block(b, name=quoted("y")))}
+
+data = root / "retry.jsonl"
+write(data, row("r1"))
+loop = load("retry", block(data))
+poll(loop)
+write(data, row("r1"), row("r2"))
+before = {"cursor": state.cursor("retry#0"), "owner": state.source_owner("retry#0")}
+real_enqueue = state.enqueue
+def broken(*args, **kwargs):
+    raise RuntimeError("queue is down")
+state.enqueue = broken
+failed = poll(loop)
+state.enqueue = real_enqueue
+after = {"cursor": state.cursor("retry#0"), "owner": state.source_owner("retry#0")}
+out["retry"] = {"failed": failed, "before": before, "after": after, "seen": seen("retry#0"),
+                "queued_after_failure": queued("retry"), "healed": poll(loop), "queued": queued("retry"),
+                "third": poll(loop)}
+
+data = root / "race.jsonl"
+write(data, row("r1"))
+loop = load("race", block(data))
+poll(loop)
+write(data, row("r1"), row("r2"))
+gate, reached = threading.Event(), threading.Event()
+real_fetch = sources.Command.fetch
+def slow(self, *args, **kwargs):
+    got = real_fetch(self, *args, **kwargs)
+    reached.set()
+    gate.wait(30)
+    return got
+sources.Command.fetch = slow
+server.tried.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    server.poll(loop)
+    reached.wait(30)
+    named = load("race", block(data, name=quoted("named")))
+    server.tried.clear()
+    server.poll(named)
+    named_started = "race#named" in server.polls
+    gate.set()
+    server.polls["race#0"].result(30)
+    sources.Command.fetch = real_fetch
+    server.tried.clear()
+    server.poll(named)
+    server.polls["race#named"].result(30)
+out["race"] = {"named_started": named_started, "queued": queued("race"), "slot": rows_for("race#0"),
+               "named_seen": seen("race#named")}
+
+server.pool.shutdown(wait=False)
+for pool in server.job_pools.values():
+    pool.shutdown(wait=False)
+print("BEHAVIOR_RESULT=" + json.dumps(out))
+'''
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for folder in ("home", "config", "state", "logs", "tmp"):
+            (self.root / folder).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+        self.env.update(HOME=str(self.root / "home"), ARETE_CONFIG_DIR=str(self.root / "config"),
+                        ARETE_STATE_DIR=str(self.root / "state"), ARETE_LOG_DIR=str(self.root / "logs"),
+                        TMPDIR=str(self.root / "tmp"), IDENT_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull)
+
+    def found(self):
+        code = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+        done = subprocess.run([sys.executable, "-I", "-c", code], cwd=self.root, env=self.env, text=True,
+                              capture_output=True, timeout=300, check=False)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                       if line.startswith("BEHAVIOR_RESULT=")), None)
+        self.assertIsNotNone(output, done.stdout + done.stderr)
+        return json.loads(output)
+
+    def said(self, got, text):
+        return [line for line in got["lines"] if text in line]
+
+    def test_a_source_keeps_its_unpolled_events_through_edits_reorders_and_new_sources(self):
+        found = self.found()
+        shown = json.dumps(found, indent=1)
+
+        plain = found["plain"]
+        self.assertTrue(self.said(plain["first"], "first read"), shown)
+        self.assertEqual(plain["edited"]["keys"], ["p3"], shown)
+        self.assertFalse(self.said(plain["edited"], "first read") or self.said(plain["edited"], "settings changed"),
+                         shown)
+        self.assertEqual(plain["again"]["keys"], [], shown)
+        self.assertEqual((plain["seen"], plain["queued"]), (["p1", "p2", "p3"], [["p3"]]), shown)
+
+        outage = found["outage"]
+        self.assertEqual([p["ran"] for p in outage["failed"]], [False, False], shown)
+        self.assertEqual(len([line for line in outage["failed"][0]["lines"] + outage["failed"][1]["lines"]
+                              if "poll failed" in line]), 1, shown)
+        self.assertEqual((outage["bad"]["ok"], outage["bad"]["last_ok"]), (0, outage["good"]["last_ok"]), shown)
+        self.assertEqual(outage["owner_after"], outage["owner"], shown)
+        self.assertEqual(outage["fixed"]["keys"], [f"ABC-{n}" for n in range(2, 7)], shown)
+        changed = self.said(outage["fixed"], "source settings changed")
+        self.assertEqual(len(changed), 1, shown)
+        self.assertIn("ABC-7", changed[0], shown)
+        self.assertEqual(outage["further"]["keys"], [], shown)
+        self.assertEqual(outage["queued"], [[f"ABC-{n}" for n in range(2, 7)]], shown)
+        self.assertEqual(found["edge"]["keys"], ["on-edge"], shown)
+        self.assertIn("just-before", self.said(found["edge"], "source settings changed")[0], shown)
+
+        cmd = found["cmdscope"]
+        self.assertEqual(cmd["changed"]["keys"], ["timed"], shown)
+        self.assertIn("untimed", self.said(cmd["changed"], "source settings changed")[0], shown)
+        self.assertEqual((cmd["repeat"]["keys"], cmd["seen"], cmd["queued"]),
+                         ([], ["k0", "timed", "untimed"], [["timed"]]), shown)
+
+        reorder = found["reorder"]
+        self.assertEqual((reorder["first"]["keys"], reorder["second"]["keys"]), (["b2"], ["a5"]), shown)
+        self.assertEqual((reorder["a"], reorder["b"]), (["a1", "a5"], ["b1", "b2"]), shown)
+        self.assertEqual(reorder["ids"], ["demo#b", "demo#a"], shown)
+        self.assertEqual(reorder["slots"], [{"cursors": 0, "seen": 0, "source_owners": 0}] * 2, shown)
+
+        for case in ("above", "below"):
+            got = found[case]
+            self.assertEqual(got["polls"]["old"]["keys"], ["f3"], shown)
+            self.assertEqual(got["polls"]["fresh"]["keys"], [], shown)
+            self.assertIn("n1", self.said(got["polls"]["fresh"], "first read")[0], shown)
+            self.assertFalse(self.said(got["polls"]["old"], "first read"), shown)
+            self.assertEqual(got["slot"], {"cursors": 0, "seen": 0, "source_owners": 0}, shown)
+            self.assertEqual((got["old_seen"], got["fresh_seen"]), (["f1", "f2", "f3"], ["n1"]), shown)
+
+        foreign = found["foreign"]
+        self.assertIn("s1", self.said(foreign["first"], "first read")[0], shown)
+        self.assertEqual((foreign["foreign_seen"], foreign["solo_seen"], foreign["slot"]["cursors"]),
+                         (["z1"], ["s1"], 1), shown)
+        rename = found["rename"]
+        self.assertEqual(rename["renamed"]["keys"], [], shown)
+        self.assertIn("r1", self.said(rename["renamed"], "first read")[0], shown)
+        self.assertEqual((rename["new_seen"], rename["old_seen"]), (["r1", "r2"], ["r1", "r2"]), shown)
+
+        logs = found["logs"]
+        self.assertEqual(len(logs["scoped"]["keys"]), 1, shown)
+        self.assertIn("alpha", logs["scoped"]["titles"][0], shown)
+        self.assertFalse(any("beta" in title for title in logs["scoped"]["titles"]), shown)
+        self.assertEqual(sorted(logs["offsets"]), logs["names"], shown)
+        self.assertEqual(logs["offsets"][logs["names"][1]][0], logs["two_size"], shown)
+        self.assertEqual(len(logs["later"]["keys"]), 1, shown)
+        self.assertIn("gamma", logs["later"]["titles"][0], shown)
+
+        legacy = found["legacy"]
+        self.assertEqual(legacy["poll"]["keys"], ["l2"], shown)
+        self.assertFalse(self.said(legacy["poll"], "first read") or self.said(legacy["poll"], "settings changed"),
+                         shown)
+        self.assertTrue(legacy["owner"].startswith("scope:"), shown)
+        self.assertEqual((legacy["kept"], legacy["seen"], legacy["queued"]),
+                         ("2026-01-01T00:00:00Z", ["l1", "l2"], [["l2"]]), shown)
+
+        edit = found["legacy_edit"]
+        self.assertEqual((edit["poll"]["keys"], edit["queued"], edit["seen"]), (["a3"], [["a3"]], ["a1", "a2", "a3"]),
+                         shown)
+        self.assertFalse(self.said(edit["poll"], "settings changed"), shown)
+
+        names = found["names"]
+        for case, reason in (("unnamed", "needs a name"), ("repeated", "more than one"), ("webhook", "reserved"),
+                             ("metric", "reserved"), ("digits", "only digits"), ("characters", "lowercase"),
+                             ("number", "lowercase")):
+            self.assertIn(reason, names[case] or "", shown)
+        self.assertEqual((names["single"], names["distinct"]), (None, None), shown)
+
+        race = found["race"]
+        self.assertFalse(race["named_started"], shown)
+        self.assertEqual((race["queued"], race["named_seen"]), ([["r2"]], ["r1", "r2"]), shown)
+        self.assertEqual(race["slot"], {"cursors": 0, "seen": 0, "source_owners": 0}, shown)
+
+        retry = found["retry"]
+        self.assertFalse(retry["failed"]["ran"], shown)
+        self.assertEqual((retry["seen"], retry["queued_after_failure"]), (["r1"], []), shown)
+        self.assertEqual(retry["after"]["owner"], retry["before"]["owner"], shown)
+        self.assertEqual((retry["after"]["cursor"]["value"], retry["after"]["cursor"]["last_ok"]),
+                         (retry["before"]["cursor"]["value"], retry["before"]["cursor"]["last_ok"]), shown)
+        self.assertEqual((retry["healed"]["keys"], retry["queued"], retry["third"]["keys"]),
+                         (["r2"], [["r2"]], []), shown)
+
+
+class DurableCostTests(unittest.TestCase):
+    PRELUDE = r'''
+import contextlib, gzip, io, json, os, sqlite3, sys
+from pathlib import Path
+from unittest import mock
+from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, state, util
+root, mode = Path(sys.argv[1]), sys.argv[2]
+def forbidden(*a, **kw):
+    raise AssertionError("offline cost test attempted a provider or credential lookup")
+claude.run = codex.run = pi.run = forbidden
+accounts.read = gh.auth_token = forbidden
+original_sh = util.sh
+def local_sh(cmd, *a, **kw):
+    if isinstance(cmd, list) and cmd[:1] == ["git"]:
+        return original_sh(cmd, *a, **kw)
+    return forbidden(cmd, *a, **kw)
+util.sh = local_sh
+record.secrets = lambda *a, **kw: ()
+cfg = config.Config()
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = cli.main(list(argv))
+        except SystemExit as e:
+            code = e.code
+    return code, out.getvalue(), err.getvalue()
+def rows(rid):
+    with state.db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (rid,))]
+def marks(rid):
+    f = paths.record_dir(rid) / record.TIMELINE
+    return [v for line in gzip.decompress(f.read_bytes()).decode().splitlines()
+            if (v := json.loads(line))["kind"] == "agent"] if f.exists() else []
+def attempt(rid, which="claude", **kw):
+    return runner.attempt(which, "test", "offline", root, agent.Session(), cfg, (rid, "build"), rid,
+                          devices.LOCAL, kw, auth=accounts.Auth(mode="api_key"))
+def result():
+    return agent.Result(ok=True, cost_usd=2.5)
+'''
+
+    def run_costs(self, body, modes=("run",)):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for folder in ("home", "config", "state", "logs", "worktrees", "tmp"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(HOME=str(root / "home"), ARETE_CONFIG_DIR=str(root / "config"),
+                       ARETE_STATE_DIR=str(root / "state"), ARETE_LOG_DIR=str(root / "logs"),
+                       ARETE_WORKTREES_DIR=str(root / "worktrees"), TMPDIR=str(root / "tmp"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+            for mode in modes:
+                done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), mode],
+                                      cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
+                self.assertEqual(done.returncode, 9 if mode == "kill" else 0, done.stderr + done.stdout)
+
+    def test_commit_precedes_timeline_even_when_finish_kills_the_process(self):
+        self.run_costs(r'''
+if mode == "kill":
+    rid = record.start("pipeline", run_id="killed")
+    claude.run = lambda *a, **kw: result()
+    record.Recorder.finish = lambda *a: os._exit(9)
+    attempt(rid)
+else:
+    found = rows("killed")
+    assert len(found) == 1 and found[0]["cost_usd"] == 2.5, found
+    assert state.run_get("killed")["cost_usd"] == 2.5
+    assert all(rows("killed") for m in marks("killed") if m.get("cost_usd"))
+''', ("kill", "inspect"))
+
+    def test_successful_batch_and_second_insert_rollback(self):
+        self.run_costs(r'''
+def batch(*a, **kw):
+    return agent.Result(ok=True, calls=[
+        agent.Result(ok=True, runner="claude", model="test", cost_usd=1, auth_mode="api_key", call_seconds=1.25),
+        agent.Result(ok=True, runner="pi", model="test", cost_usd=1.5, auth_mode="subscription", call_seconds=2.75)])
+claude.run = batch
+rid = record.start("pipeline")
+attempt(rid)
+found = rows(rid)
+assert [(r["seconds"], r["auth_mode"]) for r in found] == [(1.25, "api_key"), (2.75, "subscription")], found
+assert [r["try"] for r in found] == [1, 2]
+assert state.run_get(rid)["cost_usd"] == marks(rid)[0]["cost_usd"] == 2.5
+rid = record.start("pipeline")
+with state.db() as c:
+    c.execute("CREATE TRIGGER reject_second BEFORE INSERT ON steps WHEN NEW.cost_usd = 1.5 "
+              "BEGIN SELECT RAISE(ABORT, 'second insert refused'); END")
+try:
+    attempt(rid)
+    raise AssertionError("batch should fail")
+except sqlite3.IntegrityError:
+    pass
+assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+assert marks(rid)[0]["cost_usd"] == 2.5 and "cost is not in steps" in marks(rid)[0]["error"]
+''')
+
+    def test_lock_timeout_keeps_cost_and_diagnostic_only_in_timeline(self):
+        self.run_costs(r'''
+rid = record.start("pipeline")
+original = paths.connect_db
+sqlite_connect = sqlite3.connect
+def quick_connect(*a, **kw):
+    kw["timeout"] = .2
+    return sqlite_connect(*a, **kw)
+def short_wait(*a, **kw):
+    with mock.patch.object(sqlite3, "connect", quick_connect):
+        return original(*a, **kw)
+paths.connect_db = short_wait
+lock = sqlite3.connect(paths.DB_FILE)
+def locked(*a, **kw):
+    lock.execute("BEGIN EXCLUSIVE")
+    return result()
+claude.run = locked
+try:
+    attempt(rid)
+    raise AssertionError("write should time out")
+except sqlite3.OperationalError as e:
+    assert "locked" in str(e)
+finally:
+    lock.rollback()
+    lock.close()
+assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+assert marks(rid)[0]["cost_usd"] == 2.5 and "cost is not in steps" in marks(rid)[0]["error"]
+''')
+
+    def test_unlimited_interruptions_crash_park_and_token_cut_charge_once(self):
+        self.run_costs(r'''
+cfg.pricing = {"test": (2, 4)}
+def streamed(*a, **kw):
+    for ident in ("one", "two"):
+        line = json.dumps({"type": "assistant", "message": {"id": ident,
+                          "usage": {"input_tokens": 100, "output_tokens": 50}}})
+        kw["on_line"](line)
+        kw["on_line"](line)
+    raise KeyboardInterrupt()
+claude.run = streamed
+rid = record.start("pipeline")
+try:
+    attempt(rid)
+    raise AssertionError("must interrupt")
+except KeyboardInterrupt:
+    pass
+r, = rows(rid)
+assert (r["turns"], r["tokens_in"], r["tokens_out"], r["ok"], r["error"]) == (2, 200, 100, 0, "stopped by request"), r
+assert abs(r["cost_usd"] - .0008) < 1e-12 and state.run_get(rid)["cost_usd"] == r["cost_usd"]
+assert marks(rid)[0]["error"] == r["error"] and marks(rid)[0]["cost_usd"] == r["cost_usd"]
+rid = record.start("pipeline")
+res = attempt(rid, max_tokens=150)
+r, = rows(rid)
+assert not res.ok and r["turns"] == 1 and "tokens left under the limit" in r["error"], r
+def stopped(*a, **kw):
+    raise KeyboardInterrupt()
+codex.run = stopped
+rid = record.start("pipeline")
+try:
+    attempt(rid, "codex")
+except KeyboardInterrupt:
+    pass
+r, = rows(rid)
+assert (r["ok"], r["error"], r["turns"], r["cost_usd"]) == (0, "stopped by request", 0, 0), r
+assert marks(rid)[0]["error"] == r["error"]
+def crashed(*a, **kw):
+    kw["on_line"](json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": {
+        "input": 300, "output": 100, "cost": {"total": .25}}}}))
+    raise RuntimeError("parked by chain budget")
+pi.run = crashed
+rid = record.start("pipeline")
+try:
+    attempt(rid, "pi")
+    raise AssertionError("must crash")
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert (r["turns"], r["tokens_in"], r["tokens_out"]) == (1, 300, 100), r
+assert abs(r["cost_usd"] - .001) < 1e-12
+assert r["error"] == marks(rid)[0]["error"] and "parked by chain budget" in r["error"]
+def parked(*a, **kw):
+    raise RuntimeError("parked before usage")
+claude.run = parked
+rid = record.start("pipeline")
+try:
+    attempt(rid)
+    raise AssertionError("must park")
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert r["cost_usd"] == 0 and r["error"] == marks(rid)[0]["error"] and "crashed:" in r["error"]
+rid = record.start("pipeline")
+record.ask_stop(rid)
+try:
+    attempt(rid)
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert r["error"] == marks(rid)[0]["error"] == "stopped by request"
+assert heartbeat.check_costs()[0].ok
+''')
+
+    def test_failed_interrupted_write_and_post_commit_exception_never_charge_twice(self):
+        self.run_costs(r'''
+rid = record.start("pipeline")
+with state.db() as c:
+    c.execute("CREATE TRIGGER reject_call BEFORE INSERT ON steps BEGIN SELECT RAISE(ABORT, 'refused'); END")
+def interrupted(*a, **kw):
+    kw["on_line"](json.dumps({"type": "assistant", "message": {"id": "one", "usage": {
+        "input_tokens": 100, "output_tokens": 50}}}))
+    raise KeyboardInterrupt()
+cfg.pricing = {"test": (2, 4)}
+claude.run = interrupted
+try:
+    attempt(rid)
+    raise AssertionError("write must fail")
+except sqlite3.IntegrityError:
+    pass
+assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+mark, = marks(rid)
+assert abs(mark["cost_usd"] - .0004) < 1e-12 and "cost is not in steps" in mark["error"], mark
+with state.db() as c:
+    c.execute("DROP TRIGGER reject_call")
+cfg.pricing = {}
+claude.run = lambda *a, **kw: result()
+rid = record.start("pipeline")
+attempt(rid)
+assert len(rows(rid)) == len(marks(rid)) == 1 and marks(rid)[0]["cost_usd"] == 2.5
+rid = record.start("pipeline")
+def broken_finish(*a):
+    raise RuntimeError("timeline failure after commit")
+record.Recorder.finish = broken_finish
+try:
+    attempt(rid)
+    raise AssertionError("finish must fail")
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert r["cost_usd"] == state.run_get(rid)["cost_usd"] == 2.5
+''')
+
+    def test_backfill_boundary_before_mapping_paid_totals_and_drift(self):
+        for before in (False, True):
+            self.run_costs("use_before = " + repr(before) + r'''
+for rid, started, usd, tin in (("A", "2020-01-01", 9, 900), ("B", "2020-01-02", 3, 300),
+                               ("C", "2020-01-04", 2, 200)):
+    record.start("pipeline", run_id=rid, started=started, cost_usd=usd, tokens_in=tin, tokens_out=tin // 10)
+with state.db() as c:
+    for rid, usd, ts in (("B", 1, "2020-01-03"), ("C", 1.5, "2020-01-04")):
+        c.execute("INSERT INTO steps (run_id, runner, cost_usd, tokens_in, tokens_out, ts) VALUES (?, 'claude', ?, 100, 10, ?)",
+                  (rid, usd, ts))
+paid = state.paid_by_run(["A", "B", "C"])
+args = ["costs", "--backfill"]
+if use_before:
+    f = root / "before.json"
+    f.write_text(json.dumps({"A": 12}))
+    args += ["--before", str(f)]
+code, out, err = call(*args)
+assert code == 0, (out, err)
+a = rows("A")
+assert [(r["step"], r["cost_usd"]) for r in a] == ([("legacy", 12), ("correction", -3)] if use_before else [("legacy", 9)]), a
+assert all(r["auth_mode"] == "subscription" and r["ts"] == "2020-01-01" for r in a)
+assert (a[0]["tokens_in"], a[0]["tokens_out"]) == (900, 90)
+b = rows("B")[-1]
+assert (b["step"], b["cost_usd"], b["tokens_in"], b["auth_mode"], b["ts"]) == ("legacy", 2, 200, "subscription", "2020-01-02"), b
+assert len(rows("C")) == 1
+assert "backfilled 0 steps" in call(*args)[1]
+assert state.paid_by_run(["A", "B", "C"]) == paid
+assert [state.run_get(r)["cost_usd"] for r in ("A", "B", "C")] == [9, 3, 2]
+check, = heartbeat.check_costs()
+assert not check.ok and "1 runs" in check.detail and "$0.500000" in check.detail and check.detail.endswith("C"), check
+assert state.cost_drift() == [{"id": "C", "run_usd": 2, "steps_usd": 1.5, "difference": .5}]
+checked = []
+def fake_check(name):
+    def check(*a):
+        checked.append(name)
+        return []
+    return check
+for name in ("jobs", "probes", "claude_auth", "codex_auth", "codex_cleanup", "pi_auth", "hook", "disk", "serve",
+             "backups", "loops", "oncall", "workspaces", "scratch"):
+    setattr(heartbeat, "check_" + name, fake_check(name))
+heartbeat.install.rotate_logs = lambda: None
+heartbeat.network_up_or_skip = lambda *a: True
+alerts = []
+heartbeat.alerts.raise_alert = lambda repo, key, *a: alerts.append(key)
+heartbeat.alerts.clear_alert = lambda *a: None
+with contextlib.redirect_stdout(io.StringIO()):
+    assert heartbeat.run(dry_run=True) == 1
+assert alerts == ["costs:drift"] and {"backups", "workspaces", "scratch"} <= set(checked), (alerts, checked)
+assert call("costs")[0] == 0
+code, out, err = call("costs", "--by", "step", "kind", "model", "route", "--days", "36500")
+assert code == 0 and "legacy" in out, (out, err)
+code, out, err = call("costs", "--by", "route", "--days", "36500", "--json")
+assert code == 0 and "subscription" in out, (out, err)
+''')
+
+    def test_corrections_billing_validation_and_drift_tolerance(self):
+        self.run_costs(r'''
+for mode in ("subscription", "api_key", "local"):
+    rid = record.start("pipeline")
+    record.step(rid, "build", agent.Result(ok=True, cost_usd=5, auth_mode="api_key"), 1)
+    args = ["costs", "--correct", rid, "-1.25", "--why", "repriced"]
+    if mode != "subscription":
+        args += ["--auth-mode", mode]
+    assert call(*args)[0] == 0
+    r = rows(rid)[-1]
+    assert (r["step"], r["kind"], r["runner"], r["auth_mode"], r["error"], r["cost_usd"]) == (
+        "correction", "correction", "correction", mode, "repriced", -1.25), r
+    assert state.run_get(rid)["cost_usd"] == 3.75
+    assert state.paid_by_run([rid])[rid] == (3.75 if mode == "api_key" else 5)
+assert heartbeat.check_costs()[0].ok
+snapshot = rows(rid), state.run_get(rid)
+bad = root / "bad.json"
+bad.write_text('{bad')
+for args in (["--correct", rid, "1"], ["--correct", "absent", "1", "--why", "x"],
+             ["--correct", rid, "nan", "--why", "x"], ["--correct", rid, "inf", "--why", "x"],
+             ["--correct", rid, "1", "--why", "x", "--by", "step"], ["--why", "x"],
+             ["--auth-mode", "api_key"], ["--before", str(bad)], ["--backfill", "--before", str(bad)],
+             ["--correct", rid, "1", "--why", "x", "--backfill"]):
+    assert call("costs", *args)[0] != 0, args
+    assert (rows(rid), state.run_get(rid)) == snapshot
+for value in (None, [], {"absent": 12}, {rid: "12"}, {rid: float("inf")}, {rid: True}):
+    bad.write_text(json.dumps(value))
+    assert call("costs", "--backfill", "--before", str(bad))[0] != 0
+    assert (rows(rid), state.run_get(rid)) == snapshot
+record.start("pipeline", run_id="null", cost_usd=None)
+record.start("pipeline", run_id="small", cost_usd=.0000009)
+for i in range(7):
+    record.start("pipeline", run_id=f"drift-{i}", cost_usd=.0000011 if i == 0 else i)
+found = state.cost_drift()
+assert [r["id"] for r in found] == [f"drift-{i}" for i in range(7)], found
+check, = heartbeat.check_costs()
+assert "7 runs" in check.detail and "$21.000001" in check.detail and "drift-4" in check.detail
+assert "drift-5" not in check.detail
+''')
+
+
 class WorkerRecoveryTests(unittest.TestCase):
     SCRIPT = r'''
 import contextlib, importlib.util, io, json, os, sys
@@ -3022,6 +5310,266 @@ def result(**fields):
             self.assertIsNotNone(output, done.stdout + done.stderr)
             return json.loads(output)
 
+    def test_pr_poll_and_supersede_preserve_the_winning_status(self):
+        found = self.scratch(r'''
+from types import SimpleNamespace
+from arete import pipeline
+repo = config.Repo("race", root, github="example/race")
+cfg = config.Config(repos=[repo])
+logs = []
+run = SimpleNamespace(repo=repo, tid="R-1", log=logs.append)
+first = made("first", "pr", minutes=1, repo=repo.name, issue=run.tid)
+second = made("second", "pr", minutes=2, repo=repo.name, issue=run.tid)
+record.note(first, pr_url="one two")
+record.note(second, pr_url="three")
+finished = state.run_get(first)["finished"]
+closed = "2099-01-01T00:00:00+00:00"
+def view(url):
+    if url == "two":
+        pipeline.supersede_older_runs(run, ["one", "two"])
+    return {"state": "MERGED", "mergedAt": closed, "closedAt": closed}
+with mock.patch.object(pipeline.gh, "pr_view", side_effect=view), \
+        mock.patch.object(pipeline, "record_feedback"):
+    pipeline.sync_outcomes(cfg)
+row = state.run_get(first)
+assert row["status"] == "superseded" and row["finished"] == finished, row
+third = made("third", "pr", minutes=0, repo=repo.name, issue=run.tid)
+record.note(third, pr_url="three")
+original = state.open_runs
+def snapshot(*args):
+    rows = original(*args)
+    pipeline.sync_outcomes(cfg)
+    return rows
+logs.clear()
+with mock.patch.object(state, "open_runs", side_effect=snapshot), \
+        mock.patch.object(pipeline.gh, "pr_view", return_value=view("three")), \
+        mock.patch.object(pipeline, "record_feedback"):
+    pipeline.supersede_older_runs(run, ["three"])
+assert state.run_get(third)["status"] == "merged"
+assert not logs, logs
+result(status=row["status"], finished=row["finished"], logs=logs)
+''')
+        self.assertEqual(found["status"], "superseded")
+        self.assertEqual(found["logs"], [])
+
+    def test_status_moves_compare_fields_and_rejected_prs_can_reopen(self):
+        found = self.scratch(r'''
+from arete import pipeline
+rid = made("move", "pr")
+before = state.run_get(rid)
+assert not record.move(rid, "merged", expect=(), summary="wrong")
+assert not record.move(rid, "merged", expect=("running",), finished="wrong", summary="wrong")
+assert state.run_get(rid) == before
+try:
+    record.note(rid, status="merged")
+except ValueError:
+    pass
+else:
+    raise AssertionError("note accepted status")
+assert record.move(rid, "rejected", expect=("pr",), pr_url="one")
+with mock.patch.object(pipeline.gh, "pr_view", return_value={"state": "OPEN"}), \
+        mock.patch.object(pipeline, "record_feedback"):
+    pipeline.sync_outcomes(config.Config())
+assert state.run_get(rid)["status"] == "pr"
+for merged in (False, True):
+    pr = {"state": "MERGED" if merged else "CLOSED", "closedAt": util.iso()}
+    if merged:
+        pr["mergedAt"] = pr["closedAt"]
+    with mock.patch.object(pipeline.gh, "pr_view", return_value=pr), \
+            mock.patch.object(pipeline, "record_feedback"):
+        pipeline.sync_outcomes(config.Config())
+    assert state.run_get(rid)["status"] == ("merged" if merged else "rejected")
+result(status=state.run_get(rid)["status"])
+''')
+        self.assertEqual(found["status"], "merged")
+
+    def test_carried_merges_count_and_report_landings_once(self):
+        for wider in (False, True):
+            for landed in ("", "staging"):
+                with self.subTest(wider=wider, landed=landed):
+                    found = self.scratch(f"wider, landed = {wider!r}, {landed!r}\n" + r'''
+from types import SimpleNamespace
+from arete import pipeline
+repo = config.Repo("landing", root, tracker="jira")
+cfg = config.Config(repos=[repo])
+cfg.jira.landed = {"staging": "Testing", "main": "Done"}
+old = made("old", "merged", minutes=2, repo=repo.name, issue="R-1")
+new = made("new", "merged", minutes=1, repo=repo.name, issue="R-1")
+record.note(old, pr_url="one", landed=landed)
+record.note(new, pr_url="two one" if wider else " one  ")
+other_ticket = made("other-ticket", "merged", minutes=3, repo=repo.name, issue="R-2")
+other_repo = made("other-repo", "merged", minutes=3, repo="elsewhere", issue="R-1")
+record.note(other_ticket, pr_url="one two", landed="main")
+record.note(other_repo, pr_url="one two", landed="main")
+record.move(other_ticket, "done", expect=("merged",))
+assert pipeline.streak(repo.name) == 1
+assert pipeline.streak(repo.name, since="9999") == 0
+comments, moves = [], []
+tk = SimpleNamespace(move_to=lambda *args: moves.append(args) or "")
+with mock.patch.object(pipeline.tracker, "for_repo", return_value=tk), \
+        mock.patch.object(pipeline, "furthest_branch", return_value="staging") as branch, \
+        mock.patch.object(pipeline, "uat_steps", return_value="test here"), \
+        mock.patch.object(pipeline.Run, "say", lambda run, text: comments.append((run.id, text)) or ""):
+    pipeline.sync_landings(cfg)
+    expected = int(wider or not landed)
+    assert len(comments) == len(moves) == expected, (comments, moves)
+    assert all(rid == new for rid, _ in comments), comments
+    pipeline.sync_landings(cfg)
+    assert len(comments) == len(moves) == expected
+    branch.return_value = "main"
+    pipeline.sync_landings(cfg)
+    assert len(comments) == expected and len(moves) == expected + 1
+    pipeline.sync_landings(cfg)
+    assert len(moves) == expected + 1
+rows = state.runs(kind="pipeline", repo=repo.name)
+assert pipeline.carried_by_newer(rows, 1)
+for field, value in (("repo", "other"), ("issue", "R-2"), ("pr_url", "")):
+    changed = [rows[0], rows[1] | {field: value}]
+    assert not pipeline.carried_by_newer(changed, 1), changed
+for status in ("rejected", "failed"):
+    boundary = made(status, status, minutes=1.5, repo=repo.name, issue="R-2")
+    assert pipeline.streak(repo.name) == 1
+    record.move(boundary, "done", expect=(status,))
+result(streak=pipeline.streak(repo.name), comments=comments, moves=moves)
+''')
+                    self.assertEqual(found["streak"], 1)
+
+    def test_ask_answers_serialize_with_tracker_replies(self):
+        for in_flight in (False, True):
+            with self.subTest(in_flight=in_flight):
+                found = self.scratch(f"in_flight = {in_flight!r}\n" + r'''
+import threading
+from types import SimpleNamespace
+from arete import asks, control, pipeline, tasks
+repo = config.Repo("asking", root)
+cfg = config.Config(repos=[repo])
+rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
+state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
+              [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
+row = state.run_get(rid)
+fetched, threads, errors, launches = threading.Event(), [], [], []
+lock_requested, tracker_closes = threading.Event(), []
+original_lock, original_close = util.lock, state.ask_close
+def lock(name, *args, **kwargs):
+    if name == asks.STEER_LOCK and threading.current_thread() is not threading.main_thread():
+        lock_requested.set()
+    return original_lock(name, *args, **kwargs)
+def close(*args, **kwargs):
+    if threading.current_thread() is not threading.main_thread():
+        tracker_closes.append(args)
+    return original_close(*args, **kwargs)
+def reply(*args):
+    fetched.set()
+    return "tracker text"
+tk = SimpleNamespace(reply_since=reply)
+def tracker_thread():
+    try:
+        pipeline.tracker_reply(repo, tk, "R-1", False)
+    except BaseException as e:
+        errors.append(repr(e))
+def continuing(*args):
+    if in_flight:
+        thread = threading.Thread(target=tracker_thread, daemon=True)
+        threads.append(thread)
+        thread.start()
+        assert fetched.wait(5), "tracker did not fetch"
+        assert lock_requested.wait(5), "tracker did not take the steering lock"
+    else:
+        ask = state.ask_get("ask")
+        state.ask_close("ask", "answered", asks.text_answers(ask, "tracker text"))
+    return ["resume"]
+def launch(*args, **kwargs):
+    launches.append(args)
+    return {"state": "started"}
+with mock.patch.object(util, "lock", side_effect=lock), mock.patch.object(state, "ask_close", side_effect=close), \
+        mock.patch.object(tasks, "run_of", return_value=(cfg, repo, row)), \
+        mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
+        mock.patch.object(tasks, "free_to_start"), mock.patch.object(tasks, "continuing", side_effect=continuing), \
+        mock.patch.object(tasks, "launch", side_effect=launch):
+    try:
+        answer = tasks.answer_ask("ask", {"answers": [{"text": "dashboard text"}]})
+        assert in_flight and answer["state"] == "started", answer
+    except control.Refused as e:
+        assert not in_flight and "was answered from the tracker a moment ago" in str(e), str(e)
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive(), "tracker deadlocked"
+assert not errors, errors
+assert not tracker_closes, tracker_closes
+stored = state.ask_get("ask")
+expected = "dashboard text" if in_flight else "tracker text"
+assert expected in json.dumps(stored["answers"]), stored
+assert len(launches) == int(in_flight)
+result(answers=stored["answers"], launches=len(launches))
+''')
+                self.assertEqual(found["launches"], int(in_flight))
+
+    def test_tracker_dry_run_and_secret_restriction_leave_asks_open(self):
+        found = self.scratch(r'''
+from types import SimpleNamespace
+from arete import asks, pipeline, tasks
+repo = config.Repo("asking", root)
+cfg = config.Config(repos=[repo])
+rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
+state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
+              [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
+tk = SimpleNamespace(reply_since=mock.Mock(return_value="tracker text"))
+assert pipeline.tracker_reply(repo, tk, "R-1", True) == ""
+assert state.ask_get("ask")["status"] == "open"
+with mock.patch.object(tasks, "run_of", return_value=(cfg, repo, state.run_get(rid))), \
+        mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
+        mock.patch.object(tasks, "free_to_start"), mock.patch.object(tasks, "continuing", return_value=["resume"]), \
+        mock.patch.object(tasks, "launch", return_value={"state": "started"}) as launch:
+    answer = tasks.answer_ask("ask", {"answers": [{"text": "dashboard text"}]})
+    assert answer["state"] == "started"
+    launch.assert_called_once()
+assert "dashboard text" in json.dumps(state.ask_get("ask")["answers"])
+state.ask_add("secret", rid, repo.name, "R-1", "build", "secret", "why", "tried",
+              [{"kind": "secret", "header": "Key", "question": "Key?", "name": "EXAMPLE_TOKEN"}], {})
+tk.reply_since.reset_mock()
+assert "secret" in pipeline.tracker_reply(repo, tk, "R-1", False)
+tk.reply_since.assert_not_called()
+assert state.ask_get("secret")["status"] == "open"
+assert tasks.STEER_LOCK == asks.STEER_LOCK
+result(status=answer["state"])
+''')
+        self.assertEqual(found["status"], "started")
+
+    def test_refused_stop_leaves_asks_and_folder_and_success_retires_them(self):
+        found = self.scratch(r'''
+from arete import control, pipeline, tasks
+repo = config.Repo("stopping", root)
+cfg = config.Config(repos=[repo])
+rid = made("stop", "needs-info", repo=repo.name, issue="R-1")
+row = state.run_get(rid)
+state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried", [], {})
+folder = root / "kept"
+folder.mkdir()
+assert record.move(rid, "merged", expect=("needs-info",))
+with mock.patch.object(tasks, "kept_folder_removed") as remove:
+    try:
+        tasks.let_go(cfg, repo, row, "stopped")
+    except control.Refused:
+        pass
+    else:
+        raise AssertionError("stale stop accepted")
+    remove.assert_not_called()
+assert state.run_get(rid)["status"] == "merged"
+assert state.ask_get("ask")["status"] == "open" and folder.exists()
+assert record.move(rid, "needs-info", expect=("merged",))
+def remove(*args):
+    folder.rmdir()
+    return True
+with mock.patch.object(tasks, "kept_folder_removed", side_effect=remove), \
+        mock.patch.object(pipeline.tracker, "for_ticket"), \
+        mock.patch.object(pipeline.Run, "give_up"), mock.patch.object(pipeline, "write_report"):
+    answer = tasks.let_go(cfg, repo, row, "stopped")
+assert answer["state"] == state.run_get(rid)["status"] == "stopped"
+assert state.ask_get("ask")["status"] == "stopped" and not folder.exists()
+result(status=answer["state"])
+''')
+        self.assertEqual(found["status"], "stopped")
+
     def test_flagged_runs_come_out_worst_first_and_clean_ones_are_left_out(self):
         found = self.scratch(r'''
 clean = made("clean"); call(clean, "build")
@@ -3163,7 +5711,7 @@ def session(name, cwd):
     (folder / f"{name}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 session("s1", "/tmp/x")
 session("s2", str(paths.WORKTREES_DIR / "repo-1"))
-result(sessions=[d["session"] for d in miner.collect(2)])
+result(sessions=[d["session"] for d in miner.collect(util.now() - timedelta(hours=2), util.now())])
 ''')
         self.assertEqual(found["sessions"], ["s1"])
 
@@ -3299,6 +5847,173 @@ class WriterRegressionTests(unittest.TestCase):
                 self.assertEqual(len(sent), 1)
                 self.assertNotIn(candidate, sent[0])
                 self.assertIn("Enabled offline checks.", sent[0])
+
+
+@unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
+                     "needs macOS confinement")
+class AuthorityScopeTests(unittest.TestCase):
+    def setUp(self):
+        from arete import scratch
+        self.scratch = scratch
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        if scratch.filesystem(os.open(self.root, os.O_RDONLY)) != "apfs":
+            self.skipTest("needs APFS")
+        (self.root / "home").mkdir()
+        for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
+                      mock.patch.object(scratch, "holders", return_value=[])):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.ws, self.other = self.root / "worktrees/a", self.root / "worktrees/b"
+        self.ws.mkdir(parents=True)
+        self.other.mkdir()
+        self.made = []
+        self.addCleanup(self.release)
+
+    def release(self):
+        for a in self.made:
+            fd = self.scratch.LEASES.pop(a.selector, None)
+            if fd is not None:
+                os.close(fd)
+            self.scratch.RUN_BASELINES.pop(a.run_id, None)
+
+    def attempt(self, ws=None):
+        run_id = f"run-{len(self.made)}"
+        run_dir = self.root / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        self.scratch.RUN_BASELINES[run_id] = {}
+        a = self.scratch.make(run_id, "verify", ws or self.ws, run_dir)
+        self.made.append(a)
+        return a
+
+    def finish(self, a):
+        self.scratch.end(a, Path(a.run_dir))
+
+    def file(self, a):
+        return self.scratch.AUTHORITY / (a.selector + ".json")
+
+    def sign(self, a, key, change=lambda data: None):
+        envelope = json.loads(self.file(a).read_bytes())
+        change(envelope["data"])
+        envelope["signature"] = hmac.digest(key, self.scratch.encoded(envelope["data"]), "sha256").hex()
+        self.file(a).write_bytes(self.scratch.encoded(envelope))
+
+    def key(self, name="signing.secret"):
+        return (self.scratch.AUTHORITY / name).read_bytes()
+
+    def test_other_version_holds_only_its_workspace(self):
+        a = self.attempt()
+        self.sign(a, self.key(), lambda data: data.update(version=3))
+        self.assertTrue(self.scratch.pending(self.ws))
+        self.assertFalse(self.scratch.pending(self.other))
+        self.attempt(self.other)
+        (unreadable,) = self.scratch.survey().unreadable
+        self.assertEqual((unreadable.path, unreadable.authenticated), (str(self.file(a)), True))
+        with self.assertRaises(OSError) as raised:
+            self.attempt()
+        self.assertIn(str(self.file(a)), str(raised.exception))
+
+    def test_record_without_a_usable_signature_still_holds_only_its_workspace(self):
+        a = self.attempt()
+        for signature in (None, 7):
+            envelope = json.loads(self.file(a).read_bytes())
+            envelope.pop("signature", None)
+            if signature is not None:
+                envelope["signature"] = signature
+            self.file(a).write_bytes(self.scratch.encoded(envelope))
+            self.assertTrue(self.scratch.pending(self.ws))
+            self.assertFalse(self.scratch.pending(self.other))
+
+    def test_record_with_an_invalid_selector_name_holds_even_when_it_claims_done(self):
+        envelope = {"data": {"version": 2, "state": "done", "source_mutations": False,
+                             "attempt": {"selector": "x", "workspace": str(self.ws), "root": str(self.ws / ".gone")}},
+                    "signature": "0"}
+        self.finish(self.attempt(self.other))
+        (self.scratch.AUTHORITY / "x.json").write_bytes(self.scratch.encoded(envelope))
+        self.assertTrue(self.scratch.pending(self.ws))
+        self.assertFalse(self.scratch.pending(self.other))
+
+    def test_lost_signing_secret_scopes_holds(self):
+        self.finish(self.attempt())
+        self.attempt()
+        (self.scratch.AUTHORITY / "signing.secret").unlink()
+        with self.assertRaises(PermissionError) as raised:
+            self.attempt(self.other)
+        self.assertIn(str(self.scratch.AUTHORITY), str(raised.exception))
+        self.assertIn("2 records", str(raised.exception))
+        self.assertFalse((self.scratch.AUTHORITY / "signing.secret").exists())
+        self.assertFalse(self.scratch.pending(self.other))
+        self.assertTrue(self.scratch.pending(self.ws))
+
+    def test_interrupted_rotation_is_named(self):
+        self.finish(self.attempt())
+        b = self.attempt(self.other)
+        following = secrets.token_bytes(32)
+        (self.scratch.AUTHORITY / "signing.secret.next").write_bytes(following)
+        (self.scratch.AUTHORITY / "signing.secret.next").chmod(0o600)
+        self.sign(b, following)
+        self.assertFalse(self.scratch.pending(self.ws))
+        self.assertTrue(self.scratch.pending(self.other))
+        (unreadable,) = self.scratch.survey().unreadable
+        self.assertIn("arete rotate-authority", unreadable.reason)
+        self.assertIn("again", unreadable.reason)
+
+    def test_store_on_host_that_cannot_confine(self):
+        a = self.attempt()
+        with mock.patch.object(pi, "can_confine", return_value=False):
+            self.assertFalse(self.scratch.pending(self.other))
+            self.assertTrue(self.scratch.pending(self.ws))
+            self.assertIn(Path(a.root).name, self.scratch.root_names())
+
+    def test_oversized_record_is_refused(self):
+        a = self.attempt()
+        before = self.file(a).read_bytes()
+        with self.scratch.registry() as (fd, key):
+            data = self.scratch.load(fd, key, a.selector)
+            data["diagnostic"] = "x" * (self.scratch.MAX_RECORD_BYTES + 1)
+            with self.assertRaises(ValueError):
+                self.scratch.store(fd, key, data)
+            self.assertEqual(self.scratch.load(fd, key, a.selector)["state"], "prepared")
+        self.assertEqual(self.file(a).read_bytes(), before)
+
+    def test_settle_moves_then_prunes(self):
+        done = []
+        for _ in range(3):
+            done.append(self.attempt())
+            self.finish(done[-1])
+        locked = self.attempt()
+        self.finish(locked)
+        kept = self.attempt()
+        old = time.time() - 7200
+        for a in (*done, locked, kept):
+            os.utime(self.file(a), (old, old))
+        holder = os.open(self.scratch.AUTHORITY / (locked.selector + ".lease"), os.O_RDWR)
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.scratch.settle(30), [])
+        finally:
+            os.close(holder)
+        settled = self.scratch.AUTHORITY / "settled"
+        self.assertEqual(sorted(p.name for p in settled.iterdir()), sorted(a.selector + ".json" for a in done))
+        self.assertTrue(self.file(locked).exists() and self.file(kept).exists())
+        self.assertEqual({r["attempt"]["selector"] for r in self.scratch.records()}, {locked.selector, kept.selector})
+        self.assertTrue(self.scratch.pending(self.ws))
+        expired = done[0]
+        sentinel = self.root / "sentinel"
+        sentinel.mkdir()
+        (sentinel / "keep.txt").write_text("keep")
+        evidence = self.scratch.AUTHORITY / expired.selector
+        self.assertTrue(any(p.stat().st_mode & 0o777 == 0o500 for p in evidence.rglob("*") if p.is_dir()))
+        os.symlink(sentinel, evidence / "link")
+        long_ago = time.time() - 31 * 86400
+        os.utime(settled / (expired.selector + ".json"), (long_ago, long_ago))
+        self.assertEqual(self.scratch.settle(30), [])
+        self.assertFalse((settled / (expired.selector + ".json")).exists())
+        self.assertFalse(evidence.exists() or (self.scratch.AUTHORITY / (expired.selector + ".lease")).exists())
+        self.assertEqual((sentinel / "keep.txt").read_text(), "keep")
+        self.assertTrue((settled / (done[1].selector + ".json")).exists())
+        self.assertTrue((self.scratch.AUTHORITY / done[1].selector).exists())
 
 
 @unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
@@ -4161,8 +6876,294 @@ class TokenHelperTests(unittest.TestCase):
                 self.assertNotIn("x-access-token", bare.stdout)
 
 
+class MinerWindowTests(unittest.TestCase):
+    PRELUDE = MinerRecordedRunTests.PRELUDE + r'''
+import dataclasses, os, re
+from datetime import UTC, datetime
+T0 = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+GOOD = {"ok": True, "structured": {"proposals": []}}
+BAD = {"ok": False, "error": "model call failed"}
+def at(h):
+    return T0 + timedelta(hours=h)
+def mark(h):
+    return util.iso(at(h) - timedelta(minutes=2))
+def reply(answer):
+    (root / "sample/replay/mine.json").write_text(json.dumps(answer))
+reply(GOOD)
+def correction(when, label):
+    folder = paths.CLAUDE_PROJECTS_DIR / "proj"
+    folder.mkdir(parents=True, exist_ok=True)
+    rows = [{"type": "user", "timestamp": util.iso(when - timedelta(minutes=1)), "cwd": "/tmp/x",
+             "message": {"content": "Fix the header"}},
+            {"type": "user", "timestamp": util.iso(when), "cwd": "/tmp/x",
+             "message": {"content": f"No, I told you never to touch the footer [tag:{label}]"}}]
+    f = folder / f"s{label}.jsonl"
+    f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    os.utime(f, (when.timestamp(), when.timestamp()))
+def event(when):
+    paths.EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with paths.EVENTS_FILE.open("a") as f:
+        f.write(json.dumps({"ts": util.iso(when), "kind": "tool", "cls": "error", "tool": "Bash", "detail": "x"}) + "\n")
+def both(h):
+    correction(at(h), f"{h:g}")
+    event(at(h))
+def failed_run(when, tag):
+    with mock.patch.object(util, "now", return_value=when):
+        rid = record.start("pipeline", tag=tag, repo="replay-sample", issue=tag)
+        call(rid, "build", ok=False, error="nope")
+        record.settle(rid, "failed", summary=tag)
+    return rid
+def mine(h, hours=None, dry_run=False, apply=False):
+    out = io.StringIO()
+    with mock.patch.object(util, "now", return_value=at(h)), contextlib.redirect_stdout(out):
+        code = miner.run(hours=hours, dry_run=dry_run, apply=apply)
+    text = out.getvalue()
+    found = re.search(r"miner ([^\s:]+): \d+ sessions", text)
+    prompt = (paths.RUNS_DIR / found.group(1) / "prompt.md").read_text() if found else ""
+    row = {} if dry_run else next(iter(state.runs(kind="miner", limit=1)), {})
+    return {"code": code, "out": text, "prompt": prompt, "status": row.get("status"),
+            "mined_until": row.get("mined_until"), "summary": row.get("summary"),
+            "heard": sorted(re.findall(r"\[tag:([^\]]+)\]", prompt)),
+            "events": sum(int(n) for n in re.findall(r"^- (\d+) x none tool/error", prompt, re.M))}
+def nums(m):
+    return sorted(float(x) for x in m["heard"])
+def slim(m):
+    return {k: v for k, v in m.items() if k != "prompt"}
+'''
+    scratch = MinerRecordedRunTests.scratch
+
+    def test_a_failed_mine_leaves_its_window_to_the_next_one(self):
+        found = self.scratch(r'''
+base = mine(0)
+for h in (3, 10, 20):
+    both(h)
+reply(BAD)
+failed = mine(24)
+for h in (26, 30, 40):
+    both(h)
+reply(GOOD)
+last = mine(48)
+result(base=slim(base), failed=slim(failed), last=slim(last), heard=nums(last), expect=mark(48))
+''')
+        self.assertEqual(found["failed"]["status"], "failed", found)
+        self.assertEqual(found["failed"]["code"], 1)
+        self.assertIsNone(found["failed"]["mined_until"], found)
+        self.assertEqual(found["heard"], [3, 10, 20, 26, 30, 40], found)
+        self.assertEqual(found["last"]["events"], 6, found)
+        self.assertEqual(found["last"]["mined_until"], found["expect"], found)
+
+    def test_a_late_fire_loses_no_hours_and_its_successor_repeats_none(self):
+        found = self.scratch(r'''
+mine(0)
+for h in (3, 10, 20, 26, 30, 40):
+    both(h)
+late = mine(31)
+after = mine(48)
+result(late=nums(late), after=nums(after), late_events=late["events"], after_events=after["events"])
+''')
+        self.assertEqual(found["late"], [3, 10, 20, 26, 30], found)
+        self.assertEqual(found["after"], [40], found)
+        self.assertEqual(found["after_events"], 1, found)
+
+    def test_a_manual_window_never_moves_the_checkpoint(self):
+        found = self.scratch(r'''
+mine(0)
+for h in (3, 10, 20):
+    both(h)
+manual = mine(21, hours=2)
+nightly = mine(24)
+result(manual=nums(manual), row=manual["mined_until"], nightly=nums(nightly))
+''')
+        self.assertEqual(found["manual"], [20], found)
+        self.assertIsNone(found["row"], found)
+        self.assertEqual(found["nightly"], [3, 10, 20], found)
+
+    def test_a_manual_window_before_any_checkpoint_is_not_the_legacy_start(self):
+        found = self.scratch(r'''
+for h in (3, 10, 20):
+    both(h)
+manual = mine(21, hours=2)
+nightly = mine(24)
+result(manual=nums(manual), nightly=nums(nightly), row=manual["mined_until"])
+''')
+        self.assertEqual(found["manual"], [20], found)
+        self.assertIsNone(found["row"], found)
+        self.assertEqual(found["nightly"], [3, 10, 20], found)
+
+    def test_a_mine_from_before_this_change_starts_where_it_started(self):
+        found = self.scratch(r'''
+with mock.patch.object(util, "now", return_value=at(2)):
+    old = record.start("miner")
+    record.settle(old, "noop", summary="old")
+both(1)
+both(3)
+m = mine(24)
+result(heard=nums(m))
+''')
+        self.assertEqual(found["heard"], [3], found)
+
+    def test_a_comment_stored_after_a_mine_reaches_the_next_one_only(self):
+        found = self.scratch(r'''
+mine(0)
+with mock.patch.object(util, "now", return_value=at(1)):
+    state.add_feedback([{"pr_url": "https://github.com/example/arete/pull/1", "kind": "comment", "gh_id": 1,
+                         "repo": "arete", "issue": "1", "body": "late-comment", "created": util.iso(at(-5)),
+                         "pr_state": "OPEN", "status": "new"}])
+first = mine(24)
+second = mine(48)
+result(first="late-comment" in first["prompt"], second="late-comment" in second["prompt"])
+''')
+        self.assertTrue(found["first"], found)
+        self.assertFalse(found["second"], found)
+
+    def test_feedback_keeps_its_first_recorded_time_and_old_rows_fall_back_to_created(self):
+        found = self.scratch(r'''
+row = {"pr_url": "https://github.com/example/arete/pull/1", "kind": "comment", "gh_id": 1, "repo": "arete",
+       "issue": "1", "body": "again", "created": util.iso(at(-5)), "pr_state": "OPEN", "status": "new"}
+for h in (1, 5):
+    with mock.patch.object(util, "now", return_value=at(h)):
+        state.add_feedback([row])
+with state.db() as c:
+    c.execute("INSERT INTO feedback (pr_url, kind, gh_id, repo, issue, body, created, pr_state, status) "
+              "VALUES ('https://github.com/example/arete/pull/2', 'comment', 2, 'arete', '2', 'legacy-comment', ?, "
+              "'OPEN', 'new')", (util.iso(at(3)),))
+    stored = [dict(r) for r in c.execute("SELECT gh_id, created, recorded FROM feedback ORDER BY gh_id")]
+m = mine(24)
+result(stored=stored, created=util.iso(at(-5)), recorded=util.iso(at(1)),
+       again="again" in m["prompt"], legacy="legacy-comment" in m["prompt"])
+''')
+        self.assertEqual(found["stored"][0], {"gh_id": 1, "created": found["created"], "recorded": found["recorded"]})
+        self.assertIsNone(found["stored"][1]["recorded"])
+        self.assertTrue(found["again"] and found["legacy"], found)
+
+    def test_a_mine_after_a_long_gap_reads_only_the_last_seven_days_and_says_so(self):
+        found = self.scratch(r'''
+mine(0)
+for h in (48, 72, 216):
+    both(h)
+m = mine(240)
+result(heard=nums(m), summary=m["summary"], out=m["out"], mined=m["mined_until"], expect=mark(240))
+''')
+        self.assertEqual(found["heard"], [72, 216], found)
+        self.assertIn("window capped at 7 days", found["summary"])
+        self.assertIn("window capped at 7 days", found["out"])
+        self.assertEqual(found["mined"], found["expect"])
+
+    def test_proposals_done_before_and_skipped_before_are_listed_apart(self):
+        found = self.scratch(r'''
+for status in ("memory", "filed", "merged", "skipped"):
+    state.add_proposal("seed", {"layer": "repo", "repo": "arete", "file": "a.md", "change": f"fact-{status}",
+                                "why": "w"}, status)
+both(3)
+m = mine(24)
+done = m["prompt"].partition("## Done before (do not propose again)")[2].partition("## Rejected or skipped before")[0]
+rejected = m["prompt"].partition("## Rejected or skipped before")[2].partition("## Rules")[0]
+result(done=done, rejected=rejected)
+''')
+        for status in ("memory", "filed", "merged"):
+            self.assertIn(f"fact-{status}", found["done"])
+            self.assertNotIn(f"fact-{status}", found["rejected"])
+        self.assertIn("fact-skipped", found["rejected"])
+        self.assertNotIn("fact-skipped", found["done"])
+
+    def test_every_source_cuts_its_window_at_the_same_half_open_bounds_and_lags_two_minutes(self):
+        found = self.scratch(r'''
+mine(0)
+since, until = at(0) - timedelta(minutes=2), at(24) - timedelta(minutes=2)
+edges = {"lo": since, "before": since - timedelta(seconds=1), "in": until - timedelta(seconds=1),
+         "hi": until, "lag": until + timedelta(seconds=60)}
+for label, when in edges.items():
+    correction(when, label)
+    event(when)
+runs = {tag: failed_run(when, tag) for tag, when in
+        (("rlo", since), ("rin", until - timedelta(seconds=1)), ("rat", until), ("raf", until + timedelta(seconds=1)))}
+first = mine(24)
+second = mine(48)
+result(first=first["heard"], second=second["heard"], first_events=first["events"], second_events=second["events"],
+       first_runs=sorted(t for t, r in runs.items() if r in first["prompt"]),
+       second_runs=sorted(t for t, r in runs.items() if r in second["prompt"]))
+''')
+        self.assertEqual(found["first"], ["in", "lo"], found)
+        self.assertEqual(found["second"], ["hi", "lag"], found)
+        self.assertEqual((found["first_events"], found["second_events"]), (2, 2), found)
+        self.assertEqual(found["first_runs"], ["rin", "rlo"], found)
+        self.assertEqual(found["second_runs"], ["raf", "rat"], found)
+
+    def test_only_a_good_automatic_mine_with_a_repo_moves_the_checkpoint(self):
+        found = self.scratch(r'''
+base = mine(0)
+both(3)
+with mock.patch.object(miner, "collect", side_effect=RuntimeError("boom")):
+    crashed = mine(24)
+original = config.load
+with mock.patch.object(config, "load", side_effect=lambda: dataclasses.replace(original(), repos=[])):
+    norepo = mine(30)
+rows = len(state.runs(kind="miner", limit=50))
+dry = mine(36, dry_run=True)
+dry_rows = [rows, len(state.runs(kind="miner", limit=50))]
+reply({"ok": True, "structured": {"proposals": [{"layer": "repo", "repo": "arete", "file": "notes.md",
+                                                  "change": "c", "why": "w", "evidence": [], "confidence": 0.9}]}})
+with mock.patch.object(miner, "allowed", return_value=(True, "")), \
+        mock.patch.object(miner, "apply_repo", side_effect=RuntimeError("push refused")):
+    applying = mine(42, apply=True)
+reply(GOOD)
+last = mine(48)
+result(base=base["mined_until"], base_expect=mark(0), crashed=slim(crashed), norepo=slim(norepo), dry=slim(dry),
+       dry_rows=dry_rows, applying=slim(applying), heard=nums(last),
+       last=last["mined_until"], last_expect=mark(48))
+''')
+        self.assertEqual(found["base"], found["base_expect"], found)
+        self.assertEqual((found["crashed"]["status"], found["crashed"]["code"]), ("failed", 1), found)
+        self.assertEqual(found["norepo"]["status"], "noop", found)
+        self.assertEqual(found["dry"]["code"], 0, found)
+        self.assertEqual(found["dry_rows"][0], found["dry_rows"][1], found)
+        self.assertEqual((found["applying"]["status"], found["applying"]["code"]), ("failed", 1), found)
+        for name in ("crashed", "norepo", "dry", "applying"):
+            self.assertIsNone(found[name]["mined_until"], found)
+        self.assertEqual(found["heard"], [3], found)
+        self.assertEqual(found["last"], found["last_expect"], found)
+
+    def test_a_failed_apply_model_call_keeps_the_checkpoint(self):
+        found = self.scratch(r'''
+from types import SimpleNamespace
+mine(0)
+both(3)
+reply({"ok": True, "structured": {"proposals": [{"layer": "repo", "repo": "arete", "file": "notes.md",
+                                                  "change": "c", "why": "w", "evidence": [], "confidence": 0.9}]}})
+failed = SimpleNamespace(ok=False, error="apply broke", text="")
+with mock.patch.object(miner, "allowed", return_value=(True, "")), \
+        mock.patch.object(miner.gh, "default_branch", return_value="main"), \
+        mock.patch.object(miner.gh, "open_pr_url", return_value=""), \
+        mock.patch.object(miner, "make_worktree", return_value=root), \
+        mock.patch.object(miner, "remove_worktree"), \
+        mock.patch.object(miner, "apply_in", return_value=failed):
+    applying = mine(24, apply=True)
+reply(GOOD)
+last = mine(48)
+result(applying=slim(applying), heard=nums(last))
+''')
+        self.assertEqual((found["applying"]["status"], found["applying"]["code"]), ("failed", 1), found)
+        self.assertIsNone(found["applying"]["mined_until"], found)
+        self.assertEqual(found["heard"], [3], found)
+
+    def test_a_window_reads_events_across_a_month_archive_once(self):
+        found = self.scratch(r'''
+from arete import hook
+folder = paths.EVENTS_FILE.parent
+folder.mkdir(parents=True, exist_ok=True)
+def line(ts):
+    return json.dumps({"ts": ts, "kind": "tool", "cls": "error", "detail": ts}) + "\n"
+(folder / "events-202605.jsonl").write_text(line("2026-05-31T23:00:00Z") + line("2026-05-31T23:59:59Z"))
+paths.EVENTS_FILE.write_text(line("2026-06-01T00:00:00Z") + line("2026-06-01T00:30:00Z"))
+since = datetime(2026, 5, 31, 23, 30, tzinfo=UTC).timestamp()
+until = datetime(2026, 6, 1, 0, 30, tzinfo=UTC).timestamp()
+result(details=[e["detail"] for e in hook.read_events(since_ts=since, until_ts=until)])
+''')
+        self.assertEqual(found["details"], ["2026-05-31T23:59:59Z", "2026-06-01T00:00:00Z"])
+
+
 class PushedPrDraftTests(unittest.TestCase):
-    URL = "https://github.com/fixture/repo/pull/7"
+    URL ="https://github.com/fixture/repo/pull/7"
 
     def setUp(self):
         from arete import gh, jev
@@ -4674,9 +7675,12 @@ class WorkspaceOwnerTests(unittest.TestCase):
     SCRIPT = r'''
 import json, os, runpy, shutil, subprocess, sys, time
 from pathlib import Path
-from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, state, util
+from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, scratch, state, util
 from arete import ci
 root, scenario = Path(sys.argv[1]), sys.argv[2]
+probe = [sys.executable, "-V"]
+if scratch.protected_command(probe) != probe:
+    scratch.AUTHORITY = root / "authority-parent/verification-authority"
 SETUP = sys.argv[3]
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport")
@@ -4729,7 +7733,7 @@ else:
                 "checkouts": [{"dir": "", "github": "octo/widgets", "src": str(src), "wt": str(ws)}]}
     a_task, a, a_c, a_run = make("a", "arete/a")
     pipeline.note_made(a, [a_c])
-    record.note(a_run, status="merged", started=util.iso(util.now() - __import__("datetime").timedelta(days=30)),
+    record.settle(a_run, "merged", started=util.iso(util.now() - __import__("datetime").timedelta(days=30)),
                 finished=util.iso(util.now() - __import__("datetime").timedelta(days=30)))
     old = time.time() - 30 * 86400
     os.utime(a, (old, old))
@@ -4737,7 +7741,7 @@ else:
     pipeline.note_made(b, [b_c], owner(b_task, b_run, b))
     held_lock = util.hold_lock(state.run_lock("pipeline", "replay-sample", b_task))
     c_task, cw, c_c, c_run = make("c", "arete/c")
-    record.note(c_run, status="merged", finished=util.iso())
+    record.settle(c_run, "merged", finished=util.iso())
     pipeline.note_made(cw, [c_c], owner(c_task, c_run, cw))
     (cw / "hand.txt").write_text("mine\n")
     gone = paths.WORKTREES_DIR / "gone"
@@ -4751,7 +7755,7 @@ else:
                "check": [check.ok, check.detail]}
     (cw / "hand.txt").unlink()
     e_task, e, e_c, e_run = make("e", "arete/e")
-    record.note(e_run, status="merged", finished=util.iso())
+    record.settle(e_run, "merged", finished=util.iso())
     pipeline.note_made(e, [e_c], owner(e_task, e_run, e))
     with (e / replay.SAMPLE_FILE).open("a") as out:
         out.write("by hand\n")
@@ -4768,12 +7772,12 @@ else:
     g_c = pipeline.Checkout("", "octo/widgets", src, g, "main")
     pipeline.add_worktree(g_c, "arete/g", "main")
     g_run = record.start("pipeline", repo="replay-sample", issue="42")
-    record.note(g_run, status="failed", finished=util.iso())
+    record.settle(g_run, "failed", finished=util.iso())
     pipeline.note_made(g, [g_c], owner("42", g_run, g))
     import types
     pipeline.tracker.for_repo = lambda cfg, repo: types.SimpleNamespace(get=lambda tid: types.SimpleNamespace(open=False))
     f_task, f, f_c, f_run = make("f", "arete/f")
-    record.note(f_run, status="failed", finished=util.iso())
+    record.settle(f_run, "failed", finished=util.iso())
     pipeline.note_made(f, [f_c], owner(f_task, f_run, f))
     (f / "stray.txt").write_text("x\n")
     pipeline.cleanup_worktrees(cfg=config.load())
@@ -4787,7 +7791,7 @@ print("BEHAVIOR_RESULT=" + json.dumps(result))
     def run_script(self, scenario):
         with tempfile.TemporaryDirectory(suffix=".noindex") as directory:
             root = Path(directory).resolve()
-            for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "authority-parent", "home"):
                 (root / folder).mkdir()
             env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
             env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
@@ -8840,6 +11844,938 @@ result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)
 ''')
         self.assertTrue(found["continued"] and found["rotated"] and found["stopped"])
         self.assertTrue(any("state prune failed: OSError: state unavailable" in m for m in found["messages"]))
+
+
+class ConfigForwardCompatTests(unittest.TestCase):
+    PRELUDE = r'''
+import json, os, sys, threading, time, urllib.request
+from pathlib import Path
+from unittest import mock
+from arete import accounts, config, control, gh, paths, replay, serve, settings, state, util
+root = Path(sys.argv[1])
+def forbidden(*args, **kwargs):
+    raise AssertionError("config compatibility case attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+gh.gh = forbidden
+GOOD = "max_parallel=1\n\n" + "\n".join(replay.sample(root / "sample", adw=True)) + "\n\n[jev]\nenabled=false\n"
+BAD = GOOD + "\n[routing]\nfuture_key = 1\n"
+NEWER = GOOD + """
+[steps.future_step]
+tries = 1
+
+[kinds.chore]
+
+[ask]
+future_option = 1
+max_per_run = 5
+
+[retention]
+future = 1
+days = 10
+lines_days = 40
+
+[jev.risk_weights]
+future_weight = 0.5
+"""
+def write(text):
+    paths.CONFIG_FILE.write_text(text)
+def result(**found):
+    print("BEHAVIOR_RESULT=" + json.dumps(found))
+def refused(text, **kw):
+    write(text)
+    try:
+        config.load(**kw)
+    except ValueError as e:
+        return str(e)
+    return ""
+def quiet_server():
+    serve.Server.sweep_vms = lambda self: None
+    serve.Server.prune = lambda self: None
+    serve.engine.launch = lambda *a, **k: (_ for _ in ()).throw(control.Refused("fixture"))
+    server = serve.Server()
+    said = []
+    server.say = said.append
+    return server, said
+write(GOOD)
+'''
+
+    def environment(self, root):
+        for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
+            (root / folder).mkdir()
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+        env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                   ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                   TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                   GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+        return env
+
+    def program(self, body):
+        return f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+
+    def case(self, body, timeout=120):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.environment(root)
+            done = subprocess.run([sys.executable, "-I", "-c", self.program(body), str(root)],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=timeout)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            line = next(x for x in done.stdout.splitlines() if x.startswith("BEHAVIOR_RESULT="))
+            return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+
+    def test_names_from_a_newer_engine_are_ignored_once(self):
+        found = self.case(r'''
+write(NEWER)
+cfg = config.load()
+result(ignored=list(cfg.ignored), max_per_run=cfg.ask.max_per_run, days=cfg.retention.days,
+       weights=sorted(cfg.jev.risk_weights), engine=sorted(config.JevConfig().risk_weights),
+       strict=refused(NEWER, strict=True))
+''')
+        self.assertEqual(sorted(found["ignored"]), sorted(["[steps] future_step", "[kinds] chore", "[ask] future_option",
+                                                           "[retention] future", "[jev.risk_weights] future_weight"]))
+        self.assertEqual((found["max_per_run"], found["days"]), (5, 10))
+        self.assertEqual(found["weights"], found["engine"])
+        self.assertIn("future_step", found["strict"])
+
+    def test_other_tolerant_readers_and_strict_direct_calls(self):
+        found = self.case(r'''
+more = GOOD.replace("[replay]\n", "[replay]\nfuture = 1\n") + """
+[chat]
+future = 1
+[research]
+future = 1
+[document]
+future = 1
+[kinds.feat]
+future = 1
+[kinds.feat.steps.future_step]
+tries = 1
+[jev.screen_lines]
+future_question = 0.5
+"""
+write(more)
+cfg = config.load()
+direct = {}
+for name, call in (("ask", lambda: config.ask_table({"future": 1})), ("steps", lambda: config.step_tables({"future_step": {}}, "steps")),
+                   ("known", lambda: config.known({"x": 1}, ("y",), "t", None))):
+    try:
+        call()
+    except ValueError as e:
+        direct[name] = str(e)
+kept = config.known({"x": 1, "y": 2}, ("y",), "t", (collected := []))
+result(ignored=sorted(cfg.ignored), direct=direct, kept=kept, collected=collected,
+       invalid=refused(GOOD + "\n[ask]\nfuture = 1\nmax_per_run = -1\n"), screen=sorted(cfg.jev.screen_lines))
+''')
+        self.assertEqual(found["ignored"], sorted([
+            "[replay] future", "[chat] future", "[research] future", "[document] future", "[kinds.feat] future",
+            "[kinds.feat.steps] future_step", "[jev.screen_lines] future_question"]))
+        self.assertEqual(sorted(found["direct"]), ["ask", "known", "steps"])
+        self.assertEqual((found["kept"], found["collected"]), ({"y": 2}, ["[t] x"]))
+        self.assertIn("max_per_run", found["invalid"])
+        self.assertNotIn("future_question", found["screen"])
+
+    def test_reach_tables_stay_strict(self):
+        found = self.case(r'''
+cases = {
+    "steps.build": "[steps.build]\nfuture_key = 1\n",
+    "mcp.x": "[mcp.x]\ncommand = 'x'\nfuture_key = 1\n",
+    "tiers": "[tiers.x]\nfast = { future_key = '1' }\n",
+    "routing": "[routing]\nfuture_key = 1\n",
+    "environment": "[environment]\nfuture_key = 1\n",
+    "capture": "[capture]\nfuture_key = 1\n",
+    "ab.x": "[ab.x]\nfuture_key = 1\n",
+    "oncall": "[oncall]\nfuture_key = 1\n",
+    "oncall.source": "[[oncall.source]]\nfuture_key = 1\n",
+    "session": "[steps.build]\nsession = 'fork'\n",
+    "payment_modes": "[routing]\npayment_modes = ['future_mode']\n",
+}
+result(errors={name: refused(GOOD + "\n" + text) for name, text in cases.items()})
+''')
+        for name, error in found["errors"].items():
+            self.assertTrue(error, name)
+
+    def test_settings_save_still_refuses_unknown_names(self):
+        found = self.case(r'''
+write(NEWER)
+before = paths.CONFIG_FILE.read_bytes()
+try:
+    settings.save({"max_parallel": 2})
+    refusal = ""
+except settings.Refused as e:
+    refusal = str(e)
+unchanged = paths.CONFIG_FILE.read_bytes() == before
+write(GOOD)
+settings.save({"max_parallel": 2})
+result(refusal=refusal, unchanged=unchanged, saved=config.load().max_parallel)
+''')
+        self.assertIn("future", found["refusal"])
+        self.assertTrue(found["unchanged"])
+        self.assertEqual(found["saved"], 2)
+
+    def test_layer_ignores_new_step_names(self):
+        found = self.case(r'''
+layer = root / "sample/layer"
+with (layer / "config.toml").open("a") as out:
+    out.write("\n[steps.future_step]\ntries = 1\n\n[kinds.chore]\n")
+loaded = config.load_layer(layer)
+try:
+    config.load_layer(layer, strict=True)
+    strict = ""
+except ValueError as e:
+    strict = str(e)
+result(ignored=list(loaded.ignored), strict=strict)
+''')
+        self.assertEqual(found["ignored"], ["[steps] future_step", "[kinds] chore"])
+        self.assertTrue(found["strict"])
+
+    def test_fallback_keeps_dashboard_fields_and_never_raises(self):
+        found = self.case(r'''
+write(BAD + "\n[dashboard]\nport = 4321\nhttps = true\nowner = 'me@example.com'\n")
+cfg, problem = config.load_or_problem()
+write("[[[ not toml")
+broken, why = config.load_or_problem()
+write(GOOD + "\n[dashboard]\nport = 'x'\n")
+bad_port, bad_port_why = config.load_or_problem()
+write(GOOD + "\n[dashboard]\nport = 'x'\nhttps = true\nowner = 'me@example.com'\n")
+mixed = config.load_or_problem()[0]
+write(GOOD + "\n[dashboard]\nport = 4321\nhttps = 'yes'\n")
+kept_port = config.load_or_problem()[0].dashboard_port
+result(mixed=[mixed.dashboard_https, mixed.dashboard_owner], kept_port=kept_port,
+       port=cfg.dashboard_port, https=cfg.dashboard_https, owner=cfg.dashboard_owner, problem=problem,
+       broken=[broken.dashboard_port == config.DASHBOARD_PORT, why], bad_port=[bad_port.dashboard_port, bad_port_why])
+''')
+        self.assertEqual((found["port"], found["https"], found["owner"]), (4321, True, "me@example.com"))
+        self.assertTrue(found["problem"].startswith("ValueError: [routing]"))
+        self.assertTrue(found["broken"][0] and found["broken"][1].startswith("TOMLDecodeError"))
+        self.assertTrue(found["bad_port"][1])
+        self.assertEqual((found["mixed"], found["kept_port"]), ([True, "me@example.com"], 4321))
+
+    def test_serve_stays_up_on_a_reach_key(self):
+        found = self.case(r'''
+server, said = quiet_server()
+server.tick()
+write(BAD)
+server.tick()
+server.tick()
+beat = util.read_json(control.BEAT_FILE, {})
+paused = {"said": [s for s in said if "does not load" in s], "problem": beat.get("config_problem", ""),
+          "ticks": beat.get("ticks"), "running": state.runs_marked_running()}
+write(GOOD)
+server.tick()
+again = util.read_json(control.BEAT_FILE, {})
+write(BAD)
+second = serve.Server()
+write(NEWER)
+server.tick()
+server.tick()
+result(paused=paused, recovered=[s for s in said if "loads again" in s], again_problem="config_problem" in again,
+       again_ticks=again.get("ticks"), second=second.config_problem, ignored=[s for s in said if "ignores them" in s])
+''')
+        self.assertEqual(len(found["paused"]["said"]), 1)
+        self.assertIn("future_key", found["paused"]["problem"])
+        self.assertEqual((found["paused"]["ticks"], found["paused"]["running"]), (3, []))
+        self.assertEqual(len(found["recovered"]), 1)
+        self.assertFalse(found["again_problem"])
+        self.assertEqual(found["again_ticks"], 4)
+        self.assertIn("future_key", found["second"])
+        self.assertEqual(len(found["ignored"]), 1)
+
+    def test_serve_process_lives_through_a_bad_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.environment(root)
+            body = "write(BAD)\nserve.run(with_dashboard=False)\n"
+            child = subprocess.Popen([sys.executable, "-I", "-u", "-c", self.program(body), str(root)], cwd=root, env=env,
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                time.sleep(6)
+                alive = child.poll() is None
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                output, _ = child.communicate(timeout=30)
+        self.assertTrue(alive, output)
+        self.assertEqual(output.count("does not load"), 1, output)
+        self.assertNotIn("Traceback", output)
+
+    def test_dashboard_answers_while_config_does_not_load(self):
+        found = self.case(r'''
+from arete import dashboard
+write(BAD)
+server, said = quiet_server()
+server.tick()
+class Host(dashboard.ScratchHost):
+    def node(self, owner):
+        return dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    def whois(self, address):
+        return "me@example.com"
+import socket
+probe = socket.socket()
+probe.bind(("127.0.0.1", 0))
+port = probe.getsockname()[1]
+probe.close()
+threading.Thread(target=dashboard.serve, kwargs={"port": port, "inside_serve": True, "host": Host()}, daemon=True).start()
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+answers = {}
+deadline = time.monotonic() + 40
+while len(answers) < 2 and time.monotonic() < deadline:
+    try:
+        for route in ("/", "/api/health"):
+            with opener.open(f"http://127.0.0.1:{port}{route}", timeout=5) as r:
+                answers[route] = [r.status, r.read().decode()]
+    except OSError:
+        time.sleep(.5)
+health = json.loads(answers["/api/health"][1]) if "/api/health" in answers else {}
+result(status={k: v[0] for k, v in answers.items()}, state=health.get("state"),
+       problem=(health.get("serve") or {}).get("config_problem", ""))
+''', timeout=150)
+        self.assertEqual(found["status"], {"/": 200, "/api/health": 200})
+        self.assertEqual(found["state"], "fault")
+        self.assertIn("future_key", found["problem"])
+
+    def test_new_code_that_cannot_read_config_is_not_started(self):
+        found = self.case(r'''
+import subprocess
+mode = {"config": 1}
+execs = []
+def fake_sh(argv, **kw):
+    if argv[-1] == serve.IMPORT_CHECK:
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    if argv[-1] == serve.CONFIG_CHECK:
+        return subprocess.CompletedProcess(argv, mode["config"], "", "ValueError: cannot read")
+    return subprocess.CompletedProcess(argv, 1, "", "")
+changed = frozenset({("changed", 1, 1)})
+def reload_server():
+    server, said = quiet_server()
+    server.busy_with = lambda: ""
+    server.lock = util.lock_file(serve.SERVE_LOCK)
+    server.code, server.code_seen = frozenset(), changed
+    return server, said
+def settle():
+    os.environ.pop(serve.SERVE_LOCK_FD, None)
+    os.environ.pop(serve.RESTARTED_FOR_NEW_CODE, None)
+with mock.patch.object(serve, "code_stamp", lambda: changed), mock.patch.object(util, "sh", fake_sh), \
+        mock.patch.object(os, "execv", lambda *a: execs.append(a)):
+    server, said = reload_server()
+    server.load_new_code()
+    server.tick()
+    server.load_new_code()
+    beat = util.read_json(control.BEAT_FILE, {})
+    refused = {"execs": len(execs), "said": len([s for s in said if "new code cannot read config.toml" in s]),
+               "beat": beat.get("code_problem", ""), "running": state.runs_marked_running()}
+    mode["config"] = 0
+    server.load_new_code()
+    passed = {"execs": len(execs), "problem": server.code_problem}
+    settle()
+    execs.clear()
+    mode["config"] = 1
+    write(BAD)
+    broken, _ = reload_server()
+    broken.load_new_code()
+    escaped = len(execs)
+    settle()
+    execs.clear()
+    write(GOOD)
+    server, said = reload_server()
+    server.load_new_code()
+with mock.patch.object(serve, "code_stamp", lambda: server.code):
+    server.load_new_code()
+result(refused=refused, passed=passed, escaped=escaped, reverted=server.code_problem)
+''')
+        self.assertEqual((found["refused"]["execs"], found["refused"]["said"]), (0, 1))
+        self.assertIn("cannot read", found["refused"]["beat"])
+        self.assertEqual(found["refused"]["running"], [])
+        self.assertEqual((found["passed"]["execs"], found["passed"]["problem"]), (1, ""))
+        self.assertEqual(found["escaped"], 1)
+        self.assertEqual(found["reverted"], "")
+
+    def test_old_run_child_survives_a_new_step_name(self):
+        baseline = OfflineWorkflowTests.workflow(self, "future-step-baseline")
+        edited = OfflineWorkflowTests.workflow(self, "future-step-appended")
+        self.assertTrue(edited["appended"])
+        self.assertEqual(baseline["status"], "done")
+        self.assertEqual((edited["status"], edited["steps"]), (baseline["status"], baseline["steps"]))
+
+    def test_the_serve_line_names_each_pause(self):
+        beat = {"alive": True, "pid": 1, "loops": 0, "off": 0, "running": 0, "pending": 0}
+        self.assertNotIn("does not load", cli.serve_line(beat))
+        line = cli.serve_line({**beat, "config_problem": "ValueError: [routing]: unknown key x",
+                               "code_problem": "new code cannot read config.toml"})
+        self.assertIn("serve: up", line)
+        self.assertIn("config does not load: ValueError: [routing]: unknown key x", line)
+        self.assertIn("new code cannot read config.toml", line)
+
+
+class ServeReloadTests(unittest.TestCase):
+    PRELUDE = ConfigForwardCompatTests.PRELUDE + r'''
+import http.client, http.server, socket, subprocess, types
+from arete import client, dashboard, delivery
+OWNER = "owner@example.test"
+CHANGED = frozenset({("changed", 1, 1)})
+real_sh = util.sh
+who = [OWNER]
+dashboard.Logins.of = lambda self, address: who[0]
+NODE = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), OWNER, "127.0.0.1")
+def listen(logins, handler):
+    web = dashboard.Server("127.0.0.1", 0, NODE, logins, True, handler=handler)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    return web
+web = listen(dashboard.Logins(None), dashboard.Handler)
+PORT = web.server_address[1]
+gate, sending = threading.Event(), threading.Event()
+def fake_notify(item, batch, loop, run, cfg):
+    sending.set()
+    if not gate.wait(20):
+        raise TimeoutError("fixture gate never opened")
+    return "sent"
+delivery.EMITS["notify"].execute = fake_notify
+def approval():
+    return state.add_approval("demo", "", {"type": "notify", "item": {"title": "t", "message": "m"}}, "summary")
+def status_of(n):
+    return state.approval(n)["status"]
+def post(n, body=b'{"approve": true}', host="127.0.0.1", port=None, header=("X-Arete", "1"), extra=None):
+    conn = http.client.HTTPConnection("127.0.0.1", port or PORT, timeout=20)
+    conn.request("POST", f"/api/approvals/{n}", body, {"Host": host, **dict([header] if header else []), **(extra or {})})
+    resp = conn.getresponse()
+    answer = {"status": resp.status, "retry": resp.getheader("Retry-After"), "body": json.loads(resp.read())}
+    conn.close()
+    return answer
+def page():
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=20)
+    conn.request("GET", "/", headers={"Host": "127.0.0.1"})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    return resp.status
+def raw(n, length):
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    s.sendall(f"POST /api/approvals/{n} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Arete: 1\r\n{length}Connection: close\r\n\r\n".encode())
+    data = b""
+    while chunk := s.recv(4096):
+        data += chunk
+    s.close()
+    head = data.split(b"\r\n\r\n")[0].decode()
+    return {"status": int(head.split()[1]), "retry": "Retry-After: 3" in head}
+def background(fn):
+    box = {}
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:
+            box["error"] = repr(e)
+    box["thread"] = threading.Thread(target=run)
+    box["thread"].start()
+    return box
+def finish(box):
+    box["thread"].join(20)
+    return box.get("value", box.get("error", "still running"))
+def wait_for(ready):
+    end = time.monotonic() + 10
+    while not ready():
+        if time.monotonic() > end:
+            raise TimeoutError("fixture condition never held")
+        time.sleep(0.01)
+def reload_server():
+    server, said = quiet_server()
+    server.lock = util.lock_file(serve.SERVE_LOCK)
+    server.code, server.code_seen = frozenset(), CHANGED
+    return server, said
+def passing(argv, **kw):
+    if argv[-1] in (serve.IMPORT_CHECK, serve.CONFIG_CHECK):
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return real_sh(argv, **kw)
+def attempt(server, sh, execv):
+    try:
+        with mock.patch.object(serve, "code_stamp", lambda: CHANGED), mock.patch.object(util, "sh", sh), \
+                mock.patch.object(os, "execv", execv):
+            server.load_new_code()
+    except BaseException as e:
+        return repr(e)
+    finally:
+        os.environ.pop(serve.SERVE_LOCK_FD, None)
+        os.environ.pop(serve.RESTARTED_FOR_NEW_CODE, None)
+    return ""
+'''
+    environment = ConfigForwardCompatTests.environment
+    program = ConfigForwardCompatTests.program
+    case = ConfigForwardCompatTests.case
+
+    def test_a_post_during_the_import_check_holds_the_restart(self):
+        found = self.case(r'''
+n, started, execs = approval(), [], []
+def probing(argv, **kw):
+    if argv[-1] == serve.IMPORT_CHECK and not started:
+        started.append(background(lambda: post(n)))
+        wait_for(lambda: dashboard.POSTS_IN_FLIGHT.count == 1 and sending.is_set())
+    return passing(argv, **kw)
+def record(*a):
+    execs.append({"count": dashboard.POSTS_IN_FLIGHT.count, "closed": dashboard.POSTS_IN_FLIGHT.closed,
+                  "status": status_of(n)})
+    raise OSError("fixture refuses to exec")
+server, said = reload_server()
+first = attempt(server, probing, record)
+held = {"execs": len(execs), "said": [s for s in said if "new code waits to load" in s],
+        "closed": dashboard.POSTS_IN_FLIGHT.closed, "status": status_of(n), "error": first}
+gate.set()
+answer = finish(started[0])
+after = {"status": status_of(n), "count": dashboard.POSTS_IN_FLIGHT.count}
+second = attempt(server, probing, record)
+result(held=held, answer=answer, after=after, second=second, execs=execs,
+       closed=dashboard.POSTS_IN_FLIGHT.closed, inheritable=os.get_inheritable(server.lock.fileno()))
+''')
+        self.assertEqual(found["held"], {"execs": 0, "closed": False, "status": "approved", "error": "", "said": [
+            found["held"]["said"][0]]})
+        self.assertTrue(found["held"]["said"][0].endswith("new code waits to load: the dashboard is still answering a request"))
+        self.assertEqual((found["answer"]["status"], found["answer"]["retry"]), (200, None))
+        self.assertIn("sent", json.dumps(found["answer"]["body"]))
+        self.assertEqual(found["after"], {"status": "done", "count": 0})
+        self.assertIn("OSError", found["second"])
+        self.assertEqual(found["execs"], [{"count": 0, "closed": True, "status": "done"}])
+        self.assertFalse(found["closed"])
+        self.assertFalse(found["inheritable"])
+
+    def test_a_closed_gauge_answers_503_and_keeps_the_approval_for_a_second_try(self):
+        found = self.case(r'''
+gate.set()
+a = approval()
+dashboard.POSTS_IN_FLIGHT.close()
+refused = post(a)
+during = {"status": status_of(a), "listed": a in [x["id"] for x in state.approvals()],
+          "count": dashboard.POSTS_IN_FLIGHT.count}
+foreign = post(a, host="foreign.invalid")
+who[0] = "someone@else.test"
+stranger = post(a)
+who[0] = OWNER
+unmarked = post(a, header=None)
+lengths = {"missing": raw(a, ""), "invalid": raw(a, "Content-Length: abc\r\n")}
+fronted = listen(dashboard.FrontedLogins(), dashboard.FrontedHandler)
+port = fronted.server_address[1]
+through = {"owner": post(a, port=port, extra={client.IDENTITY_HEADER: OWNER})["status"],
+           "stranger": post(a, port=port, extra={client.IDENTITY_HEADER: "someone@else.test"})["status"]}
+reading = page()
+dashboard.POSTS_IN_FLIGHT.reopen()
+again = post(a)
+result(refused=refused, text=dashboard.RESTARTING, during=during, foreign=foreign["status"],
+       stranger=stranger["status"], unmarked=unmarked["status"], lengths=lengths, through=through, reading=reading,
+       again=again, status=status_of(a), count=dashboard.POSTS_IN_FLIGHT.count, kept=status_of(a))
+''')
+        self.assertEqual((found["refused"]["status"], found["refused"]["retry"]), (503, "3"))
+        self.assertEqual(found["refused"]["body"], {"error": found["text"]})
+        self.assertEqual(found["during"], {"status": "pending", "listed": True, "count": 0})
+        self.assertEqual((found["foreign"], found["stranger"], found["unmarked"]), (421, 403, 403))
+        self.assertEqual(found["lengths"], {"missing": {"status": 503, "retry": True},
+                                            "invalid": {"status": 503, "retry": True}})
+        self.assertEqual(found["through"], {"owner": 503, "stranger": 403})
+        self.assertEqual(found["reading"], 200)
+        self.assertEqual((found["again"]["status"], found["again"]["retry"]), (200, None))
+        self.assertEqual((found["status"], found["count"]), ("done", 0))
+
+    def test_a_restart_that_does_not_happen_leaves_posts_open(self):
+        found = self.case(r'''
+gate.set()
+def CP(argv, code, err=""):
+    return subprocess.CompletedProcess(argv, code, "", err)
+def refusing(import_code, config_code=0):
+    def sh(argv, **kw):
+        seen.append(dashboard.POSTS_IN_FLIGHT.closed)
+        if argv[-1] == serve.IMPORT_CHECK:
+            return CP(argv, import_code, "SyntaxError: broken" if import_code else "")
+        if argv[-1] == serve.CONFIG_CHECK:
+            return CP(argv, config_code, "ValueError: cannot read" if config_code else "")
+        return real_sh(argv, **kw)
+    return sh
+def works():
+    return post(approval())["status"]
+def count_exec(*a):
+    execs.append(1)
+def raising(*a):
+    execs.append(1)
+    raise OSError("fixture refuses to exec")
+found = {}
+def run(name, sh, execv=count_exec, server=None, around=None):
+    global seen, execs
+    seen, execs = [], []
+    server, said = server or reload_server()
+    error = attempt(server, sh, execv)
+    found[name] = {"seen": seen, "execs": len(execs), "error": error, "said": " | ".join(said),
+                   "closed": dashboard.POSTS_IN_FLIGHT.closed, "works": works()}
+run("import", refusing(1))
+run("config", refusing(0, 1))
+run("execv", passing, raising)
+server, said = reload_server()
+calls = []
+def second_busy_fails():
+    calls.append(1)
+    if len(calls) == 2:
+        raise RuntimeError("fixture busy failure")
+    return ""
+server.busy_with = second_busy_fails
+run("busy", passing, server=(server, said))
+with mock.patch.object(serve, "child_pids", mock.Mock(side_effect=RuntimeError("fixture pgrep failure"))):
+    run("children", passing)
+flag = [False]
+def work_starts(argv, **kw):
+    flag[0] = argv[-1] == serve.IMPORT_CHECK or flag[0]
+    return passing(argv, **kw)
+with mock.patch.object(serve.chat, "any_busy", lambda: flag[0]):
+    run("chat", work_starts)
+flag[0] = False
+with mock.patch.object(serve.capture, "checking", lambda: flag[0]):
+    run("capture", work_starts)
+result(**found)
+''', timeout=180)
+        self.assertEqual(found["import"]["seen"], [False])
+        self.assertIn("new code does not import", found["import"]["said"])
+        self.assertIn("new code cannot read config.toml", found["config"]["said"])
+        self.assertEqual(set(found["config"]["seen"]), {False})
+        self.assertIn("OSError", found["execv"]["error"])
+        self.assertIn("RuntimeError", found["busy"]["error"])
+        self.assertIn("RuntimeError", found["children"]["error"])
+        self.assertIn("a chat message is still running", found["chat"]["said"])
+        self.assertIn("a feedback request is still being checked or filed", found["capture"]["said"])
+        for name in ("import", "config", "busy", "children", "chat", "capture"):
+            self.assertEqual(found[name]["execs"], 0, name)
+        self.assertEqual(found["execv"]["execs"], 1)
+        for name, one in found.items():
+            self.assertEqual((one["closed"], one["works"]), (False, 200), name)
+
+    def test_the_client_sends_a_restart_503_again_and_fails_everything_else_at_once(self):
+        found = self.case(r'''
+RESTART = {"error": dashboard.RESTARTING}
+class Clock:
+    def __init__(self):
+        self.now, self.slept = 0.0, []
+    def monotonic(self):
+        return self.now
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+def scripted(replies):
+    seen = []
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append((self.path, self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            status, headers, body = replies[min(len(seen) - 1, len(replies) - 1)]
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+def dead_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+def live(srv, fn=None):
+    calls = []
+    def where():
+        calls.append(1)
+        port = srv.server_address[1] if fn is None or fn(len(calls)) else dead_port()
+        return client.Server("http", "127.0.0.1", port, "127.0.0.1")
+    return where
+def go(replies, fn=None, clock=None, path="/probe"):
+    srv, seen = scripted(replies)
+    client.server = live(srv, fn)
+    out = {}
+    began = time.monotonic()
+    try:
+        if clock:
+            with mock.patch.object(client, "time", types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)):
+                out["answer"] = client.call("POST", path, {"value": 1})
+        else:
+            out["answer"] = client.call("POST", path, {"value": 1})
+    except client.Failed as e:
+        out["failed"] = {"code": e.code, "text": str(e)}
+    except client.Down as e:
+        out["down"] = str(e)
+    srv.shutdown()
+    return {**out, "requests": len(seen), "same": len(set(seen)) == 1, "elapsed": time.monotonic() - began}
+OK = (200, {}, {"ok": True})
+r503 = lambda after: (503, {"Retry-After": after}, RESTART)
+clock = Clock()
+repeated = go([r503("10")], clock=clock)
+repeated["slept"] = clock.slept
+clock = Clock()
+expiry = go([r503("10"), r503("10"), r503("10"), OK], clock=clock)
+expiry["slept"] = clock.slept
+clock = Clock()
+dropped = go([r503("1"), OK], fn=lambda n: n != 2, clock=clock)
+dropped["slept"] = clock.slept
+clock = Clock()
+never = go([r503("1")], fn=lambda n: n == 1, clock=clock)
+never["slept"] = clock.slept
+clock = Clock()
+client.server = lambda: client.Server("http", "127.0.0.1", dead_port(), "127.0.0.1")
+try:
+    with mock.patch.object(client, "time", types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)):
+        client.call("POST", "/probe", {})
+    initial = "no error"
+except client.Down:
+    initial = "down"
+result(again=go([r503("0"), OK]), slow=go([r503("1"), OK]), none=go([(503, {}, RESTART)]),
+       invalid=go([(503, {"Retry-After": "soon"}, RESTART)]), other=go([(409, {"Retry-After": "1"}, {"error": "Busy."})]),
+       repeated=repeated, expiry=expiry, dropped=dropped, never=never, initial=initial, initial_sleeps=clock.slept)
+''', timeout=180)
+        self.assertEqual((found["again"]["answer"], found["again"]["requests"], found["again"]["same"]), ({"ok": True}, 2, True))
+        self.assertEqual((found["slow"]["answer"], found["slow"]["requests"]), ({"ok": True}, 2))
+        self.assertGreaterEqual(found["slow"]["elapsed"], 0.9)
+        for name, code in (("none", 503), ("invalid", 503), ("other", 409)):
+            self.assertEqual((found[name]["requests"], found[name]["failed"]["code"]), (1, code), name)
+        self.assertEqual(found["other"]["failed"]["text"], "Busy.")
+        self.assertEqual(found["none"]["failed"]["text"], "Arete is loading new code. Send this again in a few seconds.")
+        self.assertEqual(found["repeated"]["failed"], {"code": 503, "text": "Arete is loading new code. Send this again in a few seconds."})
+        self.assertEqual((found["repeated"]["requests"], found["repeated"]["slept"]), (3, [10, 10, 10]))
+        self.assertEqual((found["expiry"]["requests"], found["expiry"]["slept"]), (3, [10, 10, 10]))
+        self.assertEqual(found["expiry"]["failed"]["code"], 503)
+        self.assertNotIn("answer", found["expiry"])
+        self.assertEqual((found["dropped"]["answer"], found["dropped"]["slept"]), ({"ok": True}, [1, 2]))
+        self.assertEqual(found["never"]["failed"]["code"], 503)
+        self.assertEqual(sum(found["never"]["slept"]), 30)
+        self.assertEqual((found["initial"], found["initial_sleeps"]), ("down", []))
+
+
+class LoopMarkAndDurableWriteTests(unittest.TestCase):
+    PRELUDE = r'''
+import contextlib, fcntl, io, json, os, sqlite3, subprocess, sys, time
+from pathlib import Path
+from unittest import mock
+from arete import board, config, heartbeat, paths, pipeline, record, state, util
+'''
+    MARKER = "RESULT:"
+
+    def session(self, body, setup=True):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for name in ("config", "state", "logs", "worktrees", "tmp", "home"):
+                (root / name).mkdir()
+            (root / "config" / "config.toml").write_text("[replay]\nall = true\n")
+            env = {k: v for k, v in os.environ.items() if k != "ARETE_LOOP"}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            script = self.PRELUDE + ("state.ensure_schema()\n" if setup else "") + body
+            done = subprocess.run([sys.executable, "-c", script, str(root)], env=env, cwd=SOURCE,
+                                  capture_output=True, text=True, timeout=300)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            line = next(x for x in done.stdout.splitlines() if x.startswith(self.MARKER))
+            return json.loads(line[len(self.MARKER):])
+
+    def test_two_loops_marking_together_keep_both_marks(self):
+        found = self.session(r'''
+root = Path(sys.argv[1])
+child = ("import sys, time\nfrom pathlib import Path\nfrom arete import heartbeat\nstop, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
+         "n = 0\nwhile not stop.exists():\n    heartbeat.mark_loop('research', True, 'nothing due')\n    n += 1\n"
+         "    if n == 3: ready.write_text('x')\n")
+trials = []
+for i in range(20):
+    stop, ready = root / f"stop{i}", root / f"ready{i}"
+    research = subprocess.Popen([sys.executable, "-c", child, str(stop), str(ready)])
+    try:
+        deadline = time.time() + 60
+        while not ready.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        poll = subprocess.run([sys.executable, "-c", "from arete import heartbeat\nheartbeat.mark_loop('poll', False, 'gh: HTTP 502')"])
+        time.sleep(0.05)
+    finally:
+        stop.write_text("x")
+        code = research.wait(timeout=60)
+    marks = state.loop_marks()
+    shown = {c["name"]: c for c in board.checks()["loops"]}
+    trials.append([poll.returncode, code, marks["poll"]["ok"], marks["poll"]["detail"], marks["research"]["ok"],
+                   shown["poll"]["ok"]])
+    state.set_loop_state("poll", mark_ok=None, mark_detail="", mark_at=None)
+print("RESULT:" + json.dumps({"trials": trials, "legacy": (paths.STATE_DIR / "loops.json").exists()}))
+''')
+        self.assertEqual(len(found["trials"]), 20)
+        for trial in found["trials"]:
+            self.assertEqual(trial, [0, 0, False, "gh: HTTP 502", True, False])
+        self.assertFalse(found["legacy"])
+
+    def test_a_failed_mark_fails_the_loop_check_and_the_legacy_file_is_ignored_and_removed(self):
+        found = self.session(r'''
+cfg = config.load()
+planted = paths.STATE_DIR / "loops.json"
+def plant(ok, detail):
+    planted.write_text(json.dumps({"poll": {"ts": util.iso(), "ok": ok, "detail": detail}}))
+def poll_check():
+    return next(c for c in heartbeat.check_loops(cfg) if c.key == "loop:poll")
+rid = record.start("loop", loop="poll", loop_kind="command")
+record.settle(rid, "done")
+plant(True, "legacy ok")
+heartbeat.mark_loop("poll", False, "gh: HTTP 502")
+failed = poll_check()
+heartbeat.mark_loop("poll", True, "recovered")
+plant(False, "legacy failed")
+cleared = poll_check()
+def empty(name):
+    def check(*a, **k):
+        return []
+    check.__name__ = name
+    return check
+stubs = [mock.patch.object(heartbeat, n, empty(n)) for n in (
+    "check_jobs", "check_probes", "check_claude_auth", "check_codex_auth", "check_codex_cleanup", "check_pi_auth",
+    "check_hook", "check_disk", "check_serve", "check_backups", "check_costs", "check_oncall", "check_workspaces",
+    "check_scratch")]
+def no_wait(*a, **k):
+    raise AssertionError("waited for the network")
+raised, cleared_keys = [], []
+runs = []
+with contextlib.ExitStack() as stack:
+    for s in stubs:
+        stack.enter_context(s)
+    stack.enter_context(mock.patch.object(util, "online", return_value=True))
+    stack.enter_context(mock.patch.object(util, "wait_for_network", no_wait))
+    stack.enter_context(mock.patch.object(heartbeat.install, "rotate_logs"))
+    stack.enter_context(mock.patch.object(heartbeat.alerts, "raise_alert", lambda repo, key, *a: raised.append(key)))
+    stack.enter_context(mock.patch.object(heartbeat.alerts, "clear_alert", lambda repo, key, *a: cleared_keys.append(key)))
+    heartbeat.mark_loop("poll", False, "gh: HTTP 502")
+    plant(True, "legacy ok")
+    runs.append([heartbeat.run(quiet=True), planted.exists(), list(raised)])
+    heartbeat.mark_loop("poll", True, "fine")
+    plant(False, "legacy failed")
+    runs.append([heartbeat.run(quiet=True), planted.exists(), "loop:poll" in cleared_keys])
+print("RESULT:" + json.dumps({"failed": [failed.ok, failed.detail], "cleared": [cleared.ok, cleared.detail], "runs": runs}))
+''')
+        self.assertFalse(found["failed"][0])
+        self.assertIn("failed: gh: HTTP 502", found["failed"][1])
+        self.assertTrue(found["cleared"][0])
+        self.assertNotIn("failed:", found["cleared"][1])
+        self.assertEqual(found["runs"], [[1, False, ["loop:poll"]], [0, False, True]])
+
+    def test_a_corrupt_json_file_is_logged_once_per_version(self):
+        found = self.session(r'''
+p = paths.STATE_DIR / "triage.json"
+default = {"d": 1}
+def read():
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        value = util.read_json(p, default)
+    return [value, err.getvalue()]
+out = {"missing": read()}
+p.write_text('{"issue":')
+out["first"], out["second"] = read(), read()
+p.write_text('{"issue": [')
+out["changed"] = read()
+p.write_text("")
+out["empty"] = read()
+p.write_text('{"ok": true}')
+out["valid"] = read()
+print("RESULT:" + json.dumps(out))
+''', setup=False)
+        self.assertEqual(found["missing"], [{"d": 1}, ""])
+        for key in ("first", "changed", "empty"):
+            self.assertEqual(found[key][0], {"d": 1})
+            self.assertEqual(found[key][1].count("\n"), 1)
+            self.assertIn("triage.json", found[key][1])
+        self.assertEqual(found["second"], [{"d": 1}, ""])
+        self.assertEqual(found["valid"], [{"ok": True}, ""])
+
+    def test_a_failed_replace_keeps_the_old_file_and_leaves_no_draft(self):
+        found = self.session(r'''
+folder = Path(sys.argv[1]) / "w"
+folder.mkdir()
+run = pipeline.Run.__new__(pipeline.Run)
+run.dir = folder
+(folder / "a.json").write_text("old-a")
+(folder / "b.json").write_text("old-b")
+out = {}
+for name, call in (("save", lambda: run.save("a.json", {"x": 1})), ("json", lambda: util.write_json(folder / "b.json", {"x": 1}))):
+    with mock.patch.object(util.os, "replace", side_effect=OSError("boom")):
+        try:
+            call()
+            out[name] = "no error"
+        except OSError as e:
+            out[name] = str(e)
+out["files"] = sorted(x.name for x in folder.iterdir())
+out["bytes"] = [(folder / "a.json").read_text(), (folder / "b.json").read_text()]
+print("RESULT:" + json.dumps(out))
+''')
+        self.assertEqual((found["save"], found["json"]), ("boom", "boom"))
+        self.assertEqual(found["files"], ["a.json", "b.json"])
+        self.assertEqual(found["bytes"], ["old-a", "old-b"])
+
+    def test_a_durable_write_syncs_the_file_before_replace_and_the_folder_after(self):
+        found = self.session(r'''
+folder = Path(sys.argv[1]) / "w"
+folder.mkdir()
+run = pipeline.Run.__new__(pipeline.Run)
+run.dir = folder
+real = {"fcntl": fcntl.fcntl, "fsync": os.fsync, "replace": os.replace}
+def trial(call, fullsync_fails=False):
+    events = []
+    def fcntl_spy(fd, op, *a):
+        events.append("fullsync")
+        if fullsync_fails:
+            raise OSError("no")
+        return real["fcntl"](fd, op, *a)
+    def fsync_spy(fd):
+        events.append("fsync")
+        return real["fsync"](fd)
+    def replace_spy(a, b):
+        events.append("replace")
+        return real["replace"](a, b)
+    with mock.patch.object(util.fcntl, "fcntl", fcntl_spy), mock.patch.object(util.os, "fsync", fsync_spy), \
+            mock.patch.object(util.os, "replace", replace_spy):
+        call()
+    return events
+out = {"save": trial(lambda: run.save("s.txt", "plain text")),
+       "json": trial(lambda: util.write_json(folder / "j.json", {"x": 1})),
+       "fallback": trial(lambda: util.write_json(folder / "k.json", {"x": 2}), True)}
+with mock.patch.object(util.fcntl, "F_FULLFSYNC", create=True), mock.patch.object(util, "fcntl", mock.Mock(spec=[])), \
+        mock.patch.object(util.os, "fsync") as fsync:
+    util.write_json(folder / "m.json", {"x": 3})
+    out["missing_constant_fsyncs"] = fsync.call_count
+out["modes"] = [oct((folder / n).stat().st_mode & 0o777) for n in ("s.txt", "j.json")]
+out["text"] = (folder / "s.txt").read_text()
+out["json_back"] = json.loads((folder / "j.json").read_text())
+print("RESULT:" + json.dumps(out))
+''')
+        for key in ("save", "json"):
+            self.assertEqual(found[key][-2:], ["replace", "fsync"], key)
+            self.assertLess(found[key].index("fullsync") if "fullsync" in found[key] else 0, found[key].index("replace"))
+        self.assertEqual(found["fallback"][:3], ["fullsync", "fsync", "replace"])
+        self.assertEqual(found["missing_constant_fsyncs"], 2)
+        self.assertEqual(found["modes"], ["0o600", "0o600"])
+        self.assertEqual(found["text"], "plain text")
+        self.assertEqual(found["json_back"], {"x": 1})
+
+    def test_an_unmigrated_database_shows_no_marks_and_marking_keeps_scheduling_columns(self):
+        found = self.session(r'''
+old = Path(sys.argv[1]) / "old.db"
+c = sqlite3.connect(old)
+c.executescript(state.SCHEMA)
+c.execute("INSERT INTO loop_state (loop) VALUES ('poll')")
+c.commit()
+before = [r[1] for r in c.execute("PRAGMA table_info(loop_state)")]
+c.close()
+real = paths.DB_FILE
+paths.DB_FILE = old
+try:
+    unmigrated = [state.loop_marks(connect=state.reader), board.checks()["loops"]]
+finally:
+    paths.DB_FILE = real
+c = sqlite3.connect(old)
+after = [r[1] for r in c.execute("PRAGMA table_info(loop_state)")]
+c.close()
+state.set_loop_state("research", data={"k": 1}, last_fire="2026-01-01T00:00:00Z", next_due="2026-01-02T00:00:00Z", metric_on=1)
+heartbeat.mark_loop("research", True, "ok")
+row = state.loop_state("research")
+print("RESULT:" + json.dumps({"unmigrated": unmigrated, "same": before == after, "new": "mark_at" in after,
+                              "row": [row["data"], row["last_fire"], row["next_due"], row["metric_on"], row["mark_detail"]]}))
+''')
+        self.assertEqual(found["unmigrated"], [{}, []])
+        self.assertTrue(found["same"])
+        self.assertFalse(found["new"])
+        self.assertEqual(found["row"], [{"k": 1}, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", 1, "ok"])
 
 
 if __name__ == "__main__":

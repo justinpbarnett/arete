@@ -4,7 +4,7 @@ import json
 import re
 import socket
 from collections import Counter, defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from string import Template
 
@@ -34,6 +34,10 @@ from .pipeline import (
 from .util import git
 
 MAX_PROPOSALS = 8
+MAX_CATCHUP = timedelta(days=7)
+SETTLE_LAG = timedelta(minutes=2)
+WINDOW_TRIGGER = "mine-window"
+HOURS_TRIGGER = "mine-hours"
 MIN_CONFIDENCE = 0.6
 HEADLESS_ENTRYPOINT = "sdk-cli"
 LEARNABLE = ("In this digest of a person working with a coding agent, does the person correct the agent, interrupt it, "
@@ -115,7 +119,7 @@ def _tool_summary(block: dict) -> str:
     return f"{block.get('name')}({_short(str(detail), 120)})"
 
 
-def session_digest(path: Path, since_ts: float) -> dict | None:
+def session_digest(path: Path, since_ts: float, until_ts: float) -> dict | None:
     items, cwd, sid, entry = [], "", path.stem, None
     last_agent, tools_by_id, recent_tools = "", {}, []
     n_human, strikes, replies = 0, 0, 0
@@ -134,6 +138,8 @@ def session_digest(path: Path, since_ts: float) -> dict | None:
             t = util.parse_iso(ts).timestamp() if ts else 0
         except ValueError:
             t = 0
+        if t >= until_ts:
+            continue
         typ = d.get("type")
         msg = d.get("message") or {}
         if typ == "assistant":
@@ -193,9 +199,8 @@ def session_digest(path: Path, since_ts: float) -> dict | None:
     return {"session": sid[:8], "cwd": cwd, "items": items, "signal": strikes * 3 + replies}
 
 
-def collect(hours: float) -> list[dict]:
-    since = util.now() - timedelta(hours=hours)
-    since_ts = since.timestamp()
+def collect(since: datetime, until: datetime) -> list[dict]:
+    since_ts, until_ts = since.timestamp(), until.timestamp()
     out = []
     for f in paths.CLAUDE_PROJECTS_DIR.glob("*/*.jsonl"):
         try:
@@ -203,7 +208,7 @@ def collect(hours: float) -> list[dict]:
                 continue
         except OSError:
             continue
-        d = session_digest(f, since_ts)
+        d = session_digest(f, since_ts, until_ts)
         if d:
             out.append(d)
     return sorted(out, key=lambda d: -d["signal"])
@@ -320,9 +325,9 @@ def run_digest(run: dict) -> dict:
             "status": run["status"], "minutes": max(0, run["seconds"] / 60 - run["wait_minutes"])}
 
 
-def collect_runs(since: str) -> tuple[list[dict], int]:
+def collect_runs(since: str, until: str = "9999") -> tuple[list[dict], int]:
     flagged, clean_runs = [], 0
-    for row in record.runs_since(since):
+    for row in record.runs_since(since, until):
         if row["kind"] in UNRECORDED_KINDS:
             continue
         run = record.read_run(row["id"])
@@ -370,8 +375,8 @@ def render_digest(cfg: config.Config, sessions: list[dict], limit: int) -> tuple
     return "\n".join(parts), n
 
 
-def render_events(cfg: config.Config, hours: float) -> str:
-    evs = [e for e in hook.read_events(hours) if not e.get("agent")]
+def render_events(cfg: config.Config, since: datetime, until: datetime) -> str:
+    evs = [e for e in hook.read_events(since_ts=since.timestamp(), until_ts=until.timestamp()) if not e.get("agent")]
     if not evs:
         return "## Tool failure stats\n\n(no hook events recorded in this window)"
     by = Counter()
@@ -651,7 +656,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
     try:
         res = apply_in(cfg, run_id, wt, props)
         if not res.ok:
-            return "", []
+            raise RuntimeError(f"apply model call failed: {util.first_line(res.error or '', 150)}")
         diff = diffguard.stage(wt)
         landed = [p for p in props if p["file"] in diff.counts]
         if not landed:
@@ -690,15 +695,15 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
 def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:
     paths.ensure_dirs()
     cfg = config.load()
-    given = hours
-    hours = hours or cfg.miner_lookback_hours
     with util.lock(state.run_lock("miner")) as got:
         if not got:
             print("miner already running")
             return 0
-        run_id = record.new_id("min") if dry_run else record.start("miner", lock=state.run_lock("miner"))
+        since, until, checkpointed, lost = window(cfg, hours, util.now())
+        run_id = (record.new_id("min") if dry_run else
+                  record.start("miner", lock=state.run_lock("miner"), trigger=WINDOW_TRIGGER if checkpointed else HOURS_TRIGGER))
         try:
-            code = _run(cfg, run_id, hours, dry_run, apply, recorded_since(cfg, given))
+            code = _run(cfg, run_id, since, until, checkpointed and not dry_run, lost, dry_run, apply)
             if not dry_run:
                 mark_loop("mine", code == 0)
             return code
@@ -710,46 +715,66 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
             return 1
 
 
-def recorded_since(cfg: config.Config, hours: float | None) -> str:
+def window(cfg: config.Config, hours: float | None, now: datetime) -> tuple[datetime, datetime, bool, str]:
+    now = now.replace(microsecond=0)
     if hours:
-        return util.iso(util.now() - timedelta(hours=hours))
-    last = state.runs(kind="miner", statuses=("pr", "noop"), limit=1)
-    return last[0]["started"] if last else util.iso(util.now() - timedelta(hours=cfg.miner_lookback_hours))
+        until = now + timedelta(seconds=1)
+        return until - timedelta(hours=hours), until, False, ""
+    until = now - SETTLE_LAG
+    if marked := state.mined_until():
+        since = util.parse_iso(marked)
+    elif legacy := [r for r in state.runs(kind="miner", statuses=("pr", "noop"), limit=50)
+                    if r["trigger"] not in (WINDOW_TRIGGER, HOURS_TRIGGER)]:
+        since = util.parse_iso(legacy[0]["started"])
+    else:
+        since = until - timedelta(hours=cfg.miner_lookback_hours)
+    if since >= until - MAX_CATCHUP:
+        return since, until, True, ""
+    lost = f"window capped at 7 days: skipped {util.iso(since)} to {util.iso(until - MAX_CATCHUP)}"
+    return until - MAX_CATCHUP, until, True, lost
 
 
-def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bool, since: str) -> int:
+def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, checkpointed: bool, lost: str,
+         dry_run: bool, apply: bool) -> int:
+    if lost:
+        print(f"miner: {lost}")
+    checkpoint = {"mined_until": util.iso(until)} if checkpointed else {}
+    since_iso, until_iso = util.iso(since), util.iso(until)
+    hours = round((until - since).total_seconds() / 3600, 1)
     if not dry_run:
         sync_feedback()
-    sessions_found = collect(hours)
-    flagged, clean_runs = collect_runs(since)
+    sessions_found = collect(since, until)
+    flagged, clean_runs = collect_runs(since_iso, until_iso)
     flagged = worth_mining(cfg, run_id, flagged, recorded=True)
     records, recorded_used = render_runs(flagged, cfg.miner_max_digest_chars // RECORDED_SHARE)
     sessions = worth_mining(cfg, run_id, sessions_found)
     digest, used = render_digest(cfg, sessions, cfg.miner_max_digest_chars - len(records))
     print(f"miner {run_id}: {len(sessions)} sessions with signal, {used} in digest, "
-          f"{len(flagged)} recorded runs with signal since {since} ({clean_runs} clean left out), "
+          f"{len(flagged)} recorded runs with signal since {since_iso} ({clean_runs} clean left out), "
           f"{recorded_used} in digest, {len(digest) + len(records)} chars")
-    records = records or f"(no recorded run since {since} failed, needed a retry, hit a budget or ran long)"
+    records = records or f"(no recorded run since {since_iso} failed, needed a retry, hit a budget or ran long)"
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
-    pr_feedback = state.feedback_since(util.iso(util.now() - timedelta(hours=hours)))
+    pr_feedback = state.feedback_between(since_iso, until_iso)
     mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
         pending=_fmt(state.proposals(status=["applied", "pending", "hand", "approve", "filing"])),
-        rejected=_fmt(state.proposals(status=["rejected"])),
-        events=render_events(cfg, hours), digest=digest, audit=auditor.latest_findings(),
-        feedback=render_feedback(pr_feedback), records=records, since=since,
+        done=_fmt(state.proposals(status=["memory", "filed", "merged"])),
+        rejected=_fmt(state.proposals(status=["rejected", "skipped"])),
+        events=render_events(cfg, since, until), digest=digest, audit=auditor.latest_findings(),
+        feedback=render_feedback(pr_feedback), records=records, since=since_iso,
     )
     run_dir = paths.RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(text)
     if not sessions and not flagged and not audit_wants_fixes and not pr_feedback:
-        record.settle(run_id, "noop", summary="no sessions or recorded runs in window")
+        record.settle(run_id, "noop", summary=cut_summary(lost, "no sessions or recorded runs in window"),
+                      **(checkpoint if mine_repos else {}))
         return 0
     if not mine_repos:
-        record.settle(run_id, "noop", summary="no repo with mine = true is checked out here")
+        record.settle(run_id, "noop", summary=cut_summary(lost, "no repo with mine = true is checked out here"))
         return 0
     res =runner.run(text, mine_repos[0].path, model=cfg.model("miner"), tools=runner.READ_TOOLS,
                      allowed_tools=runner.READ_TOOLS, json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]],
@@ -758,7 +783,7 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
                                                      "error": res.error}, indent=2))
     if not res.ok or not isinstance(res.structured, dict):
         print(f"miner: model call failed: {util.first_line(res.error)}")
-        record.settle(run_id, "failed", summary="model call failed")
+        record.settle(run_id, "failed", summary=cut_summary(lost, "model call failed"))
         return 1
     props = res.structured.get("proposals", [])[:MAX_PROPOSALS]
     by_repo: dict[str, list[dict]] = defaultdict(list)
@@ -803,6 +828,10 @@ def _run(cfg: config.Config, run_id: str, hours: float, dry_run: bool, apply: bo
             if name != cfg.global_repo:
                 eval_pr(cfg, cfg.repo(name), url, branch)
     summary = "; ".join([f"{len(props)} proposals, {len(opened)} PRs", *failures])
-    record.settle(run_id, "failed" if failures else "pr" if opened else "noop", summary=summary[:300],
-                  pr_url=" ".join(opened))
+    record.settle(run_id, "failed" if failures else "pr" if opened else "noop", summary=cut_summary(lost, summary),
+                  pr_url=" ".join(opened), **({} if failures else checkpoint))
     return 1 if failures else 0
+
+
+def cut_summary(lost: str, summary: str) -> str:
+    return "; ".join(part for part in (lost, summary) if part)[:300]

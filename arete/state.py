@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import sqlite3
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 
 from . import paths, util
 from .agent import KEY_PROVIDERS, SUBSCRIPTION_RUNNERS
 
-OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status = 'failed' AND runs.pr_url != ''))"
+OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
 PAID_STEP = (f"(CASE steps.auth_mode WHEN 'subscription' THEN 0 WHEN 'local' THEN 0 WHEN 'api_key' THEN 1 ELSE "
@@ -211,8 +212,17 @@ CREATE TABLE IF NOT EXISTS evals (
     seconds REAL,
     cost_usd REAL,
     ts TEXT,
-    source TEXT DEFAULT ''
+    source TEXT DEFAULT '',
+    engine_sha TEXT DEFAULT '',
+    prompts_sha TEXT DEFAULT '',
+    prompts_from TEXT DEFAULT '',
+    context_sha TEXT DEFAULT '',
+    settings TEXT DEFAULT '',
+    base_commit TEXT DEFAULT '',
+    after_step INTEGER DEFAULT 0,
+    last_step INTEGER DEFAULT 0
 );
+CREATE UNIQUE INDEX IF NOT EXISTS evals_key ON evals (run_id, repo, task);
 CREATE TABLE IF NOT EXISTS feedback (
     pr_url TEXT NOT NULL,
     kind TEXT NOT NULL,            -- review | line | comment
@@ -535,12 +545,24 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_purges (run_id TEXT PRIMARY KEY, reason TEXT NOT NULL, queued TEXT NOT NULL);
 """
-MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
+MIGRATIONS = [("cursors", "last_ok", "ALTER TABLE cursors ADD COLUMN last_ok TEXT"),
+("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
               ("runs", "files_purged", "ALTER TABLE runs ADD COLUMN files_purged TEXT"),
               ("queue", "attempts", "ALTER TABLE queue ADD COLUMN attempts INTEGER DEFAULT 0"),
               ("queue", "dead_at", "ALTER TABLE queue ADD COLUMN dead_at TEXT"),
               ("queue", "dead_reason", "ALTER TABLE queue ADD COLUMN dead_reason TEXT DEFAULT ''"),
 ("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+              ("evals", "engine_sha", "ALTER TABLE evals ADD COLUMN engine_sha TEXT DEFAULT ''"),
+              ("evals", "prompts_sha", "ALTER TABLE evals ADD COLUMN prompts_sha TEXT DEFAULT ''"),
+              ("evals", "prompts_from", "ALTER TABLE evals ADD COLUMN prompts_from TEXT DEFAULT ''"),
+              ("evals", "context_sha", "ALTER TABLE evals ADD COLUMN context_sha TEXT DEFAULT ''"),
+              ("evals", "settings", "ALTER TABLE evals ADD COLUMN settings TEXT DEFAULT ''"),
+              ("evals", "base_commit", "ALTER TABLE evals ADD COLUMN base_commit TEXT DEFAULT ''"),
+              ("evals", "after_step", "ALTER TABLE evals ADD COLUMN after_step INTEGER DEFAULT 0"),
+              ("evals", "last_step", "ALTER TABLE evals ADD COLUMN last_step INTEGER DEFAULT 0"),
+              ("loop_state", "mark_ok", "ALTER TABLE loop_state ADD COLUMN mark_ok INTEGER"),
+              ("loop_state", "mark_detail", "ALTER TABLE loop_state ADD COLUMN mark_detail TEXT DEFAULT ''"),
+              ("loop_state", "mark_at", "ALTER TABLE loop_state ADD COLUMN mark_at TEXT"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
               ("capture_evidence", "inspection", "ALTER TABLE capture_evidence ADD COLUMN inspection TEXT DEFAULT ''"),
@@ -565,6 +587,8 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
               ("triage", "in_sprint", "ALTER TABLE triage ADD COLUMN in_sprint INTEGER DEFAULT 0"),
               ("triage", "parent", "ALTER TABLE triage ADD COLUMN parent TEXT DEFAULT ''"),
               ("feedback", "asks", "ALTER TABLE feedback ADD COLUMN asks REAL"),
+              ("feedback", "recorded", "ALTER TABLE feedback ADD COLUMN recorded TEXT"),
+              ("runs", "mined_until", "ALTER TABLE runs ADD COLUMN mined_until TEXT"),
               ("triage_approvals", "tracker", "ALTER TABLE triage_approvals ADD COLUMN tracker TEXT DEFAULT 'jira'"),
               ("triage_approvals", "sent_by", "ALTER TABLE triage_approvals ADD COLUMN sent_by TEXT DEFAULT 'triage'"),
               *[("research", col, f"ALTER TABLE research ADD COLUMN {col} TEXT DEFAULT ''")
@@ -580,7 +604,7 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
                   ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
-                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("wait_minutes", "TEXT"), ("only_step", "TEXT DEFAULT ''"),
+                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("label_pending", "TEXT"), ("wait_minutes", "TEXT"), ("only_step", "TEXT DEFAULT ''"),
                   ("engine_sha", "TEXT"))],
               ("steps", "first_context_tokens", "ALTER TABLE steps ADD COLUMN first_context_tokens INTEGER DEFAULT 0"),
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
@@ -610,6 +634,10 @@ def refuse_empty_file() -> None:
                            f"`arete backup --restore {newest}` instead of starting over with an empty file")
 
 
+def columns(conn, table) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
 @contextmanager
 def db():
     paths.ensure_dirs()
@@ -619,17 +647,84 @@ def db():
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
         for table, column, sql in MIGRATIONS:
-            if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
-                conn.execute(sql)
+            if column not in columns(conn, table):
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    if column not in columns(conn, table):
+                        raise
         yield conn
         conn.commit()
     finally:
         conn.close()
 
 
+@contextmanager
+def transaction():
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        yield lambda: nullcontext(c)
+
+
 def ensure_schema() -> None:
     with db():
         pass
+
+
+def backfill_legacy_cost(before: dict | None = None) -> int:
+    before = {} if before is None else before
+    if not isinstance(before, dict) or any(not isinstance(k, str) or isinstance(v, bool)
+                                         or not isinstance(v, (int, float))
+                                         for k, v in before.items()):
+        raise ValueError("before must map run IDs to finite dollar amounts")
+    try:
+        before = {k: float(v) for k, v in before.items()}
+    except OverflowError:
+        raise ValueError("before must map run IDs to finite dollar amounts") from None
+    if any(not math.isfinite(v) for v in before.values()):
+        raise ValueError("before must map run IDs to finite dollar amounts")
+    with db() as c:
+        missing = sorted(set(before) - {r[0] for r in c.execute("SELECT id FROM runs")})
+        if missing:
+            raise ValueError(f"no run: {missing[0]}")
+        c.execute("""
+            WITH totals AS MATERIALIZED (
+                SELECT run_id, SUM(cost_usd) AS usd, SUM(tokens_in) AS tin, SUM(tokens_out) AS tout
+                FROM steps GROUP BY run_id
+            ), eligible AS MATERIALIZED (
+                SELECT runs.id, runs.started, COALESCE(runs.cost_usd, 0) AS usd,
+                       COALESCE(totals.usd, 0) AS spent,
+                       COALESCE(runs.tokens_in, 0) - COALESCE(totals.tin, 0) AS tin,
+                       COALESCE(runs.tokens_out, 0) - COALESCE(totals.tout, 0) AS tout,
+                       edits.value AS old
+                FROM runs LEFT JOIN totals ON totals.run_id = runs.id
+                LEFT JOIN json_each(?) AS edits ON edits.key = runs.id
+                WHERE runs.started < (SELECT MIN(ts) FROM steps)
+                  AND COALESCE(runs.cost_usd, 0) != COALESCE(totals.usd, 0)
+            )
+            INSERT INTO steps (run_id, step, kind, runner, ok, auth_mode, ts,
+                               cost_usd, tokens_in, tokens_out, error)
+            SELECT id, 'legacy', 'legacy', 'legacy', 1, 'subscription', started,
+                   COALESCE(old, usd) - spent, tin, tout, '' FROM eligible
+            UNION ALL
+            SELECT id, 'correction', 'correction', 'correction', 1, 'subscription', started,
+                   usd - old, 0, 0, 'legacy repricing from supplied before value'
+            FROM eligible WHERE old IS NOT NULL AND usd != old
+        """, (json.dumps(before),))
+        return c.execute("SELECT changes()").fetchone()[0]
+
+
+def cost_drift() -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("""
+            SELECT runs.id, COALESCE(runs.cost_usd, 0) AS run_usd,
+                   COALESCE(t.usd, 0) AS steps_usd,
+                   COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0) AS difference
+            FROM runs LEFT JOIN (SELECT run_id, SUM(cost_usd) AS usd FROM steps GROUP BY run_id) t
+            ON t.run_id = runs.id
+            WHERE ABS(COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0)) > 0.000001
+            ORDER BY runs.id
+        """)]
 
 
 @contextmanager
@@ -785,6 +880,13 @@ def loop_states(connect=db) -> dict[str, dict]:
         return {r["loop"]: {**dict(r), "data": json.loads(r["data"] or "{}")} for r in c.execute("SELECT * FROM loop_state")}
 
 
+def loop_marks(connect=db) -> dict[str, dict]:
+    with connect() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM loop_state")]
+    return {r["loop"]: {"ts": r["mark_at"], "ok": bool(r.get("mark_ok")), "detail": r.get("mark_detail") or ""}
+            for r in rows if r.get("mark_at")}
+
+
 def set_loop_state(name: str, **fields) -> None:
     if "data" in fields:
         fields["data"] = json.dumps(fields["data"], default=str)
@@ -834,8 +936,8 @@ def findings(loop: str, limit: int = 50, connect=db) -> list[dict]:
                                            (loop, limit))]
 
 
-def add_event(loop: str, e: dict) -> int:
-    with db() as c:
+def add_event(loop: str, e: dict, connect=db) -> int:
+    with connect() as c:
         cur = c.execute("INSERT INTO events (loop, type, source, key, repo, title, url, trust, data, ts) "
                         "VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (loop, e.get("type"), e.get("source"), str(e.get("key")), e.get("repo"), e.get("title"),
@@ -849,15 +951,15 @@ def recent_events(limit: int = 50, connect=db) -> list[dict]:
                                            "ORDER BY id DESC LIMIT ?", (limit,))]
 
 
-def seen_keys(source: str) -> set[str]:
-    with db() as c:
-        return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
+def claim_seen(source: str, keys: list[str], connect=db) -> list[str]:
+    with connect() as c:
+        return [str(k) for k in keys if c.execute("INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
+                                                 (source, str(k), util.iso())).rowcount == 1]
 
 
-def mark_seen(source: str, keys: list[str]) -> None:
-    with db() as c:
-        c.executemany("INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
-                      [(source, str(k), util.iso()) for k in keys])
+def forget_seen(source: str, key: str, before, connect=db) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM seen WHERE source = ? AND key = ? AND ts < ?", (source, key, util.iso(before)))
 
 
 def cursor(source: str, connect=db) -> dict | None:
@@ -866,11 +968,19 @@ def cursor(source: str, connect=db) -> dict | None:
         return dict(r) if r else None
 
 
-def set_cursor(source: str, value: str | None, ok: bool, detail: str = "") -> None:
-    prev = cursor(source) or {}
+def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", connect=db, started=None) -> None:
+    prev = cursor(source, connect) or {}
+    last_ok = (started or util.iso()) if ok else prev.get("last_ok") or (prev.get("polled") if prev.get("ok") else None)
+    with connect() as c:
+        c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail, last_ok) VALUES (?,?,?,?,?,?)",
+                  (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500],
+                   last_ok))
+
+
+def adopt_source(old: str, new: str) -> None:
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
-                  (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500]))
+        for table in ("cursors", "seen", "source_owners"):
+            c.execute(f"UPDATE OR REPLACE {table} SET source = ? WHERE source = ?", (new, old))
 
 
 def source_owner(source: str) -> str | None:
@@ -879,8 +989,8 @@ def source_owner(source: str) -> str | None:
         return r[0] if r else None
 
 
-def set_source_owner(source: str, fingerprint: str) -> None:
-    with db() as c:
+def set_source_owner(source: str, fingerprint: str, connect=db) -> None:
+    with connect() as c:
         c.execute("INSERT OR REPLACE INTO source_owners (source, fingerprint) VALUES (?,?)", (source, fingerprint))
 
 
@@ -889,9 +999,10 @@ def cursors(connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM cursors ORDER BY source")]
 
 
-def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None) -> int:
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
+def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None, connect=db) -> int:
+    with connect() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
         if not payload and c.execute("SELECT 1 FROM queue WHERE loop = ? AND run_id IS NULL AND payload = '[]' "
                                      "AND trigger = ?", (loop, trigger)).fetchone():
             return 0
@@ -1660,6 +1771,12 @@ def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db, whole:
                                            + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
 
 
+def ticket_runs_marked_running(repo: str, issue: int | str, connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+                                           "AND status = 'running' ORDER BY started ASC, rowid ASC", (repo, issue))]
+
+
 def ab_placements(since: str, name: str = "", connect=db) -> list[dict]:
     with connect() as c:
         labelled = [dict(r) for r in c.execute(
@@ -1713,6 +1830,14 @@ def running_run(repo: str, issue: int | str, connect=db) -> dict | None:
         r = c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "
                       "ORDER BY started DESC, rowid DESC LIMIT 1", (repo, issue)).fetchone()
         return dict(r) if r else None
+
+
+def pending_label(repo: str, issue: int | str) -> str:
+    with db() as c:
+        r = c.execute("SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+                      "AND label_pending IS NOT NULL ORDER BY started DESC, rowid DESC LIMIT 1",
+                      (repo, issue)).fetchone()
+        return r["label_pending"] if r else ""
 
 
 def issue_running(repo: str, issue: int | str) -> bool:
@@ -1848,22 +1973,41 @@ def set_proposal_status_by_pr(pr_url: str, status: str) -> None:
         c.execute("UPDATE proposals SET status = ? WHERE pr_url = ?", (status, pr_url))
 
 
-def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, cost: float, source: str = "") -> None:
+EVAL_LINEAGE = ("engine_sha", "prompts_sha", "prompts_from", "context_sha", "settings", "base_commit",
+                "after_step", "last_step")
+
+
+def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, cost: float, source: str = "",
+             lineage: dict | None = None) -> None:
+    lineage = lineage or {}
     with db() as c:
         c.execute(
-            "INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source) VALUES (?,?,?,?,?,?,?,?)",
-            (run_id, repo, task, int(passed), seconds, cost, util.iso(), source),
+            f"INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source, {', '.join(EVAL_LINEAGE)}) "
+            f"VALUES ({','.join('?' * 16)})",
+            (run_id, repo, task, int(passed), seconds, cost, util.iso(), source,
+             *(lineage.get(k, 0 if k in ("after_step", "last_step") else "") for k in EVAL_LINEAGE)),
         )
 
 
 BASELINE_SOURCE = "worktree"
 
 
-def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[bool]:
+def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[dict]:
     with db() as c:
-        rows = c.execute("SELECT passed FROM evals WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
+        rows = c.execute(f"SELECT passed, {', '.join(EVAL_LINEAGE)} FROM evals "
+                         "WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
                          (repo, task, source, limit))
-        return [bool(r[0]) for r in rows]
+        return [{**dict(r), "passed": bool(r["passed"])} for r in rows]
+
+
+def last_step_id(run_id: str) -> int:
+    with db() as c:
+        return c.execute("SELECT COALESCE(MAX(id), 0) FROM steps WHERE run_id = ?", (run_id,)).fetchone()[0]
+
+
+def eval_rows(run_id: str) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM evals WHERE run_id = ? ORDER BY ts", (run_id,))]
 
 
 def eval_history(repo: str, limit: int = 20) -> list[dict]:
@@ -1882,7 +2026,7 @@ def evals_since(since: str, connect=db) -> list[dict]:
 
 
 FEEDBACK_COLUMNS = ("pr_url", "kind", "gh_id", "repo", "issue", "body", "path", "line", "hunk", "thread", "at_once",
-                    "created", "pr_state", "status", "asks")
+                    "created", "pr_state", "status", "asks", "recorded")
 
 
 def feedback_keys(pr_url: str) -> set[tuple[str, int]]:
@@ -1896,7 +2040,7 @@ def add_feedback(rows: list[dict]) -> int:
         before = c.total_changes
         c.executemany(f"INSERT OR IGNORE INTO feedback ({', '.join(FEEDBACK_COLUMNS)}) "
                       f"VALUES ({', '.join('?' * len(FEEDBACK_COLUMNS))})",
-                      [tuple(r.get(k) for k in FEEDBACK_COLUMNS) for r in rows])
+                      [(*(r.get(k) for k in FEEDBACK_COLUMNS[:-1]), util.iso()) for r in rows])
         return c.total_changes - before
 
 
@@ -1944,10 +2088,16 @@ def settle_feedback(run_id: str, status: str) -> None:
         c.execute("UPDATE feedback SET status = ? WHERE run_id = ? AND status = 'taken'", (status, run_id))
 
 
-def feedback_since(since: str) -> list[dict]:
+def feedback_between(since: str, until: str) -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE created >= ? ORDER BY pr_url, created",
-                                           (since,))]
+        return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE COALESCE(recorded, created) >= ? "
+                                           "AND COALESCE(recorded, created) < ? ORDER BY pr_url, created",
+                                           (since, until))]
+
+
+def mined_until() -> str | None:
+    with db() as c:
+        return c.execute("SELECT MAX(mined_until) FROM runs WHERE kind = 'miner'").fetchone()[0]
 
 
 def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why: str = "", task: str = "") -> None:
@@ -2054,11 +2204,6 @@ def research_keep(ref: str, **fields) -> None:
     with db() as c:
         c.execute(f"UPDATE research SET {', '.join(f'{k} = ?' for k in fields)} WHERE ref = ? COLLATE NOCASE",
                   (*fields.values(), ref))
-
-
-def research_prune(refs: list[str]) -> None:
-    with db() as c:
-        c.execute(f"DELETE FROM research WHERE status != 'running' AND ref NOT IN ({','.join('?' * len(refs))})", refs)
 
 
 def triage_prune(sources: list[str]) -> None:

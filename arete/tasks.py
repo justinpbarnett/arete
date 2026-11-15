@@ -32,7 +32,7 @@ from . import (
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
-STEER_LOCK = "task-steer"
+STEER_LOCK = asks.STEER_LOCK
 POLLER_LATER = "the poller starts it when a slot frees"
 RESUMABLE = ("interrupted", "stopped", "failed")
 MAX_ANSWER_CHARS = 20000
@@ -296,7 +296,8 @@ def answer_ask(ask_id: str, body) -> dict:
             vault.put_all(repo.name, given)
         except OSError as e:
             raise control.Refused(f"could not store {', '.join(given)} ({e.strerror}); the ask stays open") from None
-        state.ask_close(ask_id, "answered", answers)
+        if not state.ask_close(ask_id, "answered", answers):
+            raise control.Refused(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
         if more := state.asks_of(row["id"], "open"):
             return answer(tid, repo.name, "", "waiting",
                           f"{util.count(len(more), 'more ask')} of run {row['id']} wait for an answer")
@@ -362,6 +363,8 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
     with util.lock(state.run_lock("pipeline", repo.name, tid)) as got:
         if not got:
             raise control.Busy(f"a run of {name}")
+        if status == "stopped" and not record.move(run_id, "stopped", expect=("needs-info",), summary=record.STOPPED):
+            raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
         state.asks_retire(run_id, status)
         latest = not state.later_run(repo.name, tid, run_id)
         removed = latest and kept_folder_removed(repo, tid, run_id)
@@ -369,7 +372,6 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         run = pipeline.Run(run_id, repo, paths.RUNS_DIR / run_id, tracker=tracker.for_ticket(cfg, repo, tid), tid=tid)
         run.dir.mkdir(parents=True, exist_ok=True)
         if status == "stopped":
-            record.note(run_id, status="stopped", summary=record.STOPPED)
             run.give_up("was stopped by its owner instead of an answer")
             pipeline.write_report(state.run_get(run_id) or row)
             return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped; {folder}")
