@@ -31,6 +31,11 @@ AB_MIN_TICKETS = 20
 REPAIRS = tuple(r for r, b in config.INHERITS.items() if b == "build")
 BEAT_FILE = paths.STATE_DIR / "serve.json"
 BEAT_STALE_SECONDS = 120
+STUCK_TICKS = 3
+
+
+def serious_failure(key: str) -> bool:
+    return key in ("tick", "tick:load") or key.startswith(("stage:", "loop:"))
 DETACHED_LOG = "loops.log"
 COST_DAYS = 7
 COST_GROUPS = ("step", "kind", "model", "route")
@@ -137,6 +142,7 @@ def serve_beat() -> dict:
         data["age_seconds"] = round((util.now() - util.parse_iso(data["at"])).total_seconds())
         data["process_gone"] = not util.pid_alive(data.get("pid"))
         data["alive"] = not data["process_gone"] and data["age_seconds"] < BEAT_STALE_SECONDS
+        data["stuck"] = any(f.get("ticks", 0) >= STUCK_TICKS for f in (data.get("failing") or {}).values())
     return data
 
 

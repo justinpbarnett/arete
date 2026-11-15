@@ -47,7 +47,7 @@ function queueBody({ route, snapshot, retry, page, demo }) {
     missing=${missing} retry=${retry}>${body}<//>`;
 }
 
-function Sidebar({ route, snapshot, now }) {
+export function Sidebar({ route, snapshot, now }) {
   const serve = snapshot.serve;
   const started = serve?.started ? Date.parse(serve.started) : NaN;
   const uptime = Number.isFinite(started) ? duration((now - started) / 1000) : "";
@@ -66,6 +66,7 @@ function Sidebar({ route, snapshot, now }) {
     })}</nav>
     <footer class="side-foot">
       <p><span class=${serve?.alive ? "serve-up" : "muted"}>serve ${serve?.alive ? "up" : "down"}</span> <span>${uptime}</span></p>
+      ${serve?.alive && Object.keys(serve.failing || {}).length ? html`<p class="serve-fails">tick fails at ${Object.entries(serve.failing).map(([key, f]) => `${key}: ${f.error}`).join("; ")}</p>` : null}
       <p>heartbeat <span>${age}</span></p>
       <p class="host">${location.host}</p>
       <p aria-label="Checks passed over total">checks <span></span> / <span></span></p>
