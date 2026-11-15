@@ -306,8 +306,8 @@ class AgentRun:
             yield
 
     def save(self, name: str, data) -> None:
-        p = self.dir / name
-        p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
+        text = data if isinstance(data, str) else json.dumps(data, indent=2, default=str)
+        util.write_durably(self.dir / name, text.encode(), 0o600)
 
     @property
     def config(self) -> config.Config:

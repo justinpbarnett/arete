@@ -560,6 +560,9 @@ MIGRATIONS = [("cursors", "last_ok", "ALTER TABLE cursors ADD COLUMN last_ok TEX
               ("evals", "base_commit", "ALTER TABLE evals ADD COLUMN base_commit TEXT DEFAULT ''"),
               ("evals", "after_step", "ALTER TABLE evals ADD COLUMN after_step INTEGER DEFAULT 0"),
               ("evals", "last_step", "ALTER TABLE evals ADD COLUMN last_step INTEGER DEFAULT 0"),
+              ("loop_state", "mark_ok", "ALTER TABLE loop_state ADD COLUMN mark_ok INTEGER"),
+              ("loop_state", "mark_detail", "ALTER TABLE loop_state ADD COLUMN mark_detail TEXT DEFAULT ''"),
+              ("loop_state", "mark_at", "ALTER TABLE loop_state ADD COLUMN mark_at TEXT"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
               ("capture_evidence", "inspection", "ALTER TABLE capture_evidence ADD COLUMN inspection TEXT DEFAULT ''"),
@@ -875,6 +878,13 @@ def loop_state(name: str, connect=db) -> dict:
 def loop_states(connect=db) -> dict[str, dict]:
     with connect() as c:
         return {r["loop"]: {**dict(r), "data": json.loads(r["data"] or "{}")} for r in c.execute("SELECT * FROM loop_state")}
+
+
+def loop_marks(connect=db) -> dict[str, dict]:
+    with connect() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM loop_state")]
+    return {r["loop"]: {"ts": r["mark_at"], "ok": bool(r.get("mark_ok")), "detail": r.get("mark_detail") or ""}
+            for r in rows if r.get("mark_at")}
 
 
 def set_loop_state(name: str, **fields) -> None:

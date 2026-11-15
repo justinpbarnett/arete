@@ -8,7 +8,7 @@ sessions: agents that run in their own sandbox, do one task, and end with a repo
 - Arete's code is at $code. Your working directory is $workdir, and `git log` and `git show` read its history.
 - The config is $config. Its `max_parallel` and its `[models]` table are what the dashboard's settings change.
 - The state is in $state. `runs/` holds one folder per run with its `run.log`, except sessions, which log to
-  `sessions/<id>/session.log`. `heartbeat.json` and `loops.json` hold health. `skipped.json` holds the labeled tickets the pipeline will not run.
+  `sessions/<id>/session.log`. `heartbeat.json` holds health, and each loop's last mark is in the `loop_state` table of `arete.db`. `skipped.json` holds the labeled tickets the pipeline will not run.
 - $context holds what the dashboard shows at this moment: live runs, skipped tickets, tickets waiting on review
   comments, the last 25 runs, checks, alerts, triage, and 30 days of trends. Read it first for any question about
   state.

@@ -12105,5 +12105,240 @@ result(again=go([r503("0"), OK]), slow=go([r503("1"), OK]), none=go([(503, {}, R
         self.assertEqual((found["initial"], found["initial_sleeps"]), ("down", []))
 
 
+class LoopMarkAndDurableWriteTests(unittest.TestCase):
+    PRELUDE = r'''
+import contextlib, fcntl, io, json, os, sqlite3, subprocess, sys, time
+from pathlib import Path
+from unittest import mock
+from arete import board, config, heartbeat, paths, pipeline, record, state, util
+'''
+    MARKER = "RESULT:"
+
+    def session(self, body, setup=True):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for name in ("config", "state", "logs", "worktrees", "tmp", "home"):
+                (root / name).mkdir()
+            (root / "config" / "config.toml").write_text("[replay]\nall = true\n")
+            env = {k: v for k, v in os.environ.items() if k != "ARETE_LOOP"}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"), PYTHONPATH=str(SOURCE))
+            script = self.PRELUDE + ("state.ensure_schema()\n" if setup else "") + body
+            done = subprocess.run([sys.executable, "-c", script, str(root)], env=env, cwd=SOURCE,
+                                  capture_output=True, text=True, timeout=300)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            line = next(x for x in done.stdout.splitlines() if x.startswith(self.MARKER))
+            return json.loads(line[len(self.MARKER):])
+
+    def test_two_loops_marking_together_keep_both_marks(self):
+        found = self.session(r'''
+root = Path(sys.argv[1])
+child = ("import sys, time\nfrom pathlib import Path\nfrom arete import heartbeat\nstop, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
+         "n = 0\nwhile not stop.exists():\n    heartbeat.mark_loop('research', True, 'nothing due')\n    n += 1\n"
+         "    if n == 3: ready.write_text('x')\n")
+trials = []
+for i in range(20):
+    stop, ready = root / f"stop{i}", root / f"ready{i}"
+    research = subprocess.Popen([sys.executable, "-c", child, str(stop), str(ready)])
+    try:
+        deadline = time.time() + 60
+        while not ready.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        poll = subprocess.run([sys.executable, "-c", "from arete import heartbeat\nheartbeat.mark_loop('poll', False, 'gh: HTTP 502')"])
+        time.sleep(0.05)
+    finally:
+        stop.write_text("x")
+        code = research.wait(timeout=60)
+    marks = state.loop_marks()
+    shown = {c["name"]: c for c in board.checks()["loops"]}
+    trials.append([poll.returncode, code, marks["poll"]["ok"], marks["poll"]["detail"], marks["research"]["ok"],
+                   shown["poll"]["ok"]])
+    state.set_loop_state("poll", mark_ok=None, mark_detail="", mark_at=None)
+print("RESULT:" + json.dumps({"trials": trials, "legacy": (paths.STATE_DIR / "loops.json").exists()}))
+''')
+        self.assertEqual(len(found["trials"]), 20)
+        for trial in found["trials"]:
+            self.assertEqual(trial, [0, 0, False, "gh: HTTP 502", True, False])
+        self.assertFalse(found["legacy"])
+
+    def test_a_failed_mark_fails_the_loop_check_and_the_legacy_file_is_ignored_and_removed(self):
+        found = self.session(r'''
+cfg = config.load()
+planted = paths.STATE_DIR / "loops.json"
+def plant(ok, detail):
+    planted.write_text(json.dumps({"poll": {"ts": util.iso(), "ok": ok, "detail": detail}}))
+def poll_check():
+    return next(c for c in heartbeat.check_loops(cfg) if c.key == "loop:poll")
+rid = record.start("loop", loop="poll", loop_kind="command")
+record.settle(rid, "done")
+plant(True, "legacy ok")
+heartbeat.mark_loop("poll", False, "gh: HTTP 502")
+failed = poll_check()
+heartbeat.mark_loop("poll", True, "recovered")
+plant(False, "legacy failed")
+cleared = poll_check()
+def empty(name):
+    def check(*a, **k):
+        return []
+    check.__name__ = name
+    return check
+stubs = [mock.patch.object(heartbeat, n, empty(n)) for n in (
+    "check_jobs", "check_probes", "check_claude_auth", "check_codex_auth", "check_codex_cleanup", "check_pi_auth",
+    "check_hook", "check_disk", "check_serve", "check_backups", "check_costs", "check_oncall", "check_workspaces",
+    "check_scratch")]
+def no_wait(*a, **k):
+    raise AssertionError("waited for the network")
+raised, cleared_keys = [], []
+runs = []
+with contextlib.ExitStack() as stack:
+    for s in stubs:
+        stack.enter_context(s)
+    stack.enter_context(mock.patch.object(util, "online", return_value=True))
+    stack.enter_context(mock.patch.object(util, "wait_for_network", no_wait))
+    stack.enter_context(mock.patch.object(heartbeat.install, "rotate_logs"))
+    stack.enter_context(mock.patch.object(heartbeat.alerts, "raise_alert", lambda repo, key, *a: raised.append(key)))
+    stack.enter_context(mock.patch.object(heartbeat.alerts, "clear_alert", lambda repo, key, *a: cleared_keys.append(key)))
+    heartbeat.mark_loop("poll", False, "gh: HTTP 502")
+    plant(True, "legacy ok")
+    runs.append([heartbeat.run(quiet=True), planted.exists(), list(raised)])
+    heartbeat.mark_loop("poll", True, "fine")
+    plant(False, "legacy failed")
+    runs.append([heartbeat.run(quiet=True), planted.exists(), "loop:poll" in cleared_keys])
+print("RESULT:" + json.dumps({"failed": [failed.ok, failed.detail], "cleared": [cleared.ok, cleared.detail], "runs": runs}))
+''')
+        self.assertFalse(found["failed"][0])
+        self.assertIn("failed: gh: HTTP 502", found["failed"][1])
+        self.assertTrue(found["cleared"][0])
+        self.assertNotIn("failed:", found["cleared"][1])
+        self.assertEqual(found["runs"], [[1, False, ["loop:poll"]], [0, False, True]])
+
+    def test_a_corrupt_json_file_is_logged_once_per_version(self):
+        found = self.session(r'''
+p = paths.STATE_DIR / "triage.json"
+default = {"d": 1}
+def read():
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        value = util.read_json(p, default)
+    return [value, err.getvalue()]
+out = {"missing": read()}
+p.write_text('{"issue":')
+out["first"], out["second"] = read(), read()
+p.write_text('{"issue": [')
+out["changed"] = read()
+p.write_text("")
+out["empty"] = read()
+p.write_text('{"ok": true}')
+out["valid"] = read()
+print("RESULT:" + json.dumps(out))
+''', setup=False)
+        self.assertEqual(found["missing"], [{"d": 1}, ""])
+        for key in ("first", "changed", "empty"):
+            self.assertEqual(found[key][0], {"d": 1})
+            self.assertEqual(found[key][1].count("\n"), 1)
+            self.assertIn("triage.json", found[key][1])
+        self.assertEqual(found["second"], [{"d": 1}, ""])
+        self.assertEqual(found["valid"], [{"ok": True}, ""])
+
+    def test_a_failed_replace_keeps_the_old_file_and_leaves_no_draft(self):
+        found = self.session(r'''
+folder = Path(sys.argv[1]) / "w"
+folder.mkdir()
+run = pipeline.Run.__new__(pipeline.Run)
+run.dir = folder
+(folder / "a.json").write_text("old-a")
+(folder / "b.json").write_text("old-b")
+out = {}
+for name, call in (("save", lambda: run.save("a.json", {"x": 1})), ("json", lambda: util.write_json(folder / "b.json", {"x": 1}))):
+    with mock.patch.object(util.os, "replace", side_effect=OSError("boom")):
+        try:
+            call()
+            out[name] = "no error"
+        except OSError as e:
+            out[name] = str(e)
+out["files"] = sorted(x.name for x in folder.iterdir())
+out["bytes"] = [(folder / "a.json").read_text(), (folder / "b.json").read_text()]
+print("RESULT:" + json.dumps(out))
+''')
+        self.assertEqual((found["save"], found["json"]), ("boom", "boom"))
+        self.assertEqual(found["files"], ["a.json", "b.json"])
+        self.assertEqual(found["bytes"], ["old-a", "old-b"])
+
+    def test_a_durable_write_syncs_the_file_before_replace_and_the_folder_after(self):
+        found = self.session(r'''
+folder = Path(sys.argv[1]) / "w"
+folder.mkdir()
+run = pipeline.Run.__new__(pipeline.Run)
+run.dir = folder
+real = {"fcntl": fcntl.fcntl, "fsync": os.fsync, "replace": os.replace}
+def trial(call, fullsync_fails=False):
+    events = []
+    def fcntl_spy(fd, op, *a):
+        events.append("fullsync")
+        if fullsync_fails:
+            raise OSError("no")
+        return real["fcntl"](fd, op, *a)
+    def fsync_spy(fd):
+        events.append("fsync")
+        return real["fsync"](fd)
+    def replace_spy(a, b):
+        events.append("replace")
+        return real["replace"](a, b)
+    with mock.patch.object(util.fcntl, "fcntl", fcntl_spy), mock.patch.object(util.os, "fsync", fsync_spy), \
+            mock.patch.object(util.os, "replace", replace_spy):
+        call()
+    return events
+out = {"save": trial(lambda: run.save("s.txt", "plain text")),
+       "json": trial(lambda: util.write_json(folder / "j.json", {"x": 1})),
+       "fallback": trial(lambda: util.write_json(folder / "k.json", {"x": 2}), True)}
+with mock.patch.object(util.fcntl, "F_FULLFSYNC", create=True), mock.patch.object(util, "fcntl", mock.Mock(spec=[])), \
+        mock.patch.object(util.os, "fsync") as fsync:
+    util.write_json(folder / "m.json", {"x": 3})
+    out["missing_constant_fsyncs"] = fsync.call_count
+out["modes"] = [oct((folder / n).stat().st_mode & 0o777) for n in ("s.txt", "j.json")]
+out["text"] = (folder / "s.txt").read_text()
+out["json_back"] = json.loads((folder / "j.json").read_text())
+print("RESULT:" + json.dumps(out))
+''')
+        for key in ("save", "json"):
+            self.assertEqual(found[key][-2:], ["replace", "fsync"], key)
+            self.assertLess(found[key].index("fullsync") if "fullsync" in found[key] else 0, found[key].index("replace"))
+        self.assertEqual(found["fallback"][:3], ["fullsync", "fsync", "replace"])
+        self.assertEqual(found["missing_constant_fsyncs"], 2)
+        self.assertEqual(found["modes"], ["0o600", "0o600"])
+        self.assertEqual(found["text"], "plain text")
+        self.assertEqual(found["json_back"], {"x": 1})
+
+    def test_an_unmigrated_database_shows_no_marks_and_marking_keeps_scheduling_columns(self):
+        found = self.session(r'''
+old = Path(sys.argv[1]) / "old.db"
+c = sqlite3.connect(old)
+c.executescript(state.SCHEMA)
+c.execute("INSERT INTO loop_state (loop) VALUES ('poll')")
+c.commit()
+before = [r[1] for r in c.execute("PRAGMA table_info(loop_state)")]
+c.close()
+real = paths.DB_FILE
+paths.DB_FILE = old
+try:
+    unmigrated = [state.loop_marks(connect=state.reader), board.checks()["loops"]]
+finally:
+    paths.DB_FILE = real
+c = sqlite3.connect(old)
+after = [r[1] for r in c.execute("PRAGMA table_info(loop_state)")]
+c.close()
+state.set_loop_state("research", data={"k": 1}, last_fire="2026-01-01T00:00:00Z", next_due="2026-01-02T00:00:00Z", metric_on=1)
+heartbeat.mark_loop("research", True, "ok")
+row = state.loop_state("research")
+print("RESULT:" + json.dumps({"unmigrated": unmigrated, "same": before == after, "new": "mark_at" in after,
+                              "row": [row["data"], row["last_fire"], row["next_due"], row["metric_on"], row["mark_detail"]]}))
+''')
+        self.assertEqual(found["unmigrated"], [{}, []])
+        self.assertTrue(found["same"])
+        self.assertFalse(found["new"])
+        self.assertEqual(found["row"], [{"k": 1}, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", 1, "ok"])
+
+
 if __name__ == "__main__":
     unittest.main()
