@@ -663,6 +663,14 @@ class Checkout:
     def diff_from_base(self) -> str:
         return f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.origin_base}...HEAD"
 
+    @property
+    def diff_from_fork(self) -> str:
+        try:
+            fork = git(["merge-base", self.origin_base, "HEAD"], self.wt).strip()[:12]
+        except (RuntimeError, OSError):
+            fork = ""
+        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {fork or self.origin_base}"
+
 
 def remote_head(src: Path, branch: str) -> str:
     out = git(["ls-remote", "origin", f"refs/heads/{branch}"], src).split()
@@ -1162,6 +1170,10 @@ def workspace_note(branch: str, checkouts: list[Checkout]) -> str:
         ("The working directory itself is not a git repo, so run git as `git -C <dir> ...`. A change can touch one "
          f"repo or several; arete commits each changed repo and opens a PR in it. {stale_base_note(checkouts[0])}"),
     ])
+
+
+def compare_with_fork(checkouts: list[Checkout]) -> str:
+    return ", ".join(f"`{c.diff_from_fork}`" for c in checkouts)
 
 
 def git_reads(checkouts: list[Checkout]) -> list[str]:
@@ -2950,6 +2962,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
     res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
+                                   compare=compare_with_fork(b.checkouts),
                                    diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
                                    earlier=earlier_review(earlier, reply,
                                                           fixed_since(b, before.get("trees") or {}))),
@@ -3138,7 +3151,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                          surface=surface_note(v, url, evidence), notes=v.notes,
                                          scratch=scratch.note(attempt),
                                          commands=code_list(bash), checks=check_list(b.layer),
-                                         owner=run.owner_note, **values),
+                                         compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
                             b.ws, role=role,
                             allowed_tools=bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
