@@ -15,7 +15,6 @@ from urllib.parse import quote, urlencode, urlsplit
 from . import config, lines, paths, util
 
 ENV = "ARETE_SERVER"
-IDENTITY_HEADER = "Tailscale-User-Login"
 CONNECT_SECONDS = 5
 PROBE_SECONDS = 1
 CALL_SECONDS = 120
@@ -48,7 +47,6 @@ class Server:
     host: str
     port: int
     name: str
-    login: str = ""
 
 
 def named_server(wanted: str) -> Server:
@@ -76,7 +74,7 @@ def server() -> Server:
     addresses = [str(a) for a in found["addresses"]]
     scheme = found.get("scheme") or "http"
     host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
-    here = Server(scheme, host, port, found.get("host") or host, str(found.get("login") or ""))
+    here = Server(scheme, host, port, found.get("host") or host)
     try:
         socket.create_connection((host, port), timeout=PROBE_SECONDS).close()
     except OSError as e:
@@ -89,8 +87,6 @@ def headers_for(where: Server) -> dict[str, str]:
     headers = {"X-Arete": "1"}
     if where.scheme == "http" and where.name != where.host:
         headers["Host"] = f"{where.name}:{where.port}"
-    if where.login:
-        headers[IDENTITY_HEADER] = where.login
     return headers
 
 
