@@ -8,8 +8,6 @@ from . import board, config, control, gh, paths, pipeline, record, routing, runn
 from .agent import Result
 
 CONTEXT_FILE = paths.STATE_DIR / "dashboard.json"
-OLD_CHAT_FILE = paths.STATE_DIR / "chat.json"
-MOVED_CHAT_FILE = paths.STATE_DIR / "chat.json.moved"
 BUDGET_USD = 2
 REPLY_SHARE = 0.5
 TIMEOUT_SECONDS = 900
@@ -37,7 +35,6 @@ REPLY_SCHEMA = {
     "required": ["reply", "issue_title", "issue_body"],
 }
 filing = threading.Lock()
-moving = threading.Lock()
 starting = threading.Lock()
 replying: dict[int, float] = {}
 
@@ -67,7 +64,6 @@ def summary(row: dict) -> dict:
 
 
 def listing() -> dict:
-    move_old_chat()
     return {"chats": [summary(r) for r in state.chats()], "projects": [r.name for r in config.load_or_problem()[0].repos]}
 
 
@@ -455,33 +451,7 @@ def stop_session(chat_id: int, session_id: str) -> dict:
     return control.stop_run(session_id)
 
 
-def move_old_chat() -> None:
-    with moving:
-        if not OLD_CHAT_FILE.exists():
-            return
-        old = util.read_json(OLD_CHAT_FILE, {})
-        old = old if isinstance(old, dict) else {}
-        messages = [m for m in old.get("messages") or [] if isinstance(m, dict)]
-        draft = old.get("draft") if isinstance(old.get("draft"), dict) else {}
-        if messages or draft.get("title"):
-            if old.get("busy"):
-                messages.append({"from": "arete", "text": RESTARTED, "ts": util.iso()})
-            asked = next((m for m in messages if m.get("from") == "you"), {})
-            state.chat_import(
-                {"title": title_of(str(asked.get("text") or "")), "project": "",
-                 "created": messages[0].get("ts") if messages else util.iso(),
-                 "updated": messages[-1].get("ts") if messages else util.iso(),
-                 "spent": round(sum(float(m.get("cost") or 0) for m in messages), 2), "busy": 0,
-                 "session": old.get("session") or "", "session_spent": float(old.get("spent") or 0),
-                 "runner": old.get("runner") or "", "draft_title": draft.get("title") or "",
-                 "draft_body": draft.get("body") or ""},
-                [(m.get("from") or "arete", str(m.get("text") or ""), float(m.get("cost") or 0), m.get("ts") or util.iso())
-                 for m in messages])
-        OLD_CHAT_FILE.replace(MOVED_CHAT_FILE)
-
-
 def recover() -> None:
-    move_old_chat()
     for chat_id in state.busy_chats():
         with util.lock(answer_lock(chat_id)) as free:
             if free and chat_row(chat_id)["busy"]:

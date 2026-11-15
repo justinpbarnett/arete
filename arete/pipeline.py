@@ -93,6 +93,7 @@ SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
+CHECK_LANE_POLL_SECONDS = 2
 MAX_STARTS_PER_POLL = 64
 CHECKS_SCRIPT = "checks"
 NO_CHECKS = "(none configured)"
@@ -1268,14 +1269,30 @@ def drop_untracked_bytecode(wt: Path) -> None:
             remove_untracked(wt, name)
 
 
+def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
+    if not layer.parallel_checks:
+        return [CHECKS_LOCK]
+    return [f"{CHECKS_LOCK}-{n}" for n in range(run.config.max_parallel_checks)]
+
+
+def take_free_lane(files: list[TextIO]) -> bool:
+    for f in files:
+        if util.flock_now(f):
+            util.mark_holder(f, os.getpid())
+            return True
+    return False
+
+
 @contextmanager
-def machine_to_itself(run: AgentRun):
-    with util.lock(CHECKS_LOCK) as free:
-        if free:
-            yield
-            return
-    run.log("checks: waiting for another run's checks to finish")
-    with util.lock(CHECKS_LOCK, wait=True):
+def check_lane(layer: config.RepoLayer, run: AgentRun):
+    with ExitStack() as stack:
+        files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
+        if not take_free_lane(files):
+            run.log("checks: waiting for another run's checks to finish" if len(files) == 1 else
+                    f"checks: waiting for a free check lane (max_parallel_checks {len(files)})")
+            with run.waiting("slot"):
+                while not take_free_lane(files):
+                    time.sleep(CHECK_LANE_POLL_SECONDS)
         yield
 
 
@@ -1291,7 +1308,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
         return True, "no checks configured"
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
-    with nullcontext() if layer.parallel_checks else machine_to_itself(run):
+    with check_lane(layer, run):
         for name, cmd in layer.checks.items():
             with record.timed(run.id, "check", name=name, command=cmd) as check:
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
@@ -3070,7 +3087,8 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
                        diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
 
 
-def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:
+def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
+                require_released: bool = False, **values) -> verify.Verified:
     run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
@@ -3141,6 +3159,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
+            if require_released and not lifetime["stopped"]:
+                run.save(f"{step}-retained.json", {"reason": "service process ownership is unresolved"})
             if not attempt:
                 archived, moved, kept = "", [], []
             elif not lifetime["stopped"] or (agent_started and not agent_finished):

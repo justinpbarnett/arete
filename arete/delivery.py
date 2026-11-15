@@ -7,15 +7,14 @@ from contextlib import contextmanager, suppress
 from datetime import timedelta
 
 from . import config, state, util
-from .emits import Digest, Emit, Metric, Notify, PullRequest, Ticket, ToLoop
+from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
 
 CLAIM_SECONDS = 120
 RETRIED = ("screen", "proof")
 SAYS_WHY = (RuntimeError, OSError, ValueError)
-EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(), "loop": ToLoop(),
-                          "digest": Digest(), "notify": Notify(), "metric": Metric()}
+EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(), "loop": ToLoop()}
 
 
 class Failed(RuntimeError):
@@ -46,7 +45,8 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
     for spec in loop.emits:
         emit = EMITS[spec["type"]]
         for batch in emit.batches(findings, outcome):
-            delivery = {"type": spec["type"], "item": emit.render(loop, run_id, spec, batch, outcome), "batch": batch}
+            target = emit.resolve(spec, batch, outcome, cfg) if isinstance(emit, Ticket) else spec
+            delivery = {"type": spec["type"], "item": emit.render(loop, run_id, target, batch, outcome), "batch": batch}
             what = emit.describe(delivery["item"])
             if trial:
                 log("held", f"would {what}")

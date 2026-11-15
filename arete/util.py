@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -84,17 +84,15 @@ def sh(
 
     command = scratch.protected_command(cmd, cwd, keeps)
     try:
-        res = subprocess.run(
+        res = run_whole_tree(
             command,
+            timeout,
+            input,
             cwd=str(cwd) if cwd else None,
             shell=isinstance(command, str),
-            capture_output=True,
             text=True,
             errors="replace",
-            timeout=timeout,
             env=full_env,
-            input=input,
-            check=False,
         )
     except subprocess.TimeoutExpired as e:
         res = subprocess.CompletedProcess(
@@ -105,6 +103,19 @@ def sh(
     if check and res.returncode != 0:
         raise RuntimeError(f"{cmd!r} failed ({res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
     return res
+
+
+def run_whole_tree(command, timeout: float | None, input: str | None, **kw) -> subprocess.CompletedProcess:
+    stdin = subprocess.PIPE if input is not None else None
+    with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
+        try:
+            out, err = proc.communicate(input, timeout=timeout)
+        except BaseException:
+            with suppress(Exception):
+                kill_tree(proc.pid)
+            proc.kill()
+            raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 NETWORK_ERROR = re.compile(
@@ -373,11 +384,7 @@ def end_session(pid) -> None:
     if not pid:
         return
     groups = {int(pid)}
-    try:
-        listed = sh(["ps", "-A", "-o", "pid=,pgid="], timeout=10).stdout
-    except PermissionError:
-        listed = ""
-    for member, group in (map(int, line.split()) for line in listed.splitlines()):
+    for member, group in process_rows("pid=,pgid="):
         try:
             if os.getsid(member) == int(pid):
                 groups.add(group)
@@ -390,11 +397,19 @@ def end_session(pid) -> None:
             pass
 
 
+def process_rows(columns: str) -> list[list[int]]:
+    try:
+        listed = subprocess.run(["/bin/ps", "-A", "-o", columns], capture_output=True, text=True, timeout=10,
+                                check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [list(map(int, line.split())) for line in listed.splitlines()]
+
+
 def process_tree(root: int) -> list[tuple[int, int]]:
-    listed = sh(["ps", "-A", "-o", "pid=,ppid=,pgid="], timeout=10).stdout
     group_of: dict[int, int] = {}
     children: dict[int, list[int]] = {}
-    for pid, parent, group in (map(int, line.split()) for line in listed.splitlines()):
+    for pid, parent, group in process_rows("pid=,ppid=,pgid="):
         group_of[pid] = group
         children.setdefault(parent, []).append(pid)
     tree, todo = [], [root]
