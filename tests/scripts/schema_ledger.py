@@ -411,9 +411,8 @@ try:
     assert version() == 2
     server = serve.Server()
     server.contracts_waiting = state.migrate()
-    server.config_problem = "scheduler disabled for contract test"
-    with mock.patch.object(server, "read_config"), mock.patch.object(state, "migrate", wraps=state.migrate) as migrate:
-        server.tick()
+    with mock.patch.object(server, "load", return_value=False), mock.patch.object(state, "migrate", wraps=state.migrate) as migrate:
+        server.run_pass()
         assert server.contracts_waiting and version() == 2
         assert util.read_json(control.BEAT_FILE, {})["schema"] == state.LATEST
         sql("UPDATE runs SET schema_version=2")
@@ -422,14 +421,14 @@ try:
         older_serve.terminate()
         older_serve.wait(timeout=10)
         util.write_json(control.BEAT_FILE, dict(pid=older_serve.pid, at=util.iso(), schema=2))
-        server.tick()
+        server.run_pass()
         assert server.contracts_waiting and version() == 2
         older_run.terminate()
         older_run.wait(timeout=10)
-        server.tick()
+        server.run_pass()
         assert not server.contracts_waiting and version() == 3
         assert migrate.call_count == 3
-        server.tick()
+        server.run_pass()
         assert migrate.call_count == 3
     assert sql("SELECT id, status FROM runs ORDER BY id") == [("older", "running"), ("unstamped", "running")]
     assert sql("SELECT count(*) FROM schema_migrations WHERE n=3") == [(1,)]
