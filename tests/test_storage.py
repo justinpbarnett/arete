@@ -481,19 +481,127 @@ class DoctorTests(unittest.TestCase):
             self.fixture("cli", "audit")
             self.assertIn("audit:doctor:cost", self.inspected()["alerts"], action)
 
-    def test_backup_fails_when_stale_unrecorded_or_missing_with_serve_installed(self):
+    def backup_line(self, *actions):
         self.fixture("clean")
-        self.fixture("stale-backup")
+        for action in actions:
+            self.fixture(action)
         code, lines, _ = self.doctor()
+        return code, lines["backup"]
+
+    def test_backup_fails_when_the_newest_snapshot_is_stale(self):
+        code, line = self.backup_line("stale-backup")
         self.assertEqual(code, 1)
-        self.assertTrue(lines["backup"].startswith("FAIL") and ".db" in lines["backup"], lines["backup"])
-        self.fixture("fresh-backup")
-        self.fixture("bad-backup-record")
-        self.assertTrue(self.doctor()[1]["backup"].startswith("FAIL"))
-        self.fixture("no-backup")
-        code, lines, _ = self.doctor()
+        self.assertTrue(line.startswith("FAIL") and ".db" in line and "hours old" in line, line)
+
+    def test_backup_fails_when_the_recorded_quick_check_is_not_ok(self):
+        code, line = self.backup_line("bad-backup-record")
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith("FAIL") and "not ok" in line, line)
+
+    def test_backup_fails_when_no_quick_check_was_recorded(self):
+        code, line = self.backup_line("forget-backup-check")
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith("FAIL") and "no recorded quick_check" in line, line)
+
+    def test_backup_is_only_info_without_snapshots_when_serve_is_not_installed(self):
+        code, line = self.backup_line("no-backup")
         self.assertEqual(code, 0)
-        self.assertTrue(lines["backup"].startswith("INFO"), lines["backup"])
+        self.assertTrue(line.startswith("INFO"), line)
+
+    def test_backup_fails_without_snapshots_when_serve_is_installed(self):
+        code, line = self.backup_line("no-backup", "serve-marker")
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith("FAIL") and "serve is installed" in line, line)
+
+    def test_a_backup_fault_the_heartbeat_already_alerts_on_raises_no_doctor_alert(self):
+        self.backup_line("stale-backup", "heartbeat-backup")
+        self.fixture("cli", "audit")
+        self.assertNotIn("audit:doctor:backup", self.inspected()["alerts"])
+        self.assertIn("WARN [doctor:backup]", (self.root / "state" / "audit" / "latest.md").read_text())
+        self.assertEqual(self.doctor()[0], 1)
+        self.fixture("remove-heartbeat")
+        self.fixture("cli", "audit")
+        self.assertIn("audit:doctor:backup", self.inspected()["alerts"])
+
+    def test_an_open_doctor_alert_clears_when_the_heartbeat_takes_the_fault_over_and_returns_after(self):
+        self.fixture("faults")
+        self.fixture("cli", "audit")
+        self.assertIn("audit:doctor:cost", self.inspected()["alerts"])
+        self.fixture("heartbeat-cost")
+        self.fixture("cli", "audit")
+        self.assertNotIn("audit:doctor:cost", self.inspected()["alerts"])
+        self.fixture("remove-heartbeat")
+        self.fixture("cli", "audit")
+        self.assertIn("audit:doctor:cost", self.inspected()["alerts"])
+
+    def test_latest_findings_drops_doctor_lines_and_keeps_ordinary_ones(self):
+        self.fixture("faults")
+        self.fixture("heartbeat-cost")
+        self.fixture("cli", "audit")
+        self.fixture("append-finding")
+        latest = self.inspected()["latest"]
+        self.assertIn("skills:broken", latest)
+        self.assertNotIn("doctor:", latest)
+
+    def doctor_after(self, action):
+        self.fixture(action)
+        before = self.fingerprint()
+        code, lines, done = self.doctor()
+        self.assertEqual(self.fingerprint(), before)
+        self.assertEqual(len(lines), 7, done.stdout)
+        return code, lines
+
+    def test_orphans_count_every_table_and_skip_empty_run_ids(self):
+        code, lines = self.doctor_after("orphan-tables")
+        self.assertEqual(code, 1)
+        self.assertEqual(lines["orphans"].split()[2], "4")
+        for name in ("ghost-step", "ghost-eval", "ghost-feed", "ghost-verdict"):
+            self.assertIn(name, lines["orphans"])
+
+    def test_empty_run_ids_are_not_orphans(self):
+        code, lines = self.doctor_after("empty-ids")
+        self.assertEqual(code, 0)
+        self.assertTrue(lines["orphans"].startswith("OK"), lines["orphans"])
+
+    def test_more_than_five_faults_name_five_ids_and_count_them_all(self):
+        code, lines = self.doctor_after("many-orphans")
+        self.assertEqual(code, 1)
+        self.assertEqual(lines["orphans"].split()[2], "7")
+        self.assertEqual(lines["orphans"].count("ghost-"), 5)
+
+    def test_a_run_with_cost_and_no_steps_fails_the_cost_check(self):
+        code, lines = self.doctor_after("cost-no-steps")
+        self.assertEqual(code, 1)
+        self.assertTrue(lines["cost"].startswith("FAIL") and "bare-run" in lines["cost"], lines["cost"])
+
+    def test_cost_drift_under_the_tolerance_passes(self):
+        self.assertTrue(self.doctor_after("drift-small")[1]["cost"].startswith("OK"))
+
+    def test_cost_drift_over_the_tolerance_fails(self):
+        self.assertTrue(self.doctor_after("drift-large")[1]["cost"].startswith("FAIL"))
+
+    def test_rows_with_purged_files_are_not_named(self):
+        code, lines = self.doctor_after("purged-rows")
+        self.assertEqual(code, 0)
+        self.assertNotIn("purged-run", lines["folders"])
+
+    def test_queue_claims_on_running_runs_and_dead_entries_stay_out_of_stuck(self):
+        code, lines = self.doctor_after("settled-queue")
+        self.assertEqual(code, 1)
+        self.assertEqual(lines["stuck"].split()[2], "1")
+        self.assertIn("queue#2", lines["stuck"])
+
+    def test_young_busy_chats_and_approvals_are_not_stuck(self):
+        code, lines = self.doctor_after("young-stuck")
+        self.assertEqual(code, 0)
+        self.assertTrue(lines["stuck"].startswith("OK"), lines["stuck"])
+
+    def test_a_folder_listing_error_fails_folders_and_the_other_checks_still_print(self):
+        code, lines = self.doctor_after("unreadable-runs")
+        self.assertEqual(code, 1)
+        self.assertTrue(lines["folders"].startswith("FAIL") and "Error" in lines["folders"], lines["folders"])
+        for name in ("cost", "orphans", "chat", "stuck", "store"):
+            self.assertTrue(lines[name].startswith("OK"), lines[name])
 
     def test_doctor_fails_store_on_a_damaged_database(self):
         self.fixture("clean")
@@ -502,8 +610,20 @@ class DoctorTests(unittest.TestCase):
         code, lines, _ = self.doctor()
         self.assertEqual(code, 1)
         self.assertEqual(len(lines), 7)
+        first = self.fixture("first-quick-check").stdout.strip()
+        self.assertNotEqual(first, "ok")
         self.assertTrue(lines["store"].startswith("FAIL"), lines["store"])
+        self.assertIn(f"quick_check: {' '.join(first.split())}"," ".join(lines["store"].split()))
         self.assertEqual(self.fingerprint(), before)
+
+    def test_audit_keeps_a_failed_chat_check_a_failure(self):
+        self.fixture("clean")
+        self.fixture("corrupt-store")
+        self.fixture("cli", "audit")
+        latest = (self.root / "state" / "audit" / "latest.md").read_text()
+        self.assertIn("FAIL [doctor:chat]", latest)
+        self.assertNotIn("INFO [doctor:chat]", latest)
+        self.assertIn("audit:doctor:chat", self.inspected()["alerts"])
 
     def test_doctor_without_a_database_fails_without_creating_one(self):
         code, lines, _ = self.doctor()

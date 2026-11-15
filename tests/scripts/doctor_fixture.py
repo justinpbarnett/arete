@@ -135,7 +135,107 @@ def corrupt_store():
         f.write(bytes(page_size))
 
 
+def sql(statement, *args):
+    with state.db() as c:
+        c.execute(statement, args)
+
+
+def orphan_tables():
+    clean()
+    record.step("ghost-step", "build", agent.Result(ok=True, cost_usd=0.1), 1)
+    sql("INSERT INTO evals (run_id, repo, task) VALUES ('ghost-eval', 'r', 't')")
+    sql("INSERT INTO feed (run_id, ts, kind, text) VALUES ('ghost-feed', 'x', 'k', 't')")
+    sql("INSERT INTO verdicts (run_id, kind, subject) VALUES ('ghost-verdict', 'push', 's')")
+
+
+def empty_ids():
+    clean()
+    sql("INSERT INTO steps (run_id, step, cost_usd) VALUES ('', 'build', 0)")
+    sql("INSERT INTO evals (run_id, repo, task) VALUES ('', 'r', 't')")
+    sql("INSERT INTO feed (run_id, ts, kind, text) VALUES ('', 'x', 'k', 't')")
+    sql("INSERT INTO verdicts (run_id, kind, subject) VALUES ('', 'push', 's')")
+
+
+def many_orphans():
+    clean()
+    for n in range(7):
+        record.step(f"ghost-{n}", "build", agent.Result(ok=True, cost_usd=0.1), 1)
+
+
+def cost_no_steps():
+    clean()
+    record.start("pipeline", run_id="bare-run")
+    (paths.RUNS_DIR / "bare-run").mkdir()
+    set_row("bare-run", cost_usd=2.0, status="done", started=ago(hours=3))
+    age_folder(paths.RUNS_DIR / "bare-run", hours=3)
+
+
+def drift_by(amount):
+    clean()
+    set_row("run-a", cost_usd=0.5 + amount)
+
+
+def purged_rows():
+    clean()
+    record.start("pipeline", run_id="purged-run")
+    set_row("purged-run", started=ago(days=40), status="done", files_purged=util.iso(),
+            log=str(paths.RUNS_DIR / "purged-run" / "run.log"))
+
+
+def settled_queue_entries():
+    clean()
+    record.start("loop", run_id="live-run")
+    for run_id in ("live-run", "ghost-claim", "dead-claim"):
+        state.take_queue_item(state.enqueue("loop", "q", "g", "trigger", [1]), run_id)
+    sql("UPDATE queue SET dead_at = ?, dead_reason = 'x' WHERE run_id = 'dead-claim'", util.iso())
+
+
+def young_stuck():
+    clean()
+    chat_id = state.chat_add("")
+    state.chat_claim(chat_id, "hi", "t")
+    sql("UPDATE chats SET updated = ? WHERE id = ?", ago(minutes=5), chat_id)
+    approval = state.add_approval("loop", "run-a", {"kind": "x"}, "summary")
+    state.claim_approval(approval, util.iso(util.now() + timedelta(hours=1)))
+    sql("UPDATE approvals SET decided = ? WHERE id = ?", ago(minutes=10), approval)
+
+
+def unreadable_runs():
+    clean()
+    shutil.rmtree(paths.RUNS_DIR)
+    paths.RUNS_DIR.write_text("not a folder")
+
+
+def serve_marker():
+    from arete import install
+
+    marker = install.serve_file(install.this_platform())
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("")
+
+
+def forget_backup_check():
+    last = paths.backups_dir() / backup.LAST
+    last.unlink()
+
+
+def append_finding():
+    with (paths.STATE_DIR / "audit" / "latest.md").open("a") as out:
+        out.write("- FAIL [skills:broken] a harness fault\n")
+
+
+def first_quick_check():
+    with state.reader() as conn:
+        print(conn.execute("PRAGMA quick_check").fetchone()[0])
+
+
 ACTIONS = {
+    "first-quick-check": first_quick_check, "append-finding": append_finding, "orphan-tables": orphan_tables, "empty-ids": empty_ids, "many-orphans": many_orphans,
+    "cost-no-steps": cost_no_steps, "drift-small": lambda: drift_by(0.0000005),
+    "drift-large": lambda: drift_by(0.00001), "purged-rows": purged_rows,
+    "settled-queue": settled_queue_entries, "young-stuck": young_stuck, "unreadable-runs": unreadable_runs,
+    "serve-marker": serve_marker, "forget-backup-check": forget_backup_check,
+    "remove-heartbeat": lambda: paths.HEARTBEAT_FILE.unlink(),
     "clean": clean, "faults": faults, "repair": repair, "fingerprint": fingerprint, "inspect": inspect,
     "heartbeat-cost": lambda: heartbeat("costs:drift"), "heartbeat-backup": lambda: heartbeat("backup:db"),
     "heartbeat-both": lambda: heartbeat("costs:drift", "backup:db"),

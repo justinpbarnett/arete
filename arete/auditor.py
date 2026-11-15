@@ -276,7 +276,7 @@ def doctor_findings(results: list[doctor.Result]) -> list[Finding]:
     for r in results:
         subject = ", ".join(r.ids) or r.name
         detail = f"{r.count}: {r.detail}"
-        if r.name == "chat":
+        if r.name == "chat" and r.severity == "info":
             if r.count:
                 out.append(Finding("doctor:chat", "info", subject, detail))
         elif r.failing:
