@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from http.client import RemoteDisconnected
 from pathlib import Path
 
-from . import outbound, paths, util
+from . import adf, outbound, paths, util
 
 ENV_KEYS = ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
 TIMEOUT = 30
@@ -171,7 +171,7 @@ class Client:
     def comment(self, key: str, markdown: str) -> None:
         token, start = uuid.uuid4().hex, util.now()
         path = f"/rest/api/3/issue/{_path_segment(key)}/comment"
-        body = {"body": adf(outbound.screen(markdown)), "properties": [{"key": "arete", "value": {"key": token}}]}
+        body = {"body": adf.from_markdown(outbound.screen(markdown)), "properties": [{"key": "arete", "value": {"key": token}}]}
         try:
             self.request("POST", path, body=body)
         except JiraUnsure:
@@ -208,11 +208,15 @@ class Client:
         if ops:
             self.request("PUT", f"/rest/api/2/issue/{_path_segment(key)}", body={"update": {"labels": ops}})
 
-    def transition(self, key: str, name: str, by_name: bool = True) -> bool:
-        want = name.strip().lower()
+    def move(self, key: str, target: str) -> bool:
+        try:
+            status_exists = target.lower() in {s.lower() for s in self.statuses(key.rsplit("-", 1)[0])}
+        except JiraError:
+            status_exists = False
+        want = target.strip().lower()
         found = (self.get(f"/rest/api/2/issue/{_path_segment(key)}/transitions") or {}).get("transitions", [])
         pick = next((t for t in found if ((t.get("to") or {}).get("name") or "").lower() == want), None)
-        if pick is None and by_name:
+        if pick is None and not status_exists:
             pick = next((t for t in found if t.get("name", "").lower() == want), None)
         if pick is None:
             return False
@@ -253,95 +257,3 @@ def _error_text(e: urllib.error.HTTPError) -> str:
     errors = body.get("errors") if isinstance(body.get("errors"), dict) else {}
     msgs = [str(m) for m in body.get("errorMessages") or []] + [f"{k}: {v}" for k, v in errors.items()]
     return util.first_line("; ".join(msgs) or raw, 300)
-
-
-_INLINE = re.compile(r"`(?P<code>[^`]+)`|\*\*(?P<strong>[^*]+)\*\*|\[(?P<link>[^\]]+)\]\((?P<href>https?://[^)\s]+)\)")
-
-
-def _text(text: str, *marks: dict) -> dict:
-    return {"type": "text", "text": text, "marks": list(marks)} if marks else {"type": "text", "text": text}
-
-
-def _inline(text: str) -> list[dict]:
-    nodes, at = [], 0
-    for m in _INLINE.finditer(text):
-        if m.start() > at:
-            nodes.append(_text(text[at:m.start()]))
-        if m["code"]:
-            nodes.append(_text(m["code"], {"type": "code"}))
-        elif m["strong"]:
-            nodes.append(_text(m["strong"], {"type": "strong"}))
-        else:
-            nodes.append(_text(m["link"], {"type": "link", "attrs": {"href": m["href"]}}))
-        at = m.end()
-    if at < len(text):
-        nodes.append(_text(text[at:]))
-    return nodes
-
-
-def adf(markdown: str) -> dict:
-    content: list[dict] = []
-    para: list[str] = []
-    bullets: list[str] = []
-    numbered: list[str] = []
-    first_number = 1
-    code: list[str] | None = None
-
-    def flush() -> None:
-        if para:
-            nodes: list[dict] = []
-            for i, ln in enumerate(para):
-                if i:
-                    nodes.append({"type": "hardBreak"})
-                nodes += _inline(ln)
-            content.append({"type": "paragraph", "content": nodes})
-            para.clear()
-        for kind, items in (("bulletList", bullets), ("orderedList", numbered)):
-            if items:
-                node: dict = {"type": kind, "content": [
-                    {"type": "listItem", "content": [{"type": "paragraph", "content": _inline(i)}]} for i in items
-                ]}
-                if items is numbered and first_number != 1:
-                    node["attrs"] = {"order": first_number}
-                content.append(node)
-                items.clear()
-
-    def code_block(lines: list[str]) -> dict:
-        text = "\n".join(lines)
-        return {"type": "codeBlock", "content": [{"type": "text", "text": text}] if text else []}
-
-    for line in markdown.splitlines():
-        fence = line.strip().startswith("```")
-        if code is not None:
-            if fence:
-                content.append(code_block(code))
-                code = None
-            else:
-                code.append(line)
-            continue
-        if fence:
-            flush()
-            code = []
-        elif not line.strip():
-            flush()
-        elif m := re.match(r"^(#{1,6})\s+(.*)$", line):
-            flush()
-            content.append({"type": "heading", "attrs": {"level": len(m.group(1))}, "content": _inline(m.group(2))})
-        elif m := re.match(r"^\s*[-*]\s+(.*)$", line):
-            if para or numbered:
-                flush()
-            bullets.append(m.group(1))
-        elif m := re.match(r"^\s*(\d{1,9})[.)]\s+(.*)$", line):
-            if para or bullets:
-                flush()
-            if not numbered:
-                first_number = int(m.group(1))
-            numbered.append(m.group(2))
-        else:
-            if bullets or numbered:
-                flush()
-            para.append(line)
-    if code is not None:
-        content.append(code_block(code))
-    flush()
-    return {"type": "doc", "version": 1, "content": content or [{"type": "paragraph", "content": []}]}
