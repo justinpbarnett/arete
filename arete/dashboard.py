@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import glob
 import hashlib
-import ipaddress
 import json
 import math
 import os
@@ -28,7 +27,6 @@ from . import (
     board,
     capture,
     chat,
-    client,
     codebase,
     config,
     control,
@@ -65,7 +63,6 @@ CERT_SECONDS = 120
 RENEW_SECONDS = 7 * 24 * 3600
 CERT_RETRY_SECONDS = 3600
 HANDSHAKE_SECONDS = 10
-LOOPBACK = "127.0.0.1"
 TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
                   "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
 TAILSCALE_AS_CLI = {"TAILSCALE_BE_CLI": "1"}
@@ -181,13 +178,6 @@ class CertError(Exception):
     pass
 
 
-class ProxyError(Exception):
-    pass
-
-
-PROXY_FAILURES = (ProxyError, OSError, subprocess.SubprocessError)
-
-
 def serve_entries(status: dict) -> dict[int, dict[str, str]]:
     found: dict[int, dict[str, str]] = {}
     for scope in (status, *((status.get("Foreground") or {}).values())):
@@ -198,13 +188,13 @@ def serve_entries(status: dict) -> dict[int, dict[str, str]]:
                 port = int(str(hostport).rsplit(":", 1)[1])
             except (IndexError, ValueError):
                 continue
+            found.setdefault(port, {})
             for mount, handler in ((web or {}).get("Handlers") or {}).items():
                 target = (handler or {}).get("Proxy") if isinstance(handler, dict) else None
                 found.setdefault(port, {})[f"{hostport}{mount}"] = str(target or handler)
         for key, tcp in (scope.get("TCP") or {}).items():
-            forward = (tcp or {}).get("TCPForward") if isinstance(tcp, dict) else None
-            if forward and str(key).isdecimal():
-                found.setdefault(int(key), {})["tcp"] = str(forward)
+            if str(key).isdecimal():
+                found.setdefault(int(key), {})["tcp"] = str(tcp)
     return found
 
 
@@ -240,20 +230,6 @@ class Tailscale:
             return None
         return serve_entries(status) if isinstance(status, dict) else None
 
-    def proxy(self, port: int) -> None:
-        proc = tailscale_run("serve", "--bg", f"--https={port}", f"http://{LOOPBACK}:{port}", timeout=PROXY_SECONDS)
-        if proc is None:
-            raise ProxyError("tailscale serve is missing or did not finish in time")
-        if proc.returncode != 0:
-            raise ProxyError(util.first_line(proc.stderr or "", 200) or f"tailscale serve exited {proc.returncode}")
-
-    def unproxy(self, port: int) -> None:
-        proc = tailscale_run("serve", f"--https={port}", "off", timeout=PROXY_SECONDS)
-        if proc is None:
-            raise ProxyError("tailscale serve is missing or did not finish in time")
-        if proc.returncode != 0:
-            raise ProxyError(util.first_line(proc.stderr or "", 200) or f"tailscale serve exited {proc.returncode}")
-
 
 class ScratchHost(Tailscale):
     def certificate(self, name: str) -> str:
@@ -261,12 +237,6 @@ class ScratchHost(Tailscale):
 
     def served(self) -> dict[int, dict[str, str]] | None:
         return None
-
-    def proxy(self, port: int) -> None:
-        raise ProxyError("scratch state changes no tailscale serve mapping")
-
-    def unproxy(self, port: int) -> None:
-        raise ProxyError("scratch state changes no tailscale serve mapping")
 
 
 def host_services() -> Tailscale:
@@ -878,31 +848,10 @@ class Redirect(Handler):
         self.end_headers()
 
 
-@dataclass
-class FrontedLogins:
-    seen: threading.local = field(default_factory=threading.local)
-
-    def note(self, login: str) -> None:
-        self.seen.login = login
-
-    def of(self, address: str) -> str:
-        try:
-            loopback = ipaddress.ip_address(address).is_loopback
-        except ValueError:
-            return ""
-        return getattr(self.seen, "login", "") if loopback else ""
-
-
-class FrontedHandler(Handler):
-    def answer(self, method: str) -> None:
-        self.server.logins.note(self.headers.get(client.IDENTITY_HEADER, ""))
-        super().answer(method)
-
-
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: str, port: int, node: Node, logins: Logins | FrontedLogins, inside_serve: bool,
+    def __init__(self, address: str, port: int, node: Node, logins: Logins, inside_serve: bool,
                  tls: ssl.SSLContext | None = None, handler: type[Handler] = Handler):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
         self.node, self.logins, self.inside_serve, self.tls = node, logins, inside_serve, tls
@@ -1014,14 +963,8 @@ class Front:
     scheme: str
     servers: list[Server]
     tls: ssl.SSLContext | None = None
-    fronted: bool = False
     why: str = ""
-
-
-@dataclass(frozen=True)
-class Claim:
-    behind: bool
-    why: str = ""
+    mapping: str = ""
 
 
 def say(text: str) -> None:
@@ -1051,120 +994,20 @@ def open_servers(addresses: tuple[str, ...], port: int, node: Node, logins: Logi
     return servers
 
 
-def proxy_record(port: int) -> dict | None:
-    try:
-        found = json.loads(paths.proxy_file(port).read_text())
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError):
-        found = None
-    return found if isinstance(found, dict) else {"port": port, "pending": True}
-
-
-def write_proxy_record(node: Node, port: int, entries: dict[str, str], pending: bool) -> None:
-    util.write_json(paths.proxy_file(port), {"port": port, "name": node.name, "pid": os.getpid(),
-                                             "pending": pending, "entries": entries, "at": util.iso()})
-
-
-def drop_proxy_record(port: int) -> None:
-    try:
-        paths.proxy_file(port).unlink(missing_ok=True)
-    except OSError as e:
-        say(f"cannot remove the record of the tailscale serve mapping on port {port} ({e.strerror or e})")
-
-
 def serve_status(host: Tailscale) -> dict[int, dict[str, str]] | None:
     try:
         status = host.served()
-    except PROXY_FAILURES:
+    except (OSError, subprocess.SubprocessError):
         return None
     return None if status is None else {int(p): dict(e) for p, e in status.items()}
 
 
-def forwards_here(target: str, port: int) -> bool:
-    parts = urlsplit(target if "://" in target else f"http://{target}")
-    try:
-        return parts.hostname in (LOOPBACK, "localhost") and parts.port == port
-    except ValueError:
-        return False
-
-
-def owned(record: dict, on_port: dict[str, str], port: int) -> dict[str, str]:
-    recorded = record.get("entries")
-    recorded = recorded if isinstance(recorded, dict) else {}
-    return {m: t for m, t in on_port.items() if forwards_here(t, port) or recorded.get(m) == t}
-
-
-def release_proxy(host: Tailscale, port: int, made: dict[str, str] | None = None) -> bool:
-    record = proxy_record(port)
-    if record is None:
-        return True
-    if made:
-        record = {**record, "entries": made}
-    before = serve_status(host)
-    if before is None:
-        return False
-    on_port = before.get(port, {})
-    mine = owned(record, on_port, port)
-    if mine and len(mine) == len(on_port):
-        try:
-            host.unproxy(port)
-        except PROXY_FAILURES:
-            pass
-        after = serve_status(host)
-        if after is None:
-            return False
-        mine = owned(record, after.get(port, {}), port)
-    if mine:
-        return False
-    drop_proxy_record(port)
-    return True
-
-
-def claim_proxy(host: Tailscale, node: Node, port: int) -> Claim:
-    record = proxy_record(port)
-    before = serve_status(host)
-    if before is None:
-        return Claim(record is not None, "tailscale serve status cannot be read")
-    on_port = before.get(port, {})
-    if record:
-        mine = owned(record, on_port, port)
-        if mine:
-            try:
-                write_proxy_record(node, port, mine, False)
-            except OSError as e:
-                say(f"cannot update the record of the tailscale serve mapping on port {port} ({e.strerror or e})")
-            return Claim(True)
-        if not (on_port and record.get("pending")):
-            drop_proxy_record(port)
-    if on_port:
-        return Claim(False, f"tailscale serve has a mapping on port {port} that arete did not make")
-    try:
-        write_proxy_record(node, port, {}, True)
-    except OSError as e:
-        return Claim(False, f"cannot record a tailscale serve mapping ({e.strerror or e})")
-    failed = ""
-    try:
-        host.proxy(port)
-    except PROXY_FAILURES as e:
-        failed = f" ({util.first_line(str(e), 200)})"
-    after = serve_status(host)
-    if after is None:
-        return Claim(True, "tailscale serve status cannot be read")
-    made = after.get(port, {})
-    if not made:
-        drop_proxy_record(port)
-        return Claim(False, f"tailscale serve made no mapping{failed}")
-    try:
-        write_proxy_record(node, port, made, False)
-    except OSError as e:
-        why = f"cannot record the tailscale serve mapping ({e.strerror or e})"
-        return Claim(not release_proxy(host, port, made), why)
-    return Claim(True)
-
-
 def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_serve: bool,
-               kept: Server | None = None, secure: bool = False) -> Front:
+               secure: bool = False) -> Front:
+    status = serve_status(host)
+    mapping = (f"tailscale serve has a mapping on port {port}, which takes this port's tailnet traffic; "
+               f"turn it off (for an HTTPS mapping, `tailscale serve --https={port} off`)") \
+        if status is not None and port in status else ""
     opened = open_servers(node.addresses, port, node, logins, inside_serve)
     try:
         tls, reason = None, ""
@@ -1174,63 +1017,35 @@ def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_se
                 tls = tls_context()
             except (CertError, ssl.SSLError, OSError) as e:
                 reason = f"no certificate ({util.first_line(str(e), 200)})"
-        if (tls or not secure) and release_proxy(host, port):
-            stop_listener(kept)
-            for s in opened:
-                s.tls = tls
-            return Front("https" if tls else "http", opened, tls=tls)
-        close_all(opened)
-        opened = []
-        loopback = kept
-        if loopback is None:
-            loopback = Server(LOOPBACK, port, node, FrontedLogins(), inside_serve, handler=FrontedHandler)
-            opened = [loopback]
-        claim = Claim(True, f"arete's tailscale serve mapping on port {port} is still there") if tls or not secure \
-            else claim_proxy(host, node, port)
-        why = "; ".join(x for x in (reason, claim.why) if x)
-        if claim.behind:
-            return Front("http", [loopback], fronted=True, why=why)
-        if kept is None:
-            close_all(opened)
-            opened = []
-            opened = open_servers(node.addresses, port, node, logins, inside_serve)
-        else:
-            opened = open_servers(node.addresses, port, node, logins, inside_serve)
-            stop_listener(kept)
-        return Front("http", opened, why=why)
+        for s in opened:
+            s.tls = tls
+        return Front("https" if tls else "http", opened, tls=tls, why=reason, mapping=mapping)
     except BaseException:
         close_all(opened)
         raise
 
 
 def record_server(node: Node, port: int, front: Front) -> None:
-    fields = {"pid": os.getpid(), "engine": codebase.STAMP, "addresses": [LOOPBACK] if front.fronted else list(node.addresses), "port": port,
+    fields = {"pid": os.getpid(), "engine": codebase.STAMP, "addresses": list(node.addresses), "port": port,
               "scheme": front.scheme, "host": node.name}
-    if front.fronted:
-        fields |= {"login": node.owner, "behind": "tailscale serve"}
     try:
         util.write_json(paths.SERVER_FILE, {**fields, **paths.state_and_config(), "at": util.iso()})
     except OSError as e:
         say(f"cannot write the server file ({e.strerror or e}); the CLI will not find this dashboard")
 
 
-CERTIFICATE_RETRY = "trying for a certificate again"
-
-
 def watch(host: Tailscale, owner: str, node: Node, front: Front, secure: bool = False) -> str:
     certificate_due = time.monotonic() + (RENEW_SECONDS if front.tls else CERT_RETRY_SECONDS) \
-        if secure or front.fronted else math.inf
+        if secure else math.inf
     renewal_failed = False
     reload_pending = False
     while True:
         now = host.node(owner)
-        if now != node and not (front.fronted and now is None):
+        if now != node:
             return "the tailnet address or owner changed"
         time.sleep(WATCH_SECONDS)
         if now is None or time.monotonic() < certificate_due:
             continue
-        if front.fronted:
-            return CERTIFICATE_RETRY
         if not secure:
             continue
         try:
@@ -1270,29 +1085,24 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
     hold = util.lock_file(f"dashboard-{port}")
     held = False
     waiting_for = ""
-    kept: Server | None = None
-    kept_front: Front | None = None
-    opened_once = False
     last_line = ""
     atexit.register(forget_server)
     try:
         while True:
             node = host.node(cfg.dashboard_owner)
-            if kept is not None and kept_front is not None and node is not None and node != kept.node:
-                kept.node = node
-                record_server(node, port, kept_front)
             try:
                 if node is None:
                     raise OSError("tailscale is not running or reports no address")
-                held = held or util.flock_now(hold)
+                if not held:
+                    held = util.flock_now(hold)
+                    if held:
+                        try:
+                            (paths.STATE_DIR / f"dashboard-proxy-{port}.json").unlink(missing_ok=True)
+                        except OSError as e:
+                            say(f"cannot remove the old dashboard proxy record ({e.strerror or e})")
                 if not held:
                     raise OSError(f"another dashboard on this state holds port {port}")
-                if kept is None and not opened_once and (resumed := resume_fallback(node, port, inside_serve)):
-                    kept_front = resumed
-                    kept = resumed.servers[0]
-                    last_line = announce(node, port, resumed, last_line)
-                front = open_front(host, node, port, logins, inside_serve, kept, cfg.dashboard_https)
-                opened_once = True
+                front = open_front(host, node, port, logins, inside_serve, cfg.dashboard_https)
             except OSError as e:
                 if str(e) != waiting_for:
                     say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
@@ -1301,35 +1111,15 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
                 continue
             waiting_for = ""
             for s in front.servers:
-                if s is not kept:
-                    threading.Thread(target=s.serve_forever, daemon=True).start()
+                threading.Thread(target=s.serve_forever, daemon=True).start()
             last_line = announce(node, port, front, last_line)
             reason = watch(host, cfg.dashboard_owner, node, front, cfg.dashboard_https)
-            kept = front.servers[0] if front.fronted else None
-            kept_front = front if front.fronted else None
-            if reason != CERTIFICATE_RETRY:
-                say(f"{reason}; listening again")
+            say(f"{reason}; listening again")
             for s in front.servers:
-                if s is not kept:
-                    stop_listener(s)
-            if kept is None:
-                forget_server()
+                stop_listener(s)
+            forget_server()
     finally:
         forget_server()
-
-
-RESUMING = "checking the tailscale serve mapping arete recorded"
-
-
-def resume_fallback(node: Node, port: int, inside_serve: bool) -> Front | None:
-    if proxy_record(port) is None:
-        return None
-    try:
-        loopback = Server(LOOPBACK, port, node, FrontedLogins(), inside_serve, handler=FrontedHandler)
-    except OSError:
-        return None
-    threading.Thread(target=loopback.serve_forever, daemon=True).start()
-    return Front("http", [loopback], fronted=True, why=RESUMING)
 
 
 def announce(node: Node, port: int, front: Front, last_line: str) -> str:
@@ -1342,14 +1132,14 @@ def announce(node: Node, port: int, front: Front, last_line: str) -> str:
 
 def listening_line(node: Node, port: int, front: Front) -> str:
     if front.tls:
-        return f"dashboard listening on port {port} at {', '.join(node.addresses)} over HTTPS as {node.name}"
-    if front.fronted:
-        return (f"dashboard listening on port {port} at {LOOPBACK} behind tailscale serve as {node.name}; "
-                f"{front.why}")
-    if not front.why:
-        return f"dashboard listening on port {port} at {', '.join(node.addresses)} over plain HTTP"
-    return (f"dashboard listening on port {port} at {', '.join(node.addresses)} over plain HTTP; "
-            f"{front.why}; trying again every hour")
+        line = f"dashboard listening on port {port} at {', '.join(node.addresses)} over HTTPS as {node.name}"
+    else:
+        line = f"dashboard listening on port {port} at {', '.join(node.addresses)} over plain HTTP"
+    if front.why:
+        line += f"; {front.why}; trying again every hour"
+    if front.mapping:
+        line += f"; {front.mapping}"
+    return line
 
 
 def url(node: Node | None, port: int) -> str:
@@ -1357,10 +1147,7 @@ def url(node: Node | None, port: int) -> str:
     mine = paths.state_and_config()
     recorded = isinstance(found, dict) and {k: found.get(k) for k in mine} == mine
     fallback = "https" if config.load_or_problem()[0].dashboard_https else "http"
-    if recorded and found.get("behind"):
-        scheme = "https"
-    else:
-        scheme = found["scheme"] if recorded and found.get("scheme") in ("http", "https") else fallback
+    scheme = found["scheme"] if recorded and found.get("scheme") in ("http", "https") else fallback
     if node is None and scheme == "http":
         return f"http://<this machine's tailnet address>:{port}"
     if node is None:

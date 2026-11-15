@@ -54,7 +54,7 @@ class MergeCheckEvidenceTests(unittest.TestCase):
                            mock.patch.object(mergecheck, "deadline", nullcontext),
                            mock.patch.object(record, "start"), mock.patch.object(record, "settle"),
                            mock.patch.object(util, "git", return_value="pinned-sha"),
-                           mock.patch.object(mergecheck.verifiers, "held", return_value=False),
+                           mock.patch.object(mergecheck.verifier_suites, "held", return_value=False),
                            mock.patch.object(scratch, "make", side_effect=OSError("fixture has no scratch")),
                            mock.patch.object(verify, "preflight", return_value=None),
                            mock.patch.object(verify, "serving", side_effect=failure),

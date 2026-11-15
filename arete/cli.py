@@ -400,7 +400,7 @@ def cmd_guard(args) -> int:
     from . import guard, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return guard.main()
+    return guard.main(args.judge, args.open)
 
 
 def cmd_upload_guard(args) -> int:
@@ -423,7 +423,7 @@ def cmd_codex_guard(args) -> int:
     from . import codex, runner, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
+    return codex.guard_main(args.judge, runner.NO_GIT_WRITES, args.open)
 
 
 def cmd_mcp_ask(args) -> int:
@@ -1854,8 +1854,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
 
-    p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: keeps them out of secret files and, with JEV, "
+    p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: enforces the directory floor and secret rules; "
+                                     "with --judge, "
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
+    p.add_argument("--judge", action="store_true")
+    p.add_argument("--open", action="append", default=[])
     scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
@@ -1863,9 +1866,10 @@ def main(argv: list[str] | None = None) -> int:
                                             "in the run's evidence or browser folder (reads a payload on stdin)")
     p.set_defaults(fn=cmd_upload_guard)
 
-    p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
-                                           "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
+    p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: enforces the directory floor, "
+                                           "git write and secret rules; with --judge, asks JEV (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
+    p.add_argument("--open", action="append", default=[])
     scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
 
