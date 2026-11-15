@@ -2545,7 +2545,7 @@ def abort_merge(wt: Path) -> None:
 def resolution_diff(c: Checkout) -> diffguard.Diff:
     if not c.resolved:
         return diffguard.Diff()
-    return diffguard.between(c.wt, c.base_commit, "HEAD", "--", *c.resolved, prefix=c.prefix)
+    return diffguard.between(c.wt, c.base_commit, "HEAD", "--", *c.resolved, prefix=c.prefix, moves=True)
 
 
 def note_fresh_bases(checkouts: list[Checkout]) -> None:
@@ -2930,7 +2930,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
     res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
-                                   diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT),
+                                   diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
                                    earlier=earlier_review(earlier, reply,
                                                           fixed_since(b, before.get("trees") or {}))),
                       b.ws, role="review", allowed_tools=bash_rules(b.read_bash),
@@ -3065,7 +3065,7 @@ def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified)
 @runlimits.verification
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
     return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
-                       diff=util.tail(b.staged.patch, MAX_DIFF_IN_PROMPT))
+                       diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:

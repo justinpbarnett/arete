@@ -47,7 +47,8 @@ to build.
 
 ## Size budget
 
-This repo caps a change at $max_lines changed lines (added plus deleted, lockfiles not counted).
+This repo caps a change at $max_lines changed lines (added plus deleted; lockfiles and lines moved verbatim, even
+reindented, are not counted, so splitting or renaming a file costs only the edits it needs).
 Arete enforces it after the build, so a plan over it is wasted work. Set `estimated_lines` to your honest estimate.
 If the work cannot fit, keep `plan` to a short outline and fill `split` with two to five smaller issues, in build
 order, that each fit the budget and each leave the repo working; give each a title and a body written like an
