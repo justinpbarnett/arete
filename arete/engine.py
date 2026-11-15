@@ -419,7 +419,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
     from . import mergecheck
 
-    if not found and value is None and (not said or mergecheck.builtin(loop)):
+    if not found and (not said or mergecheck.builtin(loop)):
         return "skipped", took + ", no output; zero model calls"
     fresh = new_findings(run, found)
     outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events)}
