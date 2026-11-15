@@ -1640,6 +1640,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     print(f"{name} was not started: {no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
+            settled = [done for dead_row in state.ticket_runs_marked_running(repo.name, tid)
+                       if (done := record.interrupt(dead_row))]
             earlier = [] if only else state.ticket_runs(repo.name, tid, limit=1, whole=True)
             restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier[0]["id"] if restarting else ""))
@@ -1661,6 +1663,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if mending:
                 lines.write(run_id, "repair", source=mending)
                 run.log(f"repairing the review findings of run {mending}")
+        for done in settled:
+            if only and not dry_run:
+                tell_ticket_run_died(cfg, done)
+                continue
+            if done["status"] != "stopped":
+                lines.write(done["id"], "error", step=lines.last_step(done["id"]), message=done.get("summary") or "")
+            write_report(done)
         opening_waits(run_id, run.answering,
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
         if restarting:

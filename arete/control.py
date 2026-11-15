@@ -122,7 +122,9 @@ def stop_run(run_id: str) -> dict:
             return {"id": run_id, "stopped": True, "was": "gone"}
     if not r["pid"]:
         raise Refused(f"{run_id} is still starting; stop it again in a moment")
-    record.ask_stop(run_id)
+    r = record.ask_stop(run_id) or r
+    if r["status"] != "running":
+        raise Refused(f"{run_id} is not running; it ended {r['status']}")
     pid = int(r["pid"])
     for kill in (os.killpg, os.kill):
         try:
