@@ -4743,90 +4743,7 @@ class NoLiveStateTests(unittest.TestCase):
             self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
-BACKUP_PRELUDE = r'''
-import contextlib, dataclasses, fcntl, io, json, os, sqlite3, stat, subprocess, sys, tarfile, time
-from datetime import timedelta
-from pathlib import Path
-from unittest import mock
-from arete import backup, cli, config, control, heartbeat, install, optimize, paths, serve, settings, state, util
-root = Path(sys.argv[1])
-util.last_wake = lambda: 0.0
-out = {}
-def ago(days):
-    return util.iso(util.now() - timedelta(days=days))
-def counts(p=None):
-    c = sqlite3.connect(p or paths.DB_FILE)
-    try:
-        names = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()]
-        return {n: c.execute(f"SELECT count(*) FROM {n}").fetchone()[0] for n in names}
-    finally:
-        c.close()
-def column(sql, p=None):
-    c = sqlite3.connect(p or paths.DB_FILE)
-    try:
-        return [r[0] for r in c.execute(sql).fetchall()]
-    finally:
-        c.close()
-def incident(fp, days, closed=None):
-    with state.db() as c:
-        i = c.execute("INSERT INTO incidents (fingerprint, class, source, state, first_seen, last_seen, closed) "
-                      "VALUES (?, 'k', 's', ?, ?, ?, ?)", (fp, "dismissed" if closed else "open", ago(days + 1), ago(days),
-                                                           ago(closed) if closed else "")).lastrowid
-        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?, ?, ?)", (i, ago(days), "note " + fp))
-        c.execute("INSERT INTO incident_aliases (fingerprint, incident, ts) VALUES (?, ?, ?)", (fp + "-alias", i, ago(days)))
-        c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (?, 'r', ?)", (i, ago(days)))
-    return i
-def seed():
-    with state.db() as c:
-        for rid, kind, loop_kind, days, cost in (
-                ("pipe-old", "pipeline", "", 30, 0), ("pipe-new", "pipeline", "", 1, 0),
-                ("loop-old", "loop", "agent", 30, 0), ("loop-new", "loop", "agent", 1, 0),
-                ("paid-old", "loop", "command", 30, 0.5), ("free-old", "loop", "command", 30, 0),
-                ("free-new", "loop", "command", 1, 0)):
-            c.execute("INSERT INTO runs (id, kind, loop_kind, status, started, cost_usd) VALUES (?, ?, ?, 'done', ?, ?)",
-                      (rid, kind, loop_kind, ago(days), cost))
-            c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?, ?, 'note', ?)", (rid, ago(days), rid))
-        for name, days, run in (("q-old", 30, "x"), ("q-new", 1, "x"), ("q-null", 30, None)):
-            c.execute("INSERT INTO queue (loop, queue, enqueued, run_id) VALUES (?, 'q', ?, ?)", (name, ago(days), run))
-        for name, days in (("e-old", 60), ("e-new", 1)):
-            c.execute("INSERT INTO events (loop, type, ts) VALUES (?, ?, ?)", (name, name, ago(days)))
-    incident("open-old", 60)
-    new = incident("open-new", 1)
-    incident("closed-old", 60, 40)
-    incident("closed-recent", 60, 5)
-    with state.db() as c:
-        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?, ?, 'seen again: x')", (new, ago(30)))
-def server():
-    s = serve.Server()
-    s.said = []
-    s.say = s.said.append
-    return s
-def settle():
-    while backup.COPYING:
-        time.sleep(0.02)
-def prune(s=None):
-    s = s or server()
-    s.prune()
-    settle()
-    return s
-def tree():
-    return {p.name: p.read_bytes() for p in paths.STATE_DIR.iterdir() if p.is_file()}
-def run_cli(*argv):
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-        try:
-            rc = cli.main(list(argv))
-        except SystemExit as e:
-            rc = e.code
-    return rc, buf.getvalue()
-def dead():
-    return mock.patch.object(control, "serve_beat", return_value={"alive": False})
-real_sh = util.sh
-def rsync_only(fake):
-    def sh(cmd, *a, **k):
-        return fake(cmd) if cmd[0] == "rsync" else real_sh(cmd, *a, **k)
-    util.sh = sh
-'''
+BACKUP_PRELUDE = (SCRIPTS / "backup_prelude.py").read_text()
 
 BACKUP_SCRIPTS = {
 "prune-keeps": r'''
@@ -4846,80 +4763,8 @@ out |= {"snapshots": len(snaps), "quick_check": found["quick_check"], "snap_runs
         "repairs": column("SELECT count(*) FROM incident_repairs"),
         "last": json.loads((paths.backups_dir() / "last.json").read_text())["quick_check"]}
 ''',
-"widened-restore": r'''
-seed()
-s = server()
-pre = counts()
-with mock.patch.object(state, "FIRINGS", "(1 = 1)"):
-    prune(s)
-snap = max(paths.backups_dir().glob("arete-*.db"))
-out["deleted"] = "pipe-old" not in column("SELECT id FROM runs")
-with state.db() as c:
-    for n in range(5):
-        c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES ('later', ?, 'note', 'later')", (ago(0),))
-seq = dict(sqlite3.connect(paths.DB_FILE).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
-def untouched(rc, patch):
-    held = tree()
-    with patch:
-        got = run_cli("backup", "--restore", str(snap))
-    return [got[0], tree() == held, "stop" in got[1]]
-out["alive"] = untouched(0, mock.patch.object(control, "serve_beat", return_value={"alive": True}))
-with state.db() as c:
-    c.execute("INSERT INTO runs (id, kind, status, started, pid) VALUES ('live', 'pipeline', 'running', ?, ?)", (ago(0), os.getpid()))
-out["running"] = untouched(0, dead())
-with state.db() as c:
-    c.execute("DELETE FROM runs WHERE id = 'live'")
-with dead():
-    out["missing"] = run_cli("backup", "--restore", str(root / "nope.db"))[0]
-    (root / "bad.db").write_bytes(b"not a database" * 100)
-    out["corrupt"] = run_cli("backup", "--restore", str(root / "bad.db"))[0]
-    out["rc"] = run_cli("backup", "--restore", str(snap))[0]
-out["restored"] = counts() == pre
-after = dict(sqlite3.connect(paths.DB_FILE).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
-out["seq_kept"] = all(after.get(name, 0) >= value for name, value in seq.items())
-out["kept_file"] = len(list(paths.STATE_DIR.glob("arete.db.before-restore-*")))
-snap_seq = dict(sqlite3.connect(snap).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
-paths.DB_FILE.write_bytes(b"garbage" * 500)
-with dead():
-    out["rc_corrupt_current"] = run_cli("backup", "--restore", str(snap))[0]
-after = dict(sqlite3.connect(paths.DB_FILE).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
-out["gap"] = all(after[name] == value + 10000 for name, value in snap_seq.items())
-''',
-"hot-journal": r'''
-seed()
-with state.db() as c:
-    c.executemany("INSERT INTO feed (run_id, ts, kind, text) VALUES ('bulk', ?, 'note', 'original')", [(ago(0),)] * 20000)
-snap = backup.snapshot("hand")
-with state.db() as c:
-    c.execute("INSERT INTO runs (id, kind, status, started, pid) VALUES ('live', 'pipeline', 'running', ?, ?)", (ago(0), os.getpid()))
-CHILD = """
-import os, sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
-c.execute("PRAGMA cache_size = 10")
-c.execute("UPDATE feed SET text = 'UNCOMMITTED'")
-os._exit(0)
-"""
-subprocess.run([sys.executable, "-I", "-c", CHILD, str(paths.DB_FILE)], check=True)
-journal = Path(str(paths.DB_FILE) + "-journal")
-out["hot"] = journal.exists()
-with dead():
-    out["refused"] = run_cli("backup", "--restore", str(snap))[0]
-with state.db() as c:
-    c.execute("DELETE FROM runs WHERE id = 'live'")
-with dead():
-    out["rc"] = run_cli("backup", "--restore", str(snap))[0]
-def archived():
-    return [p for p in paths.STATE_DIR.glob("arete.db.before-restore-*") if not p.name.endswith("-journal")]
-out["uncommitted"] = column("SELECT count(*) FROM feed WHERE text = 'UNCOMMITTED'", archived()[0])[0]
-out["quick_check"] = column("PRAGMA quick_check")
-out["live_journal"] = journal.exists()
-journal.write_bytes(b"\0" * 512)
-with dead():
-    out["rc2"] = run_cli("backup", "--restore", str(snap))[0]
-pairs = [p.name for p in paths.STATE_DIR.glob("arete.db.before-restore-*-journal")]
-out["pairs"] = [name.removesuffix("-journal") in [p.name for p in archived()] for name in pairs]
-out["live_journal2"] = journal.exists()
-''',
+"widened-restore": (SCRIPTS / "backup_widened_restore.py").read_text(),
+"hot-journal": (SCRIPTS / "backup_hot_journal.py").read_text(),
 "no-copy-no-delete": r'''
 seed()
 before = counts()
@@ -4948,28 +4793,7 @@ with contextlib.ExitStack() as stack:
     out["b_files"] = listing(b)
 out["a_same"] = listing(a) == held
 ''',
-"concurrent-write": r'''
-seed()
-with state.db() as c:
-    c.executemany("INSERT INTO feed (run_id, ts, kind, text) VALUES ('bulk', ?, 'note', 'original')", [(ago(0),)] * 20000)
-CHILD = """
-import sqlite3, sys, time
-c = sqlite3.connect(sys.argv[1], timeout=30)
-c.execute("PRAGMA cache_size = 10")
-c.execute("UPDATE feed SET text = 'ROLLEDBACK' WHERE run_id = 'bulk'")
-print("ready", flush=True)
-time.sleep(1)
-c.rollback()
-"""
-writer = subprocess.Popen([sys.executable, "-I", "-c", CHILD, str(paths.DB_FILE)], stdout=subprocess.PIPE, text=True)
-assert writer.stdout.readline().strip() == "ready"
-snap = backup.snapshot("hand")
-writer.wait(timeout=60)
-out |= {"writer": writer.returncode, "quick_check": backup.inspect(snap)["quick_check"],
-        "rows": column("SELECT count(*) FROM feed WHERE run_id = 'bulk'", snap)[0],
-        "leaked": column("SELECT count(*) FROM feed WHERE text = 'ROLLEDBACK'", snap)[0],
-        "live_leaked": column("SELECT count(*) FROM feed WHERE text = 'ROLLEDBACK'")[0]}
-''',
+"concurrent-write": (SCRIPTS / "backup_concurrent_write.py").read_text(),
 "missing-file": r'''
 seed()
 snap = backup.snapshot("hand")
@@ -4999,100 +4823,8 @@ with mock.patch.object(paths, "ISOLATED", True):
 out["no_folder"] = not paths.backups_dir().exists()
 out["taken"] = backup.snapshot("hand").name
 ''',
-"retention": r'''
-seed()
-folder = paths.backups_dir()
-folder.mkdir(parents=True)
-today = util.now().date()
-planted = []
-for d in range(1, 21):
-    for hour in (6, 18):
-        planted.append(f"arete-{today - timedelta(days=d):%Y%m%d}T{hour:02d}0000Z-hand.db")
-        (folder / planted[-1]).write_bytes(b"x")
-(folder / "arete.db.before-restore-1").write_bytes(b"x")
-new = backup.snapshot("prune")
-everyone = sorted(planted + [new.name], key=lambda n: (n[6:21], n))
-by_day = {}
-for n in everyone:
-    by_day[n[6:14]] = n
-first = f"{today - timedelta(days=13):%Y%m%d}"
-expected = sorted(set(everyone[-24:]) | {n for day, n in by_day.items() if day >= first})
-out |= {"left": sorted(p.name for p in folder.glob("arete-*.db")), "expected": expected,
-        "other": (folder / "arete.db.before-restore-1").exists()}
-''',
-"copy": r'''
-seed()
-cdir = paths.CONFIG_DIR
-(cdir / "loop-switches.json").write_text("{}")
-(cdir / "pi.env").write_text("PI_KEY=1")
-(cdir / "loops/nested").mkdir(parents=True)
-(cdir / "loops/a.toml").write_text("name = 1")
-(cdir / "loops/nested/ok.toml").write_text("ok = 1")
-(cdir / "loops/secret.env").write_text("S=1")
-(cdir / "loops/nested/x.env").write_text("S=1")
-(cdir / "loops/verification-authority").mkdir()
-(cdir / "loops/verification-authority/token").write_text("T")
-(root / "outside.txt").write_text("OUTSIDE-CONTENT")
-(cdir / "loops/link.txt").symlink_to(root / "outside.txt")
-layers = cdir / "layers"
-layers.mkdir()
-git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false", *a],
-                                cwd=layers, check=True, capture_output=True)
-git("init", "-q", "-b", "main")
-(layers / "a.txt").write_text("x")
-git("add", ".")
-git("commit", "-q", "-m", "fixture")
-calls, codes = [], [1, 0, 1, 0]
-def fake_rsync(cmd):
-    calls.append({"argv": list(cmd), "closed": all(Path(x).is_file() for x in cmd[2:4])})
-    return subprocess.CompletedProcess(cmd, codes.pop(0) if codes else 0, "", "refused")
-rsync_only(fake_rsync)
-last = lambda: json.loads((paths.backups_dir() / "last.json").read_text())
-first_day = util.now().strftime("%Y-%m-%d")
-steps = []
-s = prune()
-steps += [len(calls), last().get("copy_exit"), "copied_at" in last()]
-prune(s)
-stamp = last()["copied_at"]
-steps += [len(calls), last()["copy_exit"], "copied_at" in last()]
-prune(s)
-prune()
-steps += [len(calls), last()["copied_at"] == stamp]
-real_now = util.now
-util.now = lambda: real_now() + timedelta(days=1)
-prune()
-steps += [len(calls), last()["copied_at"] == stamp]
-prune()
-steps += [len(calls), last()["copied_at"] != stamp]
-out["steps"] = steps
-out["argv0"] = calls[0]["argv"]
-out["closed"] = all(c["closed"] for c in calls)
-out["days"] = sorted(p.name for p in paths.backups_dir().glob("config-*.tar.gz"))
-out["first_day"] = first_day
-archive = paths.backups_dir() / f"config-{first_day}.tar.gz"
-with tarfile.open(archive) as tar:
-    out["members"] = tar.getnames()
-    (root / "layers.bundle").write_bytes(tar.extractfile("layers.bundle").read())
-out["verify"] = subprocess.run(["git", "bundle", "verify", str(root / "layers.bundle")], cwd=layers, capture_output=True).returncode
-out["heads"] = subprocess.run(["git", "bundle", "list-heads", str(root / "layers.bundle")], cwd=layers,
-                              capture_output=True, text=True).stdout
-def bundling():
-    try:
-        backup.layers_bundle()
-    except RuntimeError as e:
-        return str(e)
-    return ""
-(layers / "sub").mkdir()
-(layers / "sub/pi.env").write_text("K=1")
-git("add", "-f", ".")
-git("commit", "-q", "-m", "secret")
-git("rm", "-q", "-r", "sub")
-git("commit", "-q", "-m", "removed")
-out["history"] = bundling()
-layers.rename(root / "real-layers")
-layers.symlink_to(root / "real-layers")
-out["linked"] = bundling()
-''',
+"retention": (SCRIPTS / "backup_retention.py").read_text(),
+"copy": (SCRIPTS / "backup_copy.py").read_text(),
 "no-destination": r'''
 seed()
 calls = []
@@ -5102,31 +4834,7 @@ prune()
 out |= {"calls": calls, "archives": len(list(paths.backups_dir().glob("config-*.tar.gz"))),
         "copied": "copied_at" in json.loads((paths.backups_dir() / "last.json").read_text())}
 ''',
-"heartbeat": r'''
-seed()
-install.serve_installed = lambda: True
-cfg = config.load()
-keyed = lambda c: {x.key: x for x in heartbeat.check_backups(c)}
-snap = backup.snapshot("hand")
-out["fresh"] = keyed(cfg)["backup:db"].ok
-old = time.time() - 4 * 3600
-os.utime(snap, (old, old))
-out["stale"] = keyed(cfg)["backup:db"].ok
-snap = backup.snapshot("hand")
-os.truncate(snap, snap.stat().st_size // 2)
-out["truncated"] = keyed(cfg)["backup:db"].ok
-snap = backup.snapshot("hand")
-backup.update_last(quick_check="row 1 missing from index")
-out["recorded"] = keyed(cfg)["backup:db"].ok
-empty = keyed(cfg)["backup:offsite"]
-out["empty"] = [empty.ok, empty.severity, empty.detail]
-away = dataclasses.replace(cfg, backup=config.BackupConfig("h:/x"))
-out["never"] = keyed(away)["backup:offsite"].ok
-backup.update_last(copied_at=util.iso(util.now() - timedelta(hours=49)))
-out["old"] = keyed(away)["backup:offsite"].ok
-backup.update_last(copied_at=util.iso())
-out["recent"] = keyed(away)["backup:offsite"].ok
-''',
+"heartbeat": (SCRIPTS / "backup_heartbeat.py").read_text(),
 "cli": r'''
 seed()
 rc, text = run_cli("backup")
@@ -5140,49 +4848,7 @@ os.truncate(newest, newest.stat().st_size // 2)
 rc, text = run_cli("backup", "--check")
 out["truncated"] = [rc, text, paths.DB_FILE.read_bytes() == held]
 ''',
-"durable-config": r'''
-paths.CONFIG_FILE.write_text("max_parallel = 1\n")
-os.chmod(paths.CONFIG_FILE, 0o640)
-events = []
-real = {"fcntl": fcntl.fcntl, "fsync": os.fsync, "replace": os.replace}
-kind = lambda fd: "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
-def spy_fcntl(fd, op, *a):
-    if op == getattr(fcntl, "F_FULLFSYNC", None):
-        events.append(("flush", kind(fd)))
-    return real["fcntl"](fd, op, *a)
-def spy_fsync(fd):
-    events.append(("flush", kind(fd)))
-    return real["fsync"](fd)
-def spy_replace(a, b):
-    events.append(("replace", ""))
-    return real["replace"](a, b)
-with mock.patch.object(fcntl, "fcntl", spy_fcntl), mock.patch.object(os, "fsync", spy_fsync), mock.patch.object(os, "replace", spy_replace):
-    settings.write_checked('max_parallel = 2\n[backup]\ncopy_to = "h:/x"\n', lambda cfg: "")
-    out["checked"] = list(events)
-    events.clear()
-    optimize.put(b"max_parallel = 3\n")
-    out["put"] = list(events)
-    events.clear()
-    out["loaded"] = config.load().max_parallel
-    kept = paths.CONFIG_FILE.read_bytes()
-    refused = []
-    for text, why in (("max_parallel = 9\n", "no thanks"), ("this is [not toml", "")):
-        try:
-            settings.write_checked(text, lambda cfg: why)
-        except settings.Refused as e:
-            refused.append(str(e))
-    out |= {"refused": len(refused), "unchanged": paths.CONFIG_FILE.read_bytes() == kept, "events": list(events),
-            "mode": stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode), "left": sorted(p.name for p in paths.CONFIG_DIR.iterdir())}
-settings.write_checked('[backup]\ncopy_to = "h:/x"\n', lambda cfg: "")
-out["copy_to"] = config.load().backup.copy_to
-bad = []
-for table in ({"copy_to": 5}, {"other": 1}, ["x"], {"copy_to": " h:/x"}):
-    try:
-        config.backup_table(table)
-    except (ValueError, TypeError):
-        bad.append(table)
-out |= {"bad": len(bad), "default": config.backup_table({}).copy_to}
-''',
+"durable-config": (SCRIPTS / "backup_durable_config.py").read_text(),
 }
 
 
@@ -5929,64 +5595,7 @@ class NewUIShellTests(unittest.TestCase):
                     self.assertIn(method.strip(), ('"GET"', "'GET'"), path.name)
 
     def test_action_fixture_http_controls(self):
-        script = r'''
-import json, threading, unittest, urllib.request, urllib.error
-from unittest import mock
-from arete import dashboard
-from tests.ui_action_fixture import server
-check = unittest.TestCase()
-instance = server()
-check.assertEqual(instance.server_address[0], '127.0.0.1')
-thread = threading.Thread(target=instance.serve_forever, daemon=True)
-thread.start()
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-base = f'http://127.0.0.1:{instance.server_port}'
-def request(path, body=None, guard=True, key='replayed-key'):
-    headers = {'Content-Type':'application/json', 'Idempotency-Key':key}
-    if guard:
-        headers['X-Arete'] = '1'
-    req = urllib.request.Request(base+path, data=None if body is None else json.dumps(body).encode(), headers=headers)
-    try:
-        response = opener.open(req, timeout=10)
-    except urllib.error.HTTPError as error:
-        response = error
-    with response:
-        raw = response.read()
-        return response.status, json.loads(raw) if response.headers.get_content_type() == 'application/json' else raw.decode()
-try:
-    check.assertEqual(request('/ui.html')[0],200)
-    check.assertEqual(request('/')[0],200)
-    check.assertEqual(request('/__ui_actions/control',{},guard=False)[0],403)
-    check.assertEqual(request('/__ui_actions/items/TR-209/reject',{},guard=False)[0],403)
-    with mock.patch.object(dashboard.engine, 'launch', return_value={'id':'heartbeat-test'}) as launch:
-        status, body = request('/api/checks/run',{})
-        check.assertEqual((status,body),(200,{'run':'heartbeat-test'}))
-        launch.assert_called_once_with('heartbeat')
-    current = {'id':'TR-209','version':8,'state':'<b>Changed elsewhere</b>'}
-    conflict = {'error':'version_conflict','current':current}
-    check.assertEqual(request('/__ui_actions/control',{'status':409,'body':conflict})[0],200)
-    data = {'id':'TR-209','reason':'reason','base_version':0}
-    check.assertEqual(request('/__ui_actions/items/TR-209/reject',data),(409,conflict))
-    check.assertEqual(request('/__ui_actions/items/TR-209/reject',data)[0],200)
-    check.assertEqual(request('/__ui_actions/items/TR-209/reject',data)[0],200)
-    log = request('/__ui_actions/requests')[1]
-    check.assertEqual(len(log),4)
-    check.assertEqual(log[0]['response'],{'run':'heartbeat-test'})
-    check.assertEqual(log[1]['status'],409)
-    check.assertEqual(log[2]['idempotency_key'],log[3]['idempotency_key'])
-    check.assertEqual(log[2]['serialized_body'],log[3]['serialized_body'])
-    check.assertTrue(all(entry['guard']=='1' for entry in log))
-    request('/__ui_actions/control',{'status':500,'body':{'error':'broken'}})
-    check.assertEqual(request('/__ui_actions/items/TR-209/remove',data),(500,{'error':'broken'}))
-    request('/__ui_actions/control',{'delay':0.01})
-    check.assertEqual(request('/__ui_actions/items/TR-209/remove',data)[0],200)
-    check.assertEqual(request('/api/usage',{'kind':'visit','tab':'0123456789abcdef','device':'desktop','view':'floor','via':'hash','ms':10})[0],200)
-    check.assertEqual(request('/api/usage')[0],200)
-finally:
-    instance.shutdown()
-    thread.join(timeout=5)
-    instance.server_close()
-'''
+        script = (SCRIPTS / "ui_action_fixture_http.py").read_text()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             make_folders(root, "config", "state", "log", "worktrees")
@@ -5997,173 +5606,7 @@ finally:
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
 
     def test_actions_offline_behavior(self):
-        script = r'''
-import assert from 'node:assert/strict';
-import { webcrypto } from 'node:crypto';
-globalThis.crypto ??= webcrypto;
-const handlers = {}, marked = new Set();
-globalThis.location = {hash:'#triage'};
-globalThis.window = {addEventListener(){}};
-globalThis.document = {documentElement:{dataset:{}}, querySelector:()=>null,
-  querySelectorAll:()=>[], addEventListener(name, fn){handlers[name]=fn;}};
-const {prepareWrite, sendWrite} = await import('./ui-write.js');
-const {actions, dispatch, repeat, replayLast, openReason, cancelReason, confirmReason, reasonBox, ReasonBox, runContext, runAction} = await import('./ui-actions.js');
-const {undo, undoDepth, pushUndo} =await import('./ui-undo.js');
-const {notice} = await import('./ui-notice.js');
-const {createList, listContext, ListRow, List} = await import('./ui-list.js');
-const {actionFixture} = await import('./ui-hooks.js');
-const {startKeys, syncList, selectItem, mode} = await import('./ui-keys.js');
-const {globalCommands, openPalette, queryPalette, runPalette} = await import('./ui-palette.js');
-const {visit} = await import('./ui-data.js');
-const sent = [];
-let response = null, deferred = null;
-globalThis.fetch = async (url, options) => {
-  sent.push({url, ...options});
-  if (deferred) await deferred;
-  const next = response ?? {status:200, body:{run:'heartbeat-fixture', id:'new-1', version:4}};
-  response = null;
-  return {ok:next.status<400, status:next.status, json:async()=>next.body};
-};
-const tick = () => new Promise(resolve=>setTimeout(resolve,0));
-const payload = () => JSON.parse(sent.at(-1).body);
-const cached = {id:'zero',version:0}, data = {reason:'why'};
-const prepared = prepareWrite('/sample', data, cached);
-assert.deepEqual(data,{reason:'why'});
-await sendWrite(prepared); await sendWrite(prepared);
-assert.deepEqual(sent[0],sent[1]);
-assert.equal(payload().base_version,0);
-assert.equal(sent[0].headers['X-Arete'],'1');
-assert(sent[0].headers['Idempotency-Key']);
-assert.equal('base_version' in JSON.parse(prepareWrite('/sample',{},{}).body),false);
-globalCommands([{id:'checks',title:'Run checks now',run:()=>dispatch(actions.checks)}]);
-openPalette(); queryPalette('Run checks now'); runPalette(); await tick();
-assert.equal(sent.at(-1).url,'/api/checks/run');
-assert.equal(notice.value,'Checks started · u to undo');
-const attempts = sent.length;
-await undo(); assert.equal(notice.value,'Checks cannot be undone'); assert.equal(sent.length,attempts);
-await undo(); assert.equal(notice.value,'Nothing to undo');
-const list = actionFixture();
-const makeRow = id => ({dataset:{item:id}, getClientRects:()=>[{}], getAttribute:()=>null,
-  setAttribute(){marked.add(id);},removeAttribute(){marked.delete(id);},scrollIntoView(){},querySelectorAll:()=>[]});
-let rows = list.rows().map(row=>makeRow(row.id));
-const element = {dataset:{list:'action-fixture'}, querySelectorAll(selector){return selector==='[data-row]' ? rows : rows.filter(row=>marked.has(row.dataset.item));},
-  uiContext:id=>listContext(list,'action-fixture',id), querySelector:()=>null};
-const pane = {dataset:{pane:'queue'},toggleAttribute(){},matches:()=>false,querySelectorAll:()=>[element]};
-document.querySelectorAll = selector=>selector==='[data-pane]' ? [pane] : selector==='[data-list]' ? [element] : [];
-const refresh = () => {rows=list.rows().map(row=>makeRow(row.id)); marked.clear(); syncList(element);};
-list.subscribe(before=>{if(!before)refresh();});
-startKeys(); refresh();
-const key = (value, flags={}, target={}) => {
-  let prevented=false;
-  handlers.keydown({key:value,target,...flags,preventDefault(){prevented=true;}});
-  return prevented;
-};
-const field = {tagName:'INPUT',type:'text',blur(){},closest:()=>null};
-const context = id=>listContext(list,'action-fixture',id);
-assert.deepEqual(list.counts(),{total:7,high:2,med:4,needsYou:6});
-key('d'); key('d'); assert.equal(reasonBox.value.label,'Reject TR-209');
-const box = new ReasonBox();
-let focused=0;
-box.base={querySelector:()=>({focus(){focused++;},blur(){}})};
-box.setState=change=>Object.assign(box.state,change);
-box.componentDidMount(); assert.equal(focused,1);
-handlers.focusin({type:'focusin',target:{...field,closest:()=>null}}); assert.equal(mode.value,'INSERT');
-for (const letter of ['u','d','t']) assert.equal(key(letter,{},field),false);
-reasonBox.value={...reasonBox.value,text:'distinctive reason'};
-const before = sent.length;
-assert(key('Enter',{},field)); assert.equal(sent.length,before);
-key('Enter',{metaKey:true},field); await tick();
-assert.equal(reasonBox.value,null); assert.equal(mode.value,'NORMAL');
-assert.equal(payload().reason,'distinctive reason'); assert.equal(payload().base_version,3);
-assert.equal(list.counts().needsYou,5); assert.equal(list.counts().total,6);
-assert.deepEqual([...marked],['TR-210']);
-const firstKey = sent.at(-1).headers['Idempotency-Key'];
-key('.'); await tick();
-assert.equal(payload().id,'TR-210'); assert.equal(payload().base_version,0);
-assert.equal(payload().reason,'distinctive reason');
-assert.notEqual(sent.at(-1).headers['Idempotency-Key'],firstKey);
-const replayed = sent.at(-1), depth=undoDepth(), count=list.rows().length;
-await replayLast(); assert.deepEqual(sent.at(-1),replayed);
-assert.equal(undoDepth(),depth); assert.equal(list.rows().length,count);
-key('d'); key('d'); reasonBox.value={...reasonBox.value,text:'cancel this'};
-const cancelled = sent.length;
-key('Escape',{},field); assert.equal(reasonBox.value,null); assert.equal(mode.value,'NORMAL');
-assert.equal(sent.length,cancelled); assert.equal(location.hash,'#triage');
-openReason(actions.discard,context('TR-211')); await confirmReason();
-assert.equal(payload().reason,''); assert.equal('base_version' in payload(),false);
-location.hash='#floor'; await undo();
-assert.equal(location.hash,'#triage'); assert.equal(list.rows().length,count);
-assert.equal(notice.value,'Undid: Discarded TR-211');
-await undo(); assert(list.state.rows.some(row=>row.id==='TR-210'));
-await undo(); assert.equal(list.counts().total,7); assert.deepEqual([...marked],['TR-209']);
-response={status:409,body:{error:'version_conflict',current:{id:'TR-209',version:8,state:'<b>Changed elsewhere</b>'}}};
-const conflicts=sent.length;
-openReason(actions.reject,context('TR-209')); reasonBox.value={...reasonBox.value,text:'preserve'};
-await confirmReason(); await tick();
-assert.equal(sent.length,conflicts+1); assert.equal(undoDepth(),0); assert.equal(list.counts().total,7);
-assert.equal(reasonBox.value.text,'preserve'); assert.equal(list.state.stale['TR-209'].version,8);
-const tree = new List().render({controller:list,id:'action-fixture'});
-function nodes(node){return !node||typeof node!=='object'?[]:[node,...[node.props?.children].flat(Infinity).flatMap(nodes)];}
-assert(nodes(tree).some(node=>node.props?.role==='alert' && node.props.children.includes('<b>Changed elsewhere</b>')));
-assert(notice.value.startsWith('Failed:')); cancelReason();
-response={status:500,body:{error:'broken'}};
-assert.equal(await dispatch(actions.remove,context('TR-209')),false);
-assert.equal(undoDepth(),0); assert.equal(list.counts().total,7);
-let release;
-deferred = new Promise(resolve=>{release=resolve;});
-const pending = dispatch(actions.remove,context('TR-209'));
-const concurrency=sent.length;
-assert.equal(await dispatch(actions.remove,context('TR-209')),false); assert.equal(sent.length,concurrency);
-release(); deferred=null; await pending;
-assert.equal(list.counts().total,6); await undo();
-await dispatch(actions.remove,context('TR-213'));
-await dispatch(actions.stop,context('TR-214'));
-const stopped=sent.length;
-await undo(); assert.equal(notice.value,'Stopping a run cannot be undone'); assert.equal(sent.length,stopped);
-assert.equal(undoDepth(),1); await undo(); assert.equal(list.counts().total,6);
-list.setSort('title');
-openReason(actions.create,context()); reasonBox.value={...reasonBox.value,text:'ZZZ new item'}; await confirmReason();
-assert.equal(list.rows()[0].title,'ZZZ new item'); assert.equal(list.groups()[0][0],'New');
-assert(nodes(ListRow({row:list.rows()[0]})).some(node=>node.props?.children==='+ ZZZ new item · new'));
-assert.equal(list.counts().total,7); await undo(); assert.equal(list.counts().total,6);
-const end = createList({rows:[{id:'a'},{id:'b'}]});
-assert.equal(end.resolve(end.state.rows[1]).next,'a');
-assert.equal(end.resolve(end.state.rows[0]).next,undefined);
-assert.deepEqual(end.rows(),[]);
-const parked = createList({rows:[{id:'park',priority:'HIGH'},{id:'low',priority:'LOW'}]});
-const parking = parked.park(parked.state.rows[0],'Snoozed');
-assert.equal(parked.counts().needsYou,0); assert.equal(parked.state.parked.length,1);
-parking.undo(); assert.equal(parked.counts().needsYou,1); assert.equal(parked.state.parked.length,0);
-parked.setQuery('nothing'); parked.insert({id:'created',title:'Pinned'});
-assert.equal(parked.rows()[0].id,'created');
-await dispatch(actions.remove,context('TR-209'));
-const inverseDepth=undoDepth(), inverseCount=list.counts().total;
-response={status:500,body:{error:'inverse failed'}}; await undo();
-assert.equal(undoDepth(),inverseDepth); assert.equal(list.counts().total,inverseCount);
-await undo(); assert.equal(list.counts().total,inverseCount+1);
-{
-  const calls=[], base=undoDepth(); let free;
-  pushUndo({label:'first',inverse:()=>{calls.push('first'); return new Promise(resolve=>{free=resolve;});}});
-  const slow=undo();
-  pushUndo({label:'second',inverse:async()=>{calls.push('second');}});
-  free(); await slow;
-  assert.equal(undoDepth(),base+1); await undo();
-  assert.deepEqual(calls,['first','second']); assert.equal(undoDepth(),base);
-}
-const savedNotice=notice.value, savedDepth=undoDepth();
-await visit({tab:'tab',device:'desktop',view:'floor',via:'hash',ms:10});
-assert.equal(sent.at(-1).url,'/api/usage'); assert.equal(sent.at(-1).keepalive,true);
-assert.equal(notice.value,savedNotice); assert.equal(undoDepth(),savedDepth);
-response={status:200,body:null};
-await assert.rejects(sendWrite(prepared),/Invalid response/);
-const transport=globalThis.fetch;
-globalThis.fetch=async()=>{throw new Error('offline');};
-await assert.rejects(sendWrite(prepared),/Request failed: offline/);
-globalThis.fetch=transport;
-const repair=runAction('repair','Repair'); await repair.run(runContext({id:'run id',version:0},'repair'));
-assert.equal(sent.at(-1).url,'/api/runs/run%20id/repair'); assert.equal(payload().base_version,0);
-box.componentWillUnmount();
-'''
+        script = (SCRIPTS / "ui_actions_offline.mjs").read_text()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text('{"type":"module"}')
@@ -6225,132 +5668,7 @@ box.componentWillUnmount();
             self.assertEqual(state.capture_draft()["context"], before)
 
     def test_palette_offline_behavior(self):
-        script = r'''
-import assert from 'node:assert/strict';
-import { fuzzy } from './ui-fuzzy.js';
-import { palette, configurePalette, openPalette, closePalette, queryPalette, register, runPalette, Palette, paletteRouteChanged } from './ui-palette.js';
-import { startKeys, screenKeys, mode, pane, pending, sheet } from './ui-keys.js';
-const handlers = {}, windows = {};
-let restored = 0, focused = 0, scrolled = 0, prepared = 0, ran = 0;
-const opener = {isConnected:true, focus(){restored++;}};
-const input = {tagName:'INPUT', type:'search', focus(){focused++;}};
-globalThis.document = {activeElement:opener, documentElement:{dataset:{}},
-  querySelector:()=>input, querySelectorAll:()=>[], addEventListener(name, fn){handlers[name]=fn;}};
-globalThis.window = {addEventListener(name, fn){windows[name]=fn;}};
-globalThis.location = {hash:'#floor'};
-configurePalette(screenKeys.map(([key,id,title,href])=>({key,id,title,href})), ()=>{prepared++; pending.value=''; sheet.value=false;});
-const { paletteFixture } = await import('./ui-hooks.js');
-startKeys();
-function key(value, flags={}, target={}) {
-  let prevented = false;
-  handlers.keydown({key:value, target, ...flags, preventDefault(){prevented=true;}});
-  return prevented;
-}
-const ids = () => palette.peek().matches.map(row=>row.id);
-const rows = [
-  {id:'sub', title:'File library', group:'Go'}, {id:'long',title:'Floor plan', group:'Go'},
-  {id:'exact',title:'Floor',group:'Go'}, {id:'other',title:'Floor',group:'Items'}];
-const frozen = JSON.stringify(rows);
-assert.deepEqual(fuzzy(rows,'FLOOR').map(([g,rs])=>[g,rs.map(r=>r.id)]), [['Go',['exact','long']],['Items',['other']]]);
-assert.deepEqual(fuzzy(rows,'fl')[0][1].map(r=>r.id), ['long','exact','sub']);
-assert.deepEqual(fuzzy(rows,'')[0][1].map(r=>r.id), ['sub','long','exact']);
-assert.deepEqual(fuzzy(rows,'f l o o r'), []);
-assert.deepEqual(fuzzy(rows,'zzzz'), []);
-assert.equal(JSON.stringify(rows), frozen);
-pending.value = 'g'; sheet.value = true;
-assert(key(':'));
-assert.equal(prepared, 1);
-assert.equal(pending.value, ''); assert.equal(sheet.value,false);
-assert.equal(palette.peek().groups[0][0], 'Go to');
-assert.equal(ids().length,11);
-assert.equal(palette.peek().index,0);
-key('k'); key('p',{ctrlKey:true}); assert.equal(palette.peek().index,0);
-key('j'); key('n',{ctrlKey:true}); assert.equal(palette.peek().index,2);
-for(let i=0;i<30;i++) key('j');
-assert.equal(palette.peek().index,10);
-assert.equal(location.hash,'#floor'); assert.equal(pane.value,'queue');
-queryPalette('fl'); assert.equal(ids()[0],'floor');
-key('Enter'); assert.equal(palette.peek(),null); assert.equal(location.hash,'#floor');
-assert.equal(restored,1);
-mode.value='INSERT';
-assert.equal(key(':',{},input),false);
-assert.equal(palette.peek(),null);
-assert(key('k',{metaKey:true},input));
-queryPalette('sett'); assert.deepEqual(ids(),['settings']);
-queryPalette('impossible');
-assert.deepEqual(ids(),[]);
-for(const [k,flags] of [['j',{}],['k',{}],['n',{ctrlKey:true}],['p',{ctrlKey:true}],['Enter',{}]]) key(k,flags,input);
-assert(palette.peek()); assert.equal(location.hash,'#floor');
-assert(key('Tab',{},input)); assert.equal(focused,1);
-assert(key('Escape',{},input)); assert.equal(palette.peek(),null);
-key(':',{isComposing:true}); assert.equal(palette.peek(),null);
-mode.value='NORMAL';
-key('f'); assert.equal(location.hash,'#floor');
-key('?'); assert.equal(sheet.value,true); key('Escape'); assert.equal(sheet.value,false);
-const old = register('floor',[{id:'old',title:'Old'}]);
-const cleanup = register('floor',[{id:'item',title:'Item'}],[{id:'cmd',title:'Display',run(){ran++;}}]);
-old();
-register('triage',[{id:'triage-item',title:'Triage item'}],[{id:'triage-cmd',title:'Triage command'}]);
-openPalette();
-assert(ids().includes('item')); assert(!ids().includes('old')); assert(ids().includes('triage-item'));
-queryPalette('disp'); assert.equal(palette.peek().groups[0][0],'Commands');
-key('Enter'); key('Enter'); assert.equal(ran,1);
-openPalette(); location.hash='#triage'; windows.hashchange();
-assert(ids().includes('triage-cmd')); assert(!ids().includes('cmd')); assert(ids().includes('item'));
-cleanup(); assert(!ids().includes('item'));
-closePalette();
-for(const picker of ['steps','triggers','prompts','roles','drop','wires','create']) {
-  paletteFixture(picker);
-  assert.equal(palette.peek().mode,picker);
-  assert(palette.peek().groups.length);
-  if(picker==='prompts') {
-    assert.deepEqual(palette.peek().groups.map(([g])=>g),['None','This ADW','Other ADWs','Loops','Arete']);
-    assert.equal(palette.peek().matches[palette.peek().index].id,'build');
-    queryPalette('buil'); assert.deepEqual(ids(),['build']);
-    queryPalette(''); key('k'); key('k'); key('Enter');
-    assert.equal(document.documentElement.dataset.uiPaletteResult,'none');
-  } else if(picker==='roles') {
-    key('Enter'); assert.equal(document.documentElement.dataset.uiPaletteResult,'default');
-  } else {
-    const title = palette.peek().matches[0].title;
-    queryPalette(title[0]+title.at(-1)); assert(ids().length);
-    const selected = ids()[0];
-    key('Enter'); assert.equal(document.documentElement.dataset.uiPaletteResult,selected);
-  }
-  assert.equal(palette.peek(),null);
-  const result = document.documentElement.dataset.uiPaletteResult;
-  paletteFixture(picker); key('Escape');
-  assert.equal(document.documentElement.dataset.uiPaletteResult,result);
-  paletteFixture(picker); location.hash='#adws/another'; paletteRouteChanged();
-  assert.equal(palette.peek(),null);
-}
-paletteFixture('unknown'); assert.equal(palette.peek(),null);
-location.hash='#floor'; paletteFixture('registry');
-queryPalette('sett'); assert.deepEqual(palette.peek().groups.map(([g])=>g),['Go to','Items','Commands']);
-queryPalette('sample item');
-function nodes(node) {
-  if(!node || typeof node!=='object') return [];
-  return [node,...[node.props?.children].flat(Infinity).flatMap(nodes)];
-}
-const component = new Palette();
-component.setState = change => Object.assign(component.state,change);
-component.base = {querySelector(selector){return selector==='input' ? input : {scrollIntoView(){scrolled++;}};}};
-component.componentDidMount(); component.componentDidUpdate();
-const tree = component.render();
-assert(nodes(tree).some(n=>n.props?.children==='Sample item <literal>'));
-assert(nodes(tree).some(n=>n.props?.children==='<b>plain text</b>'));
-const option = nodes(tree).find(n=>n.props?.role==='option');
-option.props.onClick(); assert.equal(document.documentElement.dataset.uiPaletteResult,'sample-item');
-component.componentDidUpdate();
-openPalette({mode:'steps',rows:[{id:'x',title:'Example',group:'Agent'}],onPick(){ran++;}});
-component.componentDidUpdate(); assert(focused>=3); assert(scrolled>=2);
-const stable = palette.peek(); component.render(); component.componentDidUpdate();
-assert.equal(palette.peek(),stable);
-const scrim = component.render(); const outside = {};
-scrim.props.onClick({target:outside,currentTarget:outside}); assert.equal(palette.peek(),null);
-assert.equal(ran,1);
-component.componentWillUnmount();
-'''
+        script = (SCRIPTS / "ui_palette_offline.mjs").read_text()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text('{"type":"module"}')
@@ -6372,192 +5690,7 @@ component.componentWillUnmount();
             self.assertNotIn(banned, source)
 
     def test_shared_lists_offline_behavior(self):
-        script = r'''
-import assert from 'node:assert/strict';
-import { createList, demoRows, demoQueue, demoFocus, shortCount, longCount, ListHeader, ListRow, List, normalizePrimary } from './ui-list.js';
-import { Menu, dismissMenu } from './ui-menu.js';
-import { syncList, startKeys, pane, mode } from './ui-keys.js';
-assert.equal(demoRows.length, 40);
-assert.equal(shortCount(12, 40), '12/40');
-assert.equal(longCount(12, 40), '12 of 40');
-assert.equal(shortCount(12), '12');
-assert.equal(longCount(12), '12');
-assert.equal(demoQueue.rows().length, 12);
-assert.equal(demoFocus.rows().length, 40);
-const initial = nodes(ListHeader({controller:demoQueue, queue:true}));
-const filterMenu = initial.find(node => node.type === Menu && node.props.label === 'Filter');
-const choices = nodes({props:{children:filterMenu.props.children()}}).filter(node => node.type === 'button');
-assert.equal(choices.find(node => node.props.children[0].props.children.includes('Needs you')).props['aria-checked'], true);
-assert.equal(choices.find(node => node.props.children[0].props.children.includes('Running')).props['aria-checked'], false);
-choices.find(node => node.props.children[0].props.children.includes('Running')).props.onClick();
-assert.equal(demoQueue.rows().length, 24);
-const selected = nodes(ListHeader({controller:demoQueue, queue:true}));
-assert.equal(selected.filter(node => node.props?.class === 'ui-list-chip').length, 2);
-selected.find(node => node.props?.['aria-label'] === 'Remove Running').props.onClick();
-assert.equal(demoQueue.rows().length, 12);
-for (const [state, count] of [['Needs you', 12], ['Running', 12], ['Done', 8], ['Fault', 8]]) {
-  assert.equal(demoQueue.facetCount('state', state), count);
-}
-demoQueue.pick('state', 'Running');
-assert.equal(demoQueue.rows().length, 24);
-demoQueue.pick('repo', 'arete');
-assert.equal(demoQueue.rows().length, 12);
-assert.equal(demoQueue.facetCount('state', 'Done'), 4);
-assert.equal(demoQueue.facetCount('repo', 'workshop'), 12);
-assert.equal(demoFocus.rows().length, 40);
-demoQueue.setQuery('rEvIeW');
-assert(demoQueue.rows().every(row => row.title.toLowerCase().includes('review')));
-assert.equal(demoQueue.facetCount('state', 'Running'), 1);
-demoQueue.setQuery('nOtHiNg MaTcHeS');
-assert.deepEqual(demoQueue.rows(), []);
-assert.deepEqual(demoQueue.groups(), []);
-demoQueue.setQuery('');
-demoQueue.pick('repo', 'arete');
-demoQueue.pick('state', 'Needs you');
-demoQueue.pick('state', 'Running');
-assert.equal(demoQueue.rows().length, 40);
-demoQueue.setQuery('FAULT');
-assert.equal(demoQueue.rows().length, 8);
-demoQueue.setQuery('');
-demoFocus.setToggle(false);
-assert.equal(demoFocus.rows().length, 32);
-demoFocus.setToggle(true);
-assert.equal(demoFocus.rows().length, 40);
-for (const group of demoQueue.options.groups) {
-  demoQueue.setGroup(group.id);
-  const groups = demoQueue.groups();
-  assert.equal(groups.flatMap(([, rows]) => rows).length, 40);
-  for (const [name, rows] of groups) assert(rows.every(row => row[group.id] === name));
-}
-demoQueue.setGroup('');
-assert.equal(demoQueue.groups()[0][0], '');
-demoQueue.setSort('number');
-assert.deepEqual(demoQueue.rows().map(row => row.number), Array.from({length:40}, (_, i) => i + 1));
-demoQueue.setSort('newest');
-assert.equal(demoQueue.rows()[0].number, 40);
-demoQueue.setSort('title');
-assert(demoQueue.rows()[0].title.startsWith('Check'));
-demoQueue.setSort('source');
-const reversed = [...demoRows].reverse();
-demoQueue.setRows(reversed);
-assert.deepEqual(demoQueue.rows(), reversed);
-assert.equal(demoRows[0].number, 1);
-assert.notEqual(demoQueue.state.rows, reversed);
-const standalone = createList({rows:[{id:'a', title:'<b>literal</b>', state:'Done'}]});
-standalone.setQuery('<b>');
-assert.equal(standalone.rows().length, 1);
-function nodes(vnode) {
-  if (!vnode || typeof vnode !== 'object') return [];
-  return [vnode, ...[vnode.props?.children].flat(Infinity).flatMap(nodes)];
-}
-const all = nodes(ListHeader({controller:demoQueue, queue:true}));
-assert(all.some(node => node.type === Menu && node.props.label === '⇅' && node.props.title === 'Sort: Source order'));
-assert(all.some(node => node.props?.title === '40 of 40' && node.props.children === '40/40'));
-assert(!all.some(node => node.props?.['data-primary-candidate'] === ''));
-const focus = nodes(ListHeader({controller:demoFocus}));
-assert(focus.some(node => node.props?.children === '[c] New'));
-assert(focus.some(node => node.type === Menu && node.props.label === 'Sort'));
-const countOnly = nodes(ListHeader({controller:standalone}));
-assert(countOnly.some(node => node.props?.title === '1' && node.props.children === '1'));
-const row = ListRow({row:standalone.rows()[0], onOpen:()=>{}});
-assert(nodes(row).some(node => node.props?.children === '<b>literal</b>'));
-assert(nodes(row).some(node => node.props?.children === '✓ Done'));
-const buttons = [true, false, false].map(queue => ({
-  queue, primary:true, setAttribute(){}, closest(){return queue ? {} : null;},
-  classList:{toggle(name, value){buttons.find(button => button.classList === this).primary = value;}}
-}));
-for (let i = 0; i < 3; i++) normalizePrimary({querySelectorAll:()=>buttons});
-assert.equal(buttons.filter(button => button.primary).length, 1);
-assert.equal(buttons[1].primary, true);
-const handlers = {};
-const marked = new Set();
-let scrolled = 0, opened = 0, created = 0;
-const makeRow = id => ({dataset:{item:id}, hidden:false, disabled:false,
-  getClientRects:()=>[{}], getAttribute:()=>null, setAttribute(){marked.add(id);}, removeAttribute(){marked.delete(id);},
-  scrollIntoView(){scrolled++;}, matches:()=>false, querySelector:()=>null, click(){opened++;}});
-let rows = ['a','b','c'].map(makeRow);
-const field = {tagName:'INPUT', type:'search', value:'', isConnected:true, focus(){this.focused=true;}, blur(){}, dispatchEvent(){demoQueue.setQuery(this.value);}};
-const list = {dataset:{list:'offline'}, querySelectorAll(selector){return selector === '[data-row]' ? rows : rows.filter(row => marked.has(row.dataset.item));},
-  querySelector:()=>field, uiCreate(){created++;}};
-const paneEl = {dataset:{pane:'queue'}, toggleAttribute(){}, matches:()=>false,
-  querySelectorAll(selector){return selector === '[data-list]' ? [list] : [field];}};
-globalThis.document = {querySelectorAll(selector){return selector.includes('button') ? buttons : selector === '[data-pane]' ? [paneEl] : [list];},
-  querySelector:()=>null, addEventListener(name, fn){handlers[name]=fn;}};
-globalThis.window = {addEventListener(){}};
-globalThis.location = {hash:'#settings/health'};
-syncList(list);
-assert.deepEqual([...marked], ['a']);
-assert.equal(scrolled, 0);
-startKeys();
-const key = (value, target={}) => handlers.keydown({key:value, target, preventDefault(){}});
-key('j');
-assert.deepEqual([...marked], ['b']);
-rows.reverse();
-syncList(list);
-assert.deepEqual([...marked], ['b']);
-assert.equal(scrolled, 1);
-key('Enter');
-assert.equal(opened, 1);
-key('/');
-assert.equal(field.focused, true);
-rows = [];
-syncList(list);
-key('j'); key('k'); key('Enter'); key('/'); key('c');
-assert.equal(opened, 1);
-assert.equal(created, 1);
-field.value = 'review';
-mode.value = 'INSERT';
-key('Escape', {...field, matches:()=>true});
-assert.equal(mode.value, 'NORMAL');
-assert.equal(field.value, 'review');
-key('Escape');
-assert.equal(field.value, '');
-const menu = new Menu();
-menu.setState = change => Object.assign(menu.state, change);
-let restored = 0;
-menu.opener = {focus(){restored++;}};
-const menuTree = menu.render({label:'Filter', children:()=>[]});
-menuTree.props.children[0].props.onClick();
-assert.equal(menu.state.open, true);
-field.value = 'review';
-key('Escape');
-assert.equal(menu.state.open, false);
-assert.equal(field.value, 'review');
-assert.equal(restored, 1);
-key('Escape');
-assert.equal(field.value, '');
-assert.equal(dismissMenu(), false);
-rows = ['a','b','c'].map(makeRow);
-marked.clear();
-const scroll = {scrollTop:140, scrollLeft:9};
-const component = new List();
-component.props = {controller:demoQueue};
-component.base = {...list, querySelector(selector){return selector === '.ui-list-scroll' ? scroll : field;}};
-component.setState = change => Object.assign(component.state, change);
-component.componentDidMount();
-key('j');
-const scrollCalls = scrolled;
-for (let i=0; i<3; i++) {
-  demoQueue.setRows(i % 2 ? demoRows : reversed);
-  rows.reverse();
-  scroll.scrollTop = 0;
-  scroll.scrollLeft = 0;
-  component.componentDidUpdate();
-  assert.equal(scroll.scrollTop, 140);
-  assert.equal(scroll.scrollLeft, 9);
-  assert.deepEqual([...marked], ['b']);
-}
-component.componentWillUnmount();
-assert.equal(scrolled, scrollCalls);
-demoFocus.create();
-assert.equal(demoFocus.state.draft, true);
-assert.equal(demoFocus.dismiss(), true);
-demoFocus.open(demoRows[5]);
-assert.equal(demoFocus.state.detail.id, demoRows[5].id);
-assert.equal(demoFocus.dismiss(), true);
-assert.equal(demoFocus.dismiss(), false);
-assert.equal(pane.value, 'queue');
-'''
+        script = (SCRIPTS / "ui_shared_lists_offline.mjs").read_text()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text('{"type":"module"}')
@@ -6589,418 +5722,31 @@ assert.equal(pane.value, 'queue');
         self.assertNotIn("eval", source)
 
     def test_live_function_polls_and_recovers_offline(self):
-        script = r'''
-import assert from 'node:assert/strict';
-const errors = [];
-console.error = (...found) => errors.push(found);
-process.on('unhandledRejection', error => errors.push(error));
-let now = 1000000, ids = 0;
-const timers = new Map();
-globalThis.setTimeout = (fn, ms) => { timers.set(++ids, {fn, at: now + ms}); return ids; };
-globalThis.clearTimeout = id => { timers.delete(id); };
-Date.now = () => now;
-const listeners = new Map();
-globalThis.document = {hidden:false,
-  addEventListener(name, fn) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn); },
-  removeEventListener(name, fn) { listeners.get(name)?.delete(fn); }};
-const fire = () => [...(listeners.get('visibilitychange') ?? [])].forEach(fn => fn());
-const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
-async function advance(ms) {
-  const end = now + ms;
-  for (;;) {
-    await flush();
-    const due = [...timers].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
-    if (!due) break;
-    now = Math.max(now, due[1].at);
-    timers.delete(due[0]);
-    due[1].fn();
-  }
-  now = end;
-  await flush();
-}
-const log = [];
-const server = {mode:'ok', age:0, runs:2, held:[]};
-const bodyOf = url => url === '/api/sidebar'
-  ? {needs_you:3, running:server.runs, health:'ok', serve:{alive:true, age_seconds:server.age, started:'2026-01-01T00:00:00Z'}}
-  : {live:{rows:{runs:Array.from({length:server.runs}, (_, i) => ({id:`r${i}`, ticket:`T${i}`, step:'s', seconds:i})), slots:server.runs, waiting:0, max_parallel:4}},
-     needs_you:{approvals:{rows:[]}, skipped:{rows:[]}, proposals:{rows:{memory:[], hand:[], approve:[]}}, ready:{rows:[{}]}, draft:null}};
-const answer = url => ({ok:true, status:200, json:async () => bodyOf(url)});
-globalThis.fetch = (url, {signal}) => {
-  log.push([url, now]);
-  if (server.mode === 'down') return Promise.reject(new TypeError('fetch failed'));
-  if (server.mode === 'status') return Promise.resolve({ok:false, status:503, json:async () => ({})});
-  if (server.mode === 'malformed') return Promise.resolve({ok:true, status:200, json:async () => { throw new SyntaxError('bad'); }});
-  if (server.mode === 'hang') return new Promise((_, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {name:'AbortError'}))));
-  if (server.mode === 'defer') return new Promise(resolve => server.held.push(() => resolve(answer(url))));
-  return Promise.resolve(answer(url));
-};
-let loaded = 0;
-const load = () => import(`./ui-live.js?${++loaded}`);
-const count = path => log.filter(([url]) => url === path).length;
-const reset = () => { log.length = 0; };
-
-let {live, snapshot, connectivity} = await load();
-let feed = live('floor');
-assert.equal(snapshot.value.pending, true);
-assert.equal(snapshot.value.runs, null);
-await advance(0);
-assert.equal(count('/api/sidebar'), 1);
-assert.equal(count('/api/live'), 1);
-let current = snapshot.value;
-assert.equal(current.pending, false);
-assert.equal(current.needsYou, 3);
-assert.equal(current.runs.length, 2);
-assert.equal(current.slots, 2);
-assert.equal(current.capacity, 4);
-assert.equal(current.asks.ready.rows.length, 1);
-assert.equal(current.serve.alive, true);
-assert(!log.some(([url]) => url.includes('asks')));
-reset();
-await advance(5000);
-assert.equal(count('/api/sidebar'), 1);
-assert.equal(count('/api/live'), 1);
-server.runs = 0;
-await advance(5000);
-assert.deepEqual(snapshot.value.runs, []);
-server.runs = 2;
-await advance(5000);
-assert.equal(snapshot.value.runs.length, 2);
-feed.stop();
-
-reset();
-feed = live('prompts');
-await advance(0);
-assert.equal(count('/api/live'), 1);
-reset();
-await advance(25000);
-assert.equal(count('/api/sidebar'), 5);
-assert.equal(count('/api/live'), 0);
-await advance(5000);
-assert.equal(count('/api/sidebar'), 6);
-assert.equal(count('/api/live'), 1);
-feed.stop();
-
-feed = live('floor');
-await advance(0);
-server.mode = 'down';
-reset();
-await advance(5000);
-current = snapshot.value;
-assert.equal(current.failures, 1);
-assert.equal(current.offline, false);
-assert.equal(connectivity(current, now), '');
-assert.equal(current.runs.length, 2);
-assert.equal(current.fault.status, null);
-assert.equal(count('/api/live'), 1);
-await advance(5000);
-current = snapshot.value;
-assert.equal(current.offline, true);
-assert.equal(connectivity(current, now), 'OFFLINE');
-assert.equal(current.runs.length, 2);
-server.mode = 'ok';
-await advance(5000);
-current = snapshot.value;
-assert.equal(current.offline, false);
-assert.equal(current.fault, null);
-assert.equal(connectivity(current, now), '');
-server.mode = 'status';
-await advance(5000);
-assert.equal(snapshot.value.fault.status, 503);
-assert.equal(snapshot.value.runs.length, 2);
-server.mode = 'malformed';
-await advance(5000);
-assert.equal(snapshot.value.fault.message, 'Malformed response');
-server.mode = 'ok';
-await advance(5000);
-assert.equal(snapshot.value.fault, null);
-server.mode = 'hang';
-await advance(15000);
-assert.equal(snapshot.value.offline, true);
-assert.equal(connectivity(snapshot.value, now), 'OFFLINE');
-server.mode = 'ok';
-await advance(10000);
-assert.equal(snapshot.value.offline, false);
-feed.stop();
-
-({live, snapshot} = await load());
-server.mode = 'down';
-feed = live('floor');
-await advance(0);
-assert.equal(snapshot.value.live, null);
-assert.equal(snapshot.value.runs, null);
-assert.equal(snapshot.value.pending, false);
-assert.equal(snapshot.value.fault.message, 'Network error');
-feed.stop();
-server.mode = 'ok';
-
-const at = (age, received) => ({serve:{age_seconds:age}, received, offline:false});
-assert.equal(connectivity(at(0, now), now), '');
-assert.equal(connectivity(at(60, now), now), '');
-assert.equal(connectivity(at(61, now), now), 'STALE');
-assert.equal(connectivity(at(59, now), now + 1000), '');
-assert.equal(connectivity(at(59, now), now + 2000), 'STALE');
-assert.equal(connectivity({...at(61, now), offline:true}, now), 'OFFLINE');
-for (const age of [undefined, null, 'x', -1, NaN]) assert.equal(connectivity(at(age, now), now + 999999), '');
-assert.equal(connectivity({serve:null, received:0, offline:false}, now), '');
-
-({live, snapshot} = await load());
-document.hidden = true;
-reset();
-feed = live('floor');
-await advance(60000);
-await feed.retry();
-assert.equal(log.length, 0);
-assert.equal(snapshot.value.pending, true);
-document.hidden = false;
-fire();
-await advance(0);
-assert.equal(count('/api/sidebar'), 1);
-assert.equal(count('/api/live'), 1);
-document.hidden = true;
-fire();
-reset();
-await advance(60000);
-assert.equal(log.length, 0);
-assert.equal(timers.size, 0);
-server.mode = 'hang';
-document.hidden = false;
-fire();
-const failures = snapshot.value.failures;
-document.hidden = true;
-fire();
-await advance(10000);
-assert.equal(snapshot.value.failures, failures);
-server.mode = 'ok';
-document.hidden = false;
-reset();
-for (let i = 0; i < 5; i++) fire();
-await advance(0);
-assert.equal(timers.size, 1);
-reset();
-await advance(5000);
-assert.equal(count('/api/sidebar'), 1);
-feed.stop();
-
-({live, snapshot} = await load());
-server.mode = 'defer';
-server.held = [];
-const first = live('floor');
-const second = live('triage');
-assert.equal(server.held.length, 4);
-server.held.slice(0, 2).forEach(release => release());
-await flush();
-assert.equal(snapshot.value.pending, true);
-server.held.slice(2).forEach(release => release());
-await flush();
-assert.equal(snapshot.value.pending, false);
-server.mode = 'ok';
-second.stop();
-reset();
-await advance(60000);
-assert.equal(log.length, 0);
-assert.equal(timers.size, 0);
-assert.equal(listeners.get('visibilitychange').size, 0);
-const { readFault } = await load();
-const nested = {live:{live:{rows:{runs:[]}}}, asks:{approvals:{rows:[]}, ready:{error:'boom'}}, fault:null};
-assert.equal(readFault('triage', nested).message, 'boom');
-assert.equal(readFault('floor', nested), null);
-assert.equal(readFault('floor', {live:{live:{error:'bad'}}, fault:null}).message, 'bad');
-assert.equal(readFault('prompts', {live:{}, fault:{status:503}}).status, 503);
-assert.equal(readFault('triage', {live:{}, asks:{}, fault:null}), null);
-assert.deepEqual(errors, []);
-'''
+        script = (SCRIPTS / "ui_live_poll_recovery.mjs").read_text()
         self.run_module_script(script, ("ui-live.js",))
 
     def test_state_drawings_use_glyphs_words_and_escaped_text(self):
-        script = r'''
-import assert from 'node:assert/strict';
-import { Loading, Empty, Fault, Offline, Stale, Connectivity, Gate, faultText } from './ui-states.js';
-const nodes = vnode => !vnode || typeof vnode !== 'object' ? [vnode] : [vnode, ...[vnode.props?.children].flat(Infinity).flatMap(nodes)];
-const words = vnode => nodes(vnode).filter(node => typeof node === 'string').join('');
-const find = (vnode, test) => nodes(vnode).find(node => node && typeof node === 'object' && test(node));
-const glyph = vnode => find(vnode, node => node.props?.class === 'ui-state-glyph').props.children;
-assert.equal(glyph(Loading({what:'runs'})), '…');
-const text = vnode => words(find(vnode, node => node.props?.class === 'ui-state-text'));
-assert.equal(text(Loading({what:'runs'})), 'Loading runs');
-assert.equal(glyph(Empty({what:'No running work'})), '○');
-assert.equal(text(Empty({what:'No running work'})), 'No running work');
-assert.equal(text(Offline()), 'OFFLINE · showing the last data');
-assert.equal(text(Stale()), 'STALE · serve heartbeat is old');
-assert.equal(Connectivity({word:''}), null);
-assert.equal(words(Connectivity({word:'OFFLINE'})), '⊘ OFFLINE');
-assert.equal(find(Connectivity({word:'STALE'}), node => node.props?.['data-conn']).props.role, 'status');
-let retried = 0;
-const fault = Fault({what:'Runs', fault:{status:503, message:'<img src=x onerror=alert(1)>'}, retry:() => retried++});
-assert.equal(fault.props.role, 'alert');
-assert(words(fault).includes('Runs unavailable · HTTP 503 · <img src=x onerror=alert(1)>'));
-assert(words(fault).includes('⇧r'));
-assert(nodes(fault).every(node => !node?.props || !('dangerouslySetInnerHTML' in node.props)));
-find(fault, node => node.type === 'button').props.onClick();
-assert.equal(retried, 1);
-assert.equal(find(Fault({what:'Runs', fault:{status:null, message:'Network error'}}), node => node.type === 'button'), undefined);
-assert.equal(faultText({status:404, message:'HTTP 404'}), 'HTTP 404');
-assert.equal(faultText(null), 'Unavailable');
-const gate = props => Gate({what:'Runs', missing:'No running work', children:'content', ...props});
-assert.equal(gate({}), 'content');
-assert.equal(gate({pending:true}).type, Loading);
-assert.equal(gate({empty:true}).type, Empty);
-assert.equal(gate({empty:true}).props.what, 'No running work');
-assert.equal(gate({pending:true, fault:{status:500}}).type, Fault);
-'''
+        script = (SCRIPTS / "ui_state_drawings.mjs").read_text()
         self.run_module_script(script, ("ui-states.js",))
 
     def test_read_retry_key_leaves_item_retry_and_insert_alone(self):
-        script = r'''
-import assert from 'node:assert/strict';
-import { startKeys, readRetry, mode, notice } from './ui-keys.js';
-const handlers = {};
-let withItem = false;
-const row = {dataset:{item:'a'}, hidden:false, disabled:false, getClientRects:() => [{}], getAttribute:() => null,
-  setAttribute() {}, removeAttribute() {}, scrollIntoView() {}, matches:() => false, querySelector:() => null, click() {}};
-const list = {dataset:{list:'x'}, querySelectorAll:selector => selector === '[data-row]' ? [row] : [], querySelector:() => null,
-  uiContext:() => withItem ? {item:{id:'a'}} : null};
-const paneEl = {dataset:{pane:'queue'}, toggleAttribute() {}, matches:() => false, querySelectorAll:selector => selector === '[data-list]' ? [list] : []};
-globalThis.document = {querySelectorAll:selector => selector === '[data-pane]' ? [paneEl] : selector === '[data-list]' ? [list] : [],
-  querySelector:() => null, addEventListener(name, fn) { handlers[name] = fn; }};
-globalThis.window = {addEventListener() {}};
-globalThis.location = {hash:'#floor'};
-startKeys();
-const key = value => handlers.keydown({key:value, target:{}, preventDefault() {}});
-let retried = 0;
-key('R');
-assert.equal(retried, 0);
-readRetry.value = () => { retried++; };
-key('R');
-assert.equal(retried, 1);
-key('r');
-assert.equal(retried, 1);
-mode.value = 'INSERT';
-key('R');
-assert.equal(retried, 1);
-mode.value = 'NORMAL';
-withItem = true;
-notice.value = '';
-key('R');
-assert.equal(retried, 1);
-assert.notEqual(notice.value, '');
-'''
+        script = (SCRIPTS / "ui_read_retry_key.mjs").read_text()
         self.run_module_script(script, ("ui-keys.js", "ui-router.js", "ui-menu.js", "ui-palette.js", "ui-fuzzy.js", "ui-actions.js",
                                          "ui-undo.js", "ui-notice.js", "ui-write.js", "ui-list.js", "ui-states.js"))
 
     def test_live_poll_keeps_cursor_scroll_and_filter(self):
-        script = r'''
-import assert from 'node:assert/strict';
-import { effect } from './vendor-signals.js';
-import { createList, List } from './ui-list.js';
-import { startKeys, selectedItem } from './ui-keys.js';
-import { live, snapshot } from './ui-live.js';
-const revision = {value:1};
-globalThis.fetch = async url => ({ok:true, status:200, json:async () => url === '/api/sidebar'
-  ? {needs_you:0, running:3, health:'ok', serve:{alive:true, age_seconds:1}}
-  : {live:{rows:{runs:['a', 'b', 'c'].map((id, i) => ({id, ticket:`T-${id}`, step:`step ${revision.value}`, seconds:i, repo:'arete'})), slots:3, max_parallel:4}}, needs_you:{}}});
-const handlers = {};
-let scrolled = 0;
-const marked = new Set();
-const makeRow = id => ({dataset:{item:id}, hidden:false, disabled:false, getClientRects:() => [{}], getAttribute:() => null,
-  setAttribute() { marked.add(id); }, removeAttribute() { marked.delete(id); }, scrollIntoView() { scrolled++; }, matches:() => false,
-  querySelector:() => null, click() {}});
-const rows = ['a', 'b', 'c'].map(makeRow);
-const scroll = {scrollTop:140, scrollLeft:9};
-const list = {dataset:{list:'floor-runs'}, querySelectorAll:selector => selector === '[data-row]' ? rows : rows.filter(row => marked.has(row.dataset.item)),
-  querySelector:selector => selector === '.ui-list-scroll' ? scroll : null};
-const paneEl = {dataset:{pane:'queue'}, toggleAttribute() {}, matches:() => false, querySelectorAll:selector => selector === '[data-list]' ? [list] : []};
-globalThis.document = {hidden:false, querySelectorAll:selector => selector === '[data-pane]' ? [paneEl] : selector === '[data-list]' ? [list] : [],
-  querySelector:() => null, addEventListener(name, fn) { handlers[name] = fn; }, removeEventListener() {}};
-globalThis.window = {addEventListener() {}};
-globalThis.location = {hash:'#floor'};
-const controller = createList({rows:[], empty:'No running work'});
-const component = new List();
-component.props = {controller, id:'floor-runs', queue:true};
-component.base = list;
-component.setState = change => Object.assign(component.state, change);
-component.componentDidMount();
-effect(() => controller.setRows((snapshot.value.runs ?? []).map(run => ({id:run.id, title:`${run.ticket} · ${run.step}`, state:'Running', repo:run.repo, priority:'', number:`${run.seconds}s`}))));
-startKeys();
-const feed = live('floor');
-await new Promise(resolve => setTimeout(resolve, 50));
-assert.deepEqual(controller.rows().map(row => row.id), ['a', 'b', 'c']);
-handlers.keydown({key:'j', target:{}, preventDefault() {}});
-assert.equal(selectedItem('floor-runs'), 'b');
-controller.setQuery('step');
-const calls = scrolled;
-revision.value = 2;
-await feed.retry();
-scroll.scrollTop = 0;
-scroll.scrollLeft = 0;
-component.componentDidUpdate();
-assert.equal(controller.rows().find(row => row.id === 'b').title, 'T-b · step 2');
-assert.equal(selectedItem('floor-runs'), 'b');
-assert.deepEqual([...marked], ['b']);
-assert.equal(scroll.scrollTop, 140);
-assert.equal(scroll.scrollLeft, 9);
-assert.equal(controller.state.query, 'step');
-assert.equal(scrolled, calls);
-feed.stop();
-'''
+        script = (SCRIPTS / "ui_live_cursor_scroll.mjs").read_text()
         self.run_module_script(script, ("ui-live.js", "ui-list.js", "ui-states.js", "ui-keys.js", "ui-router.js", "ui-menu.js", "ui-palette.js",
                                          "ui-fuzzy.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js"))
 
     def test_live_fixture_serves_and_records_data_reads(self):
-        script = r'''
-import json, threading, unittest, urllib.request, urllib.error
-from tests.ui_action_fixture import server
-check = unittest.TestCase()
-instance = server(live=True)
-threading.Thread(target=instance.serve_forever, daemon=True).start()
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-base = f'http://127.0.0.1:{instance.server_port}'
-def request(path, body=None, guard=True):
-    headers = {'Content-Type': 'application/json'}
-    if guard:
-        headers['X-Arete'] = '1'
-    req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(), headers=headers)
-    try:
-        response = opener.open(req, timeout=10)
-    except urllib.error.HTTPError as error:
-        response = error
-    with response:
-        return response.status, response.read().decode()
-try:
-    status, raw = request('/api/live')
-    check.assertEqual((status, json.loads(raw)['live']['rows']['runs']), (200, []))
-    check.assertEqual(request('/__ui_live/control', {'scenario': 'populated'}, guard=False)[0], 403)
-    check.assertEqual(request('/__ui_live/control', {'scenario': 'populated', 'revision': 2, 'age_seconds': 61})[0], 200)
-    runs = json.loads(request('/api/live')[1])['live']['rows']['runs']
-    check.assertEqual(len(runs), 40)
-    check.assertIn('step 2', runs[0]['step'])
-    side = json.loads(request('/api/sidebar')[1])
-    check.assertEqual((side['serve']['age_seconds'], side['needs_you']), (61, 2))
-    request('/__ui_live/control', {'scenario': 'error', 'status': 503})
-    check.assertEqual(request('/api/sidebar')[0], 503)
-    request('/__ui_live/control', {'scenario': 'malformed'})
-    status, raw = request('/api/live')
-    check.assertEqual(status, 200)
-    with check.assertRaises(ValueError):
-        json.loads(raw)
-    request('/__ui_live/control', {'scenario': 'delay', 'delay': 0.2})
-    check.assertEqual(request('/api/sidebar')[0], 200)
-    check.assertEqual(request('/__ui_live/control', {'scenario': 'nothing'})[0], 400)
-    log = json.loads(request('/__ui_live/requests')[1])
-    check.assertEqual([entry['path'] for entry in log[:2]], ['/api/live', '/api/live'])
-    check.assertEqual(len(log), 6)
-    check.assertTrue(all(isinstance(entry['at'], float) for entry in log))
-finally:
-    instance.shutdown()
-    instance.server_close()
-'''
+        script = (SCRIPTS / "ui_live_fixture_reads.py").read_text()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("config", "state", "logs", "worktrees", "tmp"):
-                (root / name).mkdir()
-            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
-            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
-                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
-                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp")
+            env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                              TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
             command = [sys.executable, "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(SOURCE)!r});" + script]
             done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=45)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
@@ -7012,70 +5758,7 @@ finally:
             env = scratch_env(root, keep=("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR"),
                               ARETE_WORKTREES_DIR=str(root / "worktrees"),
                               TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-            script = r'''
-import json, re, threading, unittest, urllib.request
-from html.parser import HTMLParser
-from pathlib import Path
-from arete import dashboard, state
-
-class Assets(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.scripts, self.styles, self.declared = set(), set(), set()
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        self.declared.update(value for name, value in attrs.items() if name in ("src", "href") and value.startswith("/"))
-        if tag == "script" and attrs.get("src"):
-            self.scripts.add(attrs["src"])
-        if tag == "link" and attrs.get("rel") == "modulepreload":
-            self.scripts.add(attrs["href"])
-        if tag == "link" and attrs.get("rel") == "stylesheet":
-            self.styles.add(attrs["href"])
-
-check = unittest.TestCase()
-state.ensure_schema()
-node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "ui@example.com", "")
-owner = type("Owner", (), {"of": lambda self, address: "ui@example.com"})()
-server = dashboard.Server("127.0.0.1", 0, node, owner, False)
-thread = threading.Thread(target=server.serve_forever, daemon=True)
-thread.start()
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-base = f"http://127.0.0.1:{server.server_port}"
-def get(path, mime):
-    with opener.open(base + path, timeout=5) as response:
-        check.assertEqual(response.status, 200)
-        check.assertEqual(response.headers.get_content_type(), mime)
-        check.assertEqual(response.headers["Content-Security-Policy"], dashboard.PAGE_POLICY)
-        return response.read().decode()
-try:
-    page = get("/ui.html", "text/html")
-    check.assertIsNone(re.search(r"\bstyle\s*=", page, re.I))
-    assets = Assets()
-    assets.feed(page)
-    check.assertEqual(assets.scripts, {
-        "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js", "/ui-keys.js", "/ui-keybar.js", "/ui-hooks.js", "/ui-list.js", "/ui-menu.js",
-        "/ui-palette.js", "/ui-fuzzy.js", "/ui-feedback.js",
-        "/ui-actions.js", "/ui-undo.js", "/ui-notice.js", "/ui-write.js", "/ui-live.js", "/ui-states.js",
-        "/vendor-preact.js", "/vendor-htm.js", "/vendor-signals.js"})
-    check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css", "/ui-feedback.css"})
-    check.assertIn("/icon-192.png", assets.declared)
-    for path in sorted(assets.declared):
-        with opener.open(base + path, timeout=5) as response:
-            check.assertEqual(response.status, 200)
-    for path in sorted(assets.scripts):
-        get(path, "text/javascript")
-    for path in sorted(assets.styles):
-        get(path, "text/css")
-    router = get("/ui-router.js", "text/javascript")
-    for screen in ("floor", "triage", "board", "task", "run", "intake", "outbox", "prompts", "adws", "insights", "settings"):
-        check.assertIn(json.dumps(screen), router)
-    check.assertIn('<a href="/ui.html">Try the new UI</a>', get("/", "text/html"))
-    check.assertEqual(len(list((Path(dashboard.__file__).parent / "web").glob("vendor-*.js"))), 3)
-finally:
-    server.shutdown()
-    thread.join(timeout=5)
-    server.server_close()
-'''
+            script = (SCRIPTS / "ui_shell_assets.py").read_text()
             command = [sys.executable, "-I", "-B", "-c", bootstrap(script)]
             done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=45)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
@@ -7094,38 +5777,7 @@ finally:
                 self.assertNotIn(banned, source)
 
 
-CHILD_PRELUDE = r'''
-import json, os, shlex, signal, sqlite3, subprocess, sys, time
-from datetime import timedelta
-from pathlib import Path
-from unittest import mock
-from arete import board, cli, config, delivery, engine, loops, paths, push, sources, state, util
-root = Path(sys.argv[1])
-def verdicts():
-    with state.db() as c:
-        return [dict(r) for r in c.execute("SELECT kind, outcome, approval FROM verdicts")]
-def set_check(command):
-    with state.db() as c:
-        emit = json.loads(c.execute("SELECT emit FROM approvals WHERE id = 1").fetchone()["emit"])
-        emit["item"]["check"] = command
-        c.execute("UPDATE approvals SET emit = ? WHERE id = 1", (json.dumps(emit),))
-def report(**facts):
-    print("RESULT " + json.dumps(facts, default=str), flush=True)
-def no_wake():
-    util.last_wake = lambda: 0.0
-def later(seconds):
-    real = util.now
-    util.now = lambda: real() + timedelta(seconds=seconds)
-SEED = r"""
-paths.CONFIG_FILE.write_text("[jev]\nenabled=false\n")
-item = {"repo": "clone", "workdir": str(root / "clone"), "branch": "fix", "base": "main", "check": "true", "env": {},
-        "timeout": 60, "lines": 1, "files": ["fix.txt"], "deleted": [], "title": "fix", "report": "", "about": "fix",
-        "story": "", "patch": "", "proof": None}
-state.add_verdict("run-1", "push", "push", "fix", {}, "", "waiting")
-state.add_approval("fixer", "run-1", {"type": "push", "item": item, "batch": [], "held": "a person lands it"},
-                   "push fix to main")
-"""
-'''
+CHILD_PRELUDE = (SCRIPTS / "child_prelude.py").read_text()
 HUNT = ('import json; print(json.dumps({"title": "leak", "fingerprint": "fp-1"}))')
 LOOPS = {"hunt": 'kind = "command"\n[run]\ncommand = {command}\n[[emit]]\ntype = "loop"\nloop = "fix"\n',
          "fix": 'kind = "command"\n[run]\ncommand = ["true"]\n[trigger]\nevent = ["finding"]\n'}
@@ -7778,122 +6430,13 @@ result(paused=paused, recovered=[s for s in said if "loads again" in s], again_p
 
 
 class ServeReloadTests(unittest.TestCase):
-    PRELUDE = ConfigForwardCompatTests.PRELUDE + r'''
-import http.client, http.server, socket, subprocess, types
-from arete import client, dashboard, delivery
-OWNER = "owner@example.test"
-CHANGED = frozenset({("changed", 1, 1)})
-real_sh = util.sh
-who = [OWNER]
-dashboard.Logins.of = lambda self, address: who[0]
-NODE = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), OWNER, "127.0.0.1")
-def listen(logins, handler):
-    web = dashboard.Server("127.0.0.1", 0, NODE, logins, True, handler=handler)
-    threading.Thread(target=web.serve_forever, daemon=True).start()
-    return web
-web = listen(dashboard.Logins(None), dashboard.Handler)
-PORT = web.server_address[1]
-gate, sending = threading.Event(), threading.Event()
-def fake_notify(item, batch, loop, run, cfg):
-    sending.set()
-    if not gate.wait(20):
-        raise TimeoutError("fixture gate never opened")
-    return "sent"
-delivery.EMITS["notify"].execute = fake_notify
-def approval():
-    return state.add_approval("demo", "", {"type": "notify", "item": {"title": "t", "message": "m"}}, "summary")
-def status_of(n):
-    return state.approval(n)["status"]
-def post(n, body=b'{"approve": true}', host="127.0.0.1", port=None, header=("X-Arete", "1"), extra=None):
-    conn = http.client.HTTPConnection("127.0.0.1", port or PORT, timeout=20)
-    conn.request("POST", f"/api/approvals/{n}", body, {"Host": host, **dict([header] if header else []), **(extra or {})})
-    resp = conn.getresponse()
-    answer = {"status": resp.status, "retry": resp.getheader("Retry-After"), "body": json.loads(resp.read())}
-    conn.close()
-    return answer
-def page():
-    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=20)
-    conn.request("GET", "/", headers={"Host": "127.0.0.1"})
-    resp = conn.getresponse()
-    resp.read()
-    conn.close()
-    return resp.status
-def raw(n, length):
-    s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
-    s.sendall(f"POST /api/approvals/{n} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Arete: 1\r\n{length}Connection: close\r\n\r\n".encode())
-    data = b""
-    while chunk := s.recv(4096):
-        data += chunk
-    s.close()
-    head = data.split(b"\r\n\r\n")[0].decode()
-    return {"status": int(head.split()[1]), "retry": "Retry-After: 3" in head}
-def background(fn):
-    box = {}
-    def run():
-        try:
-            box["value"] = fn()
-        except BaseException as e:
-            box["error"] = repr(e)
-    box["thread"] = threading.Thread(target=run)
-    box["thread"].start()
-    return box
-def finish(box):
-    box["thread"].join(20)
-    return box.get("value", box.get("error", "still running"))
-def wait_for(ready):
-    end = time.monotonic() + 10
-    while not ready():
-        if time.monotonic() > end:
-            raise TimeoutError("fixture condition never held")
-        time.sleep(0.01)
-def reload_server():
-    server, said = quiet_server()
-    server.lock = util.lock_file(serve.SERVE_LOCK)
-    server.code, server.code_seen = frozenset(), CHANGED
-    return server, said
-def passing(argv, **kw):
-    if argv[-1] in (serve.IMPORT_CHECK, serve.CONFIG_CHECK):
-        return subprocess.CompletedProcess(argv, 0, "", "")
-    return real_sh(argv, **kw)
-def attempt(server, sh, execv):
-    try:
-        with mock.patch.object(serve, "code_stamp", lambda: CHANGED), mock.patch.object(util, "sh", sh), \
-                mock.patch.object(os, "execv", execv):
-            server.load_new_code()
-    except BaseException as e:
-        return repr(e)
-    finally:
-        os.environ.pop(serve.SERVE_LOCK_FD, None)
-        os.environ.pop(serve.RESTARTED_FOR_NEW_CODE, None)
-    return ""
-'''
+    PRELUDE = ConfigForwardCompatTests.PRELUDE + (SCRIPTS / "serve_reload_prelude.py").read_text()
     environment = ConfigForwardCompatTests.environment
     program = ConfigForwardCompatTests.program
     case = ConfigForwardCompatTests.case
 
     def test_a_post_during_the_import_check_holds_the_restart(self):
-        found = self.case(r'''
-n, started, execs = approval(), [], []
-def probing(argv, **kw):
-    if argv[-1] == serve.IMPORT_CHECK and not started:
-        started.append(background(lambda: post(n)))
-        wait_for(lambda: dashboard.POSTS_IN_FLIGHT.count == 1 and sending.is_set())
-    return passing(argv, **kw)
-def record(*a):
-    execs.append({"count": dashboard.POSTS_IN_FLIGHT.count, "closed": dashboard.POSTS_IN_FLIGHT.closed,
-                  "status": status_of(n)})
-    raise OSError("fixture refuses to exec")
-server, said = reload_server()
-first = attempt(server, probing, record)
-held = {"execs": len(execs), "said": [s for s in said if "new code waits to load" in s],
-        "closed": dashboard.POSTS_IN_FLIGHT.closed, "status": status_of(n), "error": first}
-gate.set()
-answer = finish(started[0])
-after = {"status": status_of(n), "count": dashboard.POSTS_IN_FLIGHT.count}
-second = attempt(server, probing, record)
-result(held=held, answer=answer, after=after, second=second, execs=execs,
-       closed=dashboard.POSTS_IN_FLIGHT.closed, inheritable=os.get_inheritable(server.lock.fileno()))
-''')
+        found = self.case((SCRIPTS / "serve_reload_post_during_probe.py").read_text())
         self.assertEqual(found["held"], {"execs": 0, "closed": False, "status": "approved", "error": "", "said": [
             found["held"]["said"][0]]})
         self.assertTrue(found["held"]["said"][0].endswith("new code waits to load: the dashboard is still answering a request"))
@@ -7906,30 +6449,7 @@ result(held=held, answer=answer, after=after, second=second, execs=execs,
         self.assertFalse(found["inheritable"])
 
     def test_a_closed_gauge_answers_503_and_keeps_the_approval_for_a_second_try(self):
-        found = self.case(r'''
-gate.set()
-a = approval()
-dashboard.POSTS_IN_FLIGHT.close()
-refused = post(a)
-during = {"status": status_of(a), "listed": a in [x["id"] for x in state.approvals()],
-          "count": dashboard.POSTS_IN_FLIGHT.count}
-foreign = post(a, host="foreign.invalid")
-who[0] = "someone@else.test"
-stranger = post(a)
-who[0] = OWNER
-unmarked = post(a, header=None)
-lengths = {"missing": raw(a, ""), "invalid": raw(a, "Content-Length: abc\r\n")}
-fronted = listen(dashboard.FrontedLogins(), dashboard.FrontedHandler)
-port = fronted.server_address[1]
-through = {"owner": post(a, port=port, extra={client.IDENTITY_HEADER: OWNER})["status"],
-           "stranger": post(a, port=port, extra={client.IDENTITY_HEADER: "someone@else.test"})["status"]}
-reading = page()
-dashboard.POSTS_IN_FLIGHT.reopen()
-again = post(a)
-result(refused=refused, text=dashboard.RESTARTING, during=during, foreign=foreign["status"],
-       stranger=stranger["status"], unmarked=unmarked["status"], lengths=lengths, through=through, reading=reading,
-       again=again, status=status_of(a), count=dashboard.POSTS_IN_FLIGHT.count, kept=status_of(a))
-''')
+        found = self.case((SCRIPTS / "serve_reload_closed_gauge.py").read_text())
         self.assertEqual((found["refused"]["status"], found["refused"]["retry"]), (503, "3"))
         self.assertEqual(found["refused"]["body"], {"error": found["text"]})
         self.assertEqual(found["during"], {"status": "pending", "listed": True, "count": 0})
@@ -7942,59 +6462,7 @@ result(refused=refused, text=dashboard.RESTARTING, during=during, foreign=foreig
         self.assertEqual((found["status"], found["count"]), ("done", 0))
 
     def test_a_restart_that_does_not_happen_leaves_posts_open(self):
-        found = self.case(r'''
-gate.set()
-def CP(argv, code, err=""):
-    return subprocess.CompletedProcess(argv, code, "", err)
-def refusing(import_code, config_code=0):
-    def sh(argv, **kw):
-        seen.append(dashboard.POSTS_IN_FLIGHT.closed)
-        if argv[-1] == serve.IMPORT_CHECK:
-            return CP(argv, import_code, "SyntaxError: broken" if import_code else "")
-        if argv[-1] == serve.CONFIG_CHECK:
-            return CP(argv, config_code, "ValueError: cannot read" if config_code else "")
-        return real_sh(argv, **kw)
-    return sh
-def works():
-    return post(approval())["status"]
-def count_exec(*a):
-    execs.append(1)
-def raising(*a):
-    execs.append(1)
-    raise OSError("fixture refuses to exec")
-found = {}
-def run(name, sh, execv=count_exec, server=None, around=None):
-    global seen, execs
-    seen, execs = [], []
-    server, said = server or reload_server()
-    error = attempt(server, sh, execv)
-    found[name] = {"seen": seen, "execs": len(execs), "error": error, "said": " | ".join(said),
-                   "closed": dashboard.POSTS_IN_FLIGHT.closed, "works": works()}
-run("import", refusing(1))
-run("config", refusing(0, 1))
-run("execv", passing, raising)
-server, said = reload_server()
-calls = []
-def second_busy_fails():
-    calls.append(1)
-    if len(calls) == 2:
-        raise RuntimeError("fixture busy failure")
-    return ""
-server.busy_with = second_busy_fails
-run("busy", passing, server=(server, said))
-with mock.patch.object(serve, "child_pids", mock.Mock(side_effect=RuntimeError("fixture pgrep failure"))):
-    run("children", passing)
-flag = [False]
-def work_starts(argv, **kw):
-    flag[0] = argv[-1] == serve.IMPORT_CHECK or flag[0]
-    return passing(argv, **kw)
-with mock.patch.object(serve.chat, "any_busy", lambda: flag[0]):
-    run("chat", work_starts)
-flag[0] = False
-with mock.patch.object(serve.capture, "checking", lambda: flag[0]):
-    run("capture", work_starts)
-result(**found)
-''', timeout=180)
+        found = self.case((SCRIPTS / "serve_reload_failed_restart.py").read_text(), timeout=180)
         self.assertEqual(found["import"]["seen"], [False])
         self.assertIn("new code does not import", found["import"]["said"])
         self.assertIn("new code cannot read config.toml", found["config"]["said"])
@@ -8011,90 +6479,7 @@ result(**found)
             self.assertEqual((one["closed"], one["works"]), (False, 200), name)
 
     def test_the_client_sends_a_restart_503_again_and_fails_everything_else_at_once(self):
-        found = self.case(r'''
-RESTART = {"error": dashboard.RESTARTING}
-class Clock:
-    def __init__(self):
-        self.now, self.slept = 0.0, []
-    def monotonic(self):
-        return self.now
-    def sleep(self, seconds):
-        self.slept.append(seconds)
-        self.now += seconds
-def scripted(replies):
-    seen = []
-    class H(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            seen.append((self.path, self.rfile.read(int(self.headers.get("Content-Length") or 0))))
-            status, headers, body = replies[min(len(seen) - 1, len(replies) - 1)]
-            data = json.dumps(body).encode()
-            self.send_response(status)
-            for k, v in headers.items():
-                self.send_header(k, v)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        def log_message(self, *a):
-            pass
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, seen
-def dead_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-def live(srv, fn=None):
-    calls = []
-    def where():
-        calls.append(1)
-        port = srv.server_address[1] if fn is None or fn(len(calls)) else dead_port()
-        return client.Server("http", "127.0.0.1", port, "127.0.0.1")
-    return where
-def go(replies, fn=None, clock=None, path="/probe"):
-    srv, seen = scripted(replies)
-    client.server = live(srv, fn)
-    out = {}
-    began = time.monotonic()
-    try:
-        if clock:
-            with mock.patch.object(client, "time", types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)):
-                out["answer"] = client.call("POST", path, {"value": 1})
-        else:
-            out["answer"] = client.call("POST", path, {"value": 1})
-    except client.Failed as e:
-        out["failed"] = {"code": e.code, "text": str(e)}
-    except client.Down as e:
-        out["down"] = str(e)
-    srv.shutdown()
-    return {**out, "requests": len(seen), "same": len(set(seen)) == 1, "elapsed": time.monotonic() - began}
-OK = (200, {}, {"ok": True})
-r503 = lambda after: (503, {"Retry-After": after}, RESTART)
-clock = Clock()
-repeated = go([r503("10")], clock=clock)
-repeated["slept"] = clock.slept
-clock = Clock()
-expiry = go([r503("10"), r503("10"), r503("10"), OK], clock=clock)
-expiry["slept"] = clock.slept
-clock = Clock()
-dropped = go([r503("1"), OK], fn=lambda n: n != 2, clock=clock)
-dropped["slept"] = clock.slept
-clock = Clock()
-never = go([r503("1")], fn=lambda n: n == 1, clock=clock)
-never["slept"] = clock.slept
-clock = Clock()
-client.server = lambda: client.Server("http", "127.0.0.1", dead_port(), "127.0.0.1")
-try:
-    with mock.patch.object(client, "time", types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)):
-        client.call("POST", "/probe", {})
-    initial = "no error"
-except client.Down:
-    initial = "down"
-result(again=go([r503("0"), OK]), slow=go([r503("1"), OK]), none=go([(503, {}, RESTART)]),
-       invalid=go([(503, {"Retry-After": "soon"}, RESTART)]), other=go([(409, {"Retry-After": "1"}, {"error": "Busy."})]),
-       repeated=repeated, expiry=expiry, dropped=dropped, never=never, initial=initial, initial_sleeps=clock.slept)
-''', timeout=180)
+        found = self.case((SCRIPTS / "serve_reload_client_retry.py").read_text(), timeout=180)
         self.assertEqual((found["again"]["answer"], found["again"]["requests"], found["again"]["same"]), ({"ok": True}, 2, True))
         self.assertEqual((found["slow"]["answer"], found["slow"]["requests"]), ({"ok": True}, 2))
         self.assertGreaterEqual(found["slow"]["elapsed"], 0.9)
@@ -8114,12 +6499,7 @@ result(again=go([r503("0"), OK]), slow=go([r503("1"), OK]), none=go([(503, {}, R
 
 
 class LoopMarkAndDurableWriteTests(unittest.TestCase):
-    PRELUDE = r'''
-import contextlib, fcntl, io, json, os, sqlite3, subprocess, sys, time
-from pathlib import Path
-from unittest import mock
-from arete import board, config, heartbeat, paths, pipeline, record, state, util
-'''
+    PRELUDE = (SCRIPTS / "loop_mark_durable_write_prelude.py").read_text()
     MARKER = "RESULT:"
 
     def session(self, body, setup=True):
@@ -8138,81 +6518,14 @@ from arete import board, config, heartbeat, paths, pipeline, record, state, util
             return behavior_result(done, marker=self.MARKER)
 
     def test_two_loops_marking_together_keep_both_marks(self):
-        found = self.session(r'''
-root = Path(sys.argv[1])
-child = ("import sys, time\nfrom pathlib import Path\nfrom arete import heartbeat\nstop, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
-         "n = 0\nwhile not stop.exists():\n    heartbeat.mark_loop('research', True, 'nothing due')\n    n += 1\n"
-         "    if n == 3: ready.write_text('x')\n")
-trials = []
-for i in range(20):
-    stop, ready = root / f"stop{i}", root / f"ready{i}"
-    research = subprocess.Popen([sys.executable, "-c", child, str(stop), str(ready)])
-    try:
-        deadline = time.time() + 60
-        while not ready.exists() and time.time() < deadline:
-            time.sleep(0.01)
-        poll = subprocess.run([sys.executable, "-c", "from arete import heartbeat\nheartbeat.mark_loop('poll', False, 'gh: HTTP 502')"])
-        time.sleep(0.05)
-    finally:
-        stop.write_text("x")
-        code = research.wait(timeout=60)
-    marks = state.loop_marks()
-    shown = {c["name"]: c for c in board.checks()["loops"]}
-    trials.append([poll.returncode, code, marks["poll"]["ok"], marks["poll"]["detail"], marks["research"]["ok"],
-                   shown["poll"]["ok"]])
-    state.set_loop_state("poll", mark_ok=None, mark_detail="", mark_at=None)
-print("RESULT:" + json.dumps({"trials": trials, "legacy": (paths.STATE_DIR / "loops.json").exists()}))
-''')
+        found = self.session((SCRIPTS / "loop_mark_concurrent.py").read_text())
         self.assertEqual(len(found["trials"]), 20)
         for trial in found["trials"]:
             self.assertEqual(trial, [0, 0, False, "gh: HTTP 502", True, False])
         self.assertFalse(found["legacy"])
 
     def test_a_failed_mark_fails_the_loop_check_and_the_legacy_file_is_ignored_and_removed(self):
-        found = self.session(r'''
-cfg = config.load()
-planted = paths.STATE_DIR / "loops.json"
-def plant(ok, detail):
-    planted.write_text(json.dumps({"poll": {"ts": util.iso(), "ok": ok, "detail": detail}}))
-def poll_check():
-    return next(c for c in heartbeat.check_loops(cfg) if c.key == "loop:poll")
-rid = record.start("loop", loop="poll", loop_kind="command")
-record.settle(rid, "done")
-plant(True, "legacy ok")
-heartbeat.mark_loop("poll", False, "gh: HTTP 502")
-failed = poll_check()
-heartbeat.mark_loop("poll", True, "recovered")
-plant(False, "legacy failed")
-cleared = poll_check()
-def empty(name):
-    def check(*a, **k):
-        return []
-    check.__name__ = name
-    return check
-stubs = [mock.patch.object(heartbeat, n, empty(n)) for n in (
-    "check_jobs", "check_probes", "check_claude_auth", "check_codex_auth", "check_codex_cleanup", "check_pi_auth",
-    "check_hook", "check_disk", "check_serve", "check_backups", "check_costs", "check_oncall", "check_workspaces",
-    "check_scratch")]
-def no_wait(*a, **k):
-    raise AssertionError("waited for the network")
-raised, cleared_keys = [], []
-runs = []
-with contextlib.ExitStack() as stack:
-    for s in stubs:
-        stack.enter_context(s)
-    stack.enter_context(mock.patch.object(util, "online", return_value=True))
-    stack.enter_context(mock.patch.object(util, "wait_for_network", no_wait))
-    stack.enter_context(mock.patch.object(heartbeat.install, "rotate_logs"))
-    stack.enter_context(mock.patch.object(heartbeat.alerts, "raise_alert", lambda repo, key, *a: raised.append(key)))
-    stack.enter_context(mock.patch.object(heartbeat.alerts, "clear_alert", lambda repo, key, *a: cleared_keys.append(key)))
-    heartbeat.mark_loop("poll", False, "gh: HTTP 502")
-    plant(True, "legacy ok")
-    runs.append([heartbeat.run(quiet=True), planted.exists(), list(raised)])
-    heartbeat.mark_loop("poll", True, "fine")
-    plant(False, "legacy failed")
-    runs.append([heartbeat.run(quiet=True), planted.exists(), "loop:poll" in cleared_keys])
-print("RESULT:" + json.dumps({"failed": [failed.ok, failed.detail], "cleared": [cleared.ok, cleared.detail], "runs": runs}))
-''')
+        found = self.session((SCRIPTS / "loop_mark_failure_and_legacy.py").read_text())
         self.assertFalse(found["failed"][0])
         self.assertIn("failed: gh: HTTP 502", found["failed"][1])
         self.assertTrue(found["cleared"][0])
@@ -8272,41 +6585,7 @@ print("RESULT:" + json.dumps(out))
         self.assertEqual(found["bytes"], ["old-a", "old-b"])
 
     def test_a_durable_write_syncs_the_file_before_replace_and_the_folder_after(self):
-        found = self.session(r'''
-folder = Path(sys.argv[1]) / "w"
-folder.mkdir()
-run = pipeline.Run.__new__(pipeline.Run)
-run.dir = folder
-real = {"fcntl": fcntl.fcntl, "fsync": os.fsync, "replace": os.replace}
-def trial(call, fullsync_fails=False):
-    events = []
-    def fcntl_spy(fd, op, *a):
-        events.append("fullsync")
-        if fullsync_fails:
-            raise OSError("no")
-        return real["fcntl"](fd, op, *a)
-    def fsync_spy(fd):
-        events.append("fsync")
-        return real["fsync"](fd)
-    def replace_spy(a, b):
-        events.append("replace")
-        return real["replace"](a, b)
-    with mock.patch.object(util.fcntl, "fcntl", fcntl_spy), mock.patch.object(util.os, "fsync", fsync_spy), \
-            mock.patch.object(util.os, "replace", replace_spy):
-        call()
-    return events
-out = {"save": trial(lambda: run.save("s.txt", "plain text")),
-       "json": trial(lambda: util.write_json(folder / "j.json", {"x": 1})),
-       "fallback": trial(lambda: util.write_json(folder / "k.json", {"x": 2}), True)}
-with mock.patch.object(util.fcntl, "F_FULLFSYNC", create=True), mock.patch.object(util, "fcntl", mock.Mock(spec=[])), \
-        mock.patch.object(util.os, "fsync") as fsync:
-    util.write_json(folder / "m.json", {"x": 3})
-    out["missing_constant_fsyncs"] = fsync.call_count
-out["modes"] = [oct((folder / n).stat().st_mode & 0o777) for n in ("s.txt", "j.json")]
-out["text"] = (folder / "s.txt").read_text()
-out["json_back"] = json.loads((folder / "j.json").read_text())
-print("RESULT:" + json.dumps(out))
-''')
+        found = self.session((SCRIPTS / "durable_write_sync.py").read_text())
         for key in ("save", "json"):
             self.assertEqual(found[key][-2:], ["replace", "fsync"], key)
             self.assertLess(found[key].index("fullsync") if "fullsync" in found[key] else 0, found[key].index("replace"))
@@ -8317,29 +6596,7 @@ print("RESULT:" + json.dumps(out))
         self.assertEqual(found["json_back"], {"x": 1})
 
     def test_an_unmigrated_database_shows_no_marks_and_marking_keeps_scheduling_columns(self):
-        found = self.session(r'''
-old = Path(sys.argv[1]) / "old.db"
-c = sqlite3.connect(old)
-c.executescript(state.SCHEMA)
-c.execute("INSERT INTO loop_state (loop) VALUES ('poll')")
-c.commit()
-before = [r[1] for r in c.execute("PRAGMA table_info(loop_state)")]
-c.close()
-real = paths.DB_FILE
-paths.DB_FILE = old
-try:
-    unmigrated = [state.loop_marks(connect=state.reader), board.checks()["loops"]]
-finally:
-    paths.DB_FILE = real
-c = sqlite3.connect(old)
-after = [r[1] for r in c.execute("PRAGMA table_info(loop_state)")]
-c.close()
-state.set_loop_state("research", data={"k": 1}, last_fire="2026-01-01T00:00:00Z", next_due="2026-01-02T00:00:00Z", metric_on=1)
-heartbeat.mark_loop("research", True, "ok")
-row = state.loop_state("research")
-print("RESULT:" + json.dumps({"unmigrated": unmigrated, "same": before == after, "new": "mark_at" in after,
-                              "row": [row["data"], row["last_fire"], row["next_due"], row["metric_on"], row["mark_detail"]]}))
-''')
+        found = self.session((SCRIPTS / "loop_mark_unmigrated.py").read_text())
         self.assertEqual(found["unmigrated"], [{}, []])
         self.assertTrue(found["same"])
         self.assertFalse(found["new"])
