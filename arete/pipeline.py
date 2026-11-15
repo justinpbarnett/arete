@@ -684,8 +684,7 @@ def fetch(src: Path, ref: str) -> None:
 
 def add_worktree(c: Checkout, branch: str, start: str) -> None:
     c.wt.parent.mkdir(parents=True, exist_ok=True)
-    with util.repo_lock(c.src):
-        git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
+    util.add_worktree(c.src, c.wt, branch, start, reset=True)
 
 
 def scratch_named(names: set[str] | None, name: str) -> bool:

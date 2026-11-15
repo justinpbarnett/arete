@@ -183,7 +183,7 @@ def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> N
         spec.deny = diffguard.denied_paths(config.load_layer(repo.layer_dir))
         spec.cloned = published_baseline(repo)
     with record.timed(spec.id, "worktree", repo=repo.name, branch=spec.branch, path=str(wt)):
-        util.git(["worktree", "add", "-q", "-b", spec.branch, str(wt), "HEAD"], repo.path)
+        util.add_worktree(repo.path, wt, spec.branch, "HEAD")
     spec.cwd = str(wt)
     if spec.task:
         spec.fetched = util.git(["rev-parse", "HEAD"], wt).strip()
