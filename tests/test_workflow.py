@@ -47,7 +47,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
 lock = src / '.git' / 'config.lock'
 before = (src / '.git' / 'config').read_bytes()
 lock.touch()
-ws = engine.open_workspace(run)
+ws = loop_run.open_workspace(run)
 wt = pipeline.make_worktree(repo, 'main', 'arete/probe', 'probe')
 for folder, branch in ((ws.wt, 'loop/probe'), (wt, 'arete/probe')):
     assert git('-C', folder, 'branch', '--show-current').stdout.strip() == branch
@@ -60,9 +60,9 @@ assert git('worktree', 'list', '--porcelain').stdout.count('worktree ') == 3
 
     def test_loop_initialization_failure_removes_branch_and_worktree(self):
         self.run_body('''
-with patch.object(engine.diffguard, 'denied_paths', side_effect=RuntimeError('probe denied_paths')):
+with patch.object(loop_run.diffguard, 'denied_paths', side_effect=RuntimeError('probe denied_paths')):
     try:
-        engine.open_workspace(run)
+        loop_run.open_workspace(run)
     except RuntimeError as error:
         assert 'probe denied_paths' in str(error)
     else:
@@ -79,7 +79,7 @@ hook.write_text('#!/bin/sh\nexit 1\n')
 hook.chmod(0o700)
 os.environ['GIT_CONFIG_VALUE_0'] = str(hooks)
 try:
-    engine.open_workspace(run)
+    loop_run.open_workspace(run)
 except RuntimeError:
     pass
 else:
@@ -121,10 +121,10 @@ def racing_git(args, cwd, **kw):
         timers.append(timer)
         timer.start()
     return original(args, cwd, **kw)
-ws = engine.Workspace(src, paths.WORKTREES_DIR / 'absent', 'kept', 'main', '',
+ws = loop_run.Workspace(src, paths.WORKTREES_DIR / 'absent', 'kept', 'main', '',
                       git('rev-parse', 'HEAD').stdout.strip(), [], 1000, False)
 with patch.object(util, 'git', racing_git):
-    engine.close_workspace(ws, keep_branch=False)
+    loop_run.close_workspace(ws, keep_branch=False)
 for timer in timers:
     timer.join()
 assert len(timers) == 1
@@ -198,8 +198,8 @@ assert git('branch', '--no-track', 'arete/reset', 'origin/main').returncode == 0
 wt = pipeline.make_worktree(repo, 'main', 'arete/reset', 'reset')
 assert git('-C', wt, 'rev-parse', 'HEAD').stdout == git('rev-parse', 'origin/main').stdout
 assert git('-C', wt, 'branch', '--show-current').stdout.strip() == 'arete/reset'
-ws = engine.open_workspace(run)
-engine.close_workspace(ws, keep_branch=True)
+ws = loop_run.open_workspace(run)
+loop_run.close_workspace(ws, keep_branch=True)
 assert git('rev-parse', '--verify', 'refs/heads/loop/probe').returncode == 0
 assert not ws.wt.exists()
 ''')
