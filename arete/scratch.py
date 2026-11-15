@@ -51,6 +51,7 @@ LEASES: dict[str, int] = {}
 RUN_BASELINES: dict[str, dict[int, int] | None] = {}
 RUN_LABELS: dict[str, dict | None] = {}
 MAX_RECORD_BYTES = 1024 * 1024
+REPLACED_RECORD_READS = 5
 SECRET = "signing.secret"
 NEXT_SECRET = "signing.secret.next"
 ROTATION_MARKER = "rotation.marker"
@@ -165,11 +166,17 @@ def registry(create: bool = False):
 def load(fd: int, key: bytes, selector: str) -> dict:
     if len(selector) != 64 or any(c not in "0123456789abcdef" for c in selector):
         raise ValueError("invalid attempt selector")
-    source = os.open(selector + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-    with os.fdopen(source, "rb") as inp:
-        st = os.fstat(source)
-        checked(st, identity(st))
-        envelope = json.loads(inp.read(MAX_RECORD_BYTES + 1))
+    for _ in range(REPLACED_RECORD_READS):
+        source = os.open(selector + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(source, "rb") as inp:
+            st = os.fstat(source)
+            if stat.S_ISREG(st.st_mode) and st.st_nlink == 0:
+                continue
+            checked(st, identity(st))
+            envelope = json.loads(inp.read(MAX_RECORD_BYTES + 1))
+            break
+    else:
+        raise OSError(errno.ESTALE, "resource replaced or linked")
     data = envelope["data"]
     if not hmac.compare_digest(envelope["signature"], hmac.digest(key, encoded(data), "sha256").hex()):
         raise ValueError("unauthenticated scratch record")
