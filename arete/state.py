@@ -582,7 +582,7 @@ MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DE
                   ("loop", "TEXT"), ("loop_kind", "TEXT"), ("model", "TEXT"), ("runner", "TEXT"), ("device", "TEXT"),
                   ("tokens_in", "INTEGER DEFAULT 0"), ("tokens_out", "INTEGER DEFAULT 0"), ("log", "TEXT"),
                   ("trigger", "TEXT"), ("queue", "TEXT"), ("grp", "TEXT"), ("pid", "INTEGER"), ("lock", "TEXT"),
-                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("wait_minutes", "TEXT"), ("only_step", "TEXT DEFAULT ''"),
+                  ("stop_asked", "TEXT"), ("moved", "TEXT"), ("label_pending", "TEXT"), ("wait_minutes", "TEXT"), ("only_step", "TEXT DEFAULT ''"),
                   ("engine_sha", "TEXT"))],
               ("steps", "first_context_tokens", "ALTER TABLE steps ADD COLUMN first_context_tokens INTEGER DEFAULT 0"),
               *[("steps", col, f"ALTER TABLE steps ADD COLUMN {col} {kind}") for col, kind in (
@@ -1723,6 +1723,14 @@ def running_run(repo: str, issue: int | str, connect=db) -> dict | None:
         r = c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "
                       "ORDER BY started DESC, rowid DESC LIMIT 1", (repo, issue)).fetchone()
         return dict(r) if r else None
+
+
+def pending_label(repo: str, issue: int | str) -> str:
+    with db() as c:
+        r = c.execute("SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+                      "AND label_pending IS NOT NULL ORDER BY started DESC, rowid DESC LIMIT 1",
+                      (repo, issue)).fetchone()
+        return r["label_pending"] if r else ""
 
 
 def issue_running(repo: str, issue: int | str) -> bool:
