@@ -3,7 +3,11 @@ import json, threading, urllib.request, urllib.error
 from arete import codebase, control, dashboard, paths, serve, state, util
 codebase.load()
 state.ensure_schema()
-serve.Server().beat([], [])
+beating = serve.Server()
+beating.beat()
+beating.pool.shutdown()
+for pool in beating.job_pools.values():
+    pool.shutdown()
 node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
 class Owner:
     def of(self, address):
