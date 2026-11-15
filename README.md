@@ -2094,7 +2094,7 @@ delivery below uses trial mode, which holds both tickets and metrics. Do not run
 against normal state. Start from an empty fixture directory; retain it for inspection afterward.
 
 ```sh
-SB=/Users/justin.barnett/Library/Developer/arete/verification-runtime/harness/sandbox
+SB="$HOME/Library/Developer/arete/verification-runtime/harness/sandbox"
 "$SB" python docs/merge-check-fixture.py setup
 "$SB" arete merged --help
 "$SB" arete merge-check --help
