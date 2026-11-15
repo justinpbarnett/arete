@@ -1,0 +1,10 @@
+
+src, ws = t / "src", t / "worktrees" / ("ws-" + secrets.token_hex(4))
+src.mkdir()
+git = lambda *a: subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *a], cwd=src, check=True, capture_output=True)
+git("init", "-q", "-b", "main")
+(src / "a.txt").write_text("a")
+git("add", "a.txt")
+git("commit", "-qm", "a")
+git("worktree", "add", "-q", str(ws), "HEAD")
+c = pipeline.Checkout("", "o/r", src, ws, "main")
