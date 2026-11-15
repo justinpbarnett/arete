@@ -212,8 +212,17 @@ CREATE TABLE IF NOT EXISTS evals (
     seconds REAL,
     cost_usd REAL,
     ts TEXT,
-    source TEXT DEFAULT ''
+    source TEXT DEFAULT '',
+    engine_sha TEXT DEFAULT '',
+    prompts_sha TEXT DEFAULT '',
+    prompts_from TEXT DEFAULT '',
+    context_sha TEXT DEFAULT '',
+    settings TEXT DEFAULT '',
+    base_commit TEXT DEFAULT '',
+    after_step INTEGER DEFAULT 0,
+    last_step INTEGER DEFAULT 0
 );
+CREATE UNIQUE INDEX IF NOT EXISTS evals_key ON evals (run_id, repo, task);
 CREATE TABLE IF NOT EXISTS feedback (
     pr_url TEXT NOT NULL,
     kind TEXT NOT NULL,            -- review | line | comment
@@ -543,6 +552,14 @@ MIGRATIONS = [("cursors", "last_ok", "ALTER TABLE cursors ADD COLUMN last_ok TEX
               ("queue", "dead_at", "ALTER TABLE queue ADD COLUMN dead_at TEXT"),
               ("queue", "dead_reason", "ALTER TABLE queue ADD COLUMN dead_reason TEXT DEFAULT ''"),
 ("evals", "source", "ALTER TABLE evals ADD COLUMN source TEXT DEFAULT ''"),
+              ("evals", "engine_sha", "ALTER TABLE evals ADD COLUMN engine_sha TEXT DEFAULT ''"),
+              ("evals", "prompts_sha", "ALTER TABLE evals ADD COLUMN prompts_sha TEXT DEFAULT ''"),
+              ("evals", "prompts_from", "ALTER TABLE evals ADD COLUMN prompts_from TEXT DEFAULT ''"),
+              ("evals", "context_sha", "ALTER TABLE evals ADD COLUMN context_sha TEXT DEFAULT ''"),
+              ("evals", "settings", "ALTER TABLE evals ADD COLUMN settings TEXT DEFAULT ''"),
+              ("evals", "base_commit", "ALTER TABLE evals ADD COLUMN base_commit TEXT DEFAULT ''"),
+              ("evals", "after_step", "ALTER TABLE evals ADD COLUMN after_step INTEGER DEFAULT 0"),
+              ("evals", "last_step", "ALTER TABLE evals ADD COLUMN last_step INTEGER DEFAULT 0"),
               ("captures", "jev_cost_usd", "ALTER TABLE captures ADD COLUMN jev_cost_usd REAL DEFAULT 0"),
               ("captures", "inspect_cost_usd", "ALTER TABLE captures ADD COLUMN inspect_cost_usd REAL DEFAULT 0"),
               ("capture_evidence", "inspection", "ALTER TABLE capture_evidence ADD COLUMN inspection TEXT DEFAULT ''"),
@@ -1940,22 +1957,41 @@ def set_proposal_status_by_pr(pr_url: str, status: str) -> None:
         c.execute("UPDATE proposals SET status = ? WHERE pr_url = ?", (status, pr_url))
 
 
-def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, cost: float, source: str = "") -> None:
+EVAL_LINEAGE = ("engine_sha", "prompts_sha", "prompts_from", "context_sha", "settings", "base_commit",
+                "after_step", "last_step")
+
+
+def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, cost: float, source: str = "",
+             lineage: dict | None = None) -> None:
+    lineage = lineage or {}
     with db() as c:
         c.execute(
-            "INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source) VALUES (?,?,?,?,?,?,?,?)",
-            (run_id, repo, task, int(passed), seconds, cost, util.iso(), source),
+            f"INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source, {', '.join(EVAL_LINEAGE)}) "
+            f"VALUES ({','.join('?' * 16)})",
+            (run_id, repo, task, int(passed), seconds, cost, util.iso(), source,
+             *(lineage.get(k, 0 if k in ("after_step", "last_step") else "") for k in EVAL_LINEAGE)),
         )
 
 
 BASELINE_SOURCE = "worktree"
 
 
-def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[bool]:
+def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[dict]:
     with db() as c:
-        rows = c.execute("SELECT passed FROM evals WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
+        rows = c.execute(f"SELECT passed, {', '.join(EVAL_LINEAGE)} FROM evals "
+                         "WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
                          (repo, task, source, limit))
-        return [bool(r[0]) for r in rows]
+        return [{**dict(r), "passed": bool(r["passed"])} for r in rows]
+
+
+def last_step_id(run_id: str) -> int:
+    with db() as c:
+        return c.execute("SELECT COALESCE(MAX(id), 0) FROM steps WHERE run_id = ?", (run_id,)).fetchone()[0]
+
+
+def eval_rows(run_id: str) -> list[dict]:
+    with db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM evals WHERE run_id = ? ORDER BY ts", (run_id,))]
 
 
 def eval_history(repo: str, limit: int = 20) -> list[dict]:

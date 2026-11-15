@@ -3092,6 +3092,253 @@ print("LINEAGE_OK")
         self.scenario("boundaries")
 
 
+class EvalLineageTests(unittest.TestCase):
+    slow = True
+
+    def script(self, body):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("config", "state", "logs", "worktrees", "tmp", "home", "authority-parent"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), HOME=str(root / "home"), GIT_CONFIG_NOSYSTEM="1",
+                       GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath",
+                       GIT_CONFIG_VALUE_0=os.devnull)
+            prefix = r'''
+import contextlib, io, json, os, shutil, sqlite3, sys
+from pathlib import Path
+from arete import board, codebase, config, evals, experiment, optimize, paths, scratch, state, util
+root = Path(sys.argv[1])
+probe = [sys.executable, "-V"]
+if scratch.protected_command(probe) != probe:
+    scratch.AUTHORITY = root / "authority-parent/verification-authority"
+paths.ensure_dirs()
+def sample():
+    text = "\n".join(optimize.sample(root / "sample"))
+    paths.CONFIG_FILE.write_text(text.replace("[models]", '[models]\nbuild = "scratch-a"'))
+    replies = root / "sample/replay"
+    for n in (2, 3):
+        for name in ("plan.json", "build.json", "build.patch"):
+            p = Path(name)
+            shutil.copyfile(replies / name, replies / f"{p.stem}{n}{p.suffix}")
+    return replies
+def call(*args, **kwargs):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = evals.run("replay-sample", *args, **kwargs)
+    return code, out.getvalue()
+def latest():
+    with state.db() as c:
+        return c.execute("SELECT run_id FROM evals WHERE repo = 'replay-sample' ORDER BY rowid DESC").fetchone()[0]
+'''
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + prefix + body
+            done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root)], cwd=root, env=env,
+                                  text=True, capture_output=True, timeout=600, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                           if line.startswith("BEHAVIOR_RESULT=")), None)
+            self.assertIsNotNone(output, done.stdout + done.stderr)
+            return json.loads(output)
+
+    def test_replay_lineage_regression_compare_and_step_ranges(self):
+        r = self.script(r'''
+replies = sample()
+head = util.git(["rev-parse", "HEAD"], root / "sample/repo").strip()
+rows = []
+for _ in range(3):
+    code, out = call("word-train")
+    row = state.eval_rows(latest())[0]
+    assert row["passed"] and row["base_commit"] == head, (row, out)
+    assert head[:12] in out, out
+    with state.db() as c:
+        engine = c.execute("SELECT engine_sha FROM runs WHERE id = ?", (row["run_id"],)).fetchone()[0]
+    assert row["engine_sha"] == engine == codebase.STAMP
+    assert row["prompts_from"] == ""
+    rows.append(row)
+assert len({r["prompts_sha"] for r in rows}) == 1
+assert {json.loads(r["settings"])["models"]["build"] for r in rows} == {"scratch-a"}
+with state.db() as c:
+    c.execute("UPDATE evals SET context_sha = 'older harness' WHERE source = 'worktree'")
+comparison = evals.compare("replay-sample", "main")
+assert "since that run" not in comparison.splitlines()[0], comparison
+with state.db() as c:
+    for row in rows:
+        c.execute("UPDATE evals SET context_sha = ? WHERE run_id = ?", (row["context_sha"], row["run_id"]))
+text = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text(text.replace('build = "scratch-a"', 'build = "scratch-b"'))
+comparison = evals.compare("replay-sample", "main")
+assert "build model scratch-a to scratch-b" in comparison.splitlines()[0], comparison
+assert "harness" not in comparison.splitlines()[0], comparison
+folder = root / "edited"
+shutil.copytree(paths.PROMPTS_DIR, folder)
+with (folder / "build.md").open("a") as f:
+    f.write("\nAn edited builder prompt.\n")
+(replies / "build.patch").unlink()
+code, out = call("word-train", prompts=evals.Prompts(folder, "edited"))
+fourth = state.eval_rows(latest())[0]
+md = (paths.RUNS_DIR / latest() / "results.md").read_text()
+assert not fourth["passed"], (fourth, out)
+for phrase in ("REGRESSED", "build model scratch-a to scratch-b", "prompts"):
+    assert phrase in out and phrase in md, (out, md)
+assert fourth["prompts_from"] == str(folder)
+assert fourth["prompts_sha"] != rows[0]["prompts_sha"]
+assert json.loads(fourth["settings"])["models"]["build"] == "scratch-b"
+assert fourth["engine_sha"] == codebase.STAMP and fourth["base_commit"] == head
+assert evals.lineage_changes(fourth, fourth) == []
+assert evals.lineage_changes(fourth, {**fourth, "context_sha": "different"}, skip=("harness",)) == []
+paths.CONFIG_FILE.write_text(text)
+code, out = call("word-train")
+assert "nothing recorded changed" in out, out
+shutil.copyfile(replies / "build2.patch", replies / "build.patch")
+code, out = call()
+run_id = latest()
+suite = state.eval_rows(run_id)
+assert len(suite) == 3 and all(r["passed"] for r in suite), (suite, out)
+with state.db() as c:
+    steps = [dict(s) for s in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
+covered = []
+for row in suite:
+    own = [s for s in steps if row["after_step"] < s["id"] <= row["last_step"]]
+    assert {s["step"] for s in own} >= {"plan", "build"}, own
+    assert [s["step"] for s in own][:2] == ["plan", "build"], own
+    covered.extend(s["id"] for s in own)
+assert len(covered) == len(set(covered)) and sorted(covered) == [s["id"] for s in steps]
+try:
+    state.add_eval(run_id, suite[0]["repo"], suite[0]["task"], False, 0, 0)
+except sqlite3.IntegrityError:
+    pass
+else:
+    raise AssertionError("duplicate eval accepted")
+assert state.eval_rows(run_id) == suite
+history = state.eval_history("replay-sample")
+code, out = call("word-train", dry_run=True)
+assert "word-train" in out and state.eval_history("replay-sample") == history
+assert state.last_step_id(run_id) == steps[-1]["id"]
+print("BEHAVIOR_RESULT=" + json.dumps({"tasks": len(suite), "regression": md}))
+''')
+        self.assertEqual(r["tasks"], 3)
+        self.assertIn("REGRESSED", r["regression"])
+
+    def test_legacy_migration_and_explanations(self):
+        r = self.script(r'''
+with sqlite3.connect(paths.DB_FILE) as c:
+    c.execute("CREATE TABLE evals (run_id TEXT, repo TEXT, task TEXT, passed INTEGER, seconds REAL, "
+              "cost_usd REAL, ts TEXT, source TEXT DEFAULT '')")
+    for n in range(2):
+        c.execute("INSERT INTO evals VALUES (?, 'replay-sample', 'word-train', 1, 2, 3, ?, 'worktree')",
+                  (f"old-{n}", f"2020-01-0{n + 1}"))
+for _ in range(2):
+    with state.db() as c:
+        columns = {r[1] for r in c.execute("PRAGMA table_info(evals)")}
+        assert set(state.EVAL_LINEAGE) <= columns
+        assert "evals_key" in {r[1] for r in c.execute("PRAGMA index_list(evals)")}
+        old = [dict(r) for r in c.execute("SELECT * FROM evals")]
+        assert len(old) == 2
+        for row in old:
+            assert [row[k] for k in state.EVAL_LINEAGE] == [""] * 6 + [0, 0], row
+            assert row["passed"] == 1 and row["seconds"] == 2 and row["cost_usd"] == 3
+replies = sample()
+state.add_eval("old-2", "replay-sample", "word-train", True, 0, 0, "worktree")
+with state.db() as c:
+    c.execute("UPDATE evals SET ts = '2020-01-03' WHERE run_id = 'old-2'")
+comparison = evals.compare("replay-sample", "main")
+assert "the baseline predates lineage" in comparison, comparison
+(replies / "build.patch").unlink()
+code, out = call("word-train")
+assert "REGRESSED: the last pass predates lineage" in out, out
+print("BEHAVIOR_RESULT=" + json.dumps({"columns": sorted(columns)}))
+''')
+        self.assertIn("context_sha", r["columns"])
+
+    def test_board_uses_only_baselines(self):
+        r = self.script(r'''
+state.add_eval("a", "mixed", "one", True, 0, 0, "worktree")
+state.add_eval("b", "mixed", "two", False, 0, 0, "worktree with prompts edited")
+state.add_eval("c", "prompt-only", "three", False, 0, 0, "worktree with prompts edited")
+rows = board.trend_figures()["evals"]
+assert len(rows) == 1 and rows[0]["repo"] == "mixed", rows
+print("BEHAVIOR_RESULT=" + json.dumps(rows[0]))
+''')
+        self.assertEqual((r["pass_rate"], r["tasks"]), (1.0, 1))
+
+    def test_context_prompt_selection_and_early_failures(self):
+        r = self.script(r'''
+sample()
+cfg = config.load()
+repo = cfg.repo("replay-sample")
+src = evals.Source(repo)
+harness = repo.path / "CLAUDE.md"
+harness.write_text("first\n")
+link = repo.path / "AGENTS.md"
+link.symlink_to("CLAUDE.md")
+def context():
+    code, out = call("word-train")
+    row = state.eval_rows(latest())[0]
+    assert row["passed"], (row, out)
+    return row["context_sha"]
+digests = [context()]
+harness.write_text("second\n")
+digests.append(context())
+link.unlink()
+link.symlink_to("missing.md")
+digests.append(context())
+with (repo.layer / "config.toml").open("a") as f:
+    f.write("\n# changed layer\n")
+digests.append(context())
+layer = config.load_layer(repo.layer)
+layer.expertise_file.parent.mkdir(parents=True, exist_ok=True)
+layer.expertise_file.write_text("A learned fact.\n")
+digests.append(context())
+assert len(set(digests)) == len(digests), digests
+folder = root / "prompts"
+shutil.copytree(paths.PROMPTS_DIR, folder)
+p = evals.Prompts(folder, "folder")
+original = evals.prompts_digest(p)
+(folder / "review.md").write_text("unused override")
+assert evals.prompts_digest(p) == original
+with (folder / "fix.md").open("a") as f:
+    f.write("\nchanged\n")
+assert evals.prompts_digest(p) != original
+assert original == evals.prompts_digest(evals.Prompts())
+files = {p.name: p for p in paths.PROMPTS_DIR.glob("*.md")}
+assert original == util.digest(*(part for name, p in sorted(files.items()) for part in (name, p.read_bytes())))
+exported = evals.Prompts(paths.RUNS_DIR / "exported/main", "origin/main", "a" * 40)
+assert evals.prompts_from(exported) == "origin/main@aaaaaaaaaaaa exported/main"
+assert experiment.sha is util.digest
+assert experiment.sha("a", b"bc") == util.digest("a", b"bc")
+assert util.digest("a", "bc") != util.digest("ab", "c")
+assert util.digest("") != util.digest()
+table = evals.results_md("repo", "worktree", [{"passed": False, "why": "a|b", "task": "t", "seconds": 0,
+                                            "paid": 0, "regressed": True, "changed": ["build model a|b to c"]}])
+assert r"a\|b" in table and r"build model a\|b to c" in table, table
+task = evals.Task("no-check", "No check", "Nothing")
+result = evals.run_task(cfg, repo, src, task, "early", False, evals.Prompts())
+assert [result[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
+task = evals.Task("bad-base", "Bad base", "Nothing", check="true", base="does-not-exist")
+result = evals.run_task(cfg, repo, src, task, "bad-base", False, evals.Prompts())
+assert [result[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
+with (repo.layer / "config.toml").open("a") as f:
+    f.write('\n[setup]\ncommands = ["false"]\n')
+task = evals.Task("bad-setup", "Bad setup", "Nothing", check="true")
+result = evals.run_task(cfg, repo, src, task, "bad-setup", False, evals.Prompts())
+assert result["base_commit"] and result["context_sha"] == result["settings"] == "", result
+assert "setup" in result["why"], result
+(repo.layer / "evals/no-check.toml").write_text('title = "No check"\nprompt = "Nothing"\n')
+code, out = call("no-check")
+row = state.eval_rows(latest())[0]
+assert not row["passed"] and [row[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""]
+before = state.eval_history(repo.name)
+(folder / "build.md").unlink()
+code, out = call("word-train", prompts=p)
+assert code == 1 and "build.md" in out and "all need a prompt" in out, out
+assert state.eval_history(repo.name) == before
+print("BEHAVIOR_RESULT=" + json.dumps({"contexts": len(set(digests))}))
+''')
+        self.assertEqual(r["contexts"], 5)
+
+
 class OptimizeTests(unittest.TestCase):
     slow = True
 

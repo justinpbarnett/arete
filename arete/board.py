@@ -472,7 +472,8 @@ def trend_figures() -> dict:
 
     eval_repos: dict[str, list[dict]] = defaultdict(list)
     for e in evals:
-        eval_repos[e["repo"]].append(e)
+        if e["source"] == state.BASELINE_SOURCE:
+            eval_repos[e["repo"]].append(e)
     return {
         "since": since,
         "days": list(by_day.values()),

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -128,13 +127,7 @@ def number(table: dict, key: str, where: str = "", default: float | None = None,
     return value
 
 
-def sha(*parts: bytes | str) -> str:
-    h = hashlib.sha256()
-    for part in parts:
-        data = part.encode() if isinstance(part, str) else part
-        h.update(len(data).to_bytes(8, "big"))
-        h.update(data)
-    return h.hexdigest()
+sha = util.digest
 
 
 def sha_json(value) -> str:
