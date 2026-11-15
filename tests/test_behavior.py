@@ -1099,7 +1099,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from arete import accounts, agent, asks, config, control, factory, gh, lines, paths, pipeline, record, replay, runlimits, scratch, state, util
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-scratch.AUTHORITY = root / "authority-parent/verification-authority"
+probe = [sys.executable, "-V"]
+if scratch.protected_command(probe) != probe:
+    scratch.AUTHORITY = root / "authority-parent/verification-authority"
 URL = "https://github.com/octo/widgets/pull/7"
 CALLS = root / "calls.jsonl"
 def forbidden(*args, **kwargs):
@@ -6374,7 +6376,9 @@ from pathlib import Path
 from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, scratch, state, util
 from arete import ci
 root, scenario = Path(sys.argv[1]), sys.argv[2]
-scratch.AUTHORITY = root / "authority-parent/verification-authority"
+probe = [sys.executable, "-V"]
+if scratch.protected_command(probe) != probe:
+    scratch.AUTHORITY = root / "authority-parent/verification-authority"
 SETUP = sys.argv[3]
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport")
