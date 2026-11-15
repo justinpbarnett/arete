@@ -253,6 +253,24 @@ def check_workspaces() -> list[Check]:
     return [Check("workspaces:held", not blocked, detail, "warn")]
 
 
+def check_scratch() -> list[Check]:
+    from . import scratch
+
+    try:
+        view = scratch.survey()
+    except OSError as e:
+        return [Check("scratch:records", False, f"the verification record store cannot be read: {e}")]
+    total = len(view.good) + len(view.unreadable)
+    out = []
+    if view.unreadable:
+        first = view.unreadable[0]
+        out.append(Check("scratch:records", False, f"{len(view.unreadable)} verification records cannot be read; "
+                         f"first {first.path}: {util.first_line(first.reason, 160)}"))
+    if total > MAX_HOT_RECORDS:
+        out.append(Check("scratch:count", False, f"{total} verification records are still in the hot folder", "warn"))
+    return out or [Check("scratch:records", True, f"{total} verification records, all readable")]
+
+
 def check_serve() -> list[Check]:
     from . import control
 
@@ -274,6 +292,7 @@ def check_serve() -> list[Check]:
 
 BACKUP_STALE_HOURS = 3
 OFFSITE_STALE_HOURS = 48
+MAX_HOT_RECORDS = 500
 
 
 def check_backups(cfg: config.Config) -> list[Check]:
@@ -378,6 +397,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_loops, cfg),
         (check_oncall, cfg),
         (check_workspaces,),
+        (check_scratch,),
     ):
         crash_key = f"heartbeat:{fn.__name__}"
         try:

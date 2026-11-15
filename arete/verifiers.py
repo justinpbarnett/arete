@@ -368,12 +368,13 @@ def workspace(suite: Suite, cfg: config.Config, task: Task, wt: Path) -> None:
 
 def held(trial_dir: Path, wt: Path, step: str) -> bool:
     try:
-        found = scratch.records(True)
+        view = scratch.survey()
     except (OSError, ValueError, KeyError, TypeError):
         return scratch.open_marker(trial_dir, step).exists()
-    return any(d["state"] != "done" and (d["attempt"]["run_dir"] == str(trial_dir.resolve())
-                                         or scratch.overlap(Path(d["attempt"]["workspace"]), wt.resolve()))
-               for d in found)
+    run_dir = str(trial_dir.resolve())
+    return (any(d["state"] != "done" and d["attempt"]["run_dir"] == run_dir for d in view.good)
+            or any(u.run_dir == run_dir and scratch.alive(u) for u in view.unreadable)
+            or bool(scratch.holds(view, wt)))
 
 
 def run_trial(suite: Suite, cfg: config.Config, run_id: str, n: int, task: Task, arm: str, repeat: int,

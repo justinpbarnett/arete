@@ -683,12 +683,31 @@ def scratch_named(names: set[str] | None, name: str) -> bool:
     return name.startswith(paths.SCRATCH_PREFIX) and (names is None or name in names)
 
 
+def scratch_view() -> scratch.View | None:
+    try:
+        return scratch.survey()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def record_holds(view: scratch.View | None, d: Path) -> list[Path]:
+    if view is None:
+        return [d] if os.path.lexists(scratch.AUTHORITY) else []
+    return [Path(scratch.path_of(h)) for h in scratch.holds(view, d)]
+
+
+def held_words(left: list[Path]) -> str:
+    return ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
+
+
 def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     found, unproven = [], []
-    names = scratch.root_names()
-    for d in {ws, *(c.wt for c in checkouts)}:
-        if scratch.pending(d):
-            found.append(d)
+    view = scratch_view()
+    names = scratch.root_names(view) if view is not None else None
+    scanned = {ws, *(c.wt for c in checkouts)}
+    for d in scanned:
+        if records := record_holds(view, d):
+            found += [d, *records]
 
         def unreadable(e: OSError, d: Path = d, found: list[Path] = found) -> None:
             found.append(Path(e.filename) if e.filename else d)
@@ -709,8 +728,12 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
                 dirs[:] = [n for n in dirs if n != ".git" and n not in held]
         except OSError:
             found.append(d)
-    late = scratch.root_names()
-    return found + [p for p in unproven if scratch_named(late, p.name)]
+    late_view = scratch_view()
+    late = scratch.root_names(late_view) if late_view is not None else None
+    for d in scanned:
+        if records := record_holds(late_view, d):
+            found += [d, *records]
+    return list(dict.fromkeys(found + [p for p in unproven if scratch_named(late, p.name)]))
 
 
 def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
@@ -975,8 +998,8 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
     if left := scratch_held(ws, checkouts):
-        held = ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
-        raise RunFailed(f"unresolved or unknown scratch resources keep the existing workspace retained ({held})")
+        raise RunFailed(
+            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
     if why := kept_work(ws, checkouts, source, copies):
         raise RunFailed(why)
     if not remove_workspace(ws, checkouts):
@@ -1054,8 +1077,9 @@ def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str
 
 def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
                     branch: str) -> dict[str, str]:
-    if scratch_held(ws, checkouts):
-        raise RunFailed("unresolved or unknown scratch resources keep the existing workspace retained")
+    if left := scratch_held(ws, checkouts):
+        raise RunFailed(
+            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
     kept = kept_onto(ws, checkouts, branch)
     if not kept:
         clear_workspace(ws, checkouts, source, copies)
@@ -1105,7 +1129,9 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
 def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False) -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
     if not remove_workspace(c.wt, [c]):
-        raise RunFailed("worktree removal withheld to preserve existing resources")
+        left = scratch_left(c.wt, [c])
+        raise RunFailed("worktree removal withheld to preserve existing resources"
+                        + (f" ({held_words(left)})" if left else ""))
     fetch(c.src, base)
     if resume:
         fetch(c.src, branch)
@@ -3157,16 +3183,17 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
+    view = scratch_view()
     for d, name in untracked_added_since(untracked_before):
         f = d / name
-        if scratch.pending(d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
+        if record_holds(view, d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
             continue
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
             remove_untracked(d, name)
     for d in untracked_before:
-        if not scratch.pending(d):
+        if not record_holds(view, d):
             git(["checkout", "-q", "--", "."], d)
 
 
@@ -3863,13 +3890,25 @@ def retained_line(step: str, attempt: scratch.Attempt) -> str:
     return f"{line}; held by {held}" if held else line
 
 
-def retry_scratch() -> None:
+def retry_scratch(days: float = 30) -> None:
     for root in finalize_scratch():
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
         if data["state"] in ("pending", "retained", "preserved") and data["diagnostic"]:
             print("verification scratch retained: " + json.dumps({"run": data["attempt"]["run_id"],
                   "attempt": data["attempt"]["selector"], "diagnostic": data["diagnostic"]}, ensure_ascii=True))
+    try:
+        for u in scratch.survey().unreadable:
+            print(f"verification scratch record unreadable: {u.path}: {u.reason}")
+    except OSError as e:
+        print(f"verification scratch store unreadable: {e}")
+    try:
+        for failure in scratch.settle(days):
+            print(f"verification scratch settle failed: {failure}")
+    except scratch.ConfinementUnavailable:
+        pass
+    except OSError as e:
+        print(f"verification scratch settle failed: {e}")
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
@@ -4141,7 +4180,7 @@ def poll(dry_run: bool = False) -> int:
             print(f"{util.iso()} poll already running")
             return 0
         if not dry_run:
-            retry_scratch()
+            retry_scratch(cfg.retention.days)
         if any(r.parts or r.tracker != "local" for r in cfg.repos) and not network_up_or_skip("poll", dry_run):
             return 0
         errors: list[str] = []
