@@ -615,6 +615,15 @@ def cmd_audit(args) -> int:
     return auditor.run(dry_run=args.dry_run)
 
 
+def cmd_doctor(args) -> int:
+    from . import doctor
+
+    results = doctor.run()
+    for r in results:
+        print(doctor.line(r))
+    return 1 if any(r.failing for r in results) else 0
+
+
 def cmd_verifiers(args) -> int:
     import tomllib
 
@@ -2191,6 +2200,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("audit", help="loop 2: deterministic harness audit")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_audit)
+
+    p = sub.add_parser("doctor", help="read only check of arete's own state: cost drift, orphan rows, stray folders, "
+                                      "stuck work, the database and its backup; it reports and never repairs")
+    p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser("eval", help="loop 4: run eval tasks (all repos with evals when REPO is left out); "
                                     "`eval mine [REPO]` writes tasks from merged arete PRs")

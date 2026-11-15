@@ -284,6 +284,16 @@ class OfflineWorkflowTests(unittest.TestCase):
         self.assertEqual(result["verified"], ["pass"])
         self.assertIn("kumquat", result["published"])
 
+    def test_doctor_reads_clean_after_a_replay_run(self):
+        result = self.workflow("doctor-clean")
+        self.assertEqual(result["status"], "done")
+        self.assertIn("kumquat", result["published"])
+        self.assertEqual(result["doctor_code"], 0, result["doctor_output"])
+        lines = result["doctor_output"].splitlines()
+        self.assertEqual([line.split()[:3] for line in lines],
+                         [["OK", name, "0"] for name in ("cost", "orphans", "chat", "folders", "stuck", "store", "backup")])
+        self.assertTrue(result["doctor_unchanged"])
+
     def test_record_of_another_version_does_not_stop_a_replay(self):
         result = self.workflow("foreign-version-record")
         if result["foreign_unchanged"] is None:
