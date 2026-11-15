@@ -1333,9 +1333,10 @@ def later_run(repo: str, issue: int | str, run_id: str, connect=db) -> dict | No
 def interrupted_tickets(repo: str) -> list[str]:
     with db() as c:
         rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
-                         "AND started = (SELECT MAX(started) FROM runs r2 WHERE r2.kind = 'pipeline' "
-                         "AND r2.repo = runs.repo AND r2.issue = runs.issue AND COALESCE(r2.only_step, '') = '') "
-                         "ORDER BY started", (repo,))
+                         "AND rowid = (SELECT r2.rowid FROM runs r2 WHERE r2.kind = 'pipeline' "
+                         "AND r2.repo = runs.repo AND r2.issue = runs.issue AND COALESCE(r2.only_step, '') = '' "
+                         "ORDER BY r2.started DESC, r2.rowid DESC LIMIT 1) "
+                         "ORDER BY started, rowid", (repo,))
         return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
 
 

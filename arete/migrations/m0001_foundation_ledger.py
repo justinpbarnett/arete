@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS runs (
     summary TEXT,
     landed TEXT
 );
+CREATE INDEX IF NOT EXISTS runs_ticket ON runs (repo, issue, kind, started);
+CREATE INDEX IF NOT EXISTS runs_started ON runs (started);
 CREATE TABLE IF NOT EXISTS steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,

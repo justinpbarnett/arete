@@ -332,7 +332,8 @@ class SchemaLedgerTests(unittest.TestCase):
             history.mkdir()
             for path in (source / "arete/migrations").glob("m*.py"):
                 relative = path.relative_to(source).as_posix()
-                added = subprocess.run(["git", "log", "--diff-filter=A", "--format=%H", "--", relative],
+                # Migrations first landing in this branch still use their working copy.
+                added = subprocess.run(["git", "log", "origin/main", "--diff-filter=A", "--format=%H", "--", relative],
                                        cwd=source, text=True, capture_output=True, check=True).stdout.splitlines()
                 if added:
                     content = subprocess.run(["git", "show", f"{added[-1]}:{relative}"],
@@ -394,6 +395,69 @@ class SchemaLedgerTests(unittest.TestCase):
 
     def test_times_have_one_shape(self):
         self.scenario()
+
+
+class RunsLookupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.directory.cleanup)
+        root = Path(cls.directory.name).resolve()
+        make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
+        env = scratch_env(root, ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                          TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
+        # The pre-ledger probe needs an initialized schema and canonical UTC stamps.
+        program = "from arete import state; state.migrate()\n"
+        program += (SCRIPTS / "runs_lookup_probe.py").read_text().replace(
+            '.isoformat(timespec="seconds")', '.strftime("%Y-%m-%dT%H:%M:%SZ")')
+        done = run_script(program, root, env=env, timeout=240)
+        assert done.returncode == 0, done.stderr + done.stdout
+        cls.result = behavior_result(done)
+
+    def test_the_seeded_home_has_both_indexes_and_keeps_them_after_reopening(self):
+        for seen in (self.result["seed"], self.result["reopened"]):
+            self.assertEqual((seen["runs"], seen["loops"]), (11018, 7000))
+            self.assertEqual({name: " ".join(sql.split()) for name, sql in seen["indexes"].items()},
+                             {"runs_ticket": "CREATE INDEX runs_ticket ON runs (repo, issue, kind, started)",
+                              "runs_started": "CREATE INDEX runs_started ON runs (started)"})
+
+    def test_interrupted_tickets_are_the_latest_whole_runs_in_started_order(self):
+        results = self.result["results"]
+        self.assertEqual(results["interrupted_tickets"], self.result["expected"])
+        self.assertEqual(results["latest_whole"], results["expected_latest_whole"])
+
+    def test_the_first_interrupted_lookup_reads_little(self):
+        self.assertLess(self.result["progress"], 2000)
+
+    def test_nearby_lookups_still_answer(self):
+        results = self.result["results"]
+        self.assertEqual(results["open_runs"], [self.result["ids"]["1021"][1]])
+        self.assertEqual(results["later_run"], self.result["ids"]["1021"][1])
+        self.assertEqual(results["feedback_due"], ["1021"])
+        self.assertFalse(results["history"]["default_has_firings"])
+        self.assertTrue(results["history"]["firings_has_firings"])
+
+    def test_every_lookup_uses_an_index_search(self):
+        plans = self.result["plans"]
+        required = {"interrupted_tickets": ("SEARCH runs USING INDEX runs_ticket (repo=?",
+                                            "SEARCH r2 USING INDEX runs_ticket (repo=? AND issue=?"),
+                    "runs_since": ("SEARCH runs USING INDEX runs_started",),
+                    "runs": ("SCAN runs USING INDEX runs_started",),
+                    "last_pipeline_starts": ()}
+        for name in ("issue_running", "running_run", "ticket_runs", "open_runs", "later_run", "feedback_due"):
+            required[name] = ("SEARCH runs USING INDEX runs_ticket (repo=? AND issue=?",)
+        allowed_scans = {"runs": "SCAN runs USING INDEX runs_started",
+                         "last_pipeline_starts": "SCAN runs USING COVERING INDEX runs_ticket"}
+        for name, prefixes in required.items():
+            lines = [line for entry in plans[name] for line in entry["plan"]]
+            self.assertTrue(lines, name)
+            for prefix in prefixes:
+                self.assertTrue(any(line.startswith(prefix) for line in lines), (name, prefix, lines))
+            for line in lines:
+                if line.startswith("SCAN") and line.split()[1] in ("runs", "r2"):
+                    self.assertTrue(line.startswith(allowed_scans.get(name, "\0")), (name, line))
+            if name == "runs":
+                self.assertFalse(any("USE TEMP B-TREE" in line for line in lines), lines)
 
 
 if __name__ == "__main__":
