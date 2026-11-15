@@ -5,6 +5,11 @@ conflict:
 
 $conflicts
 
+Files this branch already changed, which you may also edit when keeping the base's work needs it (for example,
+moving the base's new code into the file where the branch moved that code):
+
+$own
+
 ## Issue $ref: $title
 
 $body
@@ -19,7 +24,7 @@ $base_log
 
 ## Rules
 
-- Edit only the files listed above, and remove every conflict marker (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`).
+- Edit only the conflicting files and the branch's own files listed above, and remove every conflict marker (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`).
 - Keep both the branch's requested work and the base's already-landed behaviour. Never drop either side to make the
   conflict go away.
 - Read the sides with `git show :1:<path>` (common ancestor), `git show :2:<path>` (the branch) and
@@ -31,8 +36,8 @@ $base_log
 - Optional validation must be cache-free and must not change files: no formatters or `--fix`, no installs, and nothing
   that writes caches, build output or other files. Run Ruff as `uvx ruff check --no-cache ...` (arete also sets
   `RUFF_NO_CACHE`). Skip any check that cannot run without writing outside the listed files, because arete's own
-  checks run it later. Any new or changed file outside the listed conflicts, including ignored files and caches, makes
-  arete stop the merge.
+  checks run it later. Any new or changed file outside the listed conflicts and the branch's own files, including
+  ignored files and caches, makes arete stop the merge.
 - This is attempt $attempt of $tries; $feedback.
 
 ## What to return

@@ -2705,6 +2705,8 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
     if protected := [p for p in conflicts if util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny)]:
         raise RunFailed(f"merging `{named}` conflicts in protected paths in {c.github} "
                         f"({', '.join(protected)}), which a person must merge")
+    own = {p for p in util.git_records(["diff", "--name-only", f"{commit}...HEAD"], c.wt)
+           if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
     for n in range(1, tries + 1):
@@ -2715,6 +2717,7 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
                       base_commit=commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
                       ref=ticket.ref, title=ticket.title, body=ticket.body,
                       conflicts="\n".join(f"- `{p}`" for p in conflicts),
+                      own="\n".join(f"- `{p}`" for p in sorted(own)) or "- none",
                       branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
                       base_log=git(["log", "--oneline", "-n30", "HEAD..MERGE_HEAD"], c.wt),
                       commands=code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
@@ -2742,7 +2745,7 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
                            if ignored_before.get(n) != ignored_after.get(n)}
         touched = (set(util.git_records(["diff", "--name-only"], c.wt)) | (untracked_files(c.wt) - untracked_before)
                    | changed_ignored)
-        if outside := sorted(touched - set(conflicts)):
+        if outside := sorted(touched - set(conflicts) - own):
             raise RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
         if left := marked(c.wt, conflicts):
             feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
@@ -2750,7 +2753,7 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
                 raise RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
                                 f"in {c.github}")
             continue
-        git(["add", "-A", "--", *conflicts], c.wt)
+        git(["add", "-A", "--", *conflicts, *sorted(touched & own)], c.wt)
         if unmerged_paths(c.wt):
             raise RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
         with util.repo_lock(c.src):
