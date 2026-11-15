@@ -1818,6 +1818,7 @@ Arete then runs each eval suite twice on the same day, once with main's prompts 
 - Repos: the one it belongs in. A code ticket that names none, or needs more than one, gets a question to name it or split it.
 - Ready: the pipeline could build it as written.
 - Questions: only real blockers. The ticket does not say what to change and the code does not settle it, an attachment or copy it mentions is missing, a business decision changes the whole build, it needs an account or setup outside the repos, or it says it is parked, blocked or a duplicate.
+- Checks: up to six acceptance checks for a fix or feature, each one thing a person does on the running product and what it must show, so you see what done means before the build. Empty for research and work for a person. Triage writes and shows them; it does not yet feed them to the plan or verify steps.
 - Assumptions: the small choices the build will make where the ticket leaves them open, such as wording, placement or a default. They are not questions; the pipeline's plan reads them, and the PR lists them for you to check.
 - Size S, M or L. L means split it, so it is never ready.
 - A plan of up to 6 steps.
@@ -1903,7 +1904,7 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
   New loop drafts a loop from a sentence the way `arete loop new` does, with an optional name, repo and model, and its feed follows the draft.
   The approvals a loop waits for show on Live.
 - Triage: the triage board, one group at a time, behind buttons that show each group's count.
-  A ticket's page shows its questions, assumptions, plan, research report and pull requests.
+  A ticket's page shows its questions, assumptions, checks ("Show what done means"), plan, research report and pull requests.
   Answer a ticket's questions there and send it to the pipeline, which starts a poll.
   Refresh triage now starts a refresh.
   A research ticket offers Research it now, Research it again or Research it anyway, through the research loop; an offer that skips JEV's screen says so beside its button.

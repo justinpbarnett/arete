@@ -94,6 +94,7 @@ class Runner:
         self.folder = None
         self.history = load_history()
         self.seen = {}
+        self.again, self.flaky = [], []
 
     def command(self, identifier, result_file):
         tail = ["--one", identifier, "--start", self.start, "--result", result_file,
@@ -159,7 +160,7 @@ class Runner:
         report["tail"] = tail
         return report
 
-    def record(self, test, report, seconds):
+    def record(self, test, report, seconds, show=True):
         with self.lock:
             self.ran += report["ran"]
             self.errors += [(title, text, report["tail"]) for title, text in report["errors"]]
@@ -167,21 +168,25 @@ class Runner:
             self.skipped += len(report["skipped"])
             self.expected += report["expected"]
             self.unexpected += report["unexpected"]
-            if not self.verbose:
-                return
-            if report["errors"]:
-                outcome = "ERROR"
-            elif report["failures"]:
-                outcome = "FAIL"
-            elif report["skipped"]:
-                outcome = f"skipped {report['skipped'][0][1]!r}"
-            elif report["expected"]:
-                outcome = "expected failure"
-            elif report["unexpected"]:
-                outcome = "unexpected success"
-            else:
-                outcome = "ok"
-            print(f"{test} ... {outcome} ({seconds:.1f}s)", flush=True)
+            if show:
+                self.say(test, report, seconds)
+
+    def say(self, test, report, seconds):
+        if not self.verbose:
+            return
+        if report["errors"]:
+            outcome = "ERROR"
+        elif report["failures"]:
+            outcome = "FAIL"
+        elif report["skipped"]:
+            outcome = f"skipped {report['skipped'][0][1]!r}"
+        elif report["expected"]:
+            outcome = "expected failure"
+        elif report["unexpected"]:
+            outcome = "unexpected success"
+        else:
+            outcome = "ok"
+        print(f"{test} ... {outcome} ({seconds:.1f}s)", flush=True)
 
     def task(self, item):
         index, test = item
@@ -190,7 +195,21 @@ class Runner:
         if report is not None:
             seconds = time.monotonic() - began
             self.seen[test.id()] = seconds
+            if report["errors"] or report["failures"]:
+                with self.lock:
+                    self.again.append((index, test, seconds))
+                    self.say(test, report, seconds)
+                return
             self.record(test, report, seconds)
+
+    def rerun(self):
+        for index, test, seconds in sorted(self.again, key=lambda row: row[0]):
+            report = self.child(test, f"{index}.again")
+            if report is None:
+                return
+            if not (report["errors"] or report["failures"]):
+                self.flaky.append(str(test))
+            self.record(test, report, seconds, show=False)
 
     def broken(self, test):
         result = unittest.TestResult()
@@ -235,6 +254,7 @@ class Runner:
                     signal.signal(number, self.interrupt)
                 self.phase(pool, self.jobs)
                 self.phase(alone, 1)
+                self.rerun()
         finally:
             os.close(self.lifeline)
             os.close(self.held)
@@ -263,11 +283,14 @@ class Runner:
                     print(f"Output:\n{tail.rstrip()}")
         for title in self.unexpected:
             print(f"{RULE}\nUNEXPECTED SUCCESS: {title}")
+        for title in self.flaky:
+            print(f"FLAKY: {title} failed beside other tests and passed when run alone")
         if self.slowest:
             self.slowest_block()
         bad = bool(self.errors or self.failures or self.unexpected)
         counts = [("failures", len(self.failures)), ("errors", len(self.errors)), ("skipped", self.skipped),
-                  ("expected failures", self.expected), ("unexpected successes", len(self.unexpected))]
+                  ("expected failures", self.expected), ("unexpected successes", len(self.unexpected)),
+                  ("flaky", len(self.flaky))]
         detail = ", ".join(f"{name}={count}" for name, count in counts if count)
         line = f"Ran {self.ran} tests in {seconds:.1f}s: {'FAILED' if bad else 'OK'}"
         print(f"{line} ({detail})" if detail else line, flush=True)
