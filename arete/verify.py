@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import config, environment, paths, scratch, util, vault
+from . import config, environment, paths, sandbox, scratch, util, vault
 from .util import git
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
@@ -82,14 +82,14 @@ def port_refusal(v: config.Verify) -> str:
         port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError:
         return ""
-    if port not in scratch.dashboard_ports():
+    if port not in paths.dashboard_ports():
         return ""
     return (f"The verify URL {v.url} uses port {port}, which the live dashboard or a running arete serve uses; "
             "use {port} so verification gets a free port.")
 
 
 def with_free_ports(v: config.Verify) -> config.Verify:
-    avoid = scratch.dashboard_ports()
+    avoid = paths.dashboard_ports()
     ports = {name: free_port(avoid) for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
 
     def filled(text: str) -> str:
@@ -227,7 +227,7 @@ def relayed(url: str):
 
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
-            repo: config.Repo | None = None, sets: dict[str, str] | None = None, lifetime: dict | None = None,
+            repo: config.Repo | None = None, lifetime: dict | None = None,
             attempt: scratch.Attempt | None = None):
     if lifetime is not None:
         lifetime["stopped"] = True
@@ -239,15 +239,13 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         listen = None
         if attempt:
             app = scratch.app_port(attempt, reach)
-            listen = scratch.listen_port(attempt, app, scratch.dashboard_ports())
+            listen = scratch.listen_port(attempt, app, paths.dashboard_ports())
             scratch.update_browser(attempt, listen=listen)
         command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
-        env, kept = environment.started(cfg or config.load(), repo, sets)
+        env, kept = environment.started(cfg or config.load(), repo)
         if attempt:
             env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
-            env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
-                        "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
-                        "ARETE_WORKTREES_DIR": attempt.root + "/state/worktrees"})
+            env.update(scratch.attempt_env(attempt))
         log.write_text("")
         with scratch.producing(attempt):
             proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
@@ -439,7 +437,7 @@ def push_evidence(src: Path, github: str, run_id: str, files: list[Path]) -> dic
         return {}
     blobs = ""
     for f in files:
-        command = scratch.protected_command(["git", "hash-object", "-w", "--stdin"], src)
+        command = sandbox.protected_command(["git", "hash-object", "-w", "--stdin"], src)
         done = subprocess.run(command, check=False, cwd=src, input=contents[f], capture_output=True, timeout=300)
         if done.returncode != 0:
             raise RuntimeError(f"git hash-object: {util.git_error(done.stderr.decode(errors='replace'))}")

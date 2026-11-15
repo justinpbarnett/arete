@@ -13,10 +13,11 @@ import shutil
 import stat
 import tarfile
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from . import paths, scratch, verify
+from . import paths, sandbox, scratch, verify
 
 REGISTRY = "https://registry.npmjs.org/"
 PIN = "browser-server.pin"
@@ -28,8 +29,8 @@ PACKAGE = re.compile(r"(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*")
 FAILURES = (OSError, ValueError, KeyError, TypeError, AttributeError, tarfile.TarError, EOFError)
 
 
-def refuse(reason: str) -> scratch.ConfinementUnavailable:
-    return scratch.ConfinementUnavailable("pinned browser server: " + reason)
+def refuse(reason: str) -> sandbox.ConfinementUnavailable:
+    return sandbox.ConfinementUnavailable("pinned browser server: " + reason)
 
 
 def fetch(url: str) -> bytes:
@@ -51,7 +52,7 @@ def server_folder() -> Path:
 
 def chrome() -> Path:
     if not CHROME.is_file():
-        raise scratch.ConfinementUnavailable(f"Google Chrome is not installed at {CHROME}")
+        raise sandbox.ConfinementUnavailable(f"Google Chrome is not installed at {CHROME}")
     return CHROME
 
 
@@ -59,7 +60,7 @@ def engine_node() -> Path:
     found = shutil.which("node")
     if not found:
         raise refuse("no node in the engine's environment")
-    return scratch.canonical(Path(found))
+    return sandbox.canonical(Path(found))
 
 
 def tarball_name(name: str, version: str) -> str:
@@ -186,7 +187,7 @@ def resolved() -> Path:
                 os.rename(build, folder)
             finally:
                 shutil.rmtree(build, ignore_errors=True)
-    except scratch.ConfinementUnavailable:
+    except sandbox.ConfinementUnavailable:
         raise
     except FAILURES as error:
         raise refuse(f"cannot resolve {verify.PLAYWRIGHT_MCP}: {error}") from error
@@ -265,7 +266,50 @@ def checked() -> tuple[str, str]:
         if not os.access(found, os.X_OK) or scratch.exposure(found, (paths.WORKTREES_DIR,)) is not None:
             raise refuse("no trusted node in the engine's environment")
         return str(found), str(folder / "node_modules" / relative)
-    except scratch.ConfinementUnavailable:
+    except sandbox.ConfinementUnavailable:
         raise
     except FAILURES as error:
         raise refuse(f"verification failed: {type(error).__name__}: {error}") from error
+
+
+def with_note(kw: dict, text: str) -> None:
+    kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), text]))
+
+
+def confine(kw: dict, attempt: scratch.Attempt, which: str, remote: bool,
+            say: Callable[[str], None]) -> tuple[dict, tuple]:
+    original = kw.get("mcp_config", "")
+    if which != "claude" or remote:
+        scratch.stop_served(attempt)
+    if which == "codex" and not remote:
+        try:
+            kw["mcp_config"] = scratch.browser_config(attempt, original, kw.get("add_dirs", ()))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            kw["budget_error"] = f"browser confinement unavailable: {error}"
+    try:
+        hook = scratch.activate(attempt, which, bool(remote), kw.get("add_dirs", ()), kw.get("mcp_config", ""))
+    except (OSError, ValueError, KeyError, TypeError):
+        hook = ()
+    if (not hook and which == "codex" and not remote and scratch.has_servers(original)
+            and not kw.get("budget_error")
+            and (kw.get("mcp_config", "") != original or scratch.plain_config(attempt, original) is None)):
+        kw["budget_error"] = "browser confinement unavailable: the trusted browser could not be activated"
+    if not hook:
+        if "mcp_config" in kw:
+            kw["mcp_config"] = original
+        say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
+        with_note(kw, scratch.note(None))
+    if which == "claude" and not remote:
+        try:
+            config_json, reason = scratch.serve_browser(attempt, original, kw.get("add_dirs", ()))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            config_json = scratch.without_browser(original)
+            reason = str(error) or type(error).__name__
+        if reason:
+            kw["allowed_tools"] = [t for t in kw.get("allowed_tools") or [] if not t.startswith("mcp__playwright")]
+            with_note(kw, scratch.browser_blocked_note(reason))
+            say(f"the confined browser is unavailable for this verify: {reason}")
+        if "mcp_config" in kw:
+            kw["mcp_config"] = config_json
+    kw["verification_attempt"] = attempt
+    return kw, hook
