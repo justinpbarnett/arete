@@ -24,7 +24,7 @@ $summary
 
 ## Diff
 
-This change is staged in the checkout and is not committed until Arete publishes it. `HEAD` and any `...HEAD` range miss it, so compare the working tree with the base the PRs target: `git diff origin/<base>`, with no range.
+This change is staged in the checkout and is not committed until Arete publishes it. `HEAD` and any `...HEAD` range miss it, so compare the working tree with the commit this change starts from: $compare, with no range. Never compare with `origin/<base>` itself: other runs fetch it while this one works, so it can hold newer commits that then look as if this change undid them.
 
 ```diff
 $diff
