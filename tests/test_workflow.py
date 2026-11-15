@@ -815,6 +815,45 @@ class OfflineWorkflowTests(unittest.TestCase):
             self.assertIn(text, result["fix_prompt"])
         self.assertEqual(len(result["review"]["notes"]), 1)
 
+    def test_refactor_label_skips_the_check_in_use(self):
+        for scenario in ("refactor-pass", "refactor-review-fixes"):
+            result = self.workflow(scenario)
+            self.assertEqual(result["status"], "done", result["summary"])
+            self.assertFalse([s for s in result["steps"] if s.startswith("verify")])
+            self.assertNotIn("verify", result["seam"])
+            self.assertEqual(result["prepared_labels"], [["agent", "refactor"]])
+            for name, prompt in result["prompts"].items():
+                if name.startswith("review") and "fix" not in name:
+                    self.assertIn("skipped because the ticket is labeled `refactor`", prompt)
+        body = self.workflow("refactor-dry-run")["pr_body"]
+        self.assertIn("skipped because the ticket is labeled `refactor`", body)
+
+    def test_check_in_use_runs_once_after_the_review_fixes(self):
+        result = self.workflow("review-converges")
+        self.assertEqual([s for s in result["steps"] if s.startswith("verify")], ["verify", "verify2"])
+        self.assertEqual(result["steps"][-3:], ["review2", "verify2", "learn"])
+        self.assertIn("predates the review fixes", result["prompt"])
+        result = self.workflow("review-multiple-fixes")
+        self.assertEqual([s for s in result["steps"] if s.startswith("verify")], ["verify", "verify2"])
+        third = next(p for n, p in result["prompts"].items() if n.startswith("review3"))
+        self.assertEqual(third.count("predates the review fixes"), 1)
+        self.assertEqual([s for s in self.workflow("pass")["steps"] if s.startswith("verify")], ["verify"])
+
+    def test_final_check_in_use_failure_runs_the_repair(self):
+        failed = self.workflow("review-final-verify-fails")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("still does not work in use", failed["summary"])
+        self.assertEqual(failed["steps"][-4:], ["verify2", "verify_fix", "verify3", "learn"])
+        recovered = self.workflow("review-final-verify-recovers")
+        self.assertEqual(recovered["status"], "done", recovered["summary"])
+        self.assertNotIn("predates the review fixes", recovered["pr_body"])
+
+    def test_an_unconfigured_check_in_use_and_old_tickets_still_work(self):
+        result = self.workflow("no-verify-config")
+        self.assertEqual(result["status"], "done", result["summary"])
+        self.assertNotIn("verify", result["steps"])
+        self.assertEqual(result["old_payload_labels"], [])
+
     def test_check_broken_by_a_review_fix_gets_a_repair_before_the_run_fails(self):
         result = self.workflow("review-fix-breaks-check")
         self.assertIn("check_repair1_2", result["steps"])

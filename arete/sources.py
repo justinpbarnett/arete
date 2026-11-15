@@ -78,12 +78,6 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
             "url": url, "trust": trust, "data": data or {}}
 
 
-def metric_event(loop: Loop, value: float) -> dict:
-    name, op, threshold = loop.trigger.metric
-    return event("metric", f"{loop.name}#metric", f"{name}@{util.iso()}", f"{name} = {value:g}, {op} {threshold:g}",
-                 trust="internal", data={"metric": name, "value": value, "rule": f"{op} {threshold:g}"})
-
-
 def fire(loop: Loop, how: str, events: list[dict] | None = None, connect=state.db) -> list[int]:
     if events is None:
         return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how, connect=connect)) else []
@@ -182,7 +176,11 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
 
 def peek(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
     source = loop.sources[index]
-    found, _ = SOURCES[source["type"]].fetch(loop, source, cfg, source_id(loop, index), "{}")
+    kind = SOURCES[source["type"]]
+    if isinstance(kind, Command):
+        found, _ = kind.fetch(loop, source, cfg, source_id(loop, index), "{}", sample=True)
+    else:
+        found, _ = kind.fetch(loop, source, cfg, source_id(loop, index), "{}")
     return found
 
 
@@ -308,9 +306,12 @@ class Command(Source):
     needs = "command"
     scope = ("command",)
 
-    def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
+    def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor,
+              sample: bool = False) -> tuple[list[dict], object]:
         argv = shlex.split(source["command"]) if isinstance(source["command"], str) else list(source["command"])
-        res = util.sh(argv, cwd=loop.dir, timeout=float(source.get("timeout", 120)))
+        res = util.sh(argv, cwd=loop.dir, timeout=float(source.get("timeout", 120)),
+                      env={"ARETE_LOOP": loop.name, "ARETE_LOOP_DIR": str(loop.dir), "ARETE_SOURCE": sid,
+                           "ARETE_SOURCE_SAMPLE": "1" if sample else ""})
         if res.returncode != 0:
             raise RuntimeError(f"exit {res.returncode}: {util.first_line(res.stderr or res.stdout, 300)}")
         out = []

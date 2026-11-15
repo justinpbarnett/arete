@@ -259,6 +259,7 @@ class Config:
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
     max_parallel_per_repo: int = 1
+    max_parallel_checks: int = 2
     dashboard_port: int = DASHBOARD_PORT
     dashboard_owner: str = ""
     dashboard_https: bool = False
@@ -888,6 +889,7 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
         miner_max_digest_chars=int(data.get("miner", {}).get("max_digest_chars", 90_000)),
         max_parallel=max(1, int(data.get("max_parallel", 1))),
         max_parallel_per_repo=max(1, int(data.get("max_parallel_per_repo", 1))),
+        max_parallel_checks=max(1, int(data.get("max_parallel_checks", 2))),
         dashboard_port=int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
         dashboard_https=dashboard_https(data.get("dashboard", {}).get("https", False)),

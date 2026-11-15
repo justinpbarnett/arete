@@ -18,6 +18,7 @@ def isolate_live_state():
     for patch in (mock.patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
                   mock.patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
                   mock.patch.object(paths, "RUNS_DIR", root / "state" / "runs"),
+                  mock.patch.object(paths, "DB_FILE", root / "state" / "arete.db"),
                   *(mock.patch.object(pi, name, root / "state" / getattr(pi, name).name)
                     for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
         patch.start()

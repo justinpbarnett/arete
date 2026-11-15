@@ -702,10 +702,6 @@ def login(env: dict | None = None) -> tuple[bool, str, str]:
     return False, f"codex login status failed: exit {res.returncode}", ""
 
 
-def login_provider() -> str:
-    return KEY_PROVIDER if authentication().mode == "api_key" else CHATGPT_PROVIDER
-
-
 def git_write(command: str | list[str], rules: list[str], depth: int = 0) -> str:
     if depth > 12:
         return "nested shell command"

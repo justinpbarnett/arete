@@ -156,12 +156,6 @@ function loopSources(d) {
     : quiet(d.sources.length ? "Serve has not polled its sources yet." : "It has no source.");
 }
 
-function loopDigests(d) {
-  return d.digests.length
-    ? d.digests.map((g) => foldText(`digest:${d.name}:${g.day}`, g.day, g.text))
-    : quiet("No digest yet.");
-}
-
 function subheading(title) {
   return el("h3", { "data-jump": title, tabindex: "-1", text: title });
 }
@@ -184,9 +178,6 @@ function drawLoopDetail(result) {
           cell(clock(f.first_seen), "nb"), cell(clock(f.last_seen), "nb"))))
       : quiet("No finding yet.")],
     ["Sources", loopSources(d)],
-    d.metrics.length ? ["Metrics", table("The last 30 days", [["Metric"], ["Latest", "num c-cost"], ["When", "c-time"], ["Points", "num c-n wide-only"]],
-      d.metrics.map((m) => el("tr", {}, cell(m.name), cell(Number(m.value).toLocaleString(undefined, { maximumFractionDigits: 20 }), "num"), cell(clock(m.ts), "nb"), cell(m.points, "num"))))] : null,
-    d.emits.some((e) => e.startsWith("digest")) ? ["Digests", loopDigests(d)] : null,
     ["Memory", memory ? foldText(`memory:${d.name}`, "Show what it keeps between runs", memory) : quiet("It keeps nothing between runs yet.")],
     d.prompt ? ["Prompt", foldText(`prompt:${d.name}`, "Show the prompt", d.prompt)] : null,
   ].filter(Boolean);

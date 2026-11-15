@@ -21,15 +21,14 @@ Queued events survive a failed run or a requested stop as a dead item. A budget 
 
 | Kind | What one run does |
 |---|---|
-| `command` | Runs `[run] command`. Exit 0 is done. Events arrive on stdin as JSON lines. A stdout line that is a JSON object with `title` and `fingerprint` is a finding; one with a number `value` is the metric value. |
+| `command` | Runs `[run] command`. Exit 0 is done. Events arrive on stdin as JSON lines. A stdout line that is a JSON object with `title` and `fingerprint` is a finding. |
 | `watch` | Gives the events (or the output of `[run] script`) to an agent with `prompt.md`. The agent returns findings, a summary, and state for the next run. |
-| `climb` | Makes a worktree of `[run] repo`, measures `[climb] measure`, and asks the agent for changes that move the number toward `goal`. Keeps each change that helps and reverts each one that does not. |
 | `search` | Makes a worktree of `[run] repo` and asks the agent for a change that makes `[search] check` exit 0. Stops at the first hit. |
 
 ## loop.toml
 
 ```toml
-kind = "watch"                 # command | watch | climb | search
+kind = "watch"                 # command | watch | search
 description = "One line on what the loop is for"
 enabled = false                # a draft starts off; `arete loop enable NAME` turns it on
 
@@ -38,7 +37,6 @@ every = "1h"                   # or cron = "30 4 * * *" (minute hour day month w
 run_at_load = false            # also fire once when serve starts
 event = ["github.ci_red"]      # only these event types fire the loop, from a source or a webhook; all types when left out; "finding" takes findings from another loop's loop emit
 webhook = false                # POST /hook/<name> fires the loop as type github.<X-GitHub-Event>, else webhook; `arete webhook secret NAME` prints the token; a delivery counts once by its `X-GitHub-Delivery` or `X-Request-Id`, and a post with neither counts once per 10 minutes by the hash of its body
-metric = "pass_rate < 0.8"     # fire when the latest value of a metric crosses the rule; a metric event is internal and passes the event list
 group = "repo"                 # events that share this field wait in line one at a time
 trust = "untrusted"            # refuse events below this trust: untrusted | internal | owner; a refused webhook gets 403
 
@@ -59,7 +57,7 @@ every = "5m"                   # how often to poll; 5m when left out
 command = "arete poll"         # command loops: what to run, split into words as a shell would; pipes go in a script; ./NAME runs NAME from the loop folder
 try_command = "arete poll --dry-run"   # command loops: what `arete loop try` runs instead
 script = "./gather.sh"         # watch loops with no source: its output is the input; printing nothing skips the run
-repo = "arete"                 # a config repo name or a path to a git repo; climb and search need one
+repo = "arete"                 # a config repo name or a path to a git repo; search needs one
 model = "sonnet"               # an alias or claude-* runs on claude; provider/model (deepseek/deepseek-flash, ollama/gemma4) runs on pi
 runner = ""                    # claude | pi, to force one
 tools = ["Read", "Glob", "Grep"]       # Read Glob Grep LS, plus Edit MultiEdit Write Bash
@@ -75,12 +73,6 @@ prompt = "Is this error new and worth a look?"
 model = "haiku"                # decides the events JEV is unsure of
 jev = true                     # false sends every event to the model
 
-[climb]
-measure = "python bench.py"    # prints a number
-goal = "max"                   # max | min
-iterations = 5
-files = ["src/"]               # where the agent may change code
-
 [search]
 check = "pytest -x tests/test_bug.py"  # exits 0 on a hit
 iterations = 5
@@ -88,22 +80,19 @@ files = ["src/"]
 proof = "repro.py"             # with a push emit: the scratch script that proves the bug; see Push below
 
 [[emit]]                       # what the loop puts out; several are fine
-type = "ticket"                # ticket | pr | push | loop | digest | notify | metric
+type = "ticket"                # ticket | pr | push | loop
 repo = "arete"                 # ticket: config repo name or owner/name
 labels = ["agent"]             # ticket: `agent` hands the ticket to the pipeline
 prefix = "[ci] "               # ticket: put before each title
 approve = false                # true holds it until you approve it on the dashboard or with `arete approve ID`
-# type = "pr":     draft = true, labels = [], title = ""; climb and search only
-# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"], reviewer = "opus" }, check = "pytest -x"; climb and search only, and climb must set check; see Push below
+# type = "pr":     draft = true, labels = [], title = ""; search only
+# type = "push":   approve = { lines = 80, deletes = true, paths = ["src/auth/*"], reviewer = "opus" }, check = "pytest -x"; search only; see Push below
 # type = "loop":   loop = "fix-it"; hands each finding to that loop as a finding event
-# type = "digest": appends to ~/.local/share/arete/digests/<loop>/<day>.md
-# type = "notify": a desktop notification
-# type = "metric": name = "open_ci_red"; the value is the finding count or the command's `value`
 ```
 
 ## Source history
 
-A source's history (which events it has seen, and where a log was read to) follows its `name`, or its position in the `[[source]]` list when it has none. A loop with more than one source needs a name on each: lowercase letters, digits and dashes, not only digits, not `webhook` or `metric`, and not repeated in the loop.
+A source's history (which events it has seen, and where a log was read to) follows its `name`, or its position in the `[[source]]` list when it has none. A loop with more than one source needs a name on each: lowercase letters, digits and dashes, not only digits, not `webhook`, and not repeated in the loop.
 
 The scope keys of a source say what it watches: github `repos`, `watch`, `label`, `branch`; jira `jql`, `on_update`; command `command`; log `path`, `pattern`. An edit to any other key (`every`, `timeout`, `trust`, `limit`, `repo`, `name`) keeps everything and the next poll carries on. An edit to a scope key keeps the seen keys, and the next poll fires the events stamped since the last good poll (less two minutes); older matches are taken as seen and named in serve.log. A log source keeps its offsets for files it read before and starts newly matched files at their end. A command row can carry `data.at` (an ISO time) so it can catch up across a command change; a row without a time is taken as seen.
 
@@ -111,18 +100,18 @@ A new name starts from a baseline. Naming a source that has no name keeps its hi
 
 ## What a run can read
 
-A command loop, a watch loop's `[run] script`, and a climb or search check run with these in the environment:
+A command loop, a watch loop's `[run] script`, and a search check run with these in the environment:
 
 | Name | Holds |
 |---|---|
 | `ARETE_RUN_ID` | the run id |
 | `ARETE_LOOP` | the loop name |
 | `ARETE_LOOP_DIR` | the loop folder, for a script that keeps a file there, such as a cursor |
-| `ARETE_SCRATCH` | climb, search and the watch script: `runs/<run id>/scratch/` in the state folder. It keeps its files across tries and is never committed. The agent gets its path and may write there, so a check can run a file that the agent wrote, such as a repro |
+| `ARETE_SCRATCH` | search and the watch script: `runs/<run id>/scratch/` in the state folder. It keeps its files across tries and is never committed. The agent gets its path and may write there, so a check can run a file that the agent wrote, such as a repro |
 | `ARETE_REPO_DIR` | the watch script: the checkout of `[run] repo`, empty without one |
 | `ARETE_TRIAL` | a command loop: `1` under `arete loop try` |
 
-A climb or search agent that finds the goal cannot or should not be met changes nothing and ends with a line that starts `Stop:` and says why. The run ends as done with that reason, and nothing is emitted. The one exception is a search agent that stops while it narrows a fix the push screen or the proof check held: that fix goes to a person as an approval, with the reason in its report.
+A search agent that finds the goal cannot or should not be met changes nothing and ends with a line that starts `Stop:` and says why. The run ends as done with that reason, and nothing is emitted. The one exception is a search agent that stops while it narrows a fix the push screen or the proof check held: that fix goes to a person as an approval, with the reason in its report.
 
 ## Findings from another loop
 
@@ -134,11 +123,10 @@ A waiting finding that the loop refuses when you approve it or try it again is r
 
 ## Push
 
-A `push` emit lands a climb or search run's change on the repo's default branch, with no PR. To land it, arete rebases the run's branch onto `origin/<base>`, runs the check again on the rebased tree, and pushes. When the push loses a race, arete fetches and tries once more. Then it fast forwards the repo's own checkout when that checkout is on the base branch, and deletes the run's branch.
+A `push` emit lands a search run's change on the repo's default branch, with no PR. To land it, arete rebases the run's branch onto `origin/<base>`, runs the check again on the rebased tree, and pushes. When the push loses a race, arete fetches and tries once more. Then it fast forwards the repo's own checkout when that checkout is on the base branch, and deletes the run's branch.
 
 `check` is the command that must pass after the rebase.
 A search loop's push may leave it out, and then the `[search] check` runs.
-A climb loop has no check of its own, so its push must set one, or the loop does not load.
 A push with no check never lands.
 On a public repo, the commit message, the title and the report name the loop and the run id only, never what the agent wrote.
 
@@ -160,7 +148,7 @@ Each adjusted change that passes the check replaces the held change as one commi
 The run delivers the last change that passed the check: it lands when JEV clears it, and it waits for approval when the tries run out, the budget runs out, or the agent stops because the fix needs what JEV holds.
 A proof check hold goes back to the agent the same way: the agent rewrites the proof, and may leave the code as it is.
 Only a JEV hold goes back to the agent.
-A rule in the list above, a diff past 12000 characters, and a failed JEV call wait for approval at once, and a climb run's push is screened only when it is delivered.
+A rule in the list above, a diff past 12000 characters, and a failed JEV call wait for approval at once.
 
 Before the first try of a search run fed by findings, JEV checks whether a commit that landed since the finding's run started, or a push of the same loop that waits for approval, already fixes the finding. At a chance of `[jev] fixed_skip` (0.7) or more, the run ends as done, already fixed by that change, and no agent runs. `arete jev report` shows what came of each verdict.
 
@@ -182,7 +170,7 @@ A watch loop fed by a source or a webhook reads text from outside, so it may onl
 Its events reach the agent fenced as data, and a ticket it files is built from the finding fields, not from the event text.
 With JEV on, an event JEV reads as instructions to an agent is dropped before the agent sees it, and a ticket drawn from outside text that reads that way waits for approval.
 To act on what it finds, it emits a ticket labeled `agent` and the pipeline does the work under its own gates.
-Agents never run git writes; climb and search commit in their own worktree, and a `pr` or `push` emit pushes.
+Agents never run git writes; search commits in its own worktree, and a `pr` or `push` emit pushes.
 A loop run by pi gets Bash only on an `exe` device, whose sandbox holds no git credentials and is deleted after the run.
 
 ## prompt.md
@@ -199,3 +187,50 @@ arete loop try NAME               # run once now with every emit held; event loo
 arete loop enable NAME            # turn it on
 arete loop list | status NAME | start NAME | stop RUN | feed RUN -f
 ```
+
+## Merged base use checks
+
+`merge-check` ships disabled. It is a command loop covering configured pipeline repositories. Run
+`arete loop try merge-check` before `arete loop enable merge-check`. Try holds every emit and uses
+`arete merge-check --dry-run`: it samples the two latest real merged PRs per repo, even if already
+discovered, without fetching, creating a worktree, running setup, starting a service or calling a model.
+Empty history finishes skipped with zero model calls and no ticket or metric preview. There is no
+prompt.md. A watch loop cannot do these checks under the source safety rules.
+
+`arete merged --since-cursor` prints stable PR events from the complete merged pipeline history.
+It reads the source's seen set; polling owns discovery and enqueueing. Command sources receive
+`ARETE_LOOP`, `ARETE_LOOP_DIR`, `ARETE_SOURCE` and `ARETE_SOURCE_SAMPLE` (1 only for previews).
+`data.at` is the recorded merge completion time. The first poll baselines history; late discoveries
+remain discoverable because there is no timestamp watermark.
+
+`arete merge-check [REPO]` accepts JSON events on stdin and snapshots all unchecked merges for
+each selected repo. It checks a detached worktree pinned to `origin/<base>`, reuses saved check
+names and How instructions, and includes one earlier overlapping neighbour. Missing reports or
+diff history block verification. Reports, manifests, server logs and evidence stay in the local run
+folder. Findings include only PRs, run IDs and failed manifest check numbers/names; verifier prose
+and page contents stay local. Completed passes emit only `{"value":1}`. Completed product failures
+emit a deterministic finding and `{"value":0}`. Infrastructure failures preserve unchecked work and
+use the usual failed/dead-input recovery (`arete loop status merge-check`, then `arete loop requeue ID`).
+
+The consumer serializes checks using `.state/consumer.lock` under `ARETE_LOOP_DIR` (the shipped
+loop directory for direct calls). `checked.json` tracks PR identities independently of source history;
+`quota.json` reserves at most six attempts per repo per UTC day, before the product starts. Dry runs
+and skips reserve nothing. A quota hold releases the input to its existing queue and dispatch waits
+for the persisted daily reset. Each attempt has one logical verifier call, a 40-action runtime cutoff
+and a 30-minute deadline, without repair or network recovery. Unresolved scratch ownership retains
+the workspace and blocks the verdict.
+
+Ticket emits can explicitly select `repo = "$finding.repo"` with internal-or-higher trigger trust.
+Each finding must name a configured repository; missing and unknown repos are refused before
+rendering or sending. Fixed repo emits keep their existing behavior. The shipped loop uses this
+selector, prefix `[merge-check] ` and label `agent`.
+
+The named queue defaults to capacity one. Its explicit equivalent in private configuration is:
+
+```toml
+[serve.queues]
+merge-check = 1
+```
+
+See the [offline fixture recipe](../../README.md#offline-merge-check-fixture) for disposable origins,
+replay answers, blocked recovery and quota checks.
