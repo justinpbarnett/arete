@@ -25,8 +25,8 @@ $ticket
   - `person` when it asks for work only a person can do: a meeting, a decision, access or an account, a check done
     by hand, data entry, a purchase, or settings in an outside tool.
   A ticket that asks for research and then a code change is `research` when the change depends on what the
-  research finds. For `research` and `person`, `ready` is false, and `questions`, `assumptions` and `plan` are
-  empty.
+  research finds. For `research` and `person`, `ready` is false, and `questions`, `assumptions`, `checks` and
+  `plan` are empty.
 - `ready`: true when the pipeline can build it now. False only when one of the blockers below applies.
 - `questions`: one per blocker, short and concrete, each one the owner can answer in a line. Only these are
   blockers:
@@ -39,6 +39,10 @@ $ticket
 - `assumptions`: the small choices the build will make because the ticket leaves them open: wording, placement,
   which of two similar fields, a default value, an edge case. One short line each. The pull request lists them so
   the owner can correct them.
+- `checks`: up to 6 acceptance checks that say what done means. Each is one thing a person does on the running
+  product and what it must show: a command and its output, a request and its response, or a page action and what
+  appears. Cover the edge and error cases the ticket names. Leave out the repository's own checks (tests, lint,
+  build), which arete runs anyway. Empty for `research` and `person`.
 - `size`: `S` when one or two files change, `M` when a handful of files change in one area, `L` when the work spans
   several areas or will not fit in one pull request. `L` means the owner should split it.
 - `repos`: $repo_rule

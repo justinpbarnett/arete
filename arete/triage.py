@@ -28,6 +28,7 @@ SEARCH_FIELDS = ["summary", "updated", "labels", "parent"]
 SPRINT_JQL = "sprint in openSprints() OR (sprint in closedSprints() AND sprint not in futureSprints())"
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent", "updated"]
 MAX_ASSUMPTIONS = 8
+MAX_CHECKS = 6
 THIN_WORDS = 6
 CLI_COMMAND_ENDING_OLDER_REASONS = re.compile(r"; (check the ticket, then )?`arete research \S+ --run --force`( researches it anyway)?$")
 OUTSIDE_SPRINT = "it is outside the sprint, so the research loop leaves it to you"
@@ -47,12 +48,13 @@ SCHEMA = {
         "ready": {"type": "boolean"},
         "questions": {"type": "array", "items": {"type": "string"}},
         "assumptions": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ASSUMPTIONS},
+        "checks": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_CHECKS},
         "size": {"type": "string", "enum": list(SIZES)},
         "repos": {"type": "array", "items": {"type": "string"}},
         "plan": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_PLAN_STEPS},
         "why": {"type": "string"},
     },
-    "required": ["kind", "ready", "questions", "assumptions", "size", "repos", "plan", "why"],
+    "required": ["kind", "ready", "questions", "assumptions", "checks", "size", "repos", "plan", "why"],
 }
 WAITING = f"waiting: more than {MAX_CALLS} tickets were due in one refresh"
 ASKS_FOR_CODE = "Does this ticket ask for a change to code, configuration or documentation in a software repository?"
@@ -323,7 +325,7 @@ def not_code_by_jev(cfg: config.Config, src: TriageSource, c: Candidate, ticket:
         return None
     why += f" and as {settled} work ({kind.note()})" if kind and kind.value == settled else ""
     cost = reply.cost_usd
-    answer = {"kind": settled, "ready": False, "questions": [], "assumptions": [], "plan": [], "repos": [],
+    answer = {"kind": settled, "ready": False, "questions": [], "assumptions": [], "checks": [], "plan": [], "repos": [],
               "size": "", "why": why}
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     record_file(c.ref).write_text(f"{ticket}\n\n## Triage result ({util.paid_note(cost, 5)})\n\n```json\n"
@@ -369,13 +371,14 @@ def settle(src: TriageSource, c: Candidate, answer: dict, cost: float) -> dict:
     return row(src, c, updated=c.updated, ready=int(bool(answer.get("ready")) and not questions), code=1, kind=kind,
                repo=repo, repos=repos, route=src.route(repo), size=size, questions=questions,
                assumptions=lines_of(answer.get("assumptions"))[:MAX_ASSUMPTIONS],
+               checks=lines_of(answer.get("checks"))[:MAX_CHECKS],
                plan=lines_of(answer.get("plan"))[:MAX_PLAN_STEPS], why=why, cost=cost)
 
 
 def row(src: TriageSource, c: Candidate, **fields) -> dict:
     base = {"ref": c.ref, "source": src.name, "tracker": src.tracker, "repo": "", "route": "", "title": c.title,
             "url": c.url, "updated": "", "ready": None, "code": None, "kind": "", "size": "", "repos": [],
-            "questions": [], "assumptions": [], "plan": [], "why": "", "cost": 0.0, "ts": util.iso(),
+            "questions": [], "assumptions": [], "checks": [], "plan": [], "why": "", "cost": 0.0, "ts": util.iso(),
             "in_sprint": c.in_sprint, "parent": c.parent, "closed": ""}
     return {**base, **fields}
 
@@ -845,13 +848,16 @@ def board() -> str:
     repo_width = max((len(r["repo"] or "") for r in rows + v["sent"]), default=0)
     if g[READY]:
         lines += ["", f"Ready to build: {auto_note(config.load())}"]
-        lines += [f"  {r['ref']:<{width}}  {r['size']}  {r['repo']:<{repo_width}}  {' '.join(labels_to_add(r)):<16}  "
-                  f"{r['title']}{'' if in_sprint(r) else '  (outside the sprint)'}" for r in g[READY]]
+        for r in g[READY]:
+            lines.append(f"  {r['ref']:<{width}}  {r['size']}  {r['repo']:<{repo_width}}  "
+                         f"{' '.join(labels_to_add(r)):<16}  "
+                         f"{r['title']}{'' if in_sprint(r) else '  (outside the sprint)'}")
+            lines += done_lines(r, "      ")
     if g[SENT]:
         lines += ["", f"Sent to the pipeline in the last {SENT_DAYS} days"]
         for a in g[SENT]:
             lines += [f"  {a['ref']:<{width}}  {a['size']}  {a['repo']:<{repo_width}}  {a['title']}",
-                      f"      {sent_note(a)}"]
+                      f"      {sent_note(a)}", *done_lines(a, "      ")]
     if g[RESEARCH_WORK]:
         lines += ["", "Research: arete writes a report for each one"]
         for r in g[RESEARCH_WORK]:
@@ -864,6 +870,7 @@ def board() -> str:
         for r in g[WITH_QUESTIONS]:
             lines.append(f"  {r['ref']:<{width}}  {r['size']}  {r['repo'] or '?':<{repo_width}}  {r['title']}")
             lines += [f"      - {q}" for q in r["questions"]] or [f"      {r['why']}"]
+            lines += done_lines(r, "      ")
     if g[NEEDS_PERSON]:
         lines += ["", "Needs a person: nothing for arete to build or research"]
         for r in g[NEEDS_PERSON]:
@@ -887,6 +894,7 @@ def ticket(ref: str) -> str | None:
         if "run" in a:
             lines.append(f"Run: {a['run']['status']} {' '.join(sent_prs(a))}".rstrip() if a["run"] else "Run: none yet")
         lines += ["Assumed:"] + [f"  - {x}" for x in a["assumptions"]] if a["assumptions"] else []
+        lines += done_lines(a)
         return "\n".join(x for x in lines if x)
     lines = [f"{r['ref']}: {r['title']}", r["url"], f"{r['source']}, updated {stamp(r['updated']) or 'unknown'}"]
     kind = standing(r)
@@ -910,7 +918,13 @@ def ticket(ref: str) -> str | None:
             lines += [f"{heading}:"] + [f"  - {q}" for q in items]
     if r["plan"]:
         lines += ["Plan:"] + [f"  {n}. {step}" for n, step in enumerate(r["plan"], 1)]
+    lines += done_lines(r)
     return "\n".join(lines)
+
+
+def done_lines(r: dict, indent: str = "") -> list[str]:
+    checks = r.get("checks") or []
+    return [f"{indent}What done means:"] + [f"{indent}  {n}. {x}" for n, x in enumerate(checks, 1)] if checks else []
 
 
 def issue_header(cfg: config.Config, changed: str) -> str:
@@ -969,6 +983,8 @@ def issue_block(r: dict, v: dict, kind: str, with_plan: bool) -> str:
         lines += [f"  - {quiet(q)}" for q in r["questions"]] or [f"  {quiet(r['why'])}"]
     if with_plan and r["assumptions"]:
         lines.append(fold("Assumes", "\n".join(f"- {quiet(x)}" for x in r["assumptions"])))
+    if with_plan and r.get("checks"):
+        lines.append(fold("What done means", "\n".join(f"{n}. {quiet(x)}" for n, x in enumerate(r["checks"], 1))))
     if with_plan and r["plan"]:
         lines.append(fold("Plan", "\n".join(f"{n}. {quiet(step)}" for n, step in enumerate(r["plan"], 1))))
     return "\n".join(lines)
