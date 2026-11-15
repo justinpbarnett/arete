@@ -4142,6 +4142,340 @@ print("BEHAVIOR_RESULT=" + json.dumps(out))
                          (["r2"], [["r2"]], []), shown)
 
 
+class DurableCostTests(unittest.TestCase):
+    PRELUDE = r'''
+import contextlib, gzip, io, json, os, sqlite3, sys
+from pathlib import Path
+from unittest import mock
+from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, state, util
+root, mode = Path(sys.argv[1]), sys.argv[2]
+def forbidden(*a, **kw):
+    raise AssertionError("offline cost test attempted a provider or credential lookup")
+claude.run = codex.run = pi.run = forbidden
+accounts.read = gh.auth_token = forbidden
+original_sh = util.sh
+def local_sh(cmd, *a, **kw):
+    if isinstance(cmd, list) and cmd[:1] == ["git"]:
+        return original_sh(cmd, *a, **kw)
+    return forbidden(cmd, *a, **kw)
+util.sh = local_sh
+record.secrets = lambda *a, **kw: ()
+cfg = config.Config()
+def call(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = cli.main(list(argv))
+        except SystemExit as e:
+            code = e.code
+    return code, out.getvalue(), err.getvalue()
+def rows(rid):
+    with state.db() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (rid,))]
+def marks(rid):
+    f = paths.record_dir(rid) / record.TIMELINE
+    return [v for line in gzip.decompress(f.read_bytes()).decode().splitlines()
+            if (v := json.loads(line))["kind"] == "agent"] if f.exists() else []
+def attempt(rid, which="claude", **kw):
+    return runner.attempt(which, "test", "offline", root, agent.Session(), cfg, (rid, "build"), rid,
+                          devices.LOCAL, kw, auth=accounts.Auth(mode="api_key"))
+def result():
+    return agent.Result(ok=True, cost_usd=2.5)
+'''
+
+    def run_costs(self, body, modes=("run",)):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for folder in ("home", "config", "state", "logs", "worktrees", "tmp"):
+                (root / folder).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(HOME=str(root / "home"), ARETE_CONFIG_DIR=str(root / "config"),
+                       ARETE_STATE_DIR=str(root / "state"), ARETE_LOG_DIR=str(root / "logs"),
+                       ARETE_WORKTREES_DIR=str(root / "worktrees"), TMPDIR=str(root / "tmp"),
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            bootstrap = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+            for mode in modes:
+                done = subprocess.run([sys.executable, "-I", "-c", bootstrap, str(root), mode],
+                                      cwd=root, env=env, text=True, capture_output=True, timeout=120, check=False)
+                self.assertEqual(done.returncode, 9 if mode == "kill" else 0, done.stderr + done.stdout)
+
+    def test_commit_precedes_timeline_even_when_finish_kills_the_process(self):
+        self.run_costs(r'''
+if mode == "kill":
+    rid = record.start("pipeline", run_id="killed")
+    claude.run = lambda *a, **kw: result()
+    record.Recorder.finish = lambda *a: os._exit(9)
+    attempt(rid)
+else:
+    found = rows("killed")
+    assert len(found) == 1 and found[0]["cost_usd"] == 2.5, found
+    assert state.run_get("killed")["cost_usd"] == 2.5
+    assert all(rows("killed") for m in marks("killed") if m.get("cost_usd"))
+''', ("kill", "inspect"))
+
+    def test_successful_batch_and_second_insert_rollback(self):
+        self.run_costs(r'''
+def batch(*a, **kw):
+    return agent.Result(ok=True, calls=[
+        agent.Result(ok=True, runner="claude", model="test", cost_usd=1, auth_mode="api_key", call_seconds=1.25),
+        agent.Result(ok=True, runner="pi", model="test", cost_usd=1.5, auth_mode="subscription", call_seconds=2.75)])
+claude.run = batch
+rid = record.start("pipeline")
+attempt(rid)
+found = rows(rid)
+assert [(r["seconds"], r["auth_mode"]) for r in found] == [(1.25, "api_key"), (2.75, "subscription")], found
+assert [r["try"] for r in found] == [1, 2]
+assert state.run_get(rid)["cost_usd"] == marks(rid)[0]["cost_usd"] == 2.5
+rid = record.start("pipeline")
+with state.db() as c:
+    c.execute("CREATE TRIGGER reject_second BEFORE INSERT ON steps WHEN NEW.cost_usd = 1.5 "
+              "BEGIN SELECT RAISE(ABORT, 'second insert refused'); END")
+try:
+    attempt(rid)
+    raise AssertionError("batch should fail")
+except sqlite3.IntegrityError:
+    pass
+assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+assert marks(rid)[0]["cost_usd"] == 2.5 and "cost is not in steps" in marks(rid)[0]["error"]
+''')
+
+    def test_lock_timeout_keeps_cost_and_diagnostic_only_in_timeline(self):
+        self.run_costs(r'''
+rid = record.start("pipeline")
+original = paths.connect_db
+sqlite_connect = sqlite3.connect
+def quick_connect(*a, **kw):
+    kw["timeout"] = .2
+    return sqlite_connect(*a, **kw)
+def short_wait(*a, **kw):
+    with mock.patch.object(sqlite3, "connect", quick_connect):
+        return original(*a, **kw)
+paths.connect_db = short_wait
+lock = sqlite3.connect(paths.DB_FILE)
+def locked(*a, **kw):
+    lock.execute("BEGIN EXCLUSIVE")
+    return result()
+claude.run = locked
+try:
+    attempt(rid)
+    raise AssertionError("write should time out")
+except sqlite3.OperationalError as e:
+    assert "locked" in str(e)
+finally:
+    lock.rollback()
+    lock.close()
+assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+assert marks(rid)[0]["cost_usd"] == 2.5 and "cost is not in steps" in marks(rid)[0]["error"]
+''')
+
+    def test_unlimited_interruptions_crash_park_and_token_cut_charge_once(self):
+        self.run_costs(r'''
+cfg.pricing = {"test": (2, 4)}
+def streamed(*a, **kw):
+    for ident in ("one", "two"):
+        line = json.dumps({"type": "assistant", "message": {"id": ident,
+                          "usage": {"input_tokens": 100, "output_tokens": 50}}})
+        kw["on_line"](line)
+        kw["on_line"](line)
+    raise KeyboardInterrupt()
+claude.run = streamed
+rid = record.start("pipeline")
+try:
+    attempt(rid)
+    raise AssertionError("must interrupt")
+except KeyboardInterrupt:
+    pass
+r, = rows(rid)
+assert (r["turns"], r["tokens_in"], r["tokens_out"], r["ok"], r["error"]) == (2, 200, 100, 0, "stopped by request"), r
+assert abs(r["cost_usd"] - .0008) < 1e-12 and state.run_get(rid)["cost_usd"] == r["cost_usd"]
+assert marks(rid)[0]["error"] == r["error"] and marks(rid)[0]["cost_usd"] == r["cost_usd"]
+rid = record.start("pipeline")
+res = attempt(rid, max_tokens=150)
+r, = rows(rid)
+assert not res.ok and r["turns"] == 1 and "tokens left under the limit" in r["error"], r
+def stopped(*a, **kw):
+    raise KeyboardInterrupt()
+codex.run = stopped
+rid = record.start("pipeline")
+try:
+    attempt(rid, "codex")
+except KeyboardInterrupt:
+    pass
+r, = rows(rid)
+assert (r["ok"], r["error"], r["turns"], r["cost_usd"]) == (0, "stopped by request", 0, 0), r
+assert marks(rid)[0]["error"] == r["error"]
+def crashed(*a, **kw):
+    kw["on_line"](json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": {
+        "input": 300, "output": 100, "cost": {"total": .25}}}}))
+    raise RuntimeError("parked by chain budget")
+pi.run = crashed
+rid = record.start("pipeline")
+try:
+    attempt(rid, "pi")
+    raise AssertionError("must crash")
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert (r["turns"], r["tokens_in"], r["tokens_out"]) == (1, 300, 100), r
+assert abs(r["cost_usd"] - .001) < 1e-12
+assert r["error"] == marks(rid)[0]["error"] and "parked by chain budget" in r["error"]
+def parked(*a, **kw):
+    raise RuntimeError("parked before usage")
+claude.run = parked
+rid = record.start("pipeline")
+try:
+    attempt(rid)
+    raise AssertionError("must park")
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert r["cost_usd"] == 0 and r["error"] == marks(rid)[0]["error"] and "crashed:" in r["error"]
+rid = record.start("pipeline")
+record.ask_stop(rid)
+try:
+    attempt(rid)
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert r["error"] == marks(rid)[0]["error"] == "stopped by request"
+assert heartbeat.check_costs()[0].ok
+''')
+
+    def test_failed_interrupted_write_and_post_commit_exception_never_charge_twice(self):
+        self.run_costs(r'''
+rid = record.start("pipeline")
+with state.db() as c:
+    c.execute("CREATE TRIGGER reject_call BEFORE INSERT ON steps BEGIN SELECT RAISE(ABORT, 'refused'); END")
+def interrupted(*a, **kw):
+    kw["on_line"](json.dumps({"type": "assistant", "message": {"id": "one", "usage": {
+        "input_tokens": 100, "output_tokens": 50}}}))
+    raise KeyboardInterrupt()
+cfg.pricing = {"test": (2, 4)}
+claude.run = interrupted
+try:
+    attempt(rid)
+    raise AssertionError("write must fail")
+except sqlite3.IntegrityError:
+    pass
+assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+mark, = marks(rid)
+assert abs(mark["cost_usd"] - .0004) < 1e-12 and "cost is not in steps" in mark["error"], mark
+with state.db() as c:
+    c.execute("DROP TRIGGER reject_call")
+cfg.pricing = {}
+claude.run = lambda *a, **kw: result()
+rid = record.start("pipeline")
+attempt(rid)
+assert len(rows(rid)) == len(marks(rid)) == 1 and marks(rid)[0]["cost_usd"] == 2.5
+rid = record.start("pipeline")
+def broken_finish(*a):
+    raise RuntimeError("timeline failure after commit")
+record.Recorder.finish = broken_finish
+try:
+    attempt(rid)
+    raise AssertionError("finish must fail")
+except RuntimeError:
+    pass
+r, = rows(rid)
+assert r["cost_usd"] == state.run_get(rid)["cost_usd"] == 2.5
+''')
+
+    def test_backfill_boundary_before_mapping_paid_totals_and_drift(self):
+        for before in (False, True):
+            self.run_costs("use_before = " + repr(before) + r'''
+for rid, started, usd, tin in (("A", "2020-01-01", 9, 900), ("B", "2020-01-02", 3, 300),
+                               ("C", "2020-01-04", 2, 200)):
+    record.start("pipeline", run_id=rid, started=started, cost_usd=usd, tokens_in=tin, tokens_out=tin // 10)
+with state.db() as c:
+    for rid, usd, ts in (("B", 1, "2020-01-03"), ("C", 1.5, "2020-01-04")):
+        c.execute("INSERT INTO steps (run_id, runner, cost_usd, tokens_in, tokens_out, ts) VALUES (?, 'claude', ?, 100, 10, ?)",
+                  (rid, usd, ts))
+paid = state.paid_by_run(["A", "B", "C"])
+args = ["costs", "--backfill"]
+if use_before:
+    f = root / "before.json"
+    f.write_text(json.dumps({"A": 12}))
+    args += ["--before", str(f)]
+code, out, err = call(*args)
+assert code == 0, (out, err)
+a = rows("A")
+assert [(r["step"], r["cost_usd"]) for r in a] == ([("legacy", 12), ("correction", -3)] if use_before else [("legacy", 9)]), a
+assert all(r["auth_mode"] == "subscription" and r["ts"] == "2020-01-01" for r in a)
+assert (a[0]["tokens_in"], a[0]["tokens_out"]) == (900, 90)
+b = rows("B")[-1]
+assert (b["step"], b["cost_usd"], b["tokens_in"], b["auth_mode"], b["ts"]) == ("legacy", 2, 200, "subscription", "2020-01-02"), b
+assert len(rows("C")) == 1
+assert "backfilled 0 steps" in call(*args)[1]
+assert state.paid_by_run(["A", "B", "C"]) == paid
+assert [state.run_get(r)["cost_usd"] for r in ("A", "B", "C")] == [9, 3, 2]
+check, = heartbeat.check_costs()
+assert not check.ok and "1 runs" in check.detail and "$0.500000" in check.detail and check.detail.endswith("C"), check
+assert state.cost_drift() == [{"id": "C", "run_usd": 2, "steps_usd": 1.5, "difference": .5}]
+checked = []
+def fake_check(name):
+    def check(*a):
+        checked.append(name)
+        return []
+    return check
+for name in ("jobs", "probes", "claude_auth", "codex_auth", "codex_cleanup", "pi_auth", "hook", "disk", "serve",
+             "backups", "loops", "oncall", "workspaces", "scratch"):
+    setattr(heartbeat, "check_" + name, fake_check(name))
+heartbeat.install.rotate_logs = lambda: None
+heartbeat.network_up_or_skip = lambda *a: True
+alerts = []
+heartbeat.alerts.raise_alert = lambda repo, key, *a: alerts.append(key)
+heartbeat.alerts.clear_alert = lambda *a: None
+with contextlib.redirect_stdout(io.StringIO()):
+    assert heartbeat.run(dry_run=True) == 1
+assert alerts == ["costs:drift"] and {"backups", "workspaces", "scratch"} <= set(checked), (alerts, checked)
+assert call("costs")[0] == 0
+code, out, err = call("costs", "--by", "step", "kind", "model", "route", "--days", "36500")
+assert code == 0 and "legacy" in out, (out, err)
+code, out, err = call("costs", "--by", "route", "--days", "36500", "--json")
+assert code == 0 and "subscription" in out, (out, err)
+''')
+
+    def test_corrections_billing_validation_and_drift_tolerance(self):
+        self.run_costs(r'''
+for mode in ("subscription", "api_key", "local"):
+    rid = record.start("pipeline")
+    record.step(rid, "build", agent.Result(ok=True, cost_usd=5, auth_mode="api_key"), 1)
+    args = ["costs", "--correct", rid, "-1.25", "--why", "repriced"]
+    if mode != "subscription":
+        args += ["--auth-mode", mode]
+    assert call(*args)[0] == 0
+    r = rows(rid)[-1]
+    assert (r["step"], r["kind"], r["runner"], r["auth_mode"], r["error"], r["cost_usd"]) == (
+        "correction", "correction", "correction", mode, "repriced", -1.25), r
+    assert state.run_get(rid)["cost_usd"] == 3.75
+    assert state.paid_by_run([rid])[rid] == (3.75 if mode == "api_key" else 5)
+assert heartbeat.check_costs()[0].ok
+snapshot = rows(rid), state.run_get(rid)
+bad = root / "bad.json"
+bad.write_text('{bad')
+for args in (["--correct", rid, "1"], ["--correct", "absent", "1", "--why", "x"],
+             ["--correct", rid, "nan", "--why", "x"], ["--correct", rid, "inf", "--why", "x"],
+             ["--correct", rid, "1", "--why", "x", "--by", "step"], ["--why", "x"],
+             ["--auth-mode", "api_key"], ["--before", str(bad)], ["--backfill", "--before", str(bad)],
+             ["--correct", rid, "1", "--why", "x", "--backfill"]):
+    assert call("costs", *args)[0] != 0, args
+    assert (rows(rid), state.run_get(rid)) == snapshot
+for value in (None, [], {"absent": 12}, {rid: "12"}, {rid: float("inf")}, {rid: True}):
+    bad.write_text(json.dumps(value))
+    assert call("costs", "--backfill", "--before", str(bad))[0] != 0
+    assert (rows(rid), state.run_get(rid)) == snapshot
+record.start("pipeline", run_id="null", cost_usd=None)
+record.start("pipeline", run_id="small", cost_usd=.0000009)
+for i in range(7):
+    record.start("pipeline", run_id=f"drift-{i}", cost_usd=.0000011 if i == 0 else i)
+found = state.cost_drift()
+assert [r["id"] for r in found] == [f"drift-{i}" for i in range(7)], found
+check, = heartbeat.check_costs()
+assert "7 runs" in check.detail and "$21.000001" in check.detail and "drift-4" in check.detail
+assert "drift-5" not in check.detail
+''')
+
+
 class WorkerRecoveryTests(unittest.TestCase):
     SCRIPT = r'''
 import contextlib, importlib.util, io, json, os, sys

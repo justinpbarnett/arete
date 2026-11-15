@@ -27,6 +27,13 @@ def launchd_table() -> dict[str, tuple[str, str]]:
     return table
 
 
+def check_costs() -> list[Check]:
+    drift = state.cost_drift()
+    detail = (f"{len(drift)} runs differ from steps by ${sum(abs(r['difference']) for r in drift):.6f}: "
+              + ", ".join(r["id"] for r in drift[:5])) if drift else "run costs equal their steps"
+    return [Check("costs:drift", not drift, detail)]
+
+
 def check_jobs(cfg: config.Config) -> list[Check]:
     if not paths.ON_MAC:
         return []
@@ -394,6 +401,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_disk,),
         (check_serve,),
         (check_backups, cfg),
+        (check_costs,),
         (check_loops, cfg),
         (check_oncall, cfg),
         (check_workspaces,),

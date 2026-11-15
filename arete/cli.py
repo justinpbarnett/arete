@@ -1219,7 +1219,37 @@ def cmd_webhook(args) -> int:
 
 
 def cmd_costs(args) -> int:
-    from . import control, util
+    from pathlib import Path
+
+    from . import control, record, state, util
+
+    correct = getattr(args, "correct", None)
+    backfill = getattr(args, "backfill", False)
+    why, mode, before = (getattr(args, k, None) for k in ("why", "auth_mode", "before"))
+    try:
+        if (correct or backfill) and (args.by or args.json or args.days is not None):
+            raise ValueError("cost writes cannot be combined with report flags")
+        if (why is not None or mode is not None) and not correct:
+            raise ValueError("--why and --auth-mode require --correct")
+        if before is not None and not backfill:
+            raise ValueError("--before requires --backfill")
+        if correct and backfill:
+            raise ValueError("choose --correct or --backfill")
+        if correct:
+            if not why or not why.strip():
+                raise ValueError("--correct requires --why")
+            record.correct(correct[0], float(correct[1]), why, mode or "subscription")
+            print(f"corrected {correct[0]} by ${float(correct[1]):g}")
+            return 0
+        if backfill:
+            values = json.loads(Path(before).read_text()) if before else None
+            if before and not isinstance(values, dict):
+                raise ValueError("before must map run IDs to finite dollar amounts")
+            count = state.backfill_legacy_cost(values)
+            print(f"backfilled {count} steps")
+            return 0
+    except (ValueError, OSError) as e:
+        return refused(e)
 
     if args.by or args.json:
         return print_step_costs(args.by or ["step"], args.days, args.json)
@@ -1874,6 +1904,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--by", nargs="+", choices=("step", "kind", "model", "route"),
                    help="one grouping or several, in order; route is runner/provider/model/billing")
     p.add_argument("--json", action="store_true", help="one JSON line per group, then one with the wait minutes")
+    writes = p.add_mutually_exclusive_group()
+    writes.add_argument("--correct", nargs=2, metavar=("RUN", "USD"), help="record a signed repricing correction")
+    writes.add_argument("--backfill", action="store_true", help="fill legacy run cost differences into steps")
+    p.add_argument("--why", help="reason for --correct")
+    p.add_argument("--auth-mode", choices=("subscription", "api_key", "local"), help="correction billing (default subscription)")
+    p.add_argument("--before", metavar="FILE", help="JSON run-ID to pre-edit dollar amount map for --backfill")
     p.set_defaults(fn=cmd_costs)
 
     p = steering(sub.add_parser("ab", help="compare the arm and baseline of each per-step A/B route on live tickets: "
