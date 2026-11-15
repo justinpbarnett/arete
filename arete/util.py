@@ -21,6 +21,13 @@ from . import paths
 PROBE_GRACE_SECONDS = 0.2
 TIMED_OUT = 124
 
+
+def engine_commit() -> str:
+    from . import codebase
+
+    return codebase.STAMP
+
+
 def now() -> datetime:
     return datetime.now(UTC)
 

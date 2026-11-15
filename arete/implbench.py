@@ -273,8 +273,10 @@ def drive(bench: Bench, path: Path, hands_off: frozenset = frozenset(), shown=No
     found = experiment.events(path)
     experiment.check_design(exp, path, found)
     if not any(e.get("event") == "manifest" for e in found):
-        experiment.append(path, {"event": "manifest", "digest": exp.digest, "design": exp.design})
-    experiment.append(path, {"event": "session", "at": util.iso(), "limits": exp.limits, "pid": os.getpid()})
+        experiment.append(path, {"event": "manifest", "digest": exp.digest, "design": exp.design,
+                                 "engine": util.engine_commit()})
+    experiment.append(path, {"event": "session", "at": util.iso(), "limits": exp.limits, "pid": os.getpid(),
+                             "engine": util.engine_commit()})
     used = experiment.totals_of(experiment.events(path))
     if used.seconds > 0:
         print(f"{used.seconds:.1f} seconds of limits.minutes = {exp.limits['minutes']:g} already used in "

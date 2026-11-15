@@ -196,7 +196,8 @@ def family(atom: str) -> set[str]:
 def environment(exp: experiment.Experiment) -> str:
     live = {r: settled_now(exp.cfg, exp.layer, r) for r in family(exp.atom)}
     return experiment.sha_json({"roles": roles_of(exp.cfg, exp.layer, family(exp.atom)), "live": live,
-                                "grader": exp.design["grader"], "fingerprints": exp.design["fingerprints"]})
+                                "grader": exp.design["grader"], "fingerprints": exp.design["fingerprints"],
+                                "engine": exp.design["engine"], "money": exp.design["money"]})
 
 
 def check_digest(s: Search, trail: Path, found: list[dict]) -> None:
@@ -300,8 +301,8 @@ def phase(s: Search, folder: Path, tag: str, split: str, arms: dict, champion: s
     file = folder / f"{tag}.jsonl"
     exp = experiment.designed(manifest(s.fields, tag, split, arms, champion), carried(folder, file), follow=True)
     if environment(exp) != s.environment or any(s.task_evidence.get(n) != t for n, t in exp.design["tasks"].items()):
-        raise Refused("the fixed steps, grader, harness, prompts, tasks or live baseline changed since the search "
-                      "began; pass --out for a new folder")
+        raise Refused("the fixed steps, grader, harness, prompts, tasks, Arete's code, prices or live baseline "
+                      "changed since the search began; pass --out for a new folder")
     for arm, recorded in (pinned or {}).items():
         if recorded and exp.design["arms"][arm]["fingerprints"] != recorded:
             raise Refused(f"the prompts, context or tools of candidate {arm} changed since it was selected; "
