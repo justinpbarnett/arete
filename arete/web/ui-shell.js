@@ -87,8 +87,10 @@ export function Shell({ route, snapshot, now, retry }) {
   const page = data[route.screen](route);
   const health = route.screen === "settings" && route.path[0] === "health";
   const slots = route.screen === "floor" ? html`<p class="slots mono">Slots <span>${snapshot.slots}</span> / <span>${snapshot.capacity}</span></p>` : null;
-  const healthGate = (body, what) => html`<${Gate} pending=${snapshot.pending && snapshot.live == null}
-    fault=${snapshot.live == null ? readFault(route.screen, snapshot) : null} what=${what} retry=${retry}>${body}<//>`;
+  const healthFault = readFault(route.screen, snapshot);
+  const healthCached = snapshot.live != null;
+  const healthGate = (body, what) => html`${healthFault && healthCached ? html`<${Fault} what=${what} fault=${healthFault} retry=${retry} />` : null}
+    <${Gate} pending=${snapshot.pending && !healthCached} fault=${healthCached ? null : healthFault} what=${what} retry=${retry}>${body}<//>`;
   const nothing = (label) => html`<${Empty} what=${`No ${label.toLowerCase()} selected`} />`;
   const extra = page.extra ? html`<${Pane} name="auxiliary" label=${page.extra}>${nothing(page.extra)}<//>` : null;
   const queue = actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />`
