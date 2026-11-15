@@ -54,6 +54,10 @@ def scope_changed(owner: str | None, source: dict) -> bool:
     return owner is not None and owner.startswith("scope:") and owner != fingerprint(source)
 
 
+def opaque(owner: str | None) -> bool:
+    return owner is not None and not owner.startswith("scope:")
+
+
 def arrived(e: dict) -> datetime | None:
     data = e.get("data")
     stamp = data.get("at") or data.get("updated") if isinstance(data, dict) else None
@@ -112,7 +116,8 @@ def adopt_history(loop: Loop, index: int, source: dict, sid: str) -> None:
     if not source.get("name") or state.cursor(sid):
         return
     own = slot_id(loop, index)
-    if state.cursor(own) and same_source(state.source_owner(own), source):
+    owner = state.source_owner(own)
+    if state.cursor(own) and (same_source(owner, source) or opaque(owner) and len(loop.sources) == 1):
         state.adopt_source(own, sid)
         return
     for old in slot_cursors(loop):
@@ -142,8 +147,10 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
     owner = fingerprint(source)
     known = state.cursor(sid)
     first = known is None
-    changed = not first and scope_changed(state.source_owner(sid), source)
-    cursor = None if first else kind.rescope(source, known["value"]) if changed else known["value"]
+    held = state.source_owner(sid)
+    changed = not first and scope_changed(held, source)
+    unsure = not first and not changed and not same_source(held, source)
+    cursor = None if first else kind.rescope(source, known["value"]) if changed or unsure else known["value"]
     found, value = kind.fetch(loop, source, cfg, sid, cursor)
     unique = {e["key"]: e for e in found}
     with state.transaction() as connect:
@@ -151,22 +158,23 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
         fresh = [e for k, e in unique.items() if k in claimed]
         if first:
             forwarded, older = [], fresh
-        elif changed:
-            forwarded, older = kind.catch_up(fresh, last_good_poll(known))
+        elif changed or unsure:
+            forwarded, older = kind.catch_up(fresh, last_good_poll(known), untimed=unsure)
         else:
             forwarded, older = fresh, []
+        told = changed or unsure and bool(older)
         items = fire(loop, "event", forwarded, connect)
         detail = f"{len(found)} read, {len(fresh)} new"
         if first:
             detail += " (baseline)"
-        elif changed:
+        elif told:
             detail += f", settings changed, {len(older)} older taken as seen"
         state.set_cursor(sid, value, True, detail, connect, started)
         state.set_source_owner(sid, owner, connect)
     if first:
         say(f"{sid}: first read, {len(fresh)} existing events taken as the baseline"
             + (f": {shown([e['key'] for e in fresh])}" if fresh else ""))
-    elif changed:
+    elif told:
         say(f"{sid}: source settings changed; {len(forwarded)} events since the last good poll go on, "
             f"{len(older)} older taken as seen" + (f": {shown([e['key'] for e in older])}" if older else ""))
     return ([], []) if first else (forwarded, items)
@@ -196,9 +204,9 @@ class Source:
     def rescope(self, source: dict, cursor):
         return cursor
 
-    def catch_up(self, fresh: list[dict], since: datetime | None) -> tuple[list[dict], list[dict]]:
+    def catch_up(self, fresh: list[dict], since: datetime | None, untimed: bool = False) -> tuple[list[dict], list[dict]]:
         cutoff = since - CATCH_UP_SLACK if since else None
-        forwarded = [e for e in fresh if cutoff and (at := arrived(e)) and at >= cutoff]
+        forwarded = [e for e in fresh if ((at := arrived(e)) is None and untimed) or (cutoff and at and at >= cutoff)]
         return forwarded, [e for e in fresh if e not in forwarded]
 
     def problems(self, source: dict, loop: Loop, cfg: config.Config) -> list[str]:
@@ -337,7 +345,7 @@ class Log(Source):
                 offsets[name] = [info.st_size, info.st_ino]
         return json.dumps(offsets)
 
-    def catch_up(self, fresh: list[dict], since: datetime | None) -> tuple[list[dict], list[dict]]:
+    def catch_up(self, fresh: list[dict], since: datetime | None, untimed: bool = False) -> tuple[list[dict], list[dict]]:
         return fresh, []
 
     def problems(self, source: dict, loop: Loop, cfg: config.Config) -> list[str]:
