@@ -272,11 +272,31 @@ def due() -> list[dict]:
             and triage.research_due(r, state.research_get(r["ref"]))]
 
 
+def adopt_reports() -> None:
+    for file in REPORTS_DIR.glob("*.md"):
+        text = file.read_text()
+        lines = text.splitlines()
+        heading = re.fullmatch(r"# (\S+): (.+)", lines[0]) if lines else None
+        if not heading:
+            continue
+        ref, title = heading.groups()
+        if file.name != report_file(ref).name or state.research_get(ref):
+            continue
+        url = lines[2] if len(lines) > 2 and lines[2].startswith("http") else ""
+        summary = next((line.removeprefix("**Summary:** ") for line in lines
+                        if line.startswith("**Summary:** ")), "")
+        researched = next((line for line in lines if line.startswith("Researched")), "")
+        cost = re.search(r"\$(\d+(?:\.\d+)?)", researched)
+        state.research_set(ref, status=DONE, title=title, url=url, summary=summary, report=text,
+                           cost=float(cost[1]) if cost else 0.0, updated="", source="", ticket="", basis="",
+                           answered_by="", filed_path="", filed_url="", moved="", delivered="", error="", run_id="")
+
+
 def tidy() -> None:
     for report in state.research_rows():
         if report["status"] == RUNNING:
             state.research_set(report["ref"], status=FAILED, error="the run stopped before it finished")
-    state.research_prune([r["ref"] for r in state.triage_rows()])
+    adopt_reports()
 
 
 def source_of(cfg: config.Config, r: dict) -> triage.TriageSource | None:
