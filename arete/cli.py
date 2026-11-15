@@ -1805,6 +1805,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
 
+    from . import mergecheck
+
+    p = sub.add_parser("merged", help="print newly merged pipeline PRs as JSON events")
+    p.add_argument("--since-cursor", action="store_true", help="omit PRs already seen by this command source")
+    p.set_defaults(fn=mergecheck.command)
+
+    p = sub.add_parser("merge-check", help="use the merged origin base for landed pipeline PRs")
+    p.add_argument("repo", nargs="?", default="", help="configured repository; otherwise read events on stdin")
+    p.add_argument("--dry-run", action="store_true", help="preview saved checks without starting anything")
+    p.set_defaults(fn=mergecheck.command)
+
     p = sub.add_parser("init", help="write the default global config")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)

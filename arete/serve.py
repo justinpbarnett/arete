@@ -47,6 +47,16 @@ PRUNE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
 POLL_THREADS = 8
+
+
+def mergecheck_reset(loop: Loop, item: dict) -> str:
+    from . import mergecheck
+
+    payload = state.queue_item(item["id"])
+    names = {e.get("repo", "") for e in payload["payload"]} if payload else set()
+    return max((mergecheck.held_until(loop.dir, name) for name in names), default="")
+
+
 IMPORT_CHECK = "from arete import codebase; codebase.load()"
 CONFIG_CHECK = "from arete import config; config.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
@@ -433,6 +443,9 @@ class Server:
                 why = f"its {spent} is spent"
             elif held := loop.usage_hold(self.cfg):
                 why = held
+            elif (loop.name == "merge-check" and loop.command == ["arete", "merge-check"]
+                  and (reset := mergecheck_reset(loop, item))):
+                why = f"merge-check quota hold until {reset}"
             else:
                 try:
                     run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)

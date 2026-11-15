@@ -46,7 +46,8 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
     for spec in loop.emits:
         emit = EMITS[spec["type"]]
         for batch in emit.batches(findings, outcome):
-            delivery = {"type": spec["type"], "item": emit.render(loop, run_id, spec, batch, outcome), "batch": batch}
+            target = emit.resolve(spec, batch, outcome, cfg) if isinstance(emit, Ticket) else spec
+            delivery = {"type": spec["type"], "item": emit.render(loop, run_id, target, batch, outcome), "batch": batch}
             what = emit.describe(delivery["item"])
             if trial:
                 log("held", f"would {what}")

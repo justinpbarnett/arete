@@ -3068,7 +3068,8 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
                        diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
 
 
-def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify", **values) -> verify.Verified:
+def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
+                require_released: bool = False, **values) -> verify.Verified:
     run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
@@ -3139,6 +3140,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
+            if require_released and not lifetime["stopped"]:
+                run.save(f"{step}-retained.json", {"reason": "service process ownership is unresolved"})
             if not attempt:
                 archived, moved, kept = "", [], []
             elif not lifetime["stopped"] or (agent_started and not agent_finished):

@@ -199,3 +199,50 @@ arete loop try NAME               # run once now with every emit held; event loo
 arete loop enable NAME            # turn it on
 arete loop list | status NAME | start NAME | stop RUN | feed RUN -f
 ```
+
+## Merged base use checks
+
+`merge-check` ships disabled. It is a command loop covering configured pipeline repositories. Run
+`arete loop try merge-check` before `arete loop enable merge-check`. Try holds every emit and uses
+`arete merge-check --dry-run`: it samples the two latest real merged PRs per repo, even if already
+discovered, without fetching, creating a worktree, running setup, starting a service or calling a model.
+Empty history finishes skipped with zero model calls and no ticket or metric preview. There is no
+prompt.md. A watch loop cannot do these checks under the source safety rules.
+
+`arete merged --since-cursor` prints stable PR events from the complete merged pipeline history.
+It reads the source's seen set; polling owns discovery and enqueueing. Command sources receive
+`ARETE_LOOP`, `ARETE_LOOP_DIR`, `ARETE_SOURCE` and `ARETE_SOURCE_SAMPLE` (1 only for previews).
+`data.at` is the recorded merge completion time. The first poll baselines history; late discoveries
+remain discoverable because there is no timestamp watermark.
+
+`arete merge-check [REPO]` accepts JSON events on stdin and snapshots all unchecked merges for
+each selected repo. It checks a detached worktree pinned to `origin/<base>`, reuses saved check
+names and How instructions, and includes one earlier overlapping neighbour. Missing reports or
+diff history block verification. Reports, manifests, server logs and evidence stay in the local run
+folder. Findings include only PRs, run IDs and failed manifest check numbers/names; verifier prose
+and page contents stay local. Completed passes emit only `{"value":1}`. Completed product failures
+emit a deterministic finding and `{"value":0}`. Infrastructure failures preserve unchecked work and
+use the usual failed/dead-input recovery (`arete loop status merge-check`, then `arete loop requeue ID`).
+
+The consumer serializes checks using `.state/consumer.lock` under `ARETE_LOOP_DIR` (the shipped
+loop directory for direct calls). `checked.json` tracks PR identities independently of source history;
+`quota.json` reserves at most six attempts per repo per UTC day, before the product starts. Dry runs
+and skips reserve nothing. A quota hold releases the input to its existing queue and dispatch waits
+for the persisted daily reset. Each attempt has one logical verifier call, a 40-action runtime cutoff
+and a 30-minute deadline, without repair or network recovery. Unresolved scratch ownership retains
+the workspace and blocks the verdict.
+
+Ticket emits can explicitly select `repo = "$finding.repo"` with internal-or-higher trigger trust.
+Each finding must name a configured repository; missing and unknown repos are refused before
+rendering or sending. Fixed repo emits keep their existing behavior. The shipped loop uses this
+selector, prefix `[merge-check] `, label `agent`, and metric `merge_check_pass`.
+
+The named queue defaults to capacity one. Its explicit equivalent in private configuration is:
+
+```toml
+[serve.queues]
+merge-check = 1
+```
+
+See the [offline fixture recipe](../../README.md#offline-merge-check-fixture) for disposable origins,
+replay answers, blocked recovery and quota checks.
