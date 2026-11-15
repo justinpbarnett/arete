@@ -359,6 +359,7 @@ if importlib.util.find_spec("arete.scratch"):
 foreign = foreign_bytes = None
 if scenario == "foreign-version-record" and scratch.AUTHORITY.parent == root / "authority-parent":
     import hmac
+    scratch.AUTHORITY = root.resolve() / "authority-parent/verification-authority"
     scratch.AUTHORITY.mkdir(mode=0o700)
     key = os.urandom(32)
     secret = os.open(scratch.AUTHORITY / "signing.secret", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
