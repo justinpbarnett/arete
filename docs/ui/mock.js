@@ -3528,7 +3528,7 @@ window.MOCK = {
 					status: "done",
 					text: "",
 					tool: { name: "Bash", input: { command: "ls tests", description: "List the test folder" } },
-					result: { ok: true, text: "test_behavior.py\ntest_process_limits.py" },
+					result: { ok: true, text: "test_workflow.py\ntest_process_limits.py" },
 					durationSec: 0.1,
 					tokens: { in: 260, cacheRead: 23894, out: 40 },
 					cost: 0.0085,
@@ -4101,7 +4101,7 @@ window.MOCK = {
 			error: "PublicationAuthorityTests.test_continue_refreshes_token: AssertionError: 'ghs_stale' == 'ghs_stale'",
 			attempts: 3,
 			lastLines: [
-				"FAIL: test_continue_refreshes_token (tests.test_behavior.PublicationAuthorityTests)",
+				"FAIL: test_continue_refreshes_token (tests.test_sessions_and_tokens.PublicationAuthorityTests)",
 				"AssertionError: 'ghs_stale' == 'ghs_stale' : continue kept the token minted at the first push",
 				"Ran 31 tests in 19.882s",
 				"FAILED (failures=1)"

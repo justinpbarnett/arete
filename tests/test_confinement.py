@@ -1159,7 +1159,7 @@ class EscapeTests(unittest.TestCase):
         self.assertIn("ok", done.stdout)
 
     def test_the_regression_gate_works_inside(self):
-        test = "tests.test_behavior.OfflineWorkflowTests.test_complete_local_workflow_publishes_verified_change"
+        test = "tests.test_workflow.OfflineWorkflowTests.test_complete_local_workflow_publishes_verified_change"
         done = subprocess.run(scratch.protected_command([sys.executable, "-m", "unittest", test], SOURCE),
                               cwd=SOURCE, capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
