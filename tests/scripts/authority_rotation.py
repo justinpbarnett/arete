@@ -1,8 +1,9 @@
 
 import contextlib, fcntl, hmac, io, json, os, sys
 from pathlib import Path
-from arete import browser, cli, webhooks, record, scratch, util
+from arete import browser, cli, webhooks, record, scratch, state, util
 root, mode = Path(sys.argv[1]), sys.argv[2]
+state.migrate()
 scratch.AUTHORITY = root / "home/verification-authority"
 A = scratch.AUTHORITY
 def rotate():

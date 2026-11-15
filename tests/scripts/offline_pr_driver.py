@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, scratch, state, util
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+state.migrate()
 probe = [sys.executable, "-V"]
 if scratch.protected_command(probe) != probe:
     scratch.AUTHORITY = root / "authority-parent/verification-authority"

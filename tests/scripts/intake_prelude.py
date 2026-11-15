@@ -3,6 +3,7 @@ import hashlib, hmac, json, os, signal, sqlite3, sys, threading, urllib.error, u
 from datetime import timedelta
 from pathlib import Path
 from arete import config, dashboard, webhooks, loops, paths, serve, sources, state, util
+state.migrate()
 root = Path(os.environ["INTAKE_ROOT"])
 rows = root / "rows.jsonl"
 def make_loop(name="intake", trigger="", webhook=False):

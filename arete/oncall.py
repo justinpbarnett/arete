@@ -709,7 +709,9 @@ def known_twins(cfg: config.Config, policies: Policies, rows: list[tuple], known
 
 def serve_failures(beat: dict) -> dict[str, str]:
     now = {f"broken:{k}": f"{k}: loop broken: {v}" for k, v in (beat.get("broken") or {}).items()}
-    return now | {f"poll:{k}": f"{k}: poll failed: {v}" for k, v in (beat.get("poll_errors") or {}).items()}
+    now |= {f"poll:{k}": f"{k}: poll failed: {v}" for k, v in (beat.get("poll_errors") or {}).items()}
+    return now | {f"tick:{k}": f"{k}: tick failed: {f['error']}" for k, f in (beat.get("failing") or {}).items()
+                  if f.get("ticks", 0) >= control.STUCK_TICKS}
 
 
 class Watch:

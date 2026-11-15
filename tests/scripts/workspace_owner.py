@@ -4,6 +4,7 @@ from pathlib import Path
 from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, scratch, state, util
 from arete import ci
 root, scenario = Path(sys.argv[1]), sys.argv[2]
+state.migrate()
 probe = [sys.executable, "-V"]
 if scratch.protected_command(probe) != probe:
     scratch.AUTHORITY = root / "authority-parent/verification-authority"

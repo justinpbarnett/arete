@@ -3,6 +3,7 @@ import contextlib, json, os, shlex, shutil, subprocess, sys, urllib.request
 from pathlib import Path
 from arete import config, devices, gh, record, sessions, state, util
 root = Path(sys.argv[1])
+state.migrate()
 VALUE = "fake-clone-value-0001"
 shim_dir, shim_log = root / "device-bin", root / "shim.log"
 shim_dir.mkdir()

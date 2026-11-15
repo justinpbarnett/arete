@@ -3,6 +3,7 @@ import json, subprocess, sys
 from pathlib import Path
 from arete import config, devices, gh, record, replay, sessions, state
 root, scenario = Path(sys.argv[1]), sys.argv[2]
+state.migrate()
 lines = replay.sample(root / "sample")
 text = "\n".join(line for line in lines if not line.startswith("#")) + "\n"
 if scenario.startswith("draft"):

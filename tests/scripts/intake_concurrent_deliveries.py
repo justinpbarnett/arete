@@ -1,6 +1,6 @@
 
 loop = make_loop(webhook=True)
-state.ensure_schema()
+state.migrate()
 webhooks.secret("intake")
 server = web()
 body = b'{"title": "race"}'

@@ -1,8 +1,9 @@
 
 import contextlib, importlib.util, io, json, shutil, sys
 from pathlib import Path
-from arete import cli, experiment, optimize, paths, util
+from arete import cli, experiment, optimize, paths, state, util
 root = Path(sys.argv[1])
+state.migrate()
 if importlib.util.find_spec("arete.scratch"):
     from arete import scratch
     probe = [sys.executable, "-V"]

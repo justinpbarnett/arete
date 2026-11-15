@@ -255,10 +255,10 @@ def checks_and_alerts() -> dict:
 def health_word(beat: dict, found: dict) -> str:
     c, a = found["checks"].get("rows"), found["alerts"].get("rows")
     if (c is None or a is None or not beat.get("alive") or beat.get("config_problem") or beat.get("code_problem")
-            or a["alerts"] or any(x["state"] == "fault" for x in c["checks"])):
+            or beat.get("stuck") or a["alerts"] or any(x["state"] == "fault" for x in c["checks"])):
         return "fault"
     blocked = "incidents" in found and (found["incidents"].get("rows") is None or bool(found["incidents"]["rows"]))
-    if (not c["heartbeat"] or beat.get("broken") or beat.get("poll_errors") or blocked
+    if (not c["heartbeat"] or beat.get("broken") or beat.get("poll_errors") or beat.get("failing") or blocked
             or any(x["state"] != "ok" for x in c["checks"])):
         return "caution"
     return "ok"

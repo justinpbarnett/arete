@@ -17,7 +17,7 @@ paths.CONFIG_FILE.write_text(
     '[replay]\nall = true\ndir = ' + json.dumps(str(root / "fixture/replay"))
     + '\n[jev]\nenabled = false\nguard = false\n')
 cfg = config.load()
-state.ensure_schema()
+state.migrate()
 scratch = paths.RUNS_DIR / "r1/scratch"
 scratch.mkdir(parents=True)
 denied = [paths.STATE_DIR / "arete.db", paths.CONFIG_FILE, paths.PI_KEYS_FILE,

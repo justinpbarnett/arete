@@ -71,6 +71,7 @@ class Isolated(unittest.TestCase):
             self.patches.enter_context(patch.object(paths, name, value))
         paths.CONFIG_DIR.mkdir()
         paths.ensure_dirs()
+        state.migrate()
         self.repo = config.Repo(name="fixture", path=self.root / "repo", tracker="local", pipeline=True)
         self.repo.path.mkdir()
         self.cfg = config.Config(repos=[self.repo], max_parallel=8, max_parallel_per_repo=8)

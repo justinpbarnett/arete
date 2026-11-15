@@ -304,7 +304,15 @@ def check_serve() -> list[Check]:
     if not beat["alive"]:
         why = "its process is gone" if beat["process_gone"] else f"last beat {beat['age_seconds']}s ago"
         return [Check("serve:beat", False, f"arete serve is down: {why}")]
-    out = [Check("serve:beat", True, f"pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['pending']} waiting")]
+    waiting = "unknown" if beat["pending"] is None else beat["pending"]
+    out = [Check("serve:beat", True, f"pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {waiting} waiting")]
+    if failing := beat.get("failing"):
+        detail = "; ".join(f"{key}: {f['error']} (since {f['since']}, {util.count(f['ticks'], 'pass', 'passes')})"
+                           for key, f in sorted(failing.items()))
+        fails = any(control.serious_failure(key) and f["ticks"] >= control.STUCK_TICKS for key, f in failing.items())
+        out.append(Check("serve:tick", False, detail, "fail" if fails else "warn"))
+    else:
+        out.append(Check("serve:tick", True, "every tick part runs"))
     for name, error in (beat.get("broken") or {}).items():
         out.append(Check(f"loop:{name}:broken", False, error, "warn"))
     for sid, error in (beat.get("poll_errors") or {}).items():

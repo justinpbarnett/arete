@@ -220,7 +220,7 @@ def run_answer(handler, method, path, query):
 def server(port=0, live=False, runs=False):
     from arete import dashboard, state
 
-    state.ensure_schema()
+    state.migrate()
 
     class Handler(dashboard.Handler):
         def body(self):

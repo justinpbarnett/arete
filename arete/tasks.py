@@ -36,6 +36,7 @@ STEER_LOCK = owner_asks.STEER_LOCK
 POLLER_LATER = "the poller starts it when a slot frees"
 RESUMABLE = ("interrupted", "stopped", "failed")
 MAX_ANSWER_CHARS = 20000
+TICKET_CLOSED = "its ticket closed while it waited for an answer"
 
 
 class TrackerFailed(RuntimeError):
@@ -365,10 +366,15 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
             raise control.Busy(f"a run of {name}")
         if status == "stopped" and not record.move(run_id, "stopped", expect=("needs-info",), summary=record.STOPPED):
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
-        state.asks_retire(run_id, status)
+        if status == "closed" and not record.move(run_id, "stopped", expect=("needs-info",), summary=TICKET_CLOSED):
+            raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
+        state.asks_retire(run_id, "stopped" if status == "closed" else status)
         latest = not state.later_run(repo.name, tid, run_id)
         removed = latest and kept_folder_removed(repo, tid, run_id)
         folder = "its work folder is removed" if removed else "its work folder was left in place"
+        if status == "closed":
+            pipeline.write_report(state.run_get(run_id) or row)
+            return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped because {name} closed; {folder}")
         run = pipeline.Run(run_id, repo, paths.RUNS_DIR / run_id, tracker=tracker.for_ticket(cfg, repo, tid), tid=tid)
         run.dir.mkdir(parents=True, exist_ok=True)
         if status == "stopped":
@@ -401,6 +407,30 @@ def expire_asks(cfg: config.Config) -> list[str]:
             try:
                 notes.append(let_go(cfg, repo, row, "expired")["why"])
             except control.Busy:
+                continue
+    return notes
+
+
+def release_closed(cfg: config.Config) -> list[str]:
+    notes = []
+    for run_id in dict.fromkeys(a["run"] for a in state.open_asks()):
+        try:
+            _, repo, row = run_of(run_id)
+        except (control.NotFound, control.Refused):
+            continue
+        tid = str(row["issue"])
+        if row["status"] != "needs-info" or state.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid):
+            continue
+        if not pipeline.ticket_closed(cfg, repo.name, tid, row["status"]):
+            continue
+        with util.lock(STEER_LOCK, wait=True):
+            row = state.run_get(run_id) or row
+            if (not state.asks_of(run_id, "open") or row["status"] != "needs-info"
+                    or state.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid)):
+                continue
+            try:
+                notes.append(let_go(cfg, repo, row, "closed")["why"])
+            except (control.Busy, control.Refused):
                 continue
     return notes
 

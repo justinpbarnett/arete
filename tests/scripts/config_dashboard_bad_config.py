@@ -2,7 +2,7 @@
 from arete import dashboard
 write(BAD)
 server, said = quiet_server()
-server.tick()
+server.run_pass()
 class Host(dashboard.ScratchHost):
     def node(self, owner):
         return dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")

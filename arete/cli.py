@@ -825,9 +825,11 @@ def serve_line(beat: dict) -> str:
         return f"serve: DOWN, {'its process is gone, ' if beat['process_gone'] else ''}last beat {when(beat.get('at'))}"
     paused = f"; config does not load: {beat['config_problem']}" if beat.get("config_problem") else ""
     paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
+    failing = "".join(f"; tick fails at {key}: {found['error']}" for key, found in (beat.get("failing") or {}).items())
+    running, pending = ("unknown" if beat[k] is None else beat[k] for k in ("running", "pending"))
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
-            f"{beat['running']} running, {beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
-            + paused)
+            f"{running} running, {pending} waiting"
+            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "") + paused + failing)
 
 
 def loop_line(v: dict) -> str:
@@ -900,6 +902,17 @@ def latest_run(name_or_run: str) -> str:
     if not last:
         raise control.NotFound(f"{loop.name} has not run yet")
     return last["id"]
+
+
+def cmd_migrate(args) -> int:
+    try:
+        from . import state
+
+        state.migrate(contracts=not args.no_contracts)
+    except Exception as e:
+        print(f"arete migrate: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_serve(args) -> int:
@@ -1911,6 +1924,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("uninstall", help="stop arete serve and remove its agent or unit")
     p.set_defaults(fn=cmd_uninstall)
+
+    p = sub.add_parser("migrate", help="apply pending database migrations")
+    p.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
+    p.set_defaults(fn=cmd_migrate)
 
     p = sub.add_parser("serve", help="the daemon: fire loops on their triggers, run the queues, serve the dashboard")
     p.add_argument("--no-dashboard", action="store_true")
