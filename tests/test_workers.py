@@ -155,7 +155,7 @@ result(status=state.run_get(rid)["status"])
     def test_tracker_dry_run_and_secret_restriction_leave_asks_open(self):
         found = self.scratch(r'''
 from types import SimpleNamespace
-from arete import asks, pipeline, tasks
+from arete import owner_asks, pipeline, tasks
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
@@ -178,7 +178,7 @@ tk.reply_since.reset_mock()
 assert "secret" in pipeline.tracker_reply(repo, tk, "R-1", False)
 tk.reply_since.assert_not_called()
 assert state.ask_get("secret")["status"] == "open"
-assert tasks.STEER_LOCK == asks.STEER_LOCK
+assert tasks.STEER_LOCK == owner_asks.STEER_LOCK
 result(status=answer["state"])
 ''')
         self.assertEqual(found["status"], "started")
@@ -554,7 +554,7 @@ result(applying=slim(applying), heard=nums(last))
 
     def test_a_window_reads_events_across_a_month_archive_once(self):
         found = self.scratch(r'''
-from arete import hook
+from arete import tool_events
 folder = paths.EVENTS_FILE.parent
 folder.mkdir(parents=True, exist_ok=True)
 def line(ts):
@@ -563,7 +563,7 @@ def line(ts):
 paths.EVENTS_FILE.write_text(line("2026-06-01T00:00:00Z") + line("2026-06-01T00:30:00Z"))
 since = datetime(2026, 5, 31, 23, 30, tzinfo=UTC).timestamp()
 until = datetime(2026, 6, 1, 0, 30, tzinfo=UTC).timestamp()
-result(details=[e["detail"] for e in hook.read_events(since_ts=since, until_ts=until)])
+result(details=[e["detail"] for e in tool_events.read_events(since_ts=since, until_ts=until)])
 ''')
         self.assertEqual(found["details"], ["2026-05-31T23:59:59Z", "2026-06-01T00:00:00Z"])
 
@@ -874,7 +874,7 @@ class CutOffTests(unittest.TestCase):
             folder.mkdir(parents=True)
             (folder / "loop.toml").write_text(text.format(command=command))
 
-    HUNTS = ("def hunt():\n    run = engine.launch('hunt', detach=False)\n"
+    HUNTS = ("def hunt():\n    run = loop_run.launch('hunt', detach=False)\n"
              "    with state.db() as c:\n"
              "        queued = [r['key'] if 'key' in r.keys() else r['payload'] for r in "
              "c.execute(\"SELECT * FROM queue WHERE loop = 'fix'\")]\n"
@@ -884,7 +884,7 @@ class CutOffTests(unittest.TestCase):
     def test_a_hunt_stopped_during_delivery_hands_its_finding_on_at_the_next_run(self):
         self.write_loops()
         facts = self.facts(self.child(
-            self.HUNTS + "with mock.patch.object(sources, 'fire', side_effect=engine.Stopped):\n    first = hunt()\n"
+            self.HUNTS + "with mock.patch.object(sources, 'fire', side_effect=loop_run.Stopped):\n    first = hunt()\n"
             "second, third = hunt(), hunt()\nreport(first=first, second=second, third=third)"))
         first, second, third = facts["first"], facts["second"], facts["third"]
         self.assertEqual(first["status"], "stopped")
@@ -902,7 +902,7 @@ class CutOffTests(unittest.TestCase):
             "db.execute('CREATE TABLE findings (loop TEXT NOT NULL, fingerprint TEXT NOT NULL, fingerprint_text TEXT "
             "DEFAULT \"\", title TEXT, url TEXT, run_id TEXT, seen INTEGER DEFAULT 1, first_seen TEXT, last_seen TEXT, "
             "PRIMARY KEY (loop, fingerprint))')\n"
-            "key = engine.fingerprint_key(loops.find('hunt'), {'title': 'leak', 'fingerprint': 'fp-1'})\n"
+            "key = loop_run.fingerprint_key(loops.find('hunt'), {'title': 'leak', 'fingerprint': 'fp-1'})\n"
             "db.execute(\"INSERT INTO findings (loop, fingerprint, title, url, run_id) VALUES ('hunt', ?, 'leak', '', "
             "'old')\", (key,))\ndb.commit()\ndb.close()\n")
         facts = self.facts(self.child(
@@ -1064,10 +1064,10 @@ archive = paths.EVENTS_FILE.with_name('events-' + datetime.fromisoformat(old["ts
 paths.CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
 paths.CLAUDE_SETTINGS.write_text(json.dumps({"hooks": {"test": "arete hook"}}))
 checks = heartbeat.check_hook()
-first = [e["kind"] for e in hook.read_events(24)]
-both = [e["kind"] for e in hook.read_events(24 * 45)]
+first = [e["kind"] for e in tool_events.read_events(24)]
+both = [e["kind"] for e in tool_events.read_events(24 * 45)]
 with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Skill", "tool_input": {"skill": "test"}}))):
-    hook.main()
+    tool_events.main()
 active = paths.EVENTS_FILE.exists()
 paths.EVENTS_FILE.write_text(json.dumps(old) + '\n')
 before = archive.read_bytes()
@@ -1087,16 +1087,16 @@ result(first=first, both=both, archive=archive.exists(), expired=expired.exists(
         found = self.scratch(r'''
 old = {"ts": age(40), "kind": "old"}; new = {"ts": age(0), "kind": "new"}
 paths.EVENTS_FILE.write_text(json.dumps(old) + '\n' + json.dumps(new) + '\n')
-real = hook.event_stats
+real = tool_events.event_stats
 calls = []
 def racing():
     stats = real()
     if not calls:
         calls.append(1)
-        hook.rotate_events(365)
+        tool_events.rotate_events(365)
     return stats
-with mock.patch.object(hook, "event_stats", racing):
-    kinds = [e["kind"] for e in hook.read_events(24 * 45)]
+with mock.patch.object(tool_events, "event_stats", racing):
+    kinds = [e["kind"] for e in tool_events.read_events(24 * 45)]
 result(kinds=kinds, calls=len(calls))
 ''')
         self.assertEqual(found["kinds"], ["old", "new"])
@@ -1136,13 +1136,13 @@ result(removed=[not folder(r).exists() for r in ("plain", "timeline")],
     def test_phase_failures_continue_and_snapshot_failure_stops_deletions(self):
         found = self.scratch(r'''
 old = made("old", 40)
-with mock.patch.object(state, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(hook, "rotate_events", wraps=hook.rotate_events) as rotate:
+with mock.patch.object(state, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(tool_events, "rotate_events", wraps=tool_events.rotate_events) as rotate:
     server.prune()
     continued = purge.call_count == rotate.call_count == 1 and not paths.record_dir(old).exists()
-with mock.patch.object(record, "prune", side_effect=OSError("record unavailable")), mock.patch.object(hook, "rotate_events") as rotate:
+with mock.patch.object(record, "prune", side_effect=OSError("record unavailable")), mock.patch.object(tool_events, "rotate_events") as rotate:
     server.prune()
     rotated = rotate.call_count == 1
-with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(state, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(hook, "rotate_events") as rotate:
+with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(state, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(tool_events, "rotate_events") as rotate:
     server.prune()
     stopped = not any(f.called for f in (state_prune, purge, records, rotate))
 result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)

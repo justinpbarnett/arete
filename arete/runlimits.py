@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
 
-from . import lines, paths, state, util
+from . import paths, run_lines, state, util
 
 IDLE_WAITS = ("limit", "slot")
 CHECKPOINT_SECONDS = 30
@@ -71,7 +71,7 @@ def family(run_id: str) -> list[str]:
                 dropped.update(saved["left_out"])
             todo.extend(saved.get("parents", []))
             continue
-        for item in lines.read(rid):
+        for item in run_lines.read(rid):
             if item.get("event") == "repair" and item.get("source"):
                 todo.append(str(item["source"]))
             if item.get("event") == "route" and item.get("continues"):
@@ -91,7 +91,7 @@ def recorded_specification(run_id: str) -> str:
     saved = metadata(run_id, "budget.json").get("specification")
     if isinstance(saved, str) and saved:
         return saved
-    for item in reversed(lines.read(run_id)):
+    for item in reversed(run_lines.read(run_id)):
         data = item.get("data")
         if item.get("step") == "prepare" and isinstance(data, dict) and isinstance(data.get("ticket"), dict):
             return digest(data["ticket"].get("title", ""), data["ticket"].get("body", ""))
@@ -137,7 +137,7 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool) -> tuple[
 
 
 def repair_count(run_id: str) -> int:
-    read = lines.read(run_id)
+    read = run_lines.read(run_id)
     saved = metadata(run_id, "budget.json")
     if "repair_calls" in saved:
         count = saved["repair_calls"]
@@ -180,7 +180,7 @@ def idle_waits(run_id: str, row: dict) -> dict[str, float]:
         if until > since:
             found[cause] += (until - since).total_seconds()
 
-    for item in lines.read(run_id):
+    for item in run_lines.read(run_id):
         cause = item.get("cause")
         if item.get("event") != "wait" or cause not in IDLE_WAITS:
             continue
@@ -212,7 +212,7 @@ def measured_seconds(run_id: str, saved: dict, field: str) -> float:
 
 
 def verification_seconds(run_id: str, row: dict) -> float:
-    read = lines.read(run_id)
+    read = run_lines.read(run_id)
     saved = metadata(run_id, "budget.json")
     active, spent = saved.get("verification_active_since"), saved.get("verification_seconds", 0)
     opened = (measured_seconds(run_id, saved, "verification_open_seconds")
@@ -404,7 +404,7 @@ class Budget:
             self.verify_deadline = self.verify_started + remaining
             self.verification_active_since = util.iso()
             self.persist()
-        lines.write(self.run.id, "budget_verify_start")
+        run_lines.write(self.run.id, "budget_verify_start")
         self.arm()
         try:
             yield
@@ -416,7 +416,7 @@ class Budget:
                 self.verify_started = None
                 self.verification_active_since = None
                 self.persist()
-            lines.write(self.run.id, "budget_verify_end", seconds=spent)
+            run_lines.write(self.run.id, "budget_verify_end", seconds=spent)
             self.verify_deadline = None
             signal.setitimer(signal.ITIMER_REAL, 0)
             if self.run_deadline() > time.monotonic():
@@ -434,7 +434,7 @@ class Budget:
             raise Parked(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
         self.repair_calls += 1
         self.persist()
-        lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
+        run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
         row = state.run_get(self.run.id) or {}
@@ -451,7 +451,7 @@ class Budget:
             "heads": published, "branch": branch, "pr_url": pr_url, "kept": kept or {},
             "workspace": str(self.run.workspace[0]) if self.run.workspace else "", "retry": RETRY,
             **self.left_out_waits()})
-        lines.write(self.run.id, "parked", reason=reason, retry=RETRY)
+        run_lines.write(self.run.id, "parked", reason=reason, retry=RETRY)
         return {"branch": branch, "pr_url": pr_url}
 
 

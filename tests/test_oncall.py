@@ -517,12 +517,12 @@ class Backlogs(Scratch):
     def test_a_run_that_starts_and_ends_during_a_slow_scan_is_read_by_the_next(self):
         self.baseline()
         code = ("import time\n"
-                "from arete import config, lines, oncall, record, state\n"
+                "from arete import config, run_lines, oncall, record, state\n"
                 "original = oncall.Watch.run_files\n"
                 "def slow(self, since):\n"
                 "    found = original(self, since)\n"
                 "    run = record.start('pipeline', repo='demo', issue=9)\n"
-                "    lines.write(run, 'error', step='build', message='boom during the scan')\n"
+                "    run_lines.write(run, 'error', step='build', message='boom during the scan')\n"
                 "    with state.db() as c:\n"
                 "        c.execute(\"UPDATE runs SET status = 'failed' WHERE id = ?\", (run,))\n"
                 "    time.sleep(1.2)\n"

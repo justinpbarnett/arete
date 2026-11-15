@@ -110,15 +110,15 @@ def forbidden(*args, **kwargs):
 
 
 def main(root, scenario):
-    from arete import (accounts, alerts, asks, codebase, config, control, environment, factory, flows, gh, lines,
+    from arete import (accounts, alerts, owner_asks, codebase, config, control, environment, factory, flows, gh, run_lines,
                        paths, pipeline, record, replay, runlimits, runner, state, tasks, vault)
     state.migrate()
     scratch = None
     if importlib.util.find_spec("arete.scratch"):
         from arete import scratch
-    fx = SimpleNamespace(root=Path(root), scenario=scenario, accounts=accounts, alerts=alerts, asks=asks,
+    fx = SimpleNamespace(root=Path(root), scenario=scenario, accounts=accounts, alerts=alerts, owner_asks=owner_asks,
                          codebase=codebase, config=config, control=control, environment=environment,
-                         factory=factory, flows=flows, gh=gh, lines=lines, paths=paths, pipeline=pipeline,
+                         factory=factory, flows=flows, gh=gh, run_lines=run_lines, paths=paths, pipeline=pipeline,
                          record=record, replay=replay, runlimits=runlimits, runner=runner, scratch=scratch,
                          state=state, tasks=tasks, vault=vault)
     prohibit_transports(fx)
@@ -337,10 +337,10 @@ def create_task(fx):
 
 def add_held_pr_history(fx):
     old = fx.record.start("pipeline", repo="replay-sample", issue=fx.task)
-    fx.lines.write(old, "step_end", step="prepare", result="pass",
+    fx.run_lines.write(old, "step_end", step="prepare", result="pass",
                    data={"ticket": {"title": "Add kumquat", "body": "Add kumquat to the fixture notes"}})
     for n in (1, 2, 3):
-        fx.lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
+        fx.run_lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
     fx.record.settle(old, "pr")
     with fx.state.db() as connection:
         set_task_body(fx.task, "Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", connection=connection)
@@ -545,7 +545,7 @@ def continuation_result(fx, row):
     return {"failed": failed["summary"], "status": row["status"], "summary": row["summary"], "log": log,
             "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
             "steps": [s["step"] for s in state.steps(row["id"])],
-            "started": [l["step"] for l in fx.lines.read(row["id"]) if l.get("event") == "step_start"],
+            "started": [l["step"] for l in fx.run_lines.read(row["id"]) if l.get("event") == "step_start"],
             "failed_id": failed["id"], "failed_status": failed["status"],
             "failed_span": (pipeline.util.parse_iso(failed["finished"]) - pipeline.util.parse_iso(failed["started"])).total_seconds(),
             "failed_budget": runlimits.metadata(failed["id"], "budget.json"),
@@ -731,7 +731,7 @@ def fix_ask_base(fx):
 def fix_ask_continue(fx):
     state, runlimits = fx.state, fx.runlimits
     for ask in fx.waiting:
-        state.ask_close(ask["id"], "answered", fx.asks.text_answers(ask, "Main now has the fix."))
+        state.ask_close(ask["id"], "answered", fx.owner_asks.text_answers(ask, "Main now has the fix."))
     (fx.answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
     with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_repair_cycles=5)):
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--force", "--continue", fx.parked["id"]])
@@ -842,7 +842,7 @@ def asked_answers(fx, result):
             tasks.answer_ask(waiting[0]["id"], {"answers": [{"declined": True}]})
     else:
         for ask in waiting:
-            state.ask_close(ask["id"], "answered", fx.asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
+            state.ask_close(ask["id"], "answered", fx.owner_asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
 
 
 def answer_twice(fx, result):
@@ -960,7 +960,7 @@ def asked_continue(fx, result, continuing):
                "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])],
                "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
                "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
-               "heard": [w for w in ("`REPLAY_SECRET` is set for this repo", fx.asks.DECLINED) if w in prompts]}
+               "heard": [w for w in ("`REPLAY_SECRET` is set for this repo", fx.owner_asks.DECLINED) if w in prompts]}
     return row, events
 
 
@@ -1159,8 +1159,8 @@ def ordinary_extras(fx, row, events, result):
     if scenario == "code-identity":
         codebase = fx.codebase
         second = (f"import sys; sys.path.insert(0, {str(Path(codebase.__file__).parent.parent)!r}); "
-                  "from arete import codebase, lines; codebase.STAMP = 'second-engine'; "
-                  "lines.write(sys.argv[1], 'first'); lines.write(sys.argv[1], 'second')")
+                  "from arete import codebase, run_lines; codebase.STAMP = 'second-engine'; "
+                  "run_lines.write(sys.argv[1], 'first'); run_lines.write(sys.argv[1], 'second')")
         subprocess.run([sys.executable, "-I", "-c", second, row["id"]], env=os.environ, check=True, capture_output=True)
         result["identity"] = {
             "stamp": codebase.STAMP, "row": state.run_get(row["id"])["engine_sha"],

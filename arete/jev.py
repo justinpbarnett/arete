@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, paths, pi, record, util, verdicts
+from . import config, jev_verdicts, paths, pi, record, util
 from .agent import Result
 
 URL = "https://openrouter.ai/api/v1/systemone"
@@ -307,13 +307,13 @@ def screen(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = 
     questions = {name: yes_no(q) for name, (q, _) in SCREEN.items()} | {"reach": rate(*REACH)}
     subject, answers = judged(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace)
     lines = cfg.jev.screen_lines
-    scores = {name: verdicts.scored(answers[name].yes, lines[name]) for name in SCREEN}
-    scores["reach"] = verdicts.scored(float(answers["reach"].value), lines["reach"])
+    scores = {name: jev_verdicts.scored(answers[name].yes, lines[name]) for name in SCREEN}
+    scores["reach"] = jev_verdicts.scored(float(answers["reach"].value), lines["reach"])
     found = [f"{why} (p {scores[name]['p']:.2f}, line {lines[name]:g})" for name, (_, why) in SCREEN.items()
-             if verdicts.holds(scores[name])]
-    if verdicts.holds(scores["reach"]):
+             if jev_verdicts.holds(scores[name])]
+    if jev_verdicts.holds(scores["reach"]):
         found.append(f"reaches past the fix it names ({scores['reach']['p']:.2f} of 1, line {lines['reach']:g})")
-    verdicts.record(traced_run(trace), "push", subject, about, scores, "; ".join(found))
+    jev_verdicts.record(traced_run(trace), "push", subject, about, scores, "; ".join(found))
     return found
 
 
@@ -322,10 +322,10 @@ def proof(problem: str, name: str, script: str, patch: str, about: str, cfg: con
     text = (f"Finding:\n{problem}\n\nProof script ({name}), which must fail on the code before the fix and pass "
             f"after it:\n```\n{script}\n```\n\nFix diff:\n{patch}")
     subject, answers = judged(text, {n: yes_no(q) for n, (q, _, _) in PROOF.items()}, cfg, trace)
-    scores = {n: verdicts.scored(answers[n].yes, cfg.jev.proof_hold, over) for n, (_, over, _) in PROOF.items()}
+    scores = {n: jev_verdicts.scored(answers[n].yes, cfg.jev.proof_hold, over) for n, (_, over, _) in PROOF.items()}
     found = [f"{why} (p {scores[n]['p']:.2f}{'' if scores[n]['over'] else ' that it does'})"
-             for n, (_, _, why) in PROOF.items() if verdicts.holds(scores[n])]
-    verdicts.record(traced_run(trace), "proof", subject, about, scores, "; ".join(found))
+             for n, (_, _, why) in PROOF.items() if jev_verdicts.holds(scores[n])]
+    jev_verdicts.record(traced_run(trace), "proof", subject, about, scores, "; ".join(found))
     return found
 
 
@@ -339,7 +339,7 @@ def fixed(problem: str, candidates: list[tuple[str, str]], about: str, cfg: conf
                      key=lambda m: m.p, reverse=True)
     outcome = "skipped" if matches and matches[0].sure else "went on"
     for m in matches:
-        verdicts.record(traced_run(trace), "fixed", m.ref, about, {"fixed": verdicts.scored(m.p, cfg.jev.fixed_skip)},
+        jev_verdicts.record(traced_run(trace), "fixed", m.ref, about, {"fixed": jev_verdicts.scored(m.p, cfg.jev.fixed_skip)},
                         f"already fixed (p {m.p:.2f})" if m.sure else "", outcome)
     return matches
 

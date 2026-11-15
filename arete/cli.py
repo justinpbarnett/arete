@@ -284,9 +284,9 @@ def cmd_reject_rule(args) -> int:
 
 
 def cmd_events(args) -> int:
-    from . import hook
+    from . import tool_events
 
-    evs = hook.read_events(args.hours)
+    evs = tool_events.read_events(args.hours)
     if args.raw:
         for e in evs[max(len(evs) - args.limit, 0):]:
             print(json.dumps(e))
@@ -391,9 +391,9 @@ def cmd_oncall(args) -> int:
 
 
 def cmd_hook(args) -> int:
-    from . import hook
+    from . import tool_events
 
-    return hook.main()
+    return tool_events.main()
 
 
 def cmd_guard(args) -> int:
@@ -427,9 +427,9 @@ def cmd_codex_guard(args) -> int:
 
 
 def cmd_mcp_ask(args) -> int:
-    from . import asks
+    from . import owner_asks
 
-    return asks.check(sys.stdin, sys.stdout) if args.check else asks.serve(sys.stdin, sys.stdout)
+    return owner_asks.check(sys.stdin, sys.stdout) if args.check else owner_asks.serve(sys.stdin, sys.stdout)
 
 
 def cmd_background(args) -> int:
@@ -439,9 +439,9 @@ def cmd_background(args) -> int:
 
 
 def cmd_ask(args) -> int:
-    from . import ask
+    from . import jev_ask
 
-    return ask.main(args)
+    return jev_ask.main(args)
 
 
 def cmd_jev(args) -> int:
@@ -452,10 +452,10 @@ def cmd_jev(args) -> int:
 
     import json
 
-    from . import verdicts
+    from . import jev_verdicts
 
-    data = verdicts.report(args.days, config.load())
-    print(json.dumps(data, indent=2) if args.json else verdicts.render(data))
+    data = jev_verdicts.report(args.days, config.load())
+    print(json.dumps(data, indent=2) if args.json else jev_verdicts.render(data))
     return 0
 
 
@@ -487,7 +487,7 @@ def cmd_run(args) -> int:
 
 
 def run_followed(started: dict) -> int:
-    from . import client, lines, pipeline
+    from . import client, pipeline, run_lines
 
     client.emit(started)
     if not (run_id := started.get("run")):
@@ -495,7 +495,7 @@ def run_followed(started: dict) -> int:
     try:
         for line in client.followed(run_id):
             client.emit(line)
-            if line.get("event") == lines.END:
+            if line.get("event") == run_lines.END:
                 return 0 if line.get("status") in pipeline.SUCCEEDED else 1
     except KeyboardInterrupt:
         print(f"detached; run {run_id} keeps going; `arete stop {run_id}` stops it", file=sys.stderr)
@@ -618,7 +618,7 @@ def cmd_audit(args) -> int:
 def cmd_verifiers(args) -> int:
     import tomllib
 
-    from . import verifiers
+    from . import verifier_suites
 
     if args.dry_run and args.action != "run" or args.json and args.action != "report":
         print("usage: arete verifiers sample FOLDER | run SUITE [--dry-run] | report FILE [--json]", file=sys.stderr)
@@ -626,12 +626,12 @@ def cmd_verifiers(args) -> int:
     target = paths.expand(args.target)
     try:
         if args.action == "sample":
-            print_lines(verifiers.sample(target))
+            print_lines(verifier_suites.sample(target))
             return 0
         if args.action == "run":
-            return verifiers.run(target, dry=args.dry_run)
-        return verifiers.report(target, as_json=args.json)
-    except (verifiers.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
+            return verifier_suites.run(target, dry=args.dry_run)
+        return verifier_suites.report(target, as_json=args.json)
+    except (verifier_suites.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
 
@@ -877,7 +877,7 @@ def piped_events() -> list[dict]:
     return [json.loads(line) for line in sys.stdin if line.strip()]
 
 
-def read_events(file: str) -> list[dict] | None:
+def events_from_file(file: str) -> list[dict] | None:
     from . import control
 
     if not file:
@@ -922,7 +922,7 @@ def cmd_serve(args) -> int:
 
 
 def cmd_loop(args) -> int:
-    from . import control, engine, loops, scaffold, state, util
+    from . import control, loop_run, loops, scaffold, state, util
 
     try:
         if args.action == "requeue":
@@ -951,12 +951,12 @@ def cmd_loop(args) -> int:
             if not args.run_id:
                 print("arete loop exec needs --run-id; serve and `arete loop start` pass it", file=sys.stderr)
                 return 2
-            return 0 if engine.carry_opened(args.run_id) in ("done", "skipped") else 1
+            return 0 if loop_run.carry_opened(args.run_id) in ("done", "skipped") else 1
         if not args.name:
             print(f"arete loop {args.action} needs a NAME", file=sys.stderr)
             return 2
         if args.action == "try":
-            result = scaffold.try_loop(args.name, read_events(args.events), follow=follow)
+            result = scaffold.try_loop(args.name, events_from_file(args.events), follow=follow)
             print(f"\ntry {result['id']}: {result['status']}, every emit held"
                   + (f", {util.count(result['events'], 'sample event')}" if result["events"] else ""))
             return 0 if result["status"] in ("done", "skipped") else 1
@@ -967,7 +967,7 @@ def cmd_loop(args) -> int:
                      else ""))
             return 0
         if args.action == "start":
-            r = engine.launch(args.name, events=read_events(args.events))
+            r = loop_run.launch(args.name, events=events_from_file(args.events))
             print(f"started {r['id']}")
             if args.follow:
                 follow(r["id"])
@@ -1213,7 +1213,7 @@ def cmd_approve(args) -> int:
 
 
 def cmd_webhook(args) -> int:
-    from . import control, dashboard, hooks
+    from . import control, dashboard, webhooks
 
     try:
         loop = control.working_loop(args.name)
@@ -1223,9 +1223,9 @@ def cmd_webhook(args) -> int:
         print(f"{loop.name} has no webhook; set `webhook = true` under [trigger] in {paths.short_path(loop.file)}",
               file=sys.stderr)
         return 1
-    key = hooks.secret(loop.name)
+    key = webhooks.secret(loop.name)
     node = dashboard.this_node(config.load().dashboard_owner)
-    print(f"POST {dashboard.url(node, config.load().dashboard_port)}{hooks.hook_path(loop.name)}")
+    print(f"POST {dashboard.url(node, config.load().dashboard_port)}{webhooks.hook_path(loop.name)}")
     print(f"X-Arete-Token: {key}")
     print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
     return 0
@@ -1593,12 +1593,12 @@ def cmd_writers(args) -> int:
 
 
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
-    from . import lines, state
+    from . import run_lines, state
 
-    if not lines.path(run_id).exists() and not state.run_get(run_id):
+    if not run_lines.path(run_id).exists() and not state.run_get(run_id):
         return None
-    return (lines.follow(run_id, start) if follow
-            else (line for line in lines.read(run_id) if lines.seq_of(line) > start))
+    return (run_lines.follow(run_id, start) if follow
+            else (line for line in run_lines.read(run_id) if run_lines.seq_of(line) > start))
 
 
 def cmd_lines(args) -> int:
