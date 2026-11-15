@@ -1,0 +1,185 @@
+
+import assert from 'node:assert/strict';
+import { createList, demoRows, demoQueue, demoFocus, shortCount, longCount, ListHeader, ListRow, List, normalizePrimary } from './ui-list.js';
+import { Menu, dismissMenu } from './ui-menu.js';
+import { syncList, startKeys, pane, mode } from './ui-keys.js';
+assert.equal(demoRows.length, 40);
+assert.equal(shortCount(12, 40), '12/40');
+assert.equal(longCount(12, 40), '12 of 40');
+assert.equal(shortCount(12), '12');
+assert.equal(longCount(12), '12');
+assert.equal(demoQueue.rows().length, 12);
+assert.equal(demoFocus.rows().length, 40);
+const initial = nodes(ListHeader({controller:demoQueue, queue:true}));
+const filterMenu = initial.find(node => node.type === Menu && node.props.label === 'Filter');
+const choices = nodes({props:{children:filterMenu.props.children()}}).filter(node => node.type === 'button');
+assert.equal(choices.find(node => node.props.children[0].props.children.includes('Needs you')).props['aria-checked'], true);
+assert.equal(choices.find(node => node.props.children[0].props.children.includes('Running')).props['aria-checked'], false);
+choices.find(node => node.props.children[0].props.children.includes('Running')).props.onClick();
+assert.equal(demoQueue.rows().length, 24);
+const selected = nodes(ListHeader({controller:demoQueue, queue:true}));
+assert.equal(selected.filter(node => node.props?.class === 'ui-list-chip').length, 2);
+selected.find(node => node.props?.['aria-label'] === 'Remove Running').props.onClick();
+assert.equal(demoQueue.rows().length, 12);
+for (const [state, count] of [['Needs you', 12], ['Running', 12], ['Done', 8], ['Fault', 8]]) {
+  assert.equal(demoQueue.facetCount('state', state), count);
+}
+demoQueue.pick('state', 'Running');
+assert.equal(demoQueue.rows().length, 24);
+demoQueue.pick('repo', 'arete');
+assert.equal(demoQueue.rows().length, 12);
+assert.equal(demoQueue.facetCount('state', 'Done'), 4);
+assert.equal(demoQueue.facetCount('repo', 'workshop'), 12);
+assert.equal(demoFocus.rows().length, 40);
+demoQueue.setQuery('rEvIeW');
+assert(demoQueue.rows().every(row => row.title.toLowerCase().includes('review')));
+assert.equal(demoQueue.facetCount('state', 'Running'), 1);
+demoQueue.setQuery('nOtHiNg MaTcHeS');
+assert.deepEqual(demoQueue.rows(), []);
+assert.deepEqual(demoQueue.groups(), []);
+demoQueue.setQuery('');
+demoQueue.pick('repo', 'arete');
+demoQueue.pick('state', 'Needs you');
+demoQueue.pick('state', 'Running');
+assert.equal(demoQueue.rows().length, 40);
+demoQueue.setQuery('FAULT');
+assert.equal(demoQueue.rows().length, 8);
+demoQueue.setQuery('');
+demoFocus.setToggle(false);
+assert.equal(demoFocus.rows().length, 32);
+demoFocus.setToggle(true);
+assert.equal(demoFocus.rows().length, 40);
+for (const group of demoQueue.options.groups) {
+  demoQueue.setGroup(group.id);
+  const groups = demoQueue.groups();
+  assert.equal(groups.flatMap(([, rows]) => rows).length, 40);
+  for (const [name, rows] of groups) assert(rows.every(row => row[group.id] === name));
+}
+demoQueue.setGroup('');
+assert.equal(demoQueue.groups()[0][0], '');
+demoQueue.setSort('number');
+assert.deepEqual(demoQueue.rows().map(row => row.number), Array.from({length:40}, (_, i) => i + 1));
+demoQueue.setSort('newest');
+assert.equal(demoQueue.rows()[0].number, 40);
+demoQueue.setSort('title');
+assert(demoQueue.rows()[0].title.startsWith('Check'));
+demoQueue.setSort('source');
+const reversed = [...demoRows].reverse();
+demoQueue.setRows(reversed);
+assert.deepEqual(demoQueue.rows(), reversed);
+assert.equal(demoRows[0].number, 1);
+assert.notEqual(demoQueue.state.rows, reversed);
+const standalone = createList({rows:[{id:'a', title:'<b>literal</b>', state:'Done'}]});
+standalone.setQuery('<b>');
+assert.equal(standalone.rows().length, 1);
+function nodes(vnode) {
+  if (!vnode || typeof vnode !== 'object') return [];
+  return [vnode, ...[vnode.props?.children].flat(Infinity).flatMap(nodes)];
+}
+const all = nodes(ListHeader({controller:demoQueue, queue:true}));
+assert(all.some(node => node.type === Menu && node.props.label === '⇅' && node.props.title === 'Sort: Source order'));
+assert(all.some(node => node.props?.title === '40 of 40' && node.props.children === '40/40'));
+assert(!all.some(node => node.props?.['data-primary-candidate'] === ''));
+const focus = nodes(ListHeader({controller:demoFocus}));
+assert(focus.some(node => node.props?.children === '[c] New'));
+assert(focus.some(node => node.type === Menu && node.props.label === 'Sort'));
+const countOnly = nodes(ListHeader({controller:standalone}));
+assert(countOnly.some(node => node.props?.title === '1' && node.props.children === '1'));
+const row = ListRow({row:standalone.rows()[0], onOpen:()=>{}});
+assert(nodes(row).some(node => node.props?.children === '<b>literal</b>'));
+assert(nodes(row).some(node => node.props?.children === '✓ Done'));
+const buttons = [true, false, false].map(queue => ({
+  queue, primary:true, setAttribute(){}, closest(){return queue ? {} : null;},
+  classList:{toggle(name, value){buttons.find(button => button.classList === this).primary = value;}}
+}));
+for (let i = 0; i < 3; i++) normalizePrimary({querySelectorAll:()=>buttons});
+assert.equal(buttons.filter(button => button.primary).length, 1);
+assert.equal(buttons[1].primary, true);
+const handlers = {};
+const marked = new Set();
+let scrolled = 0, opened = 0, created = 0;
+const makeRow = id => ({dataset:{item:id}, hidden:false, disabled:false,
+  getClientRects:()=>[{}], getAttribute:()=>null, setAttribute(){marked.add(id);}, removeAttribute(){marked.delete(id);},
+  scrollIntoView(){scrolled++;}, matches:()=>false, querySelector:()=>null, click(){opened++;}});
+let rows = ['a','b','c'].map(makeRow);
+const field = {tagName:'INPUT', type:'search', value:'', isConnected:true, focus(){this.focused=true;}, blur(){}, dispatchEvent(){demoQueue.setQuery(this.value);}};
+const list = {dataset:{list:'offline'}, querySelectorAll(selector){return selector === '[data-row]' ? rows : rows.filter(row => marked.has(row.dataset.item));},
+  querySelector:()=>field, uiCreate(){created++;}};
+const paneEl = {dataset:{pane:'queue'}, toggleAttribute(){}, matches:()=>false,
+  querySelectorAll(selector){return selector === '[data-list]' ? [list] : [field];}};
+globalThis.document = {querySelectorAll(selector){return selector.includes('button') ? buttons : selector === '[data-pane]' ? [paneEl] : [list];},
+  querySelector:()=>null, addEventListener(name, fn){handlers[name]=fn;}};
+globalThis.window = {addEventListener(){}};
+globalThis.location = {hash:'#settings/health'};
+syncList(list);
+assert.deepEqual([...marked], ['a']);
+assert.equal(scrolled, 0);
+startKeys();
+const key = (value, target={}) => handlers.keydown({key:value, target, preventDefault(){}});
+key('j');
+assert.deepEqual([...marked], ['b']);
+rows.reverse();
+syncList(list);
+assert.deepEqual([...marked], ['b']);
+assert.equal(scrolled, 1);
+key('Enter');
+assert.equal(opened, 1);
+key('/');
+assert.equal(field.focused, true);
+rows = [];
+syncList(list);
+key('j'); key('k'); key('Enter'); key('/'); key('c');
+assert.equal(opened, 1);
+assert.equal(created, 1);
+field.value = 'review';
+mode.value = 'INSERT';
+key('Escape', {...field, matches:()=>true});
+assert.equal(mode.value, 'NORMAL');
+assert.equal(field.value, 'review');
+key('Escape');
+assert.equal(field.value, '');
+const menu = new Menu();
+menu.setState = change => Object.assign(menu.state, change);
+let restored = 0;
+menu.opener = {focus(){restored++;}};
+const menuTree = menu.render({label:'Filter', children:()=>[]});
+menuTree.props.children[0].props.onClick();
+assert.equal(menu.state.open, true);
+field.value = 'review';
+key('Escape');
+assert.equal(menu.state.open, false);
+assert.equal(field.value, 'review');
+assert.equal(restored, 1);
+key('Escape');
+assert.equal(field.value, '');
+assert.equal(dismissMenu(), false);
+rows = ['a','b','c'].map(makeRow);
+marked.clear();
+const scroll = {scrollTop:140, scrollLeft:9};
+const component = new List();
+component.props = {controller:demoQueue};
+component.base = {...list, querySelector(selector){return selector === '.ui-list-scroll' ? scroll : field;}};
+component.setState = change => Object.assign(component.state, change);
+component.componentDidMount();
+key('j');
+const scrollCalls = scrolled;
+for (let i=0; i<3; i++) {
+  demoQueue.setRows(i % 2 ? demoRows : reversed);
+  rows.reverse();
+  scroll.scrollTop = 0;
+  scroll.scrollLeft = 0;
+  component.componentDidUpdate();
+  assert.equal(scroll.scrollTop, 140);
+  assert.equal(scroll.scrollLeft, 9);
+  assert.deepEqual([...marked], ['b']);
+}
+component.componentWillUnmount();
+assert.equal(scrolled, scrollCalls);
+demoFocus.create();
+assert.equal(demoFocus.state.draft, true);
+assert.equal(demoFocus.dismiss(), true);
+demoFocus.open(demoRows[5]);
+assert.equal(demoFocus.state.detail.id, demoRows[5].id);
+assert.equal(demoFocus.dismiss(), true);
+assert.equal(demoFocus.dismiss(), false);
+assert.equal(pane.value, 'queue');

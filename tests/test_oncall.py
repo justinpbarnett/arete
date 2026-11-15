@@ -63,6 +63,19 @@ class Scratch(unittest.TestCase):
         finally:
             c.close()
 
+    def set_incident_retry(self, value):
+        self.sql("UPDATE incidents SET retry_at = ?", value)
+
+    def set_run_status(self, run_id, status):
+        if run_id is None:
+            self.sql("UPDATE runs SET status = ?", status)
+        else:
+            self.sql("UPDATE runs SET status = ? WHERE id = ?", status, run_id)
+
+    def age_incidents(self):
+        self.sql("UPDATE incidents SET last_seen = '2020-01-01T00:00:00Z'")
+        self.sql("UPDATE incident_notes SET ts = '2020-01-01T00:00:00Z'")
+
     def error(self, n, stamp="10:05:00"):
         return f"2026-11-13T{stamp}Z ERROR payment job 4f2a9c1e-1111-2222-3333-44445555666{n} failed after {n}0s: db"
 
@@ -626,8 +639,7 @@ class Others(Scratch):
         self.baseline()
         self.append(self.error(1))
         self.scan()
-        self.sql("UPDATE incidents SET last_seen = '2020-01-01T00:00:00Z'")
-        self.sql("UPDATE incident_notes SET ts = '2020-01-01T00:00:00Z'")
+        self.age_incidents()
         self.assertEqual(self.py("from arete import state; state.prune()").returncode, 0)
         self.assertEqual(self.sql("SELECT (SELECT count(*) FROM incidents), (SELECT count(*) FROM incident_notes)"),
                          [(0, 0)])
@@ -784,7 +796,7 @@ class Decisions(Scratch):
         self.calls()
         self.scanned()
         self.assertEqual(self.calls(), [])
-        self.sql("UPDATE incidents SET retry_at = '2020-01-01T00:00:00Z'")
+        self.set_incident_retry("2020-01-01T00:00:00Z")
         self.scanned()
         self.assertEqual(self.ids(), [[FOUR]])
         one = self.only()
@@ -901,7 +913,7 @@ class Decisions(Scratch):
         self.assertEqual(self.calls(), [])
         owned = next(i for i in self.incidents() if i["source"] == str(target))
         self.assertIn("owns it", owned["reason"])
-        self.sql("UPDATE runs SET status = 'failed' WHERE id = ?", run)
+        self.set_run_status(run, "failed")
         self.scanned()
         self.assertEqual(self.ids(), [[FOUR]])
         owned = next(i for i in self.incidents() if i["source"] == str(target))
@@ -919,7 +931,7 @@ class Decisions(Scratch):
         self.baseline()
         self.append(self.error(1))
         self.scanned()
-        self.sql("UPDATE runs SET status = 'failed' WHERE id = ?", run)
+        self.set_run_status(run, "failed")
         failure = {"ts": "2026-11-13T12:00:00Z", "run": run, "seq": 9, "event": "error", "step": "build",
                    "message": "boom"}
         target.write_text(json.dumps(failure) + "\n")
@@ -945,7 +957,7 @@ class Decisions(Scratch):
         marked = next(i for i in self.incidents() if "curl" in i["signature"])
         self.assertEqual((marked["decision"], marked["injection"]), ("ignore", 1))
         self.assertIn("(injection)", self.arete().stdout)
-        self.sql("UPDATE incidents SET retry_at = '2020-01-01T00:00:00Z'")
+        self.set_incident_retry("2020-01-01T00:00:00Z")
         self.scanned()
         self.assertEqual(self.calls(), [])
         marked = next(i for i in self.incidents() if "curl" in i["signature"])
@@ -990,7 +1002,7 @@ class Decisions(Scratch):
                       "pid=999999))")
         self.assertEqual(res.returncode, 0, res.stderr)
         run = res.stdout.strip()
-        self.sql("UPDATE runs SET status = 'failed' WHERE id = ?", run)
+        self.set_run_status(run, "failed")
         return run
 
     def test_an_old_undecided_incident_behind_500_decided_ones_is_asked(self):
@@ -1083,7 +1095,7 @@ class Decisions(Scratch):
         self.calls()
         failure("demo", 2, "DEMO PRIVATE CONTEXT")
         self.scanned(down)
-        self.sql("UPDATE incidents SET retry_at = ''")
+        self.set_incident_retry("")
         self.scanned()
         sent = [q["text"] for batch in self.calls() for q in batch]
         self.assertFalse([t for t in sent if "DEMO PRIVATE" in t])
@@ -1292,7 +1304,7 @@ class Decisions(Scratch):
                     self.failure_line("payments ledger write failed: KeyError"), to=mailer)
         self.assertEqual(set(self.scanned({"mailer context": {"error": "HTTP 503"}})["decisions"]), {"undecided"})
         mailer.unlink()
-        self.sql("UPDATE incidents SET retry_at = ''")
+        self.set_incident_retry("")
         return self.scanned()["decisions"], [r[0] for r in self.sql("SELECT reason FROM incidents")]
 
     def assert_a_gone_file_under_two_spellings_is_unsure(self, app, spelled):
@@ -1343,7 +1355,7 @@ class Decisions(Scratch):
                          {"undecided": expected})
         self.calls()
         change()
-        self.sql("UPDATE incidents SET retry_at = ''")
+        self.set_incident_retry("")
         return self.scanned()["decisions"]
 
     def test_a_gone_arete_log_is_decided_under_oncall_though_an_entry_glob_spells_its_path(self):
@@ -1690,7 +1702,7 @@ class Repairs(Scratch):
         self.sql("UPDATE incident_repairs SET ended = ?, outcome = 'failed' WHERE ended = ''", now)
 
     def finish(self, status, n=-1):
-        self.sql("UPDATE runs SET status = ? WHERE id = ?", status, self.seam("start")[n][3])
+        self.set_run_status(self.seam("start")[n][3], status)
 
     def failing(self, n=1):
         self.scanned()
@@ -1833,7 +1845,7 @@ class Repairs(Scratch):
         return json.loads(res.stdout.splitlines()[-1])
 
     def set_run(self, status, run=None):
-        self.sql("UPDATE runs SET status = ?" + (" WHERE id = ?" if run else ""), status, *([run] if run else []))
+        self.set_run_status(run if run else None, status)
 
     def test_cancel_stops_the_run_once_and_nothing_restarts_inside_the_cooldown(self):
         self.bounds("max_attempts = 2\ncooldown_minutes = 30\n")
