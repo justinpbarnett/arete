@@ -3127,7 +3127,10 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
     if not url:
         return ("Arete started no app for this repo. Run the commands its user runs, with real arguments, and read "
                 "the output and the exit code.")
-    return (f"Arete started the app with `{v.start}` and it answers at {url}. Arete stops it when you finish.\n\n"
+    return (f"Arete started the app with `{v.start}` and it answers at {url}. Arete stops it when you finish. The "
+            "browser opens only that address and refuses every other port, so a server you start yourself answers "
+            "curl but never loads in the browser: give a browser check the state it needs through the app at that "
+            "address.\n\n"
             "- Do in the browser what a person does in the browser, with these `mcp__playwright__` tools (load "
             f"them with ToolSearch first): {', '.join(f'`{t}`' for t in verify.PLAYWRIGHT_TOOLS)}. Read the page "
             "with `browser_snapshot`; no tool runs your own script in the page.\n"
