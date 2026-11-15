@@ -32,7 +32,7 @@ $expertise
   comment and say in your reply exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits, pushes and posts your replies,
   and deletes the `__pycache__` your commands leave, so do not mention it.
-- Stay under $max_lines changed lines for this revision, lockfiles not counted.
+- Stay under $max_lines changed lines for this revision, lockfiles and lines moved verbatim not counted.
 - Keep the change to what the feedback asks. No drive by refactors, no formatting churn.
 - Never edit `.agents/`, CI workflows, or env files.
 

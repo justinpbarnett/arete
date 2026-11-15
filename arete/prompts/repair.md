@@ -36,7 +36,7 @@ $expertise
   in your reply exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits and pushes, and deletes the
   `__pycache__` your commands leave, so do not mention it.
-- Stay under $max_lines changed lines for this repair, lockfiles not counted.
+- Stay under $max_lines changed lines for this repair, lockfiles and lines moved verbatim not counted.
 - Never edit `.agents/`, CI workflows, or env files.
 
 ## What to return
