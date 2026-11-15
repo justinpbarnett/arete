@@ -568,7 +568,9 @@ class Run(AgentRun):
         if self.dry_run:
             return
         others = [s for s in self.tracker.states if s != status]
-        labeled, moved = self.tracker.label(self.tid, add=[status], remove=others), self.tracker.move(self.tid, status)
+        labeled = self.tracker.label(self.tid, add=[status], remove=others)
+        record.note(self.id, label_pending=status if labeled else "")
+        moved = self.tracker.move(self.tid, status)
         for err in (labeled, moved):
             if err:
                 self.log(f"tracker: {util.first_line(err, 300)}")
@@ -3489,6 +3491,35 @@ def sync_moves(cfg: config.Config) -> None:
                   + (f"not moved: {util.first_line(m.error, 300)}" if m.error else f"{status}, moved to {target}"))
 
 
+def sync_labels(cfg: config.Config) -> None:
+    seen: set[tuple[str, str]] = set()
+    for r in state.runs(kind="pipeline", limit=200):
+        if r.get("label_pending") is None:
+            continue
+        key = (r["repo"] or "", str(r["issue"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        want = r["label_pending"]
+        if not want or r["status"] == "running" or util.lock_is_held(state.run_lock("pipeline", *key)):
+            continue
+        if r["status"] == "interrupted":
+            record.note(r["id"], label_pending="")
+            continue
+        try:
+            repo = cfg.repo(r["repo"])
+        except KeyError:
+            continue
+        tk = tracker.for_ticket(cfg, repo, key[1])
+        err = tk.label(key[1], add=[want], remove=[s for s in tk.states if s != want])
+        if err:
+            print(f"{util.iso()} {tracker.run_ticket_name(r)}: could not label it {want}, trying next poll: "
+                  f"{util.first_line(err, 300)}")
+            continue
+        record.note(r["id"], label_pending="")
+        print(f"{util.iso()} {tracker.run_ticket_name(r)}: labeled {want}")
+
+
 def carried_by_newer(rows: list[dict], i: int) -> bool:
     row = rows[i]
     prs = set((row.get("pr_url") or "").split())
@@ -4001,6 +4032,9 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
         for t in source.todo():
             if str(t.id) in excluded or other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
                 continue
+            if owed := state.pending_label(repo.name, t.id):
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
+                continue
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
@@ -4125,6 +4159,10 @@ def poll(dry_run: bool = False) -> int:
                 sync_outcomes(cfg)
             except Exception as e:
                 failed("syncing PR outcomes", e)
+            try:
+                sync_labels(cfg)
+            except Exception as e:
+                failed("labeling tickets", e)
         going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)
         starts = state.last_pipeline_starts()
