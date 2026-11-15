@@ -3,7 +3,9 @@ import htm from "./vendor-htm.js";
 import * as data from "./ui-data.js";
 import { screenKeys } from "./ui-keys.js";
 import { KeyBar, KeySheet } from "./ui-keybar.js";
-import { List, demoQueue, demoFocus } from "./ui-list.js";
+import { List, createList, demoQueue, demoFocus } from "./ui-list.js";
+import { Empty, Fault, Gate } from "./ui-states.js";
+import { readFault } from "./ui-live.js";
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 
@@ -16,6 +18,32 @@ function duration(seconds) {
   const value = Math.max(0, Math.floor(seconds));
   return value >= 3600 ? `${Math.floor(value / 3600)}h ${Math.floor(value % 3600 / 60)}m`
     : value >= 60 ? `${Math.floor(value / 60)}m ${value % 60}s` : `${value}s`;
+}
+
+const floorRuns = createList({ rows: [], empty: "No running work" });
+const runRow = (run) => ({ id: run.id, title: [run.ticket, run.step].filter(Boolean).join(" · "), state: "Running",
+  repo: run.repo, priority: "", number: `${run.seconds}s` });
+
+export function applyRuns(runs) {
+  const rows = (runs ?? []).map(runRow);
+  if (JSON.stringify(rows) !== JSON.stringify(floorRuns.state.rows)) floorRuns.setRows(rows);
+}
+
+const askParts = [["approvals", "Approvals"], ["skipped", "Skipped"], ["proposals", "Proposals"], ["ready", "Ready"]];
+const askSize = (part) => Array.isArray(part?.rows) ? part.rows.length : Object.values(part?.rows ?? {}).reduce((sum, rows) => sum + rows.length, 0);
+
+function queueBody({ route, snapshot, retry, page, demo }) {
+  const asks = route.screen === "triage" ? snapshot.asks : null;
+  const fault = readFault(route.screen, snapshot);
+  const cached = route.screen === "floor" ? snapshot.runs != null : snapshot.live != null;
+  const missing = route.screen === "floor" ? "No running work" : route.screen === "triage" ? "Nothing needs you" : `No ${page.queue.toLowerCase()} to show`;
+  const empty = demo ? false : route.screen === "floor" ? false : route.screen === "triage" ? asks != null && snapshot.needsYou === 0 : true;
+  const body = demo ? demo : route.screen === "floor" ? html`<${List} id="floor-runs" controller=${floorRuns} queue=${true} />`
+    : asks ? html`<p class="ui-summary">${askParts.map(([name, label]) => `${label} ${askSize(asks[name])}`).join(" · ")}</p>` : null;
+  const beside = fault && cached;
+  return html`${beside ? html`<${Fault} what=${page.queue} fault=${fault} retry=${retry} />` : null}
+    <${Gate} pending=${snapshot.pending && !cached} fault=${beside ? null : fault} empty=${empty || (!body && cached)} what=${page.queue}
+    missing=${missing} retry=${retry}>${body}<//>`;
 }
 
 function Sidebar({ route, snapshot, now }) {
@@ -51,7 +79,7 @@ function Pane({ name, label, children }) {
   </section>`;
 }
 
-export function Shell({ route, snapshot, now }) {
+export function Shell({ route, snapshot, now, retry }) {
   fixtureRevision.value;
   const actionList = fixture.value;
   const counts = actionList?.counts();
@@ -59,7 +87,16 @@ export function Shell({ route, snapshot, now }) {
   const page = data[route.screen](route);
   const health = route.screen === "settings" && route.path[0] === "health";
   const slots = route.screen === "floor" ? html`<p class="slots mono">Slots <span>${snapshot.slots}</span> / <span>${snapshot.capacity}</span></p>` : null;
-  const extra = page.extra ? html`<${Pane} name="auxiliary" label=${page.extra} />` : null;
+  const healthFocus = (body, what) => {
+    const fault = readFault(route.screen, snapshot);
+    const cached = snapshot.live != null;
+    return html`${fault && cached ? html`<${Fault} what=${what} fault=${fault} retry=${retry} />` : null}
+      <${Gate} pending=${snapshot.pending && !cached} fault=${cached ? null : fault} what=${what} retry=${retry}>${body}<//>`;
+  };
+  const nothing = (label) => html`<${Empty} what=${`No ${label.toLowerCase()} selected`} />`;
+  const extra = page.extra ? html`<${Pane} name="auxiliary" label=${page.extra}>${nothing(page.extra)}<//>` : null;
+  const queue = actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />`
+    : queueBody({ route, snapshot, retry, page, demo: health ? html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />` : null });
   return html`<div class="ui-app" data-screen=${route.screen} data-health-demo=${health ? "" : undefined}>
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
@@ -71,9 +108,9 @@ export function Shell({ route, snapshot, now }) {
         ${page.tabs ? html`<div class="tabs-slot" aria-label="Tabs"></div>` : null}
       </header>
       <div class="pane-grid">
-        <${Pane} name="queue" label=${page.queue}>${slots}${actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />` : health ? html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />` : null}<//>
-        ${route.screen === "run" ? html`<div class="run-focus"><${Pane} name="focus" label=${page.focus} />${extra}</div>`
-          : html`<${Pane} name="focus" label=${page.focus}>${health ? html`<${List} id="health-focus" controller=${demoFocus} />` : null}<//>${extra}`}
+        <${Pane} name="queue" label=${page.queue}>${slots}${queue}<//>
+        ${route.screen === "run" ? html`<div class="run-focus"><${Pane} name="focus" label=${page.focus}>${nothing(page.focus)}<//>${extra}</div>`
+          : html`<${Pane} name="focus" label=${page.focus}>${health ? healthFocus(html`<${List} id="health-focus" controller=${demoFocus} />`, page.focus) : nothing(page.focus)}<//>${extra}`}
       </div>
       <${KeyBar} />
       ${actionList ? html`<button class="fixture-replay" type="button" onClick=${replayLast}>Replay last request</button>` : null}

@@ -6,7 +6,32 @@ import threading
 import time
 
 
-def server(port=0):
+LIVE_PATHS = ("/api/sidebar", "/api/live")
+
+
+def live_rows(revision, count):
+    return [{"id": f"run-{n}", "kind": "pipeline", "ticket": f"ARE-{n}", "repo": "arete", "started": "2026-01-01T00:00:00Z",
+             "seconds": n * 10 + revision, "step": f"step {revision} of {n}", "slot": "", "paid": 0, "stopping": False}
+            for n in range(1, count + 1)]
+
+
+def live_answer(path, control):
+    from arete import util
+
+    populated = control["scenario"] == "populated"
+    runs = live_rows(control["revision"], 40) if populated else []
+    ready = [{"ticket": f"ARE-{n}"} for n in (1, 2)] if populated else []
+    if path == "/api/sidebar":
+        serve = {"at": util.iso(), "age_seconds": control["age_seconds"], "alive": True, "started": util.iso()}
+        return {"now": util.iso(), "needs_you": len(ready), "running": len(runs), "questions": 0, "health": "ok",
+                "serve": serve, "chat": {"busy": False, "draft": False}}
+    asks = {"approvals": {"rows": []}, "skipped": {"rows": []}, "proposals": {"rows": {"memory": [], "hand": [], "approve": []}},
+            "ready": {"rows": ready}, "draft": None}
+    return {"now": util.iso(), "live": {"rows": {"runs": runs, "slots": len(runs), "waiting": 0, "max_parallel": 4}},
+            "waiting": {"rows": {"tickets": [], "quiet_minutes": 5}}, "needs_you": asks}
+
+
+def server(port=0, live=False):
     from arete import dashboard, state
 
     state.ensure_schema()
@@ -18,6 +43,29 @@ def server(port=0):
             return self.payload
 
         def api(self, method, path, query):
+            if live and method == "GET" and path == "/__ui_live/requests":
+                with self.server.fixture_lock:
+                    return list(self.server.reads)
+            if live and method == "POST" and path == "/__ui_live/control":
+                data = self.body()
+                scenario = data.get("scenario", "empty")
+                if scenario not in ("empty", "populated", "error", "malformed", "delay"):
+                    raise dashboard.Refusal(400, "Invalid fixture scenario")
+                with self.server.fixture_lock:
+                    self.server.control = {**self.server.control, **data, "scenario": scenario}
+                return {"configured": True}
+            if live and method == "GET" and path in LIVE_PATHS:
+                with self.server.fixture_lock:
+                    self.server.reads.append({"path": path, "at": time.time()})
+                    control = dict(self.server.control)
+                if control["scenario"] == "delay":
+                    time.sleep(float(control["delay"]))
+                if control["scenario"] == "error":
+                    raise dashboard.Refusal(int(control["status"]), "fixture response")
+                if control["scenario"] == "malformed":
+                    self.malformed = True
+                    return {}
+                return live_answer(path, control)
             if method == "GET" and path == "/__ui_actions/requests":
                 with self.server.fixture_lock:
                     return list(self.server.requests)
@@ -64,6 +112,8 @@ def server(port=0):
             return raw
 
         def send_json(self, status, data):
+            if hasattr(self, "malformed"):
+                return self.send(200, b"{not json", "application/json", "no-store")
             if hasattr(self, "fixture_response"):
                 status, data = self.fixture_response
             super().send_json(status, data)
@@ -73,12 +123,15 @@ def server(port=0):
     instance = dashboard.Server("127.0.0.1", port, node, owner, False, handler=Handler)
     instance.requests, instance.next_response, instance.sequence = [], None, 0
     instance.fixture_lock = threading.Lock()
+    instance.reads = []
+    instance.control = {"scenario": "empty", "revision": 1, "age_seconds": 0, "delay": 0, "status": 503}
     return instance
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--live", action="store_true")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="arete-ui-actions-", dir=os.environ.get("ARETE_VERIFY_SCRATCH")) as directory:
         root = Path(directory).resolve()
@@ -86,7 +139,7 @@ def main():
             folder = root / name
             folder.mkdir()
             os.environ[f"ARETE_{name.upper()}_DIR"] = str(folder)
-        instance = server(args.port)
+        instance = server(args.port, args.live)
         print(f"http://127.0.0.1:{instance.server_port}/ui.html", flush=True)
         try:
             instance.serve_forever()

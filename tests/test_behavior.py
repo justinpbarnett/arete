@@ -9930,7 +9930,7 @@ component.componentWillUnmount();
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text('{"type":"module"}')
-            for name in ("ui-palette.js", "ui-fuzzy.js", "ui-hooks.js", "ui-keys.js", "ui-router.js", "ui-menu.js", "ui-list.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js", "vendor-preact.js", "vendor-signals.js"):
+            for name in ("ui-palette.js", "ui-fuzzy.js", "ui-hooks.js", "ui-keys.js", "ui-router.js", "ui-menu.js", "ui-list.js", "ui-states.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js", "vendor-preact.js", "vendor-signals.js"):
                 shutil.copyfile(SOURCE / "arete" / "web" / name, root / name)
             (root / "check.mjs").write_text(script)
             done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=30)
@@ -10137,10 +10137,448 @@ assert.equal(pane.value, 'queue');
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "package.json").write_text('{"type":"module"}')
-            for name in ("ui-list.js", "ui-menu.js", "ui-keys.js", "ui-router.js", "ui-palette.js", "ui-fuzzy.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js", "vendor-preact.js", "vendor-signals.js"):
+            for name in ("ui-list.js", "ui-states.js", "ui-menu.js", "ui-keys.js", "ui-router.js", "ui-palette.js", "ui-fuzzy.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js", "vendor-preact.js", "vendor-signals.js"):
                 shutil.copyfile(SOURCE / "arete" / "web" / name, root / name)
             (root / "check.mjs").write_text(script)
             done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
+    def run_module_script(self, script, names):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text('{"type":"module"}')
+            for name in (*names, "vendor-preact.js", "vendor-signals.js"):
+                shutil.copyfile(SOURCE / "arete" / "web" / name, root / name)
+            (root / "check.mjs").write_text(script)
+            done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
+    def test_live_source_contract(self):
+        source = (SOURCE / "arete" / "web" / "ui-live.js").read_text()
+        self.assertEqual(source.count("/api/sidebar"), 1)
+        self.assertEqual(source.count("/api/live"), 1)
+        self.assertNotIn("/api/asks", source)
+        self.assertIn("OFFLINE", source)
+        self.assertIn("STALE", source)
+        self.assertTrue("document.hidden" in source or "visibilityState" in source)
+        self.assertNotIn("innerHTML", source)
+        self.assertNotIn("eval", source)
+
+    def test_live_function_polls_and_recovers_offline(self):
+        script = r'''
+import assert from 'node:assert/strict';
+const errors = [];
+console.error = (...found) => errors.push(found);
+process.on('unhandledRejection', error => errors.push(error));
+let now = 1000000, ids = 0;
+const timers = new Map();
+globalThis.setTimeout = (fn, ms) => { timers.set(++ids, {fn, at: now + ms}); return ids; };
+globalThis.clearTimeout = id => { timers.delete(id); };
+Date.now = () => now;
+const listeners = new Map();
+globalThis.document = {hidden:false,
+  addEventListener(name, fn) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn); },
+  removeEventListener(name, fn) { listeners.get(name)?.delete(fn); }};
+const fire = () => [...(listeners.get('visibilitychange') ?? [])].forEach(fn => fn());
+const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+async function advance(ms) {
+  const end = now + ms;
+  for (;;) {
+    await flush();
+    const due = [...timers].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+    if (!due) break;
+    now = Math.max(now, due[1].at);
+    timers.delete(due[0]);
+    due[1].fn();
+  }
+  now = end;
+  await flush();
+}
+const log = [];
+const server = {mode:'ok', age:0, runs:2, held:[]};
+const bodyOf = url => url === '/api/sidebar'
+  ? {needs_you:3, running:server.runs, health:'ok', serve:{alive:true, age_seconds:server.age, started:'2026-01-01T00:00:00Z'}}
+  : {live:{rows:{runs:Array.from({length:server.runs}, (_, i) => ({id:`r${i}`, ticket:`T${i}`, step:'s', seconds:i})), slots:server.runs, waiting:0, max_parallel:4}},
+     needs_you:{approvals:{rows:[]}, skipped:{rows:[]}, proposals:{rows:{memory:[], hand:[], approve:[]}}, ready:{rows:[{}]}, draft:null}};
+const answer = url => ({ok:true, status:200, json:async () => bodyOf(url)});
+globalThis.fetch = (url, {signal}) => {
+  log.push([url, now]);
+  if (server.mode === 'down') return Promise.reject(new TypeError('fetch failed'));
+  if (server.mode === 'status') return Promise.resolve({ok:false, status:503, json:async () => ({})});
+  if (server.mode === 'malformed') return Promise.resolve({ok:true, status:200, json:async () => { throw new SyntaxError('bad'); }});
+  if (server.mode === 'hang') return new Promise((_, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {name:'AbortError'}))));
+  if (server.mode === 'defer') return new Promise(resolve => server.held.push(() => resolve(answer(url))));
+  return Promise.resolve(answer(url));
+};
+let loaded = 0;
+const load = () => import(`./ui-live.js?${++loaded}`);
+const count = path => log.filter(([url]) => url === path).length;
+const reset = () => { log.length = 0; };
+
+let {live, snapshot, connectivity} = await load();
+let feed = live('floor');
+assert.equal(snapshot.value.pending, true);
+assert.equal(snapshot.value.runs, null);
+await advance(0);
+assert.equal(count('/api/sidebar'), 1);
+assert.equal(count('/api/live'), 1);
+let current = snapshot.value;
+assert.equal(current.pending, false);
+assert.equal(current.needsYou, 3);
+assert.equal(current.runs.length, 2);
+assert.equal(current.slots, 2);
+assert.equal(current.capacity, 4);
+assert.equal(current.asks.ready.rows.length, 1);
+assert.equal(current.serve.alive, true);
+assert(!log.some(([url]) => url.includes('asks')));
+reset();
+await advance(5000);
+assert.equal(count('/api/sidebar'), 1);
+assert.equal(count('/api/live'), 1);
+server.runs = 0;
+await advance(5000);
+assert.deepEqual(snapshot.value.runs, []);
+server.runs = 2;
+await advance(5000);
+assert.equal(snapshot.value.runs.length, 2);
+feed.stop();
+
+reset();
+feed = live('prompts');
+await advance(0);
+assert.equal(count('/api/live'), 1);
+reset();
+await advance(25000);
+assert.equal(count('/api/sidebar'), 5);
+assert.equal(count('/api/live'), 0);
+await advance(5000);
+assert.equal(count('/api/sidebar'), 6);
+assert.equal(count('/api/live'), 1);
+feed.stop();
+
+feed = live('floor');
+await advance(0);
+server.mode = 'down';
+reset();
+await advance(5000);
+current = snapshot.value;
+assert.equal(current.failures, 1);
+assert.equal(current.offline, false);
+assert.equal(connectivity(current, now), '');
+assert.equal(current.runs.length, 2);
+assert.equal(current.fault.status, null);
+assert.equal(count('/api/live'), 1);
+await advance(5000);
+current = snapshot.value;
+assert.equal(current.offline, true);
+assert.equal(connectivity(current, now), 'OFFLINE');
+assert.equal(current.runs.length, 2);
+server.mode = 'ok';
+await advance(5000);
+current = snapshot.value;
+assert.equal(current.offline, false);
+assert.equal(current.fault, null);
+assert.equal(connectivity(current, now), '');
+server.mode = 'status';
+await advance(5000);
+assert.equal(snapshot.value.fault.status, 503);
+assert.equal(snapshot.value.runs.length, 2);
+server.mode = 'malformed';
+await advance(5000);
+assert.equal(snapshot.value.fault.message, 'Malformed response');
+server.mode = 'ok';
+await advance(5000);
+assert.equal(snapshot.value.fault, null);
+server.mode = 'hang';
+await advance(15000);
+assert.equal(snapshot.value.offline, true);
+assert.equal(connectivity(snapshot.value, now), 'OFFLINE');
+server.mode = 'ok';
+await advance(10000);
+assert.equal(snapshot.value.offline, false);
+feed.stop();
+
+({live, snapshot} = await load());
+server.mode = 'down';
+feed = live('floor');
+await advance(0);
+assert.equal(snapshot.value.live, null);
+assert.equal(snapshot.value.runs, null);
+assert.equal(snapshot.value.pending, false);
+assert.equal(snapshot.value.fault.message, 'Network error');
+feed.stop();
+server.mode = 'ok';
+
+const at = (age, received) => ({serve:{age_seconds:age}, received, offline:false});
+assert.equal(connectivity(at(0, now), now), '');
+assert.equal(connectivity(at(60, now), now), '');
+assert.equal(connectivity(at(61, now), now), 'STALE');
+assert.equal(connectivity(at(59, now), now + 1000), '');
+assert.equal(connectivity(at(59, now), now + 2000), 'STALE');
+assert.equal(connectivity({...at(61, now), offline:true}, now), 'OFFLINE');
+for (const age of [undefined, null, 'x', -1, NaN]) assert.equal(connectivity(at(age, now), now + 999999), '');
+assert.equal(connectivity({serve:null, received:0, offline:false}, now), '');
+
+({live, snapshot} = await load());
+document.hidden = true;
+reset();
+feed = live('floor');
+await advance(60000);
+await feed.retry();
+assert.equal(log.length, 0);
+assert.equal(snapshot.value.pending, true);
+document.hidden = false;
+fire();
+await advance(0);
+assert.equal(count('/api/sidebar'), 1);
+assert.equal(count('/api/live'), 1);
+document.hidden = true;
+fire();
+reset();
+await advance(60000);
+assert.equal(log.length, 0);
+assert.equal(timers.size, 0);
+server.mode = 'hang';
+document.hidden = false;
+fire();
+const failures = snapshot.value.failures;
+document.hidden = true;
+fire();
+await advance(10000);
+assert.equal(snapshot.value.failures, failures);
+server.mode = 'ok';
+document.hidden = false;
+reset();
+for (let i = 0; i < 5; i++) fire();
+await advance(0);
+assert.equal(timers.size, 1);
+reset();
+await advance(5000);
+assert.equal(count('/api/sidebar'), 1);
+feed.stop();
+
+({live, snapshot} = await load());
+server.mode = 'defer';
+server.held = [];
+const first = live('floor');
+const second = live('triage');
+assert.equal(server.held.length, 4);
+server.held.slice(0, 2).forEach(release => release());
+await flush();
+assert.equal(snapshot.value.pending, true);
+server.held.slice(2).forEach(release => release());
+await flush();
+assert.equal(snapshot.value.pending, false);
+server.mode = 'ok';
+second.stop();
+reset();
+await advance(60000);
+assert.equal(log.length, 0);
+assert.equal(timers.size, 0);
+assert.equal(listeners.get('visibilitychange').size, 0);
+const { readFault } = await load();
+const nested = {live:{live:{rows:{runs:[]}}}, asks:{approvals:{rows:[]}, ready:{error:'boom'}}, fault:null};
+assert.equal(readFault('triage', nested).message, 'boom');
+assert.equal(readFault('floor', nested), null);
+assert.equal(readFault('floor', {live:{live:{error:'bad'}}, fault:null}).message, 'bad');
+assert.equal(readFault('prompts', {live:{}, fault:{status:503}}).status, 503);
+assert.equal(readFault('triage', {live:{}, asks:{}, fault:null}), null);
+assert.deepEqual(errors, []);
+'''
+        self.run_module_script(script, ("ui-live.js",))
+
+    def test_state_drawings_use_glyphs_words_and_escaped_text(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { Loading, Empty, Fault, Offline, Stale, Connectivity, Gate, faultText } from './ui-states.js';
+const nodes = vnode => !vnode || typeof vnode !== 'object' ? [vnode] : [vnode, ...[vnode.props?.children].flat(Infinity).flatMap(nodes)];
+const words = vnode => nodes(vnode).filter(node => typeof node === 'string').join('');
+const find = (vnode, test) => nodes(vnode).find(node => node && typeof node === 'object' && test(node));
+const glyph = vnode => find(vnode, node => node.props?.class === 'ui-state-glyph').props.children;
+assert.equal(glyph(Loading({what:'runs'})), '…');
+const text = vnode => words(find(vnode, node => node.props?.class === 'ui-state-text'));
+assert.equal(text(Loading({what:'runs'})), 'Loading runs');
+assert.equal(glyph(Empty({what:'No running work'})), '○');
+assert.equal(text(Empty({what:'No running work'})), 'No running work');
+assert.equal(text(Offline()), 'OFFLINE · showing the last data');
+assert.equal(text(Stale()), 'STALE · serve heartbeat is old');
+assert.equal(Connectivity({word:''}), null);
+assert.equal(words(Connectivity({word:'OFFLINE'})), '⊘ OFFLINE');
+assert.equal(find(Connectivity({word:'STALE'}), node => node.props?.['data-conn']).props.role, 'status');
+let retried = 0;
+const fault = Fault({what:'Runs', fault:{status:503, message:'<img src=x onerror=alert(1)>'}, retry:() => retried++});
+assert.equal(fault.props.role, 'alert');
+assert(words(fault).includes('Runs unavailable · HTTP 503 · <img src=x onerror=alert(1)>'));
+assert(words(fault).includes('⇧r'));
+assert(nodes(fault).every(node => !node?.props || !('dangerouslySetInnerHTML' in node.props)));
+find(fault, node => node.type === 'button').props.onClick();
+assert.equal(retried, 1);
+assert.equal(find(Fault({what:'Runs', fault:{status:null, message:'Network error'}}), node => node.type === 'button'), undefined);
+assert.equal(faultText({status:404, message:'HTTP 404'}), 'HTTP 404');
+assert.equal(faultText(null), 'Unavailable');
+const gate = props => Gate({what:'Runs', missing:'No running work', children:'content', ...props});
+assert.equal(gate({}), 'content');
+assert.equal(gate({pending:true}).type, Loading);
+assert.equal(gate({empty:true}).type, Empty);
+assert.equal(gate({empty:true}).props.what, 'No running work');
+assert.equal(gate({pending:true, fault:{status:500}}).type, Fault);
+'''
+        self.run_module_script(script, ("ui-states.js",))
+
+    def test_read_retry_key_leaves_item_retry_and_insert_alone(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { startKeys, readRetry, mode, notice } from './ui-keys.js';
+const handlers = {};
+let withItem = false;
+const row = {dataset:{item:'a'}, hidden:false, disabled:false, getClientRects:() => [{}], getAttribute:() => null,
+  setAttribute() {}, removeAttribute() {}, scrollIntoView() {}, matches:() => false, querySelector:() => null, click() {}};
+const list = {dataset:{list:'x'}, querySelectorAll:selector => selector === '[data-row]' ? [row] : [], querySelector:() => null,
+  uiContext:() => withItem ? {item:{id:'a'}} : null};
+const paneEl = {dataset:{pane:'queue'}, toggleAttribute() {}, matches:() => false, querySelectorAll:selector => selector === '[data-list]' ? [list] : []};
+globalThis.document = {querySelectorAll:selector => selector === '[data-pane]' ? [paneEl] : selector === '[data-list]' ? [list] : [],
+  querySelector:() => null, addEventListener(name, fn) { handlers[name] = fn; }};
+globalThis.window = {addEventListener() {}};
+globalThis.location = {hash:'#floor'};
+startKeys();
+const key = value => handlers.keydown({key:value, target:{}, preventDefault() {}});
+let retried = 0;
+key('R');
+assert.equal(retried, 0);
+readRetry.value = () => { retried++; };
+key('R');
+assert.equal(retried, 1);
+key('r');
+assert.equal(retried, 1);
+mode.value = 'INSERT';
+key('R');
+assert.equal(retried, 1);
+mode.value = 'NORMAL';
+withItem = true;
+notice.value = '';
+key('R');
+assert.equal(retried, 1);
+assert.notEqual(notice.value, '');
+'''
+        self.run_module_script(script, ("ui-keys.js", "ui-router.js", "ui-menu.js", "ui-palette.js", "ui-fuzzy.js", "ui-actions.js",
+                                         "ui-undo.js", "ui-notice.js", "ui-write.js", "ui-list.js", "ui-states.js"))
+
+    def test_live_poll_keeps_cursor_scroll_and_filter(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { effect } from './vendor-signals.js';
+import { createList, List } from './ui-list.js';
+import { startKeys, selectedItem } from './ui-keys.js';
+import { live, snapshot } from './ui-live.js';
+const revision = {value:1};
+globalThis.fetch = async url => ({ok:true, status:200, json:async () => url === '/api/sidebar'
+  ? {needs_you:0, running:3, health:'ok', serve:{alive:true, age_seconds:1}}
+  : {live:{rows:{runs:['a', 'b', 'c'].map((id, i) => ({id, ticket:`T-${id}`, step:`step ${revision.value}`, seconds:i, repo:'arete'})), slots:3, max_parallel:4}}, needs_you:{}}});
+const handlers = {};
+let scrolled = 0;
+const marked = new Set();
+const makeRow = id => ({dataset:{item:id}, hidden:false, disabled:false, getClientRects:() => [{}], getAttribute:() => null,
+  setAttribute() { marked.add(id); }, removeAttribute() { marked.delete(id); }, scrollIntoView() { scrolled++; }, matches:() => false,
+  querySelector:() => null, click() {}});
+const rows = ['a', 'b', 'c'].map(makeRow);
+const scroll = {scrollTop:140, scrollLeft:9};
+const list = {dataset:{list:'floor-runs'}, querySelectorAll:selector => selector === '[data-row]' ? rows : rows.filter(row => marked.has(row.dataset.item)),
+  querySelector:selector => selector === '.ui-list-scroll' ? scroll : null};
+const paneEl = {dataset:{pane:'queue'}, toggleAttribute() {}, matches:() => false, querySelectorAll:selector => selector === '[data-list]' ? [list] : []};
+globalThis.document = {hidden:false, querySelectorAll:selector => selector === '[data-pane]' ? [paneEl] : selector === '[data-list]' ? [list] : [],
+  querySelector:() => null, addEventListener(name, fn) { handlers[name] = fn; }, removeEventListener() {}};
+globalThis.window = {addEventListener() {}};
+globalThis.location = {hash:'#floor'};
+const controller = createList({rows:[], empty:'No running work'});
+const component = new List();
+component.props = {controller, id:'floor-runs', queue:true};
+component.base = list;
+component.setState = change => Object.assign(component.state, change);
+component.componentDidMount();
+effect(() => controller.setRows((snapshot.value.runs ?? []).map(run => ({id:run.id, title:`${run.ticket} · ${run.step}`, state:'Running', repo:run.repo, priority:'', number:`${run.seconds}s`}))));
+startKeys();
+const feed = live('floor');
+await new Promise(resolve => setTimeout(resolve, 50));
+assert.deepEqual(controller.rows().map(row => row.id), ['a', 'b', 'c']);
+handlers.keydown({key:'j', target:{}, preventDefault() {}});
+assert.equal(selectedItem('floor-runs'), 'b');
+controller.setQuery('step');
+const calls = scrolled;
+revision.value = 2;
+await feed.retry();
+scroll.scrollTop = 0;
+scroll.scrollLeft = 0;
+component.componentDidUpdate();
+assert.equal(controller.rows().find(row => row.id === 'b').title, 'T-b · step 2');
+assert.equal(selectedItem('floor-runs'), 'b');
+assert.deepEqual([...marked], ['b']);
+assert.equal(scroll.scrollTop, 140);
+assert.equal(scroll.scrollLeft, 9);
+assert.equal(controller.state.query, 'step');
+assert.equal(scrolled, calls);
+feed.stop();
+'''
+        self.run_module_script(script, ("ui-live.js", "ui-list.js", "ui-states.js", "ui-keys.js", "ui-router.js", "ui-menu.js", "ui-palette.js",
+                                         "ui-fuzzy.js", "ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js"))
+
+    def test_live_fixture_serves_and_records_data_reads(self):
+        script = r'''
+import json, threading, unittest, urllib.request, urllib.error
+from tests.ui_action_fixture import server
+check = unittest.TestCase()
+instance = server(live=True)
+threading.Thread(target=instance.serve_forever, daemon=True).start()
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+base = f'http://127.0.0.1:{instance.server_port}'
+def request(path, body=None, guard=True):
+    headers = {'Content-Type': 'application/json'}
+    if guard:
+        headers['X-Arete'] = '1'
+    req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(), headers=headers)
+    try:
+        response = opener.open(req, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        return response.status, response.read().decode()
+try:
+    status, raw = request('/api/live')
+    check.assertEqual((status, json.loads(raw)['live']['rows']['runs']), (200, []))
+    check.assertEqual(request('/__ui_live/control', {'scenario': 'populated'}, guard=False)[0], 403)
+    check.assertEqual(request('/__ui_live/control', {'scenario': 'populated', 'revision': 2, 'age_seconds': 61})[0], 200)
+    runs = json.loads(request('/api/live')[1])['live']['rows']['runs']
+    check.assertEqual(len(runs), 40)
+    check.assertIn('step 2', runs[0]['step'])
+    side = json.loads(request('/api/sidebar')[1])
+    check.assertEqual((side['serve']['age_seconds'], side['needs_you']), (61, 2))
+    request('/__ui_live/control', {'scenario': 'error', 'status': 503})
+    check.assertEqual(request('/api/sidebar')[0], 503)
+    request('/__ui_live/control', {'scenario': 'malformed'})
+    status, raw = request('/api/live')
+    check.assertEqual(status, 200)
+    with check.assertRaises(ValueError):
+        json.loads(raw)
+    request('/__ui_live/control', {'scenario': 'delay', 'delay': 0.2})
+    check.assertEqual(request('/api/sidebar')[0], 200)
+    check.assertEqual(request('/__ui_live/control', {'scenario': 'nothing'})[0], 400)
+    log = json.loads(request('/__ui_live/requests')[1])
+    check.assertEqual([entry['path'] for entry in log[:2]], ['/api/live', '/api/live'])
+    check.assertEqual(len(log), 6)
+    check.assertTrue(all(isinstance(entry['at'], float) for entry in log))
+finally:
+    instance.shutdown()
+    instance.server_close()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("config", "state", "logs", "worktrees", "tmp"):
+                (root / name).mkdir()
+            env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+            env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                       ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                       TMPDIR=str(root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            command = [sys.executable, "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(SOURCE)!r});" + script]
+            done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=45)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
 
     def test_shell_and_declared_assets_are_served_with_page_policy(self):
@@ -10193,7 +10631,7 @@ try:
     check.assertEqual(assets.scripts, {
         "/ui-boot.js", "/ui-shell.js", "/ui-router.js", "/ui-data.js", "/ui-keys.js", "/ui-keybar.js", "/ui-hooks.js", "/ui-list.js", "/ui-menu.js",
         "/ui-palette.js", "/ui-fuzzy.js", "/ui-feedback.js",
-        "/ui-actions.js", "/ui-undo.js", "/ui-notice.js", "/ui-write.js",
+        "/ui-actions.js", "/ui-undo.js", "/ui-notice.js", "/ui-write.js", "/ui-live.js", "/ui-states.js",
         "/vendor-preact.js", "/vendor-htm.js", "/vendor-signals.js"})
     check.assertEqual(assets.styles, {"/ui-fonts.css", "/ui-tokens.css", "/ui-layout.css", "/ui-keys.css", "/ui-list.css", "/ui-palette.css", "/ui-feedback.css"})
     check.assertIn("/icon-192.png", assets.declared)

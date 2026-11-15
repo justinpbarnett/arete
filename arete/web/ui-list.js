@@ -2,6 +2,7 @@ import { h, Component } from "./vendor-preact.js";
 import { Menu } from "./ui-menu.js";
 import { syncList, selectItem, selectedItem, pane } from "./ui-keys.js";
 import { actions, perform } from "./ui-actions.js";
+import { Empty } from "./ui-states.js";
 
 export const shortCount = (n, total) => total == null ? String(n) : `${n}/${total}`;
 export const longCount = (n, total) => total == null ? String(n) : `${n} of ${total}`;
@@ -216,7 +217,7 @@ export class List extends Component {
           rows.map((row) => h("div", { key: row.id }, h(ListRow, { row, onOpen: (one) => list.open(one) }),
             Object.hasOwn(list.state.stale, row.id) ? h("div", { class: "ui-stale", role: "alert" },
               `Stale · current: ${JSON.stringify(list.state.stale[row.id])}`) : null))))
-        : h("p", { class: "ui-list-empty" }, "No matching items. Clear search or remove a filter."),
+        : h(Empty, { what: list.state.rows.length || !list.options.empty ? "No matching items. Clear search or remove a filter." : list.options.empty }),
         ["Snoozed", "Shelved"].map((group) => {
           const rows = list.state.parked.filter((row) => row.parked === group);
           return rows.length ? h("details", { key: group }, h("summary", { class: "ui-list-group" }, `${group} · ${rows.length}`),

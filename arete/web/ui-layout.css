@@ -39,6 +39,12 @@ html, body, #app { height: 100%; }
 .auxiliary { border-left: 1px solid var(--rule); background: var(--panel); }
 .slots { padding: 0 12px; color: var(--muted); font-size: var(--text-s); }
 .key-bar { height: var(--row); flex: none; border-top: 1px solid var(--rule); background: var(--panel); }
+.ui-state { display: flex; align-items: baseline; gap: 8px; padding: 8px 12px; color: var(--muted); font-size: var(--text-s); overflow-wrap: anywhere; }
+.ui-state-glyph { flex: none; width: 14px; text-align: center; font-family: var(--font-data); }
+.ui-state.error { color: var(--fault); }
+.ui-state-retry { padding: 0 4px; border: 1px solid var(--rule-strong); background: none; color: var(--ink-2); cursor: pointer; font-size: var(--text-s); }
+.ui-conn { flex: none; color: var(--muted); font: 600 var(--text-micro) var(--font-data); letter-spacing: .06em; }
+.ui-summary { padding: 0 12px; color: var(--ink-2); font: var(--text-s)/20px var(--font-data); }
 [data-screen="triage"] .pane-grid { grid-template-columns: clamp(380px, calc(30vw + 40px), 480px) minmax(0, 1fr); }
 [data-screen="board"] .pane-grid { grid-template-columns: minmax(0, 1fr) clamp(300px, 26vw, 380px); }
 [data-screen="task"] .pane-grid { grid-template-columns: clamp(240px, 18vw, 300px) minmax(0, 1fr) clamp(260px, 19vw, 300px); }

@@ -1,30 +1,7 @@
 import { prepareWrite, sendWrite } from "./ui-write.js";
 
-const endpoints = { sidebar: "/api/sidebar", live: "/api/live", usage: "/api/usage" };
-
-async function read(name) {
-  try {
-    const response = await fetch(endpoints[name], { cache: "no-store" });
-    return response.ok ? await response.json() : null;
-  } catch { return null; }
-}
-
-export async function shell() {
-  const [sidebar, live] = await Promise.all([read("sidebar"), read("live")]);
-  const rows = live?.live?.rows;
-  return {
-    needsYou: sidebar?.needs_you ?? null,
-    running: sidebar?.running ?? null,
-    health: sidebar?.health ?? null,
-    serve: sidebar?.serve ?? null,
-    slots: rows?.slots ?? null,
-    capacity: rows?.max_parallel ?? null,
-    received: Date.now(),
-  };
-}
-
 export function visit(row) {
-  return sendWrite(prepareWrite(endpoints.usage, { kind: "visit", ...row }, null, { keepalive: true })).catch(() => null);
+  return sendWrite(prepareWrite("/api/usage",{ kind: "visit", ...row }, null, { keepalive: true })).catch(() => null);
 }
 
 export function floor() { return { title: "Floor", subtitle: "The work in flight", queue: "Lines", focus: "Focus" }; }
