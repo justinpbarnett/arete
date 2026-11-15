@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, factory, gh, lines, paths, pipeline, util
+from . import config, factory, gh, paths, pipeline, run_lines, util
 
 PLAN_STEPS = ("plan", "revise", "repair")
 MAX_LOG = 200
@@ -28,7 +28,7 @@ class Source:
 
 
 def saved_review(run_id: str) -> tuple[dict, int]:
-    report = next((line for line in reversed(lines.read(run_id)) if line.get("event") == lines.END), {})
+    report = next((line for line in reversed(run_lines.read(run_id)) if line.get("event") == run_lines.END), {})
     review = report.get("review")
     if not isinstance(review, dict) or not review.get("verdict"):
         raise Refused(f"run {run_id} saved no review")

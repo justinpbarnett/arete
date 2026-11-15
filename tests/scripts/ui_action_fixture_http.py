@@ -27,7 +27,7 @@ try:
     check.assertEqual(request('/')[0],200)
     check.assertEqual(request('/__ui_actions/control',{},guard=False)[0],403)
     check.assertEqual(request('/__ui_actions/items/TR-209/reject',{},guard=False)[0],403)
-    with mock.patch.object(dashboard.engine, 'launch', return_value={'id':'heartbeat-test'}) as launch:
+    with mock.patch.object(dashboard.loop_run, 'launch', return_value={'id':'heartbeat-test'}) as launch:
         status, body = request('/api/checks/run',{})
         check.assertEqual((status,body),(200,{'run':'heartbeat-test'}))
         launch.assert_called_once_with('heartbeat')

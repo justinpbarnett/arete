@@ -24,7 +24,6 @@ from typing import NamedTuple, TextIO
 
 from . import (
     alerts,
-    asks,
     ci,
     config,
     control,
@@ -35,12 +34,14 @@ from . import (
     factory,
     gh,
     jev,
+    jev_verdicts,
     jira,
-    lines,
     outbound,
+    owner_asks,
     paths,
     record,
     routing,
+    run_lines,
     runlimits,
     runner,
     scratch,
@@ -49,7 +50,6 @@ from . import (
     tracker,
     util,
     vault,
-    verdicts,
     verify,
     webpush,
 )
@@ -223,7 +223,7 @@ REJECTED_PR_LISTEN = timedelta(days=7)
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
     text = (prompts_dir / f"{name}.md").read_text()
-    values.setdefault("owner", asks.NOBODY)
+    values.setdefault("owner", owner_asks.NOBODY)
     return Template(text).safe_substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
 
 
@@ -280,7 +280,7 @@ class AgentRun:
 
     @property
     def owner_note(self) -> str:
-        return asks.NOBODY
+        return owner_asks.NOBODY
 
     @property
     def where(self) -> str:
@@ -294,7 +294,7 @@ class AgentRun:
 
     def write_line(self, event: str, **fields) -> None:
         if self.writes_lines:
-            lines.write(self.id, event, **fields)
+            run_lines.write(self.id, event, **fields)
 
     @contextmanager
     def waiting(self, cause: str):
@@ -302,7 +302,7 @@ class AgentRun:
             if self.budget is not None:
                 stack.enter_context(self.budget.idling(cause))
             if self.writes_lines:
-                stack.enter_context(lines.waiting(self.id, cause))
+                stack.enter_context(run_lines.waiting(self.id, cause))
             yield
 
     def save(self, name: str, data) -> None:
@@ -390,7 +390,7 @@ class AgentRun:
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
         try:
-            with lines.beating(self.id, step) if lined else nullcontext():
+            with run_lines.beating(self.id, step) if lined else nullcontext():
                 res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
                 if res.connection_failed:
                     self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
@@ -466,7 +466,7 @@ class Run(AgentRun):
 
     @property
     def owner_note(self) -> str:
-        return asks.GUIDE if self.asks_owner else asks.NOBODY
+        return owner_asks.GUIDE if self.asks_owner else owner_asks.NOBODY
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if not self.asks_owner:
@@ -475,17 +475,17 @@ class Run(AgentRun):
         if due:
             text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
-        if due and kw["resume"].id and not res.ok and asks.session_gone(res.error):
+        if due and kw["resume"].id and not res.ok and owner_asks.session_gone(res.error):
             self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
             res = super().agent(step, self.fresh_text(plain, due), cwd, role, ask_owner=True,
                                 **{**kw, "resume": NO_SESSION})
         if due and res.ok:
             state.asks_taken([a["id"] for a in due], self.id)
             self.answers_due = [a for a in self.answers_due if a not in due]
-        while res.record and (sent := asks.found(record.events(paths.record_dir(self.id) / res.record))):
+        while res.record and (sent := owner_asks.found(record.events(paths.record_dir(self.id) / res.record))):
             kept = res.session if kw.get("persist", True) else NO_SESSION
             self.owner_ask(step, sent, kept)
-            res = super().agent(step, asks.settled_message(sent), cwd, role, ask_owner=True,
+            res = super().agent(step, owner_asks.settled_message(sent), cwd, role, ask_owner=True,
                                 **{**kw, "resume": kept, "resume_only": True})
         return res
 
@@ -495,13 +495,13 @@ class Run(AgentRun):
         return [a for a in here if a["call"] == call] or here
 
     def fresh_text(self, text: str, due: list[dict]) -> str:
-        return "\n\n".join(part for part in (text, asks.fresh_note(due), self.base_note) if part)
+        return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.base_note) if part)
 
     def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
         fresh = self.fresh_text(text, due)
         if session.id and kw.get("persist", True):
-            parts = (asks.answers_message(due), self.base_note, self.moved_folder_note(due[0]["run"]))
+            parts = (owner_asks.answers_message(due), self.base_note, self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
             return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
         return fresh, {**kw, "resume": NO_SESSION}
@@ -520,27 +520,27 @@ class Run(AgentRun):
         self.asks_made += len(sent)
         limit, seam = self.config.ask.max_per_run, factory.inside(self.id).step
         if self.asks_made > limit:
-            raise asks.Asked(sent, ask_ids, seam, step, session, limit=limit)
-        if (self.config.ask.settle and all(asks.settles(ask) for ask in sent) and session.id
+            raise owner_asks.Asked(sent, ask_ids, seam, step, session, limit=limit)
+        if (self.config.ask.settle and all(owner_asks.settles(ask) for ask in sent) and session.id
                 and jev.ready(self.config, [self.repo]) and self.settled_by_jev(step, sent, ask_ids)):
             return
-        raise asks.Asked(sent, ask_ids, seam, step, session)
+        raise owner_asks.Asked(sent, ask_ids, seam, step, session)
 
     def settled_by_jev(self, step: str, sent: list[dict], ask_ids: list[str]) -> bool:
         answers = []
         for ask in sent:
             state_text = (f"Step: {step}\nThe ask, with every question, option and description:\n"
                           f"{json.dumps(ask, indent=1)}")
-            reply = jev.ask(state_text, {"settle": jev.yes_no(asks.SETTLE)}, self.config,
+            reply = jev.ask(state_text, {"settle": jev.yes_no(owner_asks.SETTLE)}, self.config,
                             trace=(self.id, f"{step} ask jev"))
             answer = reply.answers.get("settle")
-            if not answer or answer.yes < asks.SETTLE_AT:
+            if not answer or answer.yes < owner_asks.SETTLE_AT:
                 return False
             answers.append(answer)
         for ask_id, ask, answer in zip(ask_ids, sent, answers, strict=True):
             self.log(f"{step}: took the recommended options without asking the owner ({answer.note()})")
-            lines.write(self.id, "ask_settled", ask_id=ask_id, step=factory.inside(self.id).step, call=step,
-                        choices=asks.choices(ask), p=round(answer.yes, 3))
+            run_lines.write(self.id, "ask_settled", ask_id=ask_id, step=factory.inside(self.id).step, call=step,
+                        choices=owner_asks.choices(ask), p=round(answer.yes, 3))
         return True
 
     @property
@@ -1522,7 +1522,7 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
     if (asked := answered_run(repo_name, str(tid))) and not dry_run:
-        path = str(factory.first(lines.read(asked["id"]), "task").get("path") or "") or name
+        path = str(factory.first(run_lines.read(asked["id"]), "task").get("path") or "") or name
         return script_command(cfg, path, repo_name, str(tid), *flags, "--continue", asked["id"])
     return script_command(cfg, name, repo_name, str(tid), *flags)
 
@@ -1661,14 +1661,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 for role, (ab, side, arm) in run.ab_held.items():
                     record.hold_ab(run_id, role, ab, side, arm)
             if mending:
-                lines.write(run_id, "repair", source=mending)
+                run_lines.write(run_id, "repair", source=mending)
                 run.log(f"repairing the review findings of run {mending}")
         for done in settled:
             if only and not dry_run:
                 tell_ticket_run_died(cfg, done)
                 continue
             if done["status"] != "stopped":
-                lines.write(done["id"], "error", step=lines.last_step(done["id"]), message=done.get("summary") or "")
+                run_lines.write(done["id"], "error", step=run_lines.last_step(done["id"]), message=done.get("summary") or "")
             write_report(done)
         opening_waits(run_id, run.answering,
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
@@ -1741,8 +1741,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if status == "failed":
             if flow and flow.matching and flow.stepped:
                 flow.route()
-            if not lines.ended_in_error(run_id, reply="respond" if flow else ""):
-                lines.write(run_id, "error", step=lines.last_step(run_id), message=summary)
+            if not run_lines.ended_in_error(run_id, reply="respond" if flow else ""):
+                run_lines.write(run_id, "error", step=run_lines.last_step(run_id), message=summary)
         pr_url = pr_url or str((state.run_get(run_id) or {}).get("pr_url") or "")
         run.log(f"done: {status} {pr_url or summary}")
         record.settle(run_id, status, summary=summary, pr_url=pr_url)
@@ -1773,21 +1773,21 @@ def write_report(row: dict, flow: factory.Flow | None = None, run: Run | None = 
     if flow:
         flow.respond(**fields)
     else:
-        lines.write(row["id"], "report", **fields)
+        run_lines.write(row["id"], "report", **fields)
 
 
 def report_fields(row: dict, facts: dict) -> dict:
-    read = lines.read(row["id"])
+    read = run_lines.read(row["id"])
     asked = next((line for line in reversed(read) if line.get("event") == "question"), {})
     return {"task": str(row.get("issue") or ""), "status": row.get("status") or "",
             "prs": (row.get("pr_url") or "").split(), "summary": row.get("summary") or "",
             "requirements": facts.get("requirements") or [],
-            "assumptions": [*(facts.get("assumptions") or []), *asks.assumed(factory.chain(row["id"]))],
+            "assumptions": [*(facts.get("assumptions") or []), *owner_asks.assumed(factory.chain(row["id"]))],
             "left_for_a_person": facts.get("left_for_a_person") or "", "held": facts.get("held") or "",
             "merge_held": facts.get("merge_held") or "",
             "review": facts.get("review") or report_review({}), "question": str(asked.get("summary") or ""),
             "steps": factory.tally(row["id"]), "minutes": run_minutes(row),
-            "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": lines.wait_minutes(row["id"])}
+            "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": run_lines.wait_minutes(row["id"])}
 
 
 def round_name(name: str, n: int) -> str:
@@ -1799,7 +1799,7 @@ def review_findings(review: dict) -> str:
 
 
 def repaired_by(run_id: str) -> str:
-    return str(factory.first(lines.read(run_id), "repair").get("source") or "") if run_id else ""
+    return str(factory.first(run_lines.read(run_id), "repair").get("source") or "") if run_id else ""
 
 
 def report_review(review: dict) -> dict:
@@ -1825,12 +1825,12 @@ def assumptions_of(plan: dict) -> list[str]:
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
     now = util.iso()
     if answering:
-        asked = next((line.get("ts") for line in reversed(lines.read(answering["id"]))
+        asked = next((line.get("ts") for line in reversed(run_lines.read(answering["id"]))
                       if line.get("event") == "question"), None) or answering.get("finished")
         if asked:
-            lines.waited(run_id, "person", asked, passed_over or now)
+            run_lines.waited(run_id, "person", asked, passed_over or now)
     if passed_over:
-        lines.waited(run_id, "slot", passed_over, now)
+        run_lines.waited(run_id, "slot", passed_over, now)
 
 
 def run_minutes(row: dict) -> float:
@@ -1842,7 +1842,7 @@ def run_minutes(row: dict) -> float:
 def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str,
          asked: list[dict] | None = None, session: dict | None = None) -> tuple[str, str, str]:
     for ask in asked or [{}]:
-        lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
+        run_lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
     if asked and session is not None and not run.dry_run:
         for ask in asked:
             state.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
@@ -1914,9 +1914,9 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         t = tk.get(run.tid)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
-    lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
+    run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
     if run.answering:
-        lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
+        run_lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
                     text=answer_text(run.answering["id"]))
     approval = state.triage_approval(t.ref if repo.tracker == "jira" else tracker.ticket_name(repo.name, t.ref))
     if run.feedback:
@@ -2286,7 +2286,7 @@ def left_section(run: Run, text: str) -> str:
 
 
 def assumed_block(run: Run) -> str:
-    taken = asks.assumed(factory.chain(run.id))
+    taken = owner_asks.assumed(factory.chain(run.id))
     if not taken:
         return ""
     return "## Assumed\n\nArete took these recommended options without asking:\n" + "".join(f"- {c}\n" for c in taken) + "\n"
@@ -2365,7 +2365,7 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
         for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
             publish_ci(run, b.ticket, pushed, ci.section(rounds, max_rounds))
-    except asks.Asked:
+    except owner_asks.Asked:
         raise
     except Exception as e:
         failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
@@ -3127,7 +3127,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                             mcp_config=verify.mcp_config(evidence) if url else "",
                             scratch=attempt)
             agent_finished = True
-    except asks.Asked:
+    except owner_asks.Asked:
         agent_finished = True
         raise
     except scratch.ConfinementUnavailable as e:
@@ -3434,12 +3434,12 @@ def judge_feedback(cfg: config.Config, repo_name: str, url: str, rows: list[dict
     for row, reply in zip(fresh, replies, strict=True):
         if (a := reply.answers.get("asks")) is None:
             continue
-        score = verdicts.scored(a.yes, cfg.jev.feedback_skip, over=False)
-        skip = verdicts.holds(score)
+        score = jev_verdicts.scored(a.yes, cfg.jev.feedback_skip, over=False)
+        skip = jev_verdicts.holds(score)
         row["asks"] = score["p"]
         if skip:
             row["status"] = "skipped"
-        verdicts.record(jev.traced_run(trace), "feedback", f"{url} {row['kind']} {row['gh_id']}", row["body"] or "",
+        jev_verdicts.record(jev.traced_run(trace), "feedback", f"{url} {row['kind']} {row['gh_id']}", row["body"] or "",
                         {"asks": score}, f"asks for no change and no answer (p {a.yes:.2f})" if skip else "",
                         "skipped" if skip else "went on")
         print(f"{util.iso()} {url}: JEV reads your {row['kind']} comment {row['gh_id']} as asking for a change or an "
@@ -3930,7 +3930,7 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
               alone=bool(row.get("only_step")))
     run.dir.mkdir(parents=True, exist_ok=True)
     if row["status"] != "stopped":
-        lines.write(row["id"], "error", step=lines.last_step(row["id"]), message=row.get("summary") or "")
+        run_lines.write(row["id"], "error", step=run_lines.last_step(row["id"]), message=row.get("summary") or "")
     write_report(row)
     if run.alone:
         run.log(f"{record.STOPPED if row['status'] == 'stopped' else record.INTERRUPTED}, a run of "
@@ -4164,13 +4164,13 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     waiting = state.asks_of(newest[0]["id"], "open")
     if not waiting:
         return ""
-    if any(asks.has_secret(a["questions"]) for a in waiting):
+    if any(owner_asks.has_secret(a["questions"]) for a in waiting):
         return "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
     text = tk.reply_since(tid, waiting[0]["asked"])
     if text and not dry_run:
-        with util.lock(asks.STEER_LOCK, wait=True):
+        with util.lock(owner_asks.STEER_LOCK, wait=True):
             for a in state.asks_of(newest[0]["id"], "open"):
-                state.ask_close(a["id"], "answered", asks.text_answers(a, text))
+                state.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
     return ""
 
 

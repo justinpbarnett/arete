@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import config, cron, devices, paths, runner, state, util
 
-ENGINE_DIR = paths.PACKAGE_DIR / "loops"
+BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
 TRIES = 5
 METRIC_RULE = re.compile(r"^\s*([\w.\-/]+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?)\s*$")
@@ -262,7 +262,7 @@ def fmt_seconds(s: float) -> str:
 
 
 def folders(cfg: config.Config) -> list[tuple[str, str, Path]]:
-    out = [("arete", "", ENGINE_DIR)]
+    out = [("arete", "", BUNDLED_LOOPS_DIR)]
     out += [("private", "", d) for d in cfg.loop_dirs]
     out += [("repo", r.name, r.layer_dir / "loops") for r in cfg.repos]
     return [(origin, repo, d / name) for origin, repo, d in out if d.is_dir()

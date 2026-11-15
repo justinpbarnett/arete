@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from . import asks, config, paths, record, state, util
+from . import config, owner_asks, paths, record, state, util
 from .agent import NO_SESSION, Result, Session, usage_totals
 
 ENV = "ARETE_REPLAY_DIR"
@@ -103,8 +103,8 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
     for call in calls:
         at = uuid.uuid4().hex
         on_line(json.dumps({"type": "tool_call", "id": at, "name": call["name"], "input": call.get("input")}))
-        if asks.is_ask(call["name"]):
-            text, error = asks.reply(call.get("input"))
+        if owner_asks.is_ask(call["name"]):
+            text, error = owner_asks.reply(call.get("input"))
             on_line(json.dumps({"type": "tool_result", "id": at, "name": call["name"], "text": text, "error": error}))
         elif isinstance(call.get("result"), str):
             on_line(json.dumps({"type": "tool_result", "id": at, "name": call["name"], "text": call["result"],

@@ -225,7 +225,7 @@ finish(out)
         found = self.result('''
 loop = make_loop(webhook=True)
 state.ensure_schema()
-hooks.secret("intake")
+webhooks.secret("intake")
 server = web()
 try:
     refused = post(server, "intake", b"{}", {"X-Arete-Token": "wrong"})[0]

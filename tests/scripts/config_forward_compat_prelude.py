@@ -43,7 +43,7 @@ def refused(text, **kw):
 def quiet_server():
     serve.Server.sweep_vms = lambda self: None
     serve.Server.prune = lambda self: None
-    serve.engine.launch = lambda *a, **k: (_ for _ in ()).throw(control.Refused("fixture"))
+    serve.loop_run.launch = lambda *a, **k: (_ for _ in ()).throw(control.Refused("fixture"))
     server = serve.Server()
     said = []
     server.say = said.append

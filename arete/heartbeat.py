@@ -6,7 +6,22 @@ import shutil
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import accounts, alerts, backup, codex, config, devices, hook, install, paths, pi, runner, state, steps, util
+from . import (
+    accounts,
+    alerts,
+    backup,
+    codex,
+    config,
+    devices,
+    install,
+    paths,
+    pi,
+    runner,
+    state,
+    steps,
+    tool_events,
+    util,
+)
 
 
 @dataclass
@@ -210,7 +225,7 @@ def check_hook() -> list[Check]:
     registered = "arete" in json.dumps(settings.get("hooks", {}))
     out = [Check("hook:registered", registered, "arete hook registered" if registered else "arete hook missing from settings")]
     if registered:
-        files = hook.event_stats()
+        files = tool_events.event_stats()
         if not files:
             out.append(Check("hook:events", False, "no events logged yet", "warn"))
         else:

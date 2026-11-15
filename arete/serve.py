@@ -23,11 +23,10 @@ from . import (
     dashboard,
     delivery,
     devices,
-    engine,
     environment,
     explain,
     hold_review,
-    hook,
+    loop_run,
     loops,
     oncall,
     paths,
@@ -37,6 +36,7 @@ from . import (
     sources,
     state,
     tasks,
+    tool_events,
     util,
     webpush,
 )
@@ -47,7 +47,7 @@ PRUNE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
 POLL_THREADS = 8
-IMPORT_CHECK = "from arete import codebase; codebase.load()"
+IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.loop_run; from arete import codebase; codebase.load()"
 CONFIG_CHECK = "from arete import config; config.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 SERVE_LOCK = "serve"
@@ -274,7 +274,7 @@ class Server:
                          "left are pinned, cited by a kept proposal, running or written in the last hour; "
                          "bytes outside record/ stay until folder expiry")
         try:
-            hook.rotate_events(limits.lines_days)
+            tool_events.rotate_events(limits.lines_days)
         except Exception as e:
             self.say(f"event rotation failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
@@ -429,17 +429,17 @@ class Server:
                 why = str(control.Busy(loop.name))
             elif per_queue[queue] >= size:
                 why = f"queue {queue} is full at {util.count(size, 'run')}"
-            elif spent := engine.spent_limit(loop, self.cfg):
+            elif spent := loop_run.spent_limit(loop, self.cfg):
                 why = f"its {spent} is spent"
             elif held := loop.usage_hold(self.cfg):
                 why = held
             else:
                 try:
-                    run = engine.launch(loop.name, item=item["id"], cfg=self.cfg)
+                    run = loop_run.launch(loop.name, item=item["id"], cfg=self.cfg)
                 except control.Busy as e:
                     busy.add(loop.name)
                     why = str(e)
-                except engine.NeverBegan as e:
+                except loop_run.NeverBegan as e:
                     self.retry_once(item, str(e))
                     continue
                 except (control.NotFound, control.Refused):

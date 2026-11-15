@@ -1,7 +1,7 @@
 
 import threading
 from types import SimpleNamespace
-from arete import asks, control, pipeline, tasks
+from arete import owner_asks, control, pipeline, tasks
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
@@ -12,7 +12,7 @@ fetched, threads, errors, launches = threading.Event(), [], [], []
 lock_requested, tracker_closes = threading.Event(), []
 original_lock, original_close = util.lock, state.ask_close
 def lock(name, *args, **kwargs):
-    if name == asks.STEER_LOCK and threading.current_thread() is not threading.main_thread():
+    if name == owner_asks.STEER_LOCK and threading.current_thread() is not threading.main_thread():
         lock_requested.set()
     return original_lock(name, *args, **kwargs)
 def close(*args, **kwargs):
@@ -37,7 +37,7 @@ def continuing(*args):
         assert lock_requested.wait(5), "tracker did not take the steering lock"
     else:
         ask = state.ask_get("ask")
-        state.ask_close("ask", "answered", asks.text_answers(ask, "tracker text"))
+        state.ask_close("ask", "answered", owner_asks.text_answers(ask, "tracker text"))
     return ["resume"]
 def launch(*args, **kwargs):
     launches.append(args)

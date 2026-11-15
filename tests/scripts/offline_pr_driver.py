@@ -2,7 +2,7 @@ import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from arete import accounts, agent, asks, config, control, factory, gh, lines, paths, pipeline, record, replay, runlimits, scratch, state, util
+from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, scratch, state, util
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 probe = [sys.executable, "-V"]
 if scratch.protected_command(probe) != probe:
@@ -82,7 +82,7 @@ def killed_run():
 since = util.iso(util.now() - timedelta(days=30))
 def snapshot(row):
     row = state.run_get(row["id"])
-    read = lines.read(row["id"])
+    read = run_lines.read(row["id"])
     reports = [e for e in read if e.get("event") == "report"]
     routes = [e for e in read if e.get("event") == "route"]
     return {"id": row["id"], "status": row["status"], "summary": row["summary"], "pr_url": row["pr_url"],
@@ -136,7 +136,7 @@ elif scenario == "repair-stop":
 elif scenario == "answer-stop":
     first = take(run_ticket())
     for ask in state.asks_of(first["id"], "open"):
-        state.ask_close(ask["id"], "answered", asks.text_answers(ask, "Spelled with a K."))
+        state.ask_close(ask["id"], "answered", owner_asks.text_answers(ask, "Spelled with a K."))
     pipeline.watch_ci = stopping
     take(run_ticket("--continue", first["id"]))
 elif scenario == "retry-stop":

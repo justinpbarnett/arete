@@ -12,6 +12,7 @@ from . import (
     config,
     gh,
     jev,
+    jev_verdicts,
     paths,
     research_plan,
     research_search,
@@ -21,7 +22,6 @@ from . import (
     tracker,
     triage,
     util,
-    verdicts,
 )
 from .agent import Result
 from .heartbeat import mark_loop, network_up_or_skip
@@ -346,9 +346,9 @@ def change_matters(cfg: config.Config, r: dict, prior: dict, said: str) -> float
     a = jev.ask(text, {"changed": jev.yes_no(CHANGED)}, cfg, trace=trace).answers.get("changed")
     if a is None:
         return None
-    score = verdicts.scored(a.yes, cfg.jev.research_rerun, over=False)
-    kept = verdicts.holds(score)
-    verdicts.record(jev.traced_run(trace), "changed", r["ref"], r["title"], {"changed": score},
+    score = jev_verdicts.scored(a.yes, cfg.jev.research_rerun, over=False)
+    kept = jev_verdicts.holds(score)
+    jev_verdicts.record(jev.traced_run(trace), "changed", r["ref"], r["title"], {"changed": score},
                     f"kept the report, the change does not need it (p {a.yes:.2f})" if kept else "",
                     "skipped" if kept else "went on")
     return a.yes
@@ -392,9 +392,9 @@ def answered_by(cfg: config.Config, r: dict, ticket: triage.TicketText, done: li
         return "", 0.0
     p = 1 - a.probabilities.get("none", 0.0)
     top = str(a.value) if a.value in options and a.value != "none" else ""
-    score = verdicts.scored(p, cfg.jev.research_answered)
-    link = top if top and verdicts.holds(score) else ""
-    verdicts.record(jev.traced_run(trace), "answered", r["ref"], r["title"], {"answered": score},
+    score = jev_verdicts.scored(p, cfg.jev.research_answered)
+    link = top if top and jev_verdicts.holds(score) else ""
+    jev_verdicts.record(jev.traced_run(trace), "answered", r["ref"], r["title"], {"answered": score},
                     f"answered by the report for {link} (p {p:.2f})" if link else "", "skipped" if link else "went on")
     return link, p
 

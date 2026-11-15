@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
 
-from . import accounts, asks, claude, config, devices, environment, paths, scratch, state, util
+from . import accounts, claude, config, devices, environment, owner_asks, paths, scratch, state, util
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -703,7 +703,7 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
         cmd += ["--extension", str(GUARD_FILE)]
         if ask_owner:
             cmd += ["--extension", str(ASK_FILE)]
-    names = [*names, asks.TOOL] if ask_owner and not remote else names
+    names = [*names, owner_asks.TOOL] if ask_owner and not remote else names
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
     if model:
         cmd += ["--model", model]
@@ -963,7 +963,7 @@ def _run(
         folder = selected.view
         env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
                **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files),
-               **({"ARETE_ASK_TOOL": json.dumps(asks.pi_tool())} if ask_owner else {})}
+               **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     try:
         with refresh_channel(selected, env) as descriptors:
             if error := plan_token_error(env.items()):
