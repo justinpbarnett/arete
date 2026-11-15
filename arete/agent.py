@@ -106,11 +106,12 @@ def rate_limit_type(data) -> str:
 
 
 def credit_limit(data) -> UsageLimit | None:
-    text = (data if isinstance(data, str) else json.dumps(data, default=str)).lower()
-    text = text.replace("_", " ").replace("-", " ")
+    raw = (data if isinstance(data, str) else json.dumps(data, default=str)).lower()
+    text = raw.replace("_", " ").replace("-", " ")
     explicit = re.search(r'\b(?:insufficient (?:quota|credits?|funds)|payment required|'
                          r'billing (?:hard )?limit reached|(?:out of|not enough|no remaining) credits?|'
                          r'no credits? (?:left|available)|'
+                         r'reached (?:your|the) (?:specified )?(?:workspace )?api usage limits?|'
                          r'(?:request )?requires more credits)\b|'
                          r'\b(?:credit balance|credits?|(?:billing|credit|spend(?:ing)?) (?:cap|limit|quota)) '
                          r'(?:(?:is|are|was|were|has been|have been|already|fully|completely) )?'
@@ -121,9 +122,14 @@ def credit_limit(data) -> UsageLimit | None:
     if not explicit:
         return None
     now = util.now()
-    reset = provider_reset(data)
+    reset = provider_reset(data) or regain_access(raw)
     until = max(now + timedelta(seconds=1), reset) if reset and reset > now else now + timedelta(hours=1)
     return UsageLimit(util.iso(until), "credit", "credit", "credit")
+
+
+def regain_access(text: str) -> datetime | None:
+    found = re.search(r'regain access on (\d{4}-\d{2}-\d{2}) at (\d{2}:\d{2}) utc', text)
+    return reset_at(f"{found[1]}T{found[2]}:00+00:00") if found else None
 
 
 @dataclass
