@@ -664,11 +664,16 @@ def open_workspace(run: LoopRun) -> Workspace:
         start = base
     branch = f"loop/{run.id}"
     wt = paths.WORKTREES_DIR / f"loop-{run.id}"
-    util.git(["worktree", "add", "-q", "-b", branch, str(wt), start], src)
-    run.log("start", f"worktree {paths.short_path(wt)} on {branch} from {start}")
-    public = repo.public or (bool(github) and gh.repo_private(github) is not True)
-    return Workspace(src, wt, branch, base, github, start=util.git(["rev-parse", "HEAD"], wt).strip(),
-                     deny=diffguard.denied_paths(layer), max_diff_lines=layer.max_diff_lines, public=public)
+    try:
+        util.add_worktree(src, wt, branch, start)
+        run.log("start", f"worktree {paths.short_path(wt)} on {branch} from {start}")
+        public = repo.public or (bool(github) and gh.repo_private(github) is not True)
+        return Workspace(src, wt, branch, base, github, start=util.git(["rev-parse", "HEAD"], wt).strip(),
+                         deny=diffguard.denied_paths(layer), max_diff_lines=layer.max_diff_lines, public=public)
+    except Exception:
+        util.git(["worktree", "remove", "--force", str(wt)], src, check=False)
+        util.delete_branch(src, branch)
+        raise
 
 
 def drop_worktree(ws: Workspace) -> None:
@@ -678,7 +683,7 @@ def drop_worktree(ws: Workspace) -> None:
 def close_workspace(ws: Workspace, keep_branch: bool) -> None:
     drop_worktree(ws)
     if not keep_branch:
-        util.git(["branch", "-D", ws.branch], ws.src, check=False)
+        util.delete_branch(ws.src, ws.branch)
 
 
 def revert(wt: Path) -> None:

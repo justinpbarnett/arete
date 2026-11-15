@@ -190,7 +190,7 @@ class PullRequest(Emit):
 
     def rejected(self, item: dict) -> None:
         if item.get("workdir"):
-            util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+            util.delete_branch(Path(item["workdir"]), item["branch"])
 
 
 class ToLoop(Emit):
