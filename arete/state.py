@@ -535,7 +535,8 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 CREATE TABLE IF NOT EXISTS record_pins (run_id TEXT PRIMARY KEY, pinned TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_purges (run_id TEXT PRIMARY KEY, reason TEXT NOT NULL, queued TEXT NOT NULL);
 """
-MIGRATIONS = [("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
+MIGRATIONS = [("cursors", "last_ok", "ALTER TABLE cursors ADD COLUMN last_ok TEXT"),
+("asks", "reminded", "ALTER TABLE asks ADD COLUMN reminded TEXT DEFAULT ''"),
               ("runs", "files_purged", "ALTER TABLE runs ADD COLUMN files_purged TEXT"),
               ("queue", "attempts", "ALTER TABLE queue ADD COLUMN attempts INTEGER DEFAULT 0"),
               ("queue", "dead_at", "ALTER TABLE queue ADD COLUMN dead_at TEXT"),
@@ -883,11 +884,19 @@ def cursor(source: str, connect=db) -> dict | None:
         return dict(r) if r else None
 
 
-def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", connect=db) -> None:
+def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", connect=db, started=None) -> None:
     prev = cursor(source, connect) or {}
+    last_ok = (started or util.iso()) if ok else prev.get("last_ok") or (prev.get("polled") if prev.get("ok") else None)
     with connect() as c:
-        c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
-                  (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500]))
+        c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail, last_ok) VALUES (?,?,?,?,?,?)",
+                  (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500],
+                   last_ok))
+
+
+def adopt_source(old: str, new: str) -> None:
+    with db() as c:
+        for table in ("cursors", "seen", "source_owners"):
+            c.execute(f"UPDATE OR REPLACE {table} SET source = ? WHERE source = ?", (new, old))
 
 
 def source_owner(source: str) -> str | None:

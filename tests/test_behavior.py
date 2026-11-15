@@ -3399,7 +3399,8 @@ finish({"base": base, "failed": failed, "lines": lines, "healed": healed, "third
         self.assertEqual(failed["cursor"]["value"], found["base"]["cursor"]["value"], shown)
         self.assertEqual(failed["owner"], found["base"]["owner"], shown)
         self.assertEqual(len([line for line in found["lines"] if "poll failed" in line]), 1, shown)
-        self.assertIn("intake#0: poll failed: OperationalError: database is locked", found["lines"][0], shown)
+        failure = next(line for line in found["lines"] if "poll failed" in line)
+        self.assertIn("intake#0: poll failed: OperationalError: database is locked", failure, shown)
         healed = found["healed"]
         self.assertEqual((healed["seen"], healed["events"], healed["queue"]), (3, 3, 1), shown)
         self.assertEqual(healed["queue_rows"], [{"grp": "", "keys": ["a", "b", "c"]}], shown)
@@ -3450,8 +3451,9 @@ error = poll(server, loop)
 finish({"error": str(error), "lines": server.lines})
 ''')
         self.assertEqual(found["error"], "cursor is locked", str(found))
-        self.assertEqual(len(found["lines"]), 1, str(found))
-        self.assertIn("intake#0: poll failed: OperationalError: cursor is locked", found["lines"][0], str(found))
+        failures = [line for line in found["lines"] if "poll failed" in line]
+        self.assertEqual(len(failures), 1, str(found))
+        self.assertIn("intake#0: poll failed: OperationalError: cursor is locked", failures[0], str(found))
 
     def test_a_row_the_loop_cannot_group_does_not_stop_the_batch(self):
         found = self.result('''
@@ -3587,6 +3589,407 @@ finish({"refused": refused, "after_refusal": after_refusal, "snap": snap()})
         self.assertEqual(found["refused"], 403, str(found))
         self.assertEqual([found["after_refusal"][t] for t in ("seen", "events", "queue")], [0, 0, 0], str(found))
         self.assertEqual(found["snap"]["queue_rows"], [{"grp": "", "keys": []}], str(found))
+
+
+class SourceIdentityTests(unittest.TestCase):
+    SCRIPT = r'''
+import contextlib, hashlib, io, json, os, sys, threading
+from datetime import timedelta
+from pathlib import Path
+from unittest import mock
+from arete import config, jira, loops, paths, serve, sources, state, util
+root = Path(os.environ["IDENT_ROOT"])
+cfg = config.load()
+server = serve.Server()
+returned = []
+real_poll = sources.poll
+def recording(*a, **k):
+    got = real_poll(*a, **k)
+    returned.append(got)
+    return got
+sources.poll = recording
+out = {}
+def block(target, **more):
+    lines = ["[[source]]", 'type = "command"', "command = " + json.dumps(["cat", str(target)])]
+    return "\n".join(lines + [f"{k} = {v}" for k, v in more.items()]) + "\n"
+def load(name, *blocks):
+    folder = paths.CONFIG_DIR / "loops" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "loop.toml").write_text('kind = "command"\n[run]\ncommand = "true"\n' + "".join(blocks))
+    return loops.load(folder, "private", "", cfg)
+def write(path, *rows):
+    Path(path).write_text("".join(json.dumps(r) + "\n" for r in rows))
+def row(key, at=None):
+    return {"key": key, "title": key, "data": {"at": at} if at else {}}
+def poll(loop, index=0):
+    returned.clear()
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        server.poll_source(loop, index)
+    events = returned[0][0] if returned else []
+    return {"ran": bool(returned), "keys": [e["key"] for e in events], "titles": [e["title"] for e in events],
+            "lines": buffer.getvalue().splitlines()}
+def sql(query, *args):
+    with state.db() as c:
+        return [tuple(r) for r in c.execute(query, args)]
+def seen(sid):
+    return sorted(r[0] for r in sql("SELECT key FROM seen WHERE source = ?", sid))
+def queued(loop):
+    return [[e["key"] for e in json.loads(r[0])] for r in sql("SELECT payload FROM queue WHERE loop = ? ORDER BY id", loop)]
+def rows_for(sid):
+    return {t: len(sql(f"SELECT 1 FROM {t} WHERE source = ?", sid)) for t in ("cursors", "seen", "source_owners")}
+def quoted(text):
+    return json.dumps(text)
+
+data = root / "plain.jsonl"
+write(data, row("p1"), row("p2"))
+loop = load("plain", block(data, timeout="60", trust=quoted("internal"), every=quoted("1m")))
+first = poll(loop)
+write(data, row("p1"), row("p2"), row("p3"))
+loop = load("plain", block(data, timeout="30", trust=quoted("owner"), every=quoted("10m")))
+edited = poll(loop)
+out["plain"] = {"first": first, "edited": edited, "again": poll(loop), "seen": seen("plain#0"),
+                "queued": queued("plain")}
+
+class Fake:
+    def __init__(self):
+        self.books = {}
+    def search(self, jql, fields, limit=50):
+        if jql not in self.books:
+            raise RuntimeError("Error in the JQL Query: " + jql)
+        return self.books[jql]
+    def browse_url(self, key):
+        return "https://jira.invalid/browse/" + key
+def ticket(key, updated):
+    return {"key": key, "fields": {"summary": key, "updated": updated, "status": {"name": "Ready"}}}
+def jira_block(jql):
+    return '[[source]]\ntype = "jira"\njql = ' + quoted(jql) + "\n"
+fake = Fake()
+with mock.patch.object(jira.Client, "from_env", lambda *a, **k: fake):
+    old = util.iso(util.now() - timedelta(days=2))
+    fake.books["status = Ready"] = [ticket("ABC-1", old)]
+    loop = load("outage", jira_block("status = Ready"))
+    base = poll(loop)
+    good, owner = state.cursor("outage#0"), state.source_owner("outage#0")
+    loop = load("outage", jira_block("status = Refused"))
+    failed = [poll(loop), poll(loop)]
+    bad, owner_after = state.cursor("outage#0"), state.source_owner("outage#0")
+    stamp = util.parse_iso(good["last_ok"])
+    after = util.iso(stamp + timedelta(seconds=30))
+    month = util.iso(stamp - timedelta(days=30))
+    fake.books["status = Fixed"] = ([ticket("ABC-1", old)] + [ticket(f"ABC-{n}", after) for n in range(2, 7)]
+                                    + [ticket("ABC-7", month)])
+    loop = load("outage", jira_block("status = Fixed"))
+    fixed = poll(loop)
+    out["outage"] = {"base": base, "failed": failed, "good": good, "bad": bad, "owner": owner,
+                     "owner_after": owner_after, "fixed": fixed,
+                     "further": poll(loop), "queued": queued("outage"), "seen": seen("outage#0")}
+
+data, other = root / "edge.jsonl", root / "edge2.jsonl"
+write(data, row("e0"))
+loop = load("edge", block(data))
+poll(loop)
+last = util.parse_iso(state.cursor("edge#0")["last_ok"])
+write(other, row("on-edge", util.iso(last - timedelta(minutes=2))),
+      row("just-before", util.iso(last - timedelta(minutes=2, seconds=1))))
+loop = load("edge", block(other))
+out["edge"] = poll(loop)
+
+data, other = root / "cmd.jsonl", root / "cmd2.jsonl"
+write(data, row("k0"))
+loop = load("cmdscope", block(data))
+poll(loop)
+write(other, row("untimed"), row("timed", util.iso()))
+loop = load("cmdscope", block(other))
+changed = poll(loop)
+out["cmdscope"] = {"changed": changed, "repeat": poll(loop), "seen": seen("cmdscope#0"), "queued": queued("cmdscope")}
+
+a, b = root / "a.jsonl", root / "b.jsonl"
+write(a, row("a1"))
+write(b, row("b1"))
+loop = load("demo", block(a, name=quoted("a")), block(b, name=quoted("b")))
+poll(loop, 0)
+poll(loop, 1)
+write(a, row("a1"), row("a5"))
+write(b, row("b1"), row("b2"))
+loop = load("demo", block(b, name=quoted("b")), block(a, name=quoted("a")))
+out["reorder"] = {"first": poll(loop, 0), "second": poll(loop, 1), "a": seen("demo#a"), "b": seen("demo#b"),
+                  "ids": [sources.source_id(loop, i) for i in range(2)], "slots": [rows_for("demo#0"), rows_for("demo#1")]}
+
+f, n = root / "f.jsonl", root / "n.jsonl"
+def adoption(name, below):
+    write(f, row("f1"), row("f2"))
+    write(n, row("n1"))
+    poll(load(name, block(f)))
+    write(f, row("f1"), row("f2"), row("f3"))
+    old_block, new_block = block(f, name=quoted("old")), block(n, name=quoted("fresh"))
+    loop = load(name, *((old_block, new_block) if below else (new_block, old_block)))
+    got = {}
+    for index in (0, 1):
+        got[sources.source_id(loop, index).split("#")[1]] = poll(loop, index)
+    return {"polls": got, "slot": rows_for(f"{name}#0"), "old_seen": seen(f"{name}#old"),
+            "fresh_seen": seen(f"{name}#fresh")}
+out["above"] = adoption("adopt", False)
+out["below"] = adoption("adoptlow", True)
+
+state.set_cursor("foreign#1", None, True, "old")
+state.claim_seen("foreign#1", ["z1"])
+solo = root / "solo.jsonl"
+write(solo, row("s1"))
+loop = load("foreign", block(solo, name=quoted("solo")))
+out["foreign"] = {"first": poll(loop), "slot": rows_for("foreign#1"), "foreign_seen": seen("foreign#1"),
+                  "solo_seen": seen("foreign#solo")}
+
+data = root / "rename.jsonl"
+write(data, row("r1"), row("r2"))
+poll(load("rename", block(data, name=quoted("old"))))
+loop = load("rename", block(data, name=quoted("new")))
+out["rename"] = {"renamed": poll(loop), "new_seen": seen("rename#new"), "old_seen": seen("rename#old")}
+
+watched = root / "watched"
+watched.mkdir()
+one, two = watched / "one.log", watched / "two.log"
+def log_block(path, pattern=None):
+    return '[[source]]\ntype = "log"\npath = ' + quoted(str(path)) + ("\npattern = " + quoted(pattern) if pattern else "") + "\n"
+one.write_text("INFO started\n")
+poll(load("logs", log_block(one)))
+with one.open("a") as handle:
+    handle.write("ERROR alpha widget exploded\n")
+two.write_text("ERROR old beta gadget\n")
+two_size = two.stat().st_size
+loop = load("logs", log_block(watched / "*.log", "ERROR"))
+scoped = poll(loop)
+offsets = json.loads(state.cursor("logs#0")["value"])
+with two.open("a") as handle:
+    handle.write("ERROR gamma sprocket fresh\n")
+out["logs"] = {"scoped": scoped, "offsets": offsets, "names": [str(one), str(two)], "two_size": two_size,
+               "later": poll(loop)}
+
+data = root / "legacy.jsonl"
+write(data, row("l1"), row("l2"))
+loop = load("legacy", block(data, timeout="60", every=quoted("1m")))
+old_owner = hashlib.sha256(json.dumps({k: v for k, v in loop.sources[0].items() if k != "every"}, sort_keys=True,
+                                      default=str).encode()).hexdigest()
+state.set_cursor("legacy#0", None, True, "1 read, 0 new")
+state.claim_seen("legacy#0", ["l1"])
+state.set_source_owner("legacy#0", old_owner)
+sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#0'")
+legacy = poll(loop)
+state.set_cursor("legacy#9", None, True, "x")
+sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#9'")
+state.set_cursor("legacy#9", None, False, "boom")
+kept = state.cursor("legacy#9")["last_ok"]
+state.ensure_schema()
+state.ensure_schema()
+out["legacy"] = {"poll": legacy, "owner": state.source_owner("legacy#0"), "kept": kept, "seen": seen("legacy#0"),
+                 "queued": queued("legacy"), "old_owner": old_owner}
+
+data = root / "legacy-edit.jsonl"
+write(data, row("a1"), row("a2"))
+old_settings = load("legacyedit", block(data, timeout="60"))
+legacy_owner = hashlib.sha256(json.dumps({k: v for k, v in old_settings.sources[0].items() if k != "every"},
+                                         sort_keys=True, default=str).encode()).hexdigest()
+state.set_cursor("legacyedit#0", None, True, "2 read, 0 new")
+state.claim_seen("legacyedit#0", ["a1", "a2"])
+state.set_source_owner("legacyedit#0", legacy_owner)
+write(data, row("a1"), row("a2"), row("a3"))
+loop = load("legacyedit", block(data, timeout="30"))
+out["legacy_edit"] = {"poll": poll(loop), "seen": seen("legacyedit#0"), "queued": queued("legacyedit")}
+
+def refused(name, *blocks):
+    try:
+        load(name, *blocks)
+    except loops.LoopError as e:
+        return str(e)
+    return None
+out["names"] = {
+    "unnamed": refused("check-one", block(a), block(b)),
+    "repeated": refused("check-two", block(a, name=quoted("x")), block(b, name=quoted("x"))),
+    "webhook": refused("check-three", block(a, name=quoted("webhook"))),
+    "metric": refused("check-four", block(a, name=quoted("metric"))),
+    "digits": refused("check-five", block(a, name=quoted("1"))),
+    "characters": refused("check-six", block(a, name=quoted("Bad Name"))),
+    "number": refused("check-seven", block(a, name="5")),
+    "single": refused("check-eight", block(a)),
+    "distinct": refused("check-nine", block(a, name=quoted("x")), block(b, name=quoted("y")))}
+
+data = root / "retry.jsonl"
+write(data, row("r1"))
+loop = load("retry", block(data))
+poll(loop)
+write(data, row("r1"), row("r2"))
+before = {"cursor": state.cursor("retry#0"), "owner": state.source_owner("retry#0")}
+real_enqueue = state.enqueue
+def broken(*args, **kwargs):
+    raise RuntimeError("queue is down")
+state.enqueue = broken
+failed = poll(loop)
+state.enqueue = real_enqueue
+after = {"cursor": state.cursor("retry#0"), "owner": state.source_owner("retry#0")}
+out["retry"] = {"failed": failed, "before": before, "after": after, "seen": seen("retry#0"),
+                "queued_after_failure": queued("retry"), "healed": poll(loop), "queued": queued("retry"),
+                "third": poll(loop)}
+
+data = root / "race.jsonl"
+write(data, row("r1"))
+loop = load("race", block(data))
+poll(loop)
+write(data, row("r1"), row("r2"))
+gate, reached = threading.Event(), threading.Event()
+real_fetch = sources.Command.fetch
+def slow(self, *args, **kwargs):
+    got = real_fetch(self, *args, **kwargs)
+    reached.set()
+    gate.wait(30)
+    return got
+sources.Command.fetch = slow
+server.tried.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    server.poll(loop)
+    reached.wait(30)
+    named = load("race", block(data, name=quoted("named")))
+    server.tried.clear()
+    server.poll(named)
+    named_started = "race#named" in server.polls
+    gate.set()
+    server.polls["race#0"].result(30)
+    sources.Command.fetch = real_fetch
+    server.tried.clear()
+    server.poll(named)
+    server.polls["race#named"].result(30)
+out["race"] = {"named_started": named_started, "queued": queued("race"), "slot": rows_for("race#0"),
+               "named_seen": seen("race#named")}
+
+server.pool.shutdown(wait=False)
+for pool in server.job_pools.values():
+    pool.shutdown(wait=False)
+print("BEHAVIOR_RESULT=" + json.dumps(out))
+'''
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for folder in ("home", "config", "state", "logs", "tmp"):
+            (self.root / folder).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+        self.env.update(HOME=str(self.root / "home"), ARETE_CONFIG_DIR=str(self.root / "config"),
+                        ARETE_STATE_DIR=str(self.root / "state"), ARETE_LOG_DIR=str(self.root / "logs"),
+                        TMPDIR=str(self.root / "tmp"), IDENT_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull)
+
+    def found(self):
+        code = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.SCRIPT
+        done = subprocess.run([sys.executable, "-I", "-c", code], cwd=self.root, env=self.env, text=True,
+                              capture_output=True, timeout=300, check=False)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                       if line.startswith("BEHAVIOR_RESULT=")), None)
+        self.assertIsNotNone(output, done.stdout + done.stderr)
+        return json.loads(output)
+
+    def said(self, got, text):
+        return [line for line in got["lines"] if text in line]
+
+    def test_a_source_keeps_its_unpolled_events_through_edits_reorders_and_new_sources(self):
+        found = self.found()
+        shown = json.dumps(found, indent=1)
+
+        plain = found["plain"]
+        self.assertTrue(self.said(plain["first"], "first read"), shown)
+        self.assertEqual(plain["edited"]["keys"], ["p3"], shown)
+        self.assertFalse(self.said(plain["edited"], "first read") or self.said(plain["edited"], "settings changed"),
+                         shown)
+        self.assertEqual(plain["again"]["keys"], [], shown)
+        self.assertEqual((plain["seen"], plain["queued"]), (["p1", "p2", "p3"], [["p3"]]), shown)
+
+        outage = found["outage"]
+        self.assertEqual([p["ran"] for p in outage["failed"]], [False, False], shown)
+        self.assertEqual(len([line for line in outage["failed"][0]["lines"] + outage["failed"][1]["lines"]
+                              if "poll failed" in line]), 1, shown)
+        self.assertEqual((outage["bad"]["ok"], outage["bad"]["last_ok"]), (0, outage["good"]["last_ok"]), shown)
+        self.assertEqual(outage["owner_after"], outage["owner"], shown)
+        self.assertEqual(outage["fixed"]["keys"], [f"ABC-{n}" for n in range(2, 7)], shown)
+        changed = self.said(outage["fixed"], "source settings changed")
+        self.assertEqual(len(changed), 1, shown)
+        self.assertIn("ABC-7", changed[0], shown)
+        self.assertEqual(outage["further"]["keys"], [], shown)
+        self.assertEqual(outage["queued"], [[f"ABC-{n}" for n in range(2, 7)]], shown)
+        self.assertEqual(found["edge"]["keys"], ["on-edge"], shown)
+        self.assertIn("just-before", self.said(found["edge"], "source settings changed")[0], shown)
+
+        cmd = found["cmdscope"]
+        self.assertEqual(cmd["changed"]["keys"], ["timed"], shown)
+        self.assertIn("untimed", self.said(cmd["changed"], "source settings changed")[0], shown)
+        self.assertEqual((cmd["repeat"]["keys"], cmd["seen"], cmd["queued"]),
+                         ([], ["k0", "timed", "untimed"], [["timed"]]), shown)
+
+        reorder = found["reorder"]
+        self.assertEqual((reorder["first"]["keys"], reorder["second"]["keys"]), (["b2"], ["a5"]), shown)
+        self.assertEqual((reorder["a"], reorder["b"]), (["a1", "a5"], ["b1", "b2"]), shown)
+        self.assertEqual(reorder["ids"], ["demo#b", "demo#a"], shown)
+        self.assertEqual(reorder["slots"], [{"cursors": 0, "seen": 0, "source_owners": 0}] * 2, shown)
+
+        for case in ("above", "below"):
+            got = found[case]
+            self.assertEqual(got["polls"]["old"]["keys"], ["f3"], shown)
+            self.assertEqual(got["polls"]["fresh"]["keys"], [], shown)
+            self.assertIn("n1", self.said(got["polls"]["fresh"], "first read")[0], shown)
+            self.assertFalse(self.said(got["polls"]["old"], "first read"), shown)
+            self.assertEqual(got["slot"], {"cursors": 0, "seen": 0, "source_owners": 0}, shown)
+            self.assertEqual((got["old_seen"], got["fresh_seen"]), (["f1", "f2", "f3"], ["n1"]), shown)
+
+        foreign = found["foreign"]
+        self.assertIn("s1", self.said(foreign["first"], "first read")[0], shown)
+        self.assertEqual((foreign["foreign_seen"], foreign["solo_seen"], foreign["slot"]["cursors"]),
+                         (["z1"], ["s1"], 1), shown)
+        rename = found["rename"]
+        self.assertEqual(rename["renamed"]["keys"], [], shown)
+        self.assertIn("r1", self.said(rename["renamed"], "first read")[0], shown)
+        self.assertEqual((rename["new_seen"], rename["old_seen"]), (["r1", "r2"], ["r1", "r2"]), shown)
+
+        logs = found["logs"]
+        self.assertEqual(len(logs["scoped"]["keys"]), 1, shown)
+        self.assertIn("alpha", logs["scoped"]["titles"][0], shown)
+        self.assertFalse(any("beta" in title for title in logs["scoped"]["titles"]), shown)
+        self.assertEqual(sorted(logs["offsets"]), logs["names"], shown)
+        self.assertEqual(logs["offsets"][logs["names"][1]][0], logs["two_size"], shown)
+        self.assertEqual(len(logs["later"]["keys"]), 1, shown)
+        self.assertIn("gamma", logs["later"]["titles"][0], shown)
+
+        legacy = found["legacy"]
+        self.assertEqual(legacy["poll"]["keys"], ["l2"], shown)
+        self.assertFalse(self.said(legacy["poll"], "first read") or self.said(legacy["poll"], "settings changed"),
+                         shown)
+        self.assertTrue(legacy["owner"].startswith("scope:"), shown)
+        self.assertEqual((legacy["kept"], legacy["seen"], legacy["queued"]),
+                         ("2026-01-01T00:00:00Z", ["l1", "l2"], [["l2"]]), shown)
+
+        edit = found["legacy_edit"]
+        self.assertEqual((edit["poll"]["keys"], edit["queued"], edit["seen"]), (["a3"], [["a3"]], ["a1", "a2", "a3"]),
+                         shown)
+        self.assertFalse(self.said(edit["poll"], "settings changed"), shown)
+
+        names = found["names"]
+        for case, reason in (("unnamed", "needs a name"), ("repeated", "more than one"), ("webhook", "reserved"),
+                             ("metric", "reserved"), ("digits", "only digits"), ("characters", "lowercase"),
+                             ("number", "lowercase")):
+            self.assertIn(reason, names[case] or "", shown)
+        self.assertEqual((names["single"], names["distinct"]), (None, None), shown)
+
+        race = found["race"]
+        self.assertFalse(race["named_started"], shown)
+        self.assertEqual((race["queued"], race["named_seen"]), ([["r2"]], ["r1", "r2"]), shown)
+        self.assertEqual(race["slot"], {"cursors": 0, "seen": 0, "source_owners": 0}, shown)
+
+        retry = found["retry"]
+        self.assertFalse(retry["failed"]["ran"], shown)
+        self.assertEqual((retry["seen"], retry["queued_after_failure"]), (["r1"], []), shown)
+        self.assertEqual(retry["after"]["owner"], retry["before"]["owner"], shown)
+        self.assertEqual((retry["after"]["cursor"]["value"], retry["after"]["cursor"]["last_ok"]),
+                         (retry["before"]["cursor"]["value"], retry["before"]["cursor"]["last_ok"]), shown)
+        self.assertEqual((retry["healed"]["keys"], retry["queued"], retry["third"]["keys"]),
+                         (["r2"], [["r2"]], []), shown)
 
 
 class WorkerRecoveryTests(unittest.TestCase):

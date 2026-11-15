@@ -307,11 +307,16 @@ class Server:
             running = self.polls.get(sid)
             if running and not running.done():
                 continue
+            if source.get("name") and self.slot_polling(loop):
+                continue
             if time.monotonic() - self.tried.get(sid, -1e9) < sources.every(source):
                 continue
             self.tried[sid] = time.monotonic()
             self.polls[sid] = future = self.pool.submit(self.poll_source, loop, i)
             future.add_done_callback(lambda done, sid=sid: self.poll_ended(sid, done))
+
+    def slot_polling(self, loop: Loop) -> bool:
+        return any(sources.is_slot(loop, sid) and not future.done() for sid, future in self.polls.items())
 
     def poll_ended(self, sid: str, done: Future) -> None:
         if done.cancelled():
@@ -364,7 +369,7 @@ class Server:
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
         try:
-            found, items = sources.poll(loop, index, self.cfg)
+            found, items = sources.poll(loop, index, self.cfg, say=self.say)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
             if (c := state.cursor(sid)) is not None:
