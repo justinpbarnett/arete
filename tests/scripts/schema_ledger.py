@@ -381,27 +381,68 @@ server.load_new_code()
 def test_a_contract_waits_for_an_older_child():
     init()
     probe("contract")
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    try:
+    finished(child('''
+older_run = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+older_serve = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+server = None
+try:
+    for stamp in (2, None):
+        sql("INSERT OR REPLACE INTO runs (id, kind, status, started, pid, schema_version) "
+            "VALUES ('older', 'loop', 'running', ?, ?, ?)", (util.iso(), older_run.pid, stamp))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert state.migrate()
+            state.ensure_schema()
+        assert "older" in output.getvalue() and "waits for" in output.getvalue(), output.getvalue()
+        assert version() == 2
+    sql("UPDATE runs SET schema_version=3")
+    for at in (util.iso(), util.iso(util.now() - timedelta(days=1))):
         for stamp in (2, None):
-            sql("INSERT OR REPLACE INTO runs (id, kind, status, started, pid, schema_version) "
-                "VALUES ('older', 'loop', 'running', ?, ?, ?)", (util.iso(), sleeper.pid, stamp))
-            output = finished(child("state.migrate(); state.ensure_schema()"))
-            assert "older" in output and "waits for" in output, output
+            beat = dict(pid=older_serve.pid, at=at)
+            if stamp is not None:
+                beat["schema"] = stamp
+            util.write_json(control.BEAT_FILE, beat)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                assert state.migrate()
+            assert f"serve {older_serve.pid}" in output.getvalue(), output.getvalue()
             assert version() == 2
-        sql("DELETE FROM runs")
-        util.write_json(control.BEAT_FILE, dict(pid=sleeper.pid, at=util.iso(), schema=2))
-        output = finished(child("state.migrate()"))
-        assert f"serve {sleeper.pid}" in output and version() == 2
-        finished(child("state.migrate(contracts=False)"))
-        assert version() == 2
-        util.write_json(control.BEAT_FILE, dict(pid=sleeper.pid, at=util.iso(), schema=3))
-        finished(child("state.migrate(contracts=False)"))
-        assert version() == 2
-    finally:
-        sleeper.kill()
-        sleeper.wait()
-    finished(child("state.migrate()"))
+    assert state.migrate(contracts=False)
+    assert version() == 2
+    server = serve.Server()
+    server.contracts_waiting = state.migrate()
+    server.config_problem = "scheduler disabled for contract test"
+    with mock.patch.object(server, "read_config"), mock.patch.object(state, "migrate", wraps=state.migrate) as migrate:
+        server.tick()
+        assert server.contracts_waiting and version() == 2
+        assert util.read_json(control.BEAT_FILE, {})["schema"] == state.LATEST
+        sql("UPDATE runs SET schema_version=2")
+        sql("INSERT INTO runs (id, kind, status, started, pid, schema_version) "
+            "VALUES ('unstamped', 'loop', 'running', ?, ?, NULL)", (util.iso(), older_run.pid))
+        older_serve.terminate()
+        older_serve.wait(timeout=10)
+        util.write_json(control.BEAT_FILE, dict(pid=older_serve.pid, at=util.iso(), schema=2))
+        server.tick()
+        assert server.contracts_waiting and version() == 2
+        older_run.terminate()
+        older_run.wait(timeout=10)
+        server.tick()
+        assert not server.contracts_waiting and version() == 3
+        assert migrate.call_count == 3
+        server.tick()
+        assert migrate.call_count == 3
+    assert sql("SELECT id, status FROM runs ORDER BY id") == [("older", "running"), ("unstamped", "running")]
+    assert sql("SELECT count(*) FROM schema_migrations WHERE n=3") == [(1,)]
+finally:
+    for process in (older_run, older_serve):
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=10)
+    if server is not None:
+        server.pool.shutdown(wait=True)
+        for pool in server.job_pools.values():
+            pool.shutdown(wait=True)
+'''))
     assert version() == 3
 
 

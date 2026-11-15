@@ -664,4 +664,3 @@ def apply(conn):
         backup TEXT NOT NULL DEFAULT '', seconds REAL NOT NULL DEFAULT 0) STRICT""")
     conn.executemany("INSERT INTO schema_meta VALUES (?, ?)",
                      [("schema_version", "1"), ("oldest_writer", "0"), *identity().items()])
-
