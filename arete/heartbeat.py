@@ -21,6 +21,7 @@ from . import (
     steps,
     tool_events,
     util,
+    workspace,
 )
 
 
@@ -263,9 +264,7 @@ def blocked_words(row: dict) -> str:
 
 
 def check_workspaces() -> list[Check]:
-    from . import pipeline
-
-    held = pipeline.held_summary()
+    held = workspace.held_summary()
     if not held["count"]:
         return [Check("workspaces:held", True, "none held", "warn")]
     detail = f"{held['count']} held, {size_words(held['bytes'])}, oldest {age_words(held['oldest'])} ({held['oldest_name']})"

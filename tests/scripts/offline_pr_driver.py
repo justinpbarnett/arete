@@ -2,7 +2,7 @@ import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, scratch, state, util
+from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, scratch, state, util, workspace
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 state.migrate()
 probe = [sys.executable, "-V"]
@@ -51,7 +51,7 @@ def parking(*a, **k):
 def asking(b, *a, **k):
     b.run.owner_ask("implement", [ASKING], agent.NO_SESSION)
 def failing_ci(*a, **k):
-    raise pipeline.RunFailed("CI failed", "fixture detail")
+    raise workspace.RunFailed("CI failed", "fixture detail")
 def raising(error):
     def call(*a, **k):
         raise error
@@ -104,7 +104,7 @@ elif scenario == "park":
 elif scenario == "automerge-gh-error":
     pipeline.automerge = raising(gh.GhError("fixture gh failure"))
 elif scenario == "automerge-run-failed":
-    pipeline.automerge = raising(pipeline.RunFailed("fixture merge failure", "detail"))
+    pipeline.automerge = raising(workspace.RunFailed("fixture merge failure", "detail"))
 elif scenario in ("ask", "answer-stop"):
     pipeline.watch_ci = asking
 elif scenario in ("ci-failure", "retry-stop"):

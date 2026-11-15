@@ -14,6 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from arete import slots, workspace
+
 from tests.harness import set_task_body
 
 
@@ -65,7 +67,7 @@ LESSON_A, LESSON_B = "- `notes.txt`: lesson A from the first run.", "- `notes.tx
 KILLED_WHILE_WAITING = """
 import os, runpy, signal, sys, urllib.request
 from unittest import mock
-from arete import accounts, factory, gh, paths, pipeline
+from arete import accounts, factory, gh, paths, pipeline, slots
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
 urllib.request.urlopen = forbidden
@@ -77,7 +79,7 @@ def kill_while_waiting(run, text):
     if "waiting for a free run slot" in text:
         os.kill(os.getpid(), signal.SIGKILL)
 feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
-with mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
+with mock.patch.multiple(slots, runs_in_slots=mock.Mock(return_value=[{}]),
                          slots_free_to_start=mock.Mock(return_value=0)), \\
         mock.patch.object(pipeline.Run, "log", kill_while_waiting):
     factory.main(feature, sys.argv[1:])
@@ -482,7 +484,7 @@ def kill_at_verify(fx):
     pipeline.git(["add", "-A"], ws)
     pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m",
                                 f"wip: edits of arete run {failed['id']}, kept when it ended before pushing\n\nArete-Run: {failed['id']}"], ws)
-    pipeline.note_made(ws, [pipeline.Checkout("", "octo/widgets", fx.src, ws, "main")])
+    workspace.note_made(ws, [workspace.Checkout("", "octo/widgets", fx.src, ws, "main")])
     return failed
 
 
@@ -615,7 +617,7 @@ def resume_parked(fx, result):
     result |= {"status": row["status"], "summary": row["summary"], "id": row["id"], "log": log,
                "trailers": og(fx, "log", "--format=%B", f"main..{branch}") if "refs/heads/" + branch in og(fx, "for-each-ref", "--format=%(refname)", "refs/heads") else "",
                "published": og(fx, "show", f"{branch}:notes.txt"),
-               "onto_recorded": [k for k in pipeline.made_before(ws) if k.startswith("\0onto")],
+               "onto_recorded": [k for k in workspace.made_before(ws) if k.startswith("\0onto")],
                "build_prompt": next((p for t, p in fx.prompts if t and t[0] == row["id"] and t[1] == "build"), "")}
     return result
 
@@ -640,14 +642,14 @@ def park_with_held_scratch(fx):
     layer.write_text(plain)
     answer.write_text(passing)
     fx.ws = ws = paths.WORKTREES_DIR / f"replay-sample-{fx.task}"
-    fx.saved = pipeline.made_record(ws).read_text()
+    fx.saved = workspace.made_record(ws).read_text()
     made = json.loads(fx.saved)
     return {"parked": parked["summary"], "recorded": [k for k in made if not k.startswith("\0")],
             "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip(),
-            "head_recorded": made.get(pipeline.head_key(pipeline.Checkout("", "", ws, ws, "main"))) == pipeline.git(["rev-parse", "HEAD"], ws).strip(),
+            "head_recorded": made.get(workspace.head_key(workspace.Checkout("", "", ws, ws, "main"))) == pipeline.git(["rev-parse", "HEAD"], ws).strip(),
             "unpushed": pipeline.git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], ws).strip(),
             "held": [p.name for p in ws.glob(paths.SCRATCH_PREFIX + "*")],
-            "left": [p.name for p in pipeline.scratch_left(ws, [])]}
+            "left": [p.name for p in workspace.scratch_left(ws, [])]}
 
 
 def release_held_scratch(fx, result):
@@ -656,7 +658,7 @@ def release_held_scratch(fx, result):
         set_task_body(fx.task, "Add kumquat on a last line of its own", connection=c)
     refused = forced(fx)
     result["while_held"] = refused["summary"]
-    result["record_kept"] = pipeline.made_record(ws).read_text() == fx.saved
+    result["record_kept"] = workspace.made_record(ws).read_text() == fx.saved
     for fd in list(scratch.LEASES.values()):
         os.close(fd)
     scratch.LEASES.clear()
@@ -922,7 +924,7 @@ def slot_wait(fx, result, continuing):
 
 def stop_while_waiting_for_slot(fx, result, continuing):
     pipeline, record, tasks, control, waiting = fx.pipeline, fx.record, fx.tasks, fx.control, fx.waiting
-    full = lambda: mock.patch.multiple(pipeline, runs_in_slots=mock.Mock(return_value=[{}]),
+    full = lambda: mock.patch.multiple(slots, runs_in_slots=mock.Mock(return_value=[{}]),
                                        slots_free_to_start=mock.Mock(return_value=0))
     said = pipeline.Run.log
     def stop_while_waiting(run, text):
