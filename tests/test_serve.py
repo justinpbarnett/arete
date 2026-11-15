@@ -22,6 +22,7 @@ class ServeBulkheadTests(unittest.TestCase):
             env = scratch_env(root, ARETE_WORKTREES_DIR=str(root / "worktrees"), TMPDIR=str(root / "tmp"),
                               HOME=str(root / "home"))
             done = run_script(self.SCRIPT, root, str(root), mode, env=env, timeout=300)
+            self.assertEqual(done.returncode, 0, done.stderr)
             return behavior_result(done, marker="RESULT")
 
     def test_one_failing_loop_costs_only_itself_and_the_readers_name_it(self):
@@ -107,8 +108,20 @@ class ServeBulkheadTests(unittest.TestCase):
         self.assertEqual(out["loaded"], [False, True])
         self.assertTrue(out["unchanged"])
         self.assertEqual(out["queued"], 0)
-        self.assertEqual(out["launched"], ["aaa", "bbb"])
+        self.assertEqual(out["launched"], ["aaa", "bbb", "ccc"])
         self.assertEqual((out["beat_back"], out["ccc"]), ([], 1))
+
+    def test_removed_subjects_clear_skipped_stages_keep_counts_and_items_release_groups(self):
+        out = self.case("extras")
+        self.assertTrue(out["last_ok_kept"])
+        self.assertEqual(out["skipped"]["loop:aaa"], 2)
+        self.assertIn("stage:states", out["skipped"])
+        self.assertEqual(out["removed"], [])
+        self.assertEqual(out["released"], [1, True, True])
+        self.assertEqual(out["capacity"], ["group g takes one at a time", "queue q is full at 1 run", "queue q is full at 1 run"])
+        self.assertEqual(out["busy_first"], "x is running; stop it or wait")
+        self.assertEqual((out["free"], out["taken"]), ("", "z is running; stop it or wait"))
+        self.assertEqual(out["reloaded"], [False, True])
 
     def test_the_beat_survives_an_unreadable_count_and_a_failed_write(self):
         out = self.case("beat")

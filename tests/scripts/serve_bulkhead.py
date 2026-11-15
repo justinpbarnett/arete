@@ -64,13 +64,13 @@ def tick_check():
 
 
 def faulting(server, name="aaa", message="bulkhead probe"):
-    real = server.watch_metric
+    real = server.poll
 
-    def watch(loop, st):
+    def poll(loop):
         if loop.name == name:
             raise ValueError(message)
-        return real(loop, st)
-    return mock.patch.object(server, "watch_metric", watch)
+        return real(loop)
+    return mock.patch.object(server, "poll", poll)
 
 
 def done(**out):
@@ -274,8 +274,7 @@ elif mode == "bad_config":
     finish(server)
 
 elif mode == "states":
-    make_loop("ccc", 'metric = "load > 1"')
-    state.add_metric("load", 5)
+    make_loop("ccc", "run_at_load = true")
     state.set_loop_state("ccc", metric_on=1)
     for name in ("aaa", "bbb"):
         state.set_loop_state(name, last_fire=util.iso(util.now() - timedelta(minutes=2)))
@@ -289,6 +288,56 @@ elif mode == "states":
     back = run(server, due=False)
     done(failing=list(beat["failing"]), severity=check.severity, ok=check.ok, loaded=[loaded, server.loaded], unchanged=unchanged,
          queued=queued, launched=sorted(launched), beat_back=list(back["failing"]), ccc=state.loop_states()["ccc"]["metric_on"])
+    finish(server)
+
+elif mode == "extras":
+    clean = run(server)
+    out = {"last_ok_start": clean["last_ok"]}
+    with faulting(server):
+        first = run(server)
+        second = run(server)
+        out["last_ok_kept"] = [first["last_ok"], second["last_ok"]] == [clean["last_ok"]] * 2
+        with mock.patch.object(state, "loop_states", mock.Mock(side_effect=OSError("busy"))):
+            skipped = run(server, due=False)
+        out["skipped"] = {k: v["ticks"] for k, v in skipped["failing"].items()}
+        loops.SWITCHES_FILE.write_text(json.dumps({**loops.switches(), "aaa": False}))
+        removed = run(server)
+    out["removed"] = list(removed["failing"])
+
+    def queued(group):
+        return state.enqueue("bbb", "bbb", group, "event", [{**EVENT, "title": group}])
+    one, two = queued("g"), queued("g")
+    tries = []
+    real_hold = loops.Loop.usage_hold
+
+    def hold(self, cfg, connect=None):
+        tries.append(1)
+        if len(tries) == 1:
+            raise RuntimeError("usage unreadable")
+        return real_hold(self, cfg, connect)
+    launched.clear()
+    with mock.patch.object(loops.Loop, "usage_hold", hold):
+        grouped = run(server, due=False)
+    out["released"] = [launched.count("bbb"), list(grouped["failing"]) == [f"queue:{one}"], state.queue_item(two)["run_id"] is not None]
+
+    cfg = config.load()
+    mine = type("L", (), {})()
+    mine.name, mine.queue_name = "y", "q"
+    row = {"kind": "loop", "queue": "q", "loop": "x", "grp": "g"}
+    slots = serve.QueueSlots([row])
+    out["capacity"] = [slots.why_full({"grp": "g"}, mine, cfg), slots.why_full({"grp": ""}, mine, cfg), slots.why_full({"grp": "h"}, mine, cfg)]
+    mine.name = "x"
+    out["busy_first"] = serve.QueueSlots([row]).why_full({"grp": ""}, mine, cfg)
+    mine.name, mine.queue_name = "z", "other"
+    free = serve.QueueSlots([row])
+    out["free"] = free.why_full({"grp": ""}, mine, cfg)
+    free.took(mine, {})
+    out["taken"] = free.why_full({"grp": ""}, mine, cfg)
+    with mock.patch.dict(serve.os.environ, {serve.RESTARTED_FOR_NEW_CODE: ""}):
+        reloaded = new_server()
+    out["reloaded"] = [run(server, due=False)["reloaded"], run(reloaded, due=False)["reloaded"]]
+    finish(reloaded)
+    done(**out)
     finish(server)
 
 elif mode == "beat":

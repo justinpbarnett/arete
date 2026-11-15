@@ -67,8 +67,8 @@ function healthSummary(h, failed) {
   const unread = [h.checks, h.alerts, h.devices, h.incidents ?? { rows: [] }].filter((p) => !("rows" in p)).length;
   const serveDown = !h.serve.at ? "serve has never run" : !h.serve.alive ? (h.serve.process_gone ? "serve's process is gone" : "serve looks stuck") : "";
   const { faults, cautions } = countStates(failed.map((f) => f.state));
-  const tickFails = Object.keys(h.serve.failing || {});
-  const parts = [serveDown, !serveDown && tickFails.length ? `serve is up but its tick fails at ${tickFails.join(", ")}` : "", faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",
+  const tickFails = Object.entries(h.serve.failing || {}).map(([key, f]) => `${key}: ${f.error}`);
+  const parts = [serveDown, !serveDown && tickFails.length ? `serve is up but its tick fails at ${tickFails.join("; ")}` : "", faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",
     unread ? `${count(unread, "part", "parts")} could not be read` : ""].filter(Boolean);
   return el("p", { class: "summary" }, stateChip(h.state), parts.length ? ` ${capitalized(parts.join(", "))}.` : " Every alert, check, probe, device and loop answers.");
 }

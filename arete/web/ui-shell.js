@@ -47,7 +47,7 @@ function queueBody({ route, snapshot, retry, page, demo }) {
     missing=${missing} retry=${retry}>${body}<//>`;
 }
 
-function Sidebar({ route, snapshot, now }) {
+export function Sidebar({ route, snapshot, now }) {
   const serve = snapshot.serve;
   const started = serve?.started ? Date.parse(serve.started) : NaN;
   const uptime = Number.isFinite(started) ? duration((now - started) / 1000) : "";

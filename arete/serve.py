@@ -303,7 +303,6 @@ class Server:
 
     def step_loop(self, loop: Loop, st: dict, now: datetime) -> None:
         self.schedule(loop, st, now)
-        self.watch_metric(loop, st)
         self.poll(loop)
 
     def approvals(self) -> None:
