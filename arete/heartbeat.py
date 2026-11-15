@@ -405,7 +405,6 @@ def network_up_or_skip(loop: str, dry_run: bool) -> bool:
 
 def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) -> int:
     paths.ensure_dirs()
-    install.rotate_logs()
     (paths.STATE_DIR / "loops.json").unlink(missing_ok=True)
     if not network_up_or_skip("heartbeat", dry_run):
         return 0

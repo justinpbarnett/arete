@@ -1,4 +1,7 @@
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import runpy
@@ -1150,6 +1153,24 @@ def review_result(fx, row, events, result):
         result["body"] = (paths.RUNS_DIR / row["id"] / "pr_body.md").read_text()
 
 
+def database_fingerprint(paths):
+    stat = paths.DB_FILE.stat()
+    return [hashlib.sha256(paths.DB_FILE.read_bytes()).hexdigest(), stat.st_mtime_ns]
+
+
+def doctor_clean(fx, result):
+    from arete import backup, cli
+    fx.alerts.notify = lambda title, message: None
+    if backup.snapshot("hand") is None:
+        raise AssertionError("the replay home took no backup")
+    before = database_fingerprint(fx.paths)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.main(["doctor"])
+    result |= {"doctor_code": code, "doctor_output": out.getvalue(),
+               "doctor_unchanged": database_fingerprint(fx.paths) == before}
+
+
 def ordinary_extras(fx, row, events, result):
     scenario, paths, pipeline, runlimits, record, state = fx.scenario, fx.paths, fx.pipeline, fx.runlimits, fx.record, fx.state
     if scenario in ("limit-wait", "work-over-budget"):
@@ -1170,11 +1191,13 @@ def ordinary_extras(fx, row, events, result):
             "second": [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()][-2:]}
     if scenario == "future-step-appended":
         result["appended"] = bool(fx.appended)
-    if scenario == "pass":
+    if scenario in ("pass", "doctor-clean"):
         assert state.run_get(row["id"])["schema_version"] == state.LATEST
         branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
         assert len(branches) == 1, result
         result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], fx.root / "sample/origin.git")
+    if scenario == "doctor-clean":
+        doctor_clean(fx, result)
     if scenario == "foreign-version-record":
         result["foreign_unchanged"] = None if fx.foreign is None else fx.foreign.read_bytes() == fx.foreign_bytes
 
@@ -1219,6 +1242,7 @@ SCENARIOS = {
     "learn-overlap-no-second-answer": learn,
     "learn-unrelated-file": learn,
     "pass": ordinary,
+    "doctor-clean": ordinary,
     "foreign-version-record": ordinary,
     "secret-in-patch": ordinary,
     "limit-wait": ordinary,

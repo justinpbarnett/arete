@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -223,6 +224,41 @@ def repo_lock(src: Path):
     with open(paths.LOCKS_DIR / f"git-{name}.lock", "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
+
+
+def add_worktree(src: Path, wt: Path, branch: str, start: str, reset: bool = False) -> None:
+    with repo_lock(src):
+        branch_existed = bool(git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).strip())
+        path_existed = wt.exists()
+        try:
+            git(["worktree", "add", "-q", "--no-track", "-B" if reset else "-b", branch, str(wt), start], src)
+        except BaseException:
+            if not path_existed:
+                git(["worktree", "remove", "--force", str(wt)], src, check=False)
+                shutil.rmtree(wt, ignore_errors=True)
+            if not branch_existed:
+                _drop_branch(src, branch)
+            raise
+
+
+def delete_branch(src: Path, branch: str) -> None:
+    with repo_lock(src):
+        _drop_branch(src, branch)
+
+
+def _drop_branch(src: Path, branch: str) -> None:
+    git(["branch", "-D", branch], src, check=False)
+    if git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).strip():
+        return
+    for attempt in range(5):
+        if not any(git(["config", "--get", f"branch.{branch}.{key}"], src, check=False).strip()
+                   for key in ("merge", "remote")):
+            break
+        removed = sh(["git", "config", "--remove-section", f"branch.{branch}"], cwd=src)
+        if removed.returncode == 0:
+            break
+        if attempt < 4:
+            time.sleep(0.1)
 
 
 def _s(b) -> str:
