@@ -789,6 +789,18 @@ def paid_by_run(run_ids: list[str], connect=db, local_providers=None) -> dict[st
     return {k: round(v, 6) for k, v in paid.items()}
 
 
+def merged_runs(connect=db) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "
+            "AND COALESCE(pr_url, '') != '' ORDER BY finished, id")]
+
+
+def source_seen(source: str, connect=db) -> set[str]:
+    with connect() as c:
+        return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
+
+
 def runs_since(since: str, connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]

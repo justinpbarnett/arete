@@ -411,7 +411,16 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
             said.append(line)
     took = f"exit {code} in {time.monotonic() - started:.0f}s"
     if code != 0:
+        from . import mergecheck
+
+        if mergecheck.builtin(loop) and code == mergecheck.HOLD_EXIT:
+            state.release_claimed_items(run.id)
+            return "skipped", "merge-check quota hold; input waits until the next UTC day"
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
+    from . import mergecheck
+
+    if not found and (not said or mergecheck.builtin(loop)):
+        return "skipped", took + ", no output; zero model calls"
     fresh = new_findings(run, found)
     outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events)}
     if loop.emits:
@@ -464,6 +473,10 @@ def finding_text(f: dict) -> str:
 
 
 def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
+    from . import mergecheck
+
+    if mergecheck.builtin(run.loop):
+        return {}
     if not unseen or not jev.ready(run.cfg, [loop_repo(run)]):
         return {}
     known = state.findings(run.loop.name, KNOWN_FINDINGS_ASKED)
@@ -485,6 +498,8 @@ def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
 
 
 def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
+    from . import mergecheck
+
     fresh = []
     for f in found:
         f["fingerprint_key"] = fingerprint_key(run.loop, f)
@@ -499,7 +514,7 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
             if not is_new:
                 continue
         elif run.trial:
-            is_new = not state.finding_seen(run.loop.name, f["fingerprint_key"])
+            is_new = mergecheck.builtin(run.loop) or not state.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
             is_new = state.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
                                           outbound.plain(f.get("title"), 200), "", run.id)

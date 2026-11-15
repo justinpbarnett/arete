@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import config, gh, jev, outbound, sources, state, util
-from .loops import FINDING_EVENT, Loop, as_list, find, worktree_kinds
+from .loops import FINDING_EVENT, Loop, as_list, find, trust_rank, worktree_kinds
 
 SEVERITIES = ("low", "medium", "high", "critical")
 FALL_BACK_TO_RUN_CONFIG_REPO = ""
@@ -106,13 +106,28 @@ class Ticket(Emit):
     approving = "It files the ticket on GitHub, so it can take a few seconds."
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        if spec.get("repo") == "$finding.repo":
+            return (["ticket emit repo = '$finding.repo' needs internal-or-higher trigger trust"]
+                    if trust_rank(loop.trigger.trust) < trust_rank("internal") else [])
         return sources.repo_problems(cfg, [spec.get("repo", "")], "ticket emit")
+
+    def resolve(self, spec: dict, findings: list[dict], outcome: dict, cfg: config.Config) -> dict:
+        if spec.get("repo") != "$finding.repo":
+            return spec
+        if trust_rank(outcome.get("trust")) < trust_rank("internal"):
+            raise ValueError("dynamic ticket repository requires internal-or-higher input trust")
+        name = findings[0].get("repo")
+        if not isinstance(name, str) or not name or not config_repo(cfg, name):
+            raise ValueError("dynamic ticket finding repo is missing or unknown")
+        return {**spec, "repo": name}
 
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [[f] for f in findings]
 
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         f = findings[0]
+        if spec.get("repo") == "$finding.repo":
+            raise ValueError("dynamic ticket repository must be resolved before rendering")
         return {"repo": spec["repo"], "title": outbound.plain(spec.get("prefix", "") + f["title"], 120),
                 "body": ticket_body(loop, run_id, f, outcome.get("trust", "")),
                 "labels": as_list(spec.get("labels", ["agent"])), "trust": outcome.get("trust", ""), "run": run_id}

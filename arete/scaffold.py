@@ -246,6 +246,8 @@ def try_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
         return taken
     if refusals:
         raise control.Refused(f"{loop.name}'s sources hold events, but its trigger {refusals[-1]}")
+    if loop.name == "merge-check" and loop.command == ["arete", "merge-check"]:
+        return []
     raise control.Refused(f"{loop.name} found no events to try on yet")
 
 
