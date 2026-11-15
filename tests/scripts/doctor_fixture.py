@@ -40,6 +40,7 @@ def valid_run(run_id, kind="pipeline", cost=0.5):
 
 def clean():
     paths.ensure_dirs()
+    state.migrate()
     valid_run("run-a")
     valid_run("run-b", cost=1.0)
     backup.snapshot("hand")
@@ -144,7 +145,7 @@ def orphan_tables():
     clean()
     record.step("ghost-step", "build", agent.Result(ok=True, cost_usd=0.1), 1)
     sql("INSERT INTO evals (run_id, repo, task) VALUES ('ghost-eval', 'r', 't')")
-    sql("INSERT INTO feed (run_id, ts, kind, text) VALUES ('ghost-feed', 'x', 'k', 't')")
+    sql("INSERT INTO feed (run_id, ts, kind, text) VALUES ('ghost-feed', '2026-11-15T00:00:00Z', 'k', 't')")
     sql("INSERT INTO verdicts (run_id, kind, subject) VALUES ('ghost-verdict', 'push', 's')")
 
 
@@ -152,7 +153,7 @@ def empty_ids():
     clean()
     sql("INSERT INTO steps (run_id, step, cost_usd) VALUES ('', 'build', 0)")
     sql("INSERT INTO evals (run_id, repo, task) VALUES ('', 'r', 't')")
-    sql("INSERT INTO feed (run_id, ts, kind, text) VALUES ('', 'x', 'k', 't')")
+    sql("INSERT INTO feed (run_id, ts, kind, text) VALUES ('', '2026-11-15T00:00:00Z', 'k', 't')")
     sql("INSERT INTO verdicts (run_id, kind, subject) VALUES ('', 'push', 's')")
 
 
