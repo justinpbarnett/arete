@@ -149,7 +149,7 @@ def checks() -> dict:
         "heartbeat": beat.get("ts", ""), "running": "heartbeat" in loops_running(),
         "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")}
                    for c in sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))],
-        "loops": [{"name": k, **v} for k, v in sorted(util.read_json(paths.LOOP_MARKS_FILE, {}).items())],
+        "loops": [{"name": k, **v} for k, v in sorted(state.loop_marks(connect=state.reader).items())],
     }
 
 

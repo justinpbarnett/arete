@@ -340,7 +340,7 @@ def check_backup_offsite(cfg: config.Config) -> Check:
 def check_loops(cfg: config.Config) -> list[Check]:
     from . import loops
 
-    beats = util.read_json(paths.LOOP_MARKS_FILE, {})
+    beats = state.loop_marks()
     out = []
     for loop in loops.load_all(cfg):
         if not loop.enabled or loop.error or not loop.stale_hours or loop.name == os.environ.get("ARETE_LOOP"):
@@ -365,9 +365,7 @@ def check_loops(cfg: config.Config) -> list[Check]:
 
 
 def mark_loop(name: str, ok: bool, detail: str = "") -> None:
-    beats = util.read_json(paths.LOOP_MARKS_FILE, {})
-    beats[name] = {"ts": util.iso(), "ok": ok, "detail": detail[:200]}
-    util.write_json(paths.LOOP_MARKS_FILE, beats)
+    state.set_loop_state(name, mark_ok=int(ok), mark_detail=detail[:200], mark_at=util.iso())
 
 
 def network_up_or_skip(loop: str, dry_run: bool) -> bool:
@@ -385,6 +383,7 @@ def network_up_or_skip(loop: str, dry_run: bool) -> bool:
 def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) -> int:
     paths.ensure_dirs()
     install.rotate_logs()
+    (paths.STATE_DIR / "loops.json").unlink(missing_ok=True)
     if not network_up_or_skip("heartbeat", dry_run):
         return 0
     cfg = config.load()

@@ -9,6 +9,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -416,18 +417,35 @@ def env_value(raw: str) -> str:
     return re.split(r"\s#", raw, maxsplit=1)[0].strip().strip('"').strip("'")
 
 
+UNREADABLE_WARNED: dict[str, tuple[int, int]] = {}
+
+
 def read_json(p: Path, default):
     try:
-        return json.loads(p.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        with open(p, "rb") as f:
+            seen = os.fstat(f.fileno())
+            raw = f.read()
+    except FileNotFoundError:
+        return default
+    try:
+        return json.loads(raw.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        version = (seen.st_mtime_ns, seen.st_size)
+        key = str(Path(p).absolute())
+        if UNREADABLE_WARNED.get(key) != version:
+            UNREADABLE_WARNED[key] = version
+            print(f"{paths.short_path(p)} is not valid JSON, using the default: {e}", file=sys.stderr)
         return default
 
 
 def flush_fd(fd: int) -> None:
     if hasattr(fcntl, "F_FULLFSYNC"):
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    else:
-        os.fsync(fd)
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
 
 
 def flush_file(p: Path) -> None:
