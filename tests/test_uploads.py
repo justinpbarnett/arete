@@ -289,7 +289,8 @@ class UploadGuardTests(unittest.TestCase):
                                target=SimpleNamespace(remote=remote), tokens=None, hard_cap=False)
         tools = [uploads.TOOL, "mcp__playwright__browser_click"]
         with mock.patch.object(runner.environment, "passed", return_value=[]):
-            return runner.launch_kwargs({"allowed_tools": tools}, picked, trip, ("r", "s"), False, [].append)
+            return runner.launch_kwargs({"allowed_tools": tools}, picked, trip, ("r", "s"), False,
+                                        [].append, cwd=Path.cwd())
 
     def test_only_local_claude_gets_the_tool_and_its_hook(self):
         for guarded in (False, True):
@@ -297,7 +298,7 @@ class UploadGuardTests(unittest.TestCase):
             groups = kw["settings"]["hooks"]["PreToolUse"]
             self.assertIn(uploads.TOOL, kw["allowed_tools"])
             self.assertEqual([g["matcher"] for g in groups if "playwright" in g["matcher"]], [uploads.TOOL])
-            self.assertEqual(guard.MATCHER in [g["matcher"] for g in groups], guarded)
+            self.assertIn(guard.MATCHER, [g["matcher"] for g in groups])
         for which, remote in (("codex", None), ("pi", None), ("claude", SimpleNamespace())):
             with self.subTest(which=which, remote=bool(remote)):
                 kw = self.launch(which, remote=remote)

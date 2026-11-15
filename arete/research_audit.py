@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from . import config, outbound, research_plan, research_search, runner, steps, tracker, util
+from . import config, outbound, research_plan, research_search, runner, steps, util
 from . import research_synthesis as synth
 from .pipeline import prompt
 
@@ -244,40 +245,39 @@ def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence
         judged: bool) -> Audit:
     s = steps.resolve(cfg, None, "research_audit")
     read = [t for t in s.tools if t not in runner.WEB_TOOLS]
-    cwd = research_search.FOLDER / "search" / tracker.safe_filename(ref)
-    cwd.mkdir(parents=True, exist_ok=True)
     audit = Audit()
     started = budget.spent_usd
     stop, failed = "", False
     pending = batches(claims(answer))
-    for n, batch in enumerate(pending, 1):
-        if stop:
-            audit.records += [record(c, None, stop) for c in batch]
-            continue
-        got = ask(cfg, budget, s, read, batch, n, evidence, ref, cwd)
-        if got.error:
-            return Audit(error=got.error)
-        audit.calls.append({"batch": n, "tries": got.tries, "refused": got.refused, "fetch": got.fetch})
-        stop = got.stop
-        if not got.answer:
-            failed = failed or got.tries > 0
-            reason = got.stop or got.why
-            audit.records += [record(c, None, reason) for c in batch]
-            research_search.say(ref, f"audit batch {n}: not audited, {reason[:200]}")
-            continue
-        by_id = {c["claim"]: c for c in got.answer["checks"]}
-        made = [record(c, by_id[c["id"]]) for c in batch]
-        extra = [{**d, "sources": list(dict.fromkeys(d["sources"])), "screen": {}} for d in got.answer["disagreements"]]
-        research_search.screen(cfg, ref, judged, [
-            ({"claim": r["id"], "note": r["note"], "correction": r["correction"], "quote": r["quote"]}, r["screen"])
-            for r in made] + [({"issue": d["issue"]}, d["screen"]) for d in extra])
-        for i, r in enumerate(made):
-            if r["screen"]["status"] in research_search.WITHHELD:
-                made[i] = {**record(batch[i], None, WITHHELD), "screen": r["screen"]}
-        audit.records += made
-        audit.disagreements += [d for d in extra if d["screen"]["status"] in research_search.PASSED_ON]
-        research_search.say(ref, f"audit batch {n}: {util.count(got.tries, 'try', 'tries')}, "
-                                 f"{len(got.refused)} refused, {util.count(len(batch), 'claim')} checked")
+    with tempfile.TemporaryDirectory(prefix="arete-audit-") as cwd:
+        for n, batch in enumerate(pending, 1):
+            if stop:
+                audit.records += [record(c, None, stop) for c in batch]
+                continue
+            got = ask(cfg, budget, s, read, batch, n, evidence, ref, cwd)
+            if got.error:
+                return Audit(error=got.error)
+            audit.calls.append({"batch": n, "tries": got.tries, "refused": got.refused, "fetch": got.fetch})
+            stop = got.stop
+            if not got.answer:
+                failed = failed or got.tries > 0
+                reason = got.stop or got.why
+                audit.records += [record(c, None, reason) for c in batch]
+                research_search.say(ref, f"audit batch {n}: not audited, {reason[:200]}")
+                continue
+            by_id = {c["claim"]: c for c in got.answer["checks"]}
+            made = [record(c, by_id[c["id"]]) for c in batch]
+            extra = [{**d, "sources": list(dict.fromkeys(d["sources"])), "screen": {}} for d in got.answer["disagreements"]]
+            research_search.screen(cfg, ref, judged, [
+                ({"claim": r["id"], "note": r["note"], "correction": r["correction"], "quote": r["quote"]}, r["screen"])
+                for r in made] + [({"issue": d["issue"]}, d["screen"]) for d in extra])
+            for i, r in enumerate(made):
+                if r["screen"]["status"] in research_search.WITHHELD:
+                    made[i] = {**record(batch[i], None, WITHHELD), "screen": r["screen"]}
+            audit.records += made
+            audit.disagreements += [d for d in extra if d["screen"]["status"] in research_search.PASSED_ON]
+            research_search.say(ref, f"audit batch {n}: {util.count(got.tries, 'try', 'tries')}, "
+                                     f"{len(got.refused)} refused, {util.count(len(batch), 'claim')} checked")
     audit.records.sort(key=lambda r: int(r["id"][1:]))
     if not audit.records:
         audit.status, audit.why = INCOMPLETE, NO_CLAIMS

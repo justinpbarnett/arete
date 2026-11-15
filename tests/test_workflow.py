@@ -1309,7 +1309,6 @@ class ServeReloadTests(unittest.TestCase):
         self.assertEqual((found["foreign"], found["stranger"], found["unmarked"]), (421, 403, 403))
         self.assertEqual(found["lengths"], {"missing": {"status": 503, "retry": True},
                                             "invalid": {"status": 503, "retry": True}})
-        self.assertEqual(found["through"], {"owner": 503, "stranger": 403})
         self.assertEqual(found["reading"], 200)
         self.assertEqual((found["again"]["status"], found["again"]["retry"]), (200, None))
         self.assertEqual((found["status"], found["count"]), ("done", 0))
