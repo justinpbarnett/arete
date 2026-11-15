@@ -1,17 +1,16 @@
 import io
 import json
 import os
-from datetime import timedelta
-from pathlib import Path
 import subprocess
 import tempfile
-from types import SimpleNamespace
 import unittest
 import urllib.error
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from arete import config, gh, outbound, paths, state, util
-
 from tests import support
 from tests.harness import make_folders, state_env
 
@@ -238,8 +237,8 @@ class JiraWriteLedger:
         self.property_missing = False
 
     def open(self, request, **kw):
-        from http.client import RemoteDisconnected
         import socket
+        from http.client import RemoteDisconnected
         from urllib.parse import urlsplit
         method, path = request.get_method(), urlsplit(request.full_url).path
         self.calls.append((method, request.full_url))

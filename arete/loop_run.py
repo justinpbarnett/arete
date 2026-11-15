@@ -28,6 +28,7 @@ from . import (
     paths,
     push,
     record,
+    routing,
     runner,
     sources,
     state,
@@ -72,7 +73,7 @@ class OverBudget(Exception):
 
 def spent_limit(loop: Loop, cfg: config.Config) -> str:
     tightest = loops.tightest_limit(loop, cfg)
-    return tightest[0] if tightest and tightest[1] <= runner.BUDGET_FLOOR_USD and loop.budget_blocked(cfg) else ""
+    return tightest[0] if tightest and tightest[1] <= routing.BUDGET_FLOOR_USD and loop.budget_blocked(cfg) else ""
 
 
 class StoppedByAgent(Exception):
@@ -136,13 +137,13 @@ class LoopRun:
         if not tightest:
             return None
         left = tightest[1]
-        return left if left <= runner.BUDGET_FLOOR_USD else round(left, 2)
+        return left if left <= routing.BUDGET_FLOOR_USD else round(left, 2)
 
     def agent(self, step: str, prompt: str, cwd: Path, *, model: str = "", tools: list[str] | None = None,
               **kw) -> Result:
         model = model or self.loop.model_for(self.cfg)
         res = runner.run(prompt, cwd, model=model, runner=self.loop.runner, trace=(self.id, step), cfg=self.cfg,
-                         tools=tools, allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES,
+                         tools=tools, allowed_tools=tools, disallowed_tools=routing.NO_GIT_WRITES,
                          remaining_budget=self.room,
                          persist=False, timeout=self.loop.timeout_minutes * 60, device=self.device,
                          say=lambda text: self.log("wait", f"{step}: {text}"), repo=loop_repo(self), **kw)
@@ -291,7 +292,7 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
                      repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
                      device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
                      log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
-                     runner=runner.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
+                     runner=routing.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
         if fire and not state.take_queue_item(item, run.id):
             why = f"queue item {item} was taken by another run"
             settle(run, "skipped", why)

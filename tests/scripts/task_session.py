@@ -1,7 +1,11 @@
 
-import json, subprocess, sys
+import json
+import subprocess
+import sys
 from pathlib import Path
+
 from arete import config, devices, gh, record, replay, sessions, state
+
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 lines = replay.sample(root / "sample")
@@ -58,6 +62,7 @@ if scenario == "unsessioned-turn":
 if scenario.startswith("rerouted"):
     from dataclasses import replace
     from types import SimpleNamespace
+
     from arete import accounts, agent, runner
     routed, launched = runner.run, runner.attempt
     def turn_on_claude(prompt, cwd, **kw):

@@ -2,9 +2,9 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env

@@ -4,17 +4,16 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
 import secrets
 import sys
 import tempfile
 import time
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from arete import config, gh, outbound, paths, pi, pipeline, scratch, verify
-
 from tests import support
 
 
@@ -25,7 +24,7 @@ def setUpModule():
 @unittest.skipUnless(importlib.util.find_spec("arete.document"), "writer is not installed on this branch")
 class WriterRegressionTests(unittest.TestCase):
     def write(self, brief, answer, *, voice=""):
-        from arete import document, outbound
+        from arete import document
         from arete.agent import Result
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -90,7 +89,7 @@ class WriterRegressionTests(unittest.TestCase):
         self.assertEqual(result.text, brief.draft)
 
     def test_private_voice_copy_cannot_reach_github_even_with_punctuation_changed(self):
-        from arete import document, gh, outbound, record, steps, tracker
+        from arete import document, record, steps, tracker
         from arete.agent import Result
         sample = "Juniper lanterns guide our midnight release ceremony."
         for candidate in (sample.rstrip("."), sample.lower().replace(".", "!")):
@@ -133,7 +132,6 @@ class WriterRegressionTests(unittest.TestCase):
 
 class AuthorityScopeTests(unittest.TestCase):
     def setUp(self):
-        from arete import scratch
         self.scratch = scratch
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
@@ -305,7 +303,6 @@ class VerificationOutputTests(unittest.TestCase):
         import ctypes
         import struct
         self.ctypes, self.struct = ctypes, struct
-        from arete import scratch
         self.scratch = scratch
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
@@ -436,7 +433,6 @@ class VerificationOutputTests(unittest.TestCase):
             self.scratch.store(fd, key, data)
         os.close(self.scratch.LEASES.pop(a.selector))
         import contextlib
-        import io
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             pipeline.retry_scratch()

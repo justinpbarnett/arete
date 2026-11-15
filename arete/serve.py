@@ -31,6 +31,7 @@ from . import (
     oncall,
     paths,
     record,
+    routing,
     runner,
     sessions,
     sources,
@@ -607,8 +608,8 @@ class Server:
     def approval_due(self, job: ApprovalJob, approval: dict, retry_from: str) -> bool:
         model = job.model_for(approval, self.cfg)
         return bool(model and not approval[job.note] and approval[f"{job.note}_tried"] <= retry_from
-                    and not runner.usage_hold(model, cfg=self.cfg, repo=delivery.repo_for(approval, self.cfg),
-                                              tools=list(job.tools), denied=list(job.denied)))
+                    and not routing.usage_hold(model, cfg=self.cfg, repo=delivery.repo_for(approval, self.cfg),
+                                               tools=list(job.tools), denied=list(job.denied)))
 
     def job_running(self, job: ApprovalJob) -> bool:
         return job.note in self.jobs and not self.jobs[job.note].done()

@@ -1,8 +1,35 @@
-import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
+import json
+import os
+import runpy
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, scratch, state, util
+
+from arete import (
+    accounts,
+    agent,
+    config,
+    control,
+    factory,
+    gh,
+    owner_asks,
+    paths,
+    pipeline,
+    record,
+    replay,
+    run_lines,
+    runlimits,
+    scratch,
+    state,
+    util,
+)
+
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 state.migrate()
 probe = [sys.executable, "-V"]

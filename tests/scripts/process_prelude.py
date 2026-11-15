@@ -1,7 +1,6 @@
 
-import atexit, os, signal, subprocess, threading
-from unittest import mock
-from arete import capture, cli, dashboard, serve, util
+import atexit
+import subprocess
 
 children = []
 outputs = {}

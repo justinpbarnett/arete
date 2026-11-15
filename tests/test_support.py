@@ -1,8 +1,7 @@
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from arete import paths, pi, scratch
-
 from tests import support
 
 

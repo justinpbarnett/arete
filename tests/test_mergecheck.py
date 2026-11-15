@@ -1,14 +1,13 @@
-from contextlib import ExitStack, nullcontext
 import io
 import json
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, nullcontext
+from pathlib import Path
 from unittest import mock
 
 from arete import config, mergecheck, paths, pipeline, record, runner, scratch, util, verify
-
 from tests import support
 
 

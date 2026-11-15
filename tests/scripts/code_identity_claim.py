@@ -1,7 +1,10 @@
 
-import json, os
+import json
+import os
 from unittest import mock
+
 from arete import codebase, control, loop_run, record, scaffold, sessions, state
+
 state.migrate()
 codebase.STAMP = "a"
 loop = record.start("loop", pid=None, loop="x")

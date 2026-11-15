@@ -1,11 +1,9 @@
 import contextlib
-from dataclasses import asdict
 import functools
 import http.server
 import io
 import json
 import os
-from pathlib import Path
 import select
 import shlex
 import shutil
@@ -18,10 +16,12 @@ import tarfile
 import tempfile
 import threading
 import time
-from types import SimpleNamespace
 import unittest
-from unittest import mock
 import urllib.request
+from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import arete
 from arete import browser, codex, config, paths, pi, pipeline, runner, scratch, util, verify
@@ -886,7 +886,7 @@ class BrowserServerTests(unittest.TestCase):
         error = scratch.ConfinementUnavailable("pinned browser server: gone")
         with scratch.producing(self.a), mock.patch.object(scratch, "browser_server", side_effect=error), \
                 mock.patch.object(codex, "home", return_value=self.root), \
-                mock.patch.object(codex.claude, "run_streaming", side_effect=AssertionError("launched")):
+                mock.patch.object(codex.child, "stream", side_effect=AssertionError("launched")):
             with mock.patch.object(scratch, "protected_command", side_effect=AssertionError("fallback")), \
                     self.assertRaises(ValueError):
                 codex.mcp_settings(text, [])
@@ -896,7 +896,7 @@ class BrowserServerTests(unittest.TestCase):
 
     def test_run_turns_a_command_oserror_into_a_failed_result(self):
         with mock.patch.object(codex, "command", side_effect=PermissionError("nope")), \
-                mock.patch.object(codex.claude, "run_streaming", side_effect=AssertionError("launched")):
+                mock.patch.object(codex.child, "stream", side_effect=AssertionError("launched")):
             res = codex._run("p", self.ws)
         self.assertFalse(res.ok)
         self.assertEqual(res.error, "nope")
@@ -1031,9 +1031,8 @@ class WalkTests(unittest.TestCase):
         with paths.directory_fd(self.scratch_root) as fd:
             self.assertEqual(sorted(os.listdir(fd)), ["config", "state"])
         (self.root / "link").symlink_to(self.closed)
-        with self.assertRaises(OSError):
-            with paths.directory_fd(self.root / "link" / "ws"):
-                pass
+        with self.assertRaises(OSError), paths.directory_fd(self.root / "link" / "ws"):
+            pass
 
     def test_isolated_state_opens_below_a_folder_it_cannot_list(self):
         state = self.scratch_root / "state"

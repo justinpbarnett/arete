@@ -1,8 +1,14 @@
 
-import json, re, threading, unittest, urllib.request
+import json
+import re
+import threading
+import unittest
+import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
+
 from arete import dashboard, state
+
 
 class Assets(HTMLParser):
     def __init__(self):
@@ -35,7 +41,7 @@ def get(path, mime):
         return response.read().decode()
 try:
     page = get("/ui.html", "text/html")
-    check.assertIsNone(re.search(r"\bstyle\s*=", page, re.I))
+    check.assertIsNone(re.search(r"\bstyle\s*=", page, re.IGNORECASE))
     assets = Assets()
     assets.feed(page)
     check.assertEqual(assets.scripts, {

@@ -1,11 +1,10 @@
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from arete import config
-
 from tests import support
 from tests.harness import behavior_result, make_folders, scratch_env
 

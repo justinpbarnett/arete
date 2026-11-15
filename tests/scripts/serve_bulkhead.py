@@ -1,9 +1,30 @@
-import json, sys, threading
+import json
+import sys
+import threading
 from concurrent.futures import wait
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
-from arete import alerts, board, cli, config, control, loop_run, explain, heartbeat, loops, oncall, paths, runner, serve, state, tasks, util, webpush
+
+from arete import (
+    alerts,
+    board,
+    cli,
+    config,
+    control,
+    explain,
+    heartbeat,
+    loop_run,
+    loops,
+    oncall,
+    paths,
+    routing,
+    serve,
+    state,
+    tasks,
+    util,
+    webpush,
+)
 
 root, mode = Path(sys.argv[1]), sys.argv[2]
 real_out = sys.stdout
@@ -88,7 +109,7 @@ for name in ("aaa", "bbb"):
     make_loop(name)
 sys.stdout = LOG.open("a", buffering=1)
 server = new_server()
-patches = [mock.patch.object(loop_run, "launch", fake_launch), mock.patch.object(runner, "usage_hold", lambda *a, **k: ""),
+patches = [mock.patch.object(loop_run, "launch", fake_launch), mock.patch.object(routing, "usage_hold", lambda *a, **k: ""),
            mock.patch.object(webpush, "remind", lambda cfg: []), mock.patch.object(state, "release_settled_claims", lambda: None)]
 for p in patches:
     p.start()

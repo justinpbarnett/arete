@@ -21,14 +21,13 @@ from . import (
     paths,
     record,
     routing,
-    runner,
     scratch,
     steps,
     tracker,
     util,
     verify,
 )
-from .agent import Result
+from .agent import REPLAY, Result
 from .pipeline import AgentRun, Checkout, TicketWork, use_product
 
 NAME = re.compile(r"[A-Za-z0-9_-]+")
@@ -269,12 +268,12 @@ def real_config(cfg: config.Config) -> config.Config:
 def arm_status(suite: Suite, cfg: config.Config, arm: str) -> dict:
     real = real_config(cfg)
     s = steps.resolve(real, suite.layer, "verify", "", suite.arms[arm])
-    which, name = runner.stands_for(s.model, s.runner)
-    replayed = runner.chosen(s.model, s.runner, cfg)[0] == runner.REPLAY
+    which, name = routing.stands_for(s.model, s.runner)
+    replayed = routing.chosen(s.model, s.runner, cfg)[0] == REPLAY
     own = verify.mcp_config(paths.RUNS_DIR) if suite.starts_app else ""
     kw = {**s.agent_kw(real, ["mcp__playwright"] if suite.starts_app else [], own),
-          "disallowed_tools": runner.NO_GIT_WRITES}
-    asked = runner.request_for(real, suite.repo, which, name, s, False, kw, 0, suite.layer)
+          "disallowed_tools": routing.NO_GIT_WRITES}
+    asked = routing.request_for(real, suite.repo, which, name, s, False, kw, 0, suite.layer)
     reason = routing.fit_refusal(asked, devices.LOCAL)
     if not reason and suite.starts_app and not replayed and shutil.which("npx") is None:
         reason = NPX_REASON

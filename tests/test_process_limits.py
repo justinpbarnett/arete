@@ -2,7 +2,6 @@ import contextlib
 import io
 import json
 import os
-from pathlib import Path
 import shlex
 import signal
 import subprocess
@@ -13,11 +12,12 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from arete import (
-    claude,
+    child,
     cli,
     config,
     control,
@@ -25,11 +25,11 @@ from arete import (
     factory,
     flows,
     gh,
-    run_lines,
     paths,
     pi,
     pipeline,
     record,
+    run_lines,
     runlimits,
     scratch,
     serve,
@@ -39,7 +39,6 @@ from arete import (
     util,
 )
 from arete.agent import Result
-
 from tests.harness import set_task_body
 
 
@@ -397,18 +396,16 @@ class BudgetTests(Isolated):
             with self.subTest(cause=cause):
                 run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
                 started = time.monotonic()
-                with self.assertRaisesRegex(runlimits.Parked, "run chain"):
-                    with run.budget.watching():
-                        with run.waiting(cause):
-                            time.sleep(.9)
-                        self.assertGreater(run.budget.deadline - time.monotonic(), 0)
-                        time.sleep(20)
+                with self.assertRaisesRegex(runlimits.Parked, "run chain"), run.budget.watching():
+                    with run.waiting(cause):
+                        time.sleep(.9)
+                    self.assertGreater(run.budget.deadline - time.monotonic(), 0)
+                    time.sleep(20)
                 self.assertLess(time.monotonic() - started, 3 + .9 + 5)
                 self.assertGreater(runlimits.metadata(run.id, "budget.json")["wait_minutes_left_out"][cause], 0)
         run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
-        with self.assertRaisesRegex(runlimits.Parked, "run chain"):
-            with run.budget.watching(), run.waiting("ci"):
-                time.sleep(20)
+        with self.assertRaisesRegex(runlimits.Parked, "run chain"), run.budget.watching(), run.waiting("ci"):
+            time.sleep(20)
 
     def chained_after(self, *waits):
         first = self.made_run()
@@ -630,9 +627,8 @@ class BudgetTests(Isolated):
                 pass
             self.assertEqual((fresh.parents, fresh.left_out), ([], [old.id]))
             kept = self.forced_budget(old.id, False)
-            with self.assertRaises(runlimits.Parked):
-                with kept.watching(), kept.verifying():
-                    pass
+            with self.assertRaises(runlimits.Parked), kept.watching(), kept.verifying():
+                pass
             record.settle(fresh.run.id, "failed")
             record.settle(kept.run.id, "failed")
             with state.db() as connection:
@@ -661,7 +657,7 @@ class BudgetTests(Isolated):
         def transport(*args, **kw):
             code = (f"import os,time;from pathlib import Path;Path({str(pid_file)!r}).write_text(str(os.getpid()));"
                     "time.sleep(20)")
-            return claude.run_streaming([sys.executable, "-I", "-c", code], str(workspace), "", {}, 30, lambda _: None)
+            return child.stream([sys.executable, "-I", "-c", code], str(workspace), "", {}, 30, lambda _: None)
 
         def drive(flow):
             run = flow.ctx.run

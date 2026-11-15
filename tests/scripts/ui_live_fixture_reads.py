@@ -1,6 +1,12 @@
 
-import json, threading, unittest, urllib.request, urllib.error
+import json
+import threading
+import unittest
+import urllib.error
+import urllib.request
+
 from tests.ui_action_fixture import server
+
 check = unittest.TestCase()
 instance = server(live=True)
 threading.Thread(target=instance.serve_forever, daemon=True).start()

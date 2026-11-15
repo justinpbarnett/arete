@@ -1,7 +1,10 @@
 
-import json, sys
+import json
+import sys
 from pathlib import Path
+
 from arete import config, paths, research, runner, state, triage, util
+
 root = Path(sys.argv[1])
 paths.ensure_dirs()
 state.migrate()

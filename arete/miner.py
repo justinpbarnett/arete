@@ -24,6 +24,7 @@ from . import (
     tool_events,
     util,
 )
+from .agent import EDIT_TOOLS, READ_TOOLS
 from .heartbeat import mark_loop
 from .pipeline import (
     make_worktree,
@@ -593,7 +594,7 @@ def proposals_text(props: list[dict]) -> str:
 
 def apply_in(cfg: config.Config, run_id: str, wt: Path, props: list[dict]) -> runner.Result:
     return runner.run(prompt("apply", proposals=proposals_text(props)), wt, model=cfg.model("apply"),
-                      allowed_tools=runner.EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
+                      allowed_tools=EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
 
 
 def awaits_approval(cfg: config.Config, p: dict) -> bool:
@@ -776,8 +777,8 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     if not mine_repos:
         record.settle(run_id, "noop", summary=cut_summary(lost, "no repo with mine = true is checked out here"))
         return 0
-    res =runner.run(text, mine_repos[0].path, model=cfg.model("miner"), tools=runner.READ_TOOLS,
-                     allowed_tools=runner.READ_TOOLS, json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]],
+    res =runner.run(text, mine_repos[0].path, model=cfg.model("miner"), tools=READ_TOOLS,
+                     allowed_tools=READ_TOOLS, json_schema=PROPOSAL_SCHEMA, timeout=1800, persist=False, add_dirs=[r.path for r in mine_repos[1:]],
                      trace=(run_id, "mine"))
     (run_dir / "result.json").write_text(json.dumps({"ok": res.ok, "cost": res.cost_usd, "structured": res.structured,
                                                      "error": res.error}, indent=2))

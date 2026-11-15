@@ -11,7 +11,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import evals, experiment, paths, pipeline, record, replay, routing, runner, state, steps, util
+from . import evals, experiment, paths, pipeline, record, replay, routing, state, steps, util
+from .agent import REPLAY, traits_of
 
 GROUPS = ("ordinary", "difficult")
 DECIDES = "holdout"
@@ -61,8 +62,8 @@ def reviewer(exp: experiment.Experiment) -> tuple[dict, list[str]]:
     except ValueError as e:
         raise experiment.Refused(f"the reviewer: {e}") from e
     routes = experiment.codex_route("the reviewer", s, exp.limits)
-    which = runner.chosen(s.model, s.runner, exp.cfg)[0]
-    if why := runner.CANNOT_GATE.get(which):
+    which = routing.chosen(s.model, s.runner, exp.cfg)[0]
+    if why := traits_of(which).cannot_gate:
         raise experiment.Refused(f"the reviewer: {why}")
     return {"runner": s.runner, "model": s.model, "effort": s.effort, "settings": experiment.effective(exp.cfg, s),
             "prompt": experiment.sha((paths.PROMPTS_DIR / "review.md").read_bytes())}, routes
@@ -248,8 +249,8 @@ def prove(bench: Bench, path: Path, clock: Clock) -> None:
 
 
 def unusable(candidates: list, atom: str, codex: bool) -> list:
-    return [c for c in candidates if not (c.state == "ready" and (c.runner not in runner.CANNOT_STOP or codex)
-                                          and not (atom == "plan" and c.runner in runner.CANNOT_GATE))]
+    return [c for c in candidates if not (c.state == "ready" and (not traits_of(c.runner).cannot_stop or codex)
+                                          and not (atom == "plan" and traits_of(c.runner).cannot_gate))]
 
 
 def unavailable(exp: experiment.Experiment) -> dict[str, str]:
@@ -258,11 +259,11 @@ def unavailable(exp: experiment.Experiment) -> dict[str, str]:
     discovery = routing.Discovery(exp.cfg, exp.repo, layer=exp.layer, priced=False)
     missing = {}
     for arm, s in exp.settings.items():
-        which, name = runner.chosen(s.model, s.runner, exp.cfg)
-        if which == runner.REPLAY and not s.requires.declared:
+        which, name = routing.chosen(s.model, s.runner, exp.cfg)
+        if which == REPLAY and not s.requires.declared:
             continue
-        kw = {**s.agent_kw(exp.cfg), **({} if exp.atom == "plan" else {"disallowed_tools": runner.NO_GIT_WRITES})}
-        found = discovery.routes(runner.request_for(exp.cfg, exp.repo, which, name, s, True, kw, 0, exp.layer))
+        kw = {**s.agent_kw(exp.cfg), **({} if exp.atom == "plan" else {"disallowed_tools": routing.NO_GIT_WRITES})}
+        found = discovery.routes(routing.request_for(exp.cfg, exp.repo, which, name, s, True, kw, 0, exp.layer))
         if len(unusable(found, exp.atom, experiment.HEADROOM in exp.limits)) == len(found):
             missing[arm] = "; ".join(f"{c.runner} ({c.credential}) {c.state}: {c.detail}" for c in found) or "no route"
     return missing

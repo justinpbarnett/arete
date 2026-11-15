@@ -1,8 +1,28 @@
 
-import contextlib, gzip, io, json, os, sqlite3, sys
+import contextlib
+import gzip
+import io
+import json
+import sys
 from pathlib import Path
-from unittest import mock
-from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, state, util
+
+from arete import (
+    accounts,
+    agent,
+    claude,
+    cli,
+    codex,
+    config,
+    devices,
+    gh,
+    paths,
+    pi,
+    record,
+    runner,
+    state,
+    util,
+)
+
 state.migrate()
 root, mode = Path(sys.argv[1]), sys.argv[2]
 def forbidden(*a, **kw):

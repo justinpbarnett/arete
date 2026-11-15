@@ -1,6 +1,11 @@
 
-import http.client, http.server, socket, subprocess, types
-from arete import client, dashboard, delivery
+import http.client
+import http.server
+import socket
+import subprocess
+
+from arete import dashboard, delivery
+
 state.migrate()
 OWNER = "owner@example.test"
 CHANGED = frozenset({("changed", 1, 1)})

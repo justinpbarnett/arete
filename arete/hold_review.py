@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import config, delivery, outbound, pipeline, push, runner, state, util
+from .agent import READ_TOOLS
 
 DECISIONS = ("approve", "reject")
 CONFIDENCES = ("high", "medium", "low")
@@ -43,7 +44,7 @@ class Review:
         return f"{self.by} says {self.decision} with {self.confidence} confidence"
 
 
-REVIEW_TOOLS = runner.READ_TOOLS + pipeline.bash_rules(GIT_READS)
+REVIEW_TOOLS = READ_TOOLS +pipeline.bash_rules(GIT_READS)
 REVIEW_DENIED = pipeline.bash_rules(GIT_READS_OUTSIDE_THE_WORKTREE)
 
 

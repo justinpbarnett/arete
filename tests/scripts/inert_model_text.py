@@ -1,8 +1,14 @@
 
-import importlib.util, json, runpy, sys, urllib.request
+import importlib.util
+import json
+import runpy
+import sys
+import urllib.request
 from pathlib import Path
+
 from arete import accounts, config, factory, gh, paths, replay, state, tracker
 from arete import ci as ci_module
+
 root, model, planted, probe = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 state.migrate()
 def forbidden(*args, **kwargs):

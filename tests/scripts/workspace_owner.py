@@ -1,8 +1,14 @@
 
-import json, os, runpy, shutil, subprocess, sys, time
+import json
+import os
+import runpy
+import shutil
+import sys
+import time
 from pathlib import Path
-from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, scratch, state, util
-from arete import ci
+
+from arete import ci, config, factory, gh, heartbeat, paths, pipeline, record, replay, scratch, state, util
+
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 probe = [sys.executable, "-V"]

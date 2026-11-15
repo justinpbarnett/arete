@@ -1,7 +1,13 @@
 
-import json, os, sys, tempfile, time
+import json
+import os
+import sys
+import tempfile
+import time
 from pathlib import Path
+
 from arete import config, paths, research, research_audit, runner, state, steps
+
 root = Path(sys.argv[1])
 replay = root / "replay"
 paths.ensure_dirs()

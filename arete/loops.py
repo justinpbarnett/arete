@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from . import config, cron, devices, paths, runner, state, util
+from .agent import EDIT_TOOLS, READ_ONLY_TOOLS, READ_TOOLS
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -80,7 +81,7 @@ class Loop:
     script: list[str] = field(default_factory=list)
     model: str = ""
     runner: str = ""
-    tools: list[str] = field(default_factory=lambda: list(runner.READ_TOOLS))
+    tools: list[str] = field(default_factory=lambda: list(READ_TOOLS))
     device: str = "local"
     timeout_minutes: float = 30
     budget_usd: float | None = None
@@ -143,7 +144,7 @@ class Loop:
         if self.classify:
             calls.append((self.classify.get("model") or cfg.model("classify"), []))
         repo = self.routing_repo(cfg)
-        return [routing.outlook(cfg, repo, self.device, model, self.runner, tools, runner.NO_GIT_WRITES, left, connect)
+        return [routing.outlook(cfg, repo, self.device, model, self.runner, tools, routing.NO_GIT_WRITES, left, connect)
                 for model, tools in calls]
 
     def meters_spend(self, cfg: config.Config) -> bool:
@@ -322,7 +323,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         script=as_argv(run.get("script")),
         model=str(run.get("model", "")),
         runner=str(run.get("runner", "")),
-        tools=list(run.get("tools", runner.EDIT_TOOLS if known and known.worktree else runner.READ_TOOLS)),
+        tools=list(run.get("tools", EDIT_TOOLS if known and known.worktree else READ_TOOLS)),
         device=str(run.get("device", "local")),
         timeout_minutes=float(run.get("timeout_minutes", 30)),
         budget_usd=float(run["budget_usd"]) if run.get("budget_usd") else None,
@@ -426,19 +427,19 @@ def validate(loop: Loop, cfg: config.Config) -> None:
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
     if loop.agent and not cfg.replay.all:
-        which, name = runner.route(loop.model_for(cfg), loop.runner)
-        asked = runner.request_for(cfg, loop.routing_repo(cfg), which, name, None, True,
-                                   {"tools": loop.tools, "disallowed_tools": runner.NO_GIT_WRITES})
+        which, name = routing.route(loop.model_for(cfg), loop.runner)
+        asked = routing.request_for(cfg, loop.routing_repo(cfg), which, name, None, True,
+                                    {"tools": loop.tools, "disallowed_tools": routing.NO_GIT_WRITES})
         if refusal := routing.fit_refusal(asked, device, routing.modes_for(cfg, loop.routing_repo(cfg))):
             problems.append(refusal)
     if loop.agent:
-        problems += [f"{reason}, so a loop run by {runner.route(loop.model_for(cfg), loop.runner)[0]} cannot have {', '.join(tools)}"
-                     for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
-    if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
+        problems += [f"{reason}, so a loop run by {routing.route(loop.model_for(cfg), loop.runner)[0]} cannot have {', '.join(tools)}"
+                     for reason, tools in routing.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
+    if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")
     elif (loop.agent and loop.takes_findings and trust_rank(loop.trigger.trust) < trust_rank("internal")
-          and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS))):
+          and (acting := sorted(set(loop.tools) - READ_ONLY_TOOLS))):
         problems.append(f"a loop that takes findings from other loops and has the acting tools {', '.join(acting)} "
                         f"needs [trigger] trust = \"internal\" or above, so a finding from untrusted text never "
                         f"reaches it")

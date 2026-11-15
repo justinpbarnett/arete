@@ -1,7 +1,15 @@
 
-import contextlib, fcntl, hmac, io, json, os, sys
+import contextlib
+import fcntl
+import hmac
+import io
+import json
+import os
+import sys
 from pathlib import Path
-from arete import browser, cli, webhooks, record, scratch, state, util
+
+from arete import browser, cli, record, scratch, state, util, webhooks
+
 root, mode = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 scratch.AUTHORITY = root / "home/verification-authority"

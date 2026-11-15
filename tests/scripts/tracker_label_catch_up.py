@@ -1,7 +1,13 @@
 
-import json, os, subprocess, sys, time, urllib.request
+import json
+import subprocess
+import sys
+import time
+import urllib.request
 from pathlib import Path
-from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker, util
+
+from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker
+
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 def forbidden(*args, **kwargs):

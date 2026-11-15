@@ -11,7 +11,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 
 from . import migrations, paths, util
-from .agent import KEY_PROVIDERS, SUBSCRIPTION_RUNNERS
+from .agent import billing_of
 from .migrations import m0002_foundation_time_shape as time_shape
 
 TIME_COLUMNS = time_shape.TIME_COLUMNS
@@ -35,10 +35,6 @@ class IncompatibleSchema(RuntimeError):
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
-PAID_STEP = (f"(CASE steps.auth_mode WHEN 'subscription' THEN 0 WHEN 'local' THEN 0 WHEN 'api_key' THEN 1 ELSE "
-             f"NOT (COALESCE(steps.runner, '') IN ({', '.join(repr(r) for r in sorted(SUBSCRIPTION_RUNNERS))}) AND "
-             f"NOT (steps.runner = 'codex' AND COALESCE(steps.provider, '') IN "
-             f"({', '.join(repr(p) for p in sorted(KEY_PROVIDERS))}))) END)")
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 REFRESH_SCOPE = "credential-refresh-v1:"
@@ -298,9 +294,9 @@ def paid_by_run(run_ids: list[str], connect=db, local_providers=None) -> dict[st
     paid: dict[str, float] = {}
     with connect() as c:
         rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "
-                         f"WHERE run_id IN ({','.join('?' * len(run_ids))}) AND {PAID_STEP}", run_ids)
+                         f"WHERE run_id IN ({','.join('?' * len(run_ids))})", run_ids)
         for r in rows:
-            if not unbilled_step(dict(r), local_providers):
+            if billing_of(dict(r), local_providers) == "api_key":
                 paid[r[0]] = paid.get(r[0], 0.0) + float(r["cost_usd"] or 0)
     return {k: round(v, 6) for k, v in paid.items()}
 
@@ -376,11 +372,10 @@ def step_tries(run_id: str, step: str) -> int:
         return c.execute("SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
 
 
-def steps_since(since: str, connect=db, paid_only: bool = False) -> list[dict]:
-    paid = f" AND {PAID_STEP}" if paid_only else ""
+def steps_since(since: str, connect=db) -> list[dict]:
     with connect() as c:
         rows = [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind AS run_kind, r.repo FROM steps "
-                                           f"LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ?{paid} "
+                                           "LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? "
                                            "ORDER BY steps.ts", (since,))]
     return [{**d, "task_kind": d.get("kind") or "", "kind": d["run_kind"]} for d in rows]
 
@@ -1054,26 +1049,16 @@ def busy_chats() -> list[int]:
         return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
 
 
-def local_step(step: dict, local_providers) -> bool:
-    mode, model = step.get("auth_mode") or "", step.get("model") or ""
-    provider = step.get("provider") or (model.partition("/")[0] if "/" in model else "")
-    return mode == "local" or (step.get("runner") == "pi" and mode != "subscription" and provider in local_providers)
-
-
-def unbilled_step(step: dict, local_providers) -> bool:
-    return step.get("runner") == "replay" or local_step(step, local_providers)
-
-
 def loop_spent_since(since: str, loop: str | None = None, local_providers=()) -> float:
     q = ("SELECT steps.cost_usd, steps.runner, steps.provider, steps.model, steps.auth_mode FROM steps "
-         f"JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop' AND {PAID_STEP}")
+         "JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop'")
     args: list = [since]
     if loop:
         q += " AND r.loop = ?"
         args.append(loop)
     with db() as c:
         return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args)
-                   if not unbilled_step(dict(r), local_providers))
+                   if billing_of(dict(r), local_providers) == "api_key")
 
 
 def hold(scope: str, until: str, why: str, connect=db) -> None:

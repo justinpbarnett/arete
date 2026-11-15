@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from . import alerts, config, gh, jev, jira, paths, runner, state, tracker, util
+from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import TRIAGE_ANSWERS, prompt
 
@@ -341,8 +342,8 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
-        res = runner.run(text, cwd, model=cfg.model("triage"), tools=runner.READ_TOOLS,
-                         allowed_tools=runner.READ_TOOLS, json_schema=SCHEMA,
+        res = runner.run(text, cwd, model=cfg.model("triage"), tools=READ_TOOLS,
+                         allowed_tools=READ_TOOLS, json_schema=SCHEMA,
                          max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
                          trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None

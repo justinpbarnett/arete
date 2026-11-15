@@ -420,10 +420,10 @@ def scratch_hook(p) -> None:
 
 
 def cmd_codex_guard(args) -> int:
-    from . import codex, runner, scratch
+    from . import codex, routing, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return codex.guard_main(args.judge, runner.NO_GIT_WRITES, args.open)
+    return codex.guard_main(args.judge, routing.NO_GIT_WRITES, args.open)
 
 
 def cmd_mcp_ask(args) -> int:
@@ -1251,7 +1251,7 @@ def hold_end(text: str) -> str:
 def cmd_hold(args) -> int:
     from datetime import timedelta
 
-    from . import accounts, claude, codex, environment, runner, state, util
+    from . import accounts, claude, codex, environment, routing, state, util
 
     try:
         if not args.subscription:
@@ -1259,7 +1259,7 @@ def cmd_hold(args) -> int:
                 raise ValueError("name the subscription: claude or codex")
             found = state.holds()
             for h in found:
-                print(f"{h['scope']}\n  {runner.hold_words(h)}")
+                print(f"{h['scope']}\n  {routing.hold_words(h)}")
             if not found:
                 print("no holds")
             return 0
@@ -1277,7 +1277,7 @@ def cmd_hold(args) -> int:
             raise ValueError("give a time like 6h, 90m, 2d or an ISO time, or --release")
         until = hold_end(args.until)
         state.hold(scope, until, f"held with arete hold {args.subscription}")
-        print(f"held {args.subscription} until {runner.local_time(until)}; its steps take the next route in their tier")
+        print(f"held {args.subscription} until {routing.local_time(until)}; its steps take the next route in their tier")
         return 0
     except (ValueError, OSError) as e:
         return refused(e)
@@ -1407,7 +1407,7 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from . import research_audit, research_search, routing, runner, steps
+    from . import research_audit, research_search, routing, steps
 
     where = ""
     try:
@@ -1429,7 +1429,7 @@ def cmd_steps(args) -> int:
         if s.step in steps.FETCHES and (why := research_audit.fetch_note(s)):
             notes.append(why)
         if s.runner == "pi" and not cfg.replay.all:
-            selected = runner.pi_route(s.model, cfg, repo)
+            selected = routing.pi_route(s.model, cfg, repo)
             if selected.login_refused:
                 notes.append(f"pi {selected.provider} login refused: {selected.login_refused}")
             if selected.error:

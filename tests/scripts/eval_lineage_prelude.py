@@ -1,7 +1,12 @@
 
-import contextlib, io, json, os, shutil, sqlite3, sys
+import contextlib
+import io
+import shutil
+import sys
 from pathlib import Path
-from arete import board, codebase, config, evals, experiment, optimize, paths, scratch, state, util
+
+from arete import evals, optimize, paths, scratch, state
+
 root = Path(sys.argv[1])
 probe = [sys.executable, "-V"]
 if scratch.protected_command(probe) != probe:

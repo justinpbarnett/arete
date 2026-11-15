@@ -1,7 +1,9 @@
 
 import threading
 from types import SimpleNamespace
-from arete import owner_asks, control, pipeline, tasks
+
+from arete import control, owner_asks, pipeline, tasks
+
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")

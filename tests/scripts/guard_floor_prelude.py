@@ -1,12 +1,11 @@
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
-from unittest import mock
+from pathlib import Path
 
-from arete import codex, config, guard, paths, pi, record, replay, runner, sessions, state, util
+from arete import config, guard, paths, replay, state, util
 
 root = Path(sys.argv[1])
 replay.sample(root / "fixture")

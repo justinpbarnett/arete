@@ -2,6 +2,7 @@
 old = Path(sys.argv[1]) / "old.db"
 c = sqlite3.connect(old)
 from arete.migrations.m0001_foundation_ledger import SCHEMA
+
 c.executescript(SCHEMA)
 c.execute("INSERT INTO loop_state (loop) VALUES ('poll')")
 c.commit()

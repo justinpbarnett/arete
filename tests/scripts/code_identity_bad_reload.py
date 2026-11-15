@@ -1,7 +1,11 @@
 
-import json, os, sys
+import json
+import os
+import sys
 from unittest import mock
+
 from arete import serve, state
+
 state.migrate()
 os.chdir(sys.argv[1])
 server = serve.Server()

@@ -1,9 +1,11 @@
 
-import contextlib, io, json, sys
+import json
+import sys
 from datetime import timedelta
 from pathlib import Path
-from unittest import mock
-from arete import config, jev, miner, paths, record, replay, state, util
+
+from arete import paths, record, replay, state, util
+
 state.migrate()
 root, source = Path(sys.argv[1]), sys.argv[2]
 repos = "".join(f'\n[[repo]]\nname = "{n}"\npath = {json.dumps(source)}\ngithub = "example/{n}"\njev = {j}\n'

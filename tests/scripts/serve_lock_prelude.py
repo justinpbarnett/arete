@@ -1,8 +1,10 @@
 
-import json, sys, time
+import json
+import sys
 from pathlib import Path
-from arete import paths, state
-from tests.harness import inherited_env, state_env
+
+from arete import state
+
 root = Path(sys.argv[1])
 state.migrate()
 def result(**fields):

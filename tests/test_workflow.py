@@ -1,7 +1,5 @@
 import json
 import os
-from datetime import timedelta
-from pathlib import Path
 import pkgutil
 import re
 import shlex
@@ -11,13 +9,14 @@ import sys
 import tempfile
 import time
 import tomllib
-from types import SimpleNamespace
 import unittest
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+
 import arete
-
-from arete import config, control, paths, pipeline, util, verify, cli
-
+from arete import cli, config, control, paths, pipeline, util, verify
 from tests import support
 from tests.harness import behavior_result, bootstrap, make_folders, run_script, scratch_env
 
