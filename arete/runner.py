@@ -176,7 +176,7 @@ def auth_hold(auth: accounts.Auth, model: str, connect=state.db, unknown: str = 
     if not (auth.identity or auth.credential or unknown):
         return None
     scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
-    found = [h for h in state.holds(connect, include_indefinite=True) if h["scope"] in scopes]
+    found = [h for h in state.holds(connect) if h["scope"] in scopes]
     return next((h for h in found if not h["until"]), found[-1] if found else None)
 
 

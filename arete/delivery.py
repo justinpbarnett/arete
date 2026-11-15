@@ -7,15 +7,14 @@ from contextlib import contextmanager, suppress
 from datetime import timedelta
 
 from . import config, state, util
-from .emits import Digest, Emit, Metric, Notify, PullRequest, Ticket, ToLoop
+from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
 
 CLAIM_SECONDS = 120
 RETRIED = ("screen", "proof")
 SAYS_WHY = (RuntimeError, OSError, ValueError)
-EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(), "loop": ToLoop(),
-                          "digest": Digest(), "notify": Notify(), "metric": Metric()}
+EMITS: dict[str, Emit] = {"ticket": Ticket(), "pr": PullRequest(), "push": Push(), "loop": ToLoop()}
 
 
 class Failed(RuntimeError):

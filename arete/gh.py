@@ -580,14 +580,6 @@ def http_message(e: urllib.error.HTTPError) -> str:
         return str(e.reason)
 
 
-def repo_exists(repo: str) -> bool:
-    try:
-        gh(["repo", "view", repo, "--json", "name"])
-        return True
-    except GhError:
-        return False
-
-
 def repo_private(repo: str) -> bool | None:
     try:
         return bool((gh_json(["repo", "view", repo, "--json", "isPrivate"]) or {}).get("isPrivate"))
