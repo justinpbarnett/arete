@@ -27,7 +27,7 @@ from .factory import Outcome
 from .verify import Verified
 
 ADW = "adw"
-TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url")
+TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels")
 BUILD = "build"
 REVIEW_FIX = "review_fix"
 CHECK_REPAIR = "check_repair"
