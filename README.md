@@ -2180,8 +2180,10 @@ queue and claim recovery while keeping the shipped loop off. The server uses the
 For prerequisites and incomplete verification add a new PR, then use `fault --pr N --fault report`,
 `malformed`, `diff`, `verify`, `preflight` or `start`. Each saves a `.bak` alongside the affected
 fixture file; `fault --pr N --fault restore` restores it. Missing reports/diffs, malformed checks,
-absent verify configuration and failed start/preflight must block with no metric or ticket and leave
-the batch unchecked. Failed preflight starts no service or verifier. `answer --verdict unavailable`,
+absent verify configuration and failed preflight must block with no metric or ticket and leave
+the batch unchecked. Failed preflight starts no service or verifier. A product startup crash emits a
+regression finding and metric 0, naming the checks it prevented; sandbox and confinement failures
+remain blocked. `answer --verdict unavailable`,
 `incomplete` or `unknown` exercises unavailable or unaccounted-for results. Restore prerequisites,
 select a passing answer and retry the same event; for scheduler dead input, inspect `arete loop status
 merge-check` and use `arete loop requeue ID` on the scratch server.

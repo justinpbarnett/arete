@@ -138,10 +138,13 @@ def reports(item: dict) -> tuple[str, Path]:
         owner = str(last.get("run") or run_id)
         data = last.get("data") or {}
         verified = data.get("verified") or {}
-        name = Path(str(verified.get("saved") or "verify.md")).name
+        saved = verified.get("saved")
+        if not isinstance(saved, str) or not saved.strip():
+            raise Blocked(f"{run_id}: latest verification has no saved report")
+        name = Path(saved).name
         if not re.fullmatch(r"verify\d*\.md", name):
             raise Blocked(f"{run_id}: latest verification has an invalid saved report name")
-        saved_owner = Path(str(verified.get("saved") or "")).parent.name
+        saved_owner = Path(saved).parent.name
         owners = {run_id, *(str(line.get("run") or "") for read in factory.chain(run_id) for line in read)}
         if saved_owner in owners:
             owner = saved_owner
@@ -210,6 +213,7 @@ class Plan:
     worktree: Path
     neighbour: dict | None = None
     matches: list[str] = field(default_factory=list)
+    startup_failed: bool = False
 
 
 def plan(cfg: config.Config, repo: config.Repo, rows: list[dict], batch: list[dict], run_id: str,
@@ -250,7 +254,9 @@ def finding(p: Plan, failed: list[int]) -> dict:
     key = hashlib.sha256(json.dumps([sorted(r["key"] for r in p.batch), failed]).encode()).hexdigest()[:20]
     return {"title": f"Merged base fails use check: {p.repo.name} after PRs {prs}",
             "fingerprint": f"merge-check/{p.repo.name}/{key}", "repo": p.repo.name,
-            "summary": f"Merged PRs {prs}. Runs: {runs}. Failed checks: {names}."}
+            "summary": f"Merged PRs {prs}. Runs: {runs}. "
+                       + ("Product startup failed before the required checks could run. " if p.startup_failed else "")
+                       + f"Failed checks: {names}."}
 
 
 def preview(p: Plan, folder: Path) -> None:
@@ -354,6 +360,11 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> list[int]:
             goal = "\n".join(s.goal(n) for n, s in enumerate(p.steps, 1))
             verified = use_product(work, "verify", "grade", goal=goal, require_released=True)
             run.save("result.json", asdict(verified))
+            if verified.verdict == "fail" and not run.invoked:
+                p.startup_failed = True
+                prevented = list(range(1, len(p.steps) + 1))
+                run.save("startup-failure.json", {"prevented_steps": prevented})
+                return prevented
             if verified.verdict not in ("pass", "fail") or not run.invoked:
                 raise Blocked(verified.blocked_by or "the product or verifier did not start")
             accounted: dict[int, bool] = {}
