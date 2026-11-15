@@ -20,8 +20,9 @@ NOBODY = "Nobody will answer questions while you work."
 GUIDE = ("Ask your owner through the `ask_owner` tool only for what you cannot finish without and cannot settle from the "
          "ticket, the repo or a quick read: a secret or an account, a setup outside the work folder, a choice that is "
          "not safe to assume, or an action only the owner can take. Do all the work that does not depend on the answer "
-         "first. Name the recommended option and put it first. The tool replies at once; then end your turn and this "
-         "session resumes with the answers.")
+         "first. Never ask the owner to change files or run commands in your work folder: arete refuses edits it did not "
+         "make there when the run resumes, so make every change there yourself. Name the recommended option and put "
+         "it first. The tool replies at once; then end your turn and this session resumes with the answers.")
 NOTE = (f"You have a tool named `{TOOL}` (`{RULE}` where tools carry a server prefix). When the work needs a value only "
         "the owner has, such as a secret that is in no file, do not guess and do not only say so in your answer: call "
         f"`{TOOL}` with the question (kind `secret` and `name` for a variable), finish what does not depend on it, then "
