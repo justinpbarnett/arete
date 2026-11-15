@@ -8,7 +8,7 @@ root, mode = Path(sys.argv[1]), sys.argv[2]
 def forbidden(*a, **kw):
     raise AssertionError("offline cost test attempted a provider or credential lookup")
 claude.run = codex.run = pi.run = forbidden
-accounts.read = gh.auth_token = forbidden
+accounts.read = util.github_token = forbidden
 original_sh = util.sh
 def local_sh(cmd, *a, **kw):
     if isinstance(cmd, list) and cmd[:1] == ["git"]:

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import accounts, claude, config, environment, guard, paths, uploads, util
+from . import accounts, browser, claude, config, environment, guard, paths, uploads, util
 from . import scratch as verification_scratch
 from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
 from .pi import SCHEMA_RULE
@@ -352,10 +352,10 @@ def mcp_settings(mcp_config: str, allowed_tools: list[str] | None = None) -> lis
     servers = (json.loads(mcp_config).get("mcpServers") or {}) if mcp_config else {}
     out: list[str] = []
     attempt = verification_scratch.PRODUCING.get()
-    browser = bool(servers) and attempt is not None and verification_scratch.activated(attempt)
-    if browser:
+    browser_wanted = bool(servers) and attempt is not None and verification_scratch.activated(attempt)
+    if browser_wanted:
         try:
-            expected = {"playwright": verification_scratch.browser_server(attempt)}
+            expected = {"playwright": browser.browser_server(attempt)}
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise ValueError(f"browser confinement unavailable: {error}") from error
         if servers != expected:
@@ -365,7 +365,7 @@ def mcp_settings(mcp_config: str, allowed_tools: list[str] | None = None) -> lis
             continue
         table = ({"url": server["url"]} if server.get("url") else
                  {"command": server.get("command", ""), "args": list(server.get("args") or [])})
-        if browser:
+        if browser_wanted:
             table["cwd"] = server["cwd"]
         elif "command" in table:
             confined = verification_scratch.protected_command([table["command"], *table["args"]])

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import (
     accounts,
+    browser,
     claude,
     codex,
     config,
@@ -819,10 +820,10 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     if trip.scratch:
         original = kw.get("mcp_config", "")
         if which != "claude" or target.remote:
-            verification_scratch.stop_served(trip.scratch)
+            browser.stop_served(trip.scratch)
         if which == "codex" and not target.remote:
             try:
-                kw["mcp_config"] = verification_scratch.browser_config(trip.scratch, original, kw.get("add_dirs", ()))
+                kw["mcp_config"] = browser.browser_config(trip.scratch, original, kw.get("add_dirs", ()))
             except (OSError, ValueError, KeyError, TypeError) as error:
                 kw["budget_error"] = f"browser confinement unavailable: {error}"
         try:
@@ -830,10 +831,10 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
                                                  kw.get("mcp_config", ""))
         except (OSError, ValueError, KeyError, TypeError):
             hook = ()
-        if (not hook and which == "codex" and not target.remote and verification_scratch.has_servers(original)
+        if (not hook and which == "codex" and not target.remote and browser.has_servers(original)
                 and not kw.get("budget_error")
                 and (kw.get("mcp_config", "") != original
-                     or verification_scratch.plain_config(trip.scratch, original) is None)):
+                     or browser.plain_config(trip.scratch, original) is None)):
             kw["budget_error"] = "browser confinement unavailable: the trusted browser could not be activated"
         if not hook:
             if "mcp_config" in kw:
@@ -842,14 +843,14 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
         if which == "claude" and not target.remote:
             try:
-                config_json, reason = verification_scratch.serve_browser(trip.scratch, original, kw.get("add_dirs", ()))
+                config_json, reason = browser.serve_browser(trip.scratch, original, kw.get("add_dirs", ()))
             except (OSError, ValueError, KeyError, TypeError) as error:
-                config_json = verification_scratch.without_browser(original)
+                config_json = browser.without_browser(original)
                 reason = str(error) or type(error).__name__
             if reason:
                 kw["allowed_tools"] = [t for t in kw.get("allowed_tools") or [] if not t.startswith("mcp__playwright")]
                 kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""),
-                                                         verification_scratch.browser_blocked_note(reason)]))
+                                                         browser.browser_blocked_note(reason)]))
                 say(f"the confined browser is unavailable for this verify: {reason}")
             if "mcp_config" in kw:
                 kw["mcp_config"] = config_json

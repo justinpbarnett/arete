@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, codebase, gh, paths, run_lines, state, util, vault
+from . import agent, codebase, paths, run_lines, state, util, vault
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -219,7 +219,7 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
 
 def secrets(*files: Path, given: Iterable[str] = ()) -> tuple[str, ...]:
     found = {v for k, v in os.environ.items() if CREDENTIAL_NAME.search(k)}
-    found |= {gh.auth_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True), *vault.values(), *given}
+    found |= {util.github_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True), *vault.values(), *given}
     for f in files:
         found |= file_secrets(f)
     found = {v for v in found if len(v) >= SHORTEST_SECRET}

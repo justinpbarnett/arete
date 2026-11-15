@@ -294,9 +294,7 @@ def run_streaming(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, s
         raise
     finally:
         if scratch.PRODUCING.get() is not None:
-            from . import verify
-
-            verify.stop(child)
+            util.stop_group(child)
         for helper in helpers:
             helper.join(DRAIN_SECONDS)
     if cuts:

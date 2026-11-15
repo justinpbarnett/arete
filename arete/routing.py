@@ -69,7 +69,7 @@ class Quote:
 
     @property
     def total(self) -> float | None:
-        return None if self.input is None or self.output is None else number(self.input + self.output)
+        return None if self.input is None or self.output is None else util.nonnegative_number(self.input + self.output)
 
 
 @dataclass(frozen=True)
@@ -288,19 +288,9 @@ def fit_refusal(request: Request, device: devices.Device, modes: tuple[str, ...]
     return first
 
 
-def number(value) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return None
-    try:
-        found = float(value)
-    except ValueError:
-        return None
-    return found if math.isfinite(found) and found >= 0 else None
-
-
 def per_million(value) -> float | None:
-    found = number(value)
-    scaled = None if found is None else number(found * 1e6)
+    found = util.nonnegative_number(value)
+    scaled = None if found is None else util.nonnegative_number(found * 1e6)
     return None if scaled is None else round(scaled, 6)
 
 
@@ -314,7 +304,7 @@ def names(value) -> list[str] | None:
 
 def listing(entry) -> dict:
     entry = accounts.mapping(entry)
-    return {**{key: number(entry.get(key)) for key in ("input", "output", "cache_read", "cache_write")},
+    return {**{key: util.nonnegative_number(entry.get(key)) for key in ("input", "output", "cache_read", "cache_write")},
             "context": whole(entry.get("context")), "modalities": names(entry.get("modalities")),
             "structured_output": entry["structured_output"] if type(entry.get("structured_output")) is bool else None}
 
@@ -362,8 +352,8 @@ def local_quote(model: str, selected: pi.Route) -> Quote | None:
         item = accounts.mapping(item)
         if item.get("id") == name and isinstance(item.get("cost"), dict):
             cost = item["cost"]
-            return Quote(number(cost.get("input")), number(cost.get("output")), number(cost.get("cacheRead")),
-                         number(cost.get("cacheWrite")), "models.json")
+            return Quote(util.nonnegative_number(cost.get("input")), util.nonnegative_number(cost.get("output")), util.nonnegative_number(cost.get("cacheRead")),
+                         util.nonnegative_number(cost.get("cacheWrite")), "models.json")
     return None
 
 

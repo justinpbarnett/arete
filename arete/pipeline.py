@@ -24,6 +24,7 @@ from typing import NamedTuple, TextIO
 
 from . import (
     alerts,
+    browser,
     ci,
     config,
     control,
@@ -3155,7 +3156,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                             b.ws, role=role,
                             allowed_tools=bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
-                            mcp_config=verify.mcp_config(evidence) if url else "",
+                            mcp_config=browser.mcp_config(evidence) if url else "",
                             scratch=attempt)
             agent_finished = True
     except owner_asks.Asked:

@@ -1050,9 +1050,7 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
             proc.kill()
             proc.wait()
         if scratch.PRODUCING.get() is not None:
-            from . import verify
-
-            verify.stop(proc)
+            util.stop_group(proc)
     reader.join(5)
     done = subprocess.CompletedProcess(cmd, proc.returncode, "".join(lines), "".join(stderr))
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")
