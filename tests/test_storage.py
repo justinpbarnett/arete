@@ -1,5 +1,8 @@
+import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -372,6 +375,142 @@ class RunsLookupTests(unittest.TestCase):
                     self.assertTrue(line.startswith(allowed_scans.get(name, "\0")), (name, line))
             if name == "runs":
                 self.assertFalse(any("USE TEMP B-TREE" in line for line in lines), lines)
+
+
+class DoctorTests(unittest.TestCase):
+    FIXTURE = SCRIPTS / "doctor_fixture.py"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        make_folders(self.root, "home", "config", "state", "logs", "worktrees", "tmp")
+        self.env = scratch_env(self.root, HOME=str(self.root / "home"), ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
+                               TMPDIR=str(self.root / "tmp"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+
+    def fixture(self, *args, check=True):
+        done = subprocess.run([sys.executable, str(self.FIXTURE), *args], cwd=self.root, env=self.env, text=True,
+                              capture_output=True, timeout=180)
+        if check:
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        return done
+
+    def lines(self, done):
+        return {line.split()[1]: line for line in done.stdout.splitlines() if line.split()[:1] in (["OK"], ["FAIL"], ["INFO"])}
+
+    def doctor(self):
+        done = self.fixture("cli", "doctor", check=False)
+        return done.returncode, self.lines(done), done
+
+    def inspected(self):
+        return json.loads(self.fixture("inspect").stdout)
+
+    def fingerprint(self):
+        return self.fixture("fingerprint").stdout
+
+    def test_a_clean_home_reads_ok_on_every_check(self):
+        self.fixture("clean")
+        code, lines, done = self.doctor()
+        self.assertEqual(code, 0, done.stdout + done.stderr)
+        self.assertEqual(list(lines), ["cost", "orphans", "chat", "folders", "stuck", "store", "backup"])
+        self.assertTrue(all(line.startswith("OK") for line in lines.values()), lines)
+
+    def test_doctor_names_each_old_fault_once_and_leaves_young_ones_alone(self):
+        self.fixture("faults")
+        before = self.fingerprint()
+        code, lines, done = self.doctor()
+        self.assertEqual(self.fingerprint(), before)
+        self.assertEqual(code, 1, done.stdout)
+        self.assertTrue(lines["cost"].startswith("FAIL") and "cost-run" in lines["cost"], lines["cost"])
+        self.assertTrue(lines["orphans"].startswith("FAIL") and "ghost-run" in lines["orphans"], lines["orphans"])
+        self.assertTrue(lines["chat"].startswith("INFO") and lines["chat"].split()[2] == "2", lines["chat"])
+        self.assertEqual(lines["folders"].split()[2], "3")
+        for name in ("stray-folder", "old-pipeline", "sess-gone"):
+            self.assertIn(name, lines["folders"])
+        self.assertEqual(lines["stuck"].split()[2], "3")
+        for name in ("chat#1", "queue#1", "approval#1"):
+            self.assertIn(name, lines["stuck"])
+        for name in ("store", "backup"):
+            self.assertTrue(lines[name].startswith("OK"), lines[name])
+        for name in ("runs/chat", "eva-x-prompts", "young-folder", "young-row"):
+            self.assertNotIn(name, done.stdout)
+
+    def test_doctor_reads_a_read_only_database(self):
+        self.fixture("faults")
+        db = self.root / "state" / "arete.db"
+        before = self.fingerprint()
+        os.chmod(db, 0o444)
+        os.chmod(db.parent, 0o555)
+        self.addCleanup(os.chmod, db.parent, 0o755)
+        self.addCleanup(os.chmod, db, 0o644)
+        code, lines, _ = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 7)
+        self.assertEqual(self.fingerprint(), before)
+
+    def test_audit_raises_one_doctor_alert_per_failing_check_and_clears_them(self):
+        self.fixture("faults")
+        for _ in range(2):
+            self.assertEqual(self.fixture("cli", "audit").returncode, 0)
+        found = self.inspected()
+        self.assertEqual([k for k in found["alerts"] if k.startswith("audit:doctor:")],
+                         ["audit:doctor:cost", "audit:doctor:folders", "audit:doctor:orphans", "audit:doctor:stuck"])
+        self.assertEqual(len([n for n in found["notified"] if "audit: doctor:" in n[1]]), 4)
+        self.assertNotIn("doctor:", found["latest"])
+        latest = (self.root / "state" / "audit" / "latest.md").read_text()
+        self.assertIn("## Doctor", latest)
+        for name in ("cost", "orphans", "chat", "folders", "stuck", "store", "backup"):
+            self.assertIn(f"- {name}: ", latest)
+        self.fixture("repair")
+        self.fixture("cli", "audit")
+        self.assertEqual([k for k in self.inspected()["alerts"] if k.startswith("audit:doctor:")], [])
+
+    def test_a_failing_heartbeat_check_makes_the_doctor_alert_a_warning(self):
+        self.fixture("faults")
+        self.fixture("heartbeat-cost")
+        self.fixture("cli", "audit")
+        self.assertNotIn("audit:doctor:cost", self.inspected()["alerts"])
+        self.assertIn("audit:doctor:orphans", self.inspected()["alerts"])
+        self.assertIn("WARN [doctor:cost]", (self.root / "state" / "audit" / "latest.md").read_text())
+        self.assertEqual(self.doctor()[0], 1)
+
+    def test_a_passing_malformed_or_warning_heartbeat_keeps_the_alert(self):
+        self.fixture("faults")
+        for action in ("heartbeat-passing", "heartbeat-malformed", "heartbeat-warn"):
+            self.fixture(action)
+            self.fixture("cli", "audit")
+            self.assertIn("audit:doctor:cost", self.inspected()["alerts"], action)
+
+    def test_backup_fails_when_stale_unrecorded_or_missing_with_serve_installed(self):
+        self.fixture("clean")
+        self.fixture("stale-backup")
+        code, lines, _ = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertTrue(lines["backup"].startswith("FAIL") and ".db" in lines["backup"], lines["backup"])
+        self.fixture("fresh-backup")
+        self.fixture("bad-backup-record")
+        self.assertTrue(self.doctor()[1]["backup"].startswith("FAIL"))
+        self.fixture("no-backup")
+        code, lines, _ = self.doctor()
+        self.assertEqual(code, 0)
+        self.assertTrue(lines["backup"].startswith("INFO"), lines["backup"])
+
+    def test_doctor_fails_store_on_a_damaged_database(self):
+        self.fixture("clean")
+        self.fixture("corrupt-store")
+        before = self.fingerprint()
+        code, lines, _ = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 7)
+        self.assertTrue(lines["store"].startswith("FAIL"), lines["store"])
+        self.assertEqual(self.fingerprint(), before)
+
+    def test_doctor_without_a_database_fails_without_creating_one(self):
+        code, lines, _ = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(lines), 7)
+        self.assertFalse((self.root / "state" / "arete.db").exists())
+        self.assertFalse((self.root / "state" / "runs").exists())
 
 
 if __name__ == "__main__":
