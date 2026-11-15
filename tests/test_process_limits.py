@@ -40,6 +40,8 @@ from arete import (
 )
 from arete.agent import Result
 
+from tests.harness import set_task_body
+
 
 def setUpModule():
     folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
@@ -246,7 +248,7 @@ class BudgetTests(Isolated):
         first.budget.park("first epoch exhausted")
         record.settle(first.id, "failed")
         with state.db() as connection:
-            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("A narrower specification", self.ticket))
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
         def concurrent():
             second = self.made_run()
             second.budget.charge("review_fix1", "review_repair")
@@ -477,7 +479,7 @@ class BudgetTests(Isolated):
             self.assertIn("parked", why)
             self.assertFalse(reset)
             with state.db() as connection:
-                connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("A narrower specification", self.ticket))
+                set_task_body(self.ticket, "A narrower specification", connection=connection)
             self.assertTrue(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, False)[0])
             self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True), ("", True))
 
@@ -563,7 +565,7 @@ class BudgetTests(Isolated):
 
     def edit_ticket(self):
         with state.db() as connection:
-            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Edited with a follow up", self.ticket))
+            set_task_body(self.ticket, "Edited with a follow up", connection=connection)
 
     def test_forced_run_leaves_out_repairs_spent_under_another_specification(self):
         legacy = self.legacy_held_run()
@@ -604,7 +606,7 @@ class BudgetTests(Isolated):
     def exhausted_then_edited(self, **budget):
         old = self.made_run()
         with state.db() as connection:
-            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Edited with a follow up", self.ticket))
+            set_task_body(self.ticket, "Edited with a follow up", connection=connection)
         if "verification_seconds" in budget:
             saved = runlimits.metadata(old.id, "budget.json")
             util.write_json(paths.RUNS_DIR / old.id / "budget.json", {**saved, **budget})
@@ -633,7 +635,7 @@ class BudgetTests(Isolated):
             record.settle(fresh.run.id, "failed")
             record.settle(kept.run.id, "failed")
             with state.db() as connection:
-                connection.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Original", self.ticket))
+                set_task_body(self.ticket, "Original", connection=connection)
 
     def test_restarting_an_interrupted_run_keeps_inherited_usage_after_an_edit(self):
         legacy = self.legacy_held_run(status="interrupted")
@@ -737,7 +739,7 @@ class QueueTests(Isolated):
         record.settle(interrupted.id, "interrupted")
         prerequisite = state.task_add(self.repo.name, "Prerequisite", "Prerequisite", "feat")
         with state.db() as connection:
-            connection.execute("UPDATE tasks SET body = ? WHERE id = ?", (f"Waits on {prerequisite}", self.ticket))
+            set_task_body(self.ticket, f"Waits on {prerequisite}", connection=connection)
         self.cfg.replay = config.ReplayConfig(all=True)
         started = []
         self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
