@@ -10463,5 +10463,341 @@ result(refused=refused, passed=passed, escaped=escaped, reverted=server.code_pro
         self.assertIn("new code cannot read config.toml", line)
 
 
+class ServeReloadTests(unittest.TestCase):
+    PRELUDE = ConfigForwardCompatTests.PRELUDE + r'''
+import http.client, http.server, socket, subprocess, types
+from arete import client, dashboard, delivery
+OWNER = "owner@example.test"
+CHANGED = frozenset({("changed", 1, 1)})
+real_sh = util.sh
+who = [OWNER]
+dashboard.Logins.of = lambda self, address: who[0]
+NODE = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), OWNER, "127.0.0.1")
+def listen(logins, handler):
+    web = dashboard.Server("127.0.0.1", 0, NODE, logins, True, handler=handler)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    return web
+web = listen(dashboard.Logins(None), dashboard.Handler)
+PORT = web.server_address[1]
+gate, sending = threading.Event(), threading.Event()
+def fake_notify(item, batch, loop, run, cfg):
+    sending.set()
+    if not gate.wait(20):
+        raise TimeoutError("fixture gate never opened")
+    return "sent"
+delivery.EMITS["notify"].execute = fake_notify
+def approval():
+    return state.add_approval("demo", "", {"type": "notify", "item": {"title": "t", "message": "m"}}, "summary")
+def status_of(n):
+    return state.approval(n)["status"]
+def post(n, body=b'{"approve": true}', host="127.0.0.1", port=None, header=("X-Arete", "1"), extra=None):
+    conn = http.client.HTTPConnection("127.0.0.1", port or PORT, timeout=20)
+    conn.request("POST", f"/api/approvals/{n}", body, {"Host": host, **dict([header] if header else []), **(extra or {})})
+    resp = conn.getresponse()
+    answer = {"status": resp.status, "retry": resp.getheader("Retry-After"), "body": json.loads(resp.read())}
+    conn.close()
+    return answer
+def page():
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=20)
+    conn.request("GET", "/", headers={"Host": "127.0.0.1"})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    return resp.status
+def raw(n, length):
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    s.sendall(f"POST /api/approvals/{n} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Arete: 1\r\n{length}Connection: close\r\n\r\n".encode())
+    data = b""
+    while chunk := s.recv(4096):
+        data += chunk
+    s.close()
+    head = data.split(b"\r\n\r\n")[0].decode()
+    return {"status": int(head.split()[1]), "retry": "Retry-After: 3" in head}
+def background(fn):
+    box = {}
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:
+            box["error"] = repr(e)
+    box["thread"] = threading.Thread(target=run)
+    box["thread"].start()
+    return box
+def finish(box):
+    box["thread"].join(20)
+    return box.get("value", box.get("error", "still running"))
+def wait_for(ready):
+    end = time.monotonic() + 10
+    while not ready():
+        if time.monotonic() > end:
+            raise TimeoutError("fixture condition never held")
+        time.sleep(0.01)
+def reload_server():
+    server, said = quiet_server()
+    server.lock = util.lock_file(serve.SERVE_LOCK)
+    server.code, server.code_seen = frozenset(), CHANGED
+    return server, said
+def passing(argv, **kw):
+    if argv[-1] in (serve.IMPORT_CHECK, serve.CONFIG_CHECK):
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return real_sh(argv, **kw)
+def attempt(server, sh, execv):
+    try:
+        with mock.patch.object(serve, "code_stamp", lambda: CHANGED), mock.patch.object(util, "sh", sh), \
+                mock.patch.object(os, "execv", execv):
+            server.load_new_code()
+    except BaseException as e:
+        return repr(e)
+    finally:
+        os.environ.pop(serve.SERVE_LOCK_FD, None)
+        os.environ.pop(serve.RESTARTED_FOR_NEW_CODE, None)
+    return ""
+'''
+    environment = ConfigForwardCompatTests.environment
+    program = ConfigForwardCompatTests.program
+    case = ConfigForwardCompatTests.case
+
+    def test_a_post_during_the_import_check_holds_the_restart(self):
+        found = self.case(r'''
+n, started, execs = approval(), [], []
+def probing(argv, **kw):
+    if argv[-1] == serve.IMPORT_CHECK and not started:
+        started.append(background(lambda: post(n)))
+        wait_for(lambda: dashboard.POSTS_IN_FLIGHT.count == 1 and sending.is_set())
+    return passing(argv, **kw)
+def record(*a):
+    execs.append({"count": dashboard.POSTS_IN_FLIGHT.count, "closed": dashboard.POSTS_IN_FLIGHT.closed,
+                  "status": status_of(n)})
+    raise OSError("fixture refuses to exec")
+server, said = reload_server()
+first = attempt(server, probing, record)
+held = {"execs": len(execs), "said": [s for s in said if "new code waits to load" in s],
+        "closed": dashboard.POSTS_IN_FLIGHT.closed, "status": status_of(n), "error": first}
+gate.set()
+answer = finish(started[0])
+after = {"status": status_of(n), "count": dashboard.POSTS_IN_FLIGHT.count}
+second = attempt(server, probing, record)
+result(held=held, answer=answer, after=after, second=second, execs=execs,
+       closed=dashboard.POSTS_IN_FLIGHT.closed, inheritable=os.get_inheritable(server.lock.fileno()))
+''')
+        self.assertEqual(found["held"], {"execs": 0, "closed": False, "status": "approved", "error": "", "said": [
+            found["held"]["said"][0]]})
+        self.assertTrue(found["held"]["said"][0].endswith("new code waits to load: the dashboard is still answering a request"))
+        self.assertEqual((found["answer"]["status"], found["answer"]["retry"]), (200, None))
+        self.assertIn("sent", json.dumps(found["answer"]["body"]))
+        self.assertEqual(found["after"], {"status": "done", "count": 0})
+        self.assertIn("OSError", found["second"])
+        self.assertEqual(found["execs"], [{"count": 0, "closed": True, "status": "done"}])
+        self.assertFalse(found["closed"])
+        self.assertFalse(found["inheritable"])
+
+    def test_a_closed_gauge_answers_503_and_keeps_the_approval_for_a_second_try(self):
+        found = self.case(r'''
+gate.set()
+a = approval()
+dashboard.POSTS_IN_FLIGHT.close()
+refused = post(a)
+during = {"status": status_of(a), "listed": a in [x["id"] for x in state.approvals()],
+          "count": dashboard.POSTS_IN_FLIGHT.count}
+foreign = post(a, host="foreign.invalid")
+who[0] = "someone@else.test"
+stranger = post(a)
+who[0] = OWNER
+unmarked = post(a, header=None)
+lengths = {"missing": raw(a, ""), "invalid": raw(a, "Content-Length: abc\r\n")}
+fronted = listen(dashboard.FrontedLogins(), dashboard.FrontedHandler)
+port = fronted.server_address[1]
+through = {"owner": post(a, port=port, extra={client.IDENTITY_HEADER: OWNER})["status"],
+           "stranger": post(a, port=port, extra={client.IDENTITY_HEADER: "someone@else.test"})["status"]}
+reading = page()
+dashboard.POSTS_IN_FLIGHT.reopen()
+again = post(a)
+result(refused=refused, text=dashboard.RESTARTING, during=during, foreign=foreign["status"],
+       stranger=stranger["status"], unmarked=unmarked["status"], lengths=lengths, through=through, reading=reading,
+       again=again, status=status_of(a), count=dashboard.POSTS_IN_FLIGHT.count, kept=status_of(a))
+''')
+        self.assertEqual((found["refused"]["status"], found["refused"]["retry"]), (503, "3"))
+        self.assertEqual(found["refused"]["body"], {"error": found["text"]})
+        self.assertEqual(found["during"], {"status": "pending", "listed": True, "count": 0})
+        self.assertEqual((found["foreign"], found["stranger"], found["unmarked"]), (421, 403, 403))
+        self.assertEqual(found["lengths"], {"missing": {"status": 503, "retry": True},
+                                            "invalid": {"status": 503, "retry": True}})
+        self.assertEqual(found["through"], {"owner": 503, "stranger": 403})
+        self.assertEqual(found["reading"], 200)
+        self.assertEqual((found["again"]["status"], found["again"]["retry"]), (200, None))
+        self.assertEqual((found["status"], found["count"]), ("done", 0))
+
+    def test_a_restart_that_does_not_happen_leaves_posts_open(self):
+        found = self.case(r'''
+gate.set()
+def CP(argv, code, err=""):
+    return subprocess.CompletedProcess(argv, code, "", err)
+def refusing(import_code, config_code=0):
+    def sh(argv, **kw):
+        seen.append(dashboard.POSTS_IN_FLIGHT.closed)
+        if argv[-1] == serve.IMPORT_CHECK:
+            return CP(argv, import_code, "SyntaxError: broken" if import_code else "")
+        if argv[-1] == serve.CONFIG_CHECK:
+            return CP(argv, config_code, "ValueError: cannot read" if config_code else "")
+        return real_sh(argv, **kw)
+    return sh
+def works():
+    return post(approval())["status"]
+def count_exec(*a):
+    execs.append(1)
+def raising(*a):
+    execs.append(1)
+    raise OSError("fixture refuses to exec")
+found = {}
+def run(name, sh, execv=count_exec, server=None, around=None):
+    global seen, execs
+    seen, execs = [], []
+    server, said = server or reload_server()
+    error = attempt(server, sh, execv)
+    found[name] = {"seen": seen, "execs": len(execs), "error": error, "said": " | ".join(said),
+                   "closed": dashboard.POSTS_IN_FLIGHT.closed, "works": works()}
+run("import", refusing(1))
+run("config", refusing(0, 1))
+run("execv", passing, raising)
+server, said = reload_server()
+calls = []
+def second_busy_fails():
+    calls.append(1)
+    if len(calls) == 2:
+        raise RuntimeError("fixture busy failure")
+    return ""
+server.busy_with = second_busy_fails
+run("busy", passing, server=(server, said))
+with mock.patch.object(serve, "child_pids", mock.Mock(side_effect=RuntimeError("fixture pgrep failure"))):
+    run("children", passing)
+flag = [False]
+def work_starts(argv, **kw):
+    flag[0] = argv[-1] == serve.IMPORT_CHECK or flag[0]
+    return passing(argv, **kw)
+with mock.patch.object(serve.chat, "any_busy", lambda: flag[0]):
+    run("chat", work_starts)
+flag[0] = False
+with mock.patch.object(serve.capture, "checking", lambda: flag[0]):
+    run("capture", work_starts)
+result(**found)
+''', timeout=180)
+        self.assertEqual(found["import"]["seen"], [False])
+        self.assertIn("new code does not import", found["import"]["said"])
+        self.assertIn("new code cannot read config.toml", found["config"]["said"])
+        self.assertEqual(set(found["config"]["seen"]), {False})
+        self.assertIn("OSError", found["execv"]["error"])
+        self.assertIn("RuntimeError", found["busy"]["error"])
+        self.assertIn("RuntimeError", found["children"]["error"])
+        self.assertIn("a chat message is still running", found["chat"]["said"])
+        self.assertIn("a feedback request is still being checked or filed", found["capture"]["said"])
+        for name in ("import", "config", "busy", "children", "chat", "capture"):
+            self.assertEqual(found[name]["execs"], 0, name)
+        self.assertEqual(found["execv"]["execs"], 1)
+        for name, one in found.items():
+            self.assertEqual((one["closed"], one["works"]), (False, 200), name)
+
+    def test_the_client_sends_a_restart_503_again_and_fails_everything_else_at_once(self):
+        found = self.case(r'''
+RESTART = {"error": dashboard.RESTARTING}
+class Clock:
+    def __init__(self):
+        self.now, self.slept = 0.0, []
+    def monotonic(self):
+        return self.now
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+def scripted(replies):
+    seen = []
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append((self.path, self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            status, headers, body = replies[min(len(seen) - 1, len(replies) - 1)]
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+def dead_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+def live(srv, fn=None):
+    calls = []
+    def where():
+        calls.append(1)
+        port = srv.server_address[1] if fn is None or fn(len(calls)) else dead_port()
+        return client.Server("http", "127.0.0.1", port, "127.0.0.1")
+    return where
+def go(replies, fn=None, clock=None, path="/probe"):
+    srv, seen = scripted(replies)
+    client.server = live(srv, fn)
+    out = {}
+    began = time.monotonic()
+    try:
+        if clock:
+            with mock.patch.object(client, "time", types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)):
+                out["answer"] = client.call("POST", path, {"value": 1})
+        else:
+            out["answer"] = client.call("POST", path, {"value": 1})
+    except client.Failed as e:
+        out["failed"] = {"code": e.code, "text": str(e)}
+    except client.Down as e:
+        out["down"] = str(e)
+    srv.shutdown()
+    return {**out, "requests": len(seen), "same": len(set(seen)) == 1, "elapsed": time.monotonic() - began}
+OK = (200, {}, {"ok": True})
+r503 = lambda after: (503, {"Retry-After": after}, RESTART)
+clock = Clock()
+repeated = go([r503("10")], clock=clock)
+repeated["slept"] = clock.slept
+clock = Clock()
+expiry = go([r503("10"), r503("10"), r503("10"), OK], clock=clock)
+expiry["slept"] = clock.slept
+clock = Clock()
+dropped = go([r503("1"), OK], fn=lambda n: n != 2, clock=clock)
+dropped["slept"] = clock.slept
+clock = Clock()
+never = go([r503("1")], fn=lambda n: n == 1, clock=clock)
+never["slept"] = clock.slept
+clock = Clock()
+client.server = lambda: client.Server("http", "127.0.0.1", dead_port(), "127.0.0.1")
+try:
+    with mock.patch.object(client, "time", types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)):
+        client.call("POST", "/probe", {})
+    initial = "no error"
+except client.Down:
+    initial = "down"
+result(again=go([r503("0"), OK]), slow=go([r503("1"), OK]), none=go([(503, {}, RESTART)]),
+       invalid=go([(503, {"Retry-After": "soon"}, RESTART)]), other=go([(409, {"Retry-After": "1"}, {"error": "Busy."})]),
+       repeated=repeated, expiry=expiry, dropped=dropped, never=never, initial=initial, initial_sleeps=clock.slept)
+''', timeout=180)
+        self.assertEqual((found["again"]["answer"], found["again"]["requests"], found["again"]["same"]), ({"ok": True}, 2, True))
+        self.assertEqual((found["slow"]["answer"], found["slow"]["requests"]), ({"ok": True}, 2))
+        self.assertGreaterEqual(found["slow"]["elapsed"], 0.9)
+        for name, code in (("none", 503), ("invalid", 503), ("other", 409)):
+            self.assertEqual((found[name]["requests"], found[name]["failed"]["code"]), (1, code), name)
+        self.assertEqual(found["other"]["failed"]["text"], "Busy.")
+        self.assertEqual(found["none"]["failed"]["text"], "Arete is loading new code. Send this again in a few seconds.")
+        self.assertEqual(found["repeated"]["failed"], {"code": 503, "text": "Arete is loading new code. Send this again in a few seconds."})
+        self.assertEqual((found["repeated"]["requests"], found["repeated"]["slept"]), (3, [10, 10, 10]))
+        self.assertEqual((found["expiry"]["requests"], found["expiry"]["slept"]), (3, [10, 10, 10]))
+        self.assertEqual(found["expiry"]["failed"]["code"], 503)
+        self.assertNotIn("answer", found["expiry"])
+        self.assertEqual((found["dropped"]["answer"], found["dropped"]["slept"]), ({"ok": True}, [1, 2]))
+        self.assertEqual(found["never"]["failed"]["code"], 503)
+        self.assertEqual(sum(found["never"]["slept"]), 30)
+        self.assertEqual((found["initial"], found["initial_sleeps"]), ("down", []))
+
+
 if __name__ == "__main__":
     unittest.main()
