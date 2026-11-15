@@ -586,7 +586,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == f"{PUSH_PATH}/remove":
                 return webpush.remove(str(self.body().get("id") or ""))
             if path == f"{PUSH_PATH}/test":
-                return webpush.test(config.load())
+                return webpush.test(config.load_or_problem()[0])
             if path.startswith(ASK_PATH):
                 ask_id, _, action = unquote(path[len(ASK_PATH):]).partition("/")
                 if action == "answer":
@@ -679,7 +679,7 @@ class Handler(BaseHTTPRequestHandler):
         questions, answers = b.get("questions"), b.get("answers")
         if not all(isinstance(x, list) and all(isinstance(t, str) for t in x) for x in (questions, answers)):
             raise Refusal(400, "Questions and answers take lists of text.")
-        said = triage.send(config.load(), ref, questions, answers, str(b.get("repo") or ""))
+        said = triage.send(config.load_or_problem()[0], ref, questions, answers, str(b.get("repo") or ""))
         return {"ref": ref, "said": f"{said} {start_poll_without_failing_the_send()}"}
 
     def usage_row(self) -> dict:
@@ -914,7 +914,7 @@ def run_ended(run_id: str) -> Callable[[], bool]:
 
 
 def draft_choices() -> dict:
-    cfg = config.load()
+    cfg = config.load_or_problem()[0]
     return {"repos": [r.name for r in cfg.repos], "models": sessions.known_models(cfg),
             "default_model": cfg.model("loop")}
 
@@ -1214,7 +1214,7 @@ def watch(host: Tailscale, owner: str, node: Node, front: Front, secure: bool = 
 
 
 def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale | None = None) -> NoReturn:
-    cfg = config.load()
+    cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
     state.ensure_schema()
     chat.recover()
@@ -1317,7 +1317,7 @@ def url(node: Node | None, port: int) -> str:
     found = util.read_json(paths.SERVER_FILE, None)
     mine = paths.state_and_config()
     recorded = isinstance(found, dict) and {k: found.get(k) for k in mine} == mine
-    fallback = "https" if config.load().dashboard_https else "http"
+    fallback = "https" if config.load_or_problem()[0].dashboard_https else "http"
     if recorded and found.get("behind"):
         scheme = "https"
     else:

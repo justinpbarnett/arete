@@ -1015,6 +1015,18 @@ except SystemExit:
         result["status_short"] = pipeline.git(["status", "--short"], layer_dir).splitlines()
     print("BEHAVIOR_RESULT=" + json.dumps(result))
     raise SystemExit(0)
+if scenario == "future-step-appended":
+    planned, appended, before_edit = [], [], runner.run
+    def edit_after_plan(prompt, cwd, **kw):
+        if planned and not appended:
+            appended.append(True)
+            with paths.CONFIG_FILE.open("a") as out:
+                out.write("\n[steps.future_step]\ntries=1\n")
+        done = before_edit(prompt, cwd, **kw)
+        if (kw.get("trace") or ("", ""))[1:2] == ("plan",):
+            planned.append(True)
+        return done
+    runner.run = edit_after_plan
 row = forced("--dry-run") if scenario == "review-notes-dry-run" else forced()
 events =[json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()]
 verification = [e.get("data", {}).get("verified") for e in events
@@ -1063,6 +1075,8 @@ if scenario == "code-identity":
         "headers": [json.loads(next(record.raw_lines(f))).get("engine") for f in record.record_files(row["id"])],
         "later": [e.get("engine") for e in events[1:]],
         "second": [json.loads(line) for line in (paths.RUNS_DIR / row["id"] / "run.jsonl").read_text().splitlines()][-2:]}
+if scenario == "future-step-appended":
+    result["appended"] = bool(appended)
 if scenario == "pass":
     branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
     assert len(branches) == 1, result
@@ -10084,6 +10098,367 @@ result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)
 ''')
         self.assertTrue(found["continued"] and found["rotated"] and found["stopped"])
         self.assertTrue(any("state prune failed: OSError: state unavailable" in m for m in found["messages"]))
+
+
+class ConfigForwardCompatTests(unittest.TestCase):
+    PRELUDE = r'''
+import json, os, sys, threading, time, urllib.request
+from pathlib import Path
+from unittest import mock
+from arete import accounts, config, control, gh, paths, replay, serve, settings, state, util
+root = Path(sys.argv[1])
+def forbidden(*args, **kwargs):
+    raise AssertionError("config compatibility case attempted an external transport or credential lookup")
+urllib.request.urlopen = forbidden
+accounts.read = forbidden
+gh.gh = forbidden
+GOOD = "max_parallel=1\n\n" + "\n".join(replay.sample(root / "sample", adw=True)) + "\n\n[jev]\nenabled=false\n"
+BAD = GOOD + "\n[routing]\nfuture_key = 1\n"
+NEWER = GOOD + """
+[steps.future_step]
+tries = 1
+
+[kinds.chore]
+
+[ask]
+future_option = 1
+max_per_run = 5
+
+[retention]
+future = 1
+days = 10
+lines_days = 40
+
+[jev.risk_weights]
+future_weight = 0.5
+"""
+def write(text):
+    paths.CONFIG_FILE.write_text(text)
+def result(**found):
+    print("BEHAVIOR_RESULT=" + json.dumps(found))
+def refused(text, **kw):
+    write(text)
+    try:
+        config.load(**kw)
+    except ValueError as e:
+        return str(e)
+    return ""
+def quiet_server():
+    serve.Server.sweep_vms = lambda self: None
+    serve.Server.prune = lambda self: None
+    serve.engine.launch = lambda *a, **k: (_ for _ in ()).throw(control.Refused("fixture"))
+    server = serve.Server()
+    said = []
+    server.say = said.append
+    return server, said
+write(GOOD)
+'''
+
+    def environment(self, root):
+        for folder in ("config", "state", "logs", "worktrees", "tmp", "home"):
+            (root / folder).mkdir()
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+        env.update(ARETE_CONFIG_DIR=str(root / "config"), ARETE_STATE_DIR=str(root / "state"),
+                   ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
+                   TMPDIR=str(root / "tmp"), HOME=str(root / "home"),
+                   GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+        return env
+
+    def program(self, body):
+        return f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+
+    def case(self, body, timeout=120):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.environment(root)
+            done = subprocess.run([sys.executable, "-I", "-c", self.program(body), str(root)],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=timeout)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            line = next(x for x in done.stdout.splitlines() if x.startswith("BEHAVIOR_RESULT="))
+            return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+
+    def test_names_from_a_newer_engine_are_ignored_once(self):
+        found = self.case(r'''
+write(NEWER)
+cfg = config.load()
+result(ignored=list(cfg.ignored), max_per_run=cfg.ask.max_per_run, days=cfg.retention.days,
+       weights=sorted(cfg.jev.risk_weights), engine=sorted(config.JevConfig().risk_weights),
+       strict=refused(NEWER, strict=True))
+''')
+        self.assertEqual(sorted(found["ignored"]), sorted(["[steps] future_step", "[kinds] chore", "[ask] future_option",
+                                                           "[retention] future", "[jev.risk_weights] future_weight"]))
+        self.assertEqual((found["max_per_run"], found["days"]), (5, 10))
+        self.assertEqual(found["weights"], found["engine"])
+        self.assertIn("future_step", found["strict"])
+
+    def test_other_tolerant_readers_and_strict_direct_calls(self):
+        found = self.case(r'''
+more = GOOD.replace("[replay]\n", "[replay]\nfuture = 1\n") + """
+[chat]
+future = 1
+[research]
+future = 1
+[document]
+future = 1
+[kinds.feat]
+future = 1
+[kinds.feat.steps.future_step]
+tries = 1
+[jev.screen_lines]
+future_question = 0.5
+"""
+write(more)
+cfg = config.load()
+direct = {}
+for name, call in (("ask", lambda: config.ask_table({"future": 1})), ("steps", lambda: config.step_tables({"future_step": {}}, "steps")),
+                   ("known", lambda: config.known({"x": 1}, ("y",), "t", None))):
+    try:
+        call()
+    except ValueError as e:
+        direct[name] = str(e)
+kept = config.known({"x": 1, "y": 2}, ("y",), "t", (collected := []))
+result(ignored=sorted(cfg.ignored), direct=direct, kept=kept, collected=collected,
+       invalid=refused(GOOD + "\n[ask]\nfuture = 1\nmax_per_run = -1\n"), screen=sorted(cfg.jev.screen_lines))
+''')
+        self.assertEqual(found["ignored"], sorted([
+            "[replay] future", "[chat] future", "[research] future", "[document] future", "[kinds.feat] future",
+            "[kinds.feat.steps] future_step", "[jev.screen_lines] future_question"]))
+        self.assertEqual(sorted(found["direct"]), ["ask", "known", "steps"])
+        self.assertEqual((found["kept"], found["collected"]), ({"y": 2}, ["[t] x"]))
+        self.assertIn("max_per_run", found["invalid"])
+        self.assertNotIn("future_question", found["screen"])
+
+    def test_reach_tables_stay_strict(self):
+        found = self.case(r'''
+cases = {
+    "steps.build": "[steps.build]\nfuture_key = 1\n",
+    "mcp.x": "[mcp.x]\ncommand = 'x'\nfuture_key = 1\n",
+    "tiers": "[tiers.x]\nfast = { future_key = '1' }\n",
+    "routing": "[routing]\nfuture_key = 1\n",
+    "environment": "[environment]\nfuture_key = 1\n",
+    "capture": "[capture]\nfuture_key = 1\n",
+    "ab.x": "[ab.x]\nfuture_key = 1\n",
+    "oncall": "[oncall]\nfuture_key = 1\n",
+    "oncall.source": "[[oncall.source]]\nfuture_key = 1\n",
+    "session": "[steps.build]\nsession = 'fork'\n",
+    "payment_modes": "[routing]\npayment_modes = ['future_mode']\n",
+}
+result(errors={name: refused(GOOD + "\n" + text) for name, text in cases.items()})
+''')
+        for name, error in found["errors"].items():
+            self.assertTrue(error, name)
+
+    def test_settings_save_still_refuses_unknown_names(self):
+        found = self.case(r'''
+write(NEWER)
+before = paths.CONFIG_FILE.read_bytes()
+try:
+    settings.save({"max_parallel": 2})
+    refusal = ""
+except settings.Refused as e:
+    refusal = str(e)
+unchanged = paths.CONFIG_FILE.read_bytes() == before
+write(GOOD)
+settings.save({"max_parallel": 2})
+result(refusal=refusal, unchanged=unchanged, saved=config.load().max_parallel)
+''')
+        self.assertIn("future", found["refusal"])
+        self.assertTrue(found["unchanged"])
+        self.assertEqual(found["saved"], 2)
+
+    def test_layer_ignores_new_step_names(self):
+        found = self.case(r'''
+layer = root / "sample/layer"
+with (layer / "config.toml").open("a") as out:
+    out.write("\n[steps.future_step]\ntries = 1\n\n[kinds.chore]\n")
+loaded = config.load_layer(layer)
+try:
+    config.load_layer(layer, strict=True)
+    strict = ""
+except ValueError as e:
+    strict = str(e)
+result(ignored=list(loaded.ignored), strict=strict)
+''')
+        self.assertEqual(found["ignored"], ["[steps] future_step", "[kinds] chore"])
+        self.assertTrue(found["strict"])
+
+    def test_fallback_keeps_dashboard_fields_and_never_raises(self):
+        found = self.case(r'''
+write(BAD + "\n[dashboard]\nport = 4321\nhttps = true\nowner = 'me@example.com'\n")
+cfg, problem = config.load_or_problem()
+write("[[[ not toml")
+broken, why = config.load_or_problem()
+write(GOOD + "\n[dashboard]\nport = 'x'\n")
+bad_port, bad_port_why = config.load_or_problem()
+write(GOOD + "\n[dashboard]\nport = 'x'\nhttps = true\nowner = 'me@example.com'\n")
+mixed = config.load_or_problem()[0]
+write(GOOD + "\n[dashboard]\nport = 4321\nhttps = 'yes'\n")
+kept_port = config.load_or_problem()[0].dashboard_port
+result(mixed=[mixed.dashboard_https, mixed.dashboard_owner], kept_port=kept_port,
+       port=cfg.dashboard_port, https=cfg.dashboard_https, owner=cfg.dashboard_owner, problem=problem,
+       broken=[broken.dashboard_port == config.DASHBOARD_PORT, why], bad_port=[bad_port.dashboard_port, bad_port_why])
+''')
+        self.assertEqual((found["port"], found["https"], found["owner"]), (4321, True, "me@example.com"))
+        self.assertTrue(found["problem"].startswith("ValueError: [routing]"))
+        self.assertTrue(found["broken"][0] and found["broken"][1].startswith("TOMLDecodeError"))
+        self.assertTrue(found["bad_port"][1])
+        self.assertEqual((found["mixed"], found["kept_port"]), ([True, "me@example.com"], 4321))
+
+    def test_serve_stays_up_on_a_reach_key(self):
+        found = self.case(r'''
+server, said = quiet_server()
+server.tick()
+write(BAD)
+server.tick()
+server.tick()
+beat = util.read_json(control.BEAT_FILE, {})
+paused = {"said": [s for s in said if "does not load" in s], "problem": beat.get("config_problem", ""),
+          "ticks": beat.get("ticks"), "running": state.runs_marked_running()}
+write(GOOD)
+server.tick()
+again = util.read_json(control.BEAT_FILE, {})
+write(BAD)
+second = serve.Server()
+write(NEWER)
+server.tick()
+server.tick()
+result(paused=paused, recovered=[s for s in said if "loads again" in s], again_problem="config_problem" in again,
+       again_ticks=again.get("ticks"), second=second.config_problem, ignored=[s for s in said if "ignores them" in s])
+''')
+        self.assertEqual(len(found["paused"]["said"]), 1)
+        self.assertIn("future_key", found["paused"]["problem"])
+        self.assertEqual((found["paused"]["ticks"], found["paused"]["running"]), (3, []))
+        self.assertEqual(len(found["recovered"]), 1)
+        self.assertFalse(found["again_problem"])
+        self.assertEqual(found["again_ticks"], 4)
+        self.assertIn("future_key", found["second"])
+        self.assertEqual(len(found["ignored"]), 1)
+
+    def test_serve_process_lives_through_a_bad_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.environment(root)
+            body = "write(BAD)\nserve.run(with_dashboard=False)\n"
+            child = subprocess.Popen([sys.executable, "-I", "-u", "-c", self.program(body), str(root)], cwd=root, env=env,
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                time.sleep(6)
+                alive = child.poll() is None
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                output, _ = child.communicate(timeout=30)
+        self.assertTrue(alive, output)
+        self.assertEqual(output.count("does not load"), 1, output)
+        self.assertNotIn("Traceback", output)
+
+    def test_dashboard_answers_while_config_does_not_load(self):
+        found = self.case(r'''
+from arete import dashboard
+write(BAD)
+server, said = quiet_server()
+server.tick()
+class Host(dashboard.ScratchHost):
+    def node(self, owner):
+        return dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    def whois(self, address):
+        return "me@example.com"
+import socket
+probe = socket.socket()
+probe.bind(("127.0.0.1", 0))
+port = probe.getsockname()[1]
+probe.close()
+threading.Thread(target=dashboard.serve, kwargs={"port": port, "inside_serve": True, "host": Host()}, daemon=True).start()
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+answers = {}
+deadline = time.monotonic() + 40
+while len(answers) < 2 and time.monotonic() < deadline:
+    try:
+        for route in ("/", "/api/health"):
+            with opener.open(f"http://127.0.0.1:{port}{route}", timeout=5) as r:
+                answers[route] = [r.status, r.read().decode()]
+    except OSError:
+        time.sleep(.5)
+health = json.loads(answers["/api/health"][1]) if "/api/health" in answers else {}
+result(status={k: v[0] for k, v in answers.items()}, state=health.get("state"),
+       problem=(health.get("serve") or {}).get("config_problem", ""))
+''', timeout=150)
+        self.assertEqual(found["status"], {"/": 200, "/api/health": 200})
+        self.assertEqual(found["state"], "fault")
+        self.assertIn("future_key", found["problem"])
+
+    def test_new_code_that_cannot_read_config_is_not_started(self):
+        found = self.case(r'''
+import subprocess
+mode = {"config": 1}
+execs = []
+def fake_sh(argv, **kw):
+    if argv[-1] == serve.IMPORT_CHECK:
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    if argv[-1] == serve.CONFIG_CHECK:
+        return subprocess.CompletedProcess(argv, mode["config"], "", "ValueError: cannot read")
+    return subprocess.CompletedProcess(argv, 1, "", "")
+changed = frozenset({("changed", 1, 1)})
+def reload_server():
+    server, said = quiet_server()
+    server.busy_with = lambda: ""
+    server.lock = util.lock_file(serve.SERVE_LOCK)
+    server.code, server.code_seen = frozenset(), changed
+    return server, said
+def settle():
+    os.environ.pop(serve.SERVE_LOCK_FD, None)
+    os.environ.pop(serve.RESTARTED_FOR_NEW_CODE, None)
+with mock.patch.object(serve, "code_stamp", lambda: changed), mock.patch.object(util, "sh", fake_sh), \
+        mock.patch.object(os, "execv", lambda *a: execs.append(a)):
+    server, said = reload_server()
+    server.load_new_code()
+    server.tick()
+    server.load_new_code()
+    beat = util.read_json(control.BEAT_FILE, {})
+    refused = {"execs": len(execs), "said": len([s for s in said if "new code cannot read config.toml" in s]),
+               "beat": beat.get("code_problem", ""), "running": state.runs_marked_running()}
+    mode["config"] = 0
+    server.load_new_code()
+    passed = {"execs": len(execs), "problem": server.code_problem}
+    settle()
+    execs.clear()
+    mode["config"] = 1
+    write(BAD)
+    broken, _ = reload_server()
+    broken.load_new_code()
+    escaped = len(execs)
+    settle()
+    execs.clear()
+    write(GOOD)
+    server, said = reload_server()
+    server.load_new_code()
+with mock.patch.object(serve, "code_stamp", lambda: server.code):
+    server.load_new_code()
+result(refused=refused, passed=passed, escaped=escaped, reverted=server.code_problem)
+''')
+        self.assertEqual((found["refused"]["execs"], found["refused"]["said"]), (0, 1))
+        self.assertIn("cannot read", found["refused"]["beat"])
+        self.assertEqual(found["refused"]["running"], [])
+        self.assertEqual((found["passed"]["execs"], found["passed"]["problem"]), (1, ""))
+        self.assertEqual(found["escaped"], 1)
+        self.assertEqual(found["reverted"], "")
+
+    def test_old_run_child_survives_a_new_step_name(self):
+        baseline = OfflineWorkflowTests.workflow(self, "future-step-baseline")
+        edited = OfflineWorkflowTests.workflow(self, "future-step-appended")
+        self.assertTrue(edited["appended"])
+        self.assertEqual(baseline["status"], "done")
+        self.assertEqual((edited["status"], edited["steps"]), (baseline["status"], baseline["steps"]))
+
+    def test_the_serve_line_names_each_pause(self):
+        beat = {"alive": True, "pid": 1, "loops": 0, "off": 0, "running": 0, "pending": 0}
+        self.assertNotIn("does not load", cli.serve_line(beat))
+        line = cli.serve_line({**beat, "config_problem": "ValueError: [routing]: unknown key x",
+                               "code_problem": "new code cannot read config.toml"})
+        self.assertIn("serve: up", line)
+        self.assertIn("config does not load: ValueError: [routing]: unknown key x", line)
+        self.assertIn("new code cannot read config.toml", line)
 
 
 if __name__ == "__main__":

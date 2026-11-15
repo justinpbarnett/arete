@@ -86,10 +86,14 @@ def cmd_status(args) -> int:
     if args.run_id:
         print("arete status --json RUN_ID prints one run's steps", file=sys.stderr)
         return 2
-    cfg = config.load()
+    cfg, problem = config.load_or_problem()
     views = control.loop_views(cfg)
     snap = board.snapshot(recent_runs=args.limit)
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
+    if problem:
+        print(f"config does not load: {problem}")
+    if cfg.ignored:
+        print(f"config names this engine ignores: {', '.join(cfg.ignored)}")
     print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
     print("models:" + "".join(f"\n  {role:<15} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
@@ -819,8 +823,11 @@ def serve_line(beat: dict) -> str:
         return "serve: never ran; `arete install` starts it"
     if not beat["alive"]:
         return f"serve: DOWN, {'its process is gone, ' if beat['process_gone'] else ''}last beat {when(beat.get('at'))}"
+    paused = f"; config does not load: {beat['config_problem']}" if beat.get("config_problem") else ""
+    paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
-            f"{beat['running']} running, {beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else ""))
+            f"{beat['running']} running, {beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
+            + paused)
 
 
 def loop_line(v: dict) -> str:

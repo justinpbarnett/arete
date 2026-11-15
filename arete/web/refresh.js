@@ -74,6 +74,7 @@ function drawSidebar(f) {
 function serveShort(serve) {
   if (!serve.at) return [stateChip("fault"), " Serve has never run"];
   if (!serve.alive) return [stateChip("fault"), ` Serve down, last beat ${ago(serve.at)}`];
+  if (serve.config_problem || serve.code_problem) return [stateChip("fault"), " Serve up, launching nothing · ", el("span", { class: "nb", text: serve.config_problem || serve.code_problem })];
   const troubled = Object.keys(serve.broken || {}).length + Object.keys(serve.poll_errors || {}).length;
   return [stateChip(troubled ? "caution" : "ok"), " Serve up · ", el("span", { class: "nb", text: `${count(serve.loops, "loop", "loops")} on` })];
 }
