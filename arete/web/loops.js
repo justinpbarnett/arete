@@ -7,12 +7,14 @@ function serveState(serve) {
   if (!serve.alive) return el("p", {}, stateChip("fault"), serve.process_gone
     ? [" Serve's process is gone; it last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so no loop fires on its own until it runs again.`]
     : [" Serve's process is up, but it last beat ", liveAgo(serve.at), ` (${clock(serve.at)}), so it looks stuck and no loop fires on its own until it beats again.`]);
+  const failing = Object.entries(serve.failing || {});
+  const tickFails = failing.map(([key, f]) => ` Serve is up but its tick fails at ${key}: ${f.error}.`).join("");
   const problem = serve.config_problem || serve.code_problem;
-  if (problem) return el("p", {}, stateChip("fault"), ` Serve is up but launches nothing: ${problem}`);
+  if (problem) return el("p", {}, stateChip("fault"), ` Serve is up but launches nothing: ${problem}` + tickFails);
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
-  return el("p", {}, stateChip(broken || errors ? "caution" : "ok"),
-    ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running} running, ${serve.pending} waiting.` +
+  return el("p", {}, stateChip(serve.stuck ? "fault" : broken || errors || failing.length ? "caution" : "ok"),
+    ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running ?? "unknown"} running, ${serve.pending ?? "unknown"} waiting.` + tickFails +
     (broken ? ` ${count(broken, "loop does", "loops do")} not load.` : "") + (errors ? ` ${count(errors, "source fails", "sources fail")} to poll.` : ""));
 }
 

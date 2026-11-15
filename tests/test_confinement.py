@@ -35,6 +35,168 @@ GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
 GRANTS = pi.WRITABLE_ALWAYS
 
 
+class GuardFloorTests(unittest.TestCase):
+    PRELUDE = (SOURCE / "tests/scripts/guard_floor_prelude.py").read_text()
+
+    def scratch(self, body):
+        from tests.harness import behavior_result, make_folders, run_script, scratch_env
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            make_folders(root, "home", "config", "state", "logs", "tmp", "xdg")
+            env = scratch_env(root, HOME=str(root / "home"), TMPDIR=str(root / "tmp"),
+                              XDG_STATE_HOME=str(root / "xdg"), ARETE_WORKTREES_DIR=str(root / "state/worktrees"))
+            done = run_script(self.PRELUDE + body, root, str(root), env=env, timeout=180)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            return behavior_result(done)
+
+    def test_claude_hook_enforces_floor_without_judge(self):
+        self.scratch(r'''
+kw = runner.local_claude({"tools": ["Read", "Write", "Glob", "Grep", "Bash"], "passing": [],
+                          "add_dirs": [scratch]}, cfg, "r1", False, print, None, floor=boundary)
+command = kw["settings"]["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+assert "--judge" not in shlex.split(command)
+for tool in ("Read", "Write"):
+    for path in denied:
+        decision = invoke(command, tool, {"file_path": str(path)})
+        assert decision.get("permissionDecision") == "deny", (tool, path, decision)
+        assert str(path) in decision["permissionDecisionReason"]
+    for path in own:
+        assert not invoke(command, tool, {"file_path": str(path)}), (tool, path)
+for tool, args in (("Grep", {"path": str(paths.STATE_DIR)}),
+                   ("Glob", {"pattern": str(paths.STATE_DIR / "runs/**")}),
+                   ("Bash", {"command": "cat $ARETE_STATE_DIR/arete.db"}),
+                   ("Bash", {"command": "cat ../../runs/r2/run.log"}),
+                   ("Bash", {"command": "security find-generic-password -s x -w"})):
+    assert invoke(command, tool, args).get("permissionDecision") == "deny", (tool, args)
+assert not invoke(command, "Bash", {"command": "ls"})
+assert not invoke(command, "Read", {"file_path": "own.txt"})
+for tool in ("Glob", "Grep", "LS"):
+    kw = runner.local_claude({"tools": [tool], "passing": []}, cfg, "r1", False, print, None, floor=boundary)
+    assert tool in kw["settings"]["hooks"]["PreToolUse"][0]["matcher"]
+result(ok=True)
+''')
+
+    def test_codex_profile_and_hook_enforce_floor(self):
+        self.scratch(r'''
+import tomllib
+argv = codex.profile(work, [scratch], writing=True, hidden=[], floor=boundary)
+table = tomllib.loads(argv[-1])["permissions"][codex.WRITE_PROFILE]["filesystem"]
+for path in (*boundary.closed, *boundary.files):
+    for spelling in codex.both(path):
+        assert table[spelling] == "deny", (spelling, table)
+for path in (work, scratch):
+    assert table[str(path)] == "write"
+argv = codex.guard_hook(False, opened=boundary.open)
+command = tomllib.loads(argv[1])["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+for text in (f"cat {paths.STATE_DIR}/arete.db", "security find-generic-password -s x -w", "git commit -am x"):
+    assert invoke(command, "shell_command", {"command": text}).get("permissionDecision") == "deny", text
+for text in ("git status", "ls"):
+    assert not invoke(command, "shell_command", {"command": text})
+for patch in (f"*** Add File: {paths.RUNS_DIR}/r2/x\n+x\n",
+              f"*** Update File: own.txt\n*** Move to: {paths.RUNS_DIR}/r2/x\n"):
+    assert invoke(command, "apply_patch", {"patch": patch}).get("permissionDecision") == "deny"
+assert not invoke(command, "apply_patch", {"patch": "*** Add File: okay.txt\n+x\n"})
+result(ok=True)
+''')
+
+    def test_floor_resolves_aliases_and_never_opens_explicit_files(self):
+        self.scratch(r'''
+(work / "escape").symlink_to(paths.RUNS_DIR / "r2", target_is_directory=True)
+assert boundary.denies(work / "escape/run.log")
+assert boundary.denies(work / "../../runs/r2/run.log")
+assert boundary.denies(paths.STATE_DIR)
+assert not any(boundary.denies(path) for path in own)
+explicit = guard.Floor(boundary.closed, (*boundary.files, own[0]), boundary.open)
+assert explicit.denies(own[0])
+assert guard.launch_refusal("r1", work / "escape", [])
+for path in (paths.STATE_DIR, paths.CONFIG_DIR, paths.RUNS_DIR / "r2"):
+    assert str(path) in guard.launch_refusal("r1", work, [path])
+result(ok=True)
+''')
+
+    def test_launch_refusals_precede_replay_and_session_work_is_open(self):
+        self.scratch(r'''
+with mock.patch.object(replay, "run", wraps=replay.run) as replayed:
+    for cwd, dirs, target in ((paths.STATE_DIR, [], paths.STATE_DIR),
+                              (work, [paths.CONFIG_DIR], paths.CONFIG_DIR),
+                              (work, [paths.RUNS_DIR / "r2"], paths.RUNS_DIR / "r2")):
+        res = runner.run("test", cwd, add_dirs=dirs, trace=("r1", "build"), cfg=cfg)
+        assert not res.ok and str(target) in res.error, res
+        assert replayed.call_count == 0
+    (root / "fixture/replay/build4.json").write_text(json.dumps({"text": "valid opening"}))
+    assert runner.run("test", work, add_dirs=[scratch], trace=("r1", "build"), cfg=cfg).ok
+    assert replayed.call_count == 1
+headers = [next(record.lines(p)) for p in paths.record_dir("r1").glob(f"*{record.RECORD_SUFFIX}")
+           if p.name != record.TIMELINE]
+assert sum(bool(h.get("refused")) for h in headers) == 3, headers
+session = sessions.SESSIONS_DIR / "session-own/work"
+session.mkdir(parents=True)
+assert not guard.launch_refusal("session-own", session, [])
+assert not guard.floor("session-own", session, []).denies(session / "new.txt")
+(root / "fixture/replay/session.json").write_text(json.dumps({"text": "session opening"}))
+assert runner.run("test", session, tools=[], trace=("session-own", "session"), cfg=cfg).ok
+result(ok=True)
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_pi_tools_respect_deeper_openings_and_aliases(self):
+        self.scratch(r'''
+(work / "escape").symlink_to(paths.RUNS_DIR / "r2", target_is_directory=True)
+script = """
+import install from REPLACE;
+let handler;
+install({on(name, callback) { if (name === 'tool_call') handler = callback; }});
+const data = JSON.parse(process.env.FLOOR_TEST);
+for (const toolName of ['grep', 'ls']) {
+    if (handler({toolName, input: {path: data.scratch}}, {cwd: data.cwd})?.block) throw Error('own search');
+}
+if (!handler({toolName: 'read', input: {path: data.explicit}}, {cwd: data.cwd})?.block) throw Error('explicit file');
+for (const toolName of ['read', 'write', 'grep', 'ls']) {
+    for (const path of data.denied) {
+        if (!handler({toolName, input: {path}}, {cwd: data.cwd})?.block) throw Error(toolName + ': ' + path);
+    }
+    for (const path of data.own) {
+        if (handler({toolName, input: {path}}, {cwd: data.cwd})?.block) throw Error('own ' + toolName + ': ' + path);
+    }
+}
+""".replace("REPLACE", json.dumps(pi.GUARD_FILE.as_uri()))
+explicit = work / "protected.txt"
+explicit.write_text("synthetic protected value")
+boundary = guard.Floor(boundary.closed, (*boundary.files, explicit), boundary.open)
+data = {"denied": [*map(str, denied), str(paths.STATE_DIR), str(work / "escape/run.log")],
+        "own": list(map(str, own)), "cwd": str(work), "scratch": str(scratch), "explicit": str(explicit)}
+done = subprocess.run(["node", "--input-type=module", "-"], input=script, text=True, capture_output=True,
+                      env={**os.environ, **pi.guard_env(boundary), "FLOOR_TEST": json.dumps(data)})
+assert done.returncode == 0, done.stderr
+result(ok=True)
+''')
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK),
+                         "macOS sandbox-exec is unavailable")
+    def test_pi_confinement_reads_and_writes(self):
+        self.scratch(r'''
+prefix = pi.confinement(work, [scratch], boundary, selected=None)
+control = subprocess.run([*prefix, "/bin/cat", str(own[0])], text=True, capture_output=True)
+if "sandbox_apply" in control.stderr:
+    result(unavailable="nested sandbox refuses sandbox_apply")
+else:
+    assert control.returncode == 0 and control.stdout == "allowed", control
+    for path in denied:
+        if path.is_relative_to(paths.STATE_DIR) or path.is_relative_to(paths.CONFIG_DIR):
+            done = subprocess.run([*prefix, "/bin/cat", str(path)], capture_output=True)
+            assert done.returncode != 0, path
+    for path in own:
+        done = subprocess.run([*prefix, "/bin/cat", str(path)], text=True, capture_output=True)
+        assert done.returncode == 0 and done.stdout == "allowed", path
+    for target, okay in ((scratch / "new.txt", True), (paths.RUNS_DIR / "r2/new.txt", False)):
+        done = subprocess.run([*prefix, "/bin/sh", "-c", 'printf allowed > "$1"', "sh", str(target)],
+                              capture_output=True)
+        assert (done.returncode == 0) == okay, target
+    result(ok=True)
+''')
+
+
 def setUpModule():
     folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
     unittest.addModuleCleanup(folder.cleanup)
@@ -420,7 +582,8 @@ class BrowserServerTests(unittest.TestCase):
         base = {"mcp_config": mcp_config, "add_dirs": [self.evidence], **({"allowed_tools": allowed} if allowed else {})}
         with mock.patch.dict(scratch.LEASES, {self.a.selector: 0}), \
                 mock.patch.object(runner.environment, "passed", return_value=[]):
-            return runner.launch_kwargs(base, picked, trip, ("r", "s"), False, [].append if said is None else said.append)
+            return runner.launch_kwargs(base, picked, trip, ("r", "s"), False,
+                                        [].append if said is None else said.append, cwd=self.ws)
 
     DOM = "echo '<html><head></head><body></body></html>'"
     FATAL = "[1:1] FATAL: sandbox initialization failed: Operation not permitted"
@@ -877,7 +1040,7 @@ class WalkTests(unittest.TestCase):
         env = {**os.environ, "ARETE_CONFIG_DIR": str(self.scratch_root / "config"), "ARETE_STATE_DIR": str(state),
                "ARETE_LOG_DIR": str(state / "logs"), "ARETE_WORKTREES_DIR": str(state / "worktrees"),
                scratch.ENV_NAME: str(self.scratch_root)}
-        boot = f"import sys; sys.path.insert(0, {str(SOURCE)!r}); from arete import state; state.ensure_schema()"
+        boot = f"import sys; sys.path.insert(0, {str(SOURCE)!r}); from arete import state; state.migrate()"
         done = subprocess.run([sys.executable, "-I", "-c", boot], env=env, capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
         self.assertTrue((state / "arete.db").exists())

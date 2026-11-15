@@ -15,7 +15,7 @@ from . import (
     control,
     cron,
     devices,
-    engine,
+    loop_run,
     loops,
     paths,
     record,
@@ -26,7 +26,7 @@ from . import (
 )
 
 DRAFT_TRIES = 3
-REFERENCE = loops.ENGINE_DIR / "README.md"
+REFERENCE = loops.BUNDLED_LOOPS_DIR / "README.md"
 DRAFTS_LOG = "drafts.log"
 SAMPLE_EVENTS = 3
 FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -154,7 +154,7 @@ def start_draft(request: DraftRequest) -> dict:
 def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
     cfg = config.load()
     if run_id:
-        record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP)
+        record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
     else:
         check_request(request, cfg, loop_names(cfg))
         run_id = record.start("draft", trigger="manual", summary=util.first_line(request.sentence, 200))
@@ -163,13 +163,13 @@ def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
         say(text)
         state.add_feed(run_id, kind, text)
 
-    signal.signal(signal.SIGTERM, engine.stop_on_term)
+    signal.signal(signal.SIGTERM, loop_run.stop_on_term)
     try:
         with record.failed_on_crash(run_id):
             try:
                 made = write_draft(run_id, request, cfg, tell)
-            except (control.Refused, engine.Stopped) as e:
-                status, why = ("stopped", record.STOPPED) if isinstance(e, engine.Stopped) else ("failed", str(e))
+            except (control.Refused, loop_run.Stopped) as e:
+                status, why = ("stopped", record.STOPPED) if isinstance(e, loop_run.Stopped) else ("failed", str(e))
                 record.settle(run_id, status, end_line=f"{status}: {why}", summary=why[:500])
                 raise control.Refused(why) from None
             drafted = f"drafted {made['name']} in {paths.short_path(made['dir'])}"
@@ -254,7 +254,7 @@ def try_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
 def start_try(name: str) -> dict:
     cfg = config.load()
     loop = control.working_loop(name, cfg)
-    return engine.launch(loop.name, events=try_events(loop, cfg), trial=True, cfg=cfg)
+    return loop_run.launch(loop.name, events=try_events(loop, cfg), trial=True, cfg=cfg)
 
 
 def try_loop(name: str, events: list[dict] | None = None, follow=None) -> dict:
@@ -272,7 +272,7 @@ def try_loop(name: str, events: list[dict] | None = None, follow=None) -> dict:
     if follower:
         follower.start()
     try:
-        run = engine.launch(loop.name, events=events, trial=True, detach=False, run_id=run_id, cfg=cfg)
+        run = loop_run.launch(loop.name, events=events, trial=True, detach=False, run_id=run_id, cfg=cfg)
     finally:
         finished.set()
         if follower:

@@ -2,7 +2,7 @@
 import json, os, sys
 from unittest import mock
 from arete import serve, state
-state.ensure_schema()
+state.migrate()
 os.chdir(sys.argv[1])
 server = serve.Server()
 server.code, server.code_seen = frozenset(), serve.code_stamp()

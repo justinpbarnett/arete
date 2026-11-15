@@ -12,17 +12,16 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from urllib.parse import quote, urlencode, urlsplit
 
-from . import config, lines, paths, util
+from . import config, paths, run_lines, util
 
 ENV = "ARETE_SERVER"
-IDENTITY_HEADER = "Tailscale-User-Login"
 CONNECT_SECONDS = 5
 PROBE_SECONDS = 1
 CALL_SECONDS = 120
 RETRY_SECONDS = 2
 RESTART_WAIT_SECONDS = 30
 RECONNECT_SECONDS = 120
-WAIT_EVENTS = ("step_end", "question", "error", lines.END)
+WAIT_EVENTS = ("step_end", "question", "error", run_lines.END)
 BROKE = (OSError, http.client.HTTPException)
 
 
@@ -48,7 +47,6 @@ class Server:
     host: str
     port: int
     name: str
-    login: str = ""
 
 
 def named_server(wanted: str) -> Server:
@@ -76,7 +74,7 @@ def server() -> Server:
     addresses = [str(a) for a in found["addresses"]]
     scheme = found.get("scheme") or "http"
     host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
-    here = Server(scheme, host, port, found.get("host") or host, str(found.get("login") or ""))
+    here = Server(scheme, host, port, found.get("host") or host)
     try:
         socket.create_connection((host, port), timeout=PROBE_SECONDS).close()
     except OSError as e:
@@ -89,8 +87,6 @@ def headers_for(where: Server) -> dict[str, str]:
     headers = {"X-Arete": "1"}
     if where.scheme == "http" and where.name != where.host:
         headers["Host"] = f"{where.name}:{where.port}"
-    if where.login:
-        headers[IDENTITY_HEADER] = where.login
     return headers
 
 
@@ -259,9 +255,9 @@ def kept(run_id: str, seen: int, read: Iterator[dict] | None) -> Iterator[dict]:
         fresh, whole = False, read is not None
         try:
             for line in read or ():
-                seen, fresh, lost = max(seen, lines.seq_of(line)), True, None
+                seen, fresh, lost = max(seen, run_lines.seq_of(line)), True, None
                 yield line
-                if line.get("event") == lines.END:
+                if line.get("event") == run_lines.END:
                     return
         except Failed:
             whole = False
@@ -388,7 +384,7 @@ def steps_of(run_id: str, read: list[dict]) -> list[dict]:
             rows.append({"run": run_id, "event": "step", "step": step, "try": line.get("try"),
                          "state": line.get("result") or ("pass" if line.get("ok") else "fail"),
                          **{k: line.get(k) for k in ("seconds", "cost_usd", "model", "runner", "error")}})
-        elif event == lines.END:
+        elif event == run_lines.END:
             report = line
     left = "unfinished" if report else "running"
     rows += [{"run": run_id, "event": "step", "step": step, "try": line.get("try"), "state": left}

@@ -52,5 +52,5 @@ def result(**fields):
     print("BEHAVIOR_RESULT=" + json.dumps(fields))
 
 
-state.ensure_schema()
+state.migrate()
 assert chat.new("")["id"] == 1

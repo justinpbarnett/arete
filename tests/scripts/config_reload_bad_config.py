@@ -7,6 +7,8 @@ def fake_sh(argv, **kw):
         return subprocess.CompletedProcess(argv, 0, "", "")
     if argv[-1] == serve.CONFIG_CHECK:
         return subprocess.CompletedProcess(argv, mode["config"], "", "ValueError: cannot read")
+    if argv == control.command(["migrate", "--no-contracts"]):
+        return subprocess.CompletedProcess(argv, 0, "", "")
     return subprocess.CompletedProcess(argv, 1, "", "")
 changed = frozenset({("changed", 1, 1)})
 def reload_server():
@@ -22,7 +24,7 @@ with mock.patch.object(serve, "code_stamp", lambda: changed), mock.patch.object(
         mock.patch.object(os, "execv", lambda *a: execs.append(a)):
     server, said = reload_server()
     server.load_new_code()
-    server.tick()
+    server.run_pass()
     server.load_new_code()
     beat = util.read_json(control.BEAT_FILE, {})
     refused = {"execs": len(execs), "said": len([s for s in said if "new code cannot read config.toml" in s]),

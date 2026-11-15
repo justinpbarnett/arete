@@ -3,6 +3,7 @@ import json, os, sys, threading, time, urllib.request
 from pathlib import Path
 from unittest import mock
 from arete import accounts, config, control, gh, paths, replay, serve, settings, state, util
+state.migrate()
 root = Path(sys.argv[1])
 def forbidden(*args, **kwargs):
     raise AssertionError("config compatibility case attempted an external transport or credential lookup")
@@ -43,7 +44,7 @@ def refused(text, **kw):
 def quiet_server():
     serve.Server.sweep_vms = lambda self: None
     serve.Server.prune = lambda self: None
-    serve.engine.launch = lambda *a, **k: (_ for _ in ()).throw(control.Refused("fixture"))
+    serve.loop_run.launch = lambda *a, **k: (_ for _ in ()).throw(control.Refused("fixture"))
     server = serve.Server()
     said = []
     server.say = said.append

@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ from . import (
     document,
     gh,
     jev,
+    jev_verdicts,
     outbound,
     paths,
     pipeline,
@@ -24,7 +26,6 @@ from . import (
     steps,
     tracker,
     util,
-    verdicts,
 )
 
 MB = 1024 * 1024
@@ -493,19 +494,16 @@ def judged(res, row: dict, print_: str) -> dict:
 
 
 def look_at(row: dict, draft_id: int, s: steps.Settings, print_: str, cfg: config.Config) -> tuple[dict, float]:
-    folder = CAPTURES_DIR / str(draft_id)
-    viewable = folder / f"{row['sha256']}.{EXTENSIONS[row['type']]}"
+    name = f"{row['sha256']}.{EXTENSIONS[row['type']]}"
     kept = tuple(m for m in s.requires.modalities if m not in MEDIA)
     settings = replace(s, requires=replace(s.requires, modalities=(*kept, row["kind"]), structured_output=True))
-    text = pipeline.prompt("capture_evidence", file=viewable.name, kind=row["kind"])
-    try:
-        shutil.copyfile(folder / row["sha256"], viewable)
-        res = runner.run(text, folder, **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
+    text = pipeline.prompt("capture_evidence", file=name, kind=row["kind"])
+    with tempfile.TemporaryDirectory(prefix="arete-capture-") as room:
+        shutil.copyfile(CAPTURES_DIR / str(draft_id) / row["sha256"], Path(room) / name)
+        res = runner.run(text, Path(room), **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
                          instructions=list(s.instructions), json_schema=EVIDENCE_SCHEMA, persist=False,
                          wait_out_limits=False, hard_cap=True, tier=s.tier,
                          trace=("", f"capture_evidence {row['sha256'][:12]}"), cfg=cfg, settings=settings)
-    finally:
-        viewable.unlink(missing_ok=True)
     return judged(res, row, print_), res.paid_usd
 
 
@@ -627,7 +625,7 @@ def chance_of(answer: jev.Answer, option: str) -> float:
 
 
 def keep_verdict(draft: dict, subject: str, scores: dict[str, dict], held: str) -> None:
-    verdicts.record(f"capture-{draft['id']}", "capture", subject, chat.title_of(draft["text"]), scores, held)
+    jev_verdicts.record(f"capture-{draft['id']}", "capture", subject, chat.title_of(draft["text"]), scores, held)
 
 
 def check_vision(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float]:
@@ -650,8 +648,8 @@ def check_vision(draft: dict, cfg: config.Config) -> tuple[str, str, dict, float
         result = "hold"
         reason = (f"JEV could not tell whether the vision supports this request: it picked {answer.value} at "
                   f"confidence {answer.confidence:.2f}, and {line:g} is needed.")
-    scores = {"supports": verdicts.scored(chance_of(answer, "supports"), line, over=False),
-              "conflicts": verdicts.scored(chance_of(answer, "conflicts"), line)}
+    scores = {"supports": jev_verdicts.scored(chance_of(answer, "supports"), line, over=False),
+              "conflicts": jev_verdicts.scored(chance_of(answer, "conflicts"), line)}
     keep_verdict(draft, "vision", scores, "" if result == "pass" else reason)
     return result, reason, detail, reply.cost_usd
 
@@ -683,7 +681,7 @@ def check_duplicates(draft: dict, cfg: config.Config) -> tuple[str, str, dict, f
     sure_yes, sure_no = (1 + line) / 2, (1 - line) / 2
     chances = [(i, a.yes) for i, r in zip(issues, replies, strict=True) if (a := r.answers.get("duplicate"))]
     for issue, p in chances:
-        keep_verdict(draft, f"duplicate #{issue['number']}", {"duplicate": verdicts.scored(p, sure_no)},
+        keep_verdict(draft, f"duplicate #{issue['number']}", {"duplicate": jev_verdicts.scored(p, sure_no)},
                      f"possible duplicate (p {p:.2f})" if p >= sure_no else "")
 
     def entry(issue: dict, p: float) -> dict:
@@ -713,7 +711,7 @@ def check_actionable(draft: dict, cfg: config.Config) -> tuple[str, str, dict, f
     if not answer:
         return unavailable(reply)
     line = cfg.jev.confidence
-    scores = {"actionable": verdicts.scored(chance_of(answer, "actionable"), line, over=False)}
+    scores = {"actionable": jev_verdicts.scored(chance_of(answer, "actionable"), line, over=False)}
     if answer.value == "actionable" and answer.sure(line):
         keep_verdict(draft, "actionable", scores, "")
         return "pass", f"A developer could start on this as written (confidence {answer.confidence:.2f}).", {}, reply.cost_usd
@@ -745,7 +743,7 @@ def check_injection(draft: dict, cfg: config.Config) -> tuple[str, str, dict, fl
     if not answer:
         return unavailable(reply)
     line = cfg.jev.injection
-    scores = {"injection": verdicts.scored(answer.yes, line)}
+    scores = {"injection": jev_verdicts.scored(answer.yes, line)}
     if answer.yes >= line:
         reason = f"This text reads as instructions for an agent (p {answer.yes:.2f}, line {line:g}). Describe the problem only."
         keep_verdict(draft, "injection", scores, reason)
@@ -780,7 +778,7 @@ def check_publication(draft: dict, cfg: config.Config) -> tuple[str, str, dict, 
     if not answer:
         held_text = unavailable(reply)[1]
     else:
-        scores = {"secrets": verdicts.scored(answer.yes, line)}
+        scores = {"secrets": jev_verdicts.scored(answer.yes, line)}
         if answer.yes >= line:
             held_text = (f"JEV thinks this text holds a credential or private personal information (p "
                          f"{answer.yes:.2f}, line {line:g}). Remove it and Submit again.")

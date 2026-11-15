@@ -938,6 +938,7 @@ class CodeIdentityTests(unittest.TestCase):
                           ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
                           TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"),
                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        self.run_child(support.SOURCE, "from arete import state; state.migrate()")
 
     def tree(self, name="tree") -> Path:
         copy = self.root / name
@@ -1204,21 +1205,21 @@ result(mixed=[mixed.dashboard_https, mixed.dashboard_owner], kept_port=kept_port
     def test_serve_stays_up_on_a_reach_key(self):
         found = self.case(r'''
 server, said = quiet_server()
-server.tick()
+server.run_pass()
 write(BAD)
-server.tick()
-server.tick()
+server.run_pass()
+server.run_pass()
 beat = util.read_json(control.BEAT_FILE, {})
 paused = {"said": [s for s in said if "does not load" in s], "problem": beat.get("config_problem", ""),
           "ticks": beat.get("ticks"), "running": state.runs_marked_running()}
 write(GOOD)
-server.tick()
+server.run_pass()
 again = util.read_json(control.BEAT_FILE, {})
 write(BAD)
 second = serve.Server()
 write(NEWER)
-server.tick()
-server.tick()
+server.run_pass()
+server.run_pass()
 result(paused=paused, recovered=[s for s in said if "loads again" in s], again_problem="config_problem" in again,
        again_ticks=again.get("ticks"), second=second.config_problem, ignored=[s for s in said if "ignores them" in s])
 ''')
@@ -1308,7 +1309,6 @@ class ServeReloadTests(unittest.TestCase):
         self.assertEqual((found["foreign"], found["stranger"], found["unmarked"]), (421, 403, 403))
         self.assertEqual(found["lengths"], {"missing": {"status": 503, "retry": True},
                                             "invalid": {"status": 503, "retry": True}})
-        self.assertEqual(found["through"], {"owner": 503, "stranger": 403})
         self.assertEqual(found["reading"], 200)
         self.assertEqual((found["again"]["status"], found["again"]["retry"]), (200, None))
         self.assertEqual((found["status"], found["count"]), ("done", 0))

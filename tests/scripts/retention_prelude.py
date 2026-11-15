@@ -4,10 +4,10 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
-from arete import backup, config, control, heartbeat, hook, paths, record, replay, serve, state, tasks, util
+from arete import backup, config, control, heartbeat, tool_events, paths, record, replay, serve, state, tasks, util
 root = Path(sys.argv[1])
 paths.CONFIG_FILE.write_text("\n".join(replay.sample(root / "sample")))
-state.ensure_schema()
+state.migrate()
 server = serve.Server()
 messages = []
 server.say = messages.append

@@ -94,8 +94,6 @@ def build_event(p: dict) -> dict | None:
             cls = classify(err, EDIT_CLASSES, "failure")
         elif tool == "Read":
             cls = "missing_file" if re.search(r"not exist|no such|not found", err, re.IGNORECASE) else "failure"
-        elif tool == "Skill":
-            cls = "failure"
         else:
             cls = "failure"
         detail = ti.get("command") or ti.get("file_path") or ti.get("skill") or ti.get("pattern") or ti.get("url") or ""

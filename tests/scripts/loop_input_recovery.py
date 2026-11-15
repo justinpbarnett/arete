@@ -3,10 +3,11 @@ import contextlib, io, json, os, signal, subprocess, sys, time
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
-from arete import cli, config, control, engine, loops, paths, record, scratch, serve, state, util
+from arete import cli, config, control, loop_run, loops, paths, record, scratch, serve, state, util
 root, mode = Path(sys.argv[1]), sys.argv[2]
 scratch.AUTHORITY = root / "authority-parent/verification-authority"
 paths.ensure_dirs()
+state.migrate()
 paths.CONFIG_FILE.write_text('[jev]\nenabled = false\n')
 event = {"type": "test", "title": "keep me", "data": {"value": 17}, "trust": "internal"}
 def folder(name, code):
@@ -39,7 +40,7 @@ def reap():
         record.reap(tickets=False)
 def start(item):
     (root / "ready").unlink(missing_ok=True)
-    r = engine.launch("slow", item=item)
+    r = loop_run.launch("slow", item=item)
     wait(lambda: (root / "ready").exists() and (root / "ready").read_text().strip())
     return r, int((root / "ready").read_text())
 def kill(r, child):
@@ -50,7 +51,6 @@ def kill(r, child):
 if mode == "outcomes":
     import sqlite3
     with sqlite3.connect(paths.DB_FILE) as c:
-        c.executescript(state.SCHEMA)
         c.execute("INSERT INTO queue (loop, queue, trigger, payload, enqueued) VALUES ('fail', 'fail', 'event', ?, ?)",
                   (json.dumps([event]), util.iso()))
         legacy = c.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -64,7 +64,7 @@ if mode == "outcomes":
         with state.db() as c:
             row = dict(c.execute("SELECT * FROM queue WHERE id = ?", (item,)).fetchone())
         assert (row["attempts"], row["dead_at"], row["dead_reason"]) == (0, None, "")
-    r = engine.launch("fail", item=item, detach=False)
+    r = loop_run.launch("fail", item=item, detach=False)
     assert r["status"] == "failed" and not state.pending()
     for args in (("list",), ("status", "fail")):
         rc, shown = call(*args)
@@ -78,21 +78,21 @@ if mode == "outcomes":
         assert call("requeue", invalid)[0] != 0
     folder("fail", "import sys; from pathlib import Path; Path(" + repr(str(root / "requeued")) +
            ").write_text(sys.stdin.read()); print('received requeued input')")
-    assert engine.launch("fail", item=item, detach=False)["status"] == "done"
+    assert loop_run.launch("fail", item=item, detach=False)["status"] == "done"
     assert json.loads((root / "requeued").read_text()) == event
     folder("fail", "raise SystemExit(1)")
     item = enqueue("ok")
-    assert engine.launch("ok", item=item, detach=False)["status"] == "done"
+    assert loop_run.launch("ok", item=item, detach=False)["status"] == "done"
     assert state.queue_item(item) is None
     assert json.loads((root / "received").read_text()) == event
     item = enqueue(payload=[], trigger="every")
-    engine.launch("fail", item=item, detach=False)
+    loop_run.launch("fail", item=item, detach=False)
     assert state.queue_item(item) is None
-    assert engine.launch("ok", detach=False)["status"] == "done"
+    assert loop_run.launch("ok", detach=False)["status"] == "done"
     item = enqueue("silent")
-    with mock.patch.object(engine.delivery, "deliver", side_effect=AssertionError("silent command delivered")), \
-            mock.patch.object(engine.runner, "run", side_effect=AssertionError("silent command called a model")):
-        silent = engine.launch("silent", item=item, detach=False)
+    with mock.patch.object(loop_run.delivery, "deliver", side_effect=AssertionError("silent command delivered")), \
+            mock.patch.object(loop_run.runner, "run", side_effect=AssertionError("silent command called a model")):
+        silent = loop_run.launch("silent", item=item, detach=False)
     assert silent["status"] == "skipped" and "no output" in silent["summary"], silent
     assert state.queue_item(item) is None
     item = enqueue("ok")
@@ -104,7 +104,7 @@ if mode == "outcomes":
     (root / "received").unlink()
     for value in (item, 999999):
         try:
-            engine.launch("ok", item=value, detach=False)
+            loop_run.launch("ok", item=value, detach=False)
         except control.NotFound:
             pass
         else:
@@ -116,7 +116,7 @@ if mode == "outcomes":
         return take(item, run_id)
     with mock.patch.object(state, "take_queue_item", side_effect=compete):
         try:
-            engine.launch("ok", item=item, detach=False)
+            loop_run.launch("ok", item=item, detach=False)
         except control.NotFound as e:
             assert "was taken by another run" in str(e)
         else:
@@ -124,15 +124,15 @@ if mode == "outcomes":
     assert not (root / "received").exists()
     assert state.runs(kind="loop", loop="ok", firings=True)[0]["status"] == "skipped"
     item = enqueue("ok")
-    with mock.patch.object(engine, "spent_limit", return_value="daily budget"):
-        engine.launch("ok", item=item, detach=False)
+    with mock.patch.object(loop_run, "spent_limit", return_value="daily budget"):
+        loop_run.launch("ok", item=item, detach=False)
     assert state.queue_item(item)["run_id"] is None and state.queue_item(item)["attempts"] == 0
-    with mock.patch.object(engine, "run_command", side_effect=engine.OverBudget("during execution")):
-        engine.launch("ok", item=item, detach=False)
+    with mock.patch.object(loop_run, "run_command", side_effect=loop_run.OverBudget("during execution")):
+        loop_run.launch("ok", item=item, detach=False)
     assert "during execution" in state.queue_item(item)["dead_reason"]
     item = enqueue("ok")
-    with mock.patch.object(engine, "screened", return_value=("skipped", "kind skipped")):
-        engine.launch("ok", item=item, detach=False)
+    with mock.patch.object(loop_run, "screened", return_value=("skipped", "kind skipped")):
+        loop_run.launch("ok", item=item, detach=False)
     assert state.queue_item(item) is None
 elif mode == "signals":
     item = enqueue("slow")

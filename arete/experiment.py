@@ -15,8 +15,7 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import TextIO
 
-from . import config, evals, paths, pipeline, prices, record, replay, runner, state, steps, util
-from . import lines as run_lines
+from . import config, evals, paths, pipeline, prices, record, replay, run_lines, runner, state, steps, util
 from .diffguard import denied_paths
 from .util import engine_commit
 

@@ -4,7 +4,9 @@ import difflib
 import hashlib
 import os
 import re
+import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from . import (
     config,
     gh,
     jev,
+    jev_verdicts,
     paths,
     research_plan,
     research_search,
@@ -21,7 +24,6 @@ from . import (
     tracker,
     triage,
     util,
-    verdicts,
 )
 from .agent import Result
 from .heartbeat import mark_loop, network_up_or_skip
@@ -346,9 +348,9 @@ def change_matters(cfg: config.Config, r: dict, prior: dict, said: str) -> float
     a = jev.ask(text, {"changed": jev.yes_no(CHANGED)}, cfg, trace=trace).answers.get("changed")
     if a is None:
         return None
-    score = verdicts.scored(a.yes, cfg.jev.research_rerun, over=False)
-    kept = verdicts.holds(score)
-    verdicts.record(jev.traced_run(trace), "changed", r["ref"], r["title"], {"changed": score},
+    score = jev_verdicts.scored(a.yes, cfg.jev.research_rerun, over=False)
+    kept = jev_verdicts.holds(score)
+    jev_verdicts.record(jev.traced_run(trace), "changed", r["ref"], r["title"], {"changed": score},
                     f"kept the report, the change does not need it (p {a.yes:.2f})" if kept else "",
                     "skipped" if kept else "went on")
     return a.yes
@@ -392,9 +394,9 @@ def answered_by(cfg: config.Config, r: dict, ticket: triage.TicketText, done: li
         return "", 0.0
     p = 1 - a.probabilities.get("none", 0.0)
     top = str(a.value) if a.value in options and a.value != "none" else ""
-    score = verdicts.scored(p, cfg.jev.research_answered)
-    link = top if top and verdicts.holds(score) else ""
-    verdicts.record(jev.traced_run(trace), "answered", r["ref"], r["title"], {"answered": score},
+    score = jev_verdicts.scored(p, cfg.jev.research_answered)
+    link = top if top and jev_verdicts.holds(score) else ""
+    jev_verdicts.record(jev.traced_run(trace), "answered", r["ref"], r["title"], {"answered": score},
                     f"answered by the report for {link} (p {p:.2f})" if link else "", "skipped" if link else "went on")
     return link, p
 
@@ -519,17 +521,17 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     print(f"{util.iso()} {ref}: researching", flush=True)
     values = {"ref": ref, "title": r["title"], "ticket": text, "related": related(src, r, done),
               "repos": "\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none"}
-    cwd = dirs[0] if dirs else REPORTS_DIR
-    if cfg.research_planner:
-        res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:], [o["ref"] for _, o, _ in done], started,
-                          judged)
-    else:
-        res = runner.run(prompt("research", **values, **filing(h, filed_path)),
-                         cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
-                         json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
-                         timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),
-                         cfg=cfg)
-        paid = res.paid_usd
+    with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
+        if cfg.research_planner:
+            res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:],
+                              [o["ref"] for _, o, _ in done], started, judged)
+        else:
+            res = runner.run(prompt("research", **values, **filing(h, filed_path)),
+                             cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
+                             json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
+                             timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),
+                             cfg=cfg)
+            paid = res.paid_usd
     answer = res.structured if res.ok and isinstance(res.structured, dict) else {}
     report = str(answer.get("report") or "").strip()
     if not report:

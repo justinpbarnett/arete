@@ -178,7 +178,7 @@ finish({"snap": snap(), "lines": server.lines})
     def test_a_webhook_whose_fire_fails_queues_on_redelivery(self):
         found = self.result('''
 loop = make_loop(webhook=True)
-state.ensure_schema()
+state.migrate()
 body = b'{"title": "hello"}'
 state.enqueue = failing_once(state.enqueue)
 server = web()
@@ -225,7 +225,7 @@ finish(out)
         found = self.result('''
 loop = make_loop(webhook=True)
 state.ensure_schema()
-hooks.secret("intake")
+webhooks.secret("intake")
 server = web()
 try:
     refused = post(server, "intake", b"{}", {"X-Arete-Token": "wrong"})[0]
@@ -379,7 +379,7 @@ class LoopMarkAndDurableWriteTests(unittest.TestCase):
                        ARETE_CONFIG_DIR=str(root / "config"),
                        ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
                        TMPDIR=str(root / "tmp"), HOME=str(root / "home"), PYTHONPATH=str(support.SOURCE))
-            script = self.PRELUDE + ("state.ensure_schema()\n" if setup else "") + body
+            script = self.PRELUDE + ("state.migrate()\n" if setup else "") + body
             done = subprocess.run([sys.executable, "-c", script, str(root)], env=env, cwd=support.SOURCE,
                                   capture_output=True, text=True, timeout=300)
             self.assertEqual(done.returncode, 0, done.stderr)

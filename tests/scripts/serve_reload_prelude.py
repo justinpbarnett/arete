@@ -1,6 +1,7 @@
 
 import http.client, http.server, socket, subprocess, types
 from arete import client, dashboard, delivery
+state.migrate()
 OWNER = "owner@example.test"
 CHANGED = frozenset({("changed", 1, 1)})
 real_sh = util.sh

@@ -372,20 +372,26 @@ class LogRotationTests(unittest.TestCase):
             inode_kept = (logs / "runs.log.1").stat().st_ino == mark[1]
             held_lines = [f"held {i}" for i in range(10)]
             held_writer.write("".join(line + "\\n" for line in held_lines))
-            held_writer.close()
+            held_writer.flush()
             new_lines = [f"new {i}" for i in range(10)]
             with p.open("a") as w:
                 w.write("".join(line + "\\n" for line in new_lines))
             older, current, mark2 = oncall.fresh(str(p), mark, False)
-            again = oncall.fresh(str(p), mark2, False)
+            late_lines = [f"late {i}" for i in range(5)]
+            held_writer.write("".join(line + "\\n" for line in late_lines))
+            held_writer.close()
+            late = oncall.fresh(str(p), mark2, False)
+            again = oncall.fresh(str(p), late[2], False)
             finish({"first": seen_first == first, "inode": inode_kept, "got": older + current,
-                    "want": held_lines + new_lines, "again": [again[0], again[1]],
+                    "want": held_lines + new_lines, "late": late[0] + late[1], "want_late": late_lines,
+                    "again": [again[0], again[1]],
                     "listed": [Path(x).name for x in oncall.arete_logs()]})
         """)
         self.assertTrue(found["first"])
         self.assertTrue(found["inode"])
         self.assertEqual(sorted(found["got"]), sorted(found["want"]))
         self.assertEqual(len(found["got"]), 20)
+        self.assertEqual(found["late"], found["want_late"])
         self.assertEqual(found["again"], [[], []])
         self.assertEqual(found["listed"], ["runs.log"])
 
@@ -420,13 +426,16 @@ class LogRotationTests(unittest.TestCase):
     def test_tick_rotates_on_its_own_timer_before_prune(self):
         found = self.scenario("""
             clock = [10_000.0]
+            from arete import state
+            with contextlib.redirect_stdout(io.StringIO()):
+                state.migrate()
             server = serve.Server()
             events = []
             server.rotate = lambda: events.append("rotate")
             server.prune = lambda: events.append("prune")
-            for name in ("read_config", "forget_unpolled_errors", "watch_oncall", "dispatch",
-                         "start_approval_jobs", "beat"):
+            for name in ("forget_unpolled_errors", "watch_oncall", "dispatch", "start_approval_jobs"):
                 setattr(server, name, lambda *a, **k: None)
+            server.load = lambda: True
             server.sweeping = lambda: True
             patches = [mock.patch.object(serve.time, "monotonic", lambda: clock[0]),
                        mock.patch.object(serve.loops, "load_all", return_value=[]),
@@ -455,7 +464,6 @@ class LogRotationTests(unittest.TestCase):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
                     failed = tick(serve.ROTATE_SECONDS + 1)
-                    ticks_after_failure = server.ticks
 
                 def prune_raises():
                     raise RuntimeError("prune broke")
@@ -463,12 +471,10 @@ class LogRotationTests(unittest.TestCase):
                 server.prune = prune_raises
                 clock[0] += serve.ROTATE_SECONDS + 1
                 del events[:]
-                try:
+                with contextlib.redirect_stdout(io.StringIO()):
                     server.tick()
-                    raised = False
-                except RuntimeError:
-                    raised = True
                 ran_before_prune = list(events)
+                prune_failing = "stage:prune" in server.failing
             finally:
                 for patch in reversed(patches):
                     patch.stop()
@@ -476,16 +482,14 @@ class LogRotationTests(unittest.TestCase):
                 for pool in server.job_pools.values():
                     pool.shutdown()
             finish({"first": first, "soon": soon, "later": later, "failed": failed,
-                    "said": out.getvalue(), "ticks": ticks_after_failure, "raised": raised,
-                    "before_prune": ran_before_prune})
+                    "said": out.getvalue(), "prune_failing": prune_failing, "before_prune": ran_before_prune})
         """)
         self.assertEqual(found["first"], ["rotate", "prune"])
         self.assertEqual(found["soon"], [])
         self.assertEqual(found["later"], ["rotate", "prune"])
         self.assertEqual(found["failed"], ["prune"])
-        self.assertIn("rotating logs: RuntimeError: rotation broke", found["said"])
-        self.assertTrue(found["ticks"] >= 1)
-        self.assertTrue(found["raised"])
+        self.assertIn("stage:rotate: tick failed: RuntimeError: rotation broke", found["said"])
+        self.assertTrue(found["prune_failing"])
         self.assertEqual(found["before_prune"], ["rotate"])
 
     def test_serve_run_says_its_own_log_notes_once_after_rotating_first(self):
@@ -505,7 +509,7 @@ class LogRotationTests(unittest.TestCase):
                 def report_config(self):
                     events.append("report")
 
-                load_new_code = tick = reap_inherited = lambda self: None
+                load_new_code = tick = reap_inherited = run_pass = lambda self: None
                 cfg = None
 
             def rotate_own_log():

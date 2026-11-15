@@ -14,14 +14,14 @@ from . import (
     config,
     delivery,
     devices,
-    hooks,
-    lines,
     loops,
     paths,
     record,
+    run_lines,
     sources,
     state,
     util,
+    webhooks,
 )
 from .agent import subscription
 from .loops import Loop
@@ -31,6 +31,11 @@ AB_MIN_TICKETS = 20
 REPAIRS = tuple(r for r, b in config.INHERITS.items() if b == "build")
 BEAT_FILE = paths.STATE_DIR / "serve.json"
 BEAT_STALE_SECONDS = 120
+STUCK_TICKS = 3
+
+
+def serious_failure(key: str) -> bool:
+    return key in ("tick", "tick:load") or key.startswith(("stage:", "loop:"))
 DETACHED_LOG = "loops.log"
 COST_DAYS = 7
 COST_GROUPS = ("step", "kind", "model", "route")
@@ -137,6 +142,7 @@ def serve_beat() -> dict:
         data["age_seconds"] = round((util.now() - util.parse_iso(data["at"])).total_seconds())
         data["process_gone"] = not util.pid_alive(data.get("pid"))
         data["alive"] = not data["process_gone"] and data["age_seconds"] < BEAT_STALE_SECONDS
+        data["stuck"] = any(f.get("ticks", 0) >= STUCK_TICKS for f in (data.get("failing") or {}).values())
     return data
 
 
@@ -182,7 +188,7 @@ def loop_detail(name: str, connect=state.db) -> dict:
             "dead": [{k: v for k, v in i.items() if k != "loop"}
                      for i in state.dead_items(connect) if i["loop"] == loop.name],
             "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
-            "webhook_path": hooks.hook_path(loop.name) if loop.trigger.webhook else "",
+            "webhook_path": webhooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "model": loop.model_for(cfg) if loop.agent and not loop.error else "",
             "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
 
@@ -286,7 +292,7 @@ def step_costs(by: str, days: float | None = None, connect=state.db, cfg: config
     out = [{**r, "runs": len(r["runs"]), "cost_usd": round(r["cost_usd"], 4), "paid_usd": round(r["paid_usd"], 4),
             "subscription_usd": round(r["subscription_usd"], 4), "minutes": round(r["minutes"], 2),
             "api_minutes": round(r["api_minutes"], 2)} for r in groups.values()]
-    waits = dict.fromkeys(lines.WAIT_CAUSES, 0.0)
+    waits = dict.fromkeys(run_lines.WAIT_CAUSES, 0.0)
     for r in state.runs_since(since, connect):
         try:
             recorded = json.loads(r.get("wait_minutes") or "{}")

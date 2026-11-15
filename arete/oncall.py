@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from string import Template
 
-from . import config, control, jev, lines, outbound, paths, record, sources, state, util
+from . import config, control, jev, outbound, paths, record, run_lines, sources, state, util
 
 UNEXPECTED, HEARTBEAT, STALLED, ORCHESTRATION, EXPECTED = "unexpected", "heartbeat", "stalled", "orchestration", "expected"
 WAKE, IGNORE, UNSURE = "wake", "ignore", "unsure"
@@ -104,23 +104,23 @@ def digest(name: str, end: int) -> str | None:
         return None
 
 
-def drain(name: str, pending: list) -> tuple[list[str], list | None]:
+def drain(name: str, pending: list) -> tuple[list[str], list | None, int | None]:
     older = name + ".1"
     offset, tail = pending
     try:
         size = os.stat(older).st_size
         if size < offset or digest(older, offset) != tail:
-            return [], None
+            return [], None, None
         end = min(size, offset + MAX_READ)
         with open(older, "rb") as f:
             f.seek(offset)
             data = f.read(end - offset)
     except OSError:
-        return [], None
+        return [], None, None
     if end < size:
         data = data[:data.rfind(b"\n") + 1 or len(data)]
         end = offset + len(data)
-    return data.decode("utf-8", "replace").splitlines(), ([end, digest(older, end)] if end < size else None)
+    return data.decode("utf-8", "replace").splitlines(), ([end, digest(older, end)] if end < size else None), end
 
 
 def stamp(name: str) -> list | None:
@@ -170,7 +170,7 @@ def gone(name: str, mark: list | None) -> tuple[list[str], list[str], list | Non
             remainder = digest(name + ".1", mark[0]) == mark[2]
         if remainder:
             pending, mark = [mark[0], mark[2]], [0, mark[1], "", None]
-    older, pending = drain(name, pending) if pending else ([], None)
+    older, pending, _ = drain(name, pending) if pending else ([], None, None)
     return older, [], [mark[0], mark[1], mark[2], pending, now]
 
 
@@ -195,13 +195,18 @@ def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list
                 noted = seen
             else:
                 pending, offset = [offset, mark[2]], 0
+        elif (now and seen and not pending and now[0] == seen[0] != inode and now[1] > seen[1]
+              and not (offset > 0 and digest(name + ".1", offset) == mark[2])):
+            pending = [seen[1], digest(name + ".1", seen[1]) or ""]
     end = min(size, offset + MAX_READ)
     if (got := sources.read_lines(name, offset, end)) is None:
         return [], [], mark
     rows, upto = got
     if upto is None:
         upto = end if end - offset >= MAX_READ else offset
-    older, pending = drain(name, pending) if pending else ([], None)
+    older, pending, drained = drain(name, pending) if pending else ([], None, None)
+    if drained is not None and pending is None and now:
+        noted = [now[0], drained, now[2]]
     return older, rows, [upto, inode, digest(name, upto) or "", pending, noted]
 
 
@@ -234,7 +239,7 @@ def run_line(line: str) -> dict | None:
         row = json.loads(line)
     except ValueError:
         return None
-    return row if isinstance(row, dict) and all(k in row for k in lines.FIXED if k != "ts") else None
+    return row if isinstance(row, dict) and all(k in row for k in run_lines.FIXED if k != "ts") else None
 
 
 def same_owner(line: str, row: dict | None) -> bool:
@@ -293,7 +298,7 @@ def tail_of(path) -> tuple[list[dict], list[str]]:
             return [], []
         if begin:
             data = data[data.find(b"\n") + 1:]
-        rows = lines.whole(data)
+        rows = run_lines.whole(data)
         events = {row.get("event") for row in rows}
         known = bool(events & {"step_start", "step_end"}) and "wait" in events
         if not begin or size >= MAX_RUN_TAIL or known or not idle(rows):
@@ -523,7 +528,7 @@ def owner_run(row: dict) -> str:
     if row["class"] == STALLED:
         return ""
     where = Path(row["source"])
-    if where.name == lines.FILE and where.parent.parent == paths.RUNS_DIR:
+    if where.name == run_lines.FILE and where.parent.parent == paths.RUNS_DIR:
         run_id = where.parent.name
     else:
         run_id = next((str(r["run"]) for r in map(run_line, str(row.get("evidence") or "").splitlines()) if r), "")
@@ -589,7 +594,7 @@ def origin_repo(source: str, repo: str) -> str:
     if repo:
         return repo
     where = Path(source)
-    if where.name == lines.FILE and where.parent.parent == paths.RUNS_DIR:
+    if where.name == run_lines.FILE and where.parent.parent == paths.RUNS_DIR:
         run_id = where.parent.name
     else:
         run_id = source.removeprefix("run ") if source.startswith("run ") else ""
@@ -709,7 +714,9 @@ def known_twins(cfg: config.Config, policies: Policies, rows: list[tuple], known
 
 def serve_failures(beat: dict) -> dict[str, str]:
     now = {f"broken:{k}": f"{k}: loop broken: {v}" for k, v in (beat.get("broken") or {}).items()}
-    return now | {f"poll:{k}": f"{k}: poll failed: {v}" for k, v in (beat.get("poll_errors") or {}).items()}
+    now |= {f"poll:{k}": f"{k}: poll failed: {v}" for k, v in (beat.get("poll_errors") or {}).items()}
+    return now | {f"tick:{k}": f"{k}: tick failed: {f['error']}" for k, f in (beat.get("failing") or {}).items()
+                  if f.get("ticks", 0) >= control.STUCK_TICKS}
 
 
 class Watch:
@@ -756,7 +763,7 @@ class Watch:
             if OWN_LINE.search(line) or URL_ONLY_END.search(line):
                 continue
             if row:
-                if not run_failure(row) or (origin.folder and lines.path(str(row["run"])).exists()):
+                if not run_failure(row) or (origin.folder and run_lines.path(str(row["run"])).exists()):
                     continue
                 if self.hushed(self.repairing(str(row["run"]))):
                     continue
@@ -802,7 +809,7 @@ class Watch:
     def run_files(self, since: str | None) -> list[str]:
         ids = [r["id"] for r in state.runs_marked_running()]
         ids += [r["id"] for r in state.runs_since(since)] if since else []
-        return [str(lines.path(run_id)) for run_id in dict.fromkeys(ids)]
+        return [str(run_lines.path(run_id)) for run_id in dict.fromkeys(ids)]
 
     def heartbeat(self) -> None:
         stored, kept = cursor_value(PREFIX + "heartbeat")
@@ -838,7 +845,7 @@ class Watch:
         for row in state.runs_marked_running():
             if (util.now() - util.parse_iso(row["started"])).total_seconds() <= record.SETTLE_GRACE_SECONDS:
                 continue
-            rows, texts = tail_of(lines.path(row["id"]))
+            rows, texts = tail_of(run_lines.path(row["id"]))
             why = "its process is gone" if process_gone(row) else "its heartbeats stopped" if silent(rows) else ""
             if not why:
                 continue
@@ -956,7 +963,7 @@ def reread(cfg: config.Config, policies: Policies, row: dict) -> tuple[bool, str
         return all(c.get("ok") for c in mine), f"heartbeat read of {beat['ts']}"
     if row["class"] == STALLED:
         found = state.run_get(row["source"].removeprefix("run ")) or {}
-        gone = found.get("status") != "running" or not (process_gone(found) or silent(tail_of(lines.path(found["id"]))[0]))
+        gone = found.get("status") != "running" or not (process_gone(found) or silent(tail_of(run_lines.path(found["id"]))[0]))
         return gone, f"run {found.get('id', '-')} {found.get('status', 'is unknown')}"
     if row["source"] == "serve":
         beat = control.serve_beat()

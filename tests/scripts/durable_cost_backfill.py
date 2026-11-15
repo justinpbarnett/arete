@@ -1,9 +1,9 @@
 
-for rid, started, usd, tin in (("A", "2020-01-01", 9, 900), ("B", "2020-01-02", 3, 300),
-                               ("C", "2020-01-04", 2, 200)):
+for rid, started, usd, tin in (("A", "2020-01-01T00:00:00Z", 9, 900), ("B", "2020-01-02T00:00:00Z", 3, 300),
+                               ("C", "2020-01-04T00:00:00Z", 2, 200)):
     record.start("pipeline", run_id=rid, started=started, cost_usd=usd, tokens_in=tin, tokens_out=tin // 10)
 with state.db() as c:
-    for rid, usd, ts in (("B", 1, "2020-01-03"), ("C", 1.5, "2020-01-04")):
+    for rid, usd, ts in (("B", 1, "2020-01-03T00:00:00Z"), ("C", 1.5, "2020-01-04T00:00:00Z")):
         c.execute("INSERT INTO steps (run_id, runner, cost_usd, tokens_in, tokens_out, ts) VALUES (?, 'claude', ?, 100, 10, ?)",
                   (rid, usd, ts))
 paid = state.paid_by_run(["A", "B", "C"])
@@ -16,10 +16,10 @@ code, out, err = call(*args)
 assert code == 0, (out, err)
 a = rows("A")
 assert [(r["step"], r["cost_usd"]) for r in a] == ([("legacy", 12), ("correction", -3)] if use_before else [("legacy", 9)]), a
-assert all(r["auth_mode"] == "subscription" and r["ts"] == "2020-01-01" for r in a)
+assert all(r["auth_mode"] == "subscription" and r["ts"] == "2020-01-01T00:00:00Z" for r in a)
 assert (a[0]["tokens_in"], a[0]["tokens_out"]) == (900, 90)
 b = rows("B")[-1]
-assert (b["step"], b["cost_usd"], b["tokens_in"], b["auth_mode"], b["ts"]) == ("legacy", 2, 200, "subscription", "2020-01-02"), b
+assert (b["step"], b["cost_usd"], b["tokens_in"], b["auth_mode"], b["ts"]) == ("legacy", 2, 200, "subscription", "2020-01-02T00:00:00Z"), b
 assert len(rows("C")) == 1
 assert "backfilled 0 steps" in call(*args)[1]
 assert state.paid_by_run(["A", "B", "C"]) == paid
