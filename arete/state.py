@@ -2190,11 +2190,6 @@ def research_keep(ref: str, **fields) -> None:
                   (*fields.values(), ref))
 
 
-def research_prune(refs: list[str]) -> None:
-    with db() as c:
-        c.execute(f"DELETE FROM research WHERE status != 'running' AND ref NOT IN ({','.join('?' * len(refs))})", refs)
-
-
 def triage_prune(sources: list[str]) -> None:
     with db() as c:
         c.execute(f"DELETE FROM triage WHERE source NOT IN ({','.join('?' * len(sources))})", sources)
