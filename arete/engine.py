@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shlex
 import signal
 import subprocess
@@ -38,7 +37,6 @@ from . import (
 from .agent import Result
 from .loops import Loop
 
-NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 KNOWN_FINDINGS_SHOWN = 30
 KNOWN_FINDINGS_ASKED = 200
 OUTPUT_TAIL = 6000
@@ -249,15 +247,6 @@ def fingerprint_key(loop: Loop, f: dict) -> str:
     return hashlib.sha1(f"{loop.name}\n{fingerprint_text(f).lower()}".encode()).hexdigest()[:20]
 
 
-def last_number(text: str) -> float | None:
-    found = NUMBER.findall(text or "")
-    return float(found[-1]) if found else None
-
-
-def number_text(value: float) -> str:
-    return str(value).removesuffix(".0")
-
-
 def fenced(data) -> str:
     return "```json\n" + json.dumps(data, indent=2, default=str).replace("```", "'''") + "\n```"
 
@@ -398,7 +387,7 @@ def json_object(line: str) -> dict:
 
 
 def reports(row: dict) -> bool:
-    return bool(row.get("title") and row.get("fingerprint")) or isinstance(row.get("value"), int | float)
+    return bool(row.get("title") and row.get("fingerprint"))
 
 
 @loops.runs_kind("command")
@@ -413,21 +402,18 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     code, text = run_command(argv if run.device.remote else from_loop_folder(argv, loop), work_dir(run), timeout=loop.timeout_minutes * 60, env=env,
                              device=run.device, stdin=stdin, output=run.log_file, on_line=feed_output(run))
     lines = [line for line in text.split("\n") if line.strip()]
-    found, value, said = [], None, []
+    found, said = [], []
     for line in lines:
         row = json_object(line)
         if row.get("title") and row.get("fingerprint"):
             found.append(row)
-        elif isinstance(row.get("value"), int | float):
-            value = row["value"]
         else:
             said.append(line)
     took = f"exit {code} in {time.monotonic() - started:.0f}s"
     if code != 0:
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
     fresh = new_findings(run, found)
-    outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events),
-               **({"value": value} if value is not None else {})}
+    outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events)}
     if loop.emits:
         delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     hand_on(run, fresh)
@@ -644,8 +630,8 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     if not run.trial and isinstance(answer.get("state"), dict):
         state.set_loop_state(loop.name, data=answer["state"])
     summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
-    outcome = {"summary": summary, "value": len(fresh), "trust": weakest_trust(events)}
-    if fresh or any(e["type"] == "metric" for e in loop.emits):
+    outcome = {"summary": summary, "trust": weakest_trust(events)}
+    if fresh:
         delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     hand_on(run, fresh)
     return "done", f"{summary} ({util.count(len(fresh), 'new finding')}, {len(found) - len(fresh)} seen before)"
@@ -716,11 +702,6 @@ def shell(run: LoopRun, command: str, wt: Path) -> tuple[int, str]:
     return res.returncode, (res.stdout or "") + (res.stderr or "")
 
 
-def measured_number(res: subprocess.CompletedProcess) -> float | None:
-    on_stdout = last_number(res.stdout)
-    return on_stdout if on_stdout is not None else last_number(res.stderr)
-
-
 def attempt_prompt(run: LoopRun, goal: str, history: list[str], files: list[str]) -> str:
     loop = run.loop
     parts = [loops.prompt_text(loop).strip(), "---", f"## Goal\n\n{goal}"]
@@ -781,78 +762,6 @@ def try_once(run: LoopRun, ws: Workspace, i: int, goal: str, history: list[str],
     return idea, ""
 
 
-@loops.runs_kind("climb")
-def climb_loop(run: LoopRun) -> tuple[str, str]:
-    spec = run.loop.spec
-    higher = loops.CLIMB_GOALS[loops.climb_goal(spec)]
-    files = loops.as_list(spec.get("files"))
-
-    def measure(wt: Path) -> tuple[float | None, str]:
-        res = shell_result(run, spec["measure"], wt)
-        if res.returncode != 0:
-            return None, f"exited {res.returncode}"
-        value = measured_number(res)
-        return value, "" if value is not None else "did not print a number"
-
-    ws = open_workspace(run)
-    kept, stopped, answered, agent_error = False, "", False, ""
-    try:
-        baseline, why = measure(ws.wt)
-        if baseline is None:
-            return "failed", f"`{spec['measure']}` {why} on the base branch"
-        best, history = baseline, [f"- baseline: {number_text(baseline)}"]
-        run.log("measure", f"baseline {number_text(baseline)}")
-        goal = (f"Make `{spec['measure']}` print a {'higher' if higher else 'lower'} number. It prints "
-                f"{number_text(baseline)} now.")
-        for i in range(1, run.loop.tries + 1):
-            try:
-                idea, why_not = try_once(run, ws, i, goal + f" Best so far: {number_text(best)}.", history, files)
-                answered = True
-            except OverBudget as e:
-                if i == 1:
-                    raise
-                run.log("budget", f"stopped before try {i}: {e}")
-                break
-            except StoppedByAgent as e:
-                history.append(f"- try {i}: stopped: {e}")
-                run.log("stop", f"try {i}: the agent stopped the run: {e}")
-                stopped = str(e)
-                break
-            except AgentFailed as e:
-                idea, why_not, agent_error = "", f"the agent failed: {e}", str(e)
-            if not idea:
-                history.append(f"- try {i}: {why_not}")
-                run.log("try", f"try {i}: {why_not}")
-                continue
-            value, why = measure(ws.wt)
-            if value is not None and (value > best if higher else value < best):
-                change = f"{number_text(best)} -> {number_text(value)}"
-                commit(ws.wt, commit_message(run, ws, f"{idea[:60]} ({change})"))
-                history.append(f"- try {i}: kept, {change}: {idea}")
-                run.log("keep", f"try {i}: {change}: {idea}")
-                best, kept = value, True
-            else:
-                revert(ws.wt)
-                result = f"measure {why}" if value is None else \
-                    f"{number_text(value)}, not better than {number_text(best)}"
-                history.append(f"- try {i}: reverted, {result}: {idea}")
-                run.log("revert", f"try {i}: {result}: {idea}")
-        if not kept:
-            return empty_handed(stopped, "" if answered else agent_error,
-                                f"no try beat the baseline {number_text(baseline)}")
-        climbed = f"{number_text(baseline)} -> {number_text(best)}"
-        summary = f"{spec['measure']}: {climbed}"
-        outcome = {**ws.outcome_fields(), "value": best, "facts": summary, "summary": summary,
-                   "title": f"{run.loop.name}: {climbed}",
-                   "report": f"Climbed `{spec['measure']}` from {number_text(baseline)} to {number_text(best)}.\n\n"
-                   + "\n".join(history)}
-        drop_worktree(ws)
-        delivery.deliver(run.loop, run.id, [], outcome, trial=run.trial, log=run.log, cfg=run.cfg)
-        return "done", summary
-    finally:
-        close_workspace(ws, keep_branch=kept and not run.trial)
-
-
 def problem(run: LoopRun) -> str:
     found = [e["data"] for e in run.events if e.get("type") == loops.FINDING_EVENT and e.get("data")]
     if found:
@@ -884,7 +793,7 @@ def restore_proof(run: LoopRun, kept: bytes | None) -> None:
 
 def search_outcome(run: LoopRun, ws: Workspace, history: list[str], tries: int, fix: str) -> dict:
     check = run.loop.spec["check"]
-    outcome = {**ws.outcome_fields(), "value": tries, "summary": f"`{check}` passes: {fix}",
+    outcome = {**ws.outcome_fields(), "summary": f"`{check}` passes: {fix}",
                "facts": f"`{check}` passes after {util.count(tries, 'try', 'tries')}",
                "title": f"{run.loop.name}: {fix.split(': ', 2)[-1]}",
                "report": f"Searched for a change that makes `{check}` pass.\n\n" + "\n".join(history)}

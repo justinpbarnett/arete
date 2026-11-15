@@ -1244,7 +1244,7 @@ def cmd_hold(args) -> int:
         if not args.subscription:
             if args.until or args.release:
                 raise ValueError("name the subscription: claude or codex")
-            found = state.holds(include_indefinite=True)
+            found = state.holds()
             for h in found:
                 print(f"{h['scope']}\n  {runner.hold_words(h)}")
             if not found:

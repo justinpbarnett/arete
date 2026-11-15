@@ -493,10 +493,6 @@ def is_pattern_rule(rule: str) -> bool:
     return "(" in rule
 
 
-def rules_for_throwaway_sandbox_without_git_credentials(disallowed_tools: list[str] | None) -> list[str]:
-    return [t for t in disallowed_tools or [] if not is_pattern_rule(t)]
-
-
 def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallowed_tools: list[str] | None) -> list[str]:
     granted = tools if tools is not None else [*(allowed_tools or []), *READ_TOOLS]
     allowed = set(allowed_tools or []) | set(READ_TOOLS)
@@ -687,30 +683,20 @@ def command_sockets(keeps: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
     return list(dict.fromkeys(folders)), list(dict.fromkeys(sockets))
 
 
-def sessions_dir(remote: devices.Device | None) -> str:
-    return f"{devices.home(remote)}/.arete/pi-sessions" if remote else str(SESSIONS_DIR)
-
-
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
-            persist: bool = True, add_dirs: list[Path] | None = None,
-            remote: devices.Device | None = None, ask_owner: bool = False) -> list[str]:
-    if refusal := remote_refusal(remote):
-        raise ValueError(refusal)
-    remote = None
-    cmd = ["pi" if remote else binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
-           "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp"]
-    if not remote:
-        cmd += ["--extension", str(GUARD_FILE)]
-        if ask_owner:
-            cmd += ["--extension", str(ASK_FILE)]
-    names = [*names, asks.TOOL] if ask_owner and not remote else names
+            persist: bool = True, add_dirs: list[Path] | None = None, ask_owner: bool = False) -> list[str]:
+    cmd = [binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
+           "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp", "--extension", str(GUARD_FILE)]
+    if ask_owner:
+        cmd += ["--extension", str(ASK_FILE)]
+    names = [*names, asks.TOOL] if ask_owner else names
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
     if model:
         cmd += ["--model", model]
     if effort:
         cmd += ["--thinking", effort]
     if persist or resume.id:
-        cmd += ["--session-dir", sessions_dir(remote)]
+        cmd += ["--session-dir", str(SESSIONS_DIR)]
         if resume.id:
             cmd += ["--session", resume.id]
     else:
@@ -722,8 +708,8 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
     return cmd
 
 
-def authentication(model: str, passing=None, providers=None, remote=None) -> accounts.Auth:
-    return accounts.Auth() if remote_refusal(remote) else select(model, passing, providers).auth
+def authentication(model: str, passing=None, providers=None) -> accounts.Auth:
+    return select(model, passing, providers).auth
 
 
 def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "") -> UsageLimit | None:
@@ -843,7 +829,7 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
     if refusal := remote_refusal(kw.get("remote")):
         return Result(ok=False, error=refusal, runner="pi", model=kw.get("model", ""),
                       session=kw.get("resume", NO_SESSION))
-    kw["remote"] = None
+    kw.pop("remote", None)
     selected = selected or select(kw.get("model", ""), kw.get("passing"), kw.get("providers"))
     auth = selected.auth
     kw["model"] = selected.model
@@ -907,7 +893,6 @@ def _run(
     persist: bool = True,
     add_dirs: list[Path] | None = None,
     mcp_config: str = "",
-    remote: devices.Device | None = None,
     instructions: list[str] | None = None,
     price: Callable[[Result], float] = lambda reply: reply.cost_usd,
     on_line: Callable[[str], None] = lambda line: None,
@@ -918,9 +903,6 @@ def _run(
     extra_env: dict[str, str] | None = None,
     ask_owner: bool = False,
 ) -> Result:
-    if refusal := remote_refusal(remote):
-        return Result(ok=False, error=refusal, session=resume, runner="pi", model=model)
-    remote = None
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
         return Result(ok=False, error="pi takes MCP servers only from its own mcp.json, so run this step on claude",
@@ -928,26 +910,21 @@ def _run(
     if instructions:
         return Result(ok=False, error="pi runs with --no-context-files and loads no instruction files, so run this "
                                       "step on claude or set instructions = []", session=resume, runner="pi", model=model)
-    cwd = cwd if remote else Path(cwd).absolute()
+    cwd = Path(cwd).absolute()
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
-    sandboxed = bool(remote and remote.exe_sandbox)
-    if sandboxed:
-        disallowed_tools = rules_for_throwaway_sandbox_without_git_credentials(disallowed_tools)
-    names = tool_names(tools, allowed_tools, disallowed_tools)
-    if not remote:
-        names = [name for name in names if name in GUARDED_TOOLS]
-    if (persist or resume.id) and not remote:
+    names = [name for name in tool_names(tools, allowed_tools, disallowed_tools) if name in GUARDED_TOOLS]
+    if persist or resume.id:
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     launch_model = selected.model.partition("/")[2] if selected else model
     cmd = command(names, model=launch_model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
-                  remote=remote, ask_owner=ask_owner)
+                  ask_owner=ask_owner)
     if selected and selected.provider:
         cmd += ["--provider", selected.provider]
     if json_schema:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
     confined = False
-    if (writing := sorted(WRITING & set(names))) and not sandboxed:
-        if not can_confine(bool(remote)):
+    if writing := sorted(WRITING & set(names)):
+        if not can_confine(False):
             return Result(ok=False, error=f"{NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
                           session=resume, runner="pi", model=model)
         cmd = write_confinement(cwd, add_dirs, selected.owner if selected and selected.using_login else None) + cmd
@@ -956,19 +933,15 @@ def _run(
         cmd = write_confinement(cwd, add_dirs, selected.owner) + cmd
 
     cmd = [*cmd, "--", prompt]
-    if remote:
-        env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, "ARETE_AGENT": "1"}
-        cmd = devices.wrap(remote, cmd, cwd, {"ARETE_AGENT": "1"}, mkdirs=(sessions_dir(remote),))
-    else:
-        folder = selected.view
-        env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
-               **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files),
-               **({"ARETE_ASK_TOOL": json.dumps(asks.pi_tool())} if ask_owner else {})}
+    folder = selected.view
+    env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
+           **guard_env([selected.owner, folder / "auth.json"], selected.sensitive_files),
+           **({"ARETE_ASK_TOOL": json.dumps(asks.pi_tool())} if ask_owner else {})}
     try:
         with refresh_channel(selected, env) as descriptors:
             if error := plan_token_error(env.items()):
                 return Result(ok=False, session=resume, error=error, runner="pi", model=model)
-            proc, cut_short_by = stream(cmd, None if remote else str(cwd), env, timeout, max_budget_usd,
+            proc, cut_short_by = stream(cmd, str(cwd), env, timeout, max_budget_usd,
                                        lambda line: reply_cost(line, model, price, auth.mode), on_line,
                                        **({"pass_fds": descriptors} if descriptors else {}))
     except FileNotFoundError as e:
@@ -981,7 +954,7 @@ def _run(
         result.session = replace(result.session, spent_usd=resume.spent_usd +
                                  (0 if auth.mode == "subscription" else price(result)))
     if json_schema and result.ok and result.structured is None:
-        restate(result, ending(proc.stdout), json_schema, model, cwd, remote, min(timeout, RESTATE_TIMEOUT), on_line,
+        restate(result, ending(proc.stdout), json_schema, model, cwd, min(timeout, RESTATE_TIMEOUT), on_line,
                 passing, providers, price,
                 max(0, max_budget_usd - (0 if auth.mode == "subscription" else price(result)))
                 if max_budget_usd is not None else None, selected=selected)
@@ -1006,21 +979,18 @@ def ending(stdout: str) -> str:
 
 
 def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd: Path | str,
-            remote: devices.Device | None, timeout: float, on_line: Callable[[str], None],
+            timeout: float, on_line: Callable[[str], None],
             passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
             price: Callable[[Result], float] = lambda reply: reply.cost_usd,
             max_budget_usd: float | None = None, selected: Route | None = None) -> None:
-    if refusal := remote_refusal(remote):
-        result.ok, result.error, result.structured = False, refusal, None
-        return
     if not ending_text:
         return
-    auth = selected.auth if selected else authentication(model, passing, providers, remote)
+    auth = selected.auth if selected else authentication(model, passing, providers)
     if auth.mode != "subscription" and max_budget_usd is not None and max_budget_usd <= 0:
         return
     prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
               f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}\n\n{NO_ANSWER}")
-    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, remote=remote, on_line=on_line,
+    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, on_line=on_line,
                 passing=passing, providers=providers, auth=auth, selected=selected, price=price,
                 max_budget_usd=max_budget_usd)
     result.calls = [replace(result, calls=[]), again]
