@@ -148,6 +148,16 @@ def snapshot(reason: str) -> Path | None:
 
 def retain(folder: Path) -> None:
     every = snapshots(folder)
+    pinned = ""
+    if paths.DB_FILE.exists():
+        conn = paths.connect_db(paths.DB_FILE, readonly=True)
+        try:
+            row = conn.execute("SELECT backup FROM schema_migrations ORDER BY n DESC LIMIT 1").fetchone()
+            pinned = row[0] if row else ""
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
     keep = set(every[-KEEP_NEWEST:])
     first_day = (util.now() - timedelta(days=KEEP_DAYS - 1)).date()
     newest_of_day = {stamp_of(p).date(): p for p in every}
@@ -155,7 +165,7 @@ def retain(folder: Path) -> None:
     old_archives = [p for p in folder.iterdir() if (m := ARCHIVE.match(p.name))
                     and datetime.strptime(m.group(1), "%Y-%m-%d").date() < first_day]
     for p in [p for p in every if p not in keep] + old_archives:
-        if p not in IN_FLIGHT:
+        if p not in IN_FLIGHT and p.name != pinned:
             p.unlink(missing_ok=True)
 
 

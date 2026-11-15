@@ -7,6 +7,7 @@ from arete import cli, config, control, engine, loops, paths, record, scratch, s
 root, mode = Path(sys.argv[1]), sys.argv[2]
 scratch.AUTHORITY = root / "authority-parent/verification-authority"
 paths.ensure_dirs()
+state.migrate()
 paths.CONFIG_FILE.write_text('[jev]\nenabled = false\n')
 event = {"type": "test", "title": "keep me", "data": {"value": 17}, "trust": "internal"}
 def folder(name, code):
@@ -50,7 +51,6 @@ def kill(r, child):
 if mode == "outcomes":
     import sqlite3
     with sqlite3.connect(paths.DB_FILE) as c:
-        c.executescript(state.SCHEMA)
         c.execute("INSERT INTO queue (loop, queue, trigger, payload, enqueued) VALUES ('fail', 'fail', 'event', ?, ?)",
                   (json.dumps([event]), util.iso()))
         legacy = c.execute("SELECT last_insert_rowid()").fetchone()[0]

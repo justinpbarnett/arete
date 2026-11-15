@@ -218,6 +218,9 @@ class Server:
         self.alert_last: Future | None = None
         self.code = self.code_seen = code_stamp()
         self.code_note = ""
+        self.migration_stamp = None
+        self.migration_error = ""
+        self.contracts_waiting = False
         self.job_pools = {job.note: ThreadPoolExecutor(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
         self.jobs: dict[str, Future] = {}
 
@@ -244,6 +247,8 @@ class Server:
     def guard(self, key: str, fn: Callable, *args):
         try:
             result = fn(*args)
+        except state.NoDatabase:
+            raise
         except Exception as e:
             error = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
             known = self.failing.get(key)
@@ -278,6 +283,9 @@ class Server:
         return True
 
     def tick(self) -> None:
+        state.ensure_schema()
+        if self.contracts_waiting:
+            self.contracts_waiting = state.migrate()
         if not self.guard("tick:load", self.load) or self.code_problem:
             return
         self.guard("stage:reap", self.reap)
@@ -650,9 +658,6 @@ class Server:
             self.code_problem = ""
         if stamp == self.code or not steady:
             return
-        if busy := self.busy_with():
-            self.note_once(f"new code waits to load: {busy}")
-            return
         check = util.sh([sys.executable, "-c", IMPORT_CHECK], timeout=120)
         if check.returncode != 0:
             self.note_once("new code does not import, so serve keeps the code it started with: "
@@ -663,6 +668,17 @@ class Server:
             self.code_problem = ("new code cannot read config.toml, so serve keeps the code it started with: "
                                  + util.last_line(candidate.stderr or candidate.stdout, 300))
             self.note_once(self.code_problem)
+            return
+        if stamp != self.migration_stamp:
+            migrated = util.sh(control.command(["migrate", "--no-contracts"]), timeout=120)
+            self.migration_stamp = stamp
+            self.migration_error = ((util.last_line(migrated.stderr or migrated.stdout, 300)
+                                     or f"migrate exited {migrated.returncode}") if migrated.returncode else "")
+        if self.migration_error:
+            self.note_once("new code migration failed, so serve keeps its code: " + self.migration_error)
+            return
+        if busy := self.busy_with():
+            self.note_once(f"new code waits to load: {busy}")
             return
         self.code_problem = ""
         dashboard.POSTS_IN_FLIGHT.close()
@@ -707,6 +723,7 @@ class Server:
         except Exception:
             running = None
         util.write_json(control.BEAT_FILE, {
+            "schema": state.LATEST,
             "pid": os.getpid(), "engine": codebase.STAMP, "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
@@ -734,7 +751,16 @@ def start_notes(cfg: config.Config) -> list[str]:
 def run(with_dashboard: bool = True) -> NoReturn:
     held = take_serve_lock()
     try:
+        beat = util.read_json(control.BEAT_FILE, {})
+        if beat.get("pid") == os.getpid():
+            util.write_json(control.BEAT_FILE, {**beat, "schema": state.LATEST})
+        try:
+            contracts_waiting = state.migrate()
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            raise SystemExit(1) from e
         server = Server()
+        server.contracts_waiting = contracts_waiting
         server.lock = held
     except BaseException:
         held.close()
@@ -747,5 +773,10 @@ def run(with_dashboard: bool = True) -> NoReturn:
         threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
     while True:
         started = time.monotonic()
-        server.run_pass()
+        try:
+            server.run_pass()
+        except state.NoDatabase as e:
+            server.say(str(e))
+            held.close()
+            raise SystemExit(1) from e
         time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))

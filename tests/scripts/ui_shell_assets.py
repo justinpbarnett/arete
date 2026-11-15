@@ -19,7 +19,7 @@ class Assets(HTMLParser):
             self.styles.add(attrs["href"])
 
 check = unittest.TestCase()
-state.ensure_schema()
+state.migrate()
 node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "ui@example.com", "")
 owner = type("Owner", (), {"of": lambda self, address: "ui@example.com"})()
 server = dashboard.Server("127.0.0.1", 0, node, owner, False)

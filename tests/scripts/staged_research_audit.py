@@ -1,10 +1,11 @@
 
 import json, os, sys, tempfile, time
 from pathlib import Path
-from arete import config, paths, research, research_audit, runner, steps
+from arete import config, paths, research, research_audit, runner, state, steps
 root = Path(sys.argv[1])
 replay = root / "replay"
 paths.ensure_dirs()
+state.migrate()
 calls = []
 real = runner.run
 def spy(*args, **kwargs):

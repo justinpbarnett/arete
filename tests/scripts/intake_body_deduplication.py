@@ -1,6 +1,6 @@
 
 loop = make_loop(webhook=True)
-state.ensure_schema()
+state.migrate()
 a, b = b'{"title": "a"}', b'{"title": "b"}'
 source = "intake#webhook"
 def age(key):

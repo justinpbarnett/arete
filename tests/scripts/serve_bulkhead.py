@@ -10,7 +10,7 @@ real_out = sys.stdout
 LOG = paths.LOG_DIR / "serve.log"
 GOOD = '[replay]\nall = true\n\n[jev]\nenabled = false\n'
 paths.ensure_dirs()
-state.ensure_schema()
+state.migrate()
 paths.CONFIG_FILE.write_text(GOOD + ('\n[oncall]\nenabled = true\n' if mode == "oncall" else ''))
 loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.ENGINE_DIR.iterdir() if p.is_dir()}))
 EVENT = {"type": "test", "title": "item", "data": {"value": 1}, "trust": "internal"}

@@ -768,11 +768,13 @@ class CutOffTests(unittest.TestCase):
         self.git("checkout", "-q", "main", cwd=self.clone)
         self.child("exec(SEED)")
 
-    def command(self, code):
-        return [sys.executable, "-c", CHILD_PRELUDE + code, str(self.root)]
+    def command(self, code, before_migrate=""):
+        prelude = CHILD_PRELUDE.replace("state.migrate()\n", before_migrate + "state.migrate()\n")
+        return [sys.executable, "-c", prelude + code, str(self.root)]
 
-    def child(self, code, timeout=120):
-        return subprocess.run(self.command(code), env=self.env, capture_output=True, text=True, timeout=timeout)
+    def child(self, code, timeout=120, before_migrate=""):
+        return subprocess.run(self.command(code, before_migrate), env=self.env,
+                              capture_output=True, text=True, timeout=timeout)
 
     def facts(self, done):
         return behavior_result(done, marker="RESULT ", last=True)
@@ -895,15 +897,16 @@ class CutOffTests(unittest.TestCase):
 
     def test_a_finding_from_before_the_emitted_column_counts_as_handed_on(self):
         self.write_loops()
-        facts = self.facts(self.child(
-            self.HUNTS + "db = sqlite3.connect(paths.DB_FILE)\n"
+        legacy = (
+            "db = sqlite3.connect(paths.DB_FILE)\n"
             "db.execute('CREATE TABLE findings (loop TEXT NOT NULL, fingerprint TEXT NOT NULL, fingerprint_text TEXT "
             "DEFAULT \"\", title TEXT, url TEXT, run_id TEXT, seen INTEGER DEFAULT 1, first_seen TEXT, last_seen TEXT, "
             "PRIMARY KEY (loop, fingerprint))')\n"
             "key = engine.fingerprint_key(loops.find('hunt'), {'title': 'leak', 'fingerprint': 'fp-1'})\n"
             "db.execute(\"INSERT INTO findings (loop, fingerprint, title, url, run_id) VALUES ('hunt', ?, 'leak', '', "
-            "'old')\", (key,))\ndb.commit()\ndb.close()\n"
-            "report(rows=state.findings('hunt'), hunted=hunt())"))
+            "'old')\", (key,))\ndb.commit()\ndb.close()\n")
+        facts = self.facts(self.child(
+            self.HUNTS + "report(rows=state.findings('hunt'), hunted=hunt())", before_migrate=legacy))
         self.assertEqual([f["emitted"] for f in facts["rows"]], ["legacy"])
         self.assertEqual(facts["hunted"]["queued"], [])
         self.assertTrue(any(line.startswith("seen before") for line in facts["hunted"]["log"]))

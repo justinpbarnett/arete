@@ -475,6 +475,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, method: str, path: str, query: dict):
         if method == "GET":
+            if path == "/api/meta":
+                with state.reader() as conn:
+                    meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+                return {"instance": {key: meta[f"instance_{key}"] for key in ("id", "tag", "name", "created")},
+                        "schema": {"version": int(meta["schema_version"]),
+                                   "oldest_writer": int(meta["oldest_writer"])}}
             if path == PUSH_PATH:
                 return webpush.view()
             if path == "/api/sidebar":
