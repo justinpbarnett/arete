@@ -258,7 +258,7 @@ def dashboard_ports() -> frozenset[int]:
         pass
     try:
         record = json.loads(SERVER_FILE.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
         record = None
     if isinstance(record, dict) and isinstance(record.get("port"), int):
         found.add(record["port"])
