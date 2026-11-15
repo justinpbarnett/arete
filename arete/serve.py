@@ -310,7 +310,14 @@ class Server:
             if time.monotonic() - self.tried.get(sid, -1e9) < sources.every(source):
                 continue
             self.tried[sid] = time.monotonic()
-            self.polls[sid] = self.pool.submit(self.poll_source, loop, i)
+            self.polls[sid] = future = self.pool.submit(self.poll_source, loop, i)
+            future.add_done_callback(lambda done, sid=sid: self.poll_ended(sid, done))
+
+    def poll_ended(self, sid: str, done: Future) -> None:
+        if done.cancelled():
+            return
+        if error := done.exception():
+            self.say(f"{sid}: poll failed: {type(error).__name__}: {util.first_line(str(error), 300)}")
 
     def forget_unpolled_errors(self, live: list[Loop]) -> None:
         polled = {sources.source_id(loop, i) for loop in live for i in range(len(loop.sources))}
@@ -357,7 +364,7 @@ class Server:
     def poll_source(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
         try:
-            found = sources.poll(loop, index, self.cfg)
+            found, items = sources.poll(loop, index, self.cfg)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
             if (c := state.cursor(sid)) is not None:
@@ -367,7 +374,7 @@ class Server:
             self.errors[sid] = text
             return
         self.errors.pop(sid, None)
-        if items := sources.fire(loop, "event", found):
+        if items:
             self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:

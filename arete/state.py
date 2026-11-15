@@ -4,7 +4,7 @@ import json
 import secrets
 import sqlite3
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 
 from . import paths, util
@@ -637,6 +637,13 @@ def db():
         conn.close()
 
 
+@contextmanager
+def transaction():
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        yield lambda: nullcontext(c)
+
+
 def ensure_schema() -> None:
     with db():
         pass
@@ -844,8 +851,8 @@ def findings(loop: str, limit: int = 50, connect=db) -> list[dict]:
                                            (loop, limit))]
 
 
-def add_event(loop: str, e: dict) -> int:
-    with db() as c:
+def add_event(loop: str, e: dict, connect=db) -> int:
+    with connect() as c:
         cur = c.execute("INSERT INTO events (loop, type, source, key, repo, title, url, trust, data, ts) "
                         "VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (loop, e.get("type"), e.get("source"), str(e.get("key")), e.get("repo"), e.get("title"),
@@ -859,15 +866,15 @@ def recent_events(limit: int = 50, connect=db) -> list[dict]:
                                            "ORDER BY id DESC LIMIT ?", (limit,))]
 
 
-def seen_keys(source: str) -> set[str]:
-    with db() as c:
-        return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
+def claim_seen(source: str, keys: list[str], connect=db) -> list[str]:
+    with connect() as c:
+        return [str(k) for k in keys if c.execute("INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
+                                                 (source, str(k), util.iso())).rowcount == 1]
 
 
-def mark_seen(source: str, keys: list[str]) -> None:
-    with db() as c:
-        c.executemany("INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
-                      [(source, str(k), util.iso()) for k in keys])
+def forget_seen(source: str, key: str, before, connect=db) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM seen WHERE source = ? AND key = ? AND ts < ?", (source, key, util.iso(before)))
 
 
 def cursor(source: str, connect=db) -> dict | None:
@@ -876,9 +883,9 @@ def cursor(source: str, connect=db) -> dict | None:
         return dict(r) if r else None
 
 
-def set_cursor(source: str, value: str | None, ok: bool, detail: str = "") -> None:
-    prev = cursor(source) or {}
-    with db() as c:
+def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", connect=db) -> None:
+    prev = cursor(source, connect) or {}
+    with connect() as c:
         c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
                   (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500]))
 
@@ -889,8 +896,8 @@ def source_owner(source: str) -> str | None:
         return r[0] if r else None
 
 
-def set_source_owner(source: str, fingerprint: str) -> None:
-    with db() as c:
+def set_source_owner(source: str, fingerprint: str, connect=db) -> None:
+    with connect() as c:
         c.execute("INSERT OR REPLACE INTO source_owners (source, fingerprint) VALUES (?,?)", (source, fingerprint))
 
 
@@ -899,9 +906,10 @@ def cursors(connect=db) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM cursors ORDER BY source")]
 
 
-def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None) -> int:
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
+def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None, connect=db) -> int:
+    with connect() as c:
+        if not c.in_transaction:
+            c.execute("BEGIN IMMEDIATE")
         if not payload and c.execute("SELECT 1 FROM queue WHERE loop = ? AND run_id IS NULL AND payload = '[]' "
                                      "AND trigger = ?", (loop, trigger)).fetchone():
             return 0

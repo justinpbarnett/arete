@@ -34,7 +34,10 @@ class Trigger:
     trust: str = "untrusted"
 
     def group_of(self, e: dict) -> str:
-        return str(e.get(self.group) or (e.get("data") or {}).get(self.group) or "") if self.group else ""
+        if not self.group:
+            return ""
+        data = e.get("data")
+        return str(e.get(self.group) or (data.get(self.group) if isinstance(data, dict) else "") or "")
 
     def refusal(self, e: dict) -> str:
         takes = [*self.events, *(["metric"] if self.metric else [])]

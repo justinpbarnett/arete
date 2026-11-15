@@ -61,6 +61,7 @@ Approving a push again is safe, because it rebases onto origin first and a commi
 A `loop` emit hands each finding to another loop, so one loop can find and another can fix.
 [arete/loops/README.md](arete/loops/README.md) has the rules for both.
 A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
+A delivery counts once by its `X-GitHub-Delivery` or `X-Request-Id`, and a post with neither counts once per 10 minutes by the hash of its body.
 
 ## On-call
 

@@ -635,13 +635,14 @@ class Others(Scratch):
     def test_a_watch_loop_with_a_log_source_still_gets_its_events(self):
         self.baseline()
         code = ("import os, types\n"
-                "from arete import config, sources\n"
+                "from arete import config, loops, sources\n"
                 f"p = {str(self.log)!r}\n"
-                "loop = types.SimpleNamespace(name='watch', sources=[{'type': 'log', 'path': p}])\n"
-                "print(len(sources.poll(loop, 0, config.Config())))\n"
+                "loop = types.SimpleNamespace(name='watch', sources=[{'type': 'log', 'path': p}],\n"
+                "                             trigger=loops.Trigger(), queue_name='watch')\n"
+                "print(len(sources.poll(loop, 0, config.Config())[0]))\n"
                 "open(p, 'a').write('2026-11-13T17:00:00Z ERROR loop and watcher both see this\\n')\n"
                 "os.system(f'{__import__(\"sys\").executable} -m arete.cli oncall scan > /dev/null')\n"
-                "found = sources.poll(loop, 0, config.Config())\n"
+                "found = sources.poll(loop, 0, config.Config())[0]\n"
                 "print(len(found), found[0]['type'], found[0]['data']['count'])")
         res = self.py(code)
         self.assertEqual(res.stdout.split("\n")[:2], ["0", "1 log.error 1"], res.stderr)

@@ -3261,6 +3261,334 @@ print("RECOVERY_OK")
         self.run_modes("race")
 
 
+class IntakeTests(unittest.TestCase):
+    PRELUDE = r'''
+import hashlib, hmac, json, os, signal, sqlite3, sys, threading, urllib.error, urllib.request
+from datetime import timedelta
+from pathlib import Path
+from arete import config, dashboard, hooks, loops, paths, serve, sources, state, util
+root = Path(os.environ["INTAKE_ROOT"])
+rows = root / "rows.jsonl"
+def make_loop(name="intake", trigger="", webhook=False):
+    folder = paths.CONFIG_DIR / "loops" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "loop.toml").write_text(
+        'kind = "command"\n[run]\ncommand = "true"\n[trigger]\n' + ("webhook = true\n" if webhook else "") + trigger +
+        f'[[source]]\ntype = "command"\ncommand = ["cat", "{rows}"]\nevery = "1m"\n')
+    return next(x for x in loops.load_all() if x.name == name)
+def write_rows(*items):
+    rows.write_text("".join(json.dumps(i) + "\n" for i in items))
+def issue(key, data=None):
+    return {"key": key, "title": f"issue {key}", "data": data or {"number": key}}
+def snap(sid="intake#0"):
+    with state.db() as c:
+        out = {t: c.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("seen", "events", "queue")}
+        out["queue_rows"] = [{"grp": r["grp"], "keys": [e["key"] for e in json.loads(r["payload"])]}
+                             for r in c.execute("SELECT grp, payload FROM queue ORDER BY id")]
+        cur = c.execute("SELECT value, ok, detail FROM cursors WHERE source = ?", (sid,)).fetchone()
+        out["cursor"] = dict(cur) if cur else None
+        owner = c.execute("SELECT fingerprint FROM source_owners WHERE source = ?", (sid,)).fetchone()
+        out["owner"] = owner[0] if owner else None
+    return out
+def make_server():
+    server = serve.Server()
+    server.lines, server.ended = [], threading.Event()
+    server.say = server.lines.append
+    original = server.poll_ended
+    def ended(sid, done):
+        original(sid, done)
+        server.ended.set()
+    server.poll_ended = ended
+    return server
+def poll(server, loop, sid="intake#0"):
+    server.tried.clear()
+    server.ended.clear()
+    server.poll(loop)
+    future = server.polls[sid]
+    error = future.exception(timeout=30)
+    assert server.ended.wait(30)
+    return error
+def failing_once(real):
+    left = [1]
+    def flaky(*a, **k):
+        if left:
+            left.pop()
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **k)
+    return flaky
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def web():
+    node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    owner = type("Owner", (), {"of": lambda self, address: "me@example.com"})()
+    server = dashboard.Server("127.0.0.1", 0, node, owner, False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+def post(server, name, body, headers):
+    request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/hook/{name}", data=body,
+                                     headers=headers, method="POST")
+    try:
+        got = OPENER.open(request, timeout=30)
+    except urllib.error.HTTPError as e:
+        got = e
+    with got:
+        return got.code, json.loads(got.read() or b"{}")
+def signed(name, body, delivery):
+    key = hooks.secret(name)
+    return {"X-GitHub-Delivery": delivery,
+            "X-Hub-Signature-256": "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()}
+def token(name, **more):
+    return {"X-Arete-Token": hooks.secret(name), **more}
+def finish(result):
+    print("BEHAVIOR_RESULT=" + json.dumps(result))
+'''
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for folder in ("home", "config", "state", "logs", "tmp"):
+            (self.root / folder).mkdir()
+        self.env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")}
+        self.env.update(HOME=str(self.root / "home"), ARETE_CONFIG_DIR=str(self.root / "config"),
+                        ARETE_STATE_DIR=str(self.root / "state"), ARETE_LOG_DIR=str(self.root / "logs"),
+                        TMPDIR=str(self.root / "tmp"), INTAKE_ROOT=str(self.root), GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull)
+
+    def run_script(self, body):
+        code = f"import sys;sys.path.insert(0,{str(SOURCE)!r});" + self.PRELUDE + body
+        done = subprocess.run([sys.executable, "-I", "-c", code], cwd=self.root, env=self.env, text=True,
+                              capture_output=True, timeout=300, check=False)
+        output = next((line.removeprefix("BEHAVIOR_RESULT=") for line in done.stdout.splitlines()
+                       if line.startswith("BEHAVIOR_RESULT=")), None)
+        return done, json.loads(output) if output else None
+
+    def result(self, body):
+        done, found = self.run_script(body)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIsNotNone(found, done.stdout + done.stderr)
+        return found
+
+    BASELINE = '''
+loop = make_loop()
+write_rows()
+server = make_server()
+poll(server, loop)
+'''
+    THREE = 'write_rows(issue("a"), issue("b"), issue("c"))\n'
+
+    def test_a_poll_that_fails_before_queueing_keeps_its_events_for_the_next_try(self):
+        found = self.result(self.BASELINE + self.THREE + '''
+base = snap()
+state.enqueue = failing_once(state.enqueue)
+error = poll(server, loop)
+failed = snap()
+lines = list(server.lines)
+poll(server, loop)
+healed = snap()
+poll(server, loop)
+finish({"base": base, "failed": failed, "lines": lines, "healed": healed, "third": snap(),
+        "error": repr(error)})
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual((found["base"]["seen"], found["base"]["cursor"]["ok"]), (0, 1), shown)
+        self.assertEqual(found["error"], "None", shown)
+        failed = found["failed"]
+        self.assertEqual((failed["seen"], failed["events"], failed["queue"]), (0, 0, 0), shown)
+        self.assertEqual(failed["cursor"]["ok"], 0, shown)
+        self.assertIn("database is locked", failed["cursor"]["detail"], shown)
+        self.assertEqual(failed["cursor"]["value"], found["base"]["cursor"]["value"], shown)
+        self.assertEqual(failed["owner"], found["base"]["owner"], shown)
+        self.assertEqual(len([line for line in found["lines"] if "poll failed" in line]), 1, shown)
+        self.assertIn("intake#0: poll failed: OperationalError: database is locked", found["lines"][0], shown)
+        healed = found["healed"]
+        self.assertEqual((healed["seen"], healed["events"], healed["queue"]), (3, 3, 1), shown)
+        self.assertEqual(healed["queue_rows"], [{"grp": "", "keys": ["a", "b", "c"]}], shown)
+        self.assertEqual(healed["cursor"]["ok"], 1, shown)
+        self.assertEqual(found["third"]["queue_rows"], healed["queue_rows"], shown)
+        self.assertEqual(found["third"]["events"], 3, shown)
+
+    def test_a_kill_inside_the_intake_transaction_loses_nothing(self):
+        self.result(self.BASELINE + 'finish({})\n')
+        done, _ = self.run_script('''
+loop = make_loop()
+''' + self.THREE + '''
+real = state.add_event
+def dies(*a, **k):
+    real(*a, **k)
+    os.kill(os.getpid(), signal.SIGKILL)
+state.add_event = dies
+server = make_server()
+server.poll(loop)
+server.polls["intake#0"].result(timeout=60)
+''')
+        self.assertEqual(done.returncode, -9, done.stdout + done.stderr)
+        after = self.result('finish(snap())\n')
+        shown = json.dumps(after, indent=1)
+        self.assertEqual((after["seen"], after["events"], after["queue"]), (0, 0, 0), shown)
+        self.assertEqual(after["cursor"]["detail"], "0 read, 0 new (baseline)", shown)
+        self.assertIsNotNone(after["owner"], shown)
+        again = self.result('''
+loop = make_loop()
+server = make_server()
+poll(server, loop)
+first = snap()
+poll(server, loop)
+finish({"first": first, "second": snap()})
+''')
+        self.assertEqual(again["first"]["queue_rows"], [{"grp": "", "keys": ["a", "b", "c"]}], str(again))
+        self.assertEqual(again["second"]["queue_rows"], again["first"]["queue_rows"], str(again))
+        self.assertEqual(again["second"]["events"], 3, str(again))
+
+    def test_an_error_while_reporting_a_failed_poll_is_still_said(self):
+        found = self.result(self.BASELINE + self.THREE + '''
+def no_enqueue(*a, **k):
+    raise sqlite3.OperationalError("enqueue is locked")
+def no_cursor(*a, **k):
+    raise sqlite3.OperationalError("cursor is locked")
+state.enqueue, state.set_cursor = no_enqueue, no_cursor
+error = poll(server, loop)
+finish({"error": str(error), "lines": server.lines})
+''')
+        self.assertEqual(found["error"], "cursor is locked", str(found))
+        self.assertEqual(len(found["lines"]), 1, str(found))
+        self.assertIn("intake#0: poll failed: OperationalError: cursor is locked", found["lines"][0], str(found))
+
+    def test_a_row_the_loop_cannot_group_does_not_stop_the_batch(self):
+        found = self.result('''
+loop = make_loop(trigger='group = "team"\\n')
+write_rows()
+server = make_server()
+poll(server, loop)
+write_rows(issue("one", {"team": "x"}), issue("two", ["x"]), issue("three", {"team": "y"}))
+poll(server, loop)
+finish({"snap": snap(), "lines": server.lines})
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual(found["snap"]["queue_rows"], [{"grp": "x", "keys": ["one"]}, {"grp": "", "keys": ["two"]},
+                                                       {"grp": "y", "keys": ["three"]}], shown)
+        self.assertEqual(found["snap"]["cursor"]["ok"], 1, shown)
+        self.assertFalse([line for line in found["lines"] if "poll failed" in line], shown)
+
+    def test_a_webhook_whose_fire_fails_queues_on_redelivery(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+body = b'{"title": "hello"}'
+state.enqueue = failing_once(state.enqueue)
+server = web()
+try:
+    out = []
+    for _ in range(3):
+        out.append(post(server, "intake", body, signed("intake", body, "abc")))
+        out.append(snap())
+finally:
+    server.shutdown()
+    server.server_close()
+finish(out)
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual([found[0][0], found[2][0], found[4][0]], [500, 202, 200], shown)
+        self.assertEqual(found[4][1]["why"], "already received", shown)
+        self.assertEqual((found[1]["seen"], found[1]["events"], found[1]["queue"]), (0, 0, 0), shown)
+        for later in (found[3], found[5]):
+            self.assertEqual((later["seen"], later["events"], later["queue"]), (1, 1, 1), shown)
+            self.assertEqual(later["queue_rows"], [{"grp": "", "keys": ["abc"]}], shown)
+
+    def test_concurrent_deliveries_of_one_id_queue_once(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+hooks.secret("intake")
+server = web()
+body = b'{"title": "race"}'
+codes = []
+try:
+    for n in range(50):
+        gate, got = threading.Barrier(2), []
+        headers = signed("intake", body, f"id-{n}")
+        def send():
+            gate.wait(30)
+            got.append(post(server, "intake", body, headers)[0])
+        threads = [threading.Thread(target=send) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        codes.append(sorted(got))
+finally:
+    server.shutdown()
+    server.server_close()
+finish({"codes": codes, "snap": snap()})
+''')
+        self.assertEqual(found["codes"], [[200, 202]] * 50)
+        self.assertEqual(found["snap"]["queue"], 50)
+        self.assertEqual(sorted(r["keys"][0] for r in found["snap"]["queue_rows"]),
+                         sorted(f"id-{n}" for n in range(50)))
+
+    def test_a_post_with_no_delivery_id_counts_once_per_ten_minutes_by_its_body(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+a, b = b'{"title": "a"}', b'{"title": "b"}'
+source = "intake#webhook"
+def age(key):
+    with state.db() as c:
+        c.execute("UPDATE seen SET ts = ? WHERE source = ? AND key = ?",
+                  (util.iso(util.now() - timedelta(minutes=11)), source, key))
+server = web()
+try:
+    out = {}
+    out["a"] = [post(server, "intake", a, token("intake")) for _ in range(2)]
+    out["b"] = post(server, "intake", b, token("intake"))
+    key = out["a"][0][1]["key"]
+    age(key)
+    out["a_aged"] = [post(server, "intake", a, token("intake")) for _ in range(2)]
+    out["id"] = [post(server, "intake", a, token("intake", **{"X-Request-Id": "req-1"}))[0]]
+    age("req-1")
+    out["id"].append(post(server, "intake", a, token("intake", **{"X-Request-Id": "req-1"}))[0])
+    out["bare"] = [post(server, "intake", a, token("intake", **{"X-Request-Id": "sha256:feed"}))[0]]
+    age("sha256:feed")
+    out["bare"].append(post(server, "intake", a, token("intake", **{"X-Request-Id": "sha256:feed"}))[0])
+    out["expected"] = "sha256:" + hashlib.sha256(a).hexdigest()
+    out["snap"] = snap()
+finally:
+    server.shutdown()
+    server.server_close()
+finish(out)
+''')
+        shown = json.dumps(found, indent=1)
+        self.assertEqual([r[0] for r in found["a"]], [202, 200], shown)
+        self.assertEqual(found["a"][0][1]["key"], found["expected"], shown)
+        self.assertEqual(found["b"][0], 202, shown)
+        self.assertEqual([r[0] for r in found["a_aged"]], [202, 200], shown)
+        self.assertEqual(found["id"], [202, 200], shown)
+        self.assertEqual(found["bare"], [202, 200], shown)
+        keys = [r["keys"][0] for r in found["snap"]["queue_rows"]]
+        self.assertEqual(keys.count(found["expected"]), 2, shown)
+        self.assertEqual(sorted(keys), sorted([found["expected"]] * 2 + [found["b"][1]["key"], "req-1", "sha256:feed"]),
+                         shown)
+
+    def test_a_refused_post_leaves_nothing_and_a_plain_fire_still_coalesces(self):
+        found = self.result('''
+loop = make_loop(webhook=True)
+state.ensure_schema()
+hooks.secret("intake")
+server = web()
+try:
+    refused = post(server, "intake", b"{}", {"X-Arete-Token": "wrong"})[0]
+finally:
+    server.shutdown()
+    server.server_close()
+after_refusal = snap()
+sources.fire(loop, "manual")
+sources.fire(loop, "manual")
+finish({"refused": refused, "after_refusal": after_refusal, "snap": snap()})
+''')
+        self.assertEqual(found["refused"], 403, str(found))
+        self.assertEqual([found["after_refusal"][t] for t in ("seen", "events", "queue")], [0, 0, 0], str(found))
+        self.assertEqual(found["snap"]["queue_rows"], [{"grp": "", "keys": []}], str(found))
+
+
 class WorkerRecoveryTests(unittest.TestCase):
     SCRIPT = r'''
 import contextlib, importlib.util, io, json, os, sys
