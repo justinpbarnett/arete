@@ -281,10 +281,26 @@ def this_node(owner: str, host: Tailscale | None = None) -> Node | None:
 class Gauge:
     count: int = 0
     guard: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
 
     def add(self, n: int) -> None:
         with self.guard:
             self.count += n
+
+    def enter(self) -> bool:
+        with self.guard:
+            if self.closed:
+                return False
+            self.count += 1
+            return True
+
+    def close(self) -> None:
+        with self.guard:
+            self.closed = True
+
+    def reopen(self) -> None:
+        with self.guard:
+            self.closed = False
 
 
 POSTS_IN_FLIGHT = Gauge()
@@ -381,6 +397,14 @@ class Refusal(Exception):
         self.status = status
 
 
+RESTART_RETRY_SECONDS = 3
+RESTARTING = "Arete is loading new code. Send this again in a few seconds."
+
+
+class Restarting(Refusal):
+    pass
+
+
 STATUS_OF_REFUSAL = {capture.TooLarge: 413, capture.Refused: 400, capture.NotStaged: 404, capture.Conflict: 409,board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
                      chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
@@ -417,22 +441,33 @@ def last_part(path: str, prefix: str) -> tuple[str, str]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "arete"
     sys_version = ""
+    restarting = False
 
     def do_GET(self) -> None:
         self.answer("GET")
 
     def do_POST(self) -> None:
-        POSTS_IN_FLIGHT.add(1)
+        entered = POSTS_IN_FLIGHT.enter()
+        self.restarting = not entered
         try:
             self.answer("POST")
         finally:
-            POSTS_IN_FLIGHT.add(-1)
+            if entered:
+                POSTS_IN_FLIGHT.add(-1)
+
+    def drop_body(self) -> None:
+        length = (self.headers.get("Content-Length") or "0").strip()
+        if length.isdigit():
+            self.rfile.read(min(int(length), hooks.MAX_HOOK_BODY))
 
     def answer(self, method: str) -> None:
         try:
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
+            if self.restarting:
+                self.drop_body()
+                raise Restarting(503, RESTARTING)
             if method == "GET" and path in WEB_BY_PATH:
                 return self.send(200, *WEB_BY_PATH[path], "no-cache")
             if method == "POST" and path.startswith(hooks.HOOK_PATH):
@@ -448,6 +483,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.api(method, path, query))
         except Exception as e:
             if status := refusal_status(e):
+                if isinstance(e, Restarting):
+                    return self.send_json(status, refusal_answer(e), retry_after=RESTART_RETRY_SECONDS)
                 return self.send_json(status, refusal_answer(e))
             said = type(e).__name__ if self.path.startswith((ASK_PATH, PUSH_PATH)) else f"{type(e).__name__}: {e}"
             self.log_error("%s", said)
@@ -771,8 +808,8 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(400, "The request body is not a JSON object.")
         return data
 
-    def send_json(self, status: int, data) -> None:
-        self.send(status, json.dumps(data, default=str).encode(), "application/json", "no-store")
+    def send_json(self, status: int, data, retry_after: int = 0) -> None:
+        self.send(status, json.dumps(data, default=str).encode(), "application/json", "no-store", retry_after)
 
     def send_events(self, run_id: str, query: dict) -> None:
         if not RUN_ID.fullmatch(run_id):
@@ -808,8 +845,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
 
-    def send(self, status: int, payload: bytes, kind: str, cache: str) -> None:
+    def send(self, status: int, payload: bytes, kind: str, cache: str, retry_after: int = 0) -> None:
         self.head(status, kind, cache, len(payload))
+        if retry_after:
+            self.send_header("Retry-After", str(retry_after))
         try:
             self.end_headers()
             self.wfile.write(payload)

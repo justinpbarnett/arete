@@ -533,20 +533,27 @@ class Server:
             self.note_once(self.code_problem)
             return
         self.code_problem = ""
-        reap_children()
-        still_running = child_pids()
-        self.say(f"new code: serve {os.getpid()} restarts itself" + (
-            f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
-        os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
-        fd = self.lock.fileno()
-        os.set_inheritable(fd, True)
-        os.environ[SERVE_LOCK_FD] = str(fd)
+        dashboard.POSTS_IN_FLIGHT.close()
         try:
-            os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
-        except BaseException:
-            os.set_inheritable(fd, False)
-            os.environ.pop(SERVE_LOCK_FD, None)
-            raise
+            if busy := self.busy_with():
+                self.note_once(f"new code waits to load: {busy}")
+                return
+            reap_children()
+            still_running = child_pids()
+            self.say(f"new code: serve {os.getpid()} restarts itself" + (
+                f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
+            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
+            fd = self.lock.fileno()
+            os.set_inheritable(fd, True)
+            os.environ[SERVE_LOCK_FD] = str(fd)
+            try:
+                os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+            except BaseException:
+                os.set_inheritable(fd, False)
+                os.environ.pop(SERVE_LOCK_FD, None)
+                raise
+        finally:
+            dashboard.POSTS_IN_FLIGHT.reopen()
 
     def note_once(self, text: str) -> None:
         if self.code_note != text:

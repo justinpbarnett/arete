@@ -20,6 +20,7 @@ CONNECT_SECONDS = 5
 PROBE_SECONDS = 1
 CALL_SECONDS = 120
 RETRY_SECONDS = 2
+RESTART_WAIT_SECONDS = 30
 RECONNECT_SECONDS = 120
 WAIT_EVENTS = ("step_end", "question", "error", lines.END)
 BROKE = (OSError, http.client.HTTPException)
@@ -33,6 +34,12 @@ class Failed(Exception):
     def __init__(self, answer: dict, code: int = 0):
         super().__init__(str(answer.get("error", "")))
         self.answer, self.code = answer, code
+
+
+class Restarting(Exception):
+    def __init__(self, answer: dict, seconds: int):
+        super().__init__(str(answer.get("error", "")))
+        self.answer, self.seconds = answer, seconds
 
 
 @dataclass(frozen=True)
@@ -106,9 +113,9 @@ class SecureConnection(http.client.HTTPSConnection):
             raise
 
 
-def connect(where: Server) -> http.client.HTTPConnection:
-    conn = SecureConnection(where, CONNECT_SECONDS) if where.scheme == "https" \
-        else http.client.HTTPConnection(where.host, where.port, timeout=CONNECT_SECONDS)
+def connect(where: Server, seconds: float = CONNECT_SECONDS) -> http.client.HTTPConnection:
+    conn = SecureConnection(where, seconds) if where.scheme == "https" \
+        else http.client.HTTPConnection(where.host, where.port, timeout=seconds)
     try:
         conn.connect()
     except ssl.SSLError as e:
@@ -135,11 +142,37 @@ def moved_to(resp: http.client.HTTPResponse, where: Server) -> Server | None:
 
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS) -> http.client.HTTPResponse:
+    deadline = None
+    restart = None
+    while True:
+        within = None if deadline is None else deadline - time.monotonic()
+        if within is not None and within <= 0:
+            raise Failed(restart.answer, 503)
+        try:
+            return request_once(method, path, body, read_seconds, within)
+        except Restarting as e:
+            restart, pause = e, e.seconds
+        except Down:
+            if restart is None:
+                raise
+            pause = RETRY_SECONDS
+        if deadline is None:
+            deadline = time.monotonic() + RESTART_WAIT_SECONDS
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise Failed(restart.answer, 503)
+        time.sleep(min(pause, left))
+
+
+def request_once(method: str, path: str, body: dict | None = None,
+                 read_seconds: float | None = CALL_SECONDS, within: float | None = None) -> http.client.HTTPResponse:
     where = server()
     payload = json.dumps(body or {}).encode() if method == "POST" else None
     followed = False
+    if within is not None:
+        read_seconds = within if read_seconds is None else min(read_seconds, within)
     while True:
-        conn = connect(where)
+        conn = connect(where, CONNECT_SECONDS if within is None else min(CONNECT_SECONDS, within))
         conn.sock.settimeout(read_seconds)
         headers = headers_for(where)
         if payload is not None:
@@ -162,8 +195,13 @@ def request(method: str, path: str, body: dict | None = None,
         answer = json.loads(text)
     except ValueError:
         answer = None
-    raise Failed(answer if isinstance(answer, dict) and "error" in answer
-                 else {"error": f"the server at {address(where)} answered {resp.status}"}, resp.status)
+    failure = (answer if isinstance(answer, dict) and "error" in answer
+               else {"error": f"the server at {address(where)} answered {resp.status}"})
+    wait = (resp.getheader("Retry-After") or "").strip()
+    if resp.status == 503 and wait.isascii() and wait.isdigit():
+        conn.close()
+        raise Restarting(failure, int(wait))
+    raise Failed(failure, resp.status)
 
 
 def call(method: str, path: str, body: dict | None = None) -> dict:
