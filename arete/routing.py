@@ -254,6 +254,14 @@ def modes_for(cfg: config.Config, repo: config.Repo | None) -> tuple[str, ...]:
         return ()
 
 
+def paid_for(cfg: config.Config, repo: config.Repo | None,
+             layer: config.RepoLayer | None = None) -> config.PaidRoutes:
+    try:
+        return config.allowed_paid_routes(cfg, layer or (config.load_layer(repo.layer_dir) if repo else None))
+    except (ValueError, TypeError, OSError):
+        return cfg.paid
+
+
 POSSIBLE_MODES = {"claude": ("subscription",), "codex": ("subscription", "api_key"),
                   "pi": ("subscription", "api_key", "local")}
 
@@ -379,6 +387,7 @@ class Discovery:
         self.connect = connect
         self.priced = priced
         self.modes = modes_for(cfg, repo)
+        self.paid = paid_for(cfg, repo, layer)
         self.passing = environment.passed(cfg, repo)
         self.probes: dict[tuple[str, str], pi.Route] = {}
         self.cache: dict[str, object] = {}
@@ -442,7 +451,7 @@ class Discovery:
         return found
 
     def quote(self, way: Way, request_tokens: int = 0) -> Quote:
-        if not self.priced:
+        if not (self.priced or self.paid.capped):
             return Quote()
         rate = self.cfg.pricing.get(way.model) or self.cfg.pricing.get(f"{way.runner}:{way.model}")
         if rate:
@@ -531,6 +540,22 @@ class Discovery:
                 reasons.append(f"directory cleanup could not be confirmed on codex: {found.detail}")
         return "; ".join(reasons)
 
+    def paid_refusal(self, way: Way, price: Quote | None) -> str:
+        rules = self.paid
+        if way.billing != "paid" or not rules.limited:
+            return ""
+        provider = self.provider(way)
+        if rules.providers is not None and provider not in rules.providers:
+            return (f"[routing.paid] allows paid routes on {', '.join(rules.providers) or 'no provider'}; "
+                    f"this route is on {provider}")
+        for side, cap in (("input", rules.max_input), ("output", rules.max_output)):
+            rate = getattr(price, side) if price else None
+            if cap is not None and rate is None:
+                return f"[routing.paid] max_{side} is {cap:g} USD per million tokens; this route's {side} price is unknown"
+            if cap is not None and rate > cap:
+                return f"[routing.paid] max_{side} is {cap:g} USD per million tokens; this route charges {rate:g}"
+        return ""
+
     def policy_refusal(self, credential: str, auth_mode: str = "") -> str:
         mode = payment_of(credential, auth_mode)
         if not mode or mode in self.modes:
@@ -582,10 +607,14 @@ class Discovery:
 
     def candidate(self, way: Way, settings, remaining: float | None, request_tokens: int = 0) -> Candidate:
         link = way.link
-        state_name, detail, until = self.judge(way, settings, remaining, request_tokens)
+        price = self.quote(way, request_tokens) if way.billing == "paid" else None
+        if why := self.policy_refusal(way.credential) or self.paid_refusal(way, price):
+            state_name, detail, until = "policy", why, ""
+        else:
+            state_name, detail, until = self.judge(way, settings, remaining, request_tokens)
         return Candidate(0, way.model, way.runner, self.provider(way), way.credential, way.billing, link.tier,
                          link.position, link.requested, settings.effort_on(way.runner),
-                         settings.instructions_on(way.runner), self.quote(way, request_tokens) if way.billing == "paid" else None,
+                         settings.instructions_on(way.runner), price,
                          state_name, " ".join(detail.split()),
                          self.capabilities(way) if settings.requires.declared else None, way.mode, until)
 

@@ -1218,6 +1218,58 @@ def cmd_webhook(args) -> int:
     return 0
 
 
+def hold_end(text: str) -> str:
+    import re
+    from datetime import UTC, timedelta
+
+    from . import util
+
+    if found := re.fullmatch(r"(\d+(?:\.\d+)?)([mhd])", text.strip().lower()):
+        minutes = float(found[1]) * {"m": 1, "h": 60, "d": 1440}[found[2]]
+        return util.iso(util.now() + timedelta(minutes=minutes))
+    end = util.parse_iso(text.strip())
+    if end.tzinfo is None:
+        end = end.astimezone()
+    if end <= util.now():
+        raise ValueError(f"{text} is already past")
+    return util.iso(end.astimezone(UTC))
+
+
+def cmd_hold(args) -> int:
+    from datetime import timedelta
+
+    from . import accounts, claude, codex, environment, runner, state, util
+
+    try:
+        if not args.subscription:
+            if args.until or args.release:
+                raise ValueError("name the subscription: claude or codex")
+            found = state.holds(include_indefinite=True)
+            for h in found:
+                print(f"{h['scope']}\n  {runner.hold_words(h)}")
+            if not found:
+                print("no holds")
+            return 0
+        module, limit = {"claude": (claude, claude.EVERY_MODEL), "codex": (codex, codex.LIMIT_SCOPE)}[args.subscription]
+        scope = accounts.scope(module.authentication(environment.passed(config.load())), limit)
+        if not scope:
+            raise ValueError(f"no {args.subscription} login found to hold")
+        if args.release:
+            if args.until:
+                raise ValueError("--release takes no time")
+            state.clear_holds([scope], util.iso(util.now() + timedelta(seconds=1)))
+            print(f"released {args.subscription}; its routes are back in every chain")
+            return 0
+        if not args.until:
+            raise ValueError("give a time like 6h, 90m, 2d or an ISO time, or --release")
+        until = hold_end(args.until)
+        state.hold(scope, until, f"held with arete hold {args.subscription}")
+        print(f"held {args.subscription} until {runner.local_time(until)}; its steps take the next route in their tier")
+        return 0
+    except (ValueError, OSError) as e:
+        return refused(e)
+
+
 def cmd_costs(args) -> int:
     from pathlib import Path
 
@@ -1911,6 +1963,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--auth-mode", choices=("subscription", "api_key", "local"), help="correction billing (default subscription)")
     p.add_argument("--before", metavar="FILE", help="JSON run-ID to pre-edit dollar amount map for --backfill")
     p.set_defaults(fn=cmd_costs)
+
+    p = steering(sub.add_parser("hold", help="move steps off a subscription before it hits its limit, or bring it back; "
+                                             "with no arguments, list the holds in force"))
+    p.add_argument("subscription", nargs="?", choices=("claude", "codex"))
+    p.add_argument("until", nargs="?", help="how long: 90m, 6h, 2d, or an ISO time")
+    p.add_argument("--release", action="store_true", help="clear the hold now, including one a real limit set")
+    p.set_defaults(fn=cmd_hold)
 
     p = steering(sub.add_parser("ab", help="compare the arm and baseline of each per-step A/B route on live tickets: "
                                            "merged PRs, repairs, review rounds and cost per merged PR"))
