@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 from arete import board, cli, config, delivery, engine, loops, paths, push, sources, state, util
 root = Path(sys.argv[1])
+state.migrate()
 def verdicts():
     with state.db() as c:
         return [dict(r) for r in c.execute("SELECT kind, outcome, approval FROM verdicts")]

@@ -2,7 +2,7 @@
 import json, os
 from unittest import mock
 from arete import codebase, control, engine, record, scaffold, sessions, state
-state.ensure_schema()
+state.migrate()
 codebase.STAMP = "a"
 loop = record.start("loop", pid=None, loop="x")
 session = record.start("session", pid=None)

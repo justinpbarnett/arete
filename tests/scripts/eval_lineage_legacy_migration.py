@@ -5,6 +5,7 @@ with sqlite3.connect(paths.DB_FILE) as c:
     for n in range(2):
         c.execute("INSERT INTO evals VALUES (?, 'replay-sample', 'word-train', 1, 2, 3, ?, 'worktree')",
                   (f"old-{n}", f"2020-01-0{n + 1}"))
+state.migrate()
 for _ in range(2):
     with state.db() as c:
         columns = {r[1] for r in c.execute("PRAGMA table_info(evals)")}
@@ -18,7 +19,7 @@ for _ in range(2):
 replies = sample()
 state.add_eval("old-2", "replay-sample", "word-train", True, 0, 0, "worktree")
 with state.db() as c:
-    c.execute("UPDATE evals SET ts = '2020-01-03' WHERE run_id = 'old-2'")
+    c.execute("UPDATE evals SET ts = '2020-01-03T00:00:00Z' WHERE run_id = 'old-2'")
 comparison = evals.compare("replay-sample", "main")
 assert "the baseline predates lineage" in comparison, comparison
 (replies / "build.patch").unlink()

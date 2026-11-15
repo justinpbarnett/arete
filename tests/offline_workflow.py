@@ -115,6 +115,7 @@ def forbidden(*args, **kwargs):
 def main(root, scenario):
     from arete import (accounts, alerts, asks, codebase, config, control, environment, factory, flows, gh, lines,
                        paths, pipeline, record, replay, runlimits, runner, state, tasks, vault)
+    state.migrate()
     scratch = None
     if importlib.util.find_spec("arete.scratch"):
         from arete import scratch
@@ -1191,6 +1192,7 @@ def ordinary_extras(fx, row, events, result):
     if scenario == "future-step-appended":
         result["appended"] = bool(fx.appended)
     if scenario in ("pass", "doctor-clean"):
+        assert state.run_get(row["id"])["schema_version"] == state.LATEST
         branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
         assert len(branches) == 1, result
         result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], fx.root / "sample/origin.git")

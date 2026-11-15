@@ -55,6 +55,7 @@ function failures(h) {
   for (const l of h.checks.rows?.loops ?? []) if (!l.ok) add("fault", "Loop", l.name, l.detail);
   if (h.serve.config_problem) add("fault", "Config", "config.toml", h.serve.config_problem);
   if (h.serve.code_problem) add("fault", "Code", "new code", h.serve.code_problem);
+  for (const [key, f] of Object.entries(h.serve.failing || {})) add(f.ticks >= 3 ? "fault" : "caution", "Serve tick", key, `${f.error} · since ${clock(f.since)}, ${count(f.ticks, "pass", "passes")}`);
   for (const [name, why] of Object.entries(h.serve.broken || {})) add("fault", "Loop file", name, why);
   for (const [source, error] of Object.entries(h.serve.poll_errors || {})) add("caution", "Source", source, error);
   for (const i of h.incidents?.rows ?? []) add("caution", "Incident", itemLink("incident", String(i.id), `#${i.id}`, `incident:${i.id}`), `blocked: ${i.waiting} · ${i.signature}`);
@@ -66,7 +67,8 @@ function healthSummary(h, failed) {
   const unread = [h.checks, h.alerts, h.devices, h.incidents ?? { rows: [] }].filter((p) => !("rows" in p)).length;
   const serveDown = !h.serve.at ? "serve has never run" : !h.serve.alive ? (h.serve.process_gone ? "serve's process is gone" : "serve looks stuck") : "";
   const { faults, cautions } = countStates(failed.map((f) => f.state));
-  const parts = [serveDown, faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",
+  const tickFails = Object.entries(h.serve.failing || {}).map(([key, f]) => `${key}: ${f.error}`);
+  const parts = [serveDown, !serveDown && tickFails.length ? `serve is up but its tick fails at ${tickFails.join("; ")}` : "", faults ? count(faults, "thing fails", "things fail") : "", cautions ? count(cautions, "thing has a warning", "things have a warning") : "",
     unread ? `${count(unread, "part", "parts")} could not be read` : ""].filter(Boolean);
   return el("p", { class: "summary" }, stateChip(h.state), parts.length ? ` ${capitalized(parts.join(", "))}.` : " Every alert, check, probe, device and loop answers.");
 }

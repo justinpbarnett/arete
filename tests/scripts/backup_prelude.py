@@ -32,6 +32,7 @@ def incident(fp, days, closed=None):
         c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (?, 'r', ?)", (i, ago(days)))
     return i
 def seed():
+    state.migrate()
     with state.db() as c:
         for rid, kind, loop_kind, days, cost in (
                 ("pipe-old", "pipeline", "", 30, 0), ("pipe-new", "pipeline", "", 1, 0),

@@ -4,7 +4,9 @@ import difflib
 import hashlib
 import os
 import re
+import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -519,17 +521,17 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     print(f"{util.iso()} {ref}: researching", flush=True)
     values = {"ref": ref, "title": r["title"], "ticket": text, "related": related(src, r, done),
               "repos": "\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none"}
-    cwd = dirs[0] if dirs else REPORTS_DIR
-    if cfg.research_planner:
-        res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:], [o["ref"] for _, o, _ in done], started,
-                          judged)
-    else:
-        res = runner.run(prompt("research", **values, **filing(h, filed_path)),
-                         cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
-                         json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
-                         timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),
-                         cfg=cfg)
-        paid = res.paid_usd
+    with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
+        if cfg.research_planner:
+            res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:],
+                              [o["ref"] for _, o, _ in done], started, judged)
+        else:
+            res = runner.run(prompt("research", **values, **filing(h, filed_path)),
+                             cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
+                             json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
+                             timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),
+                             cfg=cfg)
+            paid = res.paid_usd
     answer = res.structured if res.ok and isinstance(res.structured, dict) else {}
     report = str(answer.get("report") or "").strip()
     if not report:

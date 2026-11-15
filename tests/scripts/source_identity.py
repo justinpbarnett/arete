@@ -4,6 +4,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 from arete import config, jira, loops, paths, serve, sources, state, util
+state.migrate()
 root = Path(os.environ["IDENT_ROOT"])
 cfg = config.load()
 server = serve.Server()
@@ -185,7 +186,7 @@ state.set_cursor("legacy#9", None, True, "x")
 sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#9'")
 state.set_cursor("legacy#9", None, False, "boom")
 kept = state.cursor("legacy#9")["last_ok"]
-state.ensure_schema()
+state.migrate()
 state.ensure_schema()
 out["legacy"] = {"poll": legacy, "owner": state.source_owner("legacy#0"), "kept": kept, "seen": seen("legacy#0"),
                  "queued": queued("legacy"), "old_owner": old_owner}

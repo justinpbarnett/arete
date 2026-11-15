@@ -400,7 +400,7 @@ def cmd_guard(args) -> int:
     from . import guard, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return guard.main()
+    return guard.main(args.judge, args.open)
 
 
 def cmd_upload_guard(args) -> int:
@@ -423,7 +423,7 @@ def cmd_codex_guard(args) -> int:
     from . import codex, runner, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return codex.guard_main(args.judge, runner.NO_GIT_WRITES)
+    return codex.guard_main(args.judge, runner.NO_GIT_WRITES, args.open)
 
 
 def cmd_mcp_ask(args) -> int:
@@ -834,9 +834,11 @@ def serve_line(beat: dict) -> str:
         return f"serve: DOWN, {'its process is gone, ' if beat['process_gone'] else ''}last beat {when(beat.get('at'))}"
     paused = f"; config does not load: {beat['config_problem']}" if beat.get("config_problem") else ""
     paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
+    failing = "".join(f"; tick fails at {key}: {found['error']}" for key, found in (beat.get("failing") or {}).items())
+    running, pending = ("unknown" if beat[k] is None else beat[k] for k in ("running", "pending"))
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
-            f"{beat['running']} running, {beat['pending']} waiting" + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
-            + paused)
+            f"{running} running, {pending} waiting"
+            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "") + paused + failing)
 
 
 def loop_line(v: dict) -> str:
@@ -909,6 +911,17 @@ def latest_run(name_or_run: str) -> str:
     if not last:
         raise control.NotFound(f"{loop.name} has not run yet")
     return last["id"]
+
+
+def cmd_migrate(args) -> int:
+    try:
+        from . import state
+
+        state.migrate(contracts=not args.no_contracts)
+    except Exception as e:
+        print(f"arete migrate: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_serve(args) -> int:
@@ -1863,8 +1876,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hook", help="Claude Code event hook (reads a payload on stdin)")
     p.set_defaults(fn=cmd_hook)
 
-    p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: keeps them out of secret files and, with JEV, "
+    p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: enforces the directory floor and secret rules; "
+                                     "with --judge, "
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
+    p.add_argument("--judge", action="store_true")
+    p.add_argument("--open", action="append", default=[])
     scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
@@ -1872,9 +1888,10 @@ def main(argv: list[str] | None = None) -> int:
                                             "in the run's evidence or browser folder (reads a payload on stdin)")
     p.set_defaults(fn=cmd_upload_guard)
 
-    p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: refuses git writes and secret "
-                                           "files and, with --judge, asks JEV like guard (reads a payload on stdin)")
+    p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: enforces the directory floor, "
+                                           "git write and secret rules; with --judge, asks JEV (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
+    p.add_argument("--open", action="append", default=[])
     scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
 
@@ -1916,6 +1933,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("uninstall", help="stop arete serve and remove its agent or unit")
     p.set_defaults(fn=cmd_uninstall)
+
+    p = sub.add_parser("migrate", help="apply pending database migrations")
+    p.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
+    p.set_defaults(fn=cmd_migrate)
 
     p = sub.add_parser("serve", help="the daemon: fire loops on their triggers, run the queues, serve the dashboard")
     p.add_argument("--no-dashboard", action="store_true")

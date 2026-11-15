@@ -64,6 +64,18 @@ class NewUIShellTests(unittest.TestCase):
             done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=30)
             self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
 
+    def test_serve_status_names_a_failing_tick_in_every_serve_line(self):
+        script = (SCRIPTS / "serve_status_ui.mjs").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text('{"type":"module"}')
+            web = support.SOURCE / "arete" / "web"
+            for path in [*web.glob("ui-*.js"), *web.glob("vendor-*.js"), web / "loops.js", web / "refresh.js", web / "health.js"]:
+                shutil.copyfile(path, root / path.name)
+            (root / "check.mjs").write_text(script)
+            done = subprocess.run(["node", str(root / "check.mjs")], cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+
     def test_palette_source_contract(self):
         web = support.SOURCE / "arete" / "web"
         palette = (web / "ui-palette.js").read_text()
@@ -92,7 +104,7 @@ class NewUIShellTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(paths, "STATE_DIR", Path(folder)), \
                 mock.patch.object(paths, "DB_FILE", Path(folder) / "arete.db"), \
                 mock.patch.object(util, "iso", return_value="2026-01-02T03:04:05Z"):
-            state.ensure_schema()
+            state.migrate()
 
             def stored(body):
                 capture.add_context(body, "code123")

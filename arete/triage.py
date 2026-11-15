@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tempfile
 import textwrap
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -338,10 +340,11 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-    res = runner.run(text, dirs[0] if dirs else TICKET_RECORDS_DIR, model=cfg.model("triage"), tools=runner.READ_TOOLS,
-                     allowed_tools=runner.READ_TOOLS, json_schema=SCHEMA,
-                     max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
-                     trace=("", f"triage {c.ref}"), cfg=cfg)
+    with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
+        res = runner.run(text, cwd, model=cfg.model("triage"), tools=runner.READ_TOOLS,
+                         allowed_tools=runner.READ_TOOLS, json_schema=SCHEMA,
+                         max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
+                         trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None
     record_file(c.ref).write_text(f"{text}\n\n## Triage result ({util.paid_note(res.paid_usd, 3)})\n\n```json\n"
                                   f"{json.dumps(answer or {'error': res.error}, indent=2)}\n```\n")

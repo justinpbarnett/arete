@@ -54,7 +54,7 @@ def new_id(prefix: str, tag: str = "") -> str:
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
-           "engine_sha": codebase.STAMP, **fields}
+           "engine_sha": codebase.STAMP, "schema_version": state.LATEST, **fields}
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
