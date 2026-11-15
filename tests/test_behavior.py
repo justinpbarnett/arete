@@ -61,6 +61,7 @@ class LogRotationTests(unittest.TestCase):
                     while f"{g}:0\\n" not in (p.read_text() if p.exists() else ""):
                         assert time.monotonic() < deadline, "no first line"
                         time.sleep(0.01)
+                    assert procs[-1].poll() is None, "writer ended before rotation"
                     notes = install.rotate_logs(max_bytes=1, keep=5)
                     assert notes == [], notes
                 codes = [proc.wait(timeout=120) for proc in procs]
@@ -68,6 +69,7 @@ class LogRotationTests(unittest.TestCase):
                 for proc in procs:
                     if proc.poll() is None:
                         proc.kill()
+                        proc.wait()
             counted = Counter()
             for f in [p, *(logs / f"runs.log.{n}" for n in range(1, 5))]:
                 if f.exists():
@@ -208,6 +210,107 @@ class LogRotationTests(unittest.TestCase):
         self.assertTrue(found["same"])
         self.assertEqual(found["after"], [])
         self.assertEqual(found["names"], ["other.log.1", "runs.log.1"])
+
+    def test_filesystem_errors_become_notes_and_lose_nothing(self):
+        found = self.scenario("""
+            real_stat = Path.stat
+
+            def denied(error):
+                return OSError(error, os.strerror(error))
+
+            p.write_text("runs")
+            other = logs / "other.log"
+            other.write_text("other")
+            before = snapshot()
+            with mock.patch.object(util, "lock_file", side_effect=denied(errno.ENOSPC)):
+                lock_notes = install.rotate_logs(max_bytes=1)
+            lock_same = snapshot() == before
+
+            def no_listing(path):
+                raise denied(errno.EACCES)
+            with mock.patch.object(install.os, "listdir", side_effect=no_listing):
+                list_notes = install.rotate_logs(max_bytes=1)
+            list_same = snapshot() == before
+
+            def no_stat(self, *a, **k):
+                if self.name == "other.log":
+                    raise denied(errno.EACCES)
+                return real_stat(self, *a, **k)
+            with mock.patch.object(Path, "stat", no_stat):
+                inspect_notes = install.rotate_logs(max_bytes=1)
+            after = sorted(os.listdir(logs))
+            finish({"lock": lock_notes, "lock_same": lock_same, "list": list_notes, "list_same": list_same,
+                    "inspect": inspect_notes, "after": after, "other": other.read_text(),
+                    "archived": (logs / "runs.log.1").read_text()})
+        """)
+        (note,) = found["lock"]
+        self.assertIn("rotate-logs.lock", note)
+        self.assertIn("No space left on device", note)
+        self.assertTrue(found["lock_same"])
+        (note,) = found["list"]
+        self.assertIn("list failed", note)
+        self.assertIn("Permission denied", note)
+        self.assertTrue(found["list_same"])
+        (note,) = found["inspect"]
+        self.assertIn("other.log", note)
+        self.assertIn("inspect", note)
+        self.assertEqual(found["after"], ["other.log", "runs.log.1"])
+        self.assertEqual(found["other"], "other")
+        self.assertEqual(found["archived"], "runs")
+
+    def test_own_log_inspection_and_close_failures_are_returned(self):
+        found = self.scenario("""
+            real_stat = Path.stat
+
+            def denied_stat(self, *a, **k):
+                if self.name == "serve.log":
+                    raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+                return real_stat(self, *a, **k)
+            with mock.patch.object(Path, "stat", denied_stat):
+                inspect_notes = install.rotate_own_log(max_bytes=1)
+            finish({"inspect": inspect_notes})
+        """)
+        (note,) = found["inspect"]
+        self.assertIn("serve.log", note)
+        self.assertIn("Permission denied", note)
+        child = textwrap.dedent("""
+            import errno, json, os, sys
+            from unittest import mock
+            from arete import install
+            real_dup2, real_close = os.dup2, os.close
+            opened = []
+
+            def no_dup2(src, dst, *a, **k):
+                raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+
+            def failing_close(fd):
+                real_close(fd)
+                if fd in opened:
+                    raise OSError(errno.EIO, os.strerror(errno.EIO))
+            real_open = os.open
+
+            def tracked_open(*a, **k):
+                fd = real_open(*a, **k)
+                opened.append(fd)
+                return fd
+            with mock.patch.object(install.os, "dup2", no_dup2), mock.patch.object(install.os, "close", failing_close), \\
+                    mock.patch.object(install.os, "open", tracked_open):
+                notes = install.rotate_own_log(max_bytes=1, keep=5)
+            open(sys.argv[1] + "/notes.json", "w").write(json.dumps(notes))
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = environment(root)
+            log = root / "logs" / "serve.log"
+            log.write_text("earlier\n")
+            with open(log, "a") as handle:
+                done = self.run_child(root, env, child, stdout=handle, stderr=handle)
+            self.assertEqual(done.returncode, 0)
+            notes = json.loads((root / "notes.json").read_text())
+            self.assertEqual(len(notes), 2)
+            self.assertIn("dup2 failed", notes[0])
+            self.assertIn("close failed", notes[1])
+            self.assertEqual((root / "logs" / "serve.log.1").read_text(), "earlier\n")
 
     def run_child(self, root, env, source, *, stdout, stderr):
         return subprocess.run([sys.executable, "-I", "-c", bootstrap(source), str(root)], cwd=root, env=env,

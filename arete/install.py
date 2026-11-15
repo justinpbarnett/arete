@@ -222,25 +222,35 @@ def rotate_by_rename(f: Path, keep: int) -> list[str]:
 def rotate_logs(max_bytes: int = 5_000_000, keep: int = 5) -> list[str]:
     check_keep(keep)
     notes: list[str] = []
-    with util.lock("rotate-logs", wait=False) as held:
-        if not held:
-            return ["another rotation holds the rotate-logs lock, so no log was rotated"]
+    try:
+        with util.lock("rotate-logs", wait=False) as held:
+            if not held:
+                return ["another rotation holds the rotate-logs lock, so no log was rotated"]
+            notes = rotate_listed(max_bytes, keep)
+    except OSError as e:
+        return [*notes, f"rotate-logs.lock: lock failed: {e}"]
+    return notes
+
+
+def rotate_listed(max_bytes: int, keep: int) -> list[str]:
+    try:
+        found = sorted(n for n in os.listdir(paths.LOG_DIR) if n.endswith(".log"))
+    except OSError as e:
+        return [f"{paths.LOG_DIR.name}: list failed: {e}"]
+    notes: list[str] = []
+    for name in found:
+        if name == SERVE_LOG:
+            continue
+        f = paths.LOG_DIR / name
         try:
-            found = sorted(paths.LOG_DIR.glob("*.log"))
+            size = f.stat().st_size
+        except FileNotFoundError:
+            continue
         except OSError as e:
-            return [f"{paths.LOG_DIR.name}: list failed: {e}"]
-        for f in found:
-            if f.name == SERVE_LOG:
-                continue
-            try:
-                size = f.stat().st_size
-            except FileNotFoundError:
-                continue
-            except OSError as e:
-                notes.append(f"{f.name}: inspect failed: {e}")
-                continue
-            if size > max_bytes:
-                notes.extend(rotate_by_rename(f, keep))
+            notes.append(f"{name}: inspect failed: {e}")
+            continue
+        if size > max_bytes:
+            notes.extend(rotate_by_rename(f, keep))
     return notes
 
 
@@ -250,8 +260,10 @@ def rotate_own_log(max_bytes: int = 5_000_000, keep: int = 5) -> list[str]:
     try:
         mine = os.fstat(1)
         current = f.stat()
-    except OSError:
+    except FileNotFoundError:
         return []
+    except OSError as e:
+        return [f"{f.name}: inspect failed: {e}"]
     if (mine.st_dev, mine.st_ino) != (current.st_dev, current.st_ino) or current.st_size <= max_bytes:
         return []
     try:
@@ -265,11 +277,14 @@ def rotate_own_log(max_bytes: int = 5_000_000, keep: int = 5) -> list[str]:
         fd = os.open(f, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     except OSError as e:
         return [f"{f.name}: open failed: {e}"]
+    notes = []
     try:
         os.dup2(fd, 1)
         os.dup2(fd, 2)
     except OSError as e:
-        return [f"{f.name}: dup2 failed: {e}"]
-    finally:
+        notes.append(f"{f.name}: dup2 failed: {e}")
+    try:
         os.close(fd)
-    return []
+    except OSError as e:
+        notes.append(f"{f.name}: close failed: {e}")
+    return notes
