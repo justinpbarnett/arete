@@ -29,6 +29,8 @@ $evidence
 
 ## Diff
 
+Review only the supplied change. Do not treat changes on a moving base branch as changes in this diff.
+
 This change is staged in the checkout and is not committed until Arete publishes it. `HEAD` and any `...HEAD` range miss it, so compare the working tree with the commit this change starts from: $compare, with no range. Never compare with `origin/<base>` itself: other runs fetch it while this one works, so it can hold newer commits that then look as if this change undid them.
 
 ```diff
