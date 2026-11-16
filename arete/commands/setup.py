@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 
 from .. import __version__, config, paths
@@ -186,6 +187,29 @@ def cmd_doctor(args) -> int:
     return 1 if any(r.failing for r in results) else 0
 
 
+def cmd_prompts(args) -> int:
+    from .. import prompt_loader
+
+    names = [args.name] if args.name else sorted(p.stem for p in paths.PROMPTS_DIR.glob("*.md"))
+    failed = not names
+    if not names:
+        print("no prompt templates found", file=sys.stderr)
+    for name in names:
+        try:
+            inputs = prompt_loader.template(name).get_identifiers()
+            row = {"name": name, "valid": True, "inputs": inputs}
+        except (OSError, ValueError) as error:
+            row = {"name": name, "valid": False, "error": str(error)}
+            failed = True
+        if args.json:
+            print(json.dumps(row))
+        elif row["valid"]:
+            print(f"{name}: {', '.join(row['inputs']) or '(no inputs)'}")
+        else:
+            print(row["error"], file=sys.stderr)
+    return int(failed)
+
+
 def cmd_dashboard(args) -> int:
     from .. import dashboard
 
@@ -216,6 +240,11 @@ def register(sub) -> None:
     p = sub.add_parser("migrate", help="apply pending database migrations")
     p.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
     p.set_defaults(fn=cmd_migrate)
+
+    p = sub.add_parser("prompts", help="validate prompt templates and list their required inputs, without model calls")
+    p.add_argument("name", nargs="?", default="", help="one template's file stem; omit to inspect every template")
+    p.add_argument("--json", action="store_true", help="one JSON object per template, including validation errors")
+    p.set_defaults(fn=cmd_prompts)
 
     p = sub.add_parser("doctor", help="read only check of arete's own state: cost drift, orphan rows, stray folders, "
                                       "stuck work, the database and its backup; it reports and never repairs")
