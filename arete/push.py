@@ -97,7 +97,7 @@ class Push(Emit):
         run_id, about = item.get("env", {}).get("ARETE_RUN_ID", ""), item.get("about") or item["title"]
         found = {}
         try:
-            if held := jev.screen(item.get("patch", ""), about, cfg, trace=(run_id, "push screen jev")):
+            if held := jev.diff_screen(item.get("patch", ""), about, cfg, trace=(run_id, "push screen jev")):
                 found["screen"] = f"JEV holds it: {'; '.join(held)}"
         except jev.Unjudged as e:
             found["unjudged screen"] = f"JEV could not judge the diff: {e}"

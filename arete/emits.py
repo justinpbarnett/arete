@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import config, gh, jev, outbound, sources, state, util
+from . import config, gh, outbound, screening, sources, state, util
 from .loops import FINDING_EVENT, Loop, as_list, find, trust_rank, worktree_kinds
 
 SEVERITIES = ("low", "medium", "high", "critical")
@@ -135,11 +135,13 @@ class Ticket(Emit):
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
         if why := super().held(spec, item, cfg):
             return why
-        if item.get("trust") != "untrusted" or not jev.ready(cfg, [config_repo(cfg, item["repo"])]):
+        if item.get("trust") != "untrusted":
             return ""
-        a = jev.injection(f"{item['title']}\n\n{item['body']}", cfg, trace=(item.get("run", ""), "ticket screen jev"))
-        if a and a.yes >= cfg.jev.injection:
-            return f"it came from outside text and JEV reads it as instructions to an agent ({a.note()})"
+        screened = screening.screen(f"{item['title']}\n\n{item['body']}", cfg, [config_repo(cfg, item["repo"])],
+                                    (item.get("run", ""), "ticket screen jev"))
+        if screening.held(screened, screening.Posture.OPEN):
+            return ("it came from outside text and JEV reads it as instructions to an agent "
+                    f"({screened.answer.note()})")
         return ""
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
