@@ -44,11 +44,11 @@ for i in range(25):
     (root / ("scenario-" + str(i))).write_text("fake")
     made.append(root)
 assert all(paths.valid_scratch(str(r)) for r in made)
-assert pipeline.scratch_left(ws, [c]) == []
-assert paths.SCRATCH_PREFIX in pipeline.kept_work(ws, [c], src, [])
-pipeline.note_made(ws, [c])
-assert pipeline.kept_work(ws, [c], src, []) == ""
-pipeline.clear_workspace(ws, [c], src, [])
+assert workspace.scratch_left(ws, [c]) == []
+assert paths.SCRATCH_PREFIX in workspace.kept_work(ws, [c], src, [])
+workspace.note_made(ws, [c])
+assert workspace.kept_work(ws, [c], src, []) == ""
+workspace.clear_workspace(ws, [c], src, [])
 assert not ws.exists()
 assert list((t / "state/locks").glob("git-*.lock"))
 print("ok")
@@ -60,25 +60,25 @@ print("ok")
 spelled = t / "via" / "worktrees" / ws.name
 link = t / "link"
 link.symlink_to(ws)
-lc = pipeline.Checkout("", "o/r", src, link, "main")
+lc = workspace.Checkout("", "o/r", src, link, "main")
 root = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 for d in (root, look):
     d.mkdir(mode=0o700)
     (d / "fixture.txt").write_text("fake")
 scratch.survey = lambda: scratch.View([{"state": "done", "attempt": {"workspace": str(spelled), "root": str(spelled / root.name)}, "diagnostic": {"replacement_retained": str(spelled / root.name)}}], [], False)
-assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
-assert pipeline.scratch_left(spelled, [pipeline.Checkout("", "o/r", src, spelled, "main")]) == [spelled / root.name]
-assert pipeline.scratch_left(link, [lc]) == [link]
+assert workspace.scratch_left(ws, [c]) == [root], workspace.scratch_left(ws, [c])
+assert workspace.scratch_left(spelled, [workspace.Checkout("", "o/r", src, spelled, "main")]) == [spelled / root.name]
+assert workspace.scratch_left(link, [lc]) == [link]
 for w, k in ((ws, c), (link, lc)):
-    pipeline.note_made(w, [k])
-    made = json.loads(pipeline.made_record(w).read_text())
+    workspace.note_made(w, [k])
+    made = json.loads(workspace.made_record(w).read_text())
     assert not any(n.startswith(root.name) for n in made), w
     assert any(n.startswith(look.name) for n in made), w
 try:
-    pipeline.clear_workspace(ws, [c], src, [])
+    workspace.clear_workspace(ws, [c], src, [])
     raise SystemExit("cleared a workspace that holds an engine root")
-except pipeline.RunFailed as e:
+except workspace.RunFailed as e:
     assert "unresolved or unknown scratch" in e.why and str(root) in e.why, e.why
 assert (root / "fixture.txt").exists() and (look / "fixture.txt").exists()
 print("ok")
@@ -92,14 +92,14 @@ look.mkdir(mode=0o700)
 def unreadable():
     raise OSError("authority store unreadable")
 scratch.survey = unreadable
-assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
-pipeline.note_made(ws, [c])
-made = json.loads(pipeline.made_record(ws).read_text())
+assert workspace.scratch_left(ws, [c]) == [look], workspace.scratch_left(ws, [c])
+workspace.note_made(ws, [c])
+made = json.loads(workspace.made_record(ws).read_text())
 assert not any(k.startswith(look.name) for k in made)
 try:
-    pipeline.clear_workspace(ws, [c], src, [])
+    workspace.clear_workspace(ws, [c], src, [])
     raise SystemExit("cleared a workspace while the store was unreadable")
-except pipeline.RunFailed as e:
+except workspace.RunFailed as e:
     assert "unresolved or unknown scratch" in e.why and str(look) in e.why, e.why
 assert (look / "fixture.txt").exists()
 print("ok")
@@ -112,12 +112,12 @@ look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look.mkdir(mode=0o700)
 (look / ".gitignore").write_text("*\n")
 (look / "fixture.txt").write_text("fake")
-pipeline.note_made(ws, [c])
+workspace.note_made(ws, [c])
 (look / "fixture.txt").write_text("changed by a person")
 try:
-    pipeline.clear_workspace(ws, [c], src, [])
+    workspace.clear_workspace(ws, [c], src, [])
     raise SystemExit("removed a look alike that changed after the run")
-except pipeline.RunFailed as e:
+except workspace.RunFailed as e:
     assert look.name in e.why, e.why
 assert (look / "fixture.txt").read_text() == "changed by a person"
 print("ok")
@@ -132,7 +132,7 @@ def late():
     reads.append(True)
     return scratch.View([] if len(reads) == 1 else [{"state": "done", "attempt": {"workspace": str(ws), "root": str(root)}}], [], False)
 scratch.survey = late
-assert pipeline.scratch_left(ws, [c]) == [root], pipeline.scratch_left(ws, [c])
+assert workspace.scratch_left(ws, [c]) == [root], workspace.scratch_left(ws, [c])
 print("ok")
 ''')
 
@@ -144,11 +144,11 @@ locked =look / "locked"
 locked.mkdir(parents=True)
 locked.chmod(0)
 try:
-    assert pipeline.scratch_left(ws, [c]) == [locked], pipeline.scratch_left(ws, [c])
+    assert workspace.scratch_left(ws, [c]) == [locked], workspace.scratch_left(ws, [c])
     try:
-        pipeline.clear_workspace(ws, [c], src, [])
+        workspace.clear_workspace(ws, [c], src, [])
         raise SystemExit("cleared a workspace that could not be read")
-    except pipeline.RunFailed as e:
+    except workspace.RunFailed as e:
         assert "unresolved or unknown scratch" in e.why and str(locked) in e.why, e.why
 finally:
     locked.chmod(0o700)
@@ -168,15 +168,15 @@ run_dir.mkdir(parents=True)
 scratch.RUN_BASELINES["run-a"] = {}
 a = scratch.make("run-a", "verify", ws, run_dir)
 scratch.end(a, run_dir)
-record = scratch.AUTHORITY / (a.selector + ".json")
+record = sandbox.AUTHORITY / (a.selector + ".json")
 raw = record.read_bytes()
 record.write_bytes(raw[: len(raw) // 2])
 other = t / "worktrees" / "other"
 other.mkdir()
 try:
-    pipeline.kept_or_cleared(other, [pipeline.Checkout("", "o/r", src, other, "main")], src, [], "branch")
+    workspace.kept_or_cleared(other, [workspace.Checkout("", "o/r", src, other, "main")], src, [], "branch")
     raise SystemExit("kept a workspace beside an unreadable record")
-except pipeline.RunFailed as e:
+except workspace.RunFailed as e:
     assert str(record) in e.why, e.why
 out = io.StringIO()
 with contextlib.redirect_stdout(out):
@@ -189,13 +189,12 @@ print("ok")
 
     def test_no_store_frees_look_alikes(self):
         self.run_body(r'''
-from arete import pi
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look.mkdir(mode=0o700)
-pi.can_confine = lambda *a, **k: False
-assert pipeline.scratch_left(ws, [c]) == [], pipeline.scratch_left(ws, [c])
-pi.can_confine = lambda *a, **k: True
-assert pipeline.scratch_left(ws, [c]) == [look], pipeline.scratch_left(ws, [c])
+sandbox.can_confine = lambda *a, **k: False
+assert workspace.scratch_left(ws, [c]) == [], workspace.scratch_left(ws, [c])
+sandbox.can_confine = lambda *a, **k: True
+assert workspace.scratch_left(ws, [c]) == [look], workspace.scratch_left(ws, [c])
 print("ok")
 ''')
 
@@ -210,7 +209,7 @@ scratch.survey = lambda: scratch.View([{"state": "done", "attempt": {"workspace"
 old = time.time() - 8 * 86400
 for d in (empty, recorded, full):
     os.utime(d, (old, old))
-pipeline.cleanup_worktrees(7)
+workspace.cleanup_worktrees(7)
 assert not empty.exists()
 assert root.is_dir()
 assert (kept / "fixture.txt").exists()

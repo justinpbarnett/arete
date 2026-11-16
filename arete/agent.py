@@ -5,18 +5,76 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from . import util
+from . import config, util
 
+REPLAY = "replay"
 READ_TOOLS = ["Read", "Glob", "Grep"]
 READ_ONLY_TOOLS = frozenset({*READ_TOOLS, "LS"})
+EDIT_TOOLS = [*READ_TOOLS, "Edit", "Write"]
+BUILD_TOOLS = [*EDIT_TOOLS, "TodoWrite"]
+WEB_TOOLS = ("WebSearch", "WebFetch")
 SUBSCRIPTION_RUNNERS = frozenset({"claude", "codex"})
 KEY_PROVIDERS = frozenset({"openai"})
+
+
+@dataclass(frozen=True)
+class RunnerTraits:
+    efforts: tuple[str, ...] = ()
+    payment_modes: tuple[str, ...] = ()
+    web_tools: tuple[str, ...] = ()
+    takes_mcp: bool = True
+    instruction_scopes: tuple[str, ...] = config.INSTRUCTIONS
+    default_instructions: tuple[str, ...] = config.INSTRUCTIONS
+    always_granted_tools: tuple[str, ...] = ()
+    cannot_stop: str = ""
+    cannot_gate: str = ""
+    no_server_access: str = ""
+    uploads_supported: bool = False
+
+
+TRAITS = {
+    "claude": RunnerTraits(efforts=("low", "medium", "high", "xhigh", "max"), payment_modes=("subscription",),
+                           web_tools=WEB_TOOLS, uploads_supported=True),
+    "pi": RunnerTraits(
+        efforts=("off", "minimal", "low", "medium", "high", "xhigh", "max"), payment_modes=("subscription", "api_key", "local"), takes_mcp=False,
+        instruction_scopes=(), default_instructions=(), always_granted_tools=tuple(READ_TOOLS),
+        cannot_gate="pi restates a structured answer in a second launch that cannot be gated against the calls "
+                    "and time limits",
+        no_server_access="pi has no restricted Bash, so it cannot run the arete session commands"),
+    "codex": RunnerTraits(
+        efforts=("low", "medium", "high", "xhigh", "max", "ultra"), payment_modes=("subscription", "api_key"),
+        instruction_scopes=("repo",),
+        default_instructions=("repo",), always_granted_tools=tuple(READ_TOOLS),
+        cannot_stop="codex reports usage only when its turn ends, so it cannot stop a call at a token or spend limit",
+        no_server_access="codex runs with the network off, so it cannot reach the arete server"),
+}
+TRAITS[REPLAY] = RunnerTraits(efforts=tuple(dict.fromkeys(level for found in TRAITS.values() for level in found.efforts)))
+OPEN_TRAITS = RunnerTraits()
+
+
+def traits_of(which: str) -> RunnerTraits:
+    return TRAITS.get(which, OPEN_TRAITS)
 
 
 def subscription(runner: str, provider: str = "", auth_mode: str | None = "") -> bool:
     if auth_mode in ("subscription", "api_key"):
         return auth_mode == "subscription"
     return runner in SUBSCRIPTION_RUNNERS and not (runner == "codex" and provider in KEY_PROVIDERS)
+
+
+def local_step(step: dict, local_providers) -> bool:
+    mode, model = step.get("auth_mode") or "", step.get("model") or ""
+    provider = step.get("provider") or (model.partition("/")[0] if "/" in model else "")
+    return mode == "local" or (step.get("runner") == "pi" and mode != "subscription" and provider in local_providers)
+
+
+def billing_of(step: dict, local_providers) -> str:
+    which, mode = step.get("runner") or "", step.get("auth_mode") or ""
+    if which == REPLAY:
+        return "replay"
+    if local_step(step, local_providers):
+        return "local"
+    return "subscription" if subscription(which, step.get("provider") or "", mode) else "api_key"
 
 
 @dataclass(frozen=True)
@@ -132,6 +190,9 @@ def regain_access(text: str) -> datetime | None:
     return reset_at(f"{found[1]}T{found[2]}:00+00:00") if found else None
 
 
+USAGE = ("cost_usd", "tokens_in", "tokens_out", "cache_read", "cache_write")
+
+
 @dataclass
 class Result:
     ok: bool
@@ -165,6 +226,10 @@ class Result:
     record: str = ""
     quote: dict | None = None
     reference_usd: float | None = None
+
+    def add_usage(self, others: list[Result]) -> None:
+        for key in USAGE:
+            setattr(self, key, getattr(self, key) + sum(getattr(other, key) for other in others))
 
     @property
     def modes(self) -> tuple[str, ...]:

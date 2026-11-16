@@ -11,7 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
-from . import alerts, config, gh, jev, jira, paths, runner, state, tracker, util
+from . import alerts, config, gh, jev, jira, paths, runner, screening, state, tracker, util
+from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import TRIAGE_ANSWERS, prompt
 
@@ -341,8 +342,8 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
-        res = runner.run(text, cwd, model=cfg.model("triage"), tools=runner.READ_TOOLS,
-                         allowed_tools=runner.READ_TOOLS, json_schema=SCHEMA,
+        res = runner.run(text, cwd, model=cfg.model("triage"), tools=READ_TOOLS,
+                         allowed_tools=READ_TOOLS, json_schema=SCHEMA,
                          max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
                          trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None
@@ -428,9 +429,7 @@ def run(dry_run: bool = False) -> int:
         return refresh(cfg, dry_run)
 
 
-def refresh(cfg: config.Config, dry_run: bool) -> int:
-    old = {r["ref"]: r for r in state.triage_rows()}
-    srcs = sources(cfg)
+def read_all(srcs):
     read: dict[str, list[Candidate]] = {}
     errors: list[str] = []
     for src in srcs:
@@ -439,49 +438,53 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         except tracker.ERRORS as e:
             errors.append(f"{src.name}: {e}")
             print(f"{util.iso()} {errors[-1]}")
-    todo = sorted(((src, c) for src in srcs for c in read.get(src.name, []) if due(c, old.get(c.ref))),
-                  key=lambda sc: moment(sc[1].updated), reverse=True)
-    if dry_run:
-        preview(srcs, read, old, todo[:MAX_CALLS], todo[MAX_CALLS:])
-        ready = ", ".join(r["ref"] for r in approvable(srcs, list(old.values()))) or "none"
-        print(f"would approve up to {cfg.jira.auto_per_refresh} now ready: {ready}" if cfg.jira.auto
-              else f"ready now, approved only with `[jira] auto = true`: {ready}")
-        return 1 if errors else 0
+    return read, errors
 
-    answered: dict[str, dict] = {}
-    failed: dict[str, str] = {}
-    waiting: list[str] = []
-    spent = 0.0
-    calls = 0
+
+@dataclass
+class Triaged:
+    answered: dict[str, dict] = field(default_factory=dict)
+    failed: dict[str, str] = field(default_factory=dict)
+    waiting: list[str] = field(default_factory=list)
+    spent: float = 0.0
+    calls: int = 0
+
+
+def triage_due(cfg, todo) -> Triaged:
+    triaged = Triaged()
     for src, c in todo:
-        if calls >= MAX_CALLS:
-            waiting.append(c.ref)
+        if triaged.calls >= MAX_CALLS:
+            triaged.waiting.append(c.ref)
             continue
         print(f"{util.iso()} {c.ref}: triaging", flush=True)
         try:
             ticket = src.ticket_text(c)
         except tracker.ERRORS as e:
-            calls += 1
-            failed[c.ref] = f"could not read it: {e}"
-            print(f"{util.iso()} {c.ref}: triage failed: {failed[c.ref]}")
+            triaged.calls += 1
+            triaged.failed[c.ref] = f"could not read it: {e}"
+            print(f"{util.iso()} {c.ref}: triage failed: {triaged.failed[c.ref]}")
             continue
         if settled := not_code_by_jev(cfg, src, c, ticket):
-            answered[c.ref] = settled
-            spent += settled["cost"]
+            triaged.answered[c.ref] = settled
+            triaged.spent += settled["cost"]
             print(f"{util.iso()} {c.ref}: {verdict(settled)} by JEV, no model call")
             continue
-        calls += 1
+        triaged.calls += 1
         try:
             answer, cost, error = triage_one(cfg, src, c, ticket)
         except tracker.ERRORS as e:
             answer, cost, error = None, 0.0, f"could not read it: {e}"
-        spent += cost
+        triaged.spent += cost
         if answer:
-            answered[c.ref] = settle(src, c, answer, cost)
-            print(f"{util.iso()} {c.ref}: {verdict(answered[c.ref])} ({util.paid_note(cost, 3)})")
+            triaged.answered[c.ref] = settle(src, c, answer, cost)
+            print(f"{util.iso()} {c.ref}: {verdict(triaged.answered[c.ref])} ({util.paid_note(cost, 3)})")
         else:
-            failed[c.ref] = error
+            triaged.failed[c.ref] = error
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
+    return triaged
+
+
+def write_board(srcs, read, triaged):
     with util.lock(BOARD_LOCK, wait=True):
         board = {r["ref"]: r for r in state.triage_rows()}
         sent = {a["ref"]: a["ts"] for a in state.triage_approvals()}
@@ -489,19 +492,42 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         for src in srcs:
             if src.name in read:
                 state.triage_replace(src.name, [
-                    answered.get(c.ref) or kept(src, c, board.get(c.ref),
-                                                f"triage failed: {failed[c.ref]}" if c.ref in failed else WAITING)
+                    triaged.answered.get(c.ref) or kept(src, c, board.get(c.ref),
+                                                f"triage failed: {triaged.failed[c.ref]}" if c.ref in triaged.failed else WAITING)
                     for c in read[src.name] if not sent_since_read(c, sent)]
                     + still_shown(src, read[src.name], board, delivered))
         state.triage_prune([s.name for s in srcs])
-    approved, held = approve_ready(cfg, srcs)
+
+
+def prune_records():
     keep = {record_file(r["ref"]).name for r in state.triage_rows()}
     for f in TICKET_RECORDS_DIR.glob("*.md"):
         if f.name not in keep:
             f.unlink()
 
+
+def preview_refresh(cfg, srcs, read, old, todo):
+    preview(srcs, read, old, todo[:MAX_CALLS], todo[MAX_CALLS:])
+    ready = ", ".join(r["ref"] for r in approvable(srcs, list(old.values()))) or "none"
+    print(f"would approve up to {cfg.jira.auto_per_refresh} now ready: {ready}" if cfg.jira.auto
+          else f"ready now, approved only with `[jira] auto = true`: {ready}")
+
+
+def refresh(cfg: config.Config, dry_run: bool) -> int:
+    old = {r["ref"]: r for r in state.triage_rows()}
+    srcs = sources(cfg)
+    read, errors = read_all(srcs)
+    todo = sorted(((src, c) for src in srcs for c in read.get(src.name, []) if due(c, old.get(c.ref))),
+                  key=lambda sc: moment(sc[1].updated), reverse=True)
+    if dry_run:
+        preview_refresh(cfg, srcs, read, old, todo)
+        return 1 if errors else 0
+    triaged = triage_due(cfg, todo)
+    write_board(srcs, read, triaged)
+    approved, held = approve_ready(cfg, srcs)
+    prune_records()
     meta = util.read_json(META_FILE, {})
-    meta.update(refreshed=util.iso(), errors=errors, waiting=waiting, failed=failed, approved=approved, held=held)
+    meta.update(refreshed=util.iso(), errors=errors, waiting=triaged.waiting, failed=triaged.failed, approved=approved, held=held)
     problems = list(errors)
     try:
         posted = publish(cfg, view(), meta)
@@ -510,10 +536,10 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         posted = f"not posted: {e}"
     meta.update(posted=posted)
     util.write_json(META_FILE, meta)
-    print(f"{util.iso()} triage: {util.count(calls, 'model call')} ({util.paid_note(spent, 3)}), "
-          f"{len(failed)} failed, {len(waiting)} waiting, {len(approved)} approved; board {posted}")
-    if waiting:
-        print(f"waiting for the next refresh: {', '.join(waiting)}")
+    print(f"{util.iso()} triage: {util.count(triaged.calls, 'model call')} ({util.paid_note(triaged.spent, 3)}), "
+          f"{len(triaged.failed)} failed, {len(triaged.waiting)} waiting, {len(approved)} approved; board {posted}")
+    if triaged.waiting:
+        print(f"waiting for the next refresh: {', '.join(triaged.waiting)}")
     mark_loop("triage", not problems, "; ".join(problems))
     return 1 if problems else 0
 
@@ -558,21 +584,17 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
     now = src.ticket(src.candidate(r))
     if now.updated != r["updated"]:
         return "it changed since triage, so the next refresh triages it again"
-    screened = screen(cfg, r, now, "injection")
-    if screened is None:
-        return "JEV could not screen it this time"
-    if screened.yes >= cfg.jev.injection:
+    screened = screening.screen(f"{r['title']}\n\n{now.text}", cfg, [repo], ("", f"triage {r['ref']} injection jev"))
+    if screening.held(screened, screening.Posture.REQUIRED):
+        if screened.status != screening.FLAGGED:
+            return "JEV could not screen it this time"
         labels = " and ".join(f"`{lb}`" for lb in labels_to_add(r))
         state.triage_put({**r, "ready": 0, "questions": [
-            (f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f}). Check the ticket, then add "
+            (f"JEV reads text in it as instructions to an agent (p {screened.p:.2f}). Check the ticket, then add "
              f"{labels} by hand to approve it.")]})
-        return f"held for the injection screen (p {screened.yes:.2f})"
+        return f"held for the injection screen (p {screened.p:.2f})"
     to_pipeline(src, r, "triage")
     return ""
-
-
-def screen(cfg: config.Config, r: dict, now: TicketText, step: str) -> jev.Answer | None:
-    return jev.injection(f"{r['title']}\n\n{now.text}", cfg, trace=("", f"triage {r['ref']} {step} jev"))
 
 
 def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
@@ -653,13 +675,13 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
             raise TrackerFailed(f"Could not read {r['ref']} ({tracker_said(e)}).") from e
         if now.updated != r["updated"]:
             raise NotSendable(f"{r['ref']} changed since triage read it, so the next refresh triages it again.")
-        if jev.ready(cfg, [repo]):
-            screened = screen(cfg, r, now, "send injection")
-            if screened is None:
+        screened = screening.screen(f"{r['title']}\n\n{now.text}", cfg, [repo],
+                                    ("", f"triage {r['ref']} send injection jev"))
+        if screening.held(screened, screening.Posture.WHEN_ON):
+            if screened.status != screening.FLAGGED:
                 raise NotSendable(f"JEV could not screen {r['ref']} for injected instructions this time. Try again.")
-            if screened.yes >= cfg.jev.injection:
-                raise NotSendable(f"JEV reads text in {r['ref']} as instructions to an agent (p {screened.yes:.2f}). "
-                                  f"Read the ticket, then add {labels} by hand to send it.")
+            raise NotSendable(f"JEV reads text in {r['ref']} as instructions to an agent (p {screened.p:.2f}). "
+                              f"Read the ticket, then add {labels} by hand to send it.")
         pairs = [(q, a.strip()) for q, a in zip(questions, answers, strict=True) if q != repo_question(r) and a.strip()]
         if pairs:
             try:

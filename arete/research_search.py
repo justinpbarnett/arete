@@ -10,8 +10,11 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from . import claude, config, jev, paths, research_plan, runner, steps, tracker, util
+from . import child, config, paths, research_budget, research_plan, routing, runner, steps, tracker, util
+from .agent import WEB_TOOLS
 from .pipeline import prompt
+from .screening import Posture, Screen, screen_many
+from .screening import held as screen_held
 
 FOLDER = paths.STATE_DIR / "research"
 SOURCE_KEYS = ("question", "url", "title", "published", "event_date", "passage", "uncertainty")
@@ -27,12 +30,10 @@ RESULT_SCHEMA = {
 }
 DATE = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
 PASSAGE_CHARS = 1500
-PASSED_ON = ("passed", "unscreened")
-WITHHELD = ("flagged", "failed")
 CAP_REACHED = "the search cap was reached"
 NO_ROOM = "the research budget left no room for another search round"
 ROUTING_SECONDS = 20
-GRACE_SECONDS = ROUTING_SECONDS + claude.STOP_GRACE_SECONDS + claude.DRAIN_SECONDS
+GRACE_SECONDS = ROUTING_SECONDS + child.OVERRUN_SECONDS
 NO_REPORT =", so no report was written"
 USAGE_KEYS = ("cost_usd", "tokens_in", "tokens_out", "turns")
 
@@ -63,12 +64,12 @@ def dec(value) -> Decimal:
 
 
 def unavailable(s: steps.Settings) -> str:
-    wanted = [t for t in s.tools if t in runner.WEB_TOOLS]
+    wanted = [t for t in s.tools if t in WEB_TOOLS]
     if "WebSearch" not in wanted:
         return "[steps.research_search] tools leave out WebSearch, so a worker cannot search"
     has = runner.web_tools(s.model, s.runner)
     if missing := [t for t in wanted if t not in has]:
-        return (f"{runner.stands_for(s.model, s.runner)[0]} has no {', '.join(missing)} tool, "
+        return (f"{routing.stands_for(s.model, s.runner)[0]} has no {', '.join(missing)} tool, "
                 "and arete grants a worker nothing in its place")
     return ""
 
@@ -142,9 +143,37 @@ def skeleton(n: int, task: dict, round_no: int = 0) -> dict:
             "notes_screen": {"status": "none", "p": None}, "raw": []}
 
 
+def search_call(cfg, s, text, cwd, remaining, left, which, ref, n):
+    return runner.run(text, cwd, model=s.model, runner=s.runner, effort=s.call["effort"],
+                     tools=list(s.tools), allowed_tools=list(s.tools), instructions=list(s.instructions),
+                     json_schema=RESULT_SCHEMA, max_budget_usd=remaining, timeout=int(left), persist=False,
+                     wait_out_limits=False,
+                     remaining_budget=lambda amount=remaining: research_budget.remaining_budget(which, amount),
+                     tier=s.tier, trace=("", f"research {ref} task {n} search"), cfg=cfg, settings=s,
+                     fallback=False)
+
+
+def account_call(worker, res, paid, allowance, deadline):
+    for key in USAGE_KEYS:
+        worker[key] = research_budget.plus(worker[key], getattr(res, key)) if key == "cost_usd" else (
+            worker[key] + getattr(res, key))
+    worker["raw"].append(res.structured)
+    if not research_budget.known(res.paid_usd):
+        fatal = f"a search call's paid cost is unknown; known prior spend is {util.money(paid)} on this worker"
+        return paid, fatal
+    paid = research_budget.plus(paid, res.paid_usd)
+    if dec(paid) > dec(allowance):
+        fatal = "a search worker exceeded its allowance; its incurred cost is recorded"
+        return paid, fatal
+    if time.monotonic() > deadline:
+        fatal = "a search worker exceeded its share of the search deadline"
+        return paid, fatal
+    return paid, ""
+
+
 def work(cfg: config.Config, s: steps.Settings, task: dict, criteria: list[str], ref: str, n: int, cwd: Path,
          allowance: float, seconds: float, round_no: int = 0) -> Outcome:
-    which = runner.chosen(s.model, s.runner, cfg)[0]
+    which = routing.chosen(s.model, s.runner, cfg)[0]
     text = prompt("research_search", goal=task["goal"], queries=research_plan.bullets(task["queries"]),
                   max_sources=task["max_sources"], criteria=research_plan.bullets(criteria))
     started = time.monotonic()
@@ -154,35 +183,18 @@ def work(cfg: config.Config, s: steps.Settings, task: dict, criteria: list[str],
     answer = None
     for _ in range(s.tries):
         remaining, left = float(dec(allowance) - dec(paid)), deadline - time.monotonic() - GRACE_SECONDS
-        if remaining <= runner.BUDGET_FLOOR_USD or left < research_plan.MIN_CALL_SECONDS:
+        if remaining <= routing.BUDGET_FLOOR_USD or left < research_budget.MIN_CALL_SECONDS:
             faults = faults or ["the worker's share of the search cap was used up"]
             break
         worker["tries"] += 1
         try:
-            res = runner.run(text + feedback, cwd, model=s.model, runner=s.runner, effort=s.call["effort"],
-                             tools=list(s.tools), allowed_tools=list(s.tools), instructions=list(s.instructions),
-                             json_schema=RESULT_SCHEMA, max_budget_usd=remaining, timeout=int(left), persist=False,
-                             wait_out_limits=False,
-                             remaining_budget=lambda amount=remaining: 0.0 if which in ("claude", "codex") else amount,
-                             tier=s.tier, trace=("", f"research {ref} task {n} search"), cfg=cfg, settings=s,
-                             fallback=False)
+            res = search_call(cfg, s, text + feedback, cwd, remaining, left, which, ref, n)
         except Exception as e:
             fatal = (f"a search call failed with {util.first_line(str(e)) or type(e).__name__}, so its charge is "
                      f"unknown; known prior spend is {util.money(paid)} on this worker")
             break
-        for key in USAGE_KEYS:
-            worker[key] = research_plan.plus(worker[key], getattr(res, key)) if key == "cost_usd" else (
-                worker[key] + getattr(res, key))
-        worker["raw"].append(res.structured)
-        if not research_plan.known(res.paid_usd):
-            fatal = f"a search call's paid cost is unknown; known prior spend is {util.money(paid)} on this worker"
-            break
-        paid = research_plan.plus(paid, res.paid_usd)
-        if dec(paid) > dec(allowance):
-            fatal = "a search worker exceeded its allowance; its incurred cost is recorded"
-            break
-        if time.monotonic() > deadline:
-            fatal = "a search worker exceeded its share of the search deadline"
+        paid, fatal = account_call(worker, res, paid, allowance, deadline)
+        if fatal:
             break
         if res.usage_limit:
             limited = "a usage limit stopped the search"
@@ -241,30 +253,23 @@ def collect(outcomes: dict[int, Outcome], ids: dict[str, str], earlier: list[dic
     return sorted(sources.values(), key=lambda source: int(source["id"][1:]))
 
 
-def whole(state) -> bool:
-    text = state if isinstance(state, str) else json.dumps(state, default=str)
-    return len(text) <= jev.STATE_CHARS
+def is_withheld(status: str) -> bool:
+    return screen_held(Screen(status), Posture.WHEN_ON)
+
+
+def is_passed_on(status: str) -> bool:
+    return status != "none" and not is_withheld(status)
 
 
 def screen(cfg: config.Config, ref: str, judged: bool, items: list[tuple[object, dict]]) -> None:
     if not items:
         return
+    screens = screen_many([state for state, _ in items], cfg, [], ("", f"research {ref} notes jev"),
+                                    ready=judged)
+    for (_, target), screened in zip(items, screens, strict=True):
+        target.update(status=screened.status, p=None if screened.p is None else round(screened.p, 3))
     if not judged:
-        for _, target in items:
-            target.update(status="unscreened", p=None)
-        print(f"{util.iso()} {ref}: JEV is off, so search notes go on unscreened", flush=True)
-        return
-    questions = {"injection": jev.yes_no(jev.INJECTION)}
-    fits = [whole(state) for state, _ in items]
-    sent = [item for item, fit in zip(items, fits) if fit]
-    replies = iter(jev.ask_many([(state, questions) for state, _ in sent], cfg,
-                                trace=("", f"research {ref} notes jev")) if sent else [])
-    for (_, target), fit in zip(items, fits):
-        answer = next(replies).answers.get("injection") if fit else None
-        if answer is None:
-            target.update(status="failed", p=None)
-        else:
-            target.update(status="flagged" if answer.yes >= cfg.jev.injection else "passed", p=round(answer.yes, 3))
+        util.log_ref(ref, "JEV is off, so search notes go on unscreened")
 
 
 def screening(cfg: config.Config, ref: str, judged: bool, workers: list[dict], sources: list[dict]) -> None:
@@ -275,7 +280,7 @@ def screening(cfg: config.Config, ref: str, judged: bool, workers: list[dict], s
     screen(cfg, ref, judged, items)
     for source in sources:
         for finding in source["findings"]:
-            if finding["screen"]["status"] in PASSED_ON:
+            if is_passed_on(finding["screen"]["status"]):
                 for key in ("title", "published", "event_date"):
                     source[key] = source[key] or finding[key]
 
@@ -288,10 +293,10 @@ def totals(workers: list[dict], sources: list[dict]) -> dict:
     for w in workers:
         paid += dec(w["paid_usd"])
         for key in USAGE_KEYS:
-            sums[key] = research_plan.plus(sums[key], w[key]) if key == "cost_usd" else sums[key] + w[key]
+            sums[key] = research_budget.plus(sums[key], w[key]) if key == "cost_usd" else sums[key] + w[key]
     count = {status: sum(1 for w in workers if w["status"] == status) for status in ("ok", "failed", "cancelled")}
     return {"tasks": len(workers), **count, "sources": len(sources), "findings": len(findings),
-            "withheld": sum(1 for status in held if status in WITHHELD), "paid_usd": float(paid), **sums,
+            "withheld": sum(1 for status in held if is_withheld(status)), "paid_usd": float(paid), **sums,
             "seconds": round(sum(w["seconds"] for w in workers), 1)}
 
 
@@ -304,61 +309,63 @@ def document(cfg: config.Config, s: steps.Settings, ref: str, status: str, stop:
             **({"rounds": list(rounds)} if rounds else {})}
 
 
-def say(ref: str, line: str) -> None:
-    print(f"{util.iso()} {ref}: {line}", flush=True)
-
-
 def worker_line(ref: str, w: dict) -> None:
-    say(ref, f"search task {w['task']} {w['status']}: {util.count(len(w['sources']), 'source')}, "
+    util.log_ref(ref, f"search task {w['task']} {w['status']}: {util.count(len(w['sources']), 'source')}, "
              f"{util.count(w['tries'], 'try', 'tries')}, {util.money(w['paid_usd'], 3)} paid, {w['seconds']}s"
              + (f": {w['error']}" if w["error"] else ""))
 
 
-def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, judged: bool,
-        earlier: dict | None = None) -> Found:
-    s = steps.resolve(cfg, None, "research_search")
-    gap = earlier is not None
-    ids = dict(earlier["ids"]) if gap else previous_ids(ref)
-    first = len(earlier["workers"]) + 1 if gap else 1
-    rounds = list(earlier.get("rounds", [])) if gap else []
-    round_no = len(rounds) + 1 if gap else 0
-    head = f"gap round {round_no} " if gap else ""
-    if reason := unavailable(s):
-        if gap:
-            return Found(f"search is unavailable: {reason}, so no search ran and no report was written")
-        evidence = document(cfg, s, ref, "unavailable", reason, {"usd": 0.0, "seconds": 0}, [], [], ids)
-        util.write_json(evidence_file(ref), evidence)
-        return Found(f"search is unavailable: {reason}, so no search ran and no report was written", evidence)
+def caps(cfg, budget):
     left_usd, left_seconds = budget.final()
     share = cfg.research_search_share
     cap_usd = min(share * left_usd, left_usd - budget.reserve_usd)
     cap_seconds = min(share * left_seconds, left_seconds - budget.reserve_seconds)
     room = not budget.short(cap_usd, cap_seconds - GRACE_SECONDS)
-    if gap and not room:
-        entry = {"round": round_no, "status": "capped", "stop": NO_ROOM, "limits": {"usd": 0.0, "seconds": 0},
-                 "tasks": []}
-        evidence = {**earlier, "rounds": [*rounds, entry]}
-        util.write_json(evidence_file(ref), evidence)
-        say(ref, f"{head}search capped: {NO_ROOM}")
-        return Found(budget.error + NO_REPORT if budget.error else "", evidence, 0, NO_ROOM)
+    return cap_usd, cap_seconds, room
+
+
+def unavailable_result(cfg, s, ref, reason, ids, earlier):
+    error = f"search is unavailable: {reason}, so no search ran and no report was written"
+    if earlier is not None:
+        return Found(error)
+    evidence = document(cfg, s, ref, "unavailable", reason, {"usd": 0.0, "seconds": 0}, [], [], ids)
+    util.write_json(evidence_file(ref), evidence)
+    return Found(error, evidence)
+
+
+def capped_result(ref, budget, earlier, rounds, round_no, head):
+    entry = {"round": round_no, "status": "capped", "stop": NO_ROOM, "limits": {"usd": 0.0, "seconds": 0},
+             "tasks": []}
+    evidence = {**earlier, "rounds": [*rounds, entry]}
+    util.write_json(evidence_file(ref), evidence)
+    util.log_ref(ref, f"{head}search capped: {NO_ROOM}")
+    return Found(budget.error + NO_REPORT if budget.error else "", evidence, 0, NO_ROOM)
+
+
+def worker_result(future, n, task, round_no):
+    try:
+        return future.result()
+    except Exception as e:
+        note = (f"a search worker failed with {util.first_line(str(e)) or type(e).__name__}, "
+                "so its charge is unknown")
+        return Outcome({**skeleton(n, task, round_no), "status": "failed", "error": note}, fatal=note)
+
+
+def search_workers(cfg, budget, s, plan, ref, first, round_no, cap, stage_deadline, room):
     tasks, size = plan["tasks"], cfg.research_search_workers
-    cap = dec(cap_usd) if room else Decimal(0)
-    stage_deadline = time.monotonic() + cap_seconds if room else 0.0
-    say(ref, f"{head}searching: {util.count(len(tasks), 'task')}, {size} workers, {s.runner} {s.model}, "
-             f"tools {', '.join(s.tools)}, cap {util.money(float(cap))} and {round(cap_seconds / 60) if room else 0} minutes")
     outcomes: dict[int, Outcome] = {}
     allowances: dict[int, Decimal] = {}
     pending = list(range(first, first + len(tasks)))
     running: dict = {}
     spent = committed = Decimal(0)
     status, stop = ("done", "") if room else ("capped", "planning left no room for search")
-    floor = dec(runner.BUDGET_FLOOR_USD)
+    floor = dec(routing.BUDGET_FLOOR_USD)
     with tempfile.TemporaryDirectory(prefix="arete-search-") as cwd, ThreadPoolExecutor(size) as pool:
         while room and (pending or running):
             while pending and not stop and len(running) < size:
                 allowance = (cap - spent - committed) / min(size - len(running), len(pending))
                 seconds = min(s.timeout_minutes * 60, stage_deadline - time.monotonic())
-                if allowance <= floor or seconds < research_plan.MIN_CALL_SECONDS + GRACE_SECONDS:
+                if allowance <= floor or seconds < research_budget.MIN_CALL_SECONDS + GRACE_SECONDS:
                     status, stop = "capped", CAP_REACHED
                     break
                 n = pending.pop(0)
@@ -371,12 +378,7 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
             for future in wait(running, return_when=FIRST_COMPLETED)[0]:
                 n = running.pop(future)
                 committed -= allowances[n]
-                try:
-                    out = future.result()
-                except Exception as e:
-                    note = (f"a search worker failed with {util.first_line(str(e)) or type(e).__name__}, "
-                            "so its charge is unknown")
-                    out = Outcome({**skeleton(n, tasks[n - first], round_no), "status": "failed", "error": note}, fatal=note)
+                out = worker_result(future, n, tasks[n - first], round_no)
                 out.worker["allowance_usd"] = float(allowances[n])
                 outcomes[n] = out
                 spent += dec(out.paid)
@@ -388,6 +390,12 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
         outcomes[n] = Outcome({**skeleton(n, tasks[n - first], round_no), "error": stop})
     budget.add(float(spent))
     budget.elapsed()
+    return outcomes, spent, status, stop
+
+
+def build_evidence(cfg, s, ref, judged, outcomes, ids, earlier, rounds, round_no,
+                   cap, cap_seconds, room, status, stop):
+    gap = earlier is not None
     sources = collect(outcomes, ids, earlier["sources"] if gap else ())
     fresh = [outcomes[n].worker for n in sorted(outcomes)]
     workers = [*earlier["workers"], *fresh] if gap else fresh
@@ -400,25 +408,52 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
         evidence["limits"] = earlier["limits"]
     else:
         evidence = document(cfg, s, ref, status, stop, limits, workers, sources, ids)
+    return evidence, fresh, sources
+
+
+def run(cfg: config.Config, budget: research_budget.Budget, plan: dict, ref: str, judged: bool,
+        earlier: dict | None = None) -> Found:
+    s = steps.resolve(cfg, None, "research_search")
+    gap = earlier is not None
+    ids = dict(earlier["ids"]) if gap else previous_ids(ref)
+    first = len(earlier["workers"]) + 1 if gap else 1
+    rounds = list(earlier.get("rounds", [])) if gap else []
+    round_no = len(rounds) + 1 if gap else 0
+    head = f"gap round {round_no} " if gap else ""
+    if reason := unavailable(s):
+        return unavailable_result(cfg, s, ref, reason, ids, earlier)
+    cap_usd, cap_seconds, room = caps(cfg, budget)
+    if gap and not room:
+        return capped_result(ref, budget, earlier, rounds, round_no, head)
+    tasks, size = plan["tasks"], cfg.research_search_workers
+    cap = dec(cap_usd) if room else Decimal(0)
+    stage_deadline = time.monotonic() + cap_seconds if room else 0.0
+    util.log_ref(ref, f"{head}searching: {util.count(len(tasks), 'task')}, {size} workers, {s.runner} {s.model}, "
+             f"tools {', '.join(s.tools)}, cap {util.money(float(cap))} and {round(cap_seconds / 60) if room else 0} minutes")
+    outcomes, spent, status, stop = search_workers(cfg, budget, s, plan, ref, first, round_no,
+                                                   cap, stage_deadline, room)
+    evidence, fresh, sources = build_evidence(cfg, s, ref, judged, outcomes, ids, earlier, rounds,
+                                              round_no, cap, cap_seconds, room, status, stop)
     util.write_json(evidence_file(ref), evidence)
     for w in fresh:
         worker_line(ref, w)
     total = evidence["totals"]
-    say(ref, f"{head}search {status}: {util.money(float(spent) if gap else total['paid_usd'])} paid of "
+    util.log_ref(ref, f"{head}search {status}: {util.money(float(spent) if gap else total['paid_usd'])} paid of "
              f"{util.money(float(cap))}, {total['withheld']} withheld" + (f"; {stop}" if stop else ""))
-    say(ref, f"search evidence {paths.short_path(evidence_file(ref))}")
+    util.log_ref(ref, f"search evidence {paths.short_path(evidence_file(ref))}")
     if gap:
         added = sum(1 for source in sources for f in source["findings"]
-                    if f["task"] >= first and f["screen"]["status"] in PASSED_ON)
+                    if f["task"] >= first and is_passed_on(f["screen"]["status"]))
         return Found(budget.error + NO_REPORT if budget.error else "", evidence, added, stop)
-    return Found(verdict(budget, room, stop, workers, evidence), evidence)
+    return Found(verdict(budget, room, stop, evidence['workers'], evidence), evidence)
 
 
 def passed_on(evidence: dict) -> list[tuple[dict, dict]]:
-    return [(s, f) for s in evidence["sources"] for f in s["findings"] if f["screen"]["status"] in PASSED_ON]
+    return [(s, f) for s in evidence["sources"] for f in s["findings"]
+            if is_passed_on(f["screen"]["status"])]
 
 
-def verdict(budget: research_plan.Budget, room: bool, stop: str, workers: list[dict], evidence: dict) -> str:
+def verdict(budget: research_budget.Budget, room: bool, stop: str, workers: list[dict], evidence: dict) -> str:
     if budget.error:
         return budget.error + NO_REPORT
     if not room:
@@ -437,9 +472,9 @@ def supplied(evidence: dict) -> dict:
         if source["id"] not in [k["id"] for k in kept]:
             kept.append({**{k: source[k] for k in ("id", "url", "title", "published", "event_date", "retrieved")},
                          "findings": [{k: f[k] for k in ("task", "question", "passage", "uncertainty")}
-                                      for f in source["findings"] if f["screen"]["status"] in PASSED_ON]})
+                                      for f in source["findings"] if is_passed_on(f["screen"]["status"])]})
     notes = [{"task": w["task"], "text": w["notes"]} for w in evidence["workers"]
-             if w["notes"] and w["notes_screen"]["status"] in PASSED_ON]
+             if w["notes"] and is_passed_on(w["notes_screen"]["status"])]
     return {"sources": kept, "notes": notes}
 
 
@@ -470,7 +505,7 @@ def paid_words(paid: float) -> str:
 def finding_lines(f: dict, path: Path) -> list[str]:
     screen = f["screen"]
     chance = f" (p {screen['p']})" if screen.get("p") is not None else ""
-    if screen["status"] in WITHHELD:
+    if is_withheld(screen["status"]):
         return [f"  - task {f['task']}: {screen['status']}{chance}, withheld; the text is in {paths.short_path(path)}"]
     return [f"  - task {f['task']}: {screen['status']}{chance}", f"    question: {f['question']}",
             f"    passage: {f['passage']}", f"    uncertainty: {f['uncertainty']}"]
@@ -487,7 +522,7 @@ def render(e: dict, path: Path) -> str:
                      f"{util.count(w['tries'], 'try', 'tries')}, {paid_words(w['paid_usd'])} paid, {w['seconds']}s)"
                      + (f": {w['error']}" if w["error"] else ""))
         if w["notes"]:
-            held = w["notes_screen"]["status"] in WITHHELD
+            held = is_withheld(w["notes_screen"]["status"])
             lines.append(f"  notes ({w['notes_screen']['status']}): "
                          + (f"withheld; the text is in {paths.short_path(path)}" if held else w["notes"]))
     for r in e.get("rounds", []):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, factory, gh, paths, pipeline, run_lines, util
+from . import config, factory, gh, paths, pipeline, run_lines, util, workspace
 
 PLAN_STEPS = ("plan", "revise", "repair")
 MAX_LOG = 200
@@ -101,7 +101,7 @@ def open_heads(repo: config.Repo, found: Source) -> dict[str, str]:
             raise Refused(f"{url} is not in a repo of {repo.name}")
         src = repo.path / part.dir
         try:
-            pipeline.fetch(src, found.branch)
+            workspace.fetch(src, found.branch)
         except RuntimeError as e:
             raise Refused(f"could not fetch {found.branch} from origin: {util.first_line(str(e), 300)}") from None
         heads[part.github] = matched_head(src, f"origin/{found.branch}", found)

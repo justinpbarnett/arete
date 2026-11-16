@@ -7,7 +7,7 @@ import sys
 from contextlib import suppress
 from pathlib import Path
 
-from . import guard, paths, scratch
+from . import guard, paths, sandbox, scratch
 from .agent import Result
 
 NAME = "browser_file_upload"
@@ -35,7 +35,7 @@ def refused(path: object, roots: tuple[Path, ...]) -> str:
         raise TypeError("upload path is not a string")
     if not os.path.isabs(path):
         return OUTSIDE
-    if guard.secret_path(path):
+    if sandbox.secret_path(path):
         return SECRET
     try:
         resolved = Path(os.path.realpath(path, strict=True))
@@ -47,7 +47,7 @@ def refused(path: object, roots: tuple[Path, ...]) -> str:
                  for root in (Path(os.path.realpath(r)) for r in roots))
     if not inside:
         return OUTSIDE
-    return SECRET if guard.secret_path(resolved) else ""
+    return SECRET if sandbox.secret_path(resolved) else ""
 
 
 def decide(payload: dict) -> str:

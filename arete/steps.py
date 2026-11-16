@@ -5,18 +5,16 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import claude, codex, config, pi, routing, runner
+from . import codex, config, routing
+from .agent import BUILD_TOOLS, READ_ONLY_TOOLS, READ_TOOLS, REPLAY, TRAITS, WEB_TOOLS, traits_of
 
-EFFORTS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS, "codex": codex.EFFORTS,
-           runner.REPLAY: tuple(dict.fromkeys([*claude.EFFORTS, *pi.THINKING_LEVELS, *codex.EFFORTS]))}
-CODEX_INSTRUCTIONS = ("repo",)
-DEFAULTS = {"tools": tuple(runner.READ_TOOLS), "mcp": (), "session": "fresh"}
-BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(runner.BUILD_TOOLS), "session": "resume"},
+DEFAULTS = {"tools": tuple(READ_TOOLS), "mcp": (), "session": "fresh"}
+BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(BUILD_TOOLS), "session": "resume"},
             "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
             "research_plan": {"timeout_minutes": 10, "tries": 2},
-            "research_search": {"timeout_minutes": 10, "tries": 2, "tools": runner.WEB_TOOLS},
+            "research_search": {"timeout_minutes": 10, "tries": 2, "tools": WEB_TOOLS},
             "research_synthesis": {"timeout_minutes": 10, "tries": 2},
-            "research_audit": {"timeout_minutes": 10, "tries": 2, "tools": (*runner.READ_TOOLS, "WebFetch")},
+            "research_audit": {"timeout_minutes": 10, "tries": 2, "tools": (*READ_TOOLS, "WebFetch")},
             "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()},
             "capture_evidence": {"timeout_minutes": 3, "tries": 1, "tools": ("Read",), "instructions": (),
                                  "modalities": ("image",), "structured_output": True, "budget_usd": 0.25}}
@@ -62,7 +60,7 @@ class Settings:
         return routing.nearest_effort(which, self.effort)
 
     def instructions_on(self, which: str) -> tuple[str, ...]:
-        return self.instructions if self.instructions_explicit else default_instructions(which)
+        return self.instructions if self.instructions_explicit else traits_of(which).default_instructions
 
     @property
     def call(self) -> dict:
@@ -80,10 +78,6 @@ def mcp_config(cfg: config.Config, names, own: str = "") -> str:
         return own
     own_servers = json.loads(own)["mcpServers"] if own else {}
     return json.dumps({"mcpServers": {**{n: cfg.mcp[n] for n in names}, **own_servers}})
-
-
-def default_instructions(which: str) -> tuple[str, ...]:
-    return {"pi": (), "codex": CODEX_INSTRUCTIONS}.get(which, config.INSTRUCTIONS)
 
 
 def selected_tiers(cfg: config.Config, layer: config.RepoLayer) -> dict[str, tuple[dict[str, str], ...]]:
@@ -108,7 +102,7 @@ def chain_of(requested: tuple[str, str, str], tier: str, entries: tuple[dict[str
              explicit: tuple[str, ...] | None) -> tuple[routing.Link, ...]:
     def link(which: str, name: str, provider: str, position: int) -> routing.Link:
         return routing.Link(name, which, provider, tier, position, position == 0, routing.nearest_effort(which, effort),
-                            default_instructions(which) if explicit is None else explicit)
+                            traits_of(which).default_instructions if explicit is None else explicit)
 
     wanted = routing.identity(*requested[:2])
     chain = [link(*requested, 0)]
@@ -188,15 +182,16 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
 
 def check_reach(where: str, cfg: config.Config, role: str, which: str, found: dict, instructions: tuple) -> None:
     tools, mcp = found["tools"], found["mcp"]
-    web = runner.WEB_TOOLS if role in SEARCHES else ("WebFetch",) if role in FETCHES else ()
+    traits = traits_of(which)
+    web = WEB_TOOLS if role in SEARCHES else ("WebFetch",) if role in FETCHES else ()
     if role in FETCHES and "WebSearch" in tools:
         raise ValueError(f"{where}: tools WebSearch cannot load on {role}, which may only fetch again the sources "
                          "it audits")
-    if role in NO_WEB and (found_web := [t for t in tools if t in runner.WEB_TOOLS]):
+    if role in NO_WEB and (found_web := [t for t in tools if t in WEB_TOOLS]):
         raise ValueError(f"{where}: tools {', '.join(found_web)} cannot load on {role}, which writes only from the "
                          "evidence it is given")
     if role in READ_ONLY:
-        if acting := [t for t in tools if t not in runner.READ_ONLY_TOOLS and t not in web]:
+        if acting := [t for t in tools if t not in READ_ONLY_TOOLS and t not in web]:
             raise ValueError(f"{where}: tools {', '.join(acting)} would let {role} change files; it is read only, "
                              "so use Read, Glob, Grep and LS")
         if mcp:
@@ -205,20 +200,21 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
     if bad := [t for t in tools if t not in STEP_TOOLS and t not in web]:
         raise ValueError(f"{where}: tools {', '.join(bad)} is not a built in tool a step takes; use "
                          f"{', '.join(STEP_TOOLS)}, since shell rules come from the layer and servers from mcp")
-    if which in ("pi", "codex") and role not in SEARCHES and (missing := [t for t in runner.READ_TOOLS if t not in tools]):
+    if (role not in SEARCHES and traits.always_granted_tools
+            and (missing := [t for t in traits.always_granted_tools if t not in tools])):
         raise ValueError(f"{where}: tools {', '.join(tools) or '[]'} leaves out {', '.join(missing)}, which {which} always "
                          "grants; list them")
-    if which == "pi" and mcp:
-        raise ValueError(f"{where}: mcp {', '.join(mcp)} cannot load on pi, which runs with --no-mcp; run this step "
-                         "on claude")
+    if mcp and not traits.takes_mcp:
+        raise ValueError(f"{where}: mcp {', '.join(mcp)} cannot load on {which}, which runs with --no-mcp; run this "
+                         "step on claude")
     if bad := [n for n in mcp if n not in cfg.mcp]:
         raise ValueError(f"{where}: mcp '{bad[0]}' names no [mcp.{bad[0]}]")
-    if which == "pi" and instructions:
-        raise ValueError(f"{where}: instructions {', '.join(instructions)} cannot load on pi, which loads no "
+    if instructions and not traits.instruction_scopes:
+        raise ValueError(f"{where}: instructions {', '.join(instructions)} cannot load on {which}, which loads no "
                          "instruction files; use []")
-    if which == "codex" and "user" in instructions:
-        raise ValueError(f"{where}: instructions 'user' cannot load on codex, which runs without your own codex "
-                         "setup; use [\"repo\"] or []")
+    if traits.instruction_scopes and (refused := [i for i in instructions if i not in traits.instruction_scopes]):
+        raise ValueError(f"{where}: instructions {', '.join(map(repr, refused))} cannot load on {which}, which runs "
+                         f"without your own {which} setup; use {json.dumps(list(traits.instruction_scopes))} or []")
     if role in KEEPS_NO_SESSION and found["session"] == "resume":
         raise ValueError(f"{where}: session 'resume' needs a kept session and {role} keeps none; use fresh")
 
@@ -257,19 +253,19 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     else:
         source = {**found, "model": cfg.model(config.INHERITS.get(role, role))}
     hint = source.get("runner", "")
-    if hint and hint not in runner.RUNNERS:
-        raise ValueError(f"{where}: runner '{hint}' is not one of {', '.join(runner.RUNNERS)}")
+    if hint and hint not in routing.RUNNERS:
+        raise ValueError(f"{where}: runner '{hint}' is not one of {', '.join(routing.RUNNERS)}")
     which, name, provider = routing.source_route(source)
     effort = found.get("effort", "")
-    instructions = found.get("instructions", default_instructions(which))
+    instructions = found.get("instructions", traits_of(which).default_instructions)
     check_reach(where, cfg, role, which, found, instructions)
     notes = codex.NOTES if which == "codex" else ()
     link_tier = tier
     if not tier:
         link_tier, entries = tier_of(cfg, layer, found.get("tier", ""), routing.identity(which, name))
     if cfg.replay.all:
-        name = f"codex:{name}" if which == "codex" and runner.route(name)[0] != which else name
-        which = runner.REPLAY
+        name = f"codex:{name}" if which == "codex" and routing.route(name)[0] != which else name
+        which = REPLAY
         entries = ()
     explicit = tuple(found["instructions"]) if "instructions" in found else None
     chain = chain_of((which, name, provider), link_tier, entries, effort, explicit)
@@ -279,7 +275,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
         runners.update({"openai": "codex", "anthropic": "claude"}[vendor]
                        for link in chain if (vendor := routing.identity(link.runner, link.model)[0])
                        in ("openai", "anthropic"))
-    supported = {level for run_with in runners for level in EFFORTS[run_with]}
+    supported = {level for run_with in runners for level in TRAITS[run_with].efforts}
     if effort and effort not in supported:
         raise ValueError(f"{where}: effort '{effort}' is not a level its routes take; use "
                          f"{', '.join(level for level in routing.EFFORT_ORDER if level in supported)}")

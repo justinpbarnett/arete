@@ -28,6 +28,10 @@ def path(run_id: str) -> Path:
     return paths.RUNS_DIR / run_id / FILE
 
 
+def run_of_path(where: Path) -> str:
+    return where.parent.name if where.name == FILE and where.parent.parent == paths.RUNS_DIR else ""
+
+
 def whole(data: bytes) -> list[dict]:
     found = []
     for piece in data.split(b"\n")[:-1]:

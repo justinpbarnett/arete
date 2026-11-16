@@ -266,6 +266,8 @@ class JiraWriteLedger:
             reply = None
         elif self.lookup_fails:
             raise http(400)
+        elif path == "/rest/api/3/project/FIX/statuses":
+            reply = [{"statuses": [{"name": "Open"}, {"name": "Done"}]}]
         elif path.endswith("/myself"):
             reply = {"accountId": "fixture"}
         elif path.endswith("/properties/arete"):
@@ -349,11 +351,11 @@ class JiraWriteRecoveryTests(unittest.TestCase):
     def test_transition_checks_destination_without_another_post(self):
         ledger = JiraWriteLedger()
         with mock.patch.object(self.jira, "_opener", ledger):
-            self.assertTrue(self.client.transition("FIX-1", "Finish"))
+            self.assertTrue(self.client.move("FIX-1", "Finish"))
         self.assertEqual((ledger.posts, ledger.transitions), (1, 1))
         ledger = JiraWriteLedger(apply=False)
         with mock.patch.object(self.jira, "_opener", ledger), self.assertRaises(self.jira.JiraUnsure):
-            self.client.transition("FIX-1", "Done")
+            self.client.move("FIX-1", "Done")
         self.assertEqual(ledger.posts, 1)
 
     def test_transition_lost_status_lookup_preserves_uncertainty(self):
@@ -365,7 +367,7 @@ class JiraWriteRecoveryTests(unittest.TestCase):
             return original(request, **kw)
         with mock.patch.object(self.jira, "_opener", SimpleNamespace(open=transport)), \
                 self.assertRaises(self.jira.JiraUnsure):
-            self.client.transition("FIX-1", "Done")
+            self.client.move("FIX-1", "Done")
         self.assertEqual((ledger.posts, ledger.transitions), (1, 1))
 
     def test_missing_identity_and_failed_wait_do_not_resend(self):

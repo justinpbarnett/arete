@@ -14,19 +14,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import (
-    config,
-    environment,
-    factory,
-    loops,
-    paths,
-    record,
-    state,
-    tracker,
-    util,
-    verifier_suites,
-)
-from .pipeline import AgentRun, Checkout, TicketWork, use_product
+from . import config, environment, factory, loops, paths, record, state, tracker, util, verifier_suites, workspace
+from .pipeline import AgentRun, TicketWork, use_product
 
 PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECASE)
 CHECK = re.compile(r"^- \*\*(?:Passed|Failed(?: \(environment\))?)\*\*:\s*(.+)$")
@@ -355,7 +344,7 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> list[int]:
                     raise Blocked(f"{p.repo.name}: setup failed")
             ticket = tracker.Ticket(id=run_id, ref=run_id, title="Use the merged base", body="")
             work = TicketWork(cfg, run, ticket, p.worktree,
-                              [Checkout("", p.repo.github, p.repo.path, p.worktree, p.base)], p.layer, 1800,
+                              [workspace.Checkout("", p.repo.github, p.repo.path, p.worktree, p.base)], p.layer, 1800,
                               workspace=f"Detached checkout of origin/{p.base} at {sha}.")
             goal = "\n".join(s.goal(n) for n, s in enumerate(p.steps, 1))
             verified = use_product(work, "verify", "grade", goal=goal, require_released=True)

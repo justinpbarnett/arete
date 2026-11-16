@@ -532,6 +532,7 @@ result(base=base["mined_until"], base_expect=mark(0), crashed=slim(crashed), nor
     def test_a_failed_apply_model_call_keeps_the_checkpoint(self):
         found = self.scratch(r'''
 from types import SimpleNamespace
+from arete import workspace
 mine(0)
 both(3)
 reply({"ok": True, "structured": {"proposals": [{"layer": "repo", "repo": "arete", "file": "notes.md",
@@ -540,8 +541,8 @@ failed = SimpleNamespace(ok=False, error="apply broke", text="")
 with mock.patch.object(miner, "allowed", return_value=(True, "")), \
         mock.patch.object(miner.gh, "default_branch", return_value="main"), \
         mock.patch.object(miner.gh, "open_pr_url", return_value=""), \
-        mock.patch.object(miner, "make_worktree", return_value=root), \
-        mock.patch.object(miner, "remove_worktree"), \
+        mock.patch.object(workspace, "make_worktree", return_value=root), \
+        mock.patch.object(workspace, "remove_worktree"), \
         mock.patch.object(miner, "apply_in", return_value=failed):
     applying = mine(24, apply=True)
 reply(GOOD)
@@ -884,7 +885,8 @@ class CutOffTests(unittest.TestCase):
     def test_a_hunt_stopped_during_delivery_hands_its_finding_on_at_the_next_run(self):
         self.write_loops()
         facts = self.facts(self.child(
-            self.HUNTS + "with mock.patch.object(sources, 'fire', side_effect=loop_run.Stopped):\n    first = hunt()\n"
+            self.HUNTS + "from arete import record\n"
+            "with mock.patch.object(sources, 'fire', side_effect=record.Stopped):\n    first = hunt()\n"
             "second, third = hunt(), hunt()\nreport(first=first, second=second, third=third)"))
         first, second, third = facts["first"], facts["second"], facts["third"]
         self.assertEqual(first["status"], "stopped")

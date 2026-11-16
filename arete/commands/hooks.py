@@ -164,10 +164,10 @@ def scratch_hook(p) -> None:
 
 
 def cmd_codex_guard(args) -> int:
-    from .. import codex, runner, scratch
+    from .. import codex, routing, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return codex.guard_main(args.judge, runner.NO_GIT_WRITES, args.open)
+    return codex.guard_main(args.judge, routing.NO_GIT_WRITES, args.open)
 
 
 def cmd_mcp_ask(args) -> int:

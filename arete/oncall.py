@@ -12,7 +12,22 @@ from functools import partial
 from pathlib import Path
 from string import Template
 
-from . import config, control, jev, outbound, paths, record, run_lines, sources, state, util
+from . import (
+    config,
+    control,
+    jev,
+    log_follower,
+    outbound,
+    paths,
+    record,
+    run_lines,
+    screening,
+    scrub,
+    sources,
+    state,
+    util,
+)
+from .sighting import Sighting
 
 UNEXPECTED, HEARTBEAT, STALLED, ORCHESTRATION, EXPECTED = "unexpected", "heartbeat", "stalled", "orchestration", "expected"
 WAKE, IGNORE, UNSURE = "wake", "ignore", "unsure"
@@ -35,10 +50,8 @@ NOT_ACTIONABLE = {"actionable": "noise, not an actionable failure",
 PREFIX = "oncall:"
 SCAN = PREFIX + "scan"
 SWITCH = PREFIX + "switch"
-MAX_READ = 1_000_000
 CONTEXT_LINES = 5
 MAX_EVIDENCE = 4000
-TAIL_BYTES = 256
 RUN_TAIL_BYTES = 65536
 MAX_RUN_TAIL = 16_777_216
 STALL_SECONDS = 300
@@ -93,133 +106,6 @@ class Event:
     legacy: str = ""
 
 
-def digest(name: str, end: int) -> str | None:
-    if end <= 0:
-        return ""
-    try:
-        with open(name, "rb") as f:
-            f.seek(max(0, end - TAIL_BYTES))
-            return hashlib.sha1(f.read(min(end, TAIL_BYTES))).hexdigest()
-    except OSError:
-        return None
-
-
-def drain(name: str, pending: list) -> tuple[list[str], list | None, int | None]:
-    older = name + ".1"
-    offset, tail = pending
-    try:
-        size = os.stat(older).st_size
-        if size < offset or digest(older, offset) != tail:
-            return [], None, None
-        end = min(size, offset + MAX_READ)
-        with open(older, "rb") as f:
-            f.seek(offset)
-            data = f.read(end - offset)
-    except OSError:
-        return [], None, None
-    if end < size:
-        data = data[:data.rfind(b"\n") + 1 or len(data)]
-        end = offset + len(data)
-    return data.decode("utf-8", "replace").splitlines(), ([end, digest(older, end)] if end < size else None), end
-
-
-def stamp(name: str) -> list | None:
-    try:
-        info = os.stat(name + ".1")
-    except OSError:
-        return None
-    return [info.st_ino, info.st_size, info.st_mtime_ns]
-
-
-def whole_digest(name: str, end: int) -> str | None:
-    try:
-        with open(name, "rb") as f:
-            h, left = hashlib.sha1(), end
-            while left > 0 and (chunk := f.read(min(left, 1 << 20))):
-                h.update(chunk)
-                left -= len(chunk)
-    except OSError:
-        return None
-    return h.hexdigest() if left == 0 else None
-
-
-def still_holds(name: str, size: int, older: list, inode: int, same: int) -> bool:
-    head = min(older[1], MAX_READ)
-    return (inode == same and size >= older[1]
-            and whole_digest(name, head) == whole_digest(name + ".1", head)
-            and digest(name, older[1]) == digest(name + ".1", older[1]))
-
-
-def untouched(info: os.stat_result, older: list) -> bool:
-    return info.st_mtime_ns < older[2] or (info.st_mtime_ns == older[2] and info.st_size == older[1])
-
-
-def parts(mark: list, now: list | None) -> tuple[list | None, list | None]:
-    return (mark[3] if len(mark) > 3 else None), (mark[4] if len(mark) > 4 else now)
-
-
-def gone(name: str, mark: list | None) -> tuple[list[str], list[str], list | None]:
-    if mark is None:
-        return [], [], mark
-    now = stamp(name)
-    pending, seen = parts(mark, now)
-    if not pending and now:
-        if mark[0] == 0:
-            remainder = now != seen
-        else:
-            remainder = digest(name + ".1", mark[0]) == mark[2]
-        if remainder:
-            pending, mark = [mark[0], mark[2]], [0, mark[1], "", None]
-    older, pending, _ = drain(name, pending) if pending else ([], None, None)
-    return older, [], [mark[0], mark[1], mark[2], pending, now]
-
-
-def fresh(name: str, mark: list | None, baseline: bool) -> tuple[list[str], list[str], list | None]:
-    try:
-        info = os.stat(name)
-    except OSError:
-        return gone(name, mark)
-    size, inode = info.st_size, info.st_ino
-    now = stamp(name)
-    if baseline:
-        return [], [], [size, inode, digest(name, size) or "", None, now]
-    offset, pending, seen, noted = 0, None, now, now
-    if mark is not None:
-        offset = mark[0]
-        pending, seen = parts(mark, now)
-        if sources.log_start(mark[:2], size, inode) != offset or digest(name, offset) != mark[2]:
-            pending, offset = ([offset, mark[2]] if offset > 0 else pending), 0
-        elif now and now != seen and not pending and now[1] > offset and digest(name + ".1", offset) == mark[2]:
-            copied = still_holds(name, size, now, inode, mark[1])
-            if copied and untouched(info, now):
-                noted = seen
-            else:
-                pending, offset = [offset, mark[2]], 0
-        elif (now and seen and not pending and now[0] == seen[0] != inode and now[1] > seen[1]
-              and not (offset > 0 and digest(name + ".1", offset) == mark[2])):
-            pending = [seen[1], digest(name + ".1", seen[1]) or ""]
-    end = min(size, offset + MAX_READ)
-    if (got := sources.read_lines(name, offset, end)) is None:
-        return [], [], mark
-    rows, upto = got
-    if upto is None:
-        upto = end if end - offset >= MAX_READ else offset
-    older, pending, drained = drain(name, pending) if pending else ([], None, None)
-    if drained is not None and pending is None and now:
-        noted = [now[0], drained, now[2]]
-    return older, rows, [upto, inode, digest(name, upto) or "", pending, noted]
-
-
-def undrained(name: str, mark: list) -> bool:
-    if parts(mark, None)[0]:
-        return True
-    try:
-        more = sources.read_lines(name, mark[0], min(os.stat(name).st_size, mark[0] + MAX_READ))
-    except OSError:
-        return False
-    return bool(more and more[1] is not None)
-
-
 def traceback_end(rows: list[str], begin: int) -> tuple[int, str]:
     j = begin
     while True:
@@ -262,12 +148,15 @@ def own_step(row: dict) -> bool:
     return row["event"] == "step_end" and (row.get("step") == "checks" or row.get("atom") in REPAIR_STEPS)
 
 
-def ticket_has_live_run(row: dict) -> bool:
-    found = state.run_get(str(row["run"])) or {}
+def other_live_run(run_id, found: dict) -> dict | None:
     if not (found.get("repo") and found.get("issue")):
-        return False
+        return None
     other = state.running_run(found["repo"], found["issue"])
-    return bool(other) and other["id"] != row["run"]
+    return other if other and other["id"] != run_id else None
+
+
+def ticket_has_live_run(row: dict) -> bool:
+    return bool(other_live_run(row["run"], state.run_get(str(row["run"])) or {}))
 
 
 def classify(text: str, row: dict | None) -> str:
@@ -527,62 +416,64 @@ def changed(row: dict) -> bool:
 def owner_run(row: dict) -> str:
     if row["class"] == STALLED:
         return ""
-    where = Path(row["source"])
-    if where.name == run_lines.FILE and where.parent.parent == paths.RUNS_DIR:
-        run_id = where.parent.name
-    else:
-        run_id = next((str(r["run"]) for r in map(run_line, str(row.get("evidence") or "").splitlines()) if r), "")
+    run_id = run_lines.run_of_path(Path(row["source"])) or next(
+        (str(r["run"]) for r in map(run_line, str(row.get("evidence") or "").splitlines()) if r), "")
     if not run_id:
         return ""
     found = state.run_get(run_id) or {}
     if found.get("status") == "running" and not process_gone(found):
         return run_id
-    if found.get("repo") and found.get("issue"):
-        other = state.running_run(found["repo"], found["issue"])
-        if other and other["id"] != run_id:
-            return other["id"]
-    return ""
+    other = other_live_run(run_id, found)
+    return other["id"] if other else ""
 
 
 def injected(a: jev.Answer) -> str:
     return f"the evidence reads as instructions to an agent (p {a.yes:.2f})"
 
 
-def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, policies: Policies,
-            row: dict) -> tuple[str, float, str, dict, int]:
+@dataclass(frozen=True)
+class Verdict:
+    decision: str
+    confidence: float
+    reason: str
+    answers: dict
+    flagged: int
+
+
+def verdict(reply: jev.Reply, asking: dict, cfg: config.Config, policies: Policies, row: dict) -> Verdict:
     line, injection_line = thresholds(cfg)
     if reply.error or set(asking) - set(reply.answers):
-        return "", 0.0, reply.error or "its reply left questions out", {}, 0
+        return Verdict("", 0.0, reply.error or "its reply left questions out", {}, 0)
     got = {name: reply.answers[name] for name in asking}
     answers = {name: {"value": a.value, "confidence": a.confidence, "p": a.yes} for name, a in got.items()}
-    if got["injection"].yes >= injection_line:
-        return IGNORE, got["injection"].confidence, injected(got["injection"]), answers, 1
+    if screening.held(screening.of_answer(got["injection"], injection_line, reply), screening.Posture.REQUIRED):
+        return Verdict(IGNORE, got["injection"].confidence, injected(got["injection"]), answers, 1)
     for name, why in NOT_ACTIONABLE.items():
         if name in got and got[name].sure(line) and got[name].value is False:
-            return IGNORE, got[name].confidence, why, answers, 0
+            return Verdict(IGNORE, got[name].confidence, why, answers, 0)
     for name, a in got.items():
         if not a.sure(line):
-            return UNSURE, a.confidence, f"{name} is uncertain ({a.note()})", answers, 0
+            return Verdict(UNSURE, a.confidence, f"{name} is uncertain ({a.note()})", answers, 0)
     least = min(a.confidence for a in got.values())
     rule = policies.read_under(row)
     if rule is None:
         why = ("it was opened before incidents recorded the vision and scope their lines were read under, and the "
                "config holds more than one; the owner decides")
-        return UNSURE, least, why, answers, 0
+        return Verdict(UNSURE, least, why, answers, 0)
     if not rule:
         why = ("its file is gone or no [[oncall.source]] glob lists it, so which vision and scope apply cannot be "
                "told; the owner decides")
-        return UNSURE, least, why, answers, 0
+        return Verdict(UNSURE, least, why, answers, 0)
     if not rule <= policies.every:
         why = "the vision or scope its file was under when read is no longer in the config, so the owner decides"
-        return UNSURE, least, why, answers, 0
+        return Verdict(UNSURE, least, why, answers, 0)
     if len(rule) > 1:
         why = "more than one [[oncall.source]] vision or scope applies to this file, so the owner decides"
-        return UNSURE, least, why, answers, 0
+        return Verdict(UNSURE, least, why, answers, 0)
     for name, text in zip(("vision", "scope"), next(iter(rule)), strict=True):
         if not text:
-            return UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0
-    return WAKE, least, "actionable, fits the vision and is in scope", answers, 0
+            return Verdict(UNSURE, least, f"no [oncall] {name} is set, so the owner decides", answers, 0)
+    return Verdict(WAKE, least, "actionable, fits the vision and is in scope", answers, 0)
 
 
 def due(row: dict, now: str) -> bool:
@@ -593,11 +484,7 @@ def due(row: dict, now: str) -> bool:
 def origin_repo(source: str, repo: str) -> str:
     if repo:
         return repo
-    where = Path(source)
-    if where.name == run_lines.FILE and where.parent.parent == paths.RUNS_DIR:
-        run_id = where.parent.name
-    else:
-        run_id = source.removeprefix("run ") if source.startswith("run ") else ""
+    run_id = run_lines.run_of_path(Path(source)) or (source.removeprefix("run ") if source.startswith("run ") else "")
     return ((state.run_get(run_id) or {}).get("repo") or "") if run_id else ""
 
 
@@ -620,8 +507,14 @@ def failed(row: dict, reason: str) -> None:
     state.update_incident(row["id"], note, **fields)
 
 
-def settle(row: dict, outcome: tuple[str, float, str, dict, int]) -> None:
-    decision, confidence, reason, answers, flagged = outcome
+def count_undecided(counts: dict[str, int], row: dict, reason: str) -> None:
+    failed(row, reason)
+    counts["undecided"] = counts.get("undecided", 0) + (row["decision"] == "")
+
+
+def settle(row: dict, outcome: Verdict) -> None:
+    decision, confidence, reason, answers, flagged = (outcome.decision, outcome.confidence, outcome.reason,
+                                                      outcome.answers, outcome.flagged)
     seen = sorted(shapes(row["evidence"]))
     kept = list(dict.fromkeys([*seen, *json.loads(row["shapes"] or "[]")]))[:SHAPES_KEPT]
     detail = ", ".join(f"{name} {'yes' if a['value'] else 'no'} {a['confidence']:.2f}" for name, a in answers.items())
@@ -643,8 +536,7 @@ def decide(cfg: config.Config, policies: Policies | None = None, budget: int = M
             if row["decision"] == "" and (why := f"run {owner} owns it and is still live") != row["reason"]:
                 state.update_incident(row["id"], reason=why)
         elif why := refused(cfg, origin_repo(row["source"], row["repo"])):
-            failed(row, why)
-            counts["undecided"] = counts.get("undecided", 0) + (row["decision"] == "")
+            count_undecided(counts, row, why)
         else:
             ask.append(row)
     ask = ask[:max(budget, 0)]
@@ -652,12 +544,11 @@ def decide(cfg: config.Config, policies: Policies | None = None, budget: int = M
     replies = asked([(subject(row), q) for row, q in zip(ask, asking, strict=True)], cfg) if ask else []
     for row, q, reply in zip(ask, asking, replies, strict=True):
         outcome = verdict(reply, q, cfg, policies, row)
-        if outcome[0]:
+        if outcome.decision:
             settle(row, outcome)
-            counts[outcome[0]] = counts.get(outcome[0], 0) + 1
+            counts[outcome.decision] = counts.get(outcome.decision, 0) + 1
         else:
-            failed(row, outcome[2])
-            counts["undecided"] = counts.get("undecided", 0) + (row["decision"] == "")
+            count_undecided(counts, row, outcome.reason)
     return {name: n for name, n in counts.items() if n}
 
 
@@ -669,46 +560,48 @@ def decision_line(row: dict) -> str:
     return f"{row['decision']} {row['confidence']:.2f}{mark}: {row['reason']}"
 
 
-def known_twins(cfg: config.Config, policies: Policies, rows: list[tuple], known: dict[str, dict],
+def known_twins(cfg: config.Config, policies: Policies, sightings: list[Sighting], known: dict[str, dict],
                 budget: int = MAX_ASKS) -> tuple[list, dict, int]:
     open_rows = [r for r in state.open_incidents() if not r["injection"]]
     line, injection_line = thresholds(cfg)
     fresh, candidates = [], []
     homes = {r["id"]: origin_repo(r["source"], r["repo"]) for r in open_rows}
     rules = {r["id"]: policies.standing(r) for r in open_rows}
-    for row in rows:
-        home = origin_repo(row[2], row[3])
-        rule = unpacked(row[7])
+    for sighting in sightings:
+        home = origin_repo(sighting.source, sighting.repo)
+        rule = unpacked(sighting.policies)
         same = [r for r in open_rows if homes[r["id"]] == home and rules[r["id"]] == rule][:TWINS_OFFERED]
-        if (row[0] not in known and rule and same and not refused(cfg, home)
-                and not owner_run({"class": row[1], "source": row[2], "evidence": row[6]})):
-            fresh.append(row)
+        owned = {"class": sighting.kind, "source": sighting.source, "evidence": sighting.evidence}
+        if sighting.fingerprint not in known and rule and same and not refused(cfg, home) and not owner_run(owned):
+            fresh.append(sighting)
             candidates.append(same)
     fresh, candidates = fresh[:budget], candidates[:budget]
     items = []
-    for row, same in zip(fresh, candidates, strict=True):
+    for sighting, same in zip(fresh, candidates, strict=True):
         options = {"new": "a different problem from every open incident listed in the text",
                    **{f"i{r['id']}": f"the same problem as open incident i{r['id']} listed in the text" for r in same}}
-        text = fenced({"new symptom": {"class": row[1], "signature": row[4], "evidence": row[6]},
+        text = fenced({"new symptom": {"class": sighting.kind, "signature": sighting.signature,
+                                       "evidence": sighting.evidence},
                        "open incidents": {f"i{r['id']}": {"class": r["class"], "signature": r["signature"]}
                                           for r in same}})
         items.append((text, {"twin": jev.pick(TWIN, options), "injection": jev.yes_no(jev.INJECTION)}))
     matched, marks = [], {}
-    for row, (_, q), reply in zip(fresh, items, asked(items, cfg) if items else [], strict=True):
+    for sighting, (_, q), reply in zip(fresh, items, asked(items, cfg) if items else [], strict=True):
         a, flagged = reply.answers.get("twin"), reply.answers.get("injection")
-        if flagged and flagged.yes >= injection_line:
+        screened = screening.of_answer(flagged, injection_line, reply)
+        if screened.status == screening.FLAGGED:
             answers = {"injection": {"value": flagged.value, "confidence": flagged.confidence, "p": flagged.yes}}
             fields = {"decision": IGNORE, "confidence": flagged.confidence, "reason": injected(flagged),
                       "answers": json.dumps(answers), "injection": 1, "decided": util.iso(),
-                      "decided_count": row[5]}
+                      "decided_count": sighting.count}
             said = (f"decided {IGNORE} (confidence {flagged.confidence:.2f}): {injected(flagged)}; "
                     f"injection yes {flagged.confidence:.2f}")
-            marks[row[0]] = (fields, said)
-        elif (a and flagged and flagged.value is False and flagged.sure(line) and a.value != "new"
-              and a.value in q["twin"]["criteria"] and a.sure(line)):
+            marks[sighting.fingerprint] = (fields, said)
+        elif (not screening.held(screened, screening.Posture.REQUIRED) and a and flagged.value is False
+              and flagged.sure(line) and a.value != "new" and a.value in q["twin"]["criteria"] and a.sure(line)):
             note = (f"JEV matches a differently worded symptom to this incident ({a.note()}): "
-                    f"{outbound.plain(row[4], 200)}")
-            matched.append((row[0], int(str(a.value)[1:]), note))
+                    f"{outbound.plain(sighting.signature, 200)}")
+            matched.append((sighting.fingerprint, int(str(a.value)[1:]), note))
     return matched, marks, len(items)
 
 
@@ -738,7 +631,7 @@ class Watch:
         found = self.runs[run_id]
         return self.owned.get((found.get("repo"), found.get("issue")), 0)
 
-    def hushed(self, incident: int) -> bool:
+    def mute_if_repairing(self, incident: int) -> bool:
         if incident:
             self.quiet[incident] = self.quiet.get(incident, 0) + 1
         return bool(incident)
@@ -765,12 +658,12 @@ class Watch:
             if row:
                 if not run_failure(row) or (origin.folder and run_lines.path(str(row["run"])).exists()):
                     continue
-                if self.hushed(self.repairing(str(row["run"]))):
+                if self.mute_if_repairing(self.repairing(str(row["run"]))):
                     continue
                 text = run_text(row)
             elif (origin.pattern.search(line) or EXPECTED_TEXT.search(line)
                   or (origin.folder and ORCHESTRATION_TEXT.search(line))):
-                if (own := RUN_PREFIX.search(line)) and self.hushed(self.owned.get(own.groups(), 0)):
+                if (own := RUN_PREFIX.search(line)) and self.mute_if_repairing(self.owned.get(own.groups(), 0)):
                     continue
                 text = line
                 if TRACEBACK in line:
@@ -791,13 +684,13 @@ class Watch:
         stored, marks = cursor_value(PREFIX + group)
         marks = marks or {}
         for name in dict.fromkeys([*watched, *marks]):
-            older, rows, marks[name] = fresh(name, marks.get(name), stored is None)
+            older, rows, marks[name] = log_follower.fresh(name, marks.get(name), stored is None)
             if older:
                 self.consider(name, older, origin, self.policies.of_copy(name, origin.listed))
             if rows:
                 self.consider(name, rows, origin, self.policies.of_file(name, origin.listed))
         kept = {name: mark for name, mark in marks.items()
-                if mark is not None and (name in watched or undrained(name, mark))}
+                if mark is not None and (name in watched or log_follower.undrained(name, mark))}
         if relist and (dropped := {name for name, mark in marks.items() if mark is not None} - kept.keys()):
             kept |= {name: marks[name] for name in dropped.intersection(relist())}
         self.defer(group, json.dumps(kept), util.count(len(watched), "file"))
@@ -850,21 +743,21 @@ class Watch:
             if not why:
                 continue
             stalled.append(row["id"])
-            if row["id"] not in flagged and not self.hushed(self.owned.get((row.get("repo"), row.get("issue")), 0)):
+            if row["id"] not in flagged and not self.mute_if_repairing(self.owned.get((row.get("repo"), row.get("issue")), 0)):
                 head = f"run {row['id']} ({row.get('repo') or '-'}#{row.get('issue') or '-'}) stalled: {why}"
                 self.add(STALLED, f"run:{row['id']}", f"run stalled: {why}", f"run {row['id']}", "", [head, *texts])
         self.defer("stalls", json.dumps(stalled), f"{len(stalled)} stalled")
 
     def store(self) -> tuple[int, int, int]:
         events = [e for e in self.found.values() if e.kind != EXPECTED]
-        hidden = record.secrets() if events else ()
+        hidden = scrub.secrets() if events else ()
         held = state.known_fingerprints() if events else {}
         rows = []
         for e in events:
-            signature = outbound.redact(sources.signature(record.scrub(e.signature, hidden)))
+            signature = outbound.redact(sources.signature(scrub.scrub(e.signature, hidden)))
             if e.kind == ORCHESTRATION:
                 signature = signature.removeprefix("<time> ")
-            evidence = outbound.redact(record.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
+            evidence = outbound.redact(scrub.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
             scope = e.scope
             fingerprint = fingerprint_of(e.kind, scope, signature)
             older = fingerprint_of(e.kind, e.legacy, signature)
@@ -873,7 +766,7 @@ class Watch:
             while fingerprint in held and self.policies.standing(held[fingerprint]) != e.rule:
                 scope = bounded(scope, e.rule)
                 fingerprint = fingerprint_of(e.kind, scope, signature)
-            rows.append((fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence, packed(e.rule)))
+            rows.append(Sighting(fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence, packed(e.rule)))
         matched, marks, self.asks = known_twins(self.cfg, self.policies, rows, held)
         opened = sum(state.commit_scan(rows, self.cursors, matched, marks))
         for incident, n in self.quiet.items():
@@ -976,7 +869,7 @@ def reread(cfg: config.Config, policies: Policies, row: dict) -> tuple[bool, str
     return (True, f"{cfg.oncall.cooldown_minutes:g} minutes without a recurrence") if util.now() >= waited else None
 
 
-def recover(cfg: config.Config, row: dict, what: str) -> None:
+def recover(row: dict, what: str) -> None:
     text = f"{what} passed at {util.iso()}; no recurrence since the repair landed at {row['landed']}"
     state.update_incident(row["id"], f"resolved: {text}", state="resolved", phase="", waiting="", recovery=text)
 
@@ -989,7 +882,7 @@ def recheck(cfg: config.Config, policies: Policies, row: dict) -> None:
         return
     ok, detail = found
     if ok:
-        return recover(cfg, row, detail)
+        return recover(row, detail)
     lose(cfg, row, f"recheck failed: {detail}")
 
 
@@ -1021,18 +914,19 @@ def repair_line(row: dict) -> str:
 
 
 def route_refusal(cfg: config.Config, repo: config.Repo) -> tuple[str, bool]:
-    from . import devices, routing, runner, steps
+    from . import devices, routing, steps
+    from .agent import REPLAY
 
     try:
         layer = config.load_layer(repo.layer_dir)
         modes = routing.modes_for(cfg, repo)
         for role in ("plan", "build", *(("verify",) if layer.verify else ()), "review", *REPAIR_STEPS):
             setting = steps.resolve(cfg, layer, role, "fix")
-            which, name = runner.chosen(setting.model, setting.runner, cfg)
-            if which == runner.REPLAY:
+            which, name = routing.chosen(setting.model, setting.runner, cfg)
+            if which == REPLAY:
                 continue
-            request = runner.request_for(cfg, repo, which, name, None, True,
-                                         {"tools": list(setting.tools), "disallowed_tools": list(setting.denied)})
+            request = routing.request_for(cfg, repo, which, name, None, True,
+                                          {"tools": list(setting.tools), "disallowed_tools": list(setting.denied)})
             if why := routing.fit_refusal(request, devices.LOCAL, modes):
                 return f"{role}: {why}", True
             routes = route_outlook(cfg, repo, setting)
@@ -1069,8 +963,9 @@ def exhausted(cfg: config.Config, row: dict) -> str:
     return ""
 
 
-def day_spent(cfg: config.Config) -> str:
-    day = [r for r in state.incident_repairs() if r["started"] >= util.iso(util.now() - timedelta(days=1))]
+def day_spent(cfg: config.Config, repairs: list[dict] | None = None) -> str:
+    every = state.incident_repairs() if repairs is None else repairs
+    day = [r for r in every if r["started"] >= util.iso(util.now() - timedelta(days=1))]
     if (money := spent(cfg, day)) >= cfg.oncall.daily_budget_usd:
         return f"{money:.2f} of {cfg.oncall.daily_budget_usd:.2f} USD spent on repairs today"
     return ""
@@ -1126,52 +1021,57 @@ def parked(repo: str) -> set[str]:
     return held
 
 
-def wake(cfg: config.Config, row: dict) -> bool:
+@dataclass(frozen=True)
+class Hold:
+    phase: str
+    why: str
+    escalate: str = ""
+
+
+def hold_for(cfg: config.Config, row: dict) -> Hold | None:
     limits = cfg.oncall
-    mine = attempts(row)
     if why := exhausted(cfg, row):
-        moved(row, "blocked", why)
-        escalate(cfg, row, limit_kind(cfg, row))
-        return False
+        return Hold("blocked", why, limit_kind(cfg, row))
     if until := cooling(cfg, row):
-        moved(row, "waiting", f"cooling down until {until}")
-        return False
+        return Hold("waiting", f"cooling down until {until}")
     if owner := owner_run(row):
-        moved(row, "waiting", f"run {owner} owns it and is still live")
-        return False
+        return Hold("waiting", f"run {owner} owns it and is still live")
     name = repair_repo(cfg, row)
     repo = next((r for r in cfg.repos if r.name == name), None)
     if repo is None:
-        moved(row, "waiting", f"{name!r} is not a [[repo]] to repair in" if name else "it has no repo to repair in")
-        return False
+        return Hold("waiting", f"{name!r} is not a [[repo]] to repair in" if name else "it has no repo to repair in")
     every = state.incident_repairs()
-    if why := day_spent(cfg):
-        moved(row, "waiting", why)
-        return False
+    if why := day_spent(cfg, every):
+        return Hold("waiting", why)
     if len([r for r in every if not r["ended"]]) >= limits.max_repairs:
-        moved(row, "waiting", f"{limits.max_repairs} repairs are already running")
-        return False
+        return Hold("waiting", f"{limits.max_repairs} repairs are already running")
     if len([r for r in every if r["started"] >= util.iso(util.now() - timedelta(hours=1))]) >= limits.wakes_per_hour:
-        moved(row, "waiting", f"{limits.wakes_per_hour} wakes in the last hour is the limit")
-        return False
+        return Hold("waiting", f"{limits.wakes_per_hour} wakes in the last hour is the limit")
     why, lasting = route_refusal(cfg, repo)
     if why:
-        moved(row, "waiting", why)
-        if lasting:
-            escalate(cfg, row, "policy")
+        return Hold("waiting", why, "policy" if lasting else "")
+    return None
+
+
+def wake(cfg: config.Config, row: dict) -> bool:
+    if held := hold_for(cfg, row):
+        moved(row, held.phase, held.why)
+        if held.escalate:
+            escalate(cfg, row, held.escalate)
         return False
+    limits = cfg.oncall
+    mine = attempts(row)
+    name = repair_repo(cfg, row)
     repair = state.add_repair(row["id"], name)
     try:
         started = start_task(name, repair_prompt(row, mine, limits.max_attempts), repair_title(row["id"]))
     except (control.Refused, control.NotFound) as e:
         made = next(r for r in state.incident(row["id"])["repairs"] if r["id"] == repair)
         why = outbound.sanitize(str(e), 160)
-        if task := created_task(made):
-            state.set_repair(repair, task=task)
+        if task := adopt(made):
             moved(row, "repairing", note=f"woke repair attempt {len(mine) + 1} of {limits.max_attempts}: "
                   f"task {task} in {name}; its first run did not start: {why}")
             return True
-        state.set_repair(repair, ended=util.iso(), outcome="not started")
         moved(row, "waiting", f"the repair task would not start: {why}")
         return False
     state.set_repair(repair, task=started["task"])
@@ -1186,14 +1086,18 @@ def created_task(repair: dict) -> str:
     return found["id"] if found else ""
 
 
+def adopt(repair: dict) -> str:
+    if task := created_task(repair):
+        state.set_repair(repair["id"], task=task)
+        return task
+    state.set_repair(repair["id"], ended=util.iso(), outcome="not started")
+    return ""
+
+
 def adopt_unfinished() -> None:
     for repair in state.incident_repairs():
-        if repair["ended"] or repair["task"]:
-            continue
-        if task := created_task(repair):
-            state.set_repair(repair["id"], task=task)
-        else:
-            state.set_repair(repair["id"], ended=util.iso(), outcome="not started")
+        if not (repair["ended"] or repair["task"]):
+            adopt(repair)
 
 
 def held_for_owner(cfg: config.Config, repair: dict, run_id: str) -> bool:
@@ -1207,7 +1111,7 @@ def held_for_owner(cfg: config.Config, repair: dict, run_id: str) -> bool:
     return bool(report.get("held") or report.get("merge_held")) or trust != "automerge"
 
 
-def follow(cfg: config.Config, row: dict, repair: dict) -> bool:
+def track_repair(cfg: config.Config, row: dict, repair: dict) -> bool:
     run = next(iter(state.ticket_runs(repair["repo"], repair["task"], limit=1, whole=True)), None)
     if run is None:
         return resume(cfg, row, repair, "the repair task has no run yet")
@@ -1238,7 +1142,7 @@ def tend(cfg: config.Config, policies: Policies) -> dict:
     for listed in [] if switched_off() else state.woken_incidents():
         row = state.incident(listed["id"])
         if live := live_repair(row):
-            counts["restarted"] += follow(cfg, row, live)
+            counts["restarted"] += track_repair(cfg, row, live)
         elif row["phase"] == "verifying":
             recheck(cfg, policies, row)
         row = state.incident(row["id"])
