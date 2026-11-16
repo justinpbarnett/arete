@@ -31,7 +31,7 @@ A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work
 |------|------|------|--------------|
 | `heartbeat` | command | hourly, and when serve starts | Checks serve's beat, the loops, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
 | `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, plus arete's own recorded runs that failed, needed a retry, hit a budget or ran long, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
-| `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used. |
+| `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used, and the [doctor](#doctor)'s read of arete's own state. |
 | `poll` | command | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. `arete run REPO TICKET` runs one ticket by hand. |
 | `eval` | command | weekly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `arete eval mine` writes new tasks from merged arete PRs. |
 | `triage` | command | every 15 min | Reads your open tickets that do not have the `agent` label yet and sorts each one: a fix or a feature with its repo, size, plan and assumptions, a research ticket, or work for a person. With `[jira] auto` it sends ready Jira tickets in the sprint to the pipeline. See [Triage](#triage). |
@@ -120,7 +120,7 @@ Other application or service logs are watched only when listed as `[[oncall.sour
 **Cursors.** Each file has a durable cursor (`oncall:` in the `cursors` table) holding its offset, inode and a hash of the bytes before the offset, and what it last saw of the rotated `.1` file, so a rotation is found when nothing had been read yet and a drained `.1` is not read twice.
 A first sight of a file reads nothing old; a file that appears later is read from its start.
 A cursor is kept for a file that a glob lists again by the end of the scan, so a file renamed back or re-created while the scan ran is not read twice.
-Rotation, including the copy-then-truncate of `arete install`'s log rotation, truncation and a restart neither replay old lines nor lose new ones.
+Rotation, including the copy-then-truncate that other tools use to rotate, truncation and a restart neither replay old lines nor lose new ones.
 A new `.1` that the current file still begins with is a copy waiting for its truncate only while the current file has not been written since the copy; otherwise the lines beyond the cursor are read from the `.1` and the current file is read from its start, so a new file that starts with the same bytes as the rotated one loses nothing.
 Two cases cannot be told apart from the files alone: when a scan lands between a copy and its truncate and a line was appended in that gap, the copied lines not yet read are counted twice; and a truncated file that regrows with exactly the bytes already read is not read again.
 A scan reads at most 1,000,000 bytes per file; the rest waits for the next scan.
@@ -681,6 +681,22 @@ copy_to = "host:/backups/arete/"
 
 A failed copy is tried again at the next snapshot until one succeeds that day. **Until the owner sets `copy_to`, no copy of the database or config leaves this machine**, and `arete heartbeat` shows `backup:offsite` as a warning that says so. `backup:db` fails when serve is installed and the newest snapshot is over 3 awake hours old or fails its check, and `backup:offsite` fails when the last good copy is over 48 awake hours old.
 
+## Doctor
+
+`arete doctor` compares the places arete keeps the same facts and prints one line per check, passing ones too. It exits 1 when a check fails. It reads `arete.db` through a read only connection in one transaction plus the files under `runs/`; it makes no network call, writes nothing and never repairs, because each repair belongs to the change that owns the cause.
+
+| Check | Fails when |
+| --- | --- |
+| `cost` | a run's `cost_usd` differs from the sum of its steps by more than 0.000001, a run with cost and no steps included. |
+| `orphans` | steps, evals, feed or verdicts rows name a run id that has no `runs` row. |
+| `chat` | informational: steps filed under the pseudo run `chat`, which has no row. |
+| `folders` | a `runs/` folder has no row (except `runs/chat` and `eva-*-prompts`), a row other than a session has no folder, or a row's `log` file is missing. Folders and rows under 10 minutes old, and rows whose files were purged, are skipped. |
+| `stuck` | a chat has been busy over 20 minutes, a queue row is claimed by a run that is missing or not running, or an approval has stayed `approved` for over an hour. |
+| `store` | `PRAGMA quick_check` reports a problem. |
+| `backup` | the newest snapshot is over 3 hours old or its recorded check is not `ok`; with no snapshot it is informational until serve is installed. |
+
+Each line gives the count and up to five ids. The nightly `audit` runs the doctor and raises one `audit:doctor:<name>` alert per failing check; a `cost` or `backup` fault that the heartbeat's `costs:drift` or `backup:db` already alerts on is a warning instead. The miner does not read doctor lines.
+
 ## Run lines
 
 Each pipeline run also tells its story as JSON lines in `runs/<run_id>/run.jsonl` under the state folder, one object per line, so one file can be followed while the run works or read after it died.
@@ -796,7 +812,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
-- Logs: `~/Library/Logs/arete/`
+- Logs: `~/Library/Logs/arete/`. A log over 5 MB rotates by rename into five numbered copies (`runs.log.1` newest to `runs.log.5`), hourly by `arete serve`; `serve.log` rotates the same way when serve starts, including each restart for new code.
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names
 
 ## Develop

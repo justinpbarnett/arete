@@ -1,13 +1,13 @@
 
 import json, os, runpy, shutil, subprocess, sys, time
 from pathlib import Path
-from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, scratch, state, util, workspace
+from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, sandbox, scratch, state, util, workspace
 from arete import ci
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 probe = [sys.executable, "-V"]
-if scratch.protected_command(probe) != probe:
-    scratch.AUTHORITY = root / "authority-parent/verification-authority"
+if sandbox.protected_command(probe) != probe:
+    sandbox.AUTHORITY = root / "authority-parent/verification-authority"
 SETUP = sys.argv[3]
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport")

@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import config, gh, paths, record, scratch, state, tracker, util
+from . import config, gh, paths, record, sandbox, scratch, state, tracker, util
 from .util import git
 
 SALT_KEY = "\0salt"
@@ -105,8 +105,7 @@ def fetch(src: Path, ref: str) -> None:
 
 def add_worktree(c: Checkout, branch: str, start: str) -> None:
     c.wt.parent.mkdir(parents=True, exist_ok=True)
-    with util.repo_lock(c.src):
-        git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
+    util.add_worktree(c.src, c.wt, branch, start, reset=True)
 
 
 def start_of(c: Checkout, branch: str) -> str:
@@ -133,7 +132,7 @@ def scratch_view() -> scratch.View | None:
 
 def record_holds(view: scratch.View | None, d: Path) -> list[Path]:
     if view is None:
-        return [d] if os.path.lexists(scratch.AUTHORITY) else []
+        return [d] if os.path.lexists(sandbox.AUTHORITY) else []
     return [Path(scratch.path_of(h)) for h in scratch.holds(view, d)]
 
 

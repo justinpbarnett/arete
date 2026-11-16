@@ -24,7 +24,7 @@ from unittest import mock
 import urllib.request
 
 import arete
-from arete import browser, codex, config, paths, pi, pipeline, runner, scratch, util, verify
+from arete import browser, codex, config, paths, pi, pipeline, runner, sandbox, scratch, util, verify
 
 SOURCE = Path(arete.__file__).resolve().parent.parent
 LAUNCH = "(deny lsopen)(deny appleevent-send)(deny job-creation)"
@@ -32,7 +32,7 @@ LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/Laun
               "/Support/lsregister")
 CONNECT = "import socket, sys; socket.create_connection(('127.0.0.1', int(sys.argv[1])), 3).close(); open(sys.argv[2], 'w').close()"
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
-GRANTS = pi.WRITABLE_ALWAYS
+GRANTS = sandbox.WRITABLE_ALWAYS
 
 
 class GuardFloorTests(unittest.TestCase):
@@ -201,9 +201,9 @@ def setUpModule():
     folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
     unittest.addModuleCleanup(folder.cleanup)
     root = Path(folder.name).resolve()
-    for patch in (mock.patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+    for patch in (mock.patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
                   mock.patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
-                  *(mock.patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                  *(mock.patch.object(sandbox, name, root / "state" / getattr(sandbox, name).name)
                     for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
         patch.start()
         unittest.addModuleCleanup(patch.stop)
@@ -224,17 +224,17 @@ class ProfileTests(unittest.TestCase):
         (root / "authority").mkdir()
         self.server = root / "server.json"
         for patch in (mock.patch.object(paths, "WORKTREES_DIR", root / "worktrees"),
-                      mock.patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+                      mock.patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
                       mock.patch.object(paths, "SERVER_FILE", self.server),
-                      mock.patch.object(scratch, "sandboxed", return_value=False),
-                      mock.patch.object(pi, "can_confine", return_value=True)):
+                      mock.patch.object(sandbox, "sandboxed", return_value=False),
+                      mock.patch.object(sandbox, "can_confine", return_value=True)):
             patch.start()
             self.addCleanup(patch.stop)
 
     def profiles(self):
-        return {"protected": scratch.protected_command(["true"], self.ws),
+        return {"protected": sandbox.protected_command(["true"], self.ws),
                 "service": scratch.service_command(attempt_for(self.ws), "true"),
-                "agent": pi.write_confinement(self.ws, [])}
+                "agent": sandbox.write_confinement(self.ws, [])}
 
     def test_the_service_profile_denies_the_browser_port_only_when_given_one(self):
         attempt = attempt_for(self.ws)
@@ -253,7 +253,7 @@ class ProfileTests(unittest.TestCase):
                 self.assertIn(LAUNCH, argv[argv.index("-p") + 1])
 
     def test_launch_keep_drops_only_launch_denials(self):
-        kept = scratch.protected_command(["true"], self.ws, ("launch",))
+        kept = sandbox.protected_command(["true"], self.ws, ("launch",))
         profile = kept[kept.index("-p") + 1]
         self.assertNotIn("lsopen", profile)
         self.assertNotIn("job-creation", profile)
@@ -263,8 +263,8 @@ class ProfileTests(unittest.TestCase):
         env = {"SSH_AUTH_SOCK": "/private/tmp/agent.sock", "TMUX_TMPDIR": self.temp.name,
                "TMUX": "/private/tmp/tmux-1/default,1,0", "DOCKER_HOST": "unix:///private/tmp/docker-x.sock"}
         with mock.patch.dict(os.environ, env):
-            argv = scratch.protected_command(["true"], self.ws)
-            kept = scratch.protected_command(["true"], self.ws, ("ssh-agent",))
+            argv = sandbox.protected_command(["true"], self.ws)
+            kept = sandbox.protected_command(["true"], self.ws, ("ssh-agent",))
         wanted = ["/private/tmp/agent.sock", "/private/tmp/tmux-1/default", "/private/tmp/docker-x.sock",
                   "/private/var/run/docker.sock", f"/private/tmp/tmux-{os.getuid()}"]
         for path in wanted:
@@ -288,10 +288,10 @@ class ProfileTests(unittest.TestCase):
         for name, argv in self.profiles().items():
             with self.subTest(name):
                 self.assertIn(f'(remote tcp "*:{port}")', argv[argv.index("-p") + 1])
-        self.assertIn(port, scratch.dashboard_ports())
+        self.assertIn(port, paths.dashboard_ports())
         with mock.patch.object(socket, "socket") as make:
             make.return_value.__enter__.return_value.getsockname.side_effect = [("", port), ("", 49000)]
-            self.assertEqual(verify.free_port(scratch.dashboard_ports()), 49000)
+            self.assertEqual(verify.free_port(paths.dashboard_ports()), 49000)
         v = config.Verify(start="serve", url=f"http://localhost:{port}/x")
         self.assertIn(str(port), verify.port_refusal(v))
         self.assertIn("live dashboard", verify.port_refusal(v))
@@ -311,7 +311,7 @@ class ProfileTests(unittest.TestCase):
         run.agent.assert_not_called()
 
     def test_git_keeps_the_agent_only_for_network_commands(self):
-        with mock.patch.object(scratch, "protected_command", return_value=["true"]) as protect:
+        with mock.patch.object(sandbox, "protected_command", return_value=["true"]) as protect:
             util.git(["push", "origin", "x"], self.ws, check=False)
             self.assertEqual(protect.call_args.args[2], ("ssh-agent",))
             util.git(["status"], self.ws, check=False)
@@ -356,11 +356,11 @@ class BrowserServerTests(unittest.TestCase):
         for patch in (mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees"),
                       mock.patch.object(paths, "STATE_DIR", self.root / "state"),
                       mock.patch.object(paths, "SERVER_FILE", self.root / "server.json"),
-                      mock.patch.object(scratch, "AUTHORITY", self.root / "authority" / "verification-authority"),
-                      mock.patch.object(scratch, "sandboxed", return_value=False),
-                      mock.patch.object(pi, "can_confine", return_value=True),
+                      mock.patch.object(sandbox, "AUTHORITY", self.root / "authority" / "verification-authority"),
+                      mock.patch.object(sandbox, "sandboxed", return_value=False),
+                      mock.patch.object(sandbox, "can_confine", return_value=True),
                       mock.patch.dict(os.environ, {"TMPDIR": "/private/var/empty"}),
-                      mock.patch.object(pi, "WRITABLE_ALWAYS", ("/private/tmp", "/dev")),
+                      mock.patch.object(sandbox, "WRITABLE_ALWAYS", ("/private/tmp", "/dev")),
                       mock.patch.object(browser.shutil, "which", return_value=str(self.node))):
             patch.start()
             self.addCleanup(patch.stop)
@@ -406,7 +406,7 @@ class BrowserServerTests(unittest.TestCase):
         return scratch.browser_command(self.a, json.loads(self.config)["mcpServers"]["playwright"]["args"][2:])
 
     def settings(self, mcp_config):
-        with scratch.producing(self.a), mock.patch.object(scratch, "protected_command",
+        with scratch.producing(self.a), mock.patch.object(sandbox, "protected_command",
                                                           side_effect=AssertionError("no fallback")):
             return codex.mcp_settings(mcp_config, ["mcp__playwright__browser_navigate"])
 
@@ -425,7 +425,7 @@ class BrowserServerTests(unittest.TestCase):
         self.assertLess(profile.index("(deny network-outbound)"), profile.index('(param "SF0")'))
         self.assertEqual(argv[-1], "--no-sandbox")
         self.assertNotIn("--no-sandbox", verify.mcp_config(self.evidence))
-        agent = pi.write_confinement(self.ws, [])
+        agent = sandbox.write_confinement(self.ws, [])
         self.assertNotIn("MACHRE", agent[agent.index("-p") + 1])
         self.assertIn('(subpath "/private/tmp")', agent[agent.index("-p") + 1])
 
@@ -470,16 +470,16 @@ class BrowserServerTests(unittest.TestCase):
 
     def test_browser_command_refuses_a_sandboxed_engine_and_a_missing_port(self):
         self.prepare()
-        with mock.patch.object(scratch, "sandboxed", return_value=True), self.assertRaises(scratch.ConfinementUnavailable):
+        with mock.patch.object(sandbox, "sandboxed", return_value=True), self.assertRaises(sandbox.ConfinementUnavailable):
             scratch.browser_command(self.a, [])
-        with mock.patch.object(pi, "can_confine", return_value=False), self.assertRaises(scratch.ConfinementUnavailable):
+        with mock.patch.object(sandbox, "can_confine", return_value=False), self.assertRaises(sandbox.ConfinementUnavailable):
             scratch.browser_command(self.a, [])
         scratch.update_browser(self.a, port=0)
-        with self.assertRaises(scratch.ConfinementUnavailable):
+        with self.assertRaises(sandbox.ConfinementUnavailable):
             scratch.browser_command(self.a, [])
 
     def test_sandboxed_engine_builds_no_command(self):
-        with mock.patch.object(scratch, "sandboxed", return_value=True), self.assertRaises(scratch.ConfinementUnavailable):
+        with mock.patch.object(sandbox, "sandboxed", return_value=True), self.assertRaises(sandbox.ConfinementUnavailable):
             scratch.browser_command(self.a, [])
 
     def test_only_the_engine_built_server_is_accepted(self):
@@ -603,7 +603,7 @@ class BrowserServerTests(unittest.TestCase):
 
     def fake_browser(self, chrome, node=None):
         self.install()
-        listen = verify.free_port(scratch.dashboard_ports() | {43210})
+        listen = verify.free_port(paths.dashboard_ports() | {43210})
         scratch.update_browser(self.a, listen=listen)
         (self.root / "server.py").write_text(self.SERVER)
         for path, body in ((self.root / "chrome", chrome),
@@ -660,7 +660,7 @@ class BrowserServerTests(unittest.TestCase):
         self.assertIsInstance(listen, int)
         self.assertEqual(seen["denied"], listen)
         self.assertNotEqual(listen, port)
-        self.assertNotIn(listen, scratch.dashboard_ports())
+        self.assertNotIn(listen, paths.dashboard_ports())
 
     def test_a_claude_launch_gets_one_http_entry_and_the_server_stops_with_the_attempt(self):
         listen = self.fake_browser(self.DOM)
@@ -742,7 +742,7 @@ class BrowserServerTests(unittest.TestCase):
         (self.root / "linked").symlink_to(shared)
         folder = self.run_dir / "browser"
         cases = (
-            ("the service temp grant holds the run folder", lambda: mock.patch.object(pi, "WRITABLE_ALWAYS", GRANTS),
+            ("the service temp grant holds the run folder", lambda: mock.patch.object(sandbox, "WRITABLE_ALWAYS", GRANTS),
              "browser folder", "service"),
             ("state under /private/tmp", lambda: mock.patch.object(paths, "STATE_DIR", shared / "state"),
              "pinned browser server", "agent"),
@@ -772,9 +772,9 @@ class BrowserServerTests(unittest.TestCase):
             self.reactivate()
             with self.subTest(name), layout(), mock.patch.object(
                     browser, "resolved", side_effect=AssertionError("downloaded into an exposed tree")):
-                with self.assertRaisesRegex(scratch.ConfinementUnavailable, f"the {tree} .* the {actor} write grant"):
+                with self.assertRaisesRegex(sandbox.ConfinementUnavailable, f"the {tree} .* the {actor} write grant"):
                     scratch.browser_config(self.a, self.config, [self.evidence])
-                with self.assertRaises(scratch.ConfinementUnavailable):
+                with self.assertRaises(sandbox.ConfinementUnavailable):
                     scratch.browser_server(self.a)
                 self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], config_text))
                 with self.assertRaises(ValueError):
@@ -785,7 +785,7 @@ class BrowserServerTests(unittest.TestCase):
                 self.assertEqual(refused["mcp_config"], self.config)
                 self.assertIn(scratch.note(None), refused["system"])
                 self.assertTrue(any("trusted scratch authority unavailable" in line for line in said))
-        with self.linked_run(), self.assertRaisesRegex(scratch.ConfinementUnavailable, "the browser folder .* agent"):
+        with self.linked_run(), self.assertRaisesRegex(sandbox.ConfinementUnavailable, "the browser folder .* agent"):
             scratch.browser_server(self.a)
         self.reactivate()
         self.assertTrue(scratch.isolation(self.a, "codex", False, [self.evidence], config_text))
@@ -805,12 +805,12 @@ class BrowserServerTests(unittest.TestCase):
                 self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
         for spelling in ("/private/TMP", "/System/Volumes/Data/private/tmp"):
             authority = Path(str(shared).replace("/private/tmp", spelling)) / "verification-authority"
-            with self.subTest(spelling), mock.patch.object(scratch, "AUTHORITY", authority):
+            with self.subTest(spelling), mock.patch.object(sandbox, "AUTHORITY", authority):
                 self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
         for temp in ("..", "../..", "scratchtmp", ""):
             with self.subTest(f"relative TMPDIR {temp!r}"), mock.patch.dict(os.environ, {"TMPDIR": temp}):
                 self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
-                with self.assertRaisesRegex(scratch.ConfinementUnavailable, "TMPDIR"):
+                with self.assertRaisesRegex(sandbox.ConfinementUnavailable, "TMPDIR"):
                     scratch.browser_exposure(self.a)
 
     def test_a_tmpdir_that_climbs_back_through_a_link_is_refused(self):
@@ -821,16 +821,16 @@ class BrowserServerTests(unittest.TestCase):
         for temp in (str(self.root / "link" / ".."), "/var/../opt", "/tmp/../usr/local", "/var/folders/../../Users"):
             with self.subTest(temp), mock.patch.dict(os.environ, {"TMPDIR": temp}):
                 self.assertFalse(scratch.isolation(self.a, "codex", False, [self.evidence], ""))
-                with self.assertRaisesRegex(scratch.ConfinementUnavailable, "TMPDIR .* free of '..'"):
+                with self.assertRaisesRegex(sandbox.ConfinementUnavailable, "TMPDIR .* free of '..'"):
                     scratch.browser_exposure(self.a, self.node)
-                with self.assertRaisesRegex(scratch.ConfinementUnavailable, "TMPDIR"):
+                with self.assertRaisesRegex(sandbox.ConfinementUnavailable, "TMPDIR"):
                     scratch.actor_grants(self.a)
 
     def test_an_odd_spelling_or_a_removed_cwd_never_escapes_as_a_raw_error(self):
         nowhere = (Path("/private/var/empty"),)
         spelled = Path("/.resolve/1" + str(self.ws))
         if spelled.is_dir():
-            with self.assertRaises(scratch.ConfinementUnavailable):
+            with self.assertRaises(sandbox.ConfinementUnavailable):
                 scratch.exposure(spelled, nowhere)
             self.assertFalse(scratch.apart(spelled, nowhere))
         gone = self.root / "gone"
@@ -839,8 +839,8 @@ class BrowserServerTests(unittest.TestCase):
         os.chdir(gone)
         gone.rmdir()
         self.assertIsNone(scratch.exposure(self.ws, nowhere))
-        self.assertEqual(scratch.canonical(self.ws), self.ws)
-        with self.assertRaises(scratch.ConfinementUnavailable):
+        self.assertEqual(sandbox.canonical(self.ws), self.ws)
+        with self.assertRaises(sandbox.ConfinementUnavailable):
             scratch.exposure(Path("relative"), nowhere)
         self.assertFalse(scratch.apart(Path("relative"), nowhere))
 
@@ -883,11 +883,11 @@ class BrowserServerTests(unittest.TestCase):
     def test_a_failed_build_is_a_failed_result_and_never_the_protected_fallback(self):
         self.prepare()
         text, _ = self.exact()
-        error = scratch.ConfinementUnavailable("pinned browser server: gone")
+        error = sandbox.ConfinementUnavailable("pinned browser server: gone")
         with scratch.producing(self.a), mock.patch.object(scratch, "browser_server", side_effect=error), \
                 mock.patch.object(codex, "home", return_value=self.root), \
                 mock.patch.object(codex.claude, "run_streaming", side_effect=AssertionError("launched")):
-            with mock.patch.object(scratch, "protected_command", side_effect=AssertionError("fallback")), \
+            with mock.patch.object(sandbox, "protected_command", side_effect=AssertionError("fallback")), \
                     self.assertRaises(ValueError):
                 codex.mcp_settings(text, [])
             res = codex._run("p", self.ws, mcp_config=text, allowed_tools=["mcp__playwright__browser_navigate"])
@@ -929,7 +929,7 @@ class BrowserServerTests(unittest.TestCase):
                 mock.patch.object(scratch.os, "chdir") as chdir:
             with self.assertRaises(SystemExit):
                 scratch.browser_start([self.a.selector, "/usr/bin/sandbox-exec", "-p", "x"])
-            with mock.patch.object(scratch, "sandboxed", return_value=True), self.assertRaises(SystemExit):
+            with mock.patch.object(sandbox, "sandboxed", return_value=True), self.assertRaises(SystemExit):
                 scratch.browser_start([self.a.selector, "/usr/bin/sandbox-exec"])
             execv.assert_not_called()
             argv = self.build()
@@ -950,7 +950,7 @@ class BrowserServerTests(unittest.TestCase):
         self.assertEqual(browser.checked()[0], str(self.node))
         tarball = next((folder / "tarballs").iterdir())
         installed = folder / "node_modules" / "dep" / "index.js"
-        pin = scratch.AUTHORITY / browser.PIN
+        pin = sandbox.AUTHORITY / browser.PIN
         cases = {
             "tarball": lambda: tarball.write_bytes(tarball.read_bytes() + b"x"),
             "tree": lambda: installed.write_bytes(b"changed"),
@@ -965,7 +965,7 @@ class BrowserServerTests(unittest.TestCase):
                 shutil.rmtree(folder)
                 self.install()
                 damage()
-                with self.assertRaises(scratch.ConfinementUnavailable):
+                with self.assertRaises(sandbox.ConfinementUnavailable):
                     browser.checked()
 
     def test_a_node_any_actor_can_write_is_refused(self):
@@ -976,18 +976,18 @@ class BrowserServerTests(unittest.TestCase):
                    "service grant": service / "node", "browser folder": self.run_dir / "browser" / "node"}
         for name, planted in layouts.items():
             with self.subTest(name):
-                real = scratch.canonical(planted)
+                real = sandbox.canonical(planted)
                 real.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 real.write_text("#!/bin/sh\n")
                 real.chmod(0o755)
                 with mock.patch.object(browser.shutil, "which", return_value=str(planted)), \
                         mock.patch.dict(os.environ, {"TMPDIR": str(temp)}), \
-                        mock.patch.object(pi, "WRITABLE_ALWAYS", ("/private/tmp", "/dev", str(service))), \
-                        self.assertRaisesRegex(scratch.ConfinementUnavailable, "node"):
+                        mock.patch.object(sandbox, "WRITABLE_ALWAYS", ("/private/tmp", "/dev", str(service))), \
+                        self.assertRaisesRegex(sandbox.ConfinementUnavailable, "node"):
                     scratch.browser_command(self.a, json.loads(self.config)["mcpServers"]["playwright"]["args"][2:])
                 if name == "worktree":
                     with mock.patch.object(browser.shutil, "which", return_value=str(planted)), \
-                            self.assertRaises(scratch.ConfinementUnavailable):
+                            self.assertRaises(sandbox.ConfinementUnavailable):
                         browser.checked()
 
     def test_the_registry_is_not_trusted_blindly(self):
@@ -996,14 +996,14 @@ class BrowserServerTests(unittest.TestCase):
             with self.subTest(name):
                 self.publish(**kwargs)
                 shutil.rmtree(browser.server_folder(), ignore_errors=True)
-                with self.assertRaises(scratch.ConfinementUnavailable):
+                with self.assertRaises(sandbox.ConfinementUnavailable):
                     self.install()
                 self.assertFalse(browser.server_folder().exists())
         link = tarfile.TarInfo("package/link")
         link.type, link.linkname = tarfile.SYMTYPE, "/etc/hosts"
         self.pkg["dep"] = archive({"index.js": b"2"}, [link])
         self.publish()
-        with self.assertRaises(scratch.ConfinementUnavailable):
+        with self.assertRaises(sandbox.ConfinementUnavailable):
             self.install()
         self.pkg["dep"] = archive({"index.js": b"2"})
         self.publish()
@@ -1051,7 +1051,7 @@ class WalkTests(unittest.TestCase):
                      "sandbox-exec is unavailable on this platform")
 class EscapeTests(unittest.TestCase):
     def setUp(self):
-        if scratch.sandboxed():
+        if sandbox.sandboxed():
             self.skipTest("the gate runs under inherited confinement")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -1072,7 +1072,7 @@ class EscapeTests(unittest.TestCase):
         self.other.listen()
         (self.root / "server.json").write_text(f'{{"port": {self.port}}}')
         for patch in (mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees"),
-                      mock.patch.object(scratch, "AUTHORITY", self.secret.parent),
+                      mock.patch.object(sandbox, "AUTHORITY", self.secret.parent),
                       mock.patch.object(paths, "STATE_DIR", self.root / "state"),
                       mock.patch.object(paths, "SERVER_FILE", self.root / "server.json")):
             patch.start()
@@ -1087,9 +1087,9 @@ class EscapeTests(unittest.TestCase):
 
     def profiles(self):
         attempt = attempt_for(self.ws)
-        return {"protected": lambda cmd: scratch.protected_command(cmd, self.ws),
+        return {"protected": lambda cmd: sandbox.protected_command(cmd, self.ws),
                 "service": lambda cmd: scratch.service_command(attempt, shlex.join(cmd)),
-                "agent": lambda cmd: pi.write_confinement(self.ws, []) + list(cmd)}
+                "agent": lambda cmd: sandbox.write_confinement(self.ws, []) + list(cmd)}
 
     def browser_attempt(self):
         run_dir = paths.STATE_DIR / "runs" / "r"
@@ -1316,14 +1316,14 @@ class EscapeTests(unittest.TestCase):
     def test_uv_run_works_inside(self):
         env = {**os.environ, "UV_CACHE_DIR": str(self.root / "uv")}
         argv = ["uv", "run", "--offline", "--no-sync", "--project", str(SOURCE), "python", "-c", "print('ok')"]
-        done = subprocess.run(scratch.protected_command(argv, self.ws), cwd=self.ws, env=env,
+        done = subprocess.run(sandbox.protected_command(argv, self.ws), cwd=self.ws, env=env,
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("ok", done.stdout)
 
     def test_the_regression_gate_works_inside(self):
         test = "tests.test_workflow.OfflineWorkflowTests.test_complete_local_workflow_publishes_verified_change"
-        done = subprocess.run(scratch.protected_command([sys.executable, "-m", "unittest", test], SOURCE),
+        done = subprocess.run(sandbox.protected_command([sys.executable, "-m", "unittest", test], SOURCE),
                               cwd=SOURCE, capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
 
@@ -1417,7 +1417,7 @@ class BrowserRunTests(unittest.TestCase):
     FOLDER_LENGTH = 130
 
     def setUp(self):
-        if scratch.sandboxed() or sys.platform != "darwin":
+        if sandbox.sandboxed() or sys.platform != "darwin":
             self.skipTest("the gate runs under inherited confinement")
         if not shutil.which("node") or not CHROME.exists():
             self.skipTest("node or Google Chrome is not installed")
@@ -1440,9 +1440,9 @@ class BrowserRunTests(unittest.TestCase):
                       mock.patch.object(paths, "STATE_DIR", self.root / "state"),
                       mock.patch.object(paths, "SERVER_FILE", self.root / "server.json"),
                       mock.patch.object(paths, "CONFIG_FILE", self.root / "config.toml"),
-                      mock.patch.object(scratch, "AUTHORITY", self.root / "authority" / "verification-authority"),
+                      mock.patch.object(sandbox, "AUTHORITY", self.root / "authority" / "verification-authority"),
                       mock.patch.object(browser, "fetch", side_effect=lambda url: cached_registry()[url]),
-                      mock.patch.object(pi, "WRITABLE_ALWAYS", ("/private/tmp", "/dev")),
+                      mock.patch.object(sandbox, "WRITABLE_ALWAYS", ("/private/tmp", "/dev")),
                       mock.patch.dict(os.environ, {"TMPDIR": "/private/var/empty"})):
             patch.start()
             self.addCleanup(patch.stop)
@@ -1460,7 +1460,7 @@ class BrowserRunTests(unittest.TestCase):
         scratch.app_port(self.a, f"http://127.0.0.1:{self.port}")
 
     def assert_probe_local(self):
-        for path in (scratch.AUTHORITY, paths.STATE_DIR, paths.SERVER_FILE, paths.CONFIG_FILE, browser.server_folder()):
+        for path in (sandbox.AUTHORITY, paths.STATE_DIR, paths.SERVER_FILE, paths.CONFIG_FILE, browser.server_folder()):
             self.assertTrue(path.is_relative_to(self.root), path)
 
     def serve(self, host, port=0):
@@ -1541,7 +1541,7 @@ class BrowserRunTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(browser.server_folder().stat().st_mode), 0o700)
 
     def test_the_engine_started_server_answers_over_http_and_leaves_no_process(self):
-        listen = scratch.listen_port(self.a, self.port, scratch.dashboard_ports())
+        listen = scratch.listen_port(self.a, self.port, paths.dashboard_ports())
         scratch.update_browser(self.a, listen=listen)
         self.addCleanup(scratch.stop_served, self.a)
         built, reason = scratch.serve_browser(self.a, verify.mcp_config(self.evidence), [self.evidence])
@@ -1604,8 +1604,8 @@ class BrowserRunFixtureTests(unittest.TestCase):
             return real(path, parent, create)
 
         case = BrowserRunTests("test_headless_chrome_loads_the_app_and_writes_a_screenshot")
-        with mock.patch.object(paths, "directory_fd", watched), mock.patch.object(scratch, "sandboxed", return_value=False), \
-                mock.patch.object(pi, "can_confine", return_value=True), \
+        with mock.patch.object(paths, "directory_fd", watched), mock.patch.object(sandbox, "sandboxed", return_value=False), \
+                mock.patch.object(sandbox, "can_confine", return_value=True), \
                 mock.patch.object(shutil, "which", return_value="/bin/sh"), \
                 mock.patch(f"{__name__}.CHROME", Path("/bin/sh")), \
                 mock.patch(f"{__name__}.cached_registry", return_value={"x": b""}), \
@@ -1620,7 +1620,8 @@ class BrowserRunFixtureTests(unittest.TestCase):
 class NoLiveStateTests(unittest.TestCase):
     def test_no_test_here_points_at_the_live_authority_or_state(self):
         live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
-        for path in (scratch.AUTHORITY, paths.SERVER_FILE, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR, pi.SESSIONS_DIR):
+        for path in (sandbox.AUTHORITY, paths.SERVER_FILE, sandbox.AGENT_DIR, sandbox.LOGIN_DIR, sandbox.KEY_DIR,
+                     sandbox.SESSIONS_DIR):
             self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 

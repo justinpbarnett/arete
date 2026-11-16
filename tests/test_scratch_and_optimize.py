@@ -168,7 +168,7 @@ run_dir.mkdir(parents=True)
 scratch.RUN_BASELINES["run-a"] = {}
 a = scratch.make("run-a", "verify", ws, run_dir)
 scratch.end(a, run_dir)
-record = scratch.AUTHORITY / (a.selector + ".json")
+record = sandbox.AUTHORITY / (a.selector + ".json")
 raw = record.read_bytes()
 record.write_bytes(raw[: len(raw) // 2])
 other = t / "worktrees" / "other"
@@ -189,12 +189,11 @@ print("ok")
 
     def test_no_store_frees_look_alikes(self):
         self.run_body(r'''
-from arete import pi
 look = ws / (paths.SCRATCH_PREFIX + secrets.token_hex(8))
 look.mkdir(mode=0o700)
-pi.can_confine = lambda *a, **k: False
+sandbox.can_confine = lambda *a, **k: False
 assert workspace.scratch_left(ws, [c]) == [], workspace.scratch_left(ws, [c])
-pi.can_confine = lambda *a, **k: True
+sandbox.can_confine = lambda *a, **k: True
 assert workspace.scratch_left(ws, [c]) == [look], workspace.scratch_left(ws, [c])
 print("ok")
 ''')

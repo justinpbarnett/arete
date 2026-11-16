@@ -27,11 +27,10 @@ from arete import (
     gh,
     run_lines,
     paths,
-    pi,
     pipeline,
     record,
     runlimits,
-    scratch,
+    sandbox,
     serve,
     state,
     steps,
@@ -48,10 +47,10 @@ def setUpModule():
     folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
     unittest.addModuleCleanup(folder.cleanup)
     root = Path(folder.name).resolve()
-    for pointer in (patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+    for pointer in (patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
                     patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
                     patch.object(paths, "PI_KEYS_FILE", root / "config" / "pi.env"),
-                    *(patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                    *(patch.object(sandbox, name, root / "state" / getattr(sandbox, name).name)
                       for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
         pointer.start()
         unittest.addModuleCleanup(pointer.stop)
@@ -1310,8 +1309,8 @@ class RouteABTests(Isolated):
 class NoLiveStateTests(unittest.TestCase):
     def test_no_test_here_points_at_the_live_authority_or_state(self):
         live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
-        for path in (scratch.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR,
-                     pi.SESSIONS_DIR):
+        for path in (sandbox.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
+                     sandbox.KEY_DIR, sandbox.SESSIONS_DIR):
             self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
