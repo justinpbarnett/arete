@@ -579,7 +579,7 @@ def shown(value, template: str = "{}") -> str:
     return "unknown" if value is None else template.format(value)
 
 
-def report_lines(report: dict) -> list[str]:
+def render(report: dict) -> list[str]:
     lines = [f"benchmark {report['benchmark']} started {report['started']}", report["note"]]
     ran = 0
     for name, c in report["candidates"].items():

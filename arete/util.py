@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
@@ -536,3 +537,20 @@ def write_durably(p: Path, data: bytes, mode: int | None = None, check=None) -> 
 
 def write_json(p: Path, data) -> None:
     write_durably(p, json.dumps(data, indent=2, default=str).encode(), 0o600)
+
+
+@contextmanager
+def repeating(seconds: float, action, name: str):
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(seconds):
+            action()
+
+    beater = threading.Thread(target=beat, name=name, daemon=True)
+    beater.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        beater.join()

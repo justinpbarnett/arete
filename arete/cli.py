@@ -454,7 +454,7 @@ def cmd_jev(args) -> int:
 
     from . import jev_verdicts
 
-    data = jev_verdicts.report(args.days, config.load())
+    data = jev_verdicts.summary(args.days, config.load())
     print(json.dumps(data, indent=2) if args.json else jev_verdicts.render(data))
     return 0
 
@@ -639,7 +639,7 @@ def cmd_verifiers(args) -> int:
             return 0
         if args.action == "run":
             return verifier_suites.run(target, dry=args.dry_run)
-        return verifier_suites.report(target, as_json=args.json)
+        return verifier_suites.show(target, as_json=args.json)
     except (verifier_suites.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -718,9 +718,9 @@ def cmd_implementations(args) -> int:
             return 0
         if args.action == "report":
             file = paths.expand(args.file)
-            return (workers.show if workers.holds(file) else implbench.show)(file, args.json)
+            return (workers.show if workers.is_workers_results(file) else implbench.show)(file, args.json)
         manifest = paths.expand(args.manifest)
-        return (workers.run if workers.declared(manifest) else implbench.run)(manifest, args.out or "", args.dry_run)
+        return (workers.run if workers.is_workers_manifest(manifest) else implbench.run)(manifest, args.out or "", args.dry_run)
     except (experiment.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -760,7 +760,7 @@ def cmd_benchmark(args) -> int:
     if args.json:
         print(json.dumps(found))
     else:
-        print_lines(benchmark.report_lines(found))
+        print_lines(benchmark.render(found))
     return 0
 
 
@@ -1593,8 +1593,8 @@ def cmd_writers(args) -> int:
         elif args.action == "rate":
             print(json.dumps(writers.rate(words[0], words[1], args.rater)))
         else:
-            found = writers.report(words[0])
-            print(json.dumps(found) if args.json else "\n".join(writers.report_lines(found)))
+            found = writers.summary(words[0])
+            print(json.dumps(found) if args.json else "\n".join(writers.render(found)))
     except (writers.Refused, ValueError, TypeError, OSError, config.UnknownRepo) as e:
         print(f"arete writers: {util.first_line(str(e), 400)}", file=sys.stderr)
         return 2

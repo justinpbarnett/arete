@@ -31,4 +31,4 @@ if mode != "finish":
     record.Recorder.finish = dies
 ran = call("benchmark", "run", str(manifest), "--out", str(results))
 trials = [e for e in experiment.events(results) if e.get("event") == "trial"]
-print("BEHAVIOR_RESULT=" + json.dumps({"run": ran, "trials": trials, "report": workers.report(results)}))
+print("BEHAVIOR_RESULT=" + json.dumps({"run": ran, "trials": trials, "report": workers.summary(results)}))

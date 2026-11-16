@@ -592,7 +592,7 @@ def render(found: dict) -> str:
     return "\n".join(out)
 
 
-def report(path: Path | str, as_json: bool = False) -> int:
+def show(path: Path | str, as_json: bool = False) -> int:
     found = summary(read(path))
     print(json.dumps(found) if as_json else render(found))
     return 0

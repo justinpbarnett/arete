@@ -518,6 +518,14 @@ def reached(limits: dict, used: Totals, launching: bool = True) -> str:
                  for key in ("spend_usd", "calls", "tokens", "minutes") if over[key]), "")
 
 
+def seconds_left(limits: dict, used: Totals) -> float:
+    return limits["minutes"] * 60 - used.seconds
+
+
+def timed_out(limits: dict, used: Totals, launching: bool = True) -> str:
+    return reached(limits, replace(used, seconds=limits["minutes"] * 60), launching)
+
+
 def framed(path: Path) -> tuple[dict, dict | None]:
     header, result = {}, None
     for entry in record.lines(path):
@@ -639,7 +647,16 @@ class TrialRun(evals.EvalRun):
                       self.before.seconds + time.monotonic() - self.began)
 
     def seconds_left(self) -> float:
-        return self.limits["minutes"] * 60 - self.used().seconds
+        return seconds_left(self.limits, self.used())
+
+    def repair_limit(self, layer) -> int:
+        return self.settings("check_repair").tries
+
+    def call_kw(self, cfg: config.Config, role: str, tools: list[str], rules: list[str]) -> dict:
+        return {"role": role, "allowed_tools": rules}
+
+    def adopt(self, cfg: config.Config, layer: config.RepoLayer) -> None:
+        self.cfg, self.layer = cfg, layer
 
     def stop(self, why: str):
         self.stopped_by = why
@@ -650,7 +667,7 @@ class TrialRun(evals.EvalRun):
             if why := reached(self.limits, self.used()):
                 self.stop(why)
             if fields.get("launch", 1) > 1 and self.seconds_left() < self.call_timeout:
-                self.stop(reached(self.limits, replace(self.used(), seconds=self.limits["minutes"] * 60)))
+                self.stop(timed_out(self.limits, self.used()))
         super().write_line(event, **fields)
 
     def wait_for_network(self) -> bool:
@@ -671,7 +688,7 @@ class TrialRun(evals.EvalRun):
     def time_for(self, seconds: float) -> float:
         left = self.seconds_left()
         if left <= 0:
-            self.stop(reached(self.limits, replace(self.used(), seconds=self.limits["minutes"] * 60)))
+            self.stop(timed_out(self.limits, self.used()))
         return min(seconds, left)
 
     def dollars_left(self) -> float:
@@ -739,9 +756,9 @@ def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple
         if (why := slot_reason(exp, free, passed)) != told:
             told = why
             print(f"waiting for a run slot: {why}", flush=True)
-        left = exp.limits["minutes"] * 60 - used.seconds - (time.monotonic() - began)
+        left = seconds_left(exp.limits, used) - (time.monotonic() - began)
         if left <= 0:
-            raise Capped(reached(exp.limits, replace(used, seconds=exp.limits["minutes"] * 60)))
+            raise Capped(timed_out(exp.limits, used))
         since = since or util.iso()
         try:
             time.sleep(min(pipeline.SLOT_POLL_SECONDS, ALIVE_SECONDS, left))
@@ -756,19 +773,11 @@ def trial_overrides(exp: Experiment, arm: str) -> dict[str, dict]:
 
 @contextmanager
 def alive(path: Path, run_id: str, started: float):
-    stop = threading.Event()
-
     def beat() -> None:
-        while not stop.wait(ALIVE_SECONDS):
-            append(path, {"event": "alive", "run": run_id, "seconds": round(time.monotonic() - started, 2)})
+        append(path, {"event": "alive", "run": run_id, "seconds": round(time.monotonic() - started, 2)})
 
-    beater = threading.Thread(target=beat, name=f"experiment {run_id}", daemon=True)
-    beater.start()
-    try:
+    with util.repeating(ALIVE_SECONDS, beat, f"experiment {run_id}"):
         yield
-    finally:
-        stop.set()
-        beater.join()
 
 
 def overrun(limits: dict, used: Totals) -> dict:
@@ -808,26 +817,26 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                     extra = exp.extras.get(arm, {})
                     prompts = evals.Prompts(Path(extra["prompts"]), paths.short_path(extra["prompts"])) \
                         if "prompts" in extra else evals.Prompts()
-                    result = evals.run_task(exp.cfg, exp.repo, evals.Source(exp.repo, extra.get("context", "")),
-                                            exp.tasks[task], run_id, False, prompts, run=trial)
+                    result = evals.run_task(exp.cfg, evals.Source(exp.repo, extra.get("context", "")),
+                                            exp.tasks[task], prompts, run=trial)
                 seen = observed(exp, arm)
             except (KeyboardInterrupt, pipeline.Stopped):
                 record.settle(run_id, "stopped", summary=record.STOPPED)
                 append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started,
                                         outcomes=trial.outcomes()))
                 raise
-            failures = result["failures"] or ([result["why"]] if result["why"] else [])
+            failures = result.failures or ([result.why] if result.why else [])
             changed = drift(exp, arm, seen)
             stopped_by = drift_reason(changed) if changed else trial.stopped_by or reached(
                 exp.limits, trial.used(), launching=False)
             record.settle(run_id, "stopped" if stopped_by else "done",
-                          summary=stopped_by if stopped_by else "accepted" if result["passed"]
-                          else f"not accepted: {util.first_line(result['why'], 200)}")
+                          summary=stopped_by if stopped_by else "accepted" if result.passed
+                          else f"not accepted: {util.first_line(result.why, 200)}")
             append(path, trial_line(exp, path, begun, "drifted" if changed else "capped" if stopped_by else "done",
                                     time.monotonic() - started,
-                                    result["passed"] and not stopped_by, failures, result["repairs"],
-                                    {"checks": result["checks"], "verify": result["verify"],
-                                     "hidden_check": result["hidden"], "blocking_findings": result["blocking"],
+                                    result.passed and not stopped_by, failures, result.repairs,
+                                    {"checks": result.checks, "verify": result.verify,
+                                     "hidden_check": result.hidden, "blocking_findings": result.blocking,
                                      **trial.outcomes(),
                                      **({"drift": changed} if changed else {}),
                                      **(overrun(exp.limits, trial.used()) if stopped_by else {})}, seen=seen))

@@ -49,7 +49,7 @@ def scored_row(r: dict, question: str, score: dict) -> dict:
             "approval": r["approval"], "sha": r["sha"] or ""}
 
 
-def report(days: float, cfg: config.Config) -> dict:
+def summary(days: float, cfg: config.Config) -> dict:
     since = util.iso(util.now() - timedelta(days=days))
     rows = state.verdicts_since(since)
     kinds: dict[str, dict] = {}

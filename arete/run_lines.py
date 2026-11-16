@@ -164,16 +164,10 @@ def wait_minutes(run_id: str) -> dict:
 
 @contextmanager
 def beating(run_id: str, step: str):
-    started, stop = time.monotonic(), threading.Event()
+    started = time.monotonic()
 
     def beat() -> None:
-        while not stop.wait(HEARTBEAT_SECONDS):
-            write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
+        write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
 
-    beater = threading.Thread(target=beat, name=f"heartbeat {run_id}", daemon=True)
-    beater.start()
-    try:
+    with util.repeating(HEARTBEAT_SECONDS, beat, f"heartbeat {run_id}"):
         yield
-    finally:
-        stop.set()
-        beater.join()
