@@ -410,6 +410,12 @@ def note(run_id: str, **fields) -> None:
         c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
 
 
+def checkpoint(run_id: str, active: float, verified: float, opened: float, repairs: int, at: str) -> None:
+    with tx() as conn:
+        conn.execute("UPDATE runs SET active_seconds=?, verify_seconds=?, verify_open_seconds=?, "
+                     "repair_calls=?, measured_at=? WHERE id=?", (active, verified, opened, repairs, at, run_id))
+
+
 def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
     if not expect:
         return False

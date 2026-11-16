@@ -46,6 +46,9 @@ def new_id(prefix: str, tag: str = "") -> str:
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
            "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
+    if kind in TICKET_KINDS:
+        row.update(active_seconds=0, verify_seconds=0, verify_open_seconds=0, repair_calls=0,
+                   measured_at=row["started"])
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
         try:
