@@ -110,9 +110,8 @@ def reach(target: str) -> str:
 
 
 def settings(judge: bool = False, opened=()) -> dict:
-    entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); from arete.cli import main; raise SystemExit(main())"
-    command = shlex.join([sys.executable, "-I", "-c", entrypoint, "guard", *(["--judge"] if judge else []),
-                          *(arg for path in opened for arg in ("--open", str(path)))])
+    command = shlex.join(paths.cli_command("guard", *(["--judge"] if judge else []),
+                                           *(arg for path in opened for arg in ("--open", str(path)))))
     return {"hooks": {"PreToolUse": [{"matcher": MATCHER, "hooks": [
         {"type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECONDS}]}]}}
 
