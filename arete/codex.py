@@ -218,10 +218,14 @@ def home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or paths.HOME / ".codex")
 
 
-def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None) -> dict[str, str]:
+def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None, *,
+              api_key: str = "") -> dict[str, str]:
     passing = [] if passing is None else passing
-    return {k: v for k, v in environment.build([*LOGIN_VARS, *passing], {**AGENT_SETS, **(extra or {})},
-                                               never=NEVER, source=source).items() if k not in NEVER}
+    env = {k: v for k, v in environment.build([*LOGIN_VARS, *passing], {**AGENT_SETS, **(extra or {})},
+                                             never=NEVER, source=source).items() if k not in NEVER}
+    if api_key:
+        env["CODEX_API_KEY"] = api_key
+    return env
 
 
 def command_names(passing: list[str], extra: dict[str, str] | None = None) -> list[str]:
@@ -520,6 +524,7 @@ def _run(
     auth: accounts.Auth | None = None,
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
+    api_key: str = "",
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth()
     resume = resume if resume.runner == "codex" else NO_SESSION
@@ -542,7 +547,7 @@ def _run(
     if set(mcp_env) & {*NEVER, *LOGIN_VARS, *environment.BASE, "OPENAI_API_KEY"}:
         return Result(ok=False, session=resume, error="codex MCP environment contains a reserved login variable",
                       runner="codex", model=model)
-    env = {**agent_env(passing, extra_env), **mcp_env}
+    env = {**agent_env(passing, extra_env, api_key=api_key), **mcp_env}
     try:
         cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                       system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, instructions=instructions,

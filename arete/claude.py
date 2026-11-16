@@ -17,6 +17,7 @@ from .agent import (
     Session,
     UsageLimit,
     claude_tokens,
+    credit_limit,
     json_from_text,
     model_scope,
     provider_reset,
@@ -43,10 +44,16 @@ def binary() -> str:
     return shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
 
 
-def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None) -> dict[str, str]:
+def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None, *,
+              api_key: str = "") -> dict[str, str]:
     passing = environment.passed(config.load()) if passing is None else passing
-    return environment.build([*LOGIN_VARS, *passing], {**AGENT_SETS, **(extra or {})}, never=PARENT_SESSION_VARS,
-                             source=source)
+    env = {k: v for k, v in environment.build([*LOGIN_VARS, *passing], {**AGENT_SETS, **(extra or {})},
+                                             never=PARENT_SESSION_VARS, source=source).items()
+           if k not in PARENT_SESSION_VARS}
+    if api_key:
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        env.update(ANTHROPIC_API_KEY=api_key, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="1")
+    return env
 
 
 def command(
@@ -139,9 +146,9 @@ def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
 
 def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
     auth = auth or authentication(kw.get("passing"), kw.get("extra_env"), kw.get("remote"))
-    result = _run(*args, **kw)
+    result = _run(*args, auth=auth, **kw)
     result.auth_mode = auth.mode
-    if auth.mode != "subscription":
+    if auth.mode not in ("subscription", "api_key"):
         result.usage_limit = None
     return result
 
@@ -170,6 +177,8 @@ def _run(
     extra_env: dict[str, str] | None = None,
     passing: list[str] | None = None,
     on_line: Callable[[str], None] = lambda line: None,
+    auth: accounts.Auth | None = None,
+    api_key: str = "",
 ) -> Result:
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
@@ -178,10 +187,11 @@ def _run(
                   persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, remote=remote, settings=settings,
                   instructions=instructions)
     if remote:
-        env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, **AGENT_SETS, **(extra_env or {})}
-        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, {**AGENT_SETS, **(extra_env or {})})
+        extra = {k: v for k, v in (extra_env or {}).items() if k not in PARENT_SESSION_VARS}
+        env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, **AGENT_SETS, **extra}
+        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, {**AGENT_SETS, **extra})
     else:
-        env = agent_env(passing, extra_env)
+        env = agent_env(passing, extra_env, api_key=api_key)
     try:
         proc = child.stream(cmd, None if remote else str(cwd), prompt, env, timeout, on_line)
     except subprocess.TimeoutExpired:
@@ -189,7 +199,10 @@ def _run(
         return Result(ok=False, session=session, error=f"timed out after {timeout}s")
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
-    return parse(proc, resume, model, json_schema)
+    result = parse(proc, resume, model, json_schema)
+    if auth and auth.mode == "api_key":
+        result.usage_limit = credit_limit([result.error, failure_reason(result.raw), proc.stderr]) if not result.ok else None
+    return result
 
 
 def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None) -> Result:

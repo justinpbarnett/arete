@@ -33,7 +33,7 @@ class RunnerTraits:
 
 
 TRAITS = {
-    "claude": RunnerTraits(efforts=("low", "medium", "high", "xhigh", "max"), payment_modes=("subscription",),
+    "claude": RunnerTraits(efforts=("low", "medium", "high", "xhigh", "max"), payment_modes=("subscription", "api_key"),
                            web_tools=WEB_TOOLS, uploads_supported=True),
     "pi": RunnerTraits(
         efforts=("off", "minimal", "low", "medium", "high", "xhigh", "max"), payment_modes=("subscription", "api_key", "local"), takes_mcp=False,

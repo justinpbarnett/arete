@@ -421,6 +421,7 @@ class Picked:
     unknown: str
     auths: set
     budget: float | None
+    api_key: str = field(default="", repr=False)
 
 
 @dataclass
@@ -509,9 +510,13 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
             skipped.append(passed_over(candidate, candidate.state, candidate.detail, candidate.until))
             continue
         selected = None
+        api_key = ""
         if candidate.runner == "pi":
             selected = trip.pinned.get(key) or discovery.probe(candidate.model, candidate.mode)
             auth, name = selected.auth, selected.model
+        elif candidate.credential == "cli_key" and candidate.mode == "api_key":
+            api_key = discovery.cli_key_route(candidate).key
+            auth, name = discovery.cli_key_auth(candidate), candidate.model
         elif candidate.runner == "claude":
             auth, name = discovery.claude_auth(), candidate.model
         elif candidate.runner == "codex":
@@ -534,7 +539,7 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
                                        f"limit reported, rechecking after {routing.local_time(util.iso(floor[0]))}",
                                        util.iso(floor[0])))
             continue
-        return Picked(candidate, auth, selected, name, unknown, auths, remaining), skipped
+        return Picked(candidate, auth, selected, name, unknown, auths, remaining, api_key), skipped
     return None, skipped
 
 
@@ -639,6 +644,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         if kept:
             kw["extra_env"] = {**kept, **(kw.get("extra_env") or {})}
             kw["stored_values"] = sorted(kept.values())
+        if api_key := getattr(picked, "api_key", ""):
+            kw["api_key"] = api_key
+            kw["stored_values"] = [*(kw.get("stored_values") or ()), api_key]
     hook = ()
     kw.pop("verification_attempt", None)
     if trip.scratch:
@@ -684,7 +692,7 @@ def launch_env(picked: Picked, cfg: config.Config, repo: config.Repo | None, run
         return sorted({*pi.launch_env_names(picked.selected), *(extra or {}), *(["ARETE_ASK_TOOL"] if asking else [])})
     passing = environment.passed(cfg, repo)
     return sorted((codex if picked.candidate.runner == "codex" else claude).agent_env(
-        passing, {**(extra or {}), **run_env(run_id)}))
+        passing, {**(extra or {}), **run_env(run_id)}, api_key=getattr(picked, "api_key", "")))
 
 
 def with_spent(res: Result, earlier: list[Result]) -> Result:
