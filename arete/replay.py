@@ -9,10 +9,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import config, owner_asks, paths, record, state, util
-from .agent import NO_SESSION, Result, Session, usage_totals
+from .agent import NO_SESSION, REPLAY, Result, Session, usage_totals
 
 ENV = "ARETE_REPLAY_DIR"
-RUNNER = "replay"
+RUNNER = REPLAY
 SAMPLE_FILE = "notes.txt"
 SAMPLE_TEXT = "A small file for replay checks.\n"
 SAMPLE_WORD = "kumquat"

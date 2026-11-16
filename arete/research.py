@@ -27,12 +27,12 @@ from . import (
     util,
     workspace,
 )
-from .agent import Result
+from .agent import READ_TOOLS, Result
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import fill_template, prompt, slug
 
 REPORTS_DIR = paths.STATE_DIR / "research"
-TOOLS = [*runner.READ_TOOLS, "WebSearch", "WebFetch"]
+TOOLS = [*READ_TOOLS,"WebSearch", "WebFetch"]
 TIMEOUT_SECONDS = 40 * 60
 BUDGET_USD = 5.0
 REPORT_RESERVE_USD = 4.0
@@ -446,7 +446,7 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
         return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
                                       "so no report was written"), budget.spent_usd
     brief = research_plan.brief(plan)
-    tools = TOOLS if plan["needs_search"] else runner.READ_TOOLS
+    tools = TOOLS if plan["needs_search"] else READ_TOOLS
     if plan["needs_search"] and searching:
         found = research_search.run(cfg, budget, plan, ref, judged)
         if found.error:
@@ -458,7 +458,7 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
         if cfg.research_synthesis:
             res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
             return res, budget.spent_usd
-        brief, tools = research_search.brief(plan, found.evidence), runner.READ_TOOLS
+        brief, tools = research_search.brief(plan, found.evidence), READ_TOOLS
     res = budget.call(prompt("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
                       model=cfg.model("research"), tools=tools, allowed_tools=tools, json_schema=SCHEMA,
                       add_dirs=add_dirs, trace=("", f"research {ref} report"), cfg=cfg)

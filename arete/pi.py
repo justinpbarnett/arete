@@ -17,7 +17,21 @@ from datetime import UTC, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import accounts, claude, config, devices, environment, owner_asks, paths, sandbox, scratch, state, util, vault
+from . import (
+    accounts,
+    child,
+    claude,
+    config,
+    devices,
+    environment,
+    owner_asks,
+    paths,
+    sandbox,
+    scratch,
+    state,
+    util,
+    vault,
+)
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
@@ -51,7 +65,6 @@ NO_ANSWER = "A tool call is not an answer. If the ending holds no answer, reply 
 ENDING_REPLIES = 3
 ENDING_CHARS = 12000
 RESTATE_TIMEOUT = 600
-THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 ANTHROPIC_LOGIN_REASON = "a Claude plan login runs only on the claude runner"
 ANTHROPIC_KEY_REQUIRED = (f"pi anthropic: {ANTHROPIC_LOGIN_REASON}; "
@@ -876,11 +889,7 @@ def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd
     result.calls = [replace(result, calls=[]), again]
     result.aggregate_paid_usd = result.paid_usd + again.paid_usd
     result.auth_modes = tuple(dict.fromkeys([*result.modes, *again.modes]))
-    result.cost_usd += again.cost_usd
-    result.tokens_in += again.tokens_in
-    result.tokens_out += again.tokens_out
-    result.cache_read += again.cache_read
-    result.cache_write += again.cache_write
+    result.add_usage([again])
     result.structured = json_from_text(again.text) if again.ok else None
     if again.usage_limit:
         result.ok = False
@@ -924,8 +933,7 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-        if scratch.PRODUCING.get() is not None:
-            util.stop_group(proc)
+        child.release(proc)
     reader.join(5)
     done = subprocess.CompletedProcess(cmd, proc.returncode, "".join(lines), "".join(stderr))
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")

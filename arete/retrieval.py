@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import codebase, config, environment, evals, paths, pipeline, record, replay, routing, runner, util
+from .agent import REPLAY
 
 SPLITS = ("train", "validation", "holdout")
 KINDS = ("embedding", "rerank")
@@ -599,8 +600,8 @@ class Experiment:
                          max_budget_usd=self.suite.spend - self.charged,
                          trace=(self.run_id, f"retrieval {arm.name} {query.name}"), cfg=self.cfg, repo=self.repo,
                          **extra)
-        used = res.runner or (runner.REPLAY if self.cfg.replay.all else gen.runner)
-        charged = 0.0 if used == runner.REPLAY else res.paid_usd
+        used = res.runner or (REPLAY if self.cfg.replay.all else gen.runner)
+        charged = 0.0 if used == REPLAY else res.paid_usd
         self.charged += charged
         row.update(runner=used, model=res.model or gen.model, provider=res.provider, auth_mode=res.auth_mode,
                    effort=res.effort or gen.effort, tokens_in=res.tokens_in, tokens_out=res.tokens_out,

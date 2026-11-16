@@ -23,6 +23,7 @@ from . import (
     prices,
     record,
     replay,
+    routing,
     run_lines,
     runner,
     slots,
@@ -31,6 +32,7 @@ from . import (
     util,
     workspace,
 )
+from .agent import traits_of
 from .diffguard import denied_paths
 from .util import engine_commit
 
@@ -285,7 +287,7 @@ def fingerprints(repo: config.Repo, layer: config.RepoLayer, prompts_dir: Path =
     expertise = layer.expertise_file.read_bytes() if layer.expertise_file.exists() else b""
     return {"prompt": sha(*[(prompts_dir / f"{n}.md").read_bytes() for n in evals.BUILDER_PROMPTS]),
             "context": sha(*harness, expertise),
-            "tools": sha_json([layer.builder_bash, layer.checks, denied_paths(layer), runner.NO_GIT_WRITES])}
+            "tools": sha_json([layer.builder_bash, layer.checks, denied_paths(layer), routing.NO_GIT_WRITES])}
 
 
 def mcp_definitions(cfg: config.Config, s: steps.Settings) -> str:
@@ -303,11 +305,11 @@ def effective(cfg: config.Config, s: steps.Settings) -> str:
 
 
 def codex_route(label: str, s: steps.Settings, limits: dict) -> list[str]:
-    which = runner.stands_for(s.model, s.runner)[0]
-    if which not in runner.CANNOT_STOP:
+    which = routing.stands_for(s.model, s.runner)[0]
+    if not (why := traits_of(which).cannot_stop):
         return []
     if HEADROOM not in limits:
-        raise Refused(f"{label}: {runner.CANNOT_STOP[which]}")
+        raise Refused(f"{label}: {why}")
     return [f"{label} ({which} {s.model})"]
 
 
@@ -318,8 +320,8 @@ def unstoppable(cfg: config.Config, atom: str, arms: dict, frozen: dict, grader:
     routes = []
     for label, (s, role) in held.items():
         routes += codex_route(label, s, limits)
-        which = runner.chosen(s.model, s.runner, cfg)[0]
-        if role in ("plan", "grade") and (why := runner.CANNOT_GATE.get(which)):
+        which = routing.chosen(s.model, s.runner, cfg)[0]
+        if role in ("plan", "grade") and (why := traits_of(which).cannot_gate):
             raise Refused(f"{label}: {why}")
     return routes
 
