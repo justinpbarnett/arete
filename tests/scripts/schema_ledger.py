@@ -133,8 +133,10 @@ def free_port():
 
 DASHBOARD = """
 class Host(tailnet.ScratchHost):
-    def node(self, owner):
-        return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    def node(self):
+        return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
+    def seed_identity(self, login):
+        return "me@example.com", "Me"
     def whois(self, address):
         return "me@example.com"
 dashboard.serve(port=PORT, host=Host(), inside_serve=True)

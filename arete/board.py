@@ -16,6 +16,7 @@ from . import (
     outbound,
     paths,
     pipeline,
+    principals,
     refusals,
     sessions,
     slots,
@@ -410,7 +411,7 @@ def decisions(since: str) -> dict:
     pushes = Counter(push_decision(v) for v in insights_store.verdicts_since(since, connect=foundation.reader) if v["kind"] == "push")
     sent = Counter(a["sent_by"] for a in triage_store.triage_approvals(since, connect=foundation.reader))
     return {"pushes": {k: pushes[k] for k in ("auto", "approved", "rejected", "waiting", "other")},
-            "tickets": {"triage": sent["triage"], "owner": sent["owner"]}}
+            "tickets": {"triage": sent["triage"], "owner": sum(n for actor, n in sent.items() if principals.is_person(actor))}}
 
 
 def push_decision(v: dict) -> str:

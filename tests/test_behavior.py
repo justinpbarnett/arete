@@ -41,6 +41,59 @@ def environment(root):
                        HOME=str(root / "home"))
 
 
+class EventStreamTests(unittest.TestCase):
+    def exercise(self, name):
+        from tests.events_principals_fixture import exercise
+
+        exercise(name)
+
+    def test_live_replay(self):
+        self.exercise("live-replay")
+
+    def test_reconnect_formats(self):
+        self.exercise("reconnect-formats")
+
+    def test_filters_and_paging(self):
+        self.exercise("filters")
+
+    def test_restore_epoch_reset(self):
+        self.exercise("epoch-reset")
+
+    def test_retention_reset(self):
+        self.exercise("retention-reset")
+
+    def test_backlog_reset(self):
+        self.exercise("backlog-reset")
+
+    def test_atomicity(self):
+        self.exercise("atomicity")
+
+    def test_beats(self):
+        self.exercise("beats")
+
+    def test_existing_run_stream(self):
+        self.exercise("nearby")
+
+
+class PrincipalTests(unittest.TestCase):
+    def exercise(self, name):
+        from tests.events_principals_fixture import exercise
+
+        exercise(name)
+
+    def test_admission_and_seed(self):
+        self.exercise("admission-seed")
+
+    def test_principal_gate(self):
+        self.exercise("principal-gate")
+
+    def test_row_actors(self):
+        self.exercise("row-actors")
+
+    def test_completeness(self):
+        self.exercise("completeness")
+
+
 class StoreContractTests(unittest.TestCase):
     def scenario(self, case):
         with tempfile.TemporaryDirectory() as directory:
@@ -149,8 +202,8 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(found["historical_rows"], 2)
         self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
         self.assertEqual(found["applied_once"], found["expected_suffix"])
-        self.assertEqual(found["budget_applied_once"], [5, 6, 7])
-        self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]), (0, 3))
+        self.assertEqual(found["budget_applied_once"], [5, 6, 7, 8])
+        self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]), (0, 4))
         self.assertEqual(found["origin_main_rows_added"], 0)
         self.assertTrue(found["origin_main_unchanged"] and found["latest_unchanged"])
         self.assertEqual(len(found["historical_files"]), len(found["origin_main_ledger"]))

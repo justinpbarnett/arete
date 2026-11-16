@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NoReturn
 
-from . import codebase, config, paths, util
+from . import codebase, config, paths, principals, util
 
 CERT_SECONDS = 120
 RENEW_SECONDS = 7 * 24 * 3600
@@ -61,7 +61,6 @@ def tailscale(*args: str) -> dict:
 class Node:
     addresses: tuple[str, ...]
     names: frozenset[str]
-    owner: str
     name: str
 
 
@@ -90,15 +89,22 @@ def serve_entries(status: dict) -> dict[int, dict[str, str]]:
 
 
 class Tailscale:
-    def node(self, owner: str) -> Node | None:
+    def node(self) -> Node | None:
         status = tailscale("status", "--json")
         me = status.get("Self") or {}
         addresses = tuple(me.get("TailscaleIPs") or ())
         dns_name = (me.get("DNSName") or "").rstrip(".").lower()
-        owner = owner or ((status.get("User") or {}).get(str(me.get("UserID"))) or {}).get("LoginName", "")
-        if status.get("BackendState") != "Running" or not addresses or not owner:
+        if status.get("BackendState") != "Running" or not addresses:
             return None
-        return Node(addresses, frozenset({*addresses, dns_name, dns_name.split(".")[0]} - {""}), owner, dns_name)
+        return Node(addresses, frozenset({*addresses, dns_name, dns_name.split(".")[0]} - {""}), dns_name)
+
+    def seed_identity(self, login):
+        status = tailscale("status", "--json")
+        users = list((status.get("User") or {}).values())
+        me = ((status.get("User") or {}).get(str((status.get("Self") or {}).get("UserID"))) or {})
+        login = login or me.get("LoginName", "")
+        profile = next((u for u in users if u.get("LoginName") == login), {})
+        return login, profile.get("DisplayName") or login.split("@")[0]
 
     def whois(self, address: str) -> str:
         return (tailscale("whois", "--json", address).get("UserProfile") or {}).get("LoginName", "")
@@ -134,8 +140,13 @@ def host_services() -> Tailscale:
     return ScratchHost() if paths.ISOLATED else Tailscale()
 
 
-def this_node(owner: str, host: Tailscale | None = None) -> Node | None:
-    return (host or host_services()).node(owner)
+def this_node(host: Tailscale | None = None) -> Node | None:
+    return (host or host_services()).node()
+
+
+def seed_owner(host, cfg):
+    if not principals.active_human():
+        principals.seed_owner(*host.seed_identity(cfg.dashboard_owner))
 
 
 @dataclass
@@ -323,15 +334,15 @@ def record_server(node: Node, port: int, front: Front) -> None:
         say(f"cannot write the server file ({e.strerror or e}); the CLI will not find this dashboard")
 
 
-def watch(host: Tailscale, owner: str, node: Node, front: Front, secure: bool = False) -> str:
+def watch(host: Tailscale, node: Node, front: Front, secure: bool = False) -> str:
     certificate_due = time.monotonic() + (RENEW_SECONDS if front.tls else CERT_RETRY_SECONDS) \
         if secure else math.inf
     renewal_failed = False
     reload_pending = False
     while True:
-        now = host.node(owner)
+        now = host.node()
         if now != node:
-            return "the tailnet address or owner changed"
+            return "the tailnet address or name changed"
         time.sleep(WATCH_SECONDS)
         if now is None or time.monotonic() < certificate_due:
             continue
@@ -367,7 +378,7 @@ def serve(handlers: Handlers, cfg: config.Config, port: int, inside_serve: bool 
     atexit.register(forget_server)
     try:
         while True:
-            node = host.node(cfg.dashboard_owner)
+            node = host.node()
             try:
                 if node is None:
                     raise OSError("tailscale is not running or reports no address")
@@ -380,6 +391,7 @@ def serve(handlers: Handlers, cfg: config.Config, port: int, inside_serve: bool 
                             say(f"cannot remove the old dashboard proxy record ({e.strerror or e})")
                 if not held:
                     raise OSError(f"another dashboard on this state holds port {port}")
+                seed_owner(host, cfg)
                 front = open_front(host, node, port, logins, inside_serve, handlers, cfg.dashboard_https)
             except OSError as e:
                 if str(e) != waiting_for:
@@ -391,7 +403,7 @@ def serve(handlers: Handlers, cfg: config.Config, port: int, inside_serve: bool 
             for s in front.servers:
                 threading.Thread(target=s.serve_forever, daemon=True).start()
             last_line = announce(node, port, front, last_line)
-            reason = watch(host, cfg.dashboard_owner, node, front, cfg.dashboard_https)
+            reason = watch(host, node, front, cfg.dashboard_https)
             say(f"{reason}; listening again")
             for s in front.servers:
                 stop_listener(s)

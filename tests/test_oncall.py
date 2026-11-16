@@ -2123,7 +2123,9 @@ class Owner:
         return "me@example.com"
 
 
-server = tailnet.Server("127.0.0.1", 0, tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", ""),
+from arete import principals
+principals.seed_owner("me@example.com")
+server = tailnet.Server("127.0.0.1", 0, tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), ""),
                         Owner(), False, dashboard.Handler, dashboard.Redirect)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

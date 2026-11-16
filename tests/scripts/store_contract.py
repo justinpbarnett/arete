@@ -45,6 +45,9 @@ def ownership(root):
     before = ledger(db)
     assert all(migrations.area_owner(row[2], row[1]) for row in before), before
     assert next(row for row in before if row[0] == 4)[2] == "loops", before
+    assert before[-1][0] == 8 and before[-1][2] == "foundation", before[-1]
+    assert owners["events"]["events_log"]
+    assert set(owners["principals"]) == {"principals", "principal_logins"}
     db.migrate()
     assert ledger(db) == before
     run = record.start("pipeline", run_id="store-contract")
@@ -436,7 +439,7 @@ def record_failures(root):
 def run_retention(root, rollback_only=False):
     from datetime import timedelta
 
-    from arete import agent, paths, record, store, util
+    from arete import agent, events, paths, record, store, util
     from arete.store import approvals as approvals_store
     from arete.store import asks as asks_store
     from arete.store import db, incidents, runs as run_store
@@ -504,6 +507,11 @@ def run_retention(root, rollback_only=False):
     record.step("expired", "history", agent.Result(ok=True, runner="replay"), 0)
     run_store.save_report("expired", {"summary": "history survives"})
     seed_retention()
+    with db.tx() as c:
+        trimmed_seq = events.emit("fixture.changed", "fixture:prune", cls="derived", data={})
+        c.execute("UPDATE events_log SET at = ? WHERE seq = ?",
+                  (util.iso(instant - timedelta(days=91)), trimmed_seq))
+    event_before = snapshot_tables("events_log", "schema_meta")
     baseline = baseline_database(root, "retention-baseline")
     with mock.patch.object(paths, "DB_FILE", baseline):
         original_function("prune")()
@@ -521,11 +529,15 @@ def run_retention(root, rollback_only=False):
         refuses(RuntimeError, store.prune)
     after_failure = inventory()
     assert after_failure == before
+    assert snapshot_tables("events_log", "schema_meta") == event_before
     if rollback_only:
         clock.stop()
         return {"rollback": True, "rollback_before": before, "rollback_after": after_failure,
                 "rollback_tables": sorted(before), "rollback_failure": "incidents prune sentinel"}
     store.prune()
+    with db.reader() as c:
+        assert not c.execute("SELECT 1 FROM events_log WHERE seq = ?", (trimmed_seq,)).fetchone()
+        assert int(c.execute("SELECT value FROM schema_meta WHERE key = 'trim_derived'").fetchone()[0]) == trimmed_seq
     assert inventory() == expected
     retention = retained_inventory()
     all_ids = {r["id"] for r in run_store.runs(firings=True, limit=200)}

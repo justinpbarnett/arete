@@ -34,6 +34,7 @@ from . import (
     outbound,
     owner_asks,
     paths,
+    principals,
     prompt_loader,
     record,
     routing,
@@ -288,6 +289,10 @@ class AgentRun:
         return {}
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
+        with principals.acting(f"run:{self.id}/{step}"):
+            return self.agent_as_step(step, text, cwd, role, **kw)
+
+    def agent_as_step(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         s = self.settings(role) if role else None
         if self.budget:
             self.budget.charge(step, s.step if s else role)
@@ -317,7 +322,7 @@ class AgentRun:
                 if s:
                     fields["atom"] = s.step
                 if seam is None:
-                    self.write_line("step_start", step=step, kind=kw["kind"], **fields)
+                    self.write_line("step_start", step=step, kind=kw["kind"], **{"try": attempt_no}, **fields)
                 else:
                     self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kw["kind"],
                                     **fields)
@@ -1116,8 +1121,9 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
         if not run_lines.ended_in_error(run.id, reply="respond" if flow else ""):
             run_lines.write(run.id, "error", step=run_lines.last_step(run.id), message=summary)
     pr_url = pr_url or str((run_store.run_get(run.id) or {}).get("pr_url") or "")
-    run.log(f"done: {status} {pr_url or summary}")
-    record.settle(run.id, status, summary=summary, pr_url=pr_url)
+    end_line = f"done: {status} {pr_url or summary}"
+    run.log(end_line)
+    record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
 
 
@@ -1383,7 +1389,7 @@ def triage_notes(approval: dict | None) -> str:
     assumption_rule = ("Keep an assumption only where the ticket still leaves it open. End `plan` with an \"Assumed\" list "
                        "of every choice the ticket leaves open, these and your own, so the owner can check them in the "
                        "pull request.")
-    if approval["sent_by"] == "owner":
+    if principals.is_person(approval["sent_by"]):
         return (f"## Sent by its owner after triage\n\nIts owner sent this ticket to the pipeline from arete's triage "
                 f"board at {approval['ts']}, after reading triage's questions and assumptions. Any answers they gave are "
                 f"in their own comment that starts \"{prompt_loader.TRIAGE_ANSWERS}\", and an answer wins over what triage assumed. "
@@ -1396,7 +1402,7 @@ def triage_block(approval: dict | None) -> str:
     if not approval:
         return ""
     assumed = "".join(f"\n- {a}" for a in approval["assumptions"])
-    if approval["sent_by"] == "owner":
+    if principals.is_person(approval["sent_by"]):
         return (f"## Sent from the triage board\n\nIts owner sent this ticket from arete's triage board. Triage "
                 f"assumed:{assumed}\n\n") if assumed else ""
     return ("## Approved by triage\n\nArete's triage approved this ticket on its own, so check the choices it made"

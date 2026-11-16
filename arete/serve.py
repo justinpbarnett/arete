@@ -34,6 +34,7 @@ from . import (
     loops,
     oncall,
     paths,
+    principals,
     record,
     routing,
     runner,
@@ -266,7 +267,8 @@ class Server:
 
     def guard(self, key: str, fn: Callable, *args):
         try:
-            result = fn(*args)
+            with principals.acting(f"rule:{key[5:]}" if key.startswith("loop:") else "hand"):
+                result = fn(*args)
         except foundation.NoDatabase:
             raise
         except Exception as e:
@@ -585,6 +587,10 @@ class Server:
         return log
 
     def poll_source(self, loop: Loop, index: int) -> None:
+        with principals.acting(f"rule:{loop.name}"):
+            return self.poll_source_as_rule(loop, index)
+
+    def poll_source_as_rule(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
         try:
             found, items = sources.poll(loop, index, self.cfg, say=self.say)
@@ -610,6 +616,10 @@ class Server:
             self.guard(f"queue:{item['id']}", self.dispatch_queued, item, by_name, slots)
 
     def dispatch_queued(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
+        with principals.acting(f"rule:{item['loop']}"):
+            return self.dispatch_queued_as_rule(item, by_name, slots)
+
+    def dispatch_queued_as_rule(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
         loop = by_name.get(item["loop"])
         if not loop or not loop.enabled or loop.error:
             loop_store.drop_queue_item(item["id"])
@@ -824,46 +834,47 @@ def cleanup_legacy() -> None:
 
 def run(with_dashboard: bool = True) -> NoReturn:
     rotation_notes = install.rotate_own_log()
-    held = take_serve_lock()
-    try:
-        beat = util.read_json(control.BEAT_FILE, {})
-        if beat.get("pid") == os.getpid():
-            util.write_json(control.BEAT_FILE, {**beat, "schema": foundation.LATEST,
-                                              "db": beat.get("db") or {
-                                                  **dbstats.empty_collection(), "status": "initial",
-                                                  "requested_at": None, "finished_at": None, "error": None}})
+    with principals.acting("hand"):
+        held = take_serve_lock()
         try:
-            with util.lock("migrate", wait=True):
-                backup.recover_restore()
-            contracts_waiting = foundation.migrate()
-            if backup.pending_restore():
-                raise backup.Refused("restore metadata could not finish migration; API startup refused")
-            if not paths.ISOLATED:
-                foundation.enable_wal()
-            cleanup_legacy()
-        except Exception as e:
-            print(str(e), file=sys.stderr)
-            raise SystemExit(1) from e
-        server = Server()
-        server.contracts_waiting = contracts_waiting
-        server.lock = held
-    except BaseException:
-        held.close()
-        raise
-    server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
-    for note in rotation_notes:
-        server.say(note)
-    server.report_config()
-    for note in start_notes(server.cfg):
-        server.say(note)
-    if with_dashboard:
-        threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
-    while True:
-        started = time.monotonic()
-        try:
-            server.run_pass()
-        except foundation.NoDatabase as e:
-            server.say(str(e))
+            beat = util.read_json(control.BEAT_FILE, {})
+            if beat.get("pid") == os.getpid():
+                util.write_json(control.BEAT_FILE, {**beat, "schema": foundation.LATEST,
+                                                  "db": beat.get("db") or {
+                                                      **dbstats.empty_collection(), "status": "initial",
+                                                      "requested_at": None, "finished_at": None, "error": None}})
+            try:
+                with util.lock("migrate", wait=True):
+                    backup.recover_restore()
+                contracts_waiting = foundation.migrate()
+                if backup.pending_restore():
+                    raise backup.Refused("restore metadata could not finish migration; API startup refused")
+                if not paths.ISOLATED:
+                    foundation.enable_wal()
+                cleanup_legacy()
+            except Exception as e:
+                print(str(e), file=sys.stderr)
+                raise SystemExit(1) from e
+            server = Server()
+            server.contracts_waiting = contracts_waiting
+            server.lock = held
+        except BaseException:
             held.close()
-            raise SystemExit(1) from e
-        time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))
+            raise
+        server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
+        for note in rotation_notes:
+            server.say(note)
+        server.report_config()
+        for note in start_notes(server.cfg):
+            server.say(note)
+        if with_dashboard:
+            threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
+        while True:
+            started = time.monotonic()
+            try:
+                server.run_pass()
+            except foundation.NoDatabase as e:
+                server.say(str(e))
+                held.close()
+                raise SystemExit(1) from e
+            time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))

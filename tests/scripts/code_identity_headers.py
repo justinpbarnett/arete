@@ -9,7 +9,9 @@ beating.beat()
 beating.pool.shutdown()
 for pool in beating.job_pools.values():
     pool.shutdown()
-node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+from arete import principals
+principals.seed_owner("me@example.com")
+node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
 class Owner:
     def of(self, address):
         return "me@example.com"

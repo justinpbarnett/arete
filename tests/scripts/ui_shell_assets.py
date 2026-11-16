@@ -21,7 +21,9 @@ class Assets(HTMLParser):
 
 check = unittest.TestCase()
 foundation.migrate()
-node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "ui@example.com", "")
+from arete import principals
+principals.seed_owner("ui@example.com")
+node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
 owner = type("Owner", (), {"of": lambda self, address: "ui@example.com"})()
 server = tailnet.Server("127.0.0.1", 0, node, owner, False, dashboard.Handler, dashboard.Redirect)
 thread = threading.Thread(target=server.serve_forever, daemon=True)

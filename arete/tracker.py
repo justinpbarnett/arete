@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from . import config, gh, jira, util
+from . import config, gh, jira, principals, util
 from .store import tasks as tasks_store
 
 LABEL = "agent"
@@ -426,7 +426,7 @@ class LocalTracker:
 
     def reply_since(self, tid: str, since: str) -> str:
         return reply_text([(util.parse_iso(c["ts"]), c["body"] or "") for c in tasks_store.task_comments(tid)
-                           if c["author"] == "owner" and c["ts"]], since)
+                           if principals.is_person(c["author"]) and c["ts"]], since)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()

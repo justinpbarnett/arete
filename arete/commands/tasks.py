@@ -7,7 +7,7 @@ import sys
 import textwrap
 from typing import NoReturn
 
-from .. import config
+from .. import config, principals
 from .common import Parser, print_lines, steering, when
 
 
@@ -82,7 +82,7 @@ def task_reply(args) -> int:
     if not text:
         print('arete task reply ID "your reply"', file=sys.stderr)
         return 2
-    tasks_store.task_comment(tid, "owner", text)
+    tasks_store.task_comment(tid, principals.current(), text)
     print(f"{tid}: reply saved")
     return 0
 
