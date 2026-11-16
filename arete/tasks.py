@@ -280,11 +280,19 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
     tid = str(row["issue"])
     free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
     command = continuing(cfg, repo, row)
+    # Admission can resolve an ask. Check again before posting, and leave asks
+    # open until persistence succeeds so the poller cannot consume a failed reply.
+    with foundation.reader():
+        for a in waiting:
+            current = ask_store.ask_get(a["id"])
+            if not current or current["status"] != "open":
+                raise AlreadyResolved(f"ask {a['id']} was already resolved, so this answer was not stored")
+    kept = store_answer(cfg, repo, tid, text)
     with writes.atomic():
         for a in waiting:
             if not ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text)):
-                raise AlreadyResolved(f"ask {a['id']} was already resolved, so this answer was not stored")
-    kept = store_answer(cfg, repo, tid, text)
+                raise AlreadyResolved(f"ask {a['id']} was already resolved; the answer was stored as a comment, "
+                                      "but this reply did not update the asks or resume the run")
     started = continue_asked(cfg, repo, row, command)
     return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 

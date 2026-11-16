@@ -140,6 +140,8 @@ def stop_run(run_id: str, base_version=None, *, public=False) -> dict:
             break
         except (ProcessLookupError, PermissionError):
             continue
+    else:
+        raise Refused(f"could not signal run {run_id}; its stop request remains recorded")
     return {"id": run_id, "stopped": True, "pid": pid}
 
 

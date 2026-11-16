@@ -62,6 +62,18 @@ def committed_receipt(subject=None, *, first=False):
     return None
 
 
+def reuse_receipt(subject, ver):
+    """Collect an existing version's receipt while its entity is write-locked."""
+    c = foundation.write_connection()
+    row = c.execute("SELECT seq FROM events_log WHERE subject = ? AND ver = ? ORDER BY seq DESC LIMIT 1",
+                    (subject, ver)).fetchone()
+    if not row:
+        return False
+    if RECEIPTS.get() is not None:
+        RECEIPTS.get().append((row["seq"], subject, ver))
+    return True
+
+
 def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=None):
     c = foundation.write_connection()
     actor = principals.current()

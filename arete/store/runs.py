@@ -5,9 +5,9 @@ import math
 import sqlite3
 from datetime import timedelta
 
-from .. import util
+from .. import refusals, util
 from ..agent import billing_of
-from . import writes
+from . import events, writes
 from .db import db, reader, tx
 
 TABLES = {
@@ -430,7 +430,13 @@ def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **
 def ask_stop(run_id: str, base_version=None) -> dict | None:
     with writes.atomic():
         row = writes.check_run(run_id, base_version)
-        if not row or row["status"] != "running" or row["stop_asked"]:
+        if not row or row["status"] != "running":
+            return row
+        if row["stop_asked"]:
+            if not events.reuse_receipt(f"run:{run_id}", row["version"]):
+                raise refusals.Conflict("This run already has a stop request, but no retained receipt for its "
+                                        "current version (legacy or expired history); a repeated stop cannot "
+                                        "be acknowledged with an audit receipt.")
             return row
         return writes.update("runs", run_id, {"stop_asked": util.iso()}, base_version=base_version,
                              expect=("running",))

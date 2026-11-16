@@ -241,9 +241,12 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(found["historical_rows"], 2)
         self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
         self.assertEqual(found["applied_once"], found["expected_suffix"])
-        self.assertEqual(found["budget_applied_once"], [5, 6, 7, 8, 9])
-        self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]), (0, 5))
-        self.assertEqual(found["origin_main_rows_added"], 1)
+        self.assertEqual(found["budget_applied_once"][:5], [5, 6, 7, 8, 9])
+        self.assertEqual(found["budget_applied_once"], found["budget_expected_suffix"])
+        self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]),
+                         (0, len(found["budget_expected_suffix"])))
+        self.assertEqual(found["origin_main_actual_suffix"], found["origin_main_expected_suffix"])
+        self.assertEqual(found["origin_main_rows_added"], len(found["origin_main_expected_suffix"]))
         self.assertTrue(found["origin_main_unchanged"] and found["latest_valid"])
         self.assertEqual(len(found["historical_files"]), len(found["origin_main_ledger"]))
 

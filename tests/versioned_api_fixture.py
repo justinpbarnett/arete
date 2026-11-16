@@ -176,7 +176,11 @@ def migration(root):
 
     from arete.store import db, migrations
 
-    chain = migrations.load()
+    # Exercise migration 9 against its fixed predecessor even when newer
+    # migrations are present in the checkout.
+    chain = [m for m in migrations.load() if m.n <= 9]
+    assert [m.n for m in chain] == list(range(1, 10))
+    assert chain[-1].name == "m0009_foundation_versioned_api.py"
     with mock.patch.object(migrations, "load", return_value=chain[:-1]), \
             mock.patch.multiple(db, LATEST=8, NEEDED=8):
         db.migrate()
@@ -203,8 +207,16 @@ def migration(root):
         assert not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'idempotency'").fetchone()
         assert all("version" not in {r[1] for r in c.execute(f"PRAGMA table_info({t})")} for t in old)
         assert [tuple(r) for r in c.execute("SELECT n, sha256 FROM schema_migrations ORDER BY n")] == ledger
-    db.migrate()
-    db.migrate()
+    with mock.patch.object(migrations, "load", return_value=chain), mock.patch.multiple(db, LATEST=9, NEEDED=9):
+        db.migrate()
+        with db.reader() as c:
+            applied = [tuple(r) for r in c.execute("SELECT * FROM schema_migrations ORDER BY n")]
+            upgraded_schema = [tuple(r) for r in c.execute("SELECT * FROM sqlite_master ORDER BY name")]
+        db.migrate()
+        with db.reader() as c:
+            assert c.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert [tuple(r) for r in c.execute("SELECT * FROM schema_migrations ORDER BY n")] == applied
+            assert [tuple(r) for r in c.execute("SELECT * FROM sqlite_master ORDER BY name")] == upgraded_schema
     with db.reader() as c:
         for table, rows in old.items():
             upgraded = [dict(r) for r in c.execute(f"SELECT rowid, * FROM {table}")]
@@ -216,7 +228,7 @@ def migration(root):
         assert schema["idempotency"][0][1] == "actor" and schema["idempotency"][0][5] == 1
         assert schema["idempotency"][1][1] == "key" and schema["idempotency"][1][5] == 2
         assert next(r for r in schema["events_log"] if r[1] == "via")[3] == 0
-    with db.tx() as c:
+    with mock.patch.multiple(db, LATEST=9, NEEDED=9), db.tx() as c:
         refuses(sqlite3.IntegrityError, lambda: c.execute(
             "INSERT INTO idempotency (actor,key,route,request_sha,status,response,at) VALUES ('hand','key','r','s',0,'','bad')"))
         refuses(sqlite3.IntegrityError, lambda: c.execute(
@@ -644,7 +656,7 @@ def seed_serve(f):
     (f.root / "seed.json").write_text(json.dumps(ids, indent=2))
     port = f.server.server_port
     for label, run in ids.items():
-        print(f"{label}: {run} http://127.0.0.1:{port}/#live/run/{run} "
+        print(f"{label}: {run} http://127.0.0.1:{port}/#run/{run} "
               f"http://127.0.0.1:{port}/ui.html#run/{run}", flush=True)
     print(f"Live: http://127.0.0.1:{port}/#live; evidence: {f.root}", flush=True)
 

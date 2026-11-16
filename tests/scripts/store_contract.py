@@ -45,7 +45,9 @@ def ownership(root):
     before = ledger(db)
     assert all(migrations.area_owner(row[2], row[1]) for row in before), before
     assert next(row for row in before if row[0] == 4)[2] == "loops", before
-    assert before[-1][0] == 9 and before[-1][2] == "foundation", before[-1]
+    assert before[-1][0] == db.LATEST, before[-1]
+    assert next(row for row in before if row[0] == 8)[2] == "foundation"
+    assert next(row for row in before if row[0] == 9)[2] == "foundation"
     assert owners["events"]["events_log"]
     assert set(owners["principals"]) == {"principals", "principal_logins"}
     db.migrate()
@@ -229,21 +231,25 @@ def upgrade(root):
         db.migrate()
         upgraded = ledger(db)
         assert upgraded[:len(previous)] == previous
-        added = [m.n for m in chain if m.name not in old_names]
-        assert [row[0] for row in upgraded[len(previous):]] == added
+        budget_expected_suffix = [m.n for m in chain if m.name not in old_names]
+        added = [row[0] for row in upgraded[len(previous):]]
+        assert added == budget_expected_suffix
         assert next(row for row in previous if row[0] == 4)[2] == "work"
         db.migrate()
         assert ledger(db) == upgraded
-    available = subprocess.run(["git", "ls-tree", "--name-only", "origin/main:arete/store/migrations"],
+    origin_revision = subprocess.run(["git", "rev-parse", "origin/main"], cwd=SOURCE,
+                                     capture_output=True, check=True, text=True).stdout.strip()
+    available = subprocess.run(["git", "ls-tree", "--name-only", f"{origin_revision}:arete/store/migrations"],
                                cwd=SOURCE, capture_output=True, check=True, text=True).stdout.splitlines()
     origin_names = sorted(name for name in available if name.startswith("m") and name.endswith(".py"))
     assert names[:len(origin_names)] == origin_names
+    origin_expected_suffix = [m.n for m in chain[len(origin_names):]]
     historical_files = {}
     for name in origin_names:
         original_file = None
         for location in (f"arete/store/migrations/{name}", f"arete/migrations/{name}"):
             history = subprocess.run(
-                ["git", "log", "--follow", "--name-status", "--format=COMMIT %H", "origin/main", "--", location],
+                ["git", "log", "--follow", "--name-status", "--format=COMMIT %H", origin_revision, "--", location],
                 cwd=SOURCE, text=True, capture_output=True, check=True).stdout
             commit = None
             for line in history.splitlines():
@@ -258,9 +264,9 @@ def upgrade(root):
                                  capture_output=True, check=True).stdout
         assert content == (migrations.FOLDER / name).read_bytes(), name
         historical_files[name] = {"original": original_file, "sha256": hashlib.sha256(content).hexdigest()}
-    latest = subprocess.run(["git", "show", "origin/main:arete/store/migrations/latest.txt"],
+    latest = subprocess.run(["git", "show", f"{origin_revision}:arete/store/migrations/latest.txt"],
                             cwd=SOURCE, capture_output=True, check=True).stdout
-    origin_chain = historical_chain(root, "origin/main", origin_names)
+    origin_chain = historical_chain(root, origin_revision, origin_names)
     assert latest == (origin_chain / "latest.txt").read_bytes()
     assert (migrations.FOLDER / "latest.txt").read_text().strip() == names[-1]
     origin_db = paths.STATE_DIR / "origin-main" / "arete.db"
@@ -276,12 +282,16 @@ def upgrade(root):
         db.migrate()
         origin_upgraded, upgraded_schema = ledger(db), schema(db)
         assert origin_upgraded[:len(origin_ledger)] == origin_ledger
-        assert [row[0] for row in origin_upgraded[len(origin_ledger):]] == [m.n for m in chain[len(origin_names):]]
+        origin_actual_suffix = [row[0] for row in origin_upgraded[len(origin_ledger):]]
+        assert origin_actual_suffix == origin_expected_suffix
         db.migrate()
         assert ledger(db) == origin_upgraded and schema(db) == upgraded_schema
     return {"historical_rows": len(original), "hashes_unchanged": True, "relocated_rows_added": 0,
-            "applied_once": suffix, "expected_suffix": suffix, "pre_budget_rows_added": len(added),
+            "applied_once": [row[0] for row in full[2:]], "expected_suffix": suffix,
+            "pre_budget_rows_added": len(added), "budget_expected_suffix": budget_expected_suffix,
             "origin_main_rows_added": len(origin_upgraded) - len(origin_ledger),
+            "origin_main_expected_suffix": origin_expected_suffix, "origin_main_actual_suffix": origin_actual_suffix,
+            "origin_main_revision": origin_revision,
             "origin_main_ledger": origin_ledger, "origin_main_unchanged": True,
             "historical_files": historical_files, "latest_valid": True,
             "budget_applied_once": added, "historical_work_preserved": True}
