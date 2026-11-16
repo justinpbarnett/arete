@@ -43,11 +43,14 @@ def new_id(prefix: str, tag: str = "") -> str:
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
            "engine_sha": codebase.STAMP, "schema_version": state.LATEST, **fields}
+    if kind in TICKET_KINDS:
+        row.update(active_seconds=0, verify_seconds=0, verify_open_seconds=0, repair_calls=0,
+                   measured_at=row["started"])
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
         try:
-            with state.db() as c:
+            with state.tx() as c:
                 c.execute(f"INSERT INTO runs (id, {cols}) VALUES (?, {marks})", (minted, *row.values()))
             return minted
         except sqlite3.IntegrityError:

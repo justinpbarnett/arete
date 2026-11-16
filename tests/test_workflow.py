@@ -903,7 +903,9 @@ class OfflineWorkflowTests(unittest.TestCase):
         self.assertEqual(result["failed_status"], "failed")
         self.assertIn("checks still failing", result["failed"])
         self.assertGreater(result["failed_span"], 600)
-        self.assertLess(result["failed_budget"]["run_seconds"], 60)
+        self.assertLess(result["failed_row"]["active_seconds"], 60)
+        self.assertEqual(result["failed_row"]["verify_open_seconds"], 0)
+        self.assertRegex(result["failed_row"]["measured_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertEqual(result["failed_budget"]["wait_minutes_left_out"], {"limit": 0, "slot": 0})
         self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
         self.assertEqual(result["status"], "done", result["summary"])
@@ -915,8 +917,10 @@ class OfflineWorkflowTests(unittest.TestCase):
         result = self.workflow("failed-resume-killed")
         self.assertEqual(result["failed_status"], "interrupted")
         self.assertGreaterEqual(result["failed_span"], 600)
-        self.assertIsNotNone(result["failed_budget"]["verification_active_since"])
-        self.assertGreaterEqual(result["failed_budget"]["verification_open_seconds"], 0)
+        self.assertGreater(result["failed_row"]["verify_open_seconds"], .5)
+        self.assertLess(result["failed_row"]["verify_seconds"] + result["failed_row"]["verify_open_seconds"], 31)
+        self.assertEqual(result["killed_signal"], 9)
+        self.assertTrue(result["settlement_unchanged"])
         self.assertLess(result["inherited_run"], 60)
         self.assertLess(result["inherited_verify"], 60)
         self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
@@ -930,6 +934,23 @@ class OfflineWorkflowTests(unittest.TestCase):
         self.assertEqual(result["steps"], [])
         self.assertTrue(result["unmoved"])
         self.assertEqual(result["published"], "")
+
+    def test_fresh_forced_runs_charge_columns_instead_of_legacy_numbers(self):
+        for value in ("high", "low"):
+            with self.subTest(value=value):
+                result = self.workflow("failed-again-columns-" + value)
+                self.assertNotIn("--continue", result["forced_arguments"])
+                self.assertEqual(result["budget"]["parents"], [result["failed_id"]])
+                self.assertEqual(result["status"], "failed" if value == "high" else "done")
+
+    def test_measured_rows_override_wall_spans_and_verification_checkpoints(self):
+        result = self.workflow("failed-again-row-precedence")
+        self.assertEqual([result[k] for k in ("prior_seconds", "verify_seconds", "prior_repairs")], [10, 5, 1])
+
+    def test_unchanged_parked_force_is_refused_and_changed_specification_runs(self):
+        result = self.workflow("budget-waits-admission")
+        self.assertTrue(result["unchanged_refused"])
+        self.assertEqual(result["status"], "done", result["summary"])
 
     def test_behavioral_check_failure_stops_before_verification_or_publication(self):
         result = self.workflow("failed-check")

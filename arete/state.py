@@ -16,7 +16,7 @@ from .agent import billing_of
 from .migrations import m0002_foundation_time_shape as time_shape
 from .sighting import Sighting
 
-TIME_COLUMNS = time_shape.TIME_COLUMNS
+TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["runs"], "measured_at")}
 TIME_GLOB = time_shape.TIME_GLOB
 
 _CHAIN = migrations.load()

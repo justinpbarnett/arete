@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import signal
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -11,7 +12,7 @@ from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
 
-from . import paths, run_lines, state, util
+from . import budget_legacy, paths, run_lines, state, util
 
 IDLE_WAITS = ("limit", "slot")
 CHECKPOINT_SECONDS = 30
@@ -136,108 +137,50 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool) -> tuple[
     return ("", True) if changed else (reason, False)
 
 
+def contracted(conn=None) -> bool:
+    if conn is None:
+        with state.reader() as reader:
+            return contracted(reader)
+    return conn.execute("SELECT 1 FROM schema_migrations WHERE n = 7").fetchone() is not None
+
+
+def measured(run_id: str, row: dict) -> bool:
+    if row.get("measured_at") is not None:
+        return True
+    if row.get("kind") == "pipeline" and row.get("status") != "running" and contracted():
+        raise ValueError(f"run {run_id} has no measured budget usage")
+    return False
+
+
+def counter(run_id: str, row: dict, field: str) -> float:
+    value = row.get(field)
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"run {run_id} has invalid {field}")
+    if field == "repair_calls" and type(value) is not int:
+        raise ValueError(f"run {run_id} has invalid {field}")
+    return value
+
+
 def repair_count(run_id: str) -> int:
-    read = run_lines.read(run_id)
-    saved = metadata(run_id, "budget.json")
-    if "repair_calls" in saved:
-        count = saved["repair_calls"]
-        if type(count) is not int or count < 0:
-            raise ValueError(f"run {run_id} has invalid repair usage")
-        return count
-    if saved:
-        return sum(item.get("event") == "budget_repair" for item in read)
-    found = set()
-    for item in read:
-        name = str(item.get("call") or item.get("step") or "")
-        if (item.get("event") == "step_start" and (item.get("atom") in REPAIRS
-                or name.startswith(REPAIR_NAMES))):
-            found.add((str(item.get("step") or ""), int(item.get("try") or 1)))
-    return len(found)
-
-
-def elapsed(row: dict) -> float:
-    return max(0, (util.parse_iso(row.get("finished") or util.iso()) -
-                   util.parse_iso(row["started"])).total_seconds())
-
-
-def parsed(value):
-    try:
-        return util.parse_iso(value)
-    except (TypeError, ValueError, AttributeError):
-        return None
-
-
-def idle_waits(run_id: str, row: dict) -> dict[str, float]:
-    found = {cause: 0.0 for cause in IDLE_WAITS}
-    began = parsed(row.get("started"))
-    if began is None:
-        return found
-    ended = parsed(row.get("finished")) or parsed(util.iso())
-    opened = {}
-
-    def add(since, until, cause):
-        since, until = max(since, began), min(until, ended)
-        if until > since:
-            found[cause] += (until - since).total_seconds()
-
-    for item in run_lines.read(run_id):
-        cause = item.get("cause")
-        if item.get("event") != "wait" or cause not in IDLE_WAITS:
-            continue
-        at = parsed(item.get("at"))
-        if item.get("phase") == "start" and at is not None:
-            opened[cause] = at
-        elif item.get("phase") == "end":
-            since = parsed(item.get("since"))
-            opened.pop(cause, None)
-            if since is not None and at is not None:
-                add(since, at, cause)
-    for cause, since in opened.items():
-        add(since, ended, cause)
-    return found
+    row = state.run_get(run_id) or {}
+    if measured(run_id, row):
+        return counter(run_id, row, "repair_calls")
+    return budget_legacy.repair_count(run_id)
 
 
 def active_seconds(run_id: str, row: dict) -> float:
-    saved = metadata(run_id, "budget.json")
-    if "run_seconds" in saved:
-        return measured_seconds(run_id, saved, "run_seconds")
-    return max(0, elapsed(row) - sum(idle_waits(run_id, row).values()))
-
-
-def measured_seconds(run_id: str, saved: dict, field: str) -> float:
-    value = saved[field]
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"run {run_id} has invalid {field}")
-    return float(value)
+    if measured(run_id, row):
+        return counter(run_id, row, "active_seconds")
+    return budget_legacy.active_seconds(run_id, row)
 
 
 def verification_seconds(run_id: str, row: dict) -> float:
-    read = run_lines.read(run_id)
-    saved = metadata(run_id, "budget.json")
-    active, spent = saved.get("verification_active_since"), saved.get("verification_seconds", 0)
-    opened = (measured_seconds(run_id, saved, "verification_open_seconds")
-              if "verification_open_seconds" in saved else None)
-    if type(spent) not in (int, float) or not math.isfinite(spent) or spent < 0:
-        raise ValueError(f"run {run_id} has invalid verification usage")
-    if active is not None and (not isinstance(active, str) or not active):
-        raise ValueError(f"run {run_id} has invalid active verification checkpoint")
-    if active or spent or opened is not None:
-        if opened is not None:
-            return float(spent) + (opened if active else 0)
-        return max(0, float(spent)) + (max(0, (util.parse_iso(row.get("finished") or util.iso()) -
-                                             util.parse_iso(active)).total_seconds()) if active else 0)
-    if saved:
-        active, spent = None, 0.0
-        for item in read:
-            if item.get("event") == "budget_verify_start":
-                active = item["ts"]
-            elif item.get("event") == "budget_verify_end":
-                spent += max(0, float(item.get("seconds") or 0))
-                active = None
-        return spent + (max(0, (util.parse_iso(row.get("finished") or util.iso()) -
-                                util.parse_iso(active)).total_seconds()) if active else 0)
-    return sum(max(0, float(step.get("seconds") or 0)) for step in state.steps(run_id)
-               if str(step.get("step") or "").startswith(("verify", "grade")))
+    if measured(run_id, row):
+        return counter(run_id, row, "verify_seconds") + counter(run_id, row, "verify_open_seconds")
+    return budget_legacy.verification_seconds(run_id, row)
+
+
+idle_waits = budget_legacy.idle_waits
 
 
 class Budget:
@@ -272,8 +215,9 @@ class Budget:
         self.watched = False
         self.verify_seconds = sum(verification_seconds(row["id"], row) for row in kept)
         self.prior_repairs = sum(repair_count(rid) for rid in self.parents)
-        self.repair_calls = 0
-        self.current_verification_seconds = 0.0
+        self.repair_calls = repair_count(run.id)
+        self.current_verification_seconds = verification_seconds(run.id, own_row)
+        self.verify_seconds += self.current_verification_seconds
         self.verification_active_since = None
         self.verify_started = None
         self.started = time.monotonic() - active_seconds(run.id, own_row)
@@ -281,6 +225,16 @@ class Budget:
         self.verify_deadline = None
         self.specification = current or next(
             (found for rid in self.parents if (found := recorded_specification(rid))), None)
+        self.charged = {row["id"]: {
+            "run_minutes": round(active_seconds(row["id"], row) / 60, 1),
+            "verification_minutes": round(verification_seconds(row["id"], row) / 60, 1),
+            "repair_calls": repair_count(row["id"]), "estimate": row.get("measured_at") == ""
+        } for row in kept}
+        run_lines.write(run.id, "budget_chain", charged=self.charged)
+        run.log("budget chain: " + ("; ".join(
+            f"{rid}: {v['run_minutes']:.1f} run minutes, {v['verification_minutes']:.1f} verification minutes, "
+            f"{v['repair_calls']} repair calls" + (" (estimate)" if v["estimate"] else "")
+            for rid, v in self.charged.items()) or "no parents"))
         self.persist()
         if left:
             run.log(f"budget: left out {util.count(left_repairs, 'earlier repair cycle')}, "
@@ -288,15 +242,7 @@ class Budget:
                     f"{util.count(len(left), 'earlier run')} because the ticket specification changed since they ran")
 
     def persist(self) -> None:
-        with self.lock:
-            util.write_json(artifact(self.run.id, "budget.json"), {
-                "version": 1, "parents": self.parents, "left_out": self.left_out, "policy": asdict(self.policy),
-                "specification": self.specification, "repair_calls": self.repair_calls,
-                "run_seconds": self.run_seconds(), "run_seconds_at": util.iso(),
-                "verification_open_seconds": (max(0, time.monotonic() - self.verify_started)
-                                              if self.verify_started is not None else 0),
-                "verification_seconds": self.current_verification_seconds,
-                "verification_active_since": self.verification_active_since, **self.left_out_waits()})
+        self.checkpoint()
 
     def run_seconds(self) -> float:
         with self.lock:
@@ -305,12 +251,36 @@ class Budget:
             return max(0, now - self.started - self.idled - opened)
 
     def checkpoint(self) -> None:
-        self.persist()
+        with self.lock:
+            now, at = time.monotonic(), util.iso()
+            opened = now - self.idle_since if self.idle_since is not None else 0
+            active = max(0, now - self.started - self.idled - opened)
+            verify_open = max(0, now - self.verify_started) if self.verify_started is not None else 0
+            saved = {
+                "version": 1, "parents": self.parents, "left_out": self.left_out, "policy": asdict(self.policy),
+                "specification": self.specification, **self.left_out_waits(now)}
+            compatibility = getattr(self, "compatibility", True)
+            try:
+                with state.tx() as conn:
+                    compatibility = not contracted(conn)
+                    self.compatibility = compatibility
+                    conn.execute("UPDATE runs SET active_seconds=?, verify_seconds=?, verify_open_seconds=?, "
+                                 "repair_calls=?, measured_at=? WHERE id=?",
+                                 (active, self.current_verification_seconds, verify_open,
+                                  self.repair_calls, at, self.run.id))
+            except sqlite3.Error as e:
+                self.run.log(f"budget checkpoint failed: {e}")
+            if compatibility:
+                saved.update(run_seconds=active, run_seconds_at=at, repair_calls=self.repair_calls,
+                             verification_seconds=self.current_verification_seconds,
+                             verification_open_seconds=verify_open,
+                             verification_active_since=self.verification_active_since)
+            util.write_json(artifact(self.run.id, "budget.json"), saved)
 
-    def left_out_waits(self) -> dict:
+    def left_out_waits(self, now: float | None = None) -> dict:
         current = dict(self.idle)
         if self.idle_since is not None:
-            current[self.idle_cause] += time.monotonic() - self.idle_since
+            current[self.idle_cause] += (time.monotonic() if now is None else now) - self.idle_since
         return {"wait_minutes_left_out": {cause: round(current[cause] / 60, 2) for cause in IDLE_WAITS},
                 "earlier_wait_minutes_left_out": {cause: round(self.earlier_idle[cause] / 60, 2)
                                                   for cause in IDLE_WAITS}}
@@ -447,7 +417,7 @@ class Budget:
         pr_url = str(row.get("pr_url") or next((r.get("pr_url") for rid in self.parents
                      if (r := state.run_get(rid)) and r.get("pr_url")), ""))
         util.write_json(artifact(self.run.id, "parked.json"), {
-            "reason": reason, "policy": asdict(self.policy), "specification": self.specification,
+            "reason": reason, "charged": self.charged, "policy": asdict(self.policy), "specification": self.specification,
             "heads": published, "branch": branch, "pr_url": pr_url, "kept": kept or {},
             "workspace": str(self.run.workspace[0]) if self.run.workspace else "", "retry": RETRY,
             **self.left_out_waits()})
