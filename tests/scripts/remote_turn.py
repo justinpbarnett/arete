@@ -12,6 +12,16 @@ from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[2]
 
+PS = r'''
+import os, sys
+assert sys.argv[1:4] == ['-o', 'pgid=', '-p'], sys.argv
+assert len(sys.argv) == 5, sys.argv
+try:
+    print(os.getpgid(int(sys.argv[4])))
+except ProcessLookupError:
+    sys.exit(1)
+'''
+
 SSH = r'''
 import json, os, subprocess, sys, time
 from pathlib import Path
@@ -82,9 +92,10 @@ if resist:
 if not (root / 'local').exists():
     published = [int(p.read_text()) for p in (root / 'device').rglob('pgid')]
     assert os.getpgrp() in published, (os.getpid(), os.getpgrp(), published)
-    tool = subprocess.Popen(['sleep', '300'])
+    tool = subprocess.Popen(['sh', '-c', "trap '' TERM; exec sleep 300"] if resist else ['sleep', '300'])
     with (root / 'agents.jsonl').open('a') as f:
-        f.write(json.dumps({'pid': os.getpid(), 'tool': tool.pid, 'pgid': os.getpgrp(), 'session': sid}) + '\n')
+        f.write(json.dumps({'pid': os.getpid(), 'tool': tool.pid, 'pgid': os.getpgrp(), 'session': sid,
+                            'term_resistant_tool': resist}) + '\n')
 (root / 'prompt.txt').write_text(sys.stdin.read())
 (root / 'cwd.txt').write_text(os.getcwd())
 if (root / 'check-cwd').exists():
@@ -129,22 +140,29 @@ def rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
+def remove_turn(path):
+    deleted = path.with_name(path.name + ".deleted")
+    path.rename(deleted)
+    shutil.rmtree(deleted)
+
+
 class Fixture:
     def __init__(self, root):
-        from arete import accounts, child, config, device_turns, devices, gh
+        from arete import accounts, child, config, device_turns, devices, gh, sandbox
         from arete.store import db
 
         self.root = root
         self.observations = []
         (root / "config/config.toml").write_text("")
         urllib.request.urlopen = accounts.read = gh.gh = forbid
+        sandbox.AUTHORITY = root / "authority-parent/verification-authority"
         device_turns.WINDOW_SECONDS = 3
         device_turns.HEARTBEAT_SECONDS = 1
         child.STOP_GRACE_SECONDS = 1
         db.migrate()
         for name in ("bin", "device"):
             (root / name).mkdir()
-        for name, code in (("ssh", SSH), ("claude", CLAUDE)):
+        for name, code in (("ssh", SSH), ("claude", CLAUDE), ("ps", PS)):
             path = root / "bin" / name
             path.write_text(f"#!{sys.executable}\n" + code)
             path.chmod(0o755)
@@ -162,6 +180,8 @@ class Fixture:
             os.killpg(pgid, 0)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            return False
         return False
 
     def assert_gone(self):
@@ -177,7 +197,7 @@ class Fixture:
         target = clients[-1]
         if mode == "lost-folder":
             for pgid in (self.root / "device/.arete/turns").glob("*/*/pgid"):
-                shutil.rmtree(pgid.parent)
+                remove_turn(pgid.parent)
         else:
             if mode in ("half-open", "lost-refused"):
                 (self.root / "refuse").touch()
@@ -262,14 +282,14 @@ class Fixture:
 
     def cleanup(self):
         for agent in self.agents():
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(agent["pgid"], signal.SIGKILL)
         for r in rows(self.root / "ssh.jsonl"):
             if r["half"] == "server":
-                with contextlib.suppress(ProcessLookupError):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(r["pid"], signal.SIGKILL)
             else:
-                with contextlib.suppress(ProcessLookupError):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.kill(r["pid"], signal.SIGKILL)
 
 
@@ -375,7 +395,7 @@ def cleanup(f):
 def bytes_case(f):
     from arete import agent, claude, device_turns
     marks, lines = [], []
-    command = f"import os,time;os.write(1,'é\\n'.encode());os.write(1,b'\\xe2');time.sleep(.5);os.write(1,b'\\x82\\xacpartial');time.sleep(2);os.write(1,b'\\nlast')"
+    command = "import os,time;os.write(1,'é\\n'.encode());os.write(1,b'\\xe2');time.sleep(.5);os.write(1,b'\\x82\\xacpartial');time.sleep(2);os.write(1,b'\\nlast')"
 
     def line(text):
         lines.append(text)
@@ -460,7 +480,13 @@ def watchdog(f):
         else:
             (f.root / "early").unlink(missing_ok=True)
         before = len(f.agents())
-        code = f"import sys;sys.path.insert(0,{str(SOURCE)!r});from arete import child,device_turns,devices;child.STOP_GRACE_SECONDS=1;device_turns.WINDOW_SECONDS=3;device_turns.HEARTBEAT_SECONDS=1;device_turns.run(devices.Device('box','ssh',host='dev@box.test',dir={f.box.dir!r}),['claude'],{f.box.dir!r},{{}},'',timeout=100,on_line=lambda s:None,on_mark=lambda *a:None,leaf={variant!r})"
+        code = (f"import sys;sys.path.insert(0,{str(SOURCE)!r});"
+                "from pathlib import Path;from arete import child,device_turns,devices,sandbox;"
+                f"sandbox.AUTHORITY=Path({str(f.root / 'authority-parent/verification-authority')!r});"
+                "child.STOP_GRACE_SECONDS=1;device_turns.WINDOW_SECONDS=3;device_turns.HEARTBEAT_SECONDS=1;"
+                f"device_turns.run(devices.Device('box','ssh',host='dev@box.test',dir={f.box.dir!r}),"
+                f"['claude'],{f.box.dir!r},{{}},'',timeout=100,on_line=lambda s:None,"
+                f"on_mark=lambda *a:None,leaf={variant!r})")
         proc = subprocess.Popen([sys.executable, "-I", "-c", code])
         try:
             wait_for(lambda: len(f.agents()) > before)
@@ -468,7 +494,7 @@ def watchdog(f):
             proc.wait()
             if variant == "deleted":
                 for path in (f.root / "device/.arete/turns").glob("*/*"):
-                    shutil.rmtree(path)
+                    remove_turn(path)
             f.assert_gone()
             results.append({"variant": variant, "orchestrator": proc.pid, "gone": True})
         finally:
@@ -581,8 +607,11 @@ def answered(f):
 
 
 def upload(f):
+    from dataclasses import replace
+
     from arete import agent, claude, loop_run, ssh, util
 
+    f.box = replace(f.box, turns="upload-fixture-lease")
     prompt = "é" * (1024 * 1024)
     expected = prompt.encode()
     (f.root / "upload-mode").write_text("slow")

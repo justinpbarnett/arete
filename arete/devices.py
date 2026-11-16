@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -175,10 +176,8 @@ def lease(device: Device | str, run_id: str, log=lambda text: None, hold=lambda:
         finally:
             if d.remote:
                 try:
-                    res = device_turns.control(leased, f"rm -rf {device_turns.folder(leased)}")
-                    if res.returncode:
-                        log(f"remote turn cleanup: {ssh.failure(res)}")
-                except Exception as e:
+                    device_turns.cleanup(leased, device_turns.folder(leased), stop=True, discard=True, base=True)
+                except (OSError, subprocess.SubprocessError, RuntimeError) as e:
                     log(f"remote turn cleanup: {e}")
 
 

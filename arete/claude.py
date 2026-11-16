@@ -22,6 +22,7 @@ from .agent import (
     model_scope,
     provider_reset,
     rate_limit_type,
+    streamed_turn,
 )
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -202,10 +203,18 @@ def _run(
             proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
     except device_turns.Lost as e:
         session = Session(fresh_session, 0.0, "claude") if e.started and fresh_session else resume
-        return Result(ok=False, session=session, error=e.why)
-    except subprocess.TimeoutExpired:
+        result = parse(subprocess.CompletedProcess(cmd, 1, e.output, ""), session, model, json_schema)
+        result.error = e.why
+        return result
+    except subprocess.TimeoutExpired as e:
         session = Session(fresh_session, 0.0, "claude") if fresh_session else resume
-        return Result(ok=False, session=session, error=f"timed out after {timeout}s")
+        out = e.output or ""
+        err = e.stderr or ""
+        result = parse(subprocess.CompletedProcess(cmd, 1, out.decode(errors="replace") if isinstance(out, bytes) else out,
+                                                  err.decode(errors="replace") if isinstance(err, bytes) else err),
+                       session, model, json_schema)
+        result.error = f"timed out after {timeout}s"
+        return result
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
     fallback = Session(fresh_session, 0.0, "claude") if remote and proc.started and fresh_session else resume
@@ -219,8 +228,14 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     out = proc.stdout.strip()
     if not (data := result_event(out)):
         error = util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500)
-        return Result(ok=False, session=resume, error=error,
-                      usage_limit=usage_limit({}, proc.stderr + out, model))
+        result = Result(ok=False, session=resume, error=error,
+                        usage_limit=usage_limit({}, proc.stderr + out, model))
+        seen = {}
+        for line in out.splitlines():
+            if turn := streamed_turn(line, seen):
+                for key in ("turns", "cost_usd", "tokens_in", "tokens_out", "cache_read", "cache_write"):
+                    setattr(result, key, getattr(result, key) + turn.get(key, 0))
+        return result
 
     structured = data.get("structured_output")
     if structured is None and json_schema:

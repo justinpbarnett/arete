@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable
 
 from . import child, scratch, ssh
@@ -26,10 +27,7 @@ class Lost(RuntimeError):
     def __init__(self, offset, why, started):
         super().__init__(why)
         self.offset, self.why, self.started = offset, why, started
-
-
-class Answered(Exception):
-    pass
+        self.output = ""
 
 
 def component(value):
@@ -62,31 +60,75 @@ def control(device, script, stdin="", timeout=CONTROL_SECONDS):
             pipe.close()
 
 
-def launch_script(path, argv, cwd, env, timeout, merge_stderr, input_size):
+def launch_script(path, argv, cwd, env, timeout, merge_stderr, input_size, retain=True):
     if any(not ENV_NAME.fullmatch(k) for k in env):
         raise ValueError("invalid remote environment name")
     command = shlex.join(["env", *(f"{k}={v}" for k, v in env.items()), *argv])
     grace = max(0, int(child.STOP_GRACE_SECONDS))
-    job = f"""trap '' HUP
+    job = f"""SECONDS=0
+trap '' HUP
+trap ':' TERM
 turn=$1
 working=$2
+waiting=0
+while ! test -s "$turn/owner"; do
+  test -d "$turn" && test "$waiting" -lt 40 || exit 1
+  sleep .1; waiting=$((waiting + 1))
+done
 group=$(ps -o pgid= -p $$) || exit 1
 set -- $group
-if test "$#" -ne 1 || test "$1" -ne "$$"; then
+if test "$#" -ne 1 || test "$1" -ne "$$" || test "$(cat "$turn/owner")" != "$$"; then
   echo 'remote turn launcher did not create a separate process group' >> "$turn/err.log"
   exit 1
 fi
 echo "$$" > "$turn/pgid.tmp" && mv "$turn/pgid.tmp" "$turn/pgid" || exit 1
-cd "$working" && {command} < "$turn/in" >> "$turn/out" {'2>&1' if merge_stderr else '2>> "$turn/err.log"'}
-code=$?; echo "$code" > "$turn/exit.tmp" && mv "$turn/exit.tmp" "$turn/exit"
+(
+  while ! test -s "$turn/watchdog"; do
+    test -d "$turn" && test "$SECONDS" -lt {min(WINDOW_SECONDS, max(1, int(timeout)))} || exit 1
+    sleep .1
+  done
+  test ! -f "$turn/stop" || exit 1
+  cd "$working" && {command} < "$turn/in" >> "$turn/out" {'2>&1' if merge_stderr else '2>> "$turn/err.log"'}
+  code=$?; echo "$code" > "$turn/exit.tmp" && mv "$turn/exit.tmp" "$turn/exit"
+) &
+echo ready > "$turn/watchdog"
+last_beat=$SECONDS; previous=0
+while :; do
+  reason=
+  test -d "$turn" || reason=stop
+  test -f "$turn/exit" && break
+  test -f "$turn/stop" && reason=stop
+  current=$(cat "$turn/heartbeat" 2>/dev/null)
+  elapsed=$SECONDS
+  if test "$current" != "$previous"; then last_beat=$elapsed; previous=$current; fi
+  idle=$((elapsed - last_beat))
+  test "$idle" -ge {WINDOW_SECONDS} && reason=heartbeat
+  test "$elapsed" -ge {max(1, int(timeout))} && reason=deadline
+  if test -n "$reason"; then
+    kill -TERM -"$$"
+    sleep {grace}
+    if test -d "$turn" && ! test -f "$turn/exit"; then
+      echo "killed: $reason" > "$turn/exit.tmp" && mv "$turn/exit.tmp" "$turn/exit"
+    fi
+    {":" if retain else 'test "$reason" != heartbeat || touch "$turn/discard"'}
+    break
+  fi
+  delay=1
+  if test "$(({max(1, int(timeout))} - elapsed))" -le {grace + CONTROL_SECONDS + 2} || test "$(({WINDOW_SECONDS} - idle))" -le 1; then delay=.1; fi
+  sleep "$delay"
+done
+touch "$turn/stopping"
+kill -KILL -"$$"
 """
-    bash_job = 'set -m; ( exec sh -c "$1" sh "$2" "$3" ) & wait "$!"'
+    bash_job = ('set -m; ( exec bash -c "$1" bash "$2" "$3" ) & '
+                'worker=$!; echo "$worker" > "$2/owner"; wait "$worker"')
     return f"""umask 077
 working=$(cd {ssh.remote_dir(cwd)} && pwd -P) || exit 1
 mkdir -p -m 0700 "$(dirname {path})" || exit 1
 mkdir -m 0700 {path} || exit 2
 turn=$(cd {path} && pwd -P) || exit 1
 cd "$turn" || exit 1
+{":" if retain else "trap 'rm -rf \"$turn\"' 0"}
 cat > in || exit 1
 size=$(wc -c < in) || exit 1
 if test "$size" -ne {input_size}; then
@@ -94,55 +136,48 @@ if test "$size" -ne {input_size}; then
   exit 1
 fi
 : > out; : > err.log; echo 0 > heartbeat
-if command -v setsid >/dev/null 2>&1; then
-  setsid sh -c {shlex.quote(job)} sh "$turn" "$working" </dev/null >/dev/null 2>&1 &
-elif command -v bash >/dev/null 2>&1; then
-  bash -c {shlex.quote(bash_job)} bash {shlex.quote(job)} "$turn" "$working" </dev/null >/dev/null 2>&1 &
-else
-  echo 'remote turns need setsid or bash to create a process group' >&2
-  exit 1
-fi
-launcher=$!
+(
+  trap '' HUP
+  if ! command -v bash >/dev/null 2>&1; then
+    echo 'remote turns need bash to measure elapsed time' >> err.log
+    exit 1
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c {shlex.quote(job)} bash "$turn" "$working" &
+    worker=$!
+    echo "$worker" > owner
+  elif command -v bash >/dev/null 2>&1; then
+    bash -c {shlex.quote(bash_job)} bash {shlex.quote(job)} "$turn" "$working" &
+    worker=$!
+  else
+    echo 'remote turns need setsid or bash to create a process group' >> err.log
+    exit 1
+  fi
+  wait "$worker"
+  if test -f stopping || ! test -s pgid; then
+    : > stopped
+    {":" if retain else 'rm -f in'}
+    if test -f discard; then cd /; rm -rf "$turn"; fi
+  fi
+) </dev/null >/dev/null 2>&1 &
+trap - 0
 tries=0
-while ! test -s pgid; do
-  if ! kill -0 "$launcher" 2>/dev/null || test "$tries" -ge 4; then
-    kill -TERM "$launcher" 2>/dev/null
+while ! test -s watchdog; do
+  if test -f stopped || test "$tries" -ge 40; then
+    touch stop
     cat err.log >&2
     exit 1
   fi
-  sleep 1; tries=$((tries + 1))
+  sleep .1; tries=$((tries + 1))
 done
-pgid=$(cat pgid)
-( trap '' HUP
-  elapsed=0; idle=0; previous=0
-  while :; do
-    reason=
-    if test -f "$turn/exit"; then kill -KILL -"$pgid" 2>/dev/null; exit; fi
-    test -f "$turn/stop" && reason=stop
-    test "$elapsed" -ge {max(1, int(timeout))} && reason=deadline
-    current=$(cat "$turn/heartbeat" 2>/dev/null)
-    if test "$current" != "$previous"; then idle=0; previous=$current; fi
-    test "$idle" -ge {WINDOW_SECONDS} && reason=heartbeat
-    if test -n "$reason"; then
-      kill -TERM -"$pgid" 2>/dev/null
-      sleep {grace}
-      kill -KILL -"$pgid" 2>/dev/null
-      if test -d "$turn" && ! test -f "$turn/exit"; then
-        echo "killed: $reason" > "$turn/watchdog.tmp" && mv "$turn/watchdog.tmp" "$turn/exit"
-      fi
-      exit
-    fi
-    sleep 1; elapsed=$((elapsed + 1)); idle=$((idle + 1))
-  done
-) </dev/null >/dev/null 2>&1 &
-echo "$!" > watchdog
-printf 'started: %s\\n' "$pgid"
+printf 'started: %s\\n' "$(cat pgid)"
 """
 
 
 def attach_script(path, offset):
     return f"""turn=$(cd {path} && pwd -P) || exit 3
 offset={offset}
+printf 'attached\\n'
 while :; do
   test -d "$turn" || exit 3
   size=$(wc -c < "$turn/out") || exit 3
@@ -159,21 +194,50 @@ done
 """
 
 
-def stop(device, path):
-    grace = max(0, int(child.STOP_GRACE_SECONDS))
-    with contextlib.suppress(Exception):
-        control(device, f"test -d {path} || exit 0; cd {path} || exit 1; "
-                f"touch stop; test -s pgid || exit 0; pgid=$(cat pgid); kill -TERM -\"$pgid\" 2>/dev/null; "
-                f"sleep {grace}; kill -KILL -\"$pgid\" 2>/dev/null; true",
-                timeout=grace + CONTROL_SECONDS)
+def cleanup_script(path, *, stop=False, discard=False, base=False, remove=True):
+    ticks = (max(0, int(child.STOP_GRACE_SECONDS)) + CONTROL_SECONDS) * 10
+    return f"""test -d {path} || exit 0
+root=$(cd {path} && pwd -P) || exit 1
+{'set -- "$root"/*' if base else 'set -- "$root"'}
+for turn do
+  test -d "$turn" || continue
+  {('touch "$turn/stop" || exit 1') if stop else ':'}
+  {('touch "$turn/discard" || exit 1') if discard else ':'}
+done
+tries=0
+for turn do
+  test -d "$turn" || continue
+  while test -s "$turn/pgid" && ! test -f "$turn/stopped"; do
+    test -d "$turn" || break
+    test "$tries" -lt {ticks} || exit 1
+    sleep .1; tries=$((tries + 1))
+  done
+done
+{'cd / && rm -rf "$root"' if remove else ':'}
+"""
+
+
+def cleanup(device, path, *, stop=False, discard=False, base=False, remove=True, retry=True, deadline=None):
+    duration = max(0, int(child.STOP_GRACE_SECONDS)) + CONTROL_SECONDS + 2
+    end = time.monotonic() + duration
+    if deadline is not None:
+        end = min(end, deadline)
+    while True:
+        try:
+            result = control(device, cleanup_script(path, stop=stop, discard=discard, base=base, remove=remove),
+                             timeout=max(.01, end - time.monotonic()))
+            if result.returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not retry or time.monotonic() >= end:
+            raise RuntimeError("remote turn cleanup was not acknowledged")
+        time.sleep(min(.1, max(0, end - time.monotonic())))
 
 
 def finish(device, path, timeout=CONTROL_SECONDS):
     return control(device, f"turn=$(cd {path} && pwd -P) || exit 3; cd \"$turn\" || exit 3; "
-                   "cat exit; tail -c 6000 err.log; "
-                   "pgid=$(cat pgid); kill -KILL -\"$pgid\" 2>/dev/null; "
-                   "watchdog=$(cat watchdog); kill -TERM \"$watchdog\" 2>/dev/null; "
-                   'cd /; rm -rf "$turn"', timeout=timeout)
+                   "test -f stopped && test -f exit || exit 4; cat exit; tail -c 6000 err.log", timeout=timeout)
 
 
 def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: str, *, timeout: float,
@@ -182,35 +246,42 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
     if not db.migration_applied(CONTRACT):
         raise ssh.DeviceError("remote turns wait for the remote-turn contract; stop older runs, loops, sessions "
                               "and serve processes, then run arete migrate")
-    path = folder(device, leaf)
+    path = folder(device, leaf if device.turns else f"{leaf}-{uuid.uuid4().hex}")
     deadline = time.monotonic() + timeout
     started = False
     attempted = False
+    awaiting_status = False
     offset = 0
     output = []
     finished = threading.Event()
     heartbeat = None
     answer = child.Answer()
+    pending = b""
+    acknowledged = False
+    settling = False
 
     def lost(why):
         on_mark("lost", offset)
-        raise Lost(offset, why, started)
+        error = Lost(offset, why, started)
+        error.output = "".join(output)
+        raise error
 
     def left():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            if settle_answer and answer.given:
-                raise Answered
-            raise subprocess.TimeoutExpired(argv, timeout)
+            raise subprocess.TimeoutExpired(argv, timeout, output="".join(output))
         return remaining
 
     def beat():
         counter = 0
         while not finished.wait(HEARTBEAT_SECONDS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
             counter += 1
             with contextlib.suppress(Exception):
                 control(device, f"test -d {path} && printf '%s\\n' {counter} > {path}/heartbeat",
-                        timeout=min(CONTROL_SECONDS, HEARTBEAT_SECONDS))
+                        timeout=min(CONTROL_SECONDS, HEARTBEAT_SECONDS, remaining))
 
     def deliver(data):
         nonlocal offset
@@ -221,8 +292,24 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
             answer.saw(line)
         on_line(line)
 
+    def read_status():
+        end = min(deadline, time.monotonic() + WINDOW_SECONDS)
+        while True:
+            try:
+                result = finish(device, path, timeout=min(CONTROL_SECONDS, left(),
+                                                         max(.01, end - time.monotonic())))
+            except (OSError, subprocess.SubprocessError):
+                left()
+                result = None
+            status, _, err = result.stdout.partition("\n") if result else ("", "", "")
+            if result and result.returncode == 0 and (status.isdigit() or status.startswith("killed: ")):
+                return status, err
+            if time.monotonic() >= end:
+                lost("lost the device turn exit status")
+            time.sleep(min(.1, left(), max(0, end - time.monotonic())))
+
     try:
-        script = launch_script(path, argv, cwd, env, timeout, merge_stderr, len(stdin.encode()))
+        script = launch_script(path, argv, cwd, env, timeout, merge_stderr, len(stdin.encode()), retain=bool(device.turns))
         attempted = True
         try:
             launched = control(device, script, stdin, timeout=left())
@@ -258,6 +345,7 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
 
         while True:
             pending = b""
+            acknowledged = False
             try:
                 proc = scratch.spawn([*ssh.ssh_argv(device), attach_script(path, offset)], stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -268,8 +356,12 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
                 with selectors.DefaultSelector() as selector:
                     selector.register(proc.stdout, selectors.EVENT_READ)
                     while True:
-                        if settle_answer and answer.given and answer.quiet_for() >= child.ANSWERED_QUIET_SECONDS:
-                            raise Answered
+                        remaining = left()
+                        if settle_answer and answer.given and (
+                                answer.quiet_for() >= child.ANSWERED_QUIET_SECONDS
+                                or remaining <= child.STOP_GRACE_SECONDS + CONTROL_SECONDS + 2):
+                            settling = True
+                            break
                         if broken_since is not None and time.monotonic() - broken_since >= WINDOW_SECONDS:
                             lost("lost the device while attaching to remote turn")
                         if not selector.select(min(.25, left())):
@@ -277,58 +369,73 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
                         data = os.read(proc.stdout.fileno(), 65536)
                         if not data:
                             break
-                        broken_since = None
-                        retries = 0
                         pending += data
+                        if not acknowledged:
+                            if b"\n" not in pending:
+                                continue
+                            ack, pending = pending.split(b"\n", 1)
+                            if ack != b"attached":
+                                break
+                            acknowledged = True
+                            broken_since = None
+                            retries = 0
                         while b"\n" in pending:
                             line, pending = pending.split(b"\n", 1)
                             deliver(line + b"\n")
-                code = proc.wait(timeout=min(CONTROL_SECONDS, left()))
+                code = None if settling else proc.wait(timeout=min(CONTROL_SECONDS, left()))
             finally:
                 if proc.poll() is None:
                     proc.kill()
                 proc.wait()
                 proc.stdout.close()
-            if code == 3:
-                lost("lost the device turn folder")
-            if code == 0:
+            if settling:
                 if pending:
                     deliver(pending)
+                    pending = b""
+                break
+            if code == 3:
+                lost("lost the device turn folder")
+            if code == 0 and acknowledged:
+                if pending:
+                    deliver(pending)
+                    pending = b""
+                awaiting_status = True
                 break
             reconnect()
         finished.set()
-        heartbeat.join(CONTROL_SECONDS + 1)
+        heartbeat.join(max(0, min(CONTROL_SECONDS + 1, deadline - time.monotonic())))
+        if settling:
+            try:
+                cleanup(device, path, stop=True, remove=False, deadline=deadline)
+            except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+                lost(str(error))
+        status, err = read_status()
         try:
-            result = finish(device, path, timeout=min(CONTROL_SECONDS, left()))
-        except (OSError, subprocess.SubprocessError):
             left()
-            lost("lost the device while finishing remote turn")
-        status, _, err = result.stdout.partition("\n")
-        if result.returncode or not (status.isdigit() or status.startswith("killed: ")):
-            lost("lost the device turn exit status")
+            cleanup(device, path, deadline=deadline)
+            left()
+        except (OSError, RuntimeError):
+            lost("remote turn cleanup was not acknowledged")
         if status == "killed: deadline":
-            raise subprocess.TimeoutExpired(argv, timeout)
-        completed = subprocess.CompletedProcess(argv, int(status) if status.isdigit() else 137, "".join(output), err)
+            raise subprocess.TimeoutExpired(argv, timeout, output="".join(output), stderr=err)
+        completed = subprocess.CompletedProcess(argv, 0 if settling else int(status) if status.isdigit() else 137,
+                                                "".join(output), err)
         completed.started = started
         return completed
-    except Answered:
+    except BaseException as error:
         finished.set()
         if heartbeat:
-            heartbeat.join(CONTROL_SECONDS + 1)
-        stop(device, path)
-        err = ""
-        with contextlib.suppress(Exception):
-            result = finish(device, path)
-            _, _, err = result.stdout.partition("\n")
-        completed = subprocess.CompletedProcess(argv, 0, "".join(output), err)
-        completed.started = started
-        return completed
-    except BaseException:
-        finished.set()
-        if heartbeat:
-            heartbeat.join(CONTROL_SECONDS + 1)
+            heartbeat.join(max(0, min(CONTROL_SECONDS + 1, deadline - time.monotonic())))
+        if pending and acknowledged:
+            output.append(pending.decode(errors="replace"))
+        if isinstance(error, subprocess.TimeoutExpired | Lost):
+            error.output = "".join(output)
         if attempted:
-            stop(device, path)
+            try:
+                remove = not device.turns and not awaiting_status
+                cleanup(device, path, stop=True, discard=remove, remove=remove, retry=False, deadline=deadline)
+            except (OSError, subprocess.SubprocessError, RuntimeError) as cleanup_error:
+                error.add_note(str(cleanup_error))
         raise
     finally:
         finished.set()

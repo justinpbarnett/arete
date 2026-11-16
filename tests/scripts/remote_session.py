@@ -1,8 +1,15 @@
 
-import contextlib, json, os, shlex, shutil, subprocess, sys, urllib.request
+import contextlib
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import urllib.request
 from pathlib import Path
 from arete.store import runs as run_store
-from arete import config, devices, gh, record, sessions, util
+from arete import config, devices, gh, record, scratch, sessions, util
 from arete.store import db as foundation
 root = Path(sys.argv[1])
 foundation.migrate()
@@ -46,6 +53,13 @@ urllib.request.urlopen = lambda request, timeout=None: asked.append(json.loads(r
 gh.key_signature = lambda app, text: b"signature"
 gh.default_branch = lambda repo: "main"
 real_sh = util.sh
+real_spawn = scratch.spawn
+def remote_call(cmd):
+    assert cmd[0] == "ssh" and cmd[-2] == "dev@box.test", cmd
+    calls.append(cmd[-1])
+    script = cmd[-1].replace("https://github.com/octo/widgets.git", hub.as_uri())
+    script = script.replace("GIT_ALLOW_PROTOCOL=https", "GIT_ALLOW_PROTOCOL=https:file")
+    return script, {**agent_env, "ARETE_FAKE_CALL": str(len(calls) - 1)}
 def sh(cmd, *a, **k):
     if not (isinstance(cmd, list) and cmd[:1] == ["ssh"]):
         if "push" in cmd:
@@ -53,15 +67,19 @@ def sh(cmd, *a, **k):
             if scenario == "task-retry" and len(pushes) <= 2:
                 return subprocess.CompletedProcess(cmd, 1, "", "fatal: network down")
         return real_sh(cmd, *a, **k)
-    calls.append(cmd[-1])
+    script, env = remote_call(cmd)
     stdins.append(k.get("input") or "")
     if scenario == "bundle-fails" and "git bundle create" in cmd[-1]:
         return subprocess.CompletedProcess(cmd, 1, "", "fatal: the device went away")
-    script = cmd[-1].replace("https://github.com/octo/widgets.git", hub.as_uri())
-    script = script.replace("GIT_ALLOW_PROTOCOL=https", "GIT_ALLOW_PROTOCOL=https:file")
-    env = {**agent_env, "ARETE_FAKE_CALL": str(len(calls) - 1)}
     return subprocess.run(["sh", "-c", script], cwd=home, env=env, input=k.get("input") or "", capture_output=True, text=True)
+def spawn(cmd, *a, **k):
+    if isinstance(cmd, list) and cmd[:1] == ["ssh"]:
+        script, env = remote_call(cmd)
+        stdins.append("")
+        return subprocess.Popen(["sh", "-c", script], *a, cwd=home, env=env, **k)
+    return real_spawn(cmd, *a, **k)
 util.sh = sh
+scratch.spawn = spawn
 box = devices.Device("box", "ssh", host="dev@box.test", dir=str(home / "work"))
 devices.get = lambda name: box
 cfg = config.Config(repos=[config.Repo("widgets", here, github="octo/widgets")],
