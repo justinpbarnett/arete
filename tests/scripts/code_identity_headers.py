@@ -1,6 +1,6 @@
 
 import json, threading, urllib.request, urllib.error
-from arete import codebase, control, dashboard, paths, serve, state, util
+from arete import codebase, control, dashboard, paths, serve, state, tailnet, util
 codebase.load()
 state.migrate()
 beating = serve.Server()
@@ -8,13 +8,13 @@ beating.beat()
 beating.pool.shutdown()
 for pool in beating.job_pools.values():
     pool.shutdown()
-node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
 class Owner:
     def of(self, address):
         return "me@example.com"
-server = dashboard.Server("127.0.0.1", 0, node, Owner(), False)
+server = tailnet.Server("127.0.0.1", 0, node, Owner(), False, dashboard.Handler, dashboard.Redirect)
 threading.Thread(target=server.serve_forever, daemon=True).start()
-dashboard.record_server(node, server.server_port, dashboard.Front("http", [server]))
+tailnet.record_server(node, server.server_port, tailnet.Front("http", [server]))
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 heads = []
 for path in ("/", "/nothing-here"):

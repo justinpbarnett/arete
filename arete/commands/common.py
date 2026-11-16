@@ -29,11 +29,6 @@ def steering(p: Parser) -> Parser:
     return p
 
 
-def refused(e: Exception) -> int:
-    print(e, file=sys.stderr)
-    return 1
-
-
 def when(stamp: str | None) -> str:
     from .. import util
 

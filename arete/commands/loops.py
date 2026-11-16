@@ -6,18 +6,14 @@ import json
 import sys
 
 from .. import config, paths
-from .common import Parser, follow, loop_line, print_feed_line, print_table, refused, serve_line, when
+from .common import Parser, follow, loop_line, print_feed_line, print_table, serve_line, when
 
 
 def loop_errors(handler):
     @functools.wraps(handler)
     def guarded(args) -> int:
-        from .. import control, loops
 
-        try:
-            return handler(args)
-        except (control.NotFound, control.Busy, control.Refused, loops.LoopError) as e:
-            return refused(e)
+        return handler(args)
 
     return guarded
 
@@ -213,45 +209,36 @@ def probe_words(probe: dict | None) -> tuple[str, str]:
 
 
 def devices_list(args) -> int:
-    from .. import control, devices
+    from .. import control
 
-    try:
-        fleet = control.fleet()
-        print_table([(d["name"], d["kind"], d.get("host") or "", *probe_words(d.get("probe"))) for d in fleet], 220,
-                    indent="")
-        for d in fleet:
-            if d.get("error"):
-                print(f"  {d['error']}")
-        return 0
-    except devices.DeviceError as e:
-        return refused(e)
+    fleet = control.fleet()
+    print_table([(d["name"], d["kind"], d.get("host") or "", *probe_words(d.get("probe"))) for d in fleet], 220,
+                indent="")
+    for d in fleet:
+        if d.get("error"):
+            print(f"  {d['error']}")
+    return 0
 
 
 def devices_probe(args) -> int:
     from .. import devices
 
-    try:
-        info = devices.probe(args.name)
-        print(json.dumps(info, indent=2))
-        return 0 if info["ok"] else 1
-    except devices.DeviceError as e:
-        return refused(e)
+    info = devices.probe(args.name)
+    print(json.dumps(info, indent=2))
+    return 0 if info["ok"] else 1
 
 
 def cmd_webhook(args) -> int:
-    from .. import control, dashboard, webhooks
+    from .. import control, tailnet, webhooks
 
-    try:
-        loop = control.working_loop(args.name)
-    except (control.NotFound, control.Refused) as e:
-        return refused(e)
+    loop = control.working_loop(args.name)
     if not loop.trigger.webhook:
         print(f"{loop.name} has no webhook; set `webhook = true` under [trigger] in {paths.short_path(loop.file)}",
               file=sys.stderr)
         return 1
     key = webhooks.secret(loop.name)
-    node = dashboard.this_node(config.load().dashboard_owner)
-    print(f"POST {dashboard.url(node, config.load().dashboard_port)}{webhooks.hook_path(loop.name)}")
+    node = tailnet.this_node(config.load().dashboard_owner)
+    print(f"POST {tailnet.url(node, config.load().dashboard_port)}{webhooks.hook_path(loop.name)}")
     print(f"X-Arete-Token: {key}")
     print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
     return 0

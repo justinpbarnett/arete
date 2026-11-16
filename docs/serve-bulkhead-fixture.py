@@ -45,7 +45,7 @@ class Rig:
         self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
-        state.ensure_schema()
+        state.migrate()
         self.config_text = GOOD + ("\n[oncall]\nenabled = true\n" if oncall else "")
         paths.CONFIG_FILE.write_text(self.config_text)
         loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
@@ -548,14 +548,14 @@ def run_request(request):
 
 
 def serve(port):
-    from arete import dashboard
+    from arete import dashboard, tailnet
     for folder in (REQUESTS, RESULTS):
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True)
     fresh()
-    node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
     owner = type("Owner", (), {"of": lambda self, address: node.owner})()
-    server = dashboard.Server("127.0.0.1", port, node, owner, False)
+    server = tailnet.Server("127.0.0.1", port, node, owner, False, dashboard.Handler, dashboard.Redirect)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     SERVING.write_text(str(os.getpid()))
     print(f"fixture serving on http://127.0.0.1:{port}  (Ctrl-C stops it)", file=sys.__stdout__, flush=True)

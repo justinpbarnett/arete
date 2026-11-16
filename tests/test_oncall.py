@@ -2105,7 +2105,7 @@ class Repairs(Scratch):
 SERVER = '''
 import json, os, threading, urllib.error, urllib.request
 from datetime import timedelta
-from arete import board, dashboard, oncall, record, state, util
+from arete import board, dashboard, oncall, record, state, tailnet, util
 from arete.sighting import Sighting
 state.migrate()
 ALERTS = []
@@ -2117,8 +2117,8 @@ class Owner:
         return "me@example.com"
 
 
-server = dashboard.Server("127.0.0.1", 0, dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", ""),
-                          Owner(), False)
+server = tailnet.Server("127.0.0.1", 0, tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", ""),
+                        Owner(), False, dashboard.Handler, dashboard.Redirect)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 

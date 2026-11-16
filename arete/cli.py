@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, codebase, config, paths
+from . import __version__, codebase, paths
 from .commands import costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
 from .commands.common import Parser, serve_line
 
@@ -25,6 +25,8 @@ class ShowVersion(argparse.Action):
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import refusals
+
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
@@ -35,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         codebase.load()
     try:
         return args.fn(args) or 0
-    except config.UnknownRepo as e:
+    except refusals.Refusal as e:
         print(e, file=sys.stderr)
         return 1
 

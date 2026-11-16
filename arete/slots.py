@@ -6,7 +6,7 @@ from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import TextIO
 
-from . import config, paths, record, state, util
+from . import config, paths, record, refusals, state, util
 
 SLOTS_LOCK = "run-slots"
 SLOT_KINDS = ("pipeline", "experiment")
@@ -96,7 +96,7 @@ def no_free_slot(max_parallel: int) -> str:
     return f"no run slot is free (max_parallel {max_parallel})"
 
 
-class NoFreeSlot(RuntimeError):
+class NoFreeSlot(refusals.Conflict, RuntimeError):
     pass
 
 

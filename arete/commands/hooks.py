@@ -5,7 +5,7 @@ import sys
 from collections import Counter
 
 from .. import config, paths
-from .common import refused, when
+from .common import when
 
 
 def cmd_events(args) -> int:
@@ -51,16 +51,13 @@ def oncall_toggle(args, cfg) -> int:
 
 
 def oncall_incident_action(args, cfg) -> int:
-    from .. import control, oncall
+    from .. import oncall
 
     if not args.id.isdigit():
         print(f"no incident {args.id}" if args.id else f"{args.action} needs an incident number", file=sys.stderr)
         return 1
     number = int(args.id)
-    try:
-        done = getattr(oncall, args.action)(number)
-    except (control.NotFound, control.Refused) as e:
-        return refused(e)
+    done = getattr(oncall, args.action)(number)
     if args.action == "cancel":
         stopped = f"stopped run {done['stopped']}" if done["stopped"] else "no run was live"
         print(f"cancelled incident {number}: {stopped}; cooling down until {done['cooldown_until'] or '-'}")

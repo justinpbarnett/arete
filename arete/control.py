@@ -16,6 +16,7 @@ from . import (
     loops,
     paths,
     record,
+    refusals,
     run_lines,
     sources,
     state,
@@ -42,16 +43,16 @@ STEP_FIELD_OF = {"step": "step", "kind": "task_kind", "model": "model"}
 TOKEN_FIELDS = ("tokens_in", "cache_read", "cache_write", "tokens_out")
 
 
-class NotFound(LookupError):
+class NotFound(refusals.NotFound, LookupError):
     pass
 
 
-class Busy(RuntimeError):
+class Busy(refusals.Conflict, RuntimeError):
     def __init__(self, name: str) -> None:
         super().__init__(f"{name} is running; stop it or wait")
 
 
-class Refused(ValueError):
+class Refused(refusals.Invalid, ValueError):
     pass
 
 

@@ -2,7 +2,7 @@
 import hashlib, hmac, json, os, signal, sqlite3, sys, threading, urllib.error, urllib.request
 from datetime import timedelta
 from pathlib import Path
-from arete import config, dashboard, webhooks, loops, paths, serve, sources, state, util
+from arete import config, dashboard, webhooks, loops, paths, serve, sources, state, tailnet, util
 state.migrate()
 root = Path(os.environ["INTAKE_ROOT"])
 rows = root / "rows.jsonl"
@@ -55,9 +55,9 @@ def failing_once(real):
     return flaky
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def web():
-    node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
     owner = type("Owner", (), {"of": lambda self, address: "me@example.com"})()
-    server = dashboard.Server("127.0.0.1", 0, node, owner, False)
+    server = tailnet.Server("127.0.0.1", 0, node, owner, False, dashboard.Handler, dashboard.Redirect)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 def post(server, name, body, headers):

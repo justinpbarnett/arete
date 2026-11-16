@@ -8,7 +8,7 @@ import textwrap
 from typing import NoReturn
 
 from .. import config
-from .common import Parser, print_lines, refused, steering, when
+from .common import Parser, print_lines, steering, when
 
 
 def task_shown(task_id: str, repo: str, one_line: bool) -> int:
@@ -153,27 +153,24 @@ def stop_on_sigterm(signum, frame) -> NoReturn:
 def cmd_approve(args) -> int:
     from .. import control, delivery
 
-    try:
-        if args.id is None:
-            pending = delivery.waiting()
-            for a in pending:
-                print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
-                                    f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
-                                    subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
-                for line in approval_notes(a):
-                    print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
-                                        subsequent_indent=" " * 8, break_on_hyphens=False))
-            if not pending:
-                print("nothing waiting for approval")
-            return 0
-        before = signal.signal(signal.SIGTERM, stop_on_sigterm)
-        try:
-            print(json.dumps(control.decide(args.id, not args.reject)))
-        finally:
-            signal.signal(signal.SIGTERM, before)
+    if args.id is None:
+        pending = delivery.waiting()
+        for a in pending:
+            print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
+                                f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
+                                subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
+            for line in approval_notes(a):
+                print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
+                                    subsequent_indent=" " * 8, break_on_hyphens=False))
+        if not pending:
+            print("nothing waiting for approval")
         return 0
-    except (control.NotFound, control.Refused) as e:
-        return refused(e)
+    before = signal.signal(signal.SIGTERM, stop_on_sigterm)
+    try:
+        print(json.dumps(control.decide(args.id, not args.reject)))
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    return 0
 
 
 def register(sub) -> None:

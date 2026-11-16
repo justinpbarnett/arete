@@ -4,7 +4,7 @@ import re
 import shlex
 from dataclasses import dataclass
 
-from . import paths, util
+from . import paths, refusals, util
 
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=30", "-o", "ForwardAgent=no"]
 SSH_FAILED = 255
@@ -46,7 +46,7 @@ class Device:
 LOCAL = Device("local", note="this machine")
 
 
-class DeviceError(RuntimeError):
+class DeviceError(refusals.Invalid, RuntimeError):
     pass
 
 

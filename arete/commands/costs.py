@@ -6,7 +6,7 @@ import sys
 from collections import Counter
 
 from .. import config, paths
-from .common import Parser, print_lines, print_table, refused, steering
+from .common import Parser, print_lines, print_table, steering
 
 
 def hold_end(text: str) -> str:
@@ -58,7 +58,8 @@ def cmd_hold(args) -> int:
         print(f"held {args.subscription} until {routing.local_time(until)}; its steps take the next route in their tier")
         return 0
     except (ValueError, OSError) as e:
-        return refused(e)
+        print(e, file=sys.stderr)
+        return 1
 
 
 def cmd_costs(args) -> int:
@@ -92,14 +93,12 @@ def cmd_costs(args) -> int:
             print(f"backfilled {count} steps")
             return 0
     except (ValueError, OSError) as e:
-        return refused(e)
+        print(e, file=sys.stderr)
+        return 1
 
     if args.by or args.json:
         return print_step_costs(args.by or ["step"], args.days, args.json)
-    try:
-        c = control.costs(args.days)
-    except control.Refused as e:
-        return refused(e)
+    c = control.costs(args.days)
     print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; subscription calls count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
@@ -122,8 +121,9 @@ def cmd_ab(args) -> int:
 
     try:
         report = control.ab_report(args.name or "", args.days)
-    except (control.Refused, ValueError, TypeError) as e:
-        return refused(e)
+    except (ValueError, TypeError) as e:
+        print(e, file=sys.stderr)
+        return 1
     if args.json:
         for test in report:
             print(json.dumps(test))
@@ -154,10 +154,7 @@ def cmd_ab(args) -> int:
 def print_step_costs(groupings: list[str], days: float | None, as_json: bool) -> int:
     from .. import control
 
-    try:
-        found = [(by, control.step_costs(by, days)) for by in groupings]
-    except control.Refused as e:
-        return refused(e)
+    found = [(by, control.step_costs(by, days)) for by in groupings]
     c = found[-1][1]
     waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"], "paid_usd": c["paid_usd"],
              "subscription_usd": c["subscription_usd"]}

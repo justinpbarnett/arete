@@ -7,7 +7,7 @@ import os
 import sys
 
 from .. import paths
-from .common import Parser, follow, refused
+from .common import Parser, follow
 
 CHAT_SESSION_ACTIONS = ("start", "list", "report", "stop")
 CHAT_ONCE = "--chat is given once; the chat is the one the command was allowed for"
@@ -29,12 +29,8 @@ def chosen_chat(args) -> int | None:
 def session_errors(handler):
     @functools.wraps(handler)
     def guarded(args) -> int:
-        from .. import control
 
-        try:
-            return handler(args)
-        except (control.NotFound, control.Busy, control.Refused) as e:
-            return refused(e)
+        return handler(args)
 
     return guarded
 
@@ -164,7 +160,7 @@ def chat_session(args, chat: int) -> int:
     from urllib.parse import quote
 
     from .. import chat as chats
-    from .. import client, control
+    from .. import client
 
     base = f"/api/chats/{chat}/sessions"
     if args.action == "start":
@@ -196,8 +192,6 @@ def chat_session(args, chat: int) -> int:
     except client.Failed as e:
         print(e, file=sys.stderr)
         return 1
-    except (control.NotFound, control.Busy, control.Refused, chats.NoChat) as e:
-        return refused(e)
     print(json.dumps(answer))
     return 0
 

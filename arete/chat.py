@@ -13,6 +13,7 @@ from . import (
     paths,
     pipeline,
     record,
+    refusals,
     routing,
     runner,
     sessions,
@@ -55,19 +56,19 @@ starting = threading.Lock()
 replying: dict[int, float] = {}
 
 
-class Busy(RuntimeError):
+class Busy(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoDraft(RuntimeError):
+class NoDraft(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoChat(LookupError):
+class NoChat(refusals.NotFound, LookupError):
     pass
 
 
-class BadProject(ValueError):
+class BadProject(refusals.Invalid, ValueError):
     pass
 
 

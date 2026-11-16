@@ -1,11 +1,11 @@
 
-from arete import dashboard
+from arete import dashboard, tailnet
 write(BAD)
 server, said = quiet_server()
 server.run_pass()
-class Host(dashboard.ScratchHost):
+class Host(tailnet.ScratchHost):
     def node(self, owner):
-        return dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+        return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
     def whois(self, address):
         return "me@example.com"
 import socket
