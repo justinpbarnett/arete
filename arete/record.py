@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Self
 
 from . import agent, codebase, paths, run_lines, scrub, state, util
+from .store import db as foundation
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -42,12 +43,12 @@ def new_id(prefix: str, tag: str = "") -> str:
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
-           "engine_sha": codebase.STAMP, "schema_version": state.LATEST, **fields}
+           "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
         try:
-            with state.db() as c:
+            with foundation.db() as c:
                 c.execute(f"INSERT INTO runs (id, {cols}) VALUES (?, {marks})", (minted, *row.values()))
             return minted
         except sqlite3.IntegrityError:
@@ -62,7 +63,7 @@ def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: st
 
 def steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
           try_no: int = 0, auth_mode: str = "") -> None:
-    with state.db() as c:
+    with foundation.db() as c:
         for res, seconds in calls:
             c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
                       " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
@@ -90,13 +91,13 @@ def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") 
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",
                   (*labels.values(), run_id, step, try_no))
 
 
 def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
-    with state.db() as c:
+    with foundation.db() as c:
         row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
         held = {**json.loads((row["ab_held"] if row else "") or "{}"), role: [name, side, arm]}
         c.execute("UPDATE runs SET ab_held = ? WHERE id = ?", (json.dumps(held), run_id))
@@ -109,7 +110,7 @@ def metered_spent(run_id: str) -> float:
 def note(run_id: str, **fields) -> None:
     if "status" in fields:
         raise ValueError("use move to change a run's status")
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
 
 
@@ -117,14 +118,14 @@ def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
     if not expect:
         return False
     fields = {**fields, "status": to}
-    with state.db() as c:
+    with foundation.db() as c:
         return c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} "
                          f"WHERE id = ? AND status IN ({','.join('?' * len(expect))})",
                          (*fields.values(), run_id, *expect)).rowcount > 0
 
 
 def ask_stop(run_id: str) -> dict | None:
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running'", (util.iso(), run_id))
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     return dict(r) if r else None
@@ -154,7 +155,7 @@ def stop_asked(run_id: str) -> bool:
 
 def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | None:
     fields = {"status": status, "finished": util.iso(), **fields}
-    with state.db() as c:
+    with foundation.db() as c:
         if not c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ? AND status = 'running'",
                          (*fields.values(), run_id)).rowcount:
             return None
@@ -465,7 +466,7 @@ def raw_lines(path: Path) -> Iterator[str]:
 
 def run_status(run_id: str) -> str:
     try:
-        row = state.run_get(run_id, connect=state.reader)
+        row = state.run_get(run_id, connect=foundation.reader)
     except sqlite3.Error:
         return ""
     return (row.get("status") or "") if row else ""
@@ -534,7 +535,7 @@ def numbered_events(path: Path) -> Iterator[dict]:
 
 
 def runs_since(since: str, until: str = "9999") -> list[dict]:
-    with state.db() as c:
+    with foundation.db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status != 'running' "
                                            "AND COALESCE(finished, started) >= ? AND COALESCE(finished, started) < ? "
                                            "ORDER BY started", (since, until))]
@@ -869,7 +870,7 @@ def legacy_firing(folder: Path) -> bool:
 
 
 def purge_folders() -> Purged:
-    with state.db() as c:
+    with foundation.db() as c:
         queued = {r["run_id"] for r in c.execute("SELECT run_id FROM run_purges")}
         known = {r["id"] for r in c.execute("SELECT id FROM runs")}
     folders, size, errors = 0, 0, []
@@ -883,7 +884,7 @@ def purge_folders() -> Purged:
                 shutil.rmtree(folder)
                 folders, size = folders + 1, size + measured
             if not folder.exists():
-                with state.db() as c:
+                with foundation.db() as c:
                     c.execute("DELETE FROM run_purges WHERE run_id = ?", (run_id,))
         except (OSError, ValueError) as e:
             errors.append(f"{run_id}: {type(e).__name__}: {e}")

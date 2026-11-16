@@ -1,3 +1,4 @@
+from arete.store import db as foundation
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -69,7 +70,7 @@ def trace(sql):
         captured.setdefault(active[0], []).append(sql)
 
 
-original = paths.connect_db
+original = foundation.connect_db
 
 
 def connect_db(*args, **kwargs):
@@ -79,7 +80,7 @@ def connect_db(*args, **kwargs):
     return conn
 
 
-paths.connect_db = connect_db
+foundation.connect_db = connect_db
 
 
 def call(name, function, *args, **kwargs):

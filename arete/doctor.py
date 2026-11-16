@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from fnmatch import fnmatchcase
 
 from . import backup, install, paths, state, util
+from .store import db as foundation
 
 SAMPLE_LIMIT = 5
 YOUNG_MINUTES = 10
@@ -198,7 +199,7 @@ def run() -> list[Result]:
     with ExitStack() as stack:
         conn, opened = None, None
         try:
-            conn = stack.enter_context(state.reader())
+            conn = stack.enter_context(foundation.reader())
         except Exception as e:
             conn, opened = None, e
 

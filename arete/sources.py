@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 from . import config, cron, gh, jira, paths, state, util
 from .loops import Loop, as_list, blank, github_remote
+from .store import db as foundation
 
 DEFAULT_EVERY = 300
 GITHUB_WATCH = ("ci_red", "issue", "advisory")
@@ -79,7 +80,7 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
 
 
 def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
-    with state.tx():
+    with foundation.tx():
         if events is None:
             return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how)) else []
         batches: dict[str, list[dict]] = {}
@@ -148,7 +149,7 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
     cursor = None if first else kind.rescope(source, known["value"]) if changed or unsure else known["value"]
     found, value = kind.fetch(loop, source, cfg, sid, cursor)
     unique = {e["key"]: e for e in found}
-    with state.tx():
+    with foundation.tx():
         claimed = set(state.claim_seen(sid, list(unique)))
         fresh = [e for k, e in unique.items() if k in claimed]
         if first:

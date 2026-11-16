@@ -2,38 +2,37 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import secrets
 import sqlite3
-import threading
-import time
 from collections.abc import Sequence
-from contextlib import contextmanager, suppress
 from datetime import timedelta
 
-from . import dbstats, migrations, paths, util
+from . import util
 from .agent import billing_of
-from .migrations import m0002_foundation_time_shape as time_shape
 from .sighting import Sighting
+from .store import db as foundation
 
-TIME_COLUMNS = time_shape.TIME_COLUMNS
-TIME_GLOB = time_shape.TIME_GLOB
-
-_CHAIN = migrations.load()
-LATEST = _CHAIN[-1].n
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract")
-MIGRATE_WAIT_SECONDS = 60
-_CHECKED = set()
-_OWNER = threading.local()
-
-
-class NoDatabase(RuntimeError):
-    pass
-
-
-class IncompatibleSchema(RuntimeError):
-    pass
-
+LATEST = foundation.LATEST
+MIGRATE_WAIT_SECONDS = foundation.MIGRATE_WAIT_SECONDS
+NEEDED = foundation.NEEDED
+TIME_COLUMNS = foundation.TIME_COLUMNS
+TIME_GLOB = foundation.TIME_GLOB
+IncompatibleSchema = foundation.IncompatibleSchema
+NoDatabase = foundation.NoDatabase
+checked_connection = foundation.checked_connection
+contract_blockers = foundation.contract_blockers
+db = foundation.db
+ensure_schema = foundation.ensure_schema
+execute_statements = foundation.execute_statements
+migrate = foundation.migrate
+missing_database = foundation.missing_database
+one_read = foundation.one_read
+owned = foundation.owned
+owning_transaction = foundation.owning_transaction
+read_connection = foundation.read_connection
+reader = foundation.reader
+refuse_empty_file = foundation.refuse_empty_file
+tx = foundation.tx
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
 DECIDABLE = ("pending", "failed")
@@ -41,254 +40,6 @@ APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_trie
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 REFRESH_SCOPE = "credential-refresh-v1:"
-
-
-def refuse_empty_file() -> None:
-    if paths.DB_FILE.exists() and paths.DB_FILE.stat().st_size > 0:
-        return
-    from . import backup
-
-    if newest := backup.newest_snapshot():
-        raise NoDatabase(f"{paths.DB_FILE} is missing or empty but {newest} exists; stop arete serve and run "
-                         f"`arete backup --restore {newest}` instead of starting over with an empty file")
-
-
-def missing_database():
-    refuse_empty_file()
-    return NoDatabase(f"{paths.DB_FILE} is missing; run arete serve or arete migrate")
-
-
-def contract_blockers(conn, n):
-    from . import control, record
-
-    blockers = []
-    for row in conn.execute("SELECT * FROM runs WHERE status = 'running' "
-                            "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
-        row = dict(row)
-        with record.dead(row) as gone:
-            if not gone:
-                blockers.append(row["id"])
-    beat = util.read_json(control.BEAT_FILE, {})
-    if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
-        blockers.append(f"serve {beat.get('pid')}")
-    return blockers
-
-
-def execute_statements(conn, sql):
-    pending = ""
-    for char in sql:
-        pending += char
-        if char == ";" and sqlite3.complete_statement(pending):
-            conn.execute(pending)
-            pending = ""
-    if pending.strip():
-        conn.execute(pending)
-
-
-def migrate(contracts=True):
-    from . import backup
-
-    chain = migrations.load()
-    paths.ensure_dirs()
-    with util.lock("migrate", wait=True):
-        refuse_empty_file()
-        conn = paths.connect_db(paths.DB_FILE, create=True)
-        conn.row_factory = sqlite3.Row
-        try:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            migrations.validate(conn, chain, version)
-            conn.close()
-            conn = None
-            snapshot = None
-            started_chain = False
-            for migration in chain:
-                if migration.n <= version:
-                    continue
-                if migration.phase == "contract":
-                    if not contracts:
-                        return True
-                    conn = paths.connect_db(paths.DB_FILE)
-                    conn.row_factory = sqlite3.Row
-                    try:
-                        blockers = contract_blockers(conn, migration.n)
-                    finally:
-                        conn.close()
-                        conn = None
-                    if blockers:
-                        print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
-                        return True
-                if not started_chain:
-                    if paths.DB_FILE.stat().st_size:
-                        snapshot = backup.snapshot(f"m{migration.n}")
-                    started_chain = True
-                started = time.monotonic()
-                try:
-                    timing = dbstats.Timing(paths.DB_FILE, "write")
-                    with owning_transaction(lambda: paths.connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
-                        if migration.sql is not None:
-                            execute_statements(writer, migration.sql)
-                        else:
-                            migration.apply(writer)
-                        writer.execute("INSERT INTO schema_migrations "
-                                       "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
-                                       (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
-                                        util.iso(), snapshot.name if snapshot else "", time.monotonic() - started))
-                        writer.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
-                                       (str(migration.n),))
-                        writer.execute(f"PRAGMA user_version = {migration.n}")
-                except BaseException as e:
-                    raise migrations.Refused(f"{migration.name}: {e}") from e
-                version = migration.n
-                print(f"applied {migration.name}", flush=True)
-            backup.finish_restore()
-            return False
-        finally:
-            if conn is not None:
-                conn.close()
-
-
-def checked_connection():
-    from . import backup
-
-    if backup.pending_restore():
-        raise IncompatibleSchema("pending restore requires arete serve or arete migrate before writing")
-    try:
-        identity = paths.DB_FILE.stat()
-    except FileNotFoundError:
-        if not paths.ISOLATED:
-            raise missing_database() from None
-        migrate()
-        identity = paths.DB_FILE.stat()
-    if identity.st_size == 0:
-        refuse_empty_file()
-    try:
-        conn = paths.connect_db(paths.DB_FILE)
-    except (sqlite3.OperationalError, FileNotFoundError):
-        if not paths.DB_FILE.exists():
-            raise missing_database() from None
-        raise
-    try:
-        key = (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
-               getattr(identity, "st_birthtime", None), LATEST, NEEDED)
-        if key not in _CHECKED:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if paths.ISOLATED and version == 0:
-                conn.close()
-                migrate()
-                return checked_connection()
-            deadline = time.monotonic() + MIGRATE_WAIT_SECONDS
-            if version < NEEDED:
-                print(f"schema {version} waits for schema {NEEDED}; run arete serve or arete migrate", flush=True)
-            while version < NEEDED:
-                if time.monotonic() >= deadline:
-                    raise IncompatibleSchema(f"schema {version} needs {NEEDED}; run arete serve or arete migrate")
-                time.sleep(0.5)
-                version = conn.execute("PRAGMA user_version").fetchone()[0]
-            oldest = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0])
-            if oldest > LATEST:
-                raise IncompatibleSchema(f"oldest_writer {oldest} is above this code's schema {LATEST}")
-            _CHECKED.add(key)
-        return conn
-    except BaseException:
-        with suppress(BaseException):
-            conn.close()
-        raise
-
-
-@contextmanager
-def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True):
-    conn = None
-    failed = False
-    try:
-        conn = connect()
-        conn.row_factory = sqlite3.Row
-        conn.execute(begin)
-        if timing:
-            timing.begun()
-        yield conn
-        if commit:
-            if timing:
-                timing.committing()
-            try:
-                conn.execute("COMMIT")
-            finally:
-                if timing:
-                    timing.committed()
-    except BaseException as e:
-        failed = True
-        if timing:
-            timing.error = type(e).__name__
-            timing.sqlite_error = isinstance(e, sqlite3.Error)
-        if conn is not None:
-            with suppress(BaseException):
-                conn.execute("ROLLBACK")
-        raise
-    finally:
-        try:
-            if conn is not None:
-                if failed:
-                    with suppress(BaseException):
-                        conn.close()
-                else:
-                    conn.close()
-        finally:
-            if timing:
-                timing.finished()
-
-
-def read_connection():
-    try:
-        return paths.connect_db(paths.DB_FILE, readonly=True)
-    except (sqlite3.OperationalError, FileNotFoundError):
-        if not paths.DB_FILE.exists():
-            raise missing_database() from None
-        raise
-
-
-@contextmanager
-def owned(mode):
-    active = getattr(_OWNER, "active", None)
-    if active and active[0] == os.getpid():
-        _, held_mode, conn = active
-        if held_mode == "read" and mode == "write":
-            raise RuntimeError("cannot promote a read snapshot to a writer")
-        yield conn
-        return
-    timing = dbstats.Timing(paths.DB_FILE, mode)
-    connect = checked_connection if mode == "write" else read_connection
-    try:
-        with owning_transaction(connect, "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
-                                commit=mode == "write") as conn:
-            _OWNER.active = (os.getpid(), mode, conn)
-            yield conn
-    finally:
-        _OWNER.active = None
-
-
-@contextmanager
-def tx():
-    with owned("write") as conn:
-        yield conn
-
-
-db = tx
-
-
-@contextmanager
-def one_read():
-    with owned("read") as conn:
-        yield conn
-
-
-@contextmanager
-def reader():
-    with one_read() as conn:
-        yield conn
-
-
-def ensure_schema() -> None:
-    with db():
-        pass
 
 
 def backfill_legacy_cost(before: dict | None = None) -> int:

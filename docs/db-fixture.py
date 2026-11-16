@@ -26,6 +26,8 @@ ACTIONS = ("transactions", "concurrent-intake", "transaction-timing", "output-si
            "coherent-reads", "event-contract", "database-health", "legacy-cleanup")
 sys.path.insert(0, str(REPO))
 
+from arete.store import db as foundation
+
 
 def require(value, detail):
     if not value:
@@ -77,8 +79,8 @@ def setup():
     require(ROOT in paths.DB_FILE.resolve().parents, "refusing non-fixture database")
     paths.ensure_dirs()
     paths.CONFIG_FILE.write_text('[replay]\nall = true\n[jev]\nenabled = false\n')
-    state.migrate()
-    with state.one_read() as c:
+    foundation.migrate()
+    with foundation.one_read() as c:
         journal = c.execute("PRAGMA journal_mode").fetchone()[0]
         sync = c.execute("PRAGMA synchronous").fetchone()[0]
     require(journal == "delete" and sync == 1, (journal, sync))
@@ -109,7 +111,7 @@ def transactions():
 
     evidence = setup()
     trace, connections = [], []
-    original = paths.connect_db
+    original = foundation.connect_db
 
     def connect(*args, **kw):
         c = original(*args, **kw)
@@ -117,10 +119,10 @@ def transactions():
         connections.append({"readonly": kw.get("readonly", False), "id": id(c)})
         return c
 
-    with mock.patch.object(paths, "connect_db", connect):
-        with state.tx() as c:
+    with mock.patch.object(foundation, "connect_db", connect):
+        with foundation.tx() as c:
             item = state.enqueue("nested", "default", "", "fixture")
-            with state.db() as joined, state.reader() as read:
+            with foundation.db() as joined, foundation.reader() as read:
                 require(c is joined is read, "writer ownership was not shared")
                 require(state.queue_item(item)["loop"] == "nested", "joined helper lost uncommitted write")
                 require(c.in_transaction, "nested exit committed")
@@ -132,13 +134,13 @@ def transactions():
     event = {"key": "rollback", "type": "fixture", "title": "rollback", "data": {}}
     for error in (ValueError, KeyboardInterrupt):
         try:
-            with state.tx():
+            with foundation.tx():
                 state.enqueue("rollback", "default", "", "fixture")
                 state.add_event("rollback", event)
                 raise error("rollback")
         except error:
             pass
-        with state.one_read() as c:
+        with foundation.one_read() as c:
             require(c.execute("SELECT count(*) FROM queue WHERE loop='rollback'").fetchone()[0] == 0, "queue committed")
             require(c.execute("SELECT count(*) FROM events WHERE loop='rollback'").fetchone()[0] == 0, "event committed")
         state.set_cursor("after-error", "ok", True)
@@ -153,10 +155,10 @@ def transactions():
         return sqlite3.connect(paths.DB_FILE, factory=CommitFailure)
 
     def failed_write():
-        with state.tx():
+        with foundation.tx():
             state.enqueue("commit-failure", "default", "", "fixture")
 
-    with mock.patch.object(state, "checked_connection", failing):
+    with mock.patch.object(foundation, "checked_connection", failing):
         expect(sqlite3.OperationalError, failed_write)
     require(not any(r["loop"] == "commit-failure" for r in state.pending()), "failed commit persisted")
     parallel(lambda i: state.set_cursor(f"thread-{i}", "ok", True))
@@ -174,12 +176,12 @@ def transactions():
             faults.append(str(e))
 
     state.set_cursor("snapshot", "old", True)
-    with mock.patch.object(paths, "connect_db", connect):
-        with state.one_read() as c, state.reader() as nested:
+    with mock.patch.object(foundation, "connect_db", connect):
+        with foundation.one_read() as c, foundation.reader() as nested:
             require(c is nested, "read snapshots did not join")
-            require(state.cursor("snapshot", state.reader)["value"] == "old", "initial snapshot")
+            require(state.cursor("snapshot", foundation.reader)["value"] == "old", "initial snapshot")
             before = len(connections)
-            for scope in (state.tx, state.db):
+            for scope in (foundation.tx, foundation.db):
                 expect(RuntimeError, lambda: scope().__enter__())
             require(len(connections) == before, "promotion opened a connection")
             worker = threading.Thread(target=writer)
@@ -187,13 +189,13 @@ def transactions():
             require(ready.wait(5), "writer did not start")
             time.sleep(.15)
             require(not done.is_set(), "writer committed through a read snapshot")
-            require(state.cursor("snapshot", state.reader)["value"] == "old", "snapshot changed")
+            require(state.cursor("snapshot", foundation.reader)["value"] == "old", "snapshot changed")
         worker.join(10)
         require(not worker.is_alive() and done.is_set() and not faults, faults)
     evidence["snapshot"] = {"connections": connections[:], "trace": trace[:]}
     require(connections[0]["readonly"], "reader was not mode=ro")
     trace.clear()
-    with mock.patch.object(paths, "connect_db", connect):
+    with mock.patch.object(foundation, "connect_db", connect):
         report = doctor.run()
     require(not any("within a transaction" in r.detail for r in report), [r.detail for r in report])
     require(not any(s.upper().startswith(("INSERT", "UPDATE", "DELETE")) for s in trace), trace)
@@ -215,7 +217,7 @@ def transactions():
     require(state.queue_item(retry)["attempts"] == 0, "requeue did not reset attempts")
     staged = paths.STATE_DIR / "staged.db"
     shutil.copyfile(paths.DB_FILE, staged)
-    with state.tx() as live:
+    with foundation.tx() as live:
         live_before = backup.sequences(live)
         backup.raise_sequences(staged, {"queue": 100000})
         require(backup.sequences(live) == live_before, "restore touched live database")
@@ -237,7 +239,7 @@ def captures():
 
     require(state.capture_discard() is None, "empty discard")
     require(state.capture_save(text="fixture"), "save")
-    with state.reader() as c:
+    with foundation.reader() as c:
         draft = dict(c.execute("SELECT * FROM captures WHERE status='draft'").fetchone())
     key, revision = draft["id"], draft["revision"]
     require(not state.capture_move(key, revision + 1, "draft", "checking"), "stale move")
@@ -255,7 +257,7 @@ def captures():
     require(not state.capture_inspected(held["id"], "stale", {}, .1), "stale inspect")
     require(state.capture_drop_evidence(held["id"])["id"] == held["id"], "drop")
     require(state.capture_drop_evidence(held["id"]) is None, "repeated drop")
-    with state.reader() as c:
+    with foundation.reader() as c:
         revision = c.execute("SELECT revision FROM captures WHERE id=?", (key,)).fetchone()[0]
     require(state.capture_move(key, revision, "draft", "filing"), "filing")
     require(not state.capture_save(text="blocked"), "filing save")
@@ -267,7 +269,8 @@ def captures():
 
 
 def migration_exercise():
-    from arete import backup, migrations, paths, state, util
+    from arete import backup, paths, state, util
+    from arete.store import migrations
 
     original = paths.DB_FILE
     chain = migrations.load()
@@ -280,8 +283,8 @@ def migration_exercise():
            "CREATE TRIGGER fixture_trigger AFTER INSERT ON fixture_migration "
            "WHEN new.value = 'quoted;value' BEGIN UPDATE fixture_migration SET value='trigger;ok'; END;"
            "-- trailing comment\nINSERT INTO fixture_migration VALUES ('quoted;value')")
-    good = f"m{len(chain) + 1:04}_work_fixture.py"
-    bad = f"m{len(chain) + 2:04}_work_failure.py"
+    good = f"m{len(chain) + 1:04}_loops_fixture.py"
+    bad = f"m{len(chain) + 2:04}_loops_failure.py"
     (folder / good).write_text(f"PHASE = 'expand'\nSQL = {sql!r}\n")
     (folder / bad).write_text("PHASE = 'expand'\nSQL = \"CREATE TABLE must_rollback (id); "
                               "INSERT INTO fixture_migration VALUES ('rollback'); SELECT * FROM absent;\"\n")
@@ -303,7 +306,7 @@ def migration_exercise():
     try:
         paths.DB_FILE = paths.STATE_DIR / "migration.db"
         with mock.patch.object(migrations, "load", lambda: temporary):
-            expect(migrations.Refused, state.migrate)
+            expect(migrations.Refused, foundation.migrate)
         with sqlite3.connect(paths.DB_FILE) as c:
             require(c.execute("PRAGMA user_version").fetchone()[0] == len(chain) + 1, "version not atomic")
             require(c.execute("SELECT value FROM fixture_migration").fetchall() == [("trigger;ok",)], "data not atomic")
@@ -314,16 +317,16 @@ def migration_exercise():
         failed = replace(temporary[-1], sql=None, apply=lambda c: (
             c.execute("CREATE TABLE apply_rollback (id)"), c.execute("SELECT * FROM absent")))
         with mock.patch.object(migrations, "load", lambda: [*temporary[:-1], failed]):
-            expect(migrations.Refused, state.migrate)
+            expect(migrations.Refused, foundation.migrate)
         with sqlite3.connect(paths.DB_FILE) as c:
             require(not c.execute("SELECT 1 FROM sqlite_master WHERE name='apply_rollback'").fetchone(), "apply survived")
         snapshots = backup.snapshots(paths.backups_dir())
         require(snapshots and backup.inspect(snapshots[-1])["quick_check"] == "ok", "migration backup lost")
         contract = replace(temporary[-1], phase="contract", sql="CREATE TABLE gated_contract (id)")
         with mock.patch.object(migrations, "load", lambda: [*temporary[:-1], contract]):
-            require(state.migrate(contracts=False), "no-contracts gate ignored")
-            with mock.patch.object(state, "contract_blockers", return_value=["fixture-live-run"]):
-                require(state.migrate(), "active-writer contract gate ignored")
+            require(foundation.migrate(contracts=False), "no-contracts gate ignored")
+            with mock.patch.object(foundation, "contract_blockers", return_value=["fixture-live-run"]):
+                require(foundation.migrate(), "active-writer contract gate ignored")
         with sqlite3.connect(paths.DB_FILE) as c:
             require(not c.execute("SELECT 1 FROM sqlite_master WHERE name='gated_contract'").fetchone(), "gate applied SQL")
         return {"trigger_and_quoted_semicolon": True, "sql_and_apply_atomicity": True,
@@ -341,10 +344,10 @@ def confined_exercise():
     file = root / "scratch.db"
     if not paths.ON_MAC:
         with mock.patch.object(paths, "ISOLATED", True):
-            expect(PermissionError, lambda: paths.connect_db(file, create=True))
+            expect(PermissionError, lambda: foundation.connect_db(file, create=True))
         return {"unsupported_platform_refused": True}
     with mock.patch.object(paths, "ISOLATED", True):
-        c = paths.connect_db(file, create=True)
+        c = foundation.connect_db(file, create=True)
         try:
             require(c.execute("PRAGMA journal_mode").fetchone()[0] == "memory", "scratch journal changed")
         finally:
@@ -355,7 +358,7 @@ def confined_exercise():
         c.execute("CREATE TABLE fixture (id)")
     c.close()
     with mock.patch.object(paths, "ISOLATED", True):
-        expect(PermissionError, lambda: paths.connect_db(wal))
+        expect(PermissionError, lambda: foundation.connect_db(wal))
     return {"journal_mode": "memory", "wal_refused": True}
 
 
@@ -440,7 +443,7 @@ def concurrent_intake():
         first = webhooks.receive(loop.name, {}, b'{"title":"body"}')
         duplicate = webhooks.receive(loop.name, {}, b'{"title":"body"}')
         require(first["queued"] and not duplicate["queued"], "body key did not deduplicate")
-        with state.tx() as c:
+        with foundation.tx() as c:
             c.execute("UPDATE seen SET ts=? WHERE source=? AND key=?",
                       (util.iso(util.now() - timedelta(minutes=11)), loop.name + "#webhook", first["key"]))
         require(webhooks.receive(loop.name, {}, b'{"title":"body"}')["queued"], "body key did not expire")
@@ -451,7 +454,7 @@ def concurrent_intake():
         with mock.patch.object(state, "enqueue", side_effect=ValueError("after seen")):
             expect(ValueError, lambda: sources.poll(loop, 0, cfg))
         require(state.cursor(sid) == before and state.source_owner(sid) == owner, "failed poll partially committed")
-        with state.reader() as c:
+        with foundation.reader() as c:
             require(not c.execute("SELECT 1 FROM seen WHERE source=? AND key='retry'", (sid,)).fetchone(), "seen leaked")
             require(not c.execute("SELECT 1 FROM events WHERE key='retry'").fetchone(), "events leaked")
         require(len(sources.poll(loop, 0, cfg)[1]) == 1, "retry not enqueued")
@@ -479,7 +482,7 @@ def concurrent_intake():
         state.set_cursor("serialized", None, False)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        with state.tx():
+        with foundation.tx():
             future = pool.submit(failed_poll)
             require(ready.wait(5), "cursor waiter not started")
             state.set_cursor("serialized", "new", True, started="2026-01-01T01:00:00Z")
@@ -513,13 +516,13 @@ def transaction_timing():
 
     evidence = setup()
     initial_rows = log_rows()
-    with state.tx():
-        with state.db():
+    with foundation.tx():
+        with foundation.db():
             pass
     require(log_rows() == initial_rows, "fast success wrote diagnostics")
     before = sum(g["count"] for s in dbstats.SUMMARIES.values() for g in s["transactions"].values())
-    with state.tx():
-        with state.db(), state.reader():
+    with foundation.tx():
+        with foundation.db(), foundation.reader():
             pass
     after = sum(g["count"] for s in dbstats.SUMMARIES.values() for g in s["transactions"].values())
     require(after == before + 1, "nested scopes were counted")
@@ -548,7 +551,7 @@ def transaction_timing():
     require(len(waited) == 1 and waited[0]["begin_ms"] >= 5000, rows)
     require(waited[0]["caller"].endswith(".timed_writer"), waited)
     marker = paths.STATE_DIR / "commit-ready"
-    with state.one_read() as c:
+    with foundation.one_read() as c:
         c.execute("SELECT count(*) FROM cursors").fetchone()
         committer = child("commit-writer", marker)
         try:
@@ -563,8 +566,8 @@ def transaction_timing():
     committed = [r for r in log_rows() if r["pid"] == committer.pid]
     require(len(committed) == 1 and committed[0]["commit_ms"] >= 600, committed)
     previous = len(log_rows())
-    with state.tx():
-        with state.tx(), state.reader():
+    with foundation.tx():
+        with foundation.tx(), foundation.reader():
             time.sleep(.6)
     require(len(log_rows()) == previous + 1, "slow nesting duplicated diagnostics")
 
@@ -577,7 +580,7 @@ def transaction_timing():
             return super().execute(sql, *a)
 
     def write():
-        with state.tx() as c:
+        with foundation.tx() as c:
             c.execute("SELECT * FROM absent_PRIVATE_SQL_PAYLOAD")
 
     failures = []
@@ -592,19 +595,19 @@ def transaction_timing():
             return c
 
         def operation():
-            with state.tx() as c:
+            with foundation.tx() as c:
                 if phase == "slow-body":
                     time.sleep(.6)
                 if phase in ("body", "slow-body"):
                     c.execute("SELECT * FROM absent_PRIVATE_SQL_PAYLOAD")
 
-        with mock.patch.object(state, "checked_connection", connect):
+        with mock.patch.object(foundation, "checked_connection", connect):
             expect(sqlite3.OperationalError, operation)
         require(len(log_rows()) == previous + 1, f"{phase}: missing or duplicate record")
         failures.append({"phase": phase, "record": log_rows()[-1]})
     for function in ("open", "write"):
         with mock.patch.object(dbstats.os, function, side_effect=OSError("diagnostic unavailable")):
-            with state.tx():
+            with foundation.tx():
                 time.sleep(.51)
             expect(sqlite3.OperationalError, write)
     children = [child("timed-error") for _ in range(4)]
@@ -637,7 +640,7 @@ def summary_exercise():
     original = paths.DB_FILE
     try:
         paths.DB_FILE = other
-        with state.tx():
+        with foundation.tx():
             pass
     finally:
         paths.DB_FILE = original
@@ -645,19 +648,19 @@ def summary_exercise():
     shutil.copyfile(original, replacement)
     os.replace(replacement, original)
     require(dbstats.database_identity(original) != identity, "replacement identity was reused")
-    with state.tx():
+    with foundation.tx():
         pass
     clock = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     with mock.patch.object(dbstats, "datetime") as fake:
         fake.now.return_value = clock
-        with state.tx():
+        with foundation.tx():
             pass
     incarnation = dbstats.INCARNATION
     forked = os.fork()
     if forked == 0:
         try:
             require(dbstats.INCARNATION != incarnation and not dbstats.SUMMARIES, "fork inherited summary identity")
-            with state.tx():
+            with foundation.tx():
                 pass
             os._exit(0)
         except BaseException:
@@ -875,7 +878,7 @@ def durable_files():
 def sql_rows(query, args=(), file=None):
     from arete import paths
 
-    conn = paths.connect_db(file or paths.DB_FILE)
+    conn = foundation.connect_db(file or paths.DB_FILE)
     try:
         return conn.execute(query, args).fetchall()
     finally:
@@ -885,7 +888,7 @@ def sql_rows(query, args=(), file=None):
 def db_values():
     from arete import backup, state
 
-    with state.one_read() as conn:
+    with foundation.one_read() as conn:
         return {"sequences": backup.sequences(conn), "meta": backup.metadata(conn),
                 "feed": [tuple(r) for r in conn.execute("SELECT * FROM feed ORDER BY id")]}
 
@@ -934,21 +937,21 @@ def wal_startup():
             conn.commit()
             conn.close()
         else:
-            conn = paths.connect_db(paths.DB_FILE, create=True)
+            conn = foundation.connect_db(paths.DB_FILE, create=True)
             conn.close()
-        conn = paths.connect_db(paths.DB_FILE)
+        conn = foundation.connect_db(paths.DB_FILE)
         require(conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete", "helper enabled WAL")
         conn.close()
         process, found = start_fixture_serve()
         try:
             require(found["journal_mode"] == "wal" and found["synchronous"] == 1, found)
-            require(found["epoch"] == 0 and found["version"] == state.LATEST, found)
+            require(found["epoch"] == 0 and found["version"] == foundation.LATEST, found)
             if legacy:
-                require(state.run_get("seed", connect=state.reader), "legacy row lost")
+                require(state.run_get("seed", connect=foundation.reader), "legacy row lost")
             evidence["cases"].append({"legacy": legacy, **found})
         finally:
             stop_child(process)
-    reader = paths.connect_db(paths.DB_FILE, readonly=True)
+    reader = foundation.connect_db(paths.DB_FILE, readonly=True)
     try:
         reader.execute("BEGIN")
         before = reader.execute("SELECT count(*) FROM feed").fetchone()[0]
@@ -971,7 +974,7 @@ def confined_connections():
 
     if not paths.ON_MAC:
         with mock.patch.object(paths, "ISOLATED", True):
-            expect(PermissionError, lambda: paths.connect_db(paths.DB_FILE))
+            expect(PermissionError, lambda: foundation.connect_db(paths.DB_FILE))
         return {"unsupported_platform_refused": True}
     root = Path(tempfile.mkdtemp(prefix=".arete-scratch-", dir=ROOT))
     target = root.with_name(".arete-scratch-" + os.urandom(8).hex())
@@ -979,33 +982,33 @@ def confined_connections():
     target.chmod(0o700)
     file = target / "arete.db"
     with mock.patch.object(paths, "ISOLATED", True):
-        conn = paths.connect_db(file, create=True)
+        conn = foundation.connect_db(file, create=True)
         try:
             require(conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory", "confined journal changed")
             require(conn.execute("PRAGMA synchronous").fetchone()[0] == 1, "confined sync changed")
-            expect(PermissionError, lambda: paths.connect_db(file))
+            expect(PermissionError, lambda: foundation.connect_db(file))
         finally:
             conn.close()
         for suffix in ("-journal", "-wal", "-shm"):
             sidecar = Path(str(file) + suffix)
             sidecar.write_bytes(b"fixture")
-            expect(PermissionError, lambda: paths.connect_db(file))
+            expect(PermissionError, lambda: foundation.connect_db(file))
             sidecar.unlink()
         linked = target / "linked.db"
         linked.symlink_to(file)
-        expect(PermissionError, lambda: paths.connect_db(linked))
+        expect(PermissionError, lambda: foundation.connect_db(linked))
         linked.unlink()
         os.link(file, linked)
-        expect(PermissionError, lambda: paths.connect_db(file))
+        expect(PermissionError, lambda: foundation.connect_db(file))
         linked.unlink()
         with mock.patch.object(paths, "ON_MAC", False):
-            expect(PermissionError, lambda: paths.connect_db(file))
+            expect(PermissionError, lambda: foundation.connect_db(file))
     conn = sqlite3.connect(file)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE fixture(value)")
     conn.close()
     with mock.patch.object(paths, "ISOLATED", True):
-        expect(PermissionError, lambda: paths.connect_db(file))
+        expect(PermissionError, lambda: foundation.connect_db(file))
     return {"journal_mode": "memory", "synchronous": 1, "sidecars_links_nested_WAL_platform_refused": True}
 
 
@@ -1029,7 +1032,7 @@ def prune_restore():
 
     evidence = setup()
     old = util.iso(util.now() - timedelta(days=60))
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         for rid, kind, cost, at in (("old", "loop", 0, old), ("paid", "loop", 1, old),
                                     ("pipeline", "pipeline", 0, old), ("recent", "loop", 0, util.iso())):
             conn.execute("INSERT INTO runs(id,kind,loop_kind,status,started,cost_usd) VALUES (?,?,'command','done',?,?)",
@@ -1081,7 +1084,7 @@ def retention_policy():
     conn.executescript((REPO / "tests/fixtures/schema-v0.sql").read_text())
     conn.close()
     with mock.patch.object(paths, "DB_FILE", target):
-        state.migrate()
+        foundation.migrate()
         pinned = sql_rows("SELECT backup FROM schema_migrations ORDER BY n DESC LIMIT 1")[0][0]
         require(pinned, "migration snapshot not pinned")
         snapshots = paths.backups_dir()
@@ -1104,12 +1107,12 @@ def consistent_counts():
     daemon, _ = start_fixture_serve()
     stop_child(daemon)
     before = backup.inspect(paths.DB_FILE)["counts"]
-    connect = paths.connect_db
+    connect = foundation.connect_db
     errors, once = [], []
 
     def writer():
         try:
-            with state.tx() as conn:
+            with foundation.tx() as conn:
                 conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('count-barrier','loop','done',?)", (util.iso(),))
                 state.add_feed("count-barrier", "note", "committed together")
         except BaseException as e:
@@ -1129,7 +1132,7 @@ def consistent_counts():
             conn.set_trace_callback(trace)
         return conn
 
-    with mock.patch.object(paths, "connect_db", side_effect=traced):
+    with mock.patch.object(foundation, "connect_db", side_effect=traced):
         found = backup.inspect(paths.DB_FILE)
     after = backup.inspect(paths.DB_FILE)["counts"]
     require(once and not errors and found["quick_check"] == "ok", errors)
@@ -1142,7 +1145,7 @@ def restore_safety():
     from arete import backup, control, paths, state, util
 
     evidence = setup()
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('safety','loop','done',?)", (util.iso(),))
         state.add_feed("safety", "note", "snapshot")
     snapshot = backup.snapshot("safety")
@@ -1170,10 +1173,10 @@ def restore_safety():
     util.write_json(control.BEAT_FILE, {"pid": os.getpid(), "at": util.iso(util.now() - timedelta(days=30))})
     refused("stale-live-heartbeat", os.getpid())
     control.BEAT_FILE.unlink()
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.execute("UPDATE runs SET status='running',pid=? WHERE id='safety'", (os.getpid(),))
     refused("run-pid", os.getpid())
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.execute("UPDATE runs SET pid=NULL,lock='fixture-detached' WHERE id='safety'")
     holder = child("hold-lock", "fixture-detached", paths.STATE_DIR.parent / "run-held")
     try:
@@ -1190,7 +1193,7 @@ def restore_safety():
     for source in (invalid, invalid.with_name("missing.db"), truncated):
         before = inventory()
         require(cli_output("backup", "--restore", str(source))[0] == 1 and before == inventory(), "invalid restore changed target")
-    conn = paths.connect_db(paths.DB_FILE)
+    conn = foundation.connect_db(paths.DB_FILE)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("INSERT INTO feed(run_id,ts,kind,text) VALUES ('safety',?,'note','wal-only')", (util.iso(),))
     conn.execute("COMMIT")
@@ -1247,7 +1250,7 @@ def restore_safety():
     conn.close()
     rc, output = cli_output("backup", "--restore", str(legacy))
     require(rc == 0 and "startup" in output and backup.pending_restore(), output)
-    expect(state.IncompatibleSchema, lambda: state.add_feed("legacy", "note", "blocked"))
+    expect(foundation.IncompatibleSchema, lambda: state.add_feed("legacy", "note", "blocked"))
     process, first = start_fixture_serve()
     stop_child(process)
     process, second = start_fixture_serve()
@@ -1310,7 +1313,7 @@ def interrupted_restores(snapshot):
 def hot_journal_probe():
     from arete import backup, paths, state, util
 
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.executemany("INSERT INTO feed(run_id,ts,kind,text) VALUES ('hot',?,'note',?)",
                          [(util.iso(), "original" * 100)] * 1000)
     process = child("hot-journal")
@@ -1394,7 +1397,7 @@ def feed_cursors():
     require([r["id"] for r in got] == sorted({r["id"] for r in got}), "feed ordering")
     before = db_values()
     trace = []
-    connect = paths.connect_db
+    connect = foundation.connect_db
 
     def traced(*a, **kw):
         conn = connect(*a, **kw)
@@ -1402,8 +1405,8 @@ def feed_cursors():
         return conn
 
     try:
-        with mock.patch.object(paths, "connect_db", side_effect=traced):
-            with state.tx() as conn:
+        with mock.patch.object(foundation, "connect_db", side_effect=traced):
+            with foundation.tx() as conn:
                 state.insert_feed(rid, "note", "rollback-insert")
                 state.add_feed(rid, "note", "rollback-add")
                 written = conn.execute("SELECT text, count(*) FROM feed WHERE run_id=? "
@@ -1425,7 +1428,7 @@ def feed_cursors():
     require(state.run_get(rid)["status"] == "running", "settlement escaped end line rollback")
     http = http_feed_snapshot(rid)
     require(http["settlement_committed"], "HTTP snapshot did not overlap a committed settlement")
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.executemany("INSERT INTO feed(run_id,ts,kind,text) VALUES (?,?,'note','later')", [(rid, util.iso())] * 15001)
         conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
     high = db_values()["sequences"]["feed"]
@@ -1438,7 +1441,7 @@ def feed_cursors():
         if len(calls) == 2:
             paths.DB_FILE.write_bytes(b"unreadable")
             backup.restore(snapshot)
-            with state.tx() as conn:
+            with foundation.tx() as conn:
                 conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
             state.add_feed(rid, "note", "first restored generation")
         return real_feed(run, after)
@@ -1452,7 +1455,7 @@ def feed_cursors():
     def restore_during_poll():
         paths.DB_FILE.write_bytes(b"unreadable poll boundary")
         backup.restore(snapshot)
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
         state.add_feed(rid, "note", "first polling generation")
 
@@ -1631,7 +1634,7 @@ def page_seed():
     now = util.iso()
     modes = {"local": ("pi", "ollama", "api_key"), "replay": ("replay", "", ""),
              "subscription": ("claude", "anthropic", "subscription"), "api-key": ("pi", "openai", "api_key")}
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         for name in (*modes, "mixed", "session"):
             conn.execute("INSERT OR IGNORE INTO runs (id,kind,status,started,finished,summary) VALUES (?,?,?,?,?,?)",
                          (name, "session" if name == "session" else "pipeline", "done", now, now, name))
@@ -1687,17 +1690,17 @@ def coherent_reads():
 
     evidence = setup()
     seeded = page_seed()
-    conn = paths.connect_db(paths.DB_FILE)
+    conn = foundation.connect_db(paths.DB_FILE)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.close()
     connections, windows = [], []
-    connect, steps_since = paths.connect_db, state.steps_since
+    connect, steps_since = foundation.connect_db, state.steps_since
 
     def tracked(*args, **kw):
         connections.append({"thread": threading.current_thread().name, "readonly": kw.get("readonly", False)})
         return connect(*args, **kw)
 
-    def steps(since, connect=state.reader):
+    def steps(since, connect=foundation.reader):
         windows.append(since)
         return steps_since(since, connect)
 
@@ -1707,7 +1710,7 @@ def coherent_reads():
         require(len(connections) == 1 and connections[0]["readonly"], connections)
         return result
 
-    with mock.patch.object(paths, "connect_db", tracked), mock.patch.object(state, "steps_since", steps):
+    with mock.patch.object(foundation, "connect_db", tracked), mock.patch.object(state, "steps_since", steps):
         evidence["snapshot"] = read_once(board.snapshot)
         evidence["run"] = read_once(lambda: board.run_board("mixed"))
         require(evidence["run"]["run"]["paid"] == sum(m["paid"] for m in evidence["run"]["models"]), "paid mismatch")
@@ -1737,7 +1740,7 @@ def coherent_reads():
             require(http_json(server, "/api/chats/new", {"project": ""}, admitted=False)[0] == 403, "admission bypass")
 
             def remote(*args):
-                active = getattr(state._OWNER, "active", None)
+                active = getattr(foundation._OWNER, "active", None)
                 require(active and active[1] == "read", active)
                 return {"id": 42, "ref": "fake#42", "title": "remote"}, "fake"
 
@@ -1775,7 +1778,7 @@ def coherent_reads():
             return future.result(10)
 
     def settle():
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET status='done', finished=? WHERE id='settling'", (util.iso(),))
 
     snap = concurrent_read(board.snapshot, "runs_marked_running", settle)
@@ -1785,15 +1788,15 @@ def coherent_reads():
             and next(r for r in recent if r["id"] == "settling")["status"] == "running", snap)
 
     def add_step():
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("INSERT INTO steps (run_id,step,runner,provider,auth_mode,cost_usd,ts) "
                          "VALUES ('mixed','late','pi','openai','api_key',2,?)", (util.iso(),))
 
     run = concurrent_read(lambda: board.run_board("mixed"), "steps", add_step)
     require(run["run"]["paid"] == sum(m["paid"] for m in run["models"]), run)
     def cost_report():
-        with state.one_read():
-            return control.costs(connect=state.reader)
+        with foundation.one_read():
+            return control.costs(connect=foundation.reader)
 
     with mock.patch.object(state, "steps_since", steps):
         report = concurrent_read(cost_report, "steps_since", add_step)
@@ -1814,7 +1817,7 @@ def event_contract():
     paths.ensure_dirs()
     paths.CONFIG_FILE.write_text('[replay]\nall = true\n[jev]\nenabled = false\n')
     hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in (REPO / "arete/migrations").glob("m000[1-3]*.py")}
+              for p in (REPO / "arete/store/migrations").glob("m000[1-3]*.py")}
     original = paths.DB_FILE
     evidence = {"journal_mode": "delete", "synchronous": 1, "cases": [], "historical_hashes": hashes}
     sleeper = child("sleep")
@@ -1823,43 +1826,43 @@ def event_contract():
             paths.DB_FILE = original.parent / kind / "arete.db"
             paths.DB_FILE.parent.mkdir()
             if kind == "v0":
-                conn = paths.connect_db(paths.DB_FILE, create=True)
+                conn = foundation.connect_db(paths.DB_FILE, create=True)
                 conn.executescript((REPO / "tests/fixtures/schema-v0.sql").read_text())
                 conn.execute("INSERT INTO events(loop,type,source,key,data,ts) VALUES "
                              "('history','command','old','kept','payload',?)", (util.iso(),))
                 conn.commit()
                 conn.close()
-            state.migrate(contracts=False)
-            with state.tx() as conn:
+            foundation.migrate(contracts=False)
+            with foundation.tx() as conn:
                 conn.execute("INSERT INTO runs(id,kind,status,started,pid,schema_version) "
                              "VALUES ('older','loop','running',?,?,3)", (util.iso(), sleeper.pid))
-            require(state.migrate(), "older run did not block contract")
-            with state.tx() as conn:
+            require(foundation.migrate(), "older run did not block contract")
+            with foundation.tx() as conn:
                 conn.execute("UPDATE runs SET schema_version=NULL WHERE id='older'")
-            require(state.migrate(), "unstamped run did not block contract")
+            require(foundation.migrate(), "unstamped run did not block contract")
             state.add_event("pending", {"type": "finding", "source": "fixture", "key": kind})
-            with state.tx() as conn:
+            with foundation.tx() as conn:
                 conn.execute("UPDATE runs SET status='done' WHERE id='older'")
             for stamp in (3, None):
                 util.write_json(control.BEAT_FILE, {"pid": sleeper.pid, "schema": stamp})
-                require(state.migrate(), "older serve did not block contract")
+                require(foundation.migrate(), "older serve did not block contract")
             stop_child(sleeper)
-            require(not state.migrate(), "contract did not finish")
+            require(not foundation.migrate(), "contract did not finish")
             control.BEAT_FILE.unlink()
             state.add_event("after", {"type": "finding", "source": "fixture", "key": kind})
-            with state.one_read() as conn:
+            with foundation.one_read() as conn:
                 columns = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
                 meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
                 rows = [dict(r) for r in conn.execute("SELECT * FROM events")]
-                require("data" not in columns and int(meta["oldest_writer"]) == state.LATEST, meta)
+                require("data" not in columns and int(meta["oldest_writer"]) == foundation.LATEST, meta)
                 require(len(rows) == (3 if kind == "v0" else 2), rows)
-            require(not state.migrate(), "migration repeated")
+            require(not foundation.migrate(), "migration repeated")
             evidence["cases"].append({"kind": kind, "columns": columns, "events": rows, "meta": meta})
             sleeper = child("sleep")
     finally:
         stop_child(sleeper)
         paths.DB_FILE = original
-    state.migrate()
+    foundation.migrate()
     from arete import sources
 
     loop = loops.Loop("event-fixture", paths.CONFIG_DIR, "fixture", trigger=loops.Trigger(webhook=True))
@@ -1877,7 +1880,7 @@ def event_contract():
     require(run["status"] == "done" and run["runner"] == "replay", run)
     require(util.read_json(paths.RUNS_DIR / run["id"] / "events.json", []) == events, "run events truncated")
     require(hashes == {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                       for p in (REPO / "arete/migrations").glob("m000[1-3]*.py")}, "historical migration edited")
+                       for p in (REPO / "arete/store/migrations").glob("m000[1-3]*.py")}, "historical migration edited")
     evidence["payload_lengths"] = [len(e["data"]["text"]) for e in events]
     evidence["snapshot"] = backup.inspect(paths.DB_FILE)
     return evidence
@@ -1887,12 +1890,12 @@ def database_health():
     from arete import backup, config, dbstats, heartbeat, install, paths, state, util
 
     evidence = setup()
-    anchor = paths.connect_db(paths.DB_FILE)
+    anchor = foundation.connect_db(paths.DB_FILE)
     anchor.execute("PRAGMA journal_mode=WAL")
     anchor.execute("BEGIN")
     anchor.execute("SELECT COUNT(*) FROM schema_meta").fetchone()
     evidence["journal_mode"] = "wal"
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.execute('CREATE TABLE "odd""table" (value TEXT)')
         conn.execute('INSERT INTO "odd""table" VALUES (\'kept\')')
     now = datetime.now(UTC)
@@ -2114,7 +2117,7 @@ def legacy_cleanup():
         require(unrelated.read_text() == "keep", "unrelated file removed")
         require(legacy.exists() == (kind in ("nonempty", "symlink")), kind)
         require(marker.exists() == (kind == "symlink"), kind)
-        require(found["version"] == state.LATEST, found)
+        require(found["version"] == foundation.LATEST, found)
         cases.append({"kind": kind, "legacy_exists": legacy.exists(), "marker_exists": marker.exists(), **found})
     evidence["cases"] = cases
     return evidence
@@ -2136,7 +2139,7 @@ def browser_seed():
 def browser_serve(port):
     from arete import paths
 
-    conn = paths.connect_db(paths.DB_FILE)
+    conn = foundation.connect_db(paths.DB_FILE)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.close()
     server = fixture_http(port)
@@ -2150,7 +2153,7 @@ def browser_serve(port):
 def timed_writer():
     from arete import state
 
-    with state.tx():
+    with foundation.tx():
         state.set_cursor("timed-writer", "ok", True)
 
 
@@ -2195,12 +2198,12 @@ def child_main(role, args):
                 mock.patch.object(dbstats, "retain", observed):
             clock.now.return_value = datetime.fromisoformat(hour) + timedelta(minutes=10)
             for _ in range(10):
-                with state.tx() as conn:
+                with foundation.tx() as conn:
                     conn.execute("SELECT COUNT(*) FROM events").fetchone()
         print(json.dumps({"publisher": publisher, "pid": os.getpid(), "incarnation": dbstats.INCARNATION,
                           "count": len(durations), "durations": durations}))
     elif role == "raw-writer":
-        conn = paths.connect_db(paths.DB_FILE)
+        conn = foundation.connect_db(paths.DB_FILE)
         conn.execute("BEGIN IMMEDIATE")
         Path(args[0]).touch()
         wait_file(Path(args[1]))
@@ -2213,7 +2216,7 @@ def child_main(role, args):
         serve.Server.report_config = lambda self: None
 
         def tick(self):
-            with state.one_read() as conn:
+            with foundation.one_read() as conn:
                 found = {"journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
                          "synchronous": conn.execute("PRAGMA synchronous").fetchone()[0],
                          "epoch": int(backup.metadata(conn)["restore_epoch"]),
@@ -2226,7 +2229,7 @@ def child_main(role, args):
     elif role == "wal-failure":
         from arete import serve
 
-        connect = paths.connect_db
+        connect = foundation.connect_db
 
         class FailingConnection:
             def __init__(self, conn):
@@ -2243,7 +2246,7 @@ def child_main(role, args):
                     raise sqlite3.OperationalError("fixture WAL failure")
                 return self.conn.execute(query, *args)
 
-        paths.connect_db = lambda *a, **kw: FailingConnection(connect(*a, **kw))
+        foundation.connect_db = lambda *a, **kw: FailingConnection(connect(*a, **kw))
         serve.Server = lambda: (_ for _ in ()).throw(AssertionError("workers constructed after WAL failure"))
         expect(SystemExit, lambda: serve.run(with_dashboard=False))
         print("WAL failure stopped startup before workers/API")
@@ -2340,7 +2343,7 @@ def child_main(role, args):
             expect(SystemExit, lambda: serve.run(with_dashboard=False))
         print("startup excluded")
     elif role == "hold-writer":
-        with state.tx():
+        with foundation.tx():
             Path(args[0]).touch()
             wait_file(Path(args[1]))
     elif role == "timed-writer":
@@ -2349,15 +2352,15 @@ def child_main(role, args):
         timed_writer()
     elif role == "migrate-marker":
         Path(args[0]).touch()
-        state.migrate()
+        foundation.migrate()
         Path(args[1]).touch()
     elif role == "commit-writer":
-        with state.tx():
+        with foundation.tx():
             state.set_cursor("commit-wait", "ok", True)
             Path(args[0]).touch()
     elif role == "timed-error":
         def operation():
-            with state.tx() as c:
+            with foundation.tx() as c:
                 c.execute("SELECT * FROM absent_PRIVATE_SQL_PAYLOAD")
         expect(sqlite3.OperationalError, operation)
     else:

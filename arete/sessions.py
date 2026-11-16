@@ -31,6 +31,7 @@ from . import (
     vault,
 )
 from .agent import EDIT_TOOLS, NO_SESSION, Session
+from .store import db as foundation
 
 TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
                 'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
@@ -657,7 +658,7 @@ def execute(session_id: str) -> str:
             return "busy"
         if (ended := (state.run_get(session_id) or {}).get("status", "gone")) != "running":
             return ended
-        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
+        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=foundation.LATEST)
         try:
             with (record.stoppable(),
                   devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
@@ -719,7 +720,7 @@ def tell_chats() -> int:
     return sum(state.chat_tell_session(link["run_id"], ended_message(link)) for link in state.chat_sessions_untold())
 
 
-def views(limit: int = 30, connect=state.reader) -> list[dict]:
+def views(limit: int = 30, connect=foundation.reader) -> list[dict]:
     out = []
     rows = state.runs(kind="session", limit=limit, connect=connect)
     paid = state.paid_by_run([r["id"] for r in rows], connect)
@@ -736,7 +737,7 @@ def views(limit: int = 30, connect=state.reader) -> list[dict]:
 
 def known_models(cfg: config.Config) -> list[str]:
     since = util.iso(util.now() - timedelta(days=SEEN_MODEL_DAYS))
-    seen = {s["model"] for s in state.steps_since(since, connect=state.reader) if s["model"]}
+    seen = {s["model"] for s in state.steps_since(since, connect=foundation.reader) if s["model"]}
     return sorted({*settings.MODEL_ALIASES, *(m for m in cfg.models.values() if m), *cfg.pricing, *seen})
 
 

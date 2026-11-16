@@ -31,6 +31,7 @@ from . import (
     workspace,
 )
 from .refusals import TrackerFailed
+from .store import db as foundation
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -260,7 +261,7 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
 
 def asks_view() -> dict:
     keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
-    return {"asks": [{k: a[k] for k in keys} for a in state.open_asks(connect=state.reader)]}
+    return {"asks": [{k: a[k] for k in keys} for a in state.open_asks(connect=foundation.reader)]}
 
 
 def answer_ask(ask_id: str, body) -> dict:
@@ -536,15 +537,15 @@ def view(task_id: str, repo_name: str = "") -> dict:
     tid = task_id.strip()
     if tracker.is_task_id(tid):
         tid = tid.lower()
-        if (row := state.task_get(tid, connect=state.reader)) is None:
+        if (row := state.task_get(tid, connect=foundation.reader)) is None:
             raise control.NotFound(f"no task {tid}")
-        item, repo, refs = {**row, "comments": state.task_comments(tid, connect=state.reader)}, row["repo"], [tid]
+        item, repo, refs = {**row, "comments": state.task_comments(tid, connect=foundation.reader)}, row["repo"], [tid]
     else:
         item, repo = tracker_item(config.load(), tid, repo_name.strip())
         refs = [item["id"], item["ref"]]
-    runs = state.ticket_runs(repo, item["id"], limit=50, connect=state.reader)
-    paid = state.paid_by_run([r["id"] for r in runs], connect=state.reader)
-    children = {c["id"]: c for ref in dict.fromkeys(refs) for c in state.task_children(ref, connect=state.reader)}
+    runs = state.ticket_runs(repo, item["id"], limit=50, connect=foundation.reader)
+    paid = state.paid_by_run([r["id"] for r in runs], connect=foundation.reader)
+    children = {c["id"]: c for ref in dict.fromkeys(refs) for c in state.task_children(ref, connect=foundation.reader)}
     return {**item,
             "runs": [{"id": r["id"], "status": r["status"], "started": r["started"], "finished": r["finished"],
                       "prs": (r["pr_url"] or "").split(), "cost_usd": paid.get(r["id"], 0.0),
@@ -576,7 +577,7 @@ def newest_repo(cfg: config.Config, tid: str) -> config.Repo:
             issue = tracker.for_repo(cfg, r).normalize(tid)
         except ValueError:
             continue
-        found += [(run["started"] or "", r) for run in state.ticket_runs(r.name, issue, limit=1, connect=state.reader)]
+        found += [(run["started"] or "", r) for run in state.ticket_runs(r.name, issue, limit=1, connect=foundation.reader)]
     if not found:
         raise control.Refused(f"No run names {tid}, so say which repo it belongs to with ?repo=NAME")
     return max(found, key=lambda pair: pair[0])[1]

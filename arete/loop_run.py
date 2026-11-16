@@ -39,6 +39,7 @@ from . import (
 )
 from .agent import Result
 from .loops import Loop
+from .store import db as foundation
 
 KNOWN_FINDINGS_SHOWN = 30
 KNOWN_FINDINGS_ASKED = 200
@@ -375,7 +376,7 @@ def carry_opened(run_id: str) -> str:
     cfg = config.load()
     run = LoopRun(loops.find(r["loop"], cfg), run_id, cfg, trial=r["trigger"] == "try", trigger=r["trigger"])
     run.events = util.read_json(run.events_file, [])
-    record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
+    record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=foundation.LATEST)
     return carry(run)
 
 

@@ -15,6 +15,7 @@ from . import alerts, config, gh, jev, jira, paths, prompt_loader, refusals, run
 from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
 from .refusals import TrackerFailed
+from .store import db as foundation
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
@@ -720,7 +721,7 @@ def standing(r: dict) -> str:
     return READY if r["ready"] else WITH_QUESTIONS
 
 
-def sent(connect=state.db) -> list[dict]:
+def sent(connect=foundation.db) -> list[dict]:
     out = []
     for a in state.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
         runs = [r for r in state.ticket_runs(a["repo"], issue_id(a["tracker"], a["ref"]), limit=1, connect=connect)
@@ -729,7 +730,7 @@ def sent(connect=state.db) -> list[dict]:
     return out
 
 
-def view(connect=state.db) -> dict:
+def view(connect=foundation.db) -> dict:
     return {"rows": sorted(state.triage_rows(connect), key=lambda r: natural(r["ref"])), "sent": sent(connect),
             "research": {r["ref"]: r for r in state.research_rows(connect)}}
 

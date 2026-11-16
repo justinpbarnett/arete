@@ -37,7 +37,7 @@ def caller():
     try:
         while frame:
             module = frame.f_globals.get("__name__", "")
-            if module not in (__name__, "arete.state", "contextlib"):
+            if module not in (__name__, "arete.state", "contextlib") and not module.startswith("arete.store."):
                 return f"{module}.{frame.f_code.co_name}"
             frame = frame.f_back
     finally:
@@ -238,7 +238,7 @@ def empty_collection():
 
 
 def collect(now=None):
-    from . import state
+    from .store import db as foundation
 
     now = (now or datetime.now(UTC)).astimezone(UTC)
     end = now.replace(minute=0, second=0, microsecond=0)
@@ -253,12 +253,8 @@ def collect(now=None):
         if error := row.get("error"):
             error_kinds[kind] += 1
             errors[str(error)] += 1
-    with state.one_read() as conn:
-        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
-        tables = {}
-        for name in names:
-            quoted = '"' + name.replace('"', '""') + '"'
-            tables[name] = conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+    with foundation.one_read() as conn:
+        tables = foundation.table_counts(conn)
     return {**totals, "window_start": start.isoformat(), "window_end": end.isoformat(),
             "collected_at": now.isoformat(), "slow_by_kind": dict(slow), "errors_by_kind": dict(error_kinds),
             "errors_by_class": dict(errors), **database_bytes(), **runs_bytes(), "tables": tables}

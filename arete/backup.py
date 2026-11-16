@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import config, paths, util
+from .store import db as foundation
 
 KEEP_NEWEST = 24
 KEEP_DAYS = 14
@@ -74,8 +75,20 @@ def update_last(**fields) -> None:
         util.write_json(paths.backups_dir() / LAST, {**read_last(), **fields})
 
 
-def quoted(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
+def metadata(conn) -> dict:
+    return foundation.metadata(conn)
+
+
+def sequences(conn: sqlite3.Connection) -> dict[str, int]:
+    return foundation.sequences(conn)
+
+
+def copy_database(target: Path) -> None:
+    foundation.copy_database(target)
+
+
+def apply_metadata(target, data):
+    return foundation.apply_restore_metadata(target, data)
 
 
 def inspect(p: Path, check: bool = True) -> dict:
@@ -91,26 +104,10 @@ def inspect(p: Path, check: bool = True) -> dict:
         if size < int.from_bytes(head[28:32], "big") * page_size:
             found["quick_check"] = "file is shorter than its header says"
             return found
-        conn = paths.connect_db(p, readonly=True)
-        try:
-            conn.execute("BEGIN")
-            if check:
-                found["quick_check"] = "; ".join(r[0] for r in conn.execute("PRAGMA quick_check")) or "no answer"
-            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
-            found["counts"] = {t: conn.execute(f"SELECT count(*) FROM {quoted(t)}").fetchone()[0] for t in tables}
-        finally:
-            conn.close()
+        found.update(foundation.inspect_database(p, check))
     except (sqlite3.Error, OSError, PermissionError) as e:
         found["quick_check"] = f"{type(e).__name__}: {util.first_line(str(e), 200)}"
     return found
-
-
-def copy_database(target: Path) -> None:
-    conn = paths.connect_db(paths.DB_FILE, readonly=True)
-    try:
-        conn.execute("VACUUM INTO ?", (str(target),))
-    finally:
-        conn.close()
 
 
 def snapshot(reason: str) -> Path | None:
@@ -153,14 +150,7 @@ def retain(folder: Path) -> None:
     every = snapshots(folder)
     pinned = ""
     if paths.DB_FILE.exists():
-        conn = paths.connect_db(paths.DB_FILE, readonly=True)
-        try:
-            row = conn.execute("SELECT backup FROM schema_migrations ORDER BY n DESC LIMIT 1").fetchone()
-            pinned = row[0] if row else ""
-        except sqlite3.OperationalError:
-            pass
-        finally:
-            conn.close()
+        pinned = foundation.latest_migration_backup()
     keep = set(every[-KEEP_NEWEST:])
     first_day = (util.now() - timedelta(days=KEEP_DAYS - 1)).date()
     newest_of_day = {stamp_of(p).date(): p for p in every}
@@ -309,29 +299,19 @@ def private_database(source: Path):
             original = Path(str(source) + suffix)
             if original.exists():
                 shutil.copyfile(original, Path(str(target) + suffix))
-        conn = paths.connect_db(target)
+        conn = foundation.connect_db(target)
         try:
-            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            foundation.check_readable(conn)
             yield conn
         finally:
             conn.close()
-
-
-def metadata(conn) -> dict:
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'schema_meta'").fetchone():
-        return {}
-    return dict(conn.execute("SELECT key, value FROM schema_meta"))
 
 
 def probe_current() -> dict | None:
     try:
         with private_database(paths.DB_FILE) as conn:
             meta = metadata(conn)
-            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            runs = []
-            if "runs" in tables:
-                conn.row_factory = sqlite3.Row
-                runs = [dict(r) for r in conn.execute("SELECT * FROM runs WHERE status='running'")]
+            runs = foundation.running_runs(conn)
             return {"sequences": sequences(conn), "meta": meta, "runs": runs}
     except (sqlite3.Error, OSError):
         return None
@@ -363,30 +343,13 @@ def stop_hint() -> str:
     return "stop it first: stop the `arete serve` process or its service"
 
 
-def sequences(conn: sqlite3.Connection) -> dict[str, int]:
-    try:
-        return {name: seq for name, seq in conn.execute("SELECT name, seq FROM sqlite_sequence")}
-    except sqlite3.OperationalError:
-        return {}
-
-
 def current_sequences() -> dict[str, int] | None:
     found = probe_current()
     return found["sequences"] if found is not None else None
 
 
 def raise_sequences(staged: Path, current: dict[str, int] | None) -> None:
-    from . import dbstats, state
-
-    timing = dbstats.Timing(staged, "write")
-    with state.owning_transaction(lambda: paths.connect_db(staged), timing=timing) as conn:
-        held = sequences(conn)
-        for name in set(held) | set(current or {}):
-            wanted = max(held.get(name, 0), (current or {}).get(name, 0)) if current is not None else held[name] + RESTORE_GAP
-            if name in held:
-                conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (wanted, name))
-            elif held or conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_sequence'").fetchone():
-                conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (name, wanted))
+    foundation.raise_sequences(staged, current, RESTORE_GAP)
 
 
 def restore_record() -> Path:
@@ -440,27 +403,6 @@ def receipt_epoch():
         raise Refused(f"{file}: unreadable generation receipt; preserve it for recovery") from e
 
 
-def apply_metadata(target, data):
-    from . import dbstats, state
-
-    with state.owning_transaction(lambda: paths.connect_db(target), timing=dbstats.Timing(target, "write")) as conn:
-        held = sequences(conn)
-        has_sequence = conn.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone()
-        if has_sequence:
-            for name, floor in data["sequences"].items():
-                if name in held:
-                    conn.execute("UPDATE sqlite_sequence SET seq=? WHERE name=?", (max(held[name], floor), name))
-                else:
-                    conn.execute("INSERT INTO sqlite_sequence(name,seq) VALUES (?,?)", (name, floor))
-        meta = metadata(conn)
-        if "restore_epoch" not in meta:
-            return False
-        for key, value in {**data["identity"], "restore_epoch": str(data["epoch"])}.items():
-            conn.execute("INSERT INTO schema_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                         (key, value))
-    return True
-
-
 def finish_restore():
     data = pending_restore()
     if not data:
@@ -507,16 +449,16 @@ def prepare_restore(source, current):
         if not source.is_file():
             raise Refused(f"{source} is not a file")
         with private_database(source) as conn:
-            if [r[0] for r in conn.execute("PRAGMA quick_check")] != ["ok"]:
+            if foundation.quick_check(conn) != ["ok"]:
                 raise Refused(f"{source} failed its check")
             snap_meta, held = metadata(conn), sequences(conn)
-            conn.execute("VACUUM INTO ?", (str(staged),))
+            foundation.vacuum_into(conn, staged)
         previous = (current or {}).get("sequences", {})
         floors = {name: max(held.get(name, 0), previous.get(name, 0)) if current is not None
                   else held[name] + RESTORE_GAP for name in set(held) | set(previous)}
         identity = {k: v for k, v in (current or {}).get("meta", {}).items() if k.startswith("instance_")}
         if not identity:
-            from .migrations.m0001_foundation_ledger import identity as new_identity
+            from .store.migrations.m0001_foundation_ledger import identity as new_identity
 
             try:
                 identity = new_identity()
