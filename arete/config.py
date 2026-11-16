@@ -1119,6 +1119,7 @@ class RepoLayer:
     checks: dict[str, str] = field(default_factory=dict)
     quick_checks: tuple[str, ...] = ("lint", "format", "compile", "imports", "web", "types")
     targeted_checks: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    targeted_commands: dict[str, str] = field(default_factory=dict)
     patch: PatchPolicy = field(default_factory=PatchPolicy)
     max_diff_lines: int = 400
     deny: list[str] = field(default_factory=list)
@@ -1168,7 +1169,7 @@ class RepoLayer:
         return self.dir / "evals"
 
 
-LAYER_SECTIONS = {"setup", "checks", "check_policy", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
+LAYER_SECTIONS = {"setup", "checks", "targeted_commands", "check_policy", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
                   "factory", "environment", "routing", "document", "ab"}
 
 
@@ -1187,7 +1188,7 @@ def check_policy(layer: RepoLayer, table: dict) -> None:
             raise ValueError(f"[check_policy.quick] unknown checks: {', '.join(sorted(missing))}")
     for pattern, names in table_of(table.get("targeted", {}), "check_policy.targeted").items():
         selected = string_list(names, f"check_policy.targeted.{pattern}")
-        if not pattern.strip() or not selected or (set(selected) - layer.checks.keys()):
+        if not pattern.strip() or not selected or (set(selected) - (layer.checks.keys() | layer.targeted_commands.keys())):
             raise ValueError(f"[check_policy.targeted] {pattern!r} must name existing checks")
         layer.targeted_checks[pattern] = selected
 
@@ -1224,9 +1225,13 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
     setup = section(data, "setup")
     layer.setup = list(setup.get("commands", []))
     layer.copy = list(setup.get("copy", []))
-    layer.checks = dict(section(data, "checks"))
-    if any(not isinstance(command, str) or not command.strip() for command in layer.checks.values()):
-        raise ValueError("[checks] must map names to nonempty commands")
+    for name in ("checks", "targeted_commands"):
+        commands = dict(section(data, name))
+        if any(not isinstance(command, str) or not command.strip() for command in commands.values()):
+            raise ValueError(f"[{name}] must map names to nonempty commands")
+        setattr(layer, name, commands)
+    if shared := layer.checks.keys() & layer.targeted_commands.keys():
+        raise ValueError(f"[targeted_commands] names collide with required checks: {', '.join(sorted(shared))}")
     check_policy(layer, section(data, "check_policy"))
     lim = section(data, "limits")
     layer.max_diff_lines = int(lim.get("max_diff_lines", layer.max_diff_lines))

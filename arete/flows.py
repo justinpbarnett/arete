@@ -374,7 +374,8 @@ class Job:
 
     def policy(self, name: str, kw: dict) -> str:
         if name == "checks":
-            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks, bool(kw.get("quick")))
+            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks,
+                     self.layer.targeted_commands, bool(kw.get("quick")))
         elif name == "verify":
             value = (asdict(self.layer.verify) if self.layer.verify else None, self.goal, self.left_for_a_person)
         else:
@@ -438,12 +439,16 @@ class Job:
                 self.fix_reply = str(data.get("reply") or "")
             if outcome.session.id:
                 run.sessions[BUILD] = outcome.session
-        elif name == "checks" and "report" in data:
-            self.b.report = data["report"]
-            if outcome.passed and data.get("full"):
+        elif name == "checks":
+            self.b.report = data.get("report", self.b.report)
+            if not outcome.passed:
+                self.b.checked = {}
+            elif "checked" in data:
+                self.b.checked = data["checked"]
+            elif data.get("full"):
                 self.b.checked = {"tree": str(data.get("checked_tree") or ""), "commands": data.get("commands", {}),
                                   "report": data["report"]}
-            if not data.get("after"):
+            if "attempts" in data and not data.get("after"):
                 self.attempts = data["attempts"]
                 if stored:
                     record.note(run.id, attempts=self.attempts)
@@ -839,7 +844,6 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
     run, b = job.run, job.b
     ok = b.check(quick=True) if quick else b.check()
     if not after:
-        run.save("checks.md", b.report)
         record.note(run.id, attempts=attempt)
     if not ok:
         if not after:
@@ -847,7 +851,7 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
                              else "Checks still failing after the last attempt.")
         return Outcome("fail", next="implement", feedback=b.report,
                        data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
-                             "policy": job.policy("checks", {"quick": quick})})
+                             "policy": job.policy("checks", {"quick": quick}), "checked": b.checked})
     planned = f" (the plan estimated {job.estimate})" if job.estimate and not after else ""
     b.require_valid_diff(after or "the build and its fixes", planned)
     checked_tree = factory.fingerprint(job.ws)
@@ -855,7 +859,8 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
             and b.checked.get("report") == b.report)
     return Outcome("pass", data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
                                  "full": full, "checked_tree": checked_tree,
-                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick})})
+                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick}),
+                                 "checked": b.checked})
 
 
 @factory.step("verify")
@@ -1039,6 +1044,7 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
 @factory.step("pr")
 def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
+    job.run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     found = adopt_open_prs(job)
     refuse_closed_repair_prs(job)
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
@@ -1175,6 +1181,8 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
         return drive(flow)
     except workspace.RunFailed as e:
         return finish(flow, "failed", why=e.why, detail=e.detail)
+    except tracker.ERRORS as e:
+        return finish(flow, "failed", why=f"tracker refused {flow.ctx.run.ref}: {e}")
     except owner_asks.Asked as e:
         reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
         parks = e.limit is None

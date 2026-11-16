@@ -1001,12 +1001,20 @@ Builder and repair prompts leave the full-suite gate to Arete instead of asking 
 [check_policy]
 quick = ["lint", "compile", "imports", "web"]
 
+[targeted_commands]
+tracker-smoke = ".venv/bin/python -m unittest tests.test_tasks"
+poll-smoke = ".venv/bin/python -m unittest tests.test_process_limits.QueueTests"
+
 [check_policy.targeted]
 "arete/tracker.py" = ["tracker-smoke"]
 "arete/poll.py" = ["poll-smoke"]
 ```
 
-Every explicitly named check must exist in `[checks]`.
+`[checks]` contains the required commands for every final full run.
+`[targeted_commands]` contains owner-configured commands used only when selected for an intermediate check; they are excluded from final full runs.
+Targeted patterns may name commands from either table, while explicit quick names must exist in `[checks]`.
+Commands must be nonempty strings, selected names must exist, and the two command tables cannot share names.
+Changing a targeted command invalidates stored check evidence on resume.
 Targeted passes are marked as partial evidence, not as a successful full suite.
 
 For disposable-fixture commands that the agent's irreversible-action classifier cannot authorize, an owner can configure named product probes separately from prerequisite preflight checks:
@@ -1116,9 +1124,24 @@ private_key = "~/.config/arete/github-app.pem"
 
 An open issue labeled `agent` that the repo owner opened. Issues labeled `bug` or `fix` are fixes; the rest are features. Arete tracks progress with `agent:running`, `agent:pr`, `agent:failed` and `agent:needs-info`, and the PR closes the issue, unless it leaves a change for a person. Remove `agent:failed` or `agent:needs-info` to send it back to the queue. When the plan finds nothing left to build and the builder changes nothing, arete pushes nothing: with an open PR it keeps the PR in `agent:pr` and says so on the ticket, and with none it asks in `agent:needs-info` whether the ticket is done. A ticket in `agent:needs-info` also goes back when you reply to arete's question in a comment: poll removes the label, and the next run reads the question and your answer. A parked ask with a secret question stays waiting: answer it on the dashboard or with `arete answer`. `arete install` creates all of these labels in each GitHub pipeline repo, so `agent` is there to pick from any GitHub client, the phone app included.
 
-A body line that starts with `Waits on`, such as `Waits on #7.` or `Waits on #7 and #9`, holds the issue until every issue or PR of the same repo it names is closed or merged, and a number arete cannot read holds it too.
+A dependency declaration is a body line starting with `Waits on` or `Blocked by`, case insensitive, with an optional colon.
+Leading spaces or tabs, one Markdown bullet (`-`, `*`, `+`) or heading (`#` through `######`), and `**` bold markers around the label are accepted, as in `- **Blocked by:** #7 and #9` or `### Waits on: #7`.
+The shared parser scans lines directly, including matching lines inside code fences or HTML comments; put examples in inline code to avoid declaring dependencies.
+GitHub issues use the bare `#N` references on these lines, such as `Waits on #7.` or `Blocked by #7 and #9`, and wait until every named issue or PR in the same repository is closed or merged.
+A number arete cannot read holds the issue too.
 Poll skips an issue that waits on such a number, with the reason in the serve log and the dashboard's queue; `arete run` skips it too, and `--force` or Run on the queue runs it anyway.
-A `#N` anywhere but a `Waits on` line holds nothing, and Jira tickets order work with their own links, not `Waits on` lines.
+References outside matching declaration lines hold nothing.
+Each tracker reads only its own reference type on those lines: GitHub issue numbers, local task ids or Jira keys.
+
+A maintainer can consolidate a bounded group into one execution issue labelled `agent:batch`.
+Its first nonblank body line must be the plain, unindented header `Batch issues: #12, #13`, with comma-separated positive `#numbers` from this repository, including its own issue and at most 20 entries.
+Only blank lines may precede it; prose, Markdown formatting, fences and HTML comments before the header refuse the batch.
+Any further exact `Batch issues:` directive line, including indented lines and lines in fenced or commented examples, refuses the batch conservatively.
+Missing or malformed headers also refuse the batch before execution or any branch push, even for partial work.
+Keep every requirement in the execution issue and remove `agent` from the tracking children; `no-agent` prevents automatic readmission.
+Dependent execution issues should wait on the execution issue rather than a separately queued child.
+A complete PR closes every listed issue, with its own issue first and the other numbers in numeric order; a PR with work left for a person closes none of them.
+The batch retains the repository's diff limit, review, full checks, verification and publication policy.
 
 ## Jira tickets
 
@@ -1157,6 +1180,11 @@ Touching the labels is the approval: whatever the ticket says then, you have rea
 
 Progress shows as `agent-running`, `agent-pr`, `agent-failed` and `agent-needs-info`. A reply from you after arete's question takes `agent-needs-info` off, as on GitHub. An ask that holds a secret question is not answered by a reply; answer it on the dashboard or with `arete answer`. Bug, Fire, Incident and Problem issue types are fixes, as are tickets labeled `bug` or `fix`. PR titles end with the key, like `Fix login (ABC-12)`, PR bodies link the ticket, and these PRs get no arete labels. Tickets the approval rules hold back, and tickets with a missing or doubled route label, show in `arete status` with the reason. `arete run REPO KEY --force` runs one anyway.
 
+Jira descriptions use the same `Waits on` and `Blocked by` declarations and Markdown forms described under GitHub tickets, with Jira keys such as `Blocked by: ABC-7 and ABC-9`.
+Keys are case insensitive; every named ticket must have a status in Jira's done category before the wait clears.
+A ticket in another category, an unreadable ticket or a status without a readable category holds the dependent ticket.
+GitHub numbers and local task ids on these lines do not declare Jira dependencies.
+
 `[jira] auto = true` lets [triage](#triage) add `agent` and the route label to the tickets it finds ready, at most `auto_per_refresh` (default 3) each refresh. Default `false`.
 
 `[jira] sprint_only` (default `true`) limits that auto approval, and the research loop, to tickets in the open sprint or left over in a closed sprint and not moved to a future one. Triage still sorts every open ticket. Set it to `false` for a board without sprints.
@@ -1179,7 +1207,10 @@ arete task close t-1a2b
 
 `add` prints the new id. `--kind fix` makes a fix, and the title defaults to the body's first line. `list` prints one JSON line per task, oldest first, and both its filters are optional. `show` prints one JSON line: the task and its comments, with its `runs` and `children` as `GET /api/tasks/ID` gives them, from the server when it is up. `task start --repo NAME "PROMPT"` adds a task and starts it, and `task run REPO TICKET` starts one that exists; both go through the server (see [From the CLI](#from-the-cli)). `reply` stores your answer to arete's question, and `close` closes the task. Every task counts as yours. A task in `needs-info` whose newest comment is yours counts as replied, as an issue you answered does.
 
-A body line such as `Waits on t-1a2b.` holds the task until `t-1a2b` is `done` or `closed`. A named task in any other state holds it, `failed` and `needs-info` included, so a task that failed holds the tasks that wait on it. A name that matches no task holds it too, and the reason says so.
+Local task bodies use the same `Waits on` and `Blocked by` declarations and Markdown forms described under GitHub tickets, with case-insensitive task ids such as `Waits on t-1a2b.` or `- **Blocked by:** t-1a2b`.
+Every named task must be `done` or `closed`; any other state holds the dependent task, including `failed` and `needs-info`.
+A name that matches no task holds it too, and the reason says so.
+GitHub numbers and Jira keys on these lines do not declare local dependencies.
 
 A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for a ticket, as in `arete run web t-1a2b`. An issue number or a Jira key gets the repo's own tracker. `tracker = "local"` makes local tasks a repo's only tracker. Such a repo may have no `github`: it loads, shows in `arete status` and on the dashboard, and gets no triage, but `arete run` refuses it with `has no github remote configured` unless its layer sets `[factory] path = "adw"` and the repo has a git remote `origin`. Then the run pushes a branch to `origin` and moves the task to `done`; see [The adw flow](#the-adw-flow). A PR for a task closes nothing and ends with the id, like `Paint the door (t-1a2b)`.
 

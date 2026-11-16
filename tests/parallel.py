@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -95,6 +96,7 @@ class Runner:
         self.history = load_history()
         self.seen = {}
         self.again, self.flaky = [], []
+        self.retries = []
 
     def command(self, identifier, result_file):
         tail = ["--one", identifier, "--start", self.start, "--result", result_file,
@@ -111,8 +113,14 @@ class Runner:
 
     def captured(self, path):
         try:
-            with open(path, errors="replace") as handle:
-                return handle.read()[-TAIL:]
+            with open(path, "rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size <= 2 * TAIL:
+                    return handle.read(2 * TAIL).decode(errors="replace")
+                head = handle.read(TAIL).decode(errors="replace")
+                handle.seek(-TAIL, os.SEEK_END)
+                tail = handle.read(TAIL).decode(errors="replace")
+                return f"{head}\n... {size - 2 * TAIL} bytes omitted; full output: {path} ...\n{tail}"
         except OSError:
             return ""
 
@@ -171,9 +179,7 @@ class Runner:
             if show:
                 self.say(test, report, seconds)
 
-    def say(self, test, report, seconds):
-        if not self.verbose:
-            return
+    def outcome(self, report):
         if report["errors"]:
             outcome = "ERROR"
         elif report["failures"]:
@@ -186,7 +192,11 @@ class Runner:
             outcome = "unexpected success"
         else:
             outcome = "ok"
-        print(f"{test} ... {outcome} ({seconds:.1f}s)", flush=True)
+        return outcome
+
+    def say(self, test, report, seconds):
+        if self.verbose:
+            print(f"{test} ... {self.outcome(report)} ({seconds:.1f}s)", flush=True)
 
     def task(self, item):
         index, test = item
@@ -195,21 +205,19 @@ class Runner:
         if report is not None:
             seconds = time.monotonic() - began
             self.seen[test.id()] = seconds
+            self.record(test, report, seconds)
             if report["errors"] or report["failures"]:
                 with self.lock:
                     self.again.append((index, test, seconds))
-                    self.say(test, report, seconds)
-                return
-            self.record(test, report, seconds)
 
     def rerun(self):
         for index, test, seconds in sorted(self.again, key=lambda row: row[0]):
             report = self.child(test, f"{index}.again")
             if report is None:
                 return
-            if not (report["errors"] or report["failures"]):
+            self.retries.append((str(test), report))
+            if not (report["errors"] or report["failures"] or report["unexpected"]):
                 self.flaky.append(str(test))
-            self.record(test, report, seconds, show=False)
 
     def broken(self, test):
         result = unittest.TestResult()
@@ -245,19 +253,25 @@ class Runner:
         pool.sort(key=lambda item: (not getattr(type(item[1]), "slow", False), -self.history.get(item[1].id(), 0)))
         began = time.monotonic()
         self.lifeline, self.held = os.pipe()
+        completed = False
         try:
-            with tempfile.TemporaryDirectory(prefix="arete-parallel-") as folder:
-                self.folder = folder
-                for test in broken:
-                    self.broken(test)
-                for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                    signal.signal(number, self.interrupt)
-                self.phase(pool, self.jobs)
-                self.phase(alone, 1)
-                self.rerun()
+            self.folder = tempfile.mkdtemp(prefix="arete-parallel-")
+            for test in broken:
+                self.broken(test)
+            for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(number, self.interrupt)
+            self.phase(pool, self.jobs)
+            self.phase(alone, 1)
+            self.rerun()
+            completed = True
         finally:
             os.close(self.lifeline)
             os.close(self.held)
+            if self.folder:
+                if completed and not (self.errors or self.failures or self.unexpected or self.stopping):
+                    shutil.rmtree(self.folder)
+                else:
+                    print(f"Worker reports and output retained in: {self.folder}", flush=True)
         if self.stopping:
             print("interrupted; tests in flight: " + (", ".join(self.in_flight or []) or "none"), flush=True)
             return 130
@@ -276,6 +290,8 @@ class Runner:
                   f"longest {longest[1].rpartition('.')[2]} {longest[0]:.1f}s")
 
     def finish(self, seconds):
+        if self.again:
+            print("Original attempt diagnostics:")
         for kind, rows in (("ERROR", self.errors), ("FAIL", self.failures)):
             for title, text, tail in rows:
                 print(f"{RULE}\n{kind}: {title}\n{DASH}\n{text.rstrip()}")
@@ -283,11 +299,20 @@ class Runner:
                     print(f"Output:\n{tail.rstrip()}")
         for title in self.unexpected:
             print(f"{RULE}\nUNEXPECTED SUCCESS: {title}")
+        for title, report in self.retries:
+            print(f"{RULE}\nRETRY: {title}: {self.outcome(report)}")
+            for kind, rows in (("ERROR", report["errors"]), ("FAIL", report["failures"])):
+                for retry_title, text in rows:
+                    print(f"RETRY {kind}: {retry_title}\n{DASH}\n{text.rstrip()}")
+            for retry_title in report["unexpected"]:
+                print(f"RETRY UNEXPECTED SUCCESS: {retry_title}")
+            if report["tail"].strip():
+                print(f"Output:\n{report['tail'].rstrip()}")
         for title in self.flaky:
-            print(f"FLAKY: {title} failed beside other tests and passed when run alone")
+            print(f"FLAKY: {title} failed on the original attempt and passed on retry")
         if self.slowest:
             self.slowest_block()
-        bad = bool(self.errors or self.failures or self.unexpected)
+        bad = bool(self.errors or self.failures or self.unexpected or self.flaky)
         counts = [("failures", len(self.failures)), ("errors", len(self.errors)), ("skipped", self.skipped),
                   ("expected failures", self.expected), ("unexpected successes", len(self.unexpected)),
                   ("flaky", len(self.flaky))]

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +11,9 @@ from . import config, gh, jira, principals, util
 from .store import tasks as tasks_store
 
 LABEL = "agent"
+BATCH_LABEL = "agent:batch"
+BATCH_LINE = re.compile(r"Batch issues:[ \t]*(.*)")
+BATCH_REFS = re.compile(r"#[1-9][0-9]*(?:[ \t]*,[ \t]*#[1-9][0-9]*)*")
 APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
 STATE_COLORS = {"running": "fbca04", "pr": "0e8a16", "failed": "d93f0b", "needs-info": "c5def5"}
 FIX_LABELS = {"bug", "fix"}
@@ -109,6 +112,22 @@ def error_of(call: Callable[[], object]) -> str:
     return ""
 
 
+def batch_ids(t: Ticket) -> list[str]:
+    if BATCH_LABEL not in t.labels:
+        return [t.id]
+    lines = [line for line in t.body.splitlines() if line.strip()]
+    header = BATCH_LINE.fullmatch(lines[0]) if lines else None
+    if (not header or not BATCH_REFS.fullmatch(header[1].strip())
+            or any(BATCH_LINE.fullmatch(line.lstrip()) for line in lines[1:])):
+        raise TaskError("a batch needs its only plain, unindented Batch issues: line first, before any nonblank content, "
+                        "with comma-separated #numbers from this repo; repeated directives, even in examples, are refused")
+    named = re.findall(r"#([0-9]+)", header[1])
+    own = str(int(t.id))
+    if own not in named or len(named) > 20:
+        raise TaskError("a batch must include its own issue and name at most 20 issues")
+    return [own, *sorted(set(named) - {own}, key=int)]
+
+
 _clients: dict[str, jira.Client] = {}
 
 
@@ -133,6 +152,7 @@ class GitHubTracker:
         self.repo = repo
         self.owner = repo.github.split("/")[0]
         self._bodies: dict[str, str] = {}
+        self._labels: dict[str, list[str]] = {}
         self._open: dict[int, bool | None] = {}
 
     @property
@@ -154,11 +174,12 @@ class GitHubTracker:
     def todo(self) -> list[Ticket]:
         skip = {self.label_name(s) for s in config.RUN_LABELS}
         out = []
-        self._bodies, self._open = {}, {}
+        self._bodies, self._labels, self._open = {}, {}, {}
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
             self._bodies[str(i["number"])] = i.get("body") or ""
             self._open[int(i["number"])] = True
             names = {lb["name"] for lb in i.get("labels", [])}
+            self._labels[str(i["number"])] = sorted(names)
             if names & skip or not self.by_owner(i):
                 continue
             out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=self._bodies[str(i["number"])],
@@ -172,8 +193,11 @@ class GitHubTracker:
     def blocker(self, tid: str) -> str:
         body = self._bodies.get(tid)
         if body is None:
-            body = (gh.issue(self.repo.github, int(tid)) or {}).get("body") or ""
-        return wait_blocker(waits_on(body), self.is_open)
+            issue = gh.issue(self.repo.github, int(tid)) or {}
+            body = issue.get("body") or ""
+            self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
+        ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
+        return error_of(lambda: batch_ids(ticket)) or wait_blocker(waits_on(body), self.is_open)
 
     def is_open(self, number: int) -> bool | None:
         if number not in self._open:
@@ -191,6 +215,7 @@ class GitHubTracker:
                 continue
             full = gh.issue(self.repo.github, int(i["number"]))
             self._bodies[str(i["number"])] = full.get("body") or ""
+            self._labels[str(i["number"])] = [lb["name"] for lb in full.get("labels", [])]
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
                     if self.by_owner(c) and c.get("createdAt")]
             if answered(mine):
@@ -215,10 +240,12 @@ class GitHubTracker:
         blocker = ("" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or wait_blocker(
             waits_on(i.get("body") or ""), self.is_open)
-        return Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
+        ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
                       updated=i.get("updatedAt") or "", labels=labels, blocker=blocker)
+        batch_ids(ticket)
+        return ticket
 
     def prepare(self) -> list[str]:
         made = [gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE),
@@ -246,7 +273,10 @@ class GitHubTracker:
         return subject
 
     def pr_link(self, t: Ticket, whole: bool) -> str:
-        return f"Closes #{t.id}" if whole else f"Part of #{t.id}"
+        ids = batch_ids(t)
+        if not whole:
+            return f"Part of #{t.id}"
+        return "\n".join(f"Closes #{tid}" for tid in ids)
 
 
 class JiraTracker:
@@ -291,7 +321,16 @@ class JiraTracker:
 
     def blocker(self, tid: str) -> str:
         issue = self.client.issue(tid, JIRA_FIELDS)
-        return check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]
+        return (check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]
+                or wait_blocker(waits_on_jira((issue.get("fields") or {}).get("description") or ""), self.is_open))
+
+    def is_open(self, key: str) -> bool | None:
+        try:
+            status = (self.client.issue(key, ["status"]).get("fields") or {}).get("status") or {}
+        except jira.JiraError:
+            return None
+        category = (status.get("statusCategory") or {}).get("key")
+        return category != "done" if category else None
 
     def replied(self) -> list[Ticket]:
         jql = candidates_jql(self.project, f'labels = "{self.route}" AND labels = "{self.label_name("needs-info")}"',
@@ -317,6 +356,7 @@ class JiraTracker:
         f = issue.get("fields") or {}
         labels = list(f.get("labels") or [])
         body = f.get("description") or "(no description)"
+        blocker = blocker or wait_blocker(waits_on_jira(body), self.is_open)
         parent = f.get("parent") or {}
         if parent.get("key"):
             body = f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}\n\n{body}"
@@ -622,9 +662,12 @@ def route_blocker(routes: set[str], labels: list[str]) -> str:
     return ""
 
 
-WAIT_LINE = re.compile(r"^[ \t]*waits[ \t]+on\b(.*)$", re.IGNORECASE | re.MULTILINE)
+WAIT_LINE = re.compile(r"^[ \t]*(?:[-*+][ \t]+|#{1,6}[ \t]+)?(?:\*\*|__)?"
+                       r"(?:waits[ \t]+on|blocked[ \t]+by)\b(?:\*\*|__)?[ \t]*:?[ \t]*(?:\*\*|__)?(.*)$",
+                       re.IGNORECASE | re.MULTILINE)
 WAIT_REF = re.compile(r"(?<![\w/])#(\d+)")
 WAIT_TASK = re.compile(r"(?<![\w-])t-[0-9a-f]{4,}(?![\w-])", re.IGNORECASE)
+WAIT_JIRA = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-\d+(?![\w-])", re.IGNORECASE)
 
 
 def waits_on(body: str) -> list[int]:
@@ -637,12 +680,17 @@ def waits_on_tasks(body: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def waits_on_jira(body: str) -> list[str]:
+    found = [key.upper() for rest in WAIT_LINE.findall(body or "") for key in WAIT_JIRA.findall(rest)]
+    return list(dict.fromkeys(found))
+
+
 def joined(names: list[str]) -> str:
     return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
-def _refs(numbers: list[int]) -> str:
-    return joined([f"#{n}" for n in numbers])
+def _refs(references: Iterable[int | str]) -> str:
+    return joined([ref_for(ref) for ref in references])
 
 
 def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -> str:
@@ -657,7 +705,7 @@ def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -
     return "; ".join(parts)
 
 
-def wait_blocker(waits: list[int], is_open: Callable[[int], bool | None]) -> str:
+def wait_blocker[T: (int, str)](waits: list[T], is_open: Callable[[T], bool | None]) -> str:
     seen = {n: is_open(n) for n in waits}
     still = [n for n, v in seen.items() if v is True]
     unread = [n for n, v in seen.items() if v is None]

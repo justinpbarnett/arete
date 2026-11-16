@@ -795,9 +795,14 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
-    if not layer.checks:
+    commands = layer.checks
+    if selected is not None:
+        available = layer.checks | layer.targeted_commands
+        if missing := selected - available.keys():
+            raise ValueError(f"unknown selected checks: {', '.join(sorted(missing))}")
+        commands = {name: command for name, command in available.items() if name in selected}
+    if not commands:
         return True, "no checks configured"
-    commands = {name: command for name, command in layer.checks.items() if selected is None or name in selected}
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
@@ -926,17 +931,30 @@ class Build(TicketWork):
                               disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False) -> bool:
-        selected = selected_checks(self.layer, self.restage().files) if quick else None
-        full = selected is None or selected == set(self.layer.checks)
-        before = factory.fingerprint(self.ws) if full else ""
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
-        if ok and full:
-            after = factory.fingerprint(self.ws)
-            if before and after and before != after:
-                self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
-                return False
-            self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
-        return ok
+        previous, self.checked = self.checked, {}
+        self.report = "Checks started but did not complete; no passing result from this attempt."
+        try:
+            self.run.save("checks.md", self.report)
+            selected = selected_checks(self.layer, self.restage().files) if quick else None
+            full = selected is None or selected == set(self.layer.checks)
+            before = factory.fingerprint(self.ws)
+            ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+            if ok:
+                after = factory.fingerprint(self.ws)
+                if before and after and before != after:
+                    self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
+                    return False
+                if full:
+                    self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
+                elif before and before == after == previous.get("tree") and previous.get("commands") == self.layer.checks:
+                    self.checked = previous
+            return ok
+        except BaseException as e:
+            self.checked = {}
+            self.report = f"Checks did not complete: {type(e).__name__}: {util.first_line(str(e), 300)}"
+            raise
+        finally:
+            self.run.save("checks.md", self.report)
 
     def restage(self, *, from_base: bool | None = None) -> Staged:
         self.staged = stage(self.checkouts, self.deny, self.from_base if from_base is None else from_base)
@@ -958,6 +976,7 @@ class Build(TicketWork):
                             f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
 
     def push(self, branch: str, message: str) -> None:
+        self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
         commit_and_push(self.checkouts, self.staged.changed, branch, message)
         self.committed_lines += self.staged.lines
 
@@ -1196,6 +1215,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             layer = config.load_layer(repo.layer_dir)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
+        except tracker.ERRORS as e:
+            print(f"could not read {name}: {e}")
+            return 2
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
             return 2
@@ -1286,6 +1308,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.give_up("was stopped by request")
         except workspace.RunFailed as e:
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
+        except tracker.ERRORS as e:
+            status, summary, pr_url = _fail(run, f"tracker refused {run.ref}: {e}")
         except Exception as e:
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
@@ -1577,7 +1601,6 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
               plan_text=plan_text, build_summary=build_summary)
 
     ok, attempts = b.check_with_repairs(lambda n: f"fix{n}")
-    run.save("checks.md", b.report)
     record.note(run.id, attempts=attempts)
     if not ok:
         run.story.append("Checks still failing after the last attempt.")
@@ -1913,7 +1936,7 @@ def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.
         for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
             publish_ci(run, b.ticket, pushed, ci.section(rounds, max_rounds))
-    except owner_asks.Asked:
+    except (owner_asks.Asked, tracker.TaskError):
         raise
     except Exception as e:
         failed = e if isinstance(e, workspace.RunFailed) else workspace.RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")

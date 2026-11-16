@@ -923,7 +923,14 @@ ROUTES = (
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
-    foundation.ensure_schema()
+    while True:
+        try:
+            foundation.ensure_schema()
+            break
+        except foundation.IncompatibleSchema:
+            if not inside_serve:
+                raise
+            time.sleep(RESTART_RETRY_SECONDS)
     chat.recover()
     if inside_serve:
         capture.recover()
