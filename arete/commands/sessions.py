@@ -7,6 +7,7 @@ import os
 import sys
 
 from .. import paths
+from ..store import runs as run_store
 from .common import Parser, follow
 
 CHAT_SESSION_ACTIONS = ("start", "list", "report", "stop")
@@ -64,9 +65,9 @@ def attached(session_id: str) -> int:
     import select
     import threading
 
-    from .. import control, sessions, state
+    from .. import control, sessions
 
-    r = state.run_get(session_id)
+    r = run_store.run_get(session_id)
     if not r or r["kind"] != "session":
         raise control.NotFound(f"no session {session_id}")
     stop = threading.Event()
@@ -146,12 +147,12 @@ def session_exec(args) -> int:
 
 @chat_routed
 def session_list(args) -> int:
-    from .. import sessions, state, util
+    from .. import sessions, util
 
     for s in sessions.views():
         print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
               f"{s['device'] or '':<10} {util.paid_note(s['paid']):<12}  {s['prompt'][:70]}")
-    if not state.runs(kind="session", limit=1):
+    if not run_store.runs(kind="session", limit=1):
         print("no sessions yet; `arete session start \"what to do\"`")
     return 0
 

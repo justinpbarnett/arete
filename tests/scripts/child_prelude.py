@@ -3,6 +3,7 @@ import json, os, shlex, signal, sqlite3, subprocess, sys, time
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import board, cli, config, delivery, loop_run, loops, paths, push, sources, state, util
 root = Path(sys.argv[1])
 state.migrate()

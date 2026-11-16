@@ -4,6 +4,7 @@ import sys
 from collections.abc import Iterable
 
 from .. import paths
+from ..store import runs as run_store
 from .common import print_lines, steering
 
 
@@ -52,9 +53,9 @@ def run_followed(started: dict) -> int:
 
 
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
-    from .. import run_lines, state
+    from .. import run_lines
 
-    if not run_lines.path(run_id).exists() and not state.run_get(run_id):
+    if not run_lines.path(run_id).exists() and not run_store.run_get(run_id):
         return None
     return (run_lines.follow(run_id, start) if follow
             else (line for line in run_lines.read(run_id) if run_lines.seq_of(line) > start))

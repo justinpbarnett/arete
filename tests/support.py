@@ -5,7 +5,8 @@ from pathlib import Path
 import unittest
 from unittest import mock
 
-from arete import paths, sandbox, state
+from arete import paths, sandbox
+from arete.store import db as foundation
 from tests.harness import SOURCE as SOURCE
 
 PYTHON = shlex.quote(sys.executable)
@@ -27,4 +28,4 @@ def isolate_live_state():
                     for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
         patch.start()
         unittest.addModuleCleanup(patch.stop)
-    state.migrate()
+    foundation.migrate()

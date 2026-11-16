@@ -1,16 +1,18 @@
 
 import threading
 from types import SimpleNamespace
+from arete.store import runs as run_store
+from arete.store import asks as ask_store
 from arete import owner_asks, control, pipeline, tasks, poll
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
 state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
               [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
-row = state.run_get(rid)
+row = run_store.run_get(rid)
 fetched, threads, errors, launches = threading.Event(), [], [], []
 lock_requested, tracker_closes = threading.Event(), []
-original_lock, original_close = util.lock, state.ask_close
+original_lock, original_close = util.lock, ask_store.ask_close
 def lock(name, *args, **kwargs):
     if name == owner_asks.STEER_LOCK and threading.current_thread() is not threading.main_thread():
         lock_requested.set()
@@ -37,12 +39,12 @@ def continuing(*args):
         assert lock_requested.wait(5), "tracker did not take the steering lock"
     else:
         ask = state.ask_get("ask")
-        state.ask_close("ask", "answered", owner_asks.text_answers(ask, "tracker text"))
+        ask_store.ask_close("ask", "answered", owner_asks.text_answers(ask, "tracker text"))
     return ["resume"]
 def launch(*args, **kwargs):
     launches.append(args)
     return {"state": "started"}
-with mock.patch.object(util, "lock", side_effect=lock), mock.patch.object(state, "ask_close", side_effect=close), \
+with mock.patch.object(util, "lock", side_effect=lock), mock.patch.object(ask_store, "ask_close", side_effect=close), \
         mock.patch.object(tasks, "run_of", return_value=(cfg, repo, row)), \
         mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
         mock.patch.object(tasks, "free_to_start"), mock.patch.object(tasks, "continuing", side_effect=continuing), \

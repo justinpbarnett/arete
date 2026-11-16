@@ -1,4 +1,6 @@
 
+from arete.store import runs as run_store
+
 for rid, started, usd, tin in (("A", "2020-01-01T00:00:00Z", 9, 900), ("B", "2020-01-02T00:00:00Z", 3, 300),
                                ("C", "2020-01-04T00:00:00Z", 2, 200)):
     record.start("pipeline", run_id=rid, started=started, cost_usd=usd, tokens_in=tin, tokens_out=tin // 10)
@@ -6,7 +8,7 @@ with state.db() as c:
     for rid, usd, ts in (("B", 1, "2020-01-03T00:00:00Z"), ("C", 1.5, "2020-01-04T00:00:00Z")):
         c.execute("INSERT INTO steps (run_id, runner, cost_usd, tokens_in, tokens_out, ts) VALUES (?, 'claude', ?, 100, 10, ?)",
                   (rid, usd, ts))
-paid = state.paid_by_run(["A", "B", "C"])
+paid = run_store.paid_by_run(["A", "B", "C"])
 args = ["costs", "--backfill"]
 if use_before:
     f = root / "before.json"
@@ -22,11 +24,11 @@ b = rows("B")[-1]
 assert (b["step"], b["cost_usd"], b["tokens_in"], b["auth_mode"], b["ts"]) == ("legacy", 2, 200, "subscription", "2020-01-02T00:00:00Z"), b
 assert len(rows("C")) == 1
 assert "backfilled 0 steps" in call(*args)[1]
-assert state.paid_by_run(["A", "B", "C"]) == paid
-assert [state.run_get(r)["cost_usd"] for r in ("A", "B", "C")] == [9, 3, 2]
+assert run_store.paid_by_run(["A", "B", "C"]) == paid
+assert [run_store.run_get(r)["cost_usd"] for r in ("A", "B", "C")] == [9, 3, 2]
 check, = heartbeat.check_costs()
 assert not check.ok and "1 runs" in check.detail and "$0.500000" in check.detail and check.detail.endswith("C"), check
-assert state.cost_drift() == [{"id": "C", "run_usd": 2, "steps_usd": 1.5, "difference": .5}]
+assert run_store.cost_drift() == [{"id": "C", "run_usd": 2, "steps_usd": 1.5, "difference": .5}]
 checked = []
 def fake_check(name):
     def check(*a):

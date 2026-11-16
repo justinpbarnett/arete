@@ -24,6 +24,7 @@ from . import (
     util,
 )
 from .agent import READ_TOOLS, Result
+from .store import runs as run_store
 
 CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
 BUDGET_USD = 2
@@ -93,7 +94,6 @@ def chat_row(chat_id: int) -> dict:
 
 
 def view(chat_id: int) -> dict:
-    sessions.tell_chats()
     row = chat_row(chat_id)
     cfg = config.load()
     try:
@@ -390,7 +390,7 @@ def drop_draft(chat_id: int) -> dict:
 
 def limits(chat_id: int, row: dict, cfg: config.Config) -> dict:
     links = state.chat_sessions(chat_id)
-    paid = state.paid_by_run([link["run_id"] for link in links])
+    paid = run_store.paid_by_run([link["run_id"] for link in links])
     running = [link for link in links if link["status"] == "running"]
     spent = row["paid_usd"] + replying.get(chat_id, 0) + sum(
         max(link["budget_usd"] or 0, paid.get(link["run_id"], 0)) if link["status"] == "running"
@@ -442,7 +442,7 @@ def start_session(chat_id: int, prompt: str, *, repo: str | None = None, device:
 def sessions_of(chat_id: int) -> dict:
     row = chat_row(chat_id)
     links = state.chat_sessions(chat_id)
-    paid = state.paid_by_run([link["run_id"] for link in links])
+    paid = run_store.paid_by_run([link["run_id"] for link in links])
     listed = [{"id": link["run_id"], "status": link["status"] or "gone", "started": link["started"],
                "finished": link["finished"], "repo": link["repo"] or "", "branch": link["branch"] or "",
                "device": link["device"], "model": link["model"], "runner": link["runner"],

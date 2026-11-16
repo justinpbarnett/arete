@@ -4,6 +4,8 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 from arete import config, jira, loops, paths, serve, sources, state, util
+from arete.store import loops as loop_store
+from arete.store import sources as source_store
 state.migrate()
 root = Path(os.environ["IDENT_ROOT"])
 cfg = config.load()
@@ -77,10 +79,10 @@ with mock.patch.object(jira.Client, "from_env", lambda *a, **k: fake):
     fake.books["status = Ready"] = [ticket("ABC-1", old)]
     loop = load("outage", jira_block("status = Ready"))
     base = poll(loop)
-    good, owner = state.cursor("outage#0"), state.source_owner("outage#0")
+    good, owner = source_store.cursor("outage#0"), source_store.source_owner("outage#0")
     loop = load("outage", jira_block("status = Refused"))
     failed = [poll(loop), poll(loop)]
-    bad, owner_after = state.cursor("outage#0"), state.source_owner("outage#0")
+    bad, owner_after = source_store.cursor("outage#0"), source_store.source_owner("outage#0")
     stamp = util.parse_iso(good["last_ok"])
     after = util.iso(stamp + timedelta(seconds=30))
     month = util.iso(stamp - timedelta(days=30))
@@ -96,7 +98,7 @@ data, other = root / "edge.jsonl", root / "edge2.jsonl"
 write(data, row("e0"))
 loop = load("edge", block(data))
 poll(loop)
-last = util.parse_iso(state.cursor("edge#0")["last_ok"])
+last = util.parse_iso(source_store.cursor("edge#0")["last_ok"])
 write(other, row("on-edge", util.iso(last - timedelta(minutes=2))),
       row("just-before", util.iso(last - timedelta(minutes=2, seconds=1))))
 loop = load("edge", block(other))
@@ -139,8 +141,8 @@ def adoption(name, below):
 out["above"] = adoption("adopt", False)
 out["below"] = adoption("adoptlow", True)
 
-state.set_cursor("foreign#1", None, True, "old")
-state.claim_seen("foreign#1", ["z1"])
+source_store.set_cursor("foreign#1", None, True, "old")
+source_store.claim_seen("foreign#1", ["z1"])
 solo = root / "solo.jsonl"
 write(solo, row("s1"))
 loop = load("foreign", block(solo, name=quoted("solo")))
@@ -166,7 +168,7 @@ two.write_text("ERROR old beta gadget\n")
 two_size = two.stat().st_size
 loop = load("logs", log_block(watched / "*.log", "ERROR"))
 scoped = poll(loop)
-offsets = json.loads(state.cursor("logs#0")["value"])
+offsets = json.loads(source_store.cursor("logs#0")["value"])
 with two.open("a") as handle:
     handle.write("ERROR gamma sprocket fresh\n")
 out["logs"] = {"scoped": scoped, "offsets": offsets, "names": [str(one), str(two)], "two_size": two_size,
@@ -177,18 +179,18 @@ write(data, row("l1"), row("l2"))
 loop = load("legacy", block(data, timeout="60", every=quoted("1m")))
 old_owner = hashlib.sha256(json.dumps({k: v for k, v in loop.sources[0].items() if k != "every"}, sort_keys=True,
                                       default=str).encode()).hexdigest()
-state.set_cursor("legacy#0", None, True, "1 read, 0 new")
-state.claim_seen("legacy#0", ["l1"])
-state.set_source_owner("legacy#0", old_owner)
+source_store.set_cursor("legacy#0", None, True, "1 read, 0 new")
+source_store.claim_seen("legacy#0", ["l1"])
+source_store.set_source_owner("legacy#0", old_owner)
 sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#0'")
 legacy = poll(loop)
-state.set_cursor("legacy#9", None, True, "x")
+source_store.set_cursor("legacy#9", None, True, "x")
 sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#9'")
-state.set_cursor("legacy#9", None, False, "boom")
-kept = state.cursor("legacy#9")["last_ok"]
+source_store.set_cursor("legacy#9", None, False, "boom")
+kept = source_store.cursor("legacy#9")["last_ok"]
 state.migrate()
 state.ensure_schema()
-out["legacy"] = {"poll": legacy, "owner": state.source_owner("legacy#0"), "kept": kept, "seen": seen("legacy#0"),
+out["legacy"] = {"poll": legacy, "owner": source_store.source_owner("legacy#0"), "kept": kept, "seen": seen("legacy#0"),
                  "queued": queued("legacy"), "old_owner": old_owner}
 
 data = root / "legacy-edit.jsonl"
@@ -196,9 +198,9 @@ write(data, row("a1"), row("a2"))
 old_settings = load("legacyedit", block(data, timeout="60"))
 legacy_owner = hashlib.sha256(json.dumps({k: v for k, v in old_settings.sources[0].items() if k != "every"},
                                          sort_keys=True, default=str).encode()).hexdigest()
-state.set_cursor("legacyedit#0", None, True, "2 read, 0 new")
-state.claim_seen("legacyedit#0", ["a1", "a2"])
-state.set_source_owner("legacyedit#0", legacy_owner)
+source_store.set_cursor("legacyedit#0", None, True, "2 read, 0 new")
+source_store.claim_seen("legacyedit#0", ["a1", "a2"])
+source_store.set_source_owner("legacyedit#0", legacy_owner)
 write(data, row("a1"), row("a2"), row("a3"))
 loop = load("legacyedit", block(data, timeout="30"))
 out["legacy_edit"] = {"poll": poll(loop), "seen": seen("legacyedit#0"), "queued": queued("legacyedit")}
@@ -225,14 +227,14 @@ write(data, row("r1"))
 loop = load("retry", block(data))
 poll(loop)
 write(data, row("r1"), row("r2"))
-before = {"cursor": state.cursor("retry#0"), "owner": state.source_owner("retry#0")}
-real_enqueue = state.enqueue
+before = {"cursor": source_store.cursor("retry#0"), "owner": source_store.source_owner("retry#0")}
+real_enqueue = loop_store.enqueue
 def broken(*args, **kwargs):
     raise RuntimeError("queue is down")
-state.enqueue = broken
+loop_store.enqueue = broken
 failed = poll(loop)
-state.enqueue = real_enqueue
-after = {"cursor": state.cursor("retry#0"), "owner": state.source_owner("retry#0")}
+loop_store.enqueue = real_enqueue
+after = {"cursor": source_store.cursor("retry#0"), "owner": source_store.source_owner("retry#0")}
 out["retry"] = {"failed": failed, "before": before, "after": after, "seen": seen("retry#0"),
                 "queued_after_failure": queued("retry"), "healed": poll(loop), "queued": queued("retry"),
                 "third": poll(loop)}

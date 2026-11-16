@@ -4,9 +4,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import config, diffguard, environment, jev, outbound, paths, state, util, vault
+from . import config, diffguard, environment, jev, outbound, paths, util, vault
 from .emits import Emit, config_repo
 from .loops import Loop, as_list, blank, check_env, worktree_kinds
+from .store import insights as insight_store
 
 APPROVE_KEYS = ("lines", "deletes", "paths", "reviewer")
 PATCH_SHOWN = 12000
@@ -114,7 +115,7 @@ class Push(Emit):
             raise RuntimeError(f"{paths.short_path(src)} has no origin to push to")
         with branch_worktree(src, item["branch"], f"push-{run_id}") as wt:
             sha = land(item, wt, src, base, cfg)
-        state.set_verdict_sha(run_id, sha)
+        insight_store.set_verdict_sha(run_id, sha)
         util.delete_branch(src, item["branch"])
         return f"pushed {sha[:10]} to {base}; {fast_forward(src, base, sha)}"
 

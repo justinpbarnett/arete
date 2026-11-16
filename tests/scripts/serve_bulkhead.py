@@ -3,6 +3,9 @@ from concurrent.futures import wait
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
+from arete.store import loops as loop_store
+from arete.store import incidents as incident_store
 from arete import alerts, board, cli, config, control, loop_run, explain, heartbeat, loops, oncall, paths, routing, serve, state, tasks, util, webpush
 
 root, mode = Path(sys.argv[1]), sys.argv[2]
@@ -27,7 +30,7 @@ def fake_launch(name, item=None, cfg=None, **kw):
     for fault in calls:
         calls.remove(fault)
         raise fault
-    if not state.take_queue_item(item, f"r-{item}"):
+    if not loop_store.take_queue_item(item, f"r-{item}"):
         raise control.NotFound("taken")
     launched.append(name)
     return {"id": f"r-{item}"}
@@ -48,7 +51,7 @@ def drain(server):
 def run(server, due=True, wait_for=True):
     if due:
         for name in ("aaa", "bbb"):
-            state.set_loop_state(name, last_fire=util.iso(util.now() - timedelta(minutes=2)))
+            loop_store.set_loop_state(name, last_fire=util.iso(util.now() - timedelta(minutes=2)))
     server.run_pass()
     if wait_for:
         drain(server)
@@ -89,7 +92,7 @@ for name in ("aaa", "bbb"):
 sys.stdout = LOG.open("a", buffering=1)
 server = new_server()
 patches = [mock.patch.object(loop_run, "launch", fake_launch), mock.patch.object(routing, "usage_hold", lambda *a, **k: ""),
-           mock.patch.object(webpush, "remind", lambda cfg: []), mock.patch.object(state, "release_settled_claims", lambda: None)]
+           mock.patch.object(webpush, "remind", lambda cfg: []), mock.patch.object(loop_store, "release_settled_claims", lambda: None)]
 for p in patches:
     p.start()
 healthy = {"checks": {"rows": {"heartbeat": True, "checks": []}}, "alerts": {"rows": {"alerts": []}}}
@@ -109,11 +112,11 @@ if mode in ("fault", "oncall"):
                            "error": beat["failing"]["loop:aaa"]["error"], "severity": check.severity, "ok": check.ok})
         if mode == "oncall":
             oncall.scan(config.load())
-            first = [i["id"] for i in state.incidents()]
+            first = [i["id"] for i in incident_store.incidents()]
             run(server)
             oncall.scan(config.load())
-            second = [i["id"] for i in state.incidents()]
-            texts = [str(i) for i in state.incidents()]
+            second = [i["id"] for i in incident_store.incidents()]
+            texts = [str(i) for i in incident_store.incidents()]
             done(first=first, second=second, texts=texts)
             finish(server)
             sys.exit(0)
@@ -152,8 +155,8 @@ elif mode == "approvals":
 
 elif mode == "queue":
     run(server, due=False)
-    one = state.enqueue("aaa", "aaa", "", "event", [EVENT])
-    two = state.enqueue("bbb", "bbb", "", "event", [EVENT])
+    one = loop_store.enqueue("aaa", "aaa", "", "event", [EVENT])
+    two = loop_store.enqueue("bbb", "bbb", "", "event", [EVENT])
 
     def hold(self, cfg, connect=None):
         if self.name == "aaa":
@@ -162,11 +165,11 @@ elif mode == "queue":
     with mock.patch.object(loops.Loop, "usage_hold", hold):
         first = run(server, due=False)
         again = run(server, due=False)
-    pending = [i["id"] for i in state.pending()]
+    pending = [i["id"] for i in loop_store.pending()]
     kept = {k: v["ticks"] for k, v in again["failing"].items()}
-    with mock.patch.object(state, "pending", mock.Mock(side_effect=OSError("busy"))):
+    with mock.patch.object(loop_store, "pending", mock.Mock(side_effect=OSError("busy"))):
         unread = run(server, due=False)
-    state.drop_queue_item(one)
+    loop_store.drop_queue_item(one)
     cleared = run(server, due=False)
     done(one=one, two=two, launched=launched, pending=pending, first=list(first["failing"]), kept=kept,
          unread={k: v["ticks"] for k, v in unread["failing"].items()}, unread_pending=unread["pending"],
@@ -178,11 +181,11 @@ elif mode == "waits":
     out = {}
 
     def queued(*groups, loop="aaa"):
-        return [state.enqueue(loop, loop, g, "event", [{**EVENT, "title": f"{g}{i}"}]) for i, g in enumerate(groups)]
+        return [loop_store.enqueue(loop, loop, g, "event", [{**EVENT, "title": f"{g}{i}"}]) for i, g in enumerate(groups)]
 
     def clear():
-        for item in state.pending():
-            state.drop_queue_item(item["id"])
+        for item in loop_store.pending():
+            loop_store.drop_queue_item(item["id"])
     one, two = queued("g", "g")
     run(server, due=False)
     out["group"] = [launched.count("aaa"), len([x for x in log_lines() if f"queue item {two} waits, group g takes one at a time" in x])]
@@ -192,7 +195,7 @@ elif mode == "waits":
         one, two = queued("g", "g")
         calls.append(fault)
         run(server, due=False)
-        out[type(fault).__name__] = [launched.count("aaa"), state.queue_item(one)["run_id"], state.queue_item(two)["run_id"]]
+        out[type(fault).__name__] = [launched.count("aaa"), loop_store.queue_item(one)["run_id"], loop_store.queue_item(two)["run_id"]]
         clear()
         launched.clear()
     item, = queued("")
@@ -209,7 +212,7 @@ elif mode == "waits":
         beat = run(server, due=False)
     out["spent"] = [len([x for x in log_lines() if f"queue item {item} waits, its daily budget is spent" in x]), list(beat["failing"])]
     clear()
-    gone = state.enqueue("ghost", "ghost", "", "event", [EVENT])
+    gone = loop_store.enqueue("ghost", "ghost", "", "event", [EVENT])
     run(server, due=False)
     out["dropped"] = len([x for x in log_lines() if f"ghost: dropped queue item {gone}, the loop is off or gone" in x])
     done(**out)
@@ -246,7 +249,7 @@ elif mode in ("alerts", "alert_order"):
             closed = len([o for o in order if o[0] == "clear"])
             expired = len(asks)
             fresh = new_server()
-            state.alert_set("serve:tick", None)
+            incident_store.alert_set("serve:tick", None)
             run(fresh, due=False)
             run(fresh, due=False)
             done(seen=seen, ticks=[b["ticks"] for b in beats], tick_ok=calm["tick_ok"], closed=closed, asks=expired,
@@ -259,11 +262,11 @@ elif mode in ("alerts", "alert_order"):
 elif mode == "bad_config":
     first = run(server)
     for name in ("aaa", "bbb"):
-        state.set_loop_state(name, last_fire=util.iso(util.now() - timedelta(minutes=2)))
-    before = [state.loop_states(), state.pending()]
+        loop_store.set_loop_state(name, last_fire=util.iso(util.now() - timedelta(minutes=2)))
+    before = [loop_store.loop_states(), loop_store.pending()]
     paths.CONFIG_FILE.write_text("[replay\n")
     beat = run(server, due=False)
-    after = [state.loop_states(), state.pending()]
+    after = [loop_store.loop_states(), loop_store.pending()]
     line = cli.serve_line(control.serve_beat())
     paths.CONFIG_FILE.write_text(GOOD)
     fired = len(launched)
@@ -275,19 +278,19 @@ elif mode == "bad_config":
 
 elif mode == "states":
     make_loop("ccc", "run_at_load = true")
-    state.set_loop_state("ccc", metric_on=1)
+    loop_store.set_loop_state("ccc", metric_on=1)
     for name in ("aaa", "bbb"):
-        state.set_loop_state(name, last_fire=util.iso(util.now() - timedelta(minutes=2)))
-    stamp = state.loop_states()
-    with mock.patch.object(state, "loop_states", mock.Mock(side_effect=OSError("busy"))):
+        loop_store.set_loop_state(name, last_fire=util.iso(util.now() - timedelta(minutes=2)))
+    stamp = loop_store.loop_states()
+    with mock.patch.object(loop_store, "loop_states", mock.Mock(side_effect=OSError("busy"))):
         beat = run(server, due=False)
         check = tick_check()
         loaded = server.loaded
-    unchanged = state.loop_states() == stamp
-    queued = len(state.pending()) + len(launched)
+    unchanged = loop_store.loop_states() == stamp
+    queued = len(loop_store.pending()) + len(launched)
     back = run(server, due=False)
     done(failing=list(beat["failing"]), severity=check.severity, ok=check.ok, loaded=[loaded, server.loaded], unchanged=unchanged,
-         queued=queued, launched=sorted(launched), beat_back=list(back["failing"]), ccc=state.loop_states()["ccc"]["metric_on"])
+         queued=queued, launched=sorted(launched), beat_back=list(back["failing"]), ccc=loop_store.loop_states()["ccc"]["metric_on"])
     finish(server)
 
 elif mode == "extras":
@@ -297,7 +300,7 @@ elif mode == "extras":
         first = run(server)
         second = run(server)
         out["last_ok_kept"] = [first["last_ok"], second["last_ok"]] == [clean["last_ok"]] * 2
-        with mock.patch.object(state, "loop_states", mock.Mock(side_effect=OSError("busy"))):
+        with mock.patch.object(loop_store, "loop_states", mock.Mock(side_effect=OSError("busy"))):
             skipped = run(server, due=False)
         out["skipped"] = {k: v["ticks"] for k, v in skipped["failing"].items()}
         loops.SWITCHES_FILE.write_text(json.dumps({**loops.switches(), "aaa": False}))
@@ -305,7 +308,7 @@ elif mode == "extras":
     out["removed"] = list(removed["failing"])
 
     def queued(group):
-        return state.enqueue("bbb", "bbb", group, "event", [{**EVENT, "title": group}])
+        return loop_store.enqueue("bbb", "bbb", group, "event", [{**EVENT, "title": group}])
     one, two = queued("g"), queued("g")
     tries = []
     real_hold = loops.Loop.usage_hold
@@ -318,7 +321,7 @@ elif mode == "extras":
     launched.clear()
     with mock.patch.object(loops.Loop, "usage_hold", hold):
         grouped = run(server, due=False)
-    out["released"] = [launched.count("bbb"), list(grouped["failing"]) == [f"queue:{one}"], state.queue_item(two)["run_id"] is not None]
+    out["released"] = [launched.count("bbb"), list(grouped["failing"]) == [f"queue:{one}"], loop_store.queue_item(two)["run_id"] is not None]
 
     cfg = config.load()
     mine = type("L", (), {})()
@@ -341,9 +344,9 @@ elif mode == "extras":
     finish(server)
 
 elif mode == "beat":
-    with mock.patch.object(state, "pending", mock.Mock(side_effect=OSError("busy"))):
+    with mock.patch.object(loop_store, "pending", mock.Mock(side_effect=OSError("busy"))):
         first = run(server, due=False)
-    with mock.patch.object(state, "runs_marked_running", mock.Mock(side_effect=OSError("busy"))):
+    with mock.patch.object(run_store, "runs_marked_running", mock.Mock(side_effect=OSError("busy"))):
         second = run(server, due=False)
     real = util.write_json
 

@@ -110,12 +110,13 @@ class MinerRecordedRunTests(unittest.TestCase):
 
     def test_status_moves_compare_fields_and_rejected_prs_can_reopen(self):
         found = self.scratch(r'''
+from arete.store import runs as run_store
 from arete import outcomes
 rid = made("move", "pr")
-before = state.run_get(rid)
+before = run_store.run_get(rid)
 assert not record.move(rid, "merged", expect=(), summary="wrong")
 assert not record.move(rid, "merged", expect=("running",), finished="wrong", summary="wrong")
-assert state.run_get(rid) == before
+assert run_store.run_get(rid) == before
 try:
     record.note(rid, status="merged")
 except ValueError:
@@ -126,7 +127,7 @@ assert record.move(rid, "rejected", expect=("pr",), pr_url="one")
 with mock.patch.object(outcomes.gh, "pr_view", return_value={"state": "OPEN"}), \
         mock.patch.object(outcomes, "record_feedback"):
     outcomes.sync_outcomes(config.Config())
-assert state.run_get(rid)["status"] == "pr"
+assert run_store.run_get(rid)["status"] == "pr"
 for merged in (False, True):
     pr = {"state": "MERGED" if merged else "CLOSED", "closedAt": util.iso()}
     if merged:
@@ -134,8 +135,8 @@ for merged in (False, True):
     with mock.patch.object(outcomes.gh, "pr_view", return_value=pr), \
             mock.patch.object(outcomes, "record_feedback"):
         outcomes.sync_outcomes(config.Config())
-    assert state.run_get(rid)["status"] == ("merged" if merged else "rejected")
-result(status=state.run_get(rid)["status"])
+    assert run_store.run_get(rid)["status"] == ("merged" if merged else "rejected")
+result(status=run_store.run_get(rid)["status"])
 ''')
         self.assertEqual(found["status"], "merged")
 
@@ -155,6 +156,7 @@ result(status=state.run_get(rid)["status"])
     def test_tracker_dry_run_and_secret_restriction_leave_asks_open(self):
         found = self.scratch(r'''
 from types import SimpleNamespace
+from arete.store import runs as run_store
 from arete import owner_asks, poll, tasks
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
@@ -164,7 +166,7 @@ state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
 tk = SimpleNamespace(reply_since=mock.Mock(return_value="tracker text"))
 assert poll.tracker_reply(repo, tk, "R-1", True) == ""
 assert state.ask_get("ask")["status"] == "open"
-with mock.patch.object(tasks, "run_of", return_value=(cfg, repo, state.run_get(rid))), \
+with mock.patch.object(tasks, "run_of", return_value=(cfg, repo, run_store.run_get(rid))), \
         mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
         mock.patch.object(tasks, "free_to_start"), mock.patch.object(tasks, "continuing", return_value=["resume"]), \
         mock.patch.object(tasks, "launch", return_value={"state": "started"}) as launch:
@@ -504,9 +506,9 @@ with mock.patch.object(miner, "collect", side_effect=RuntimeError("boom")):
 original = config.load
 with mock.patch.object(config, "load", side_effect=lambda: dataclasses.replace(original(), repos=[])):
     norepo = mine(30)
-rows = len(state.runs(kind="miner", limit=50))
+rows = len(run_store.runs(kind="miner", limit=50))
 dry = mine(36, dry_run=True)
-dry_rows = [rows, len(state.runs(kind="miner", limit=50))]
+dry_rows = [rows, len(run_store.runs(kind="miner", limit=50))]
 reply({"ok": True, "structured": {"proposals": [{"layer": "repo", "repo": "arete", "file": "notes.md",
                                                   "change": "c", "why": "w", "evidence": [], "confidence": 0.9}]}})
 with mock.patch.object(miner, "allowed", return_value=(True, "")), \
@@ -532,6 +534,7 @@ result(base=base["mined_until"], base_expect=mark(0), crashed=slim(crashed), nor
     def test_a_failed_apply_model_call_keeps_the_checkpoint(self):
         found = self.scratch(r'''
 from types import SimpleNamespace
+from arete.store import runs as run_store
 from arete import workspace
 mine(0)
 both(3)
@@ -555,6 +558,7 @@ result(applying=slim(applying), heard=nums(last))
 
     def test_a_window_reads_events_across_a_month_archive_once(self):
         found = self.scratch(r'''
+from arete.store import runs as run_store
 from arete import tool_events
 folder = paths.EVENTS_FILE.parent
 folder.mkdir(parents=True, exist_ok=True)
@@ -814,7 +818,8 @@ class CutOffTests(unittest.TestCase):
 
     def test_sigterm_after_the_push_leaves_it_failed_with_the_fix_on_origin(self):
         self.held_push()
-        done = self.cut_off("state.set_verdict_sha = lambda run_id, sha: os.kill(os.getpid(), signal.SIGTERM)\n"
+        done = self.cut_off("from arete.store import insights as insight_store\n"
+                            "insight_store.set_verdict_sha = lambda run_id, sha: os.kill(os.getpid(), signal.SIGTERM)\n"
                             "cli.main(['approve', '1'])")
         self.assertEqual(done.returncode, 143)
         facts = self.listed()
@@ -880,7 +885,7 @@ class CutOffTests(unittest.TestCase):
              "        queued = [r['key'] if 'key' in r.keys() else r['payload'] for r in "
              "c.execute(\"SELECT * FROM queue WHERE loop = 'fix'\")]\n"
              "    return {'status': run['status'], 'queued': queued, 'finding': state.findings('hunt'), "
-             "'log': [f['text'] for f in state.feed(run['id'])]}\n")
+             "'log': [f['text'] for f in run_store.feed(run['id'])]}\n")
 
     def test_a_hunt_stopped_during_delivery_hands_its_finding_on_at_the_next_run(self):
         self.write_loops()
@@ -929,7 +934,7 @@ with state.db() as c:
     feed = [c.execute("SELECT COUNT(*) FROM feed WHERE run_id = ?", (rid,)).fetchone()[0] for rid in (old, young)]
 snap = backup.newest_snapshot()
 checked = backup.inspect(snap)
-result(rows=[state.run_get(r) is not None for r in (old, young)],
+result(rows=[run_store.run_get(r) is not None for r in (old, young)],
        folders=[folder(r).exists() for r in (old, young)], feed=feed,
        queues=[queued(r) for r in (old, young)], snapshot=bool(snap),
        checked=checked["quick_check"] == "ok" and checked["counts"]["runs"] == 2)
@@ -946,7 +951,7 @@ rid = made("firing", 15, "done", "loop", raw=False)
 old = made("raw", 40)
 with mock.patch.object(record, "purge_folders", side_effect=OSError("disk busy")):
     server.prune()
-first = [state.run_get(rid) is None, folder(rid).exists(), queued(rid), not paths.record_dir(old).exists()]
+first = [run_store.run_get(rid) is None, folder(rid).exists(), queued(rid), not paths.record_dir(old).exists()]
 server.prune()
 result(first=first, retried=not folder(rid).exists() and not queued(rid), messages=messages)
 ''')
@@ -964,7 +969,7 @@ with state.db() as c:
     from tests.harness import age_run
     age_run(recent_finish, finished=age(2), connection=c)
 server.prune()
-row = state.run_get(failed)
+row = run_store.run_get(failed)
 try:
     tasks.resume(failed)
 except control.Refused as e:
@@ -974,8 +979,8 @@ with state.db() as c:
 with mock.patch.object(tasks, "script_path", return_value="feature"), mock.patch.object(tasks, "launch", return_value={"ok": True}):
     resumed = tasks.resume(recent_finish)
 result(folders=[folder(r).exists() for r in (old, young, failed, recent_finish)],
-       young_record=paths.record_dir(young).exists(), history=bool(state.run_get(old)), steps=steps,
-       purged=state.run_get(old)["files_purged"], refusal=refusal, date=row["files_purged"], resumed=resumed)
+       young_record=paths.record_dir(young).exists(), history=bool(run_store.run_get(old)), steps=steps,
+       purged=run_store.run_get(old)["files_purged"], refusal=refusal, date=row["files_purged"], resumed=resumed)
 ''')
         self.assertEqual(found["folders"], [False, True, False, True])
         self.assertFalse(found["young_record"])
@@ -1003,7 +1008,7 @@ with state.db() as c:
     from tests.harness import age_run
     age_run(ids["running"], finished=None, connection=c)
 server.prune()
-result(kept={tag: folder(rid).exists() and state.run_get(rid)["files_purged"] is None for tag, rid in ids.items()})
+result(kept={tag: folder(rid).exists() and run_store.run_get(rid)["files_purged"] is None for tag, rid in ids.items()})
 ''')
         self.assertTrue(all(found["kept"].values()), found)
 
@@ -1046,7 +1051,7 @@ with state.db() as c:
     from tests.harness import age_run
     age_run(merged, started=age(91), finished=age(91), connection=c)
 server.prune()
-result(first=first, folder=folder(merged).exists(), history=bool(state.run_get(merged)), proposals=len(state.proposals()))
+result(first=first, folder=folder(merged).exists(), history=bool(run_store.run_get(merged)), proposals=len(state.proposals()))
 ''')
         self.assertEqual(found["first"], [True, False])
         self.assertFalse(found["folder"])
@@ -1138,13 +1143,13 @@ result(removed=[not folder(r).exists() for r in ("plain", "timeline")],
     def test_phase_failures_continue_and_snapshot_failure_stops_deletions(self):
         found = self.scratch(r'''
 old = made("old", 40)
-with mock.patch.object(state, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(tool_events, "rotate_events", wraps=tool_events.rotate_events) as rotate:
+with mock.patch.object(store, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(tool_events, "rotate_events", wraps=tool_events.rotate_events) as rotate:
     server.prune()
     continued = purge.call_count == rotate.call_count == 1 and not paths.record_dir(old).exists()
 with mock.patch.object(record, "prune", side_effect=OSError("record unavailable")), mock.patch.object(tool_events, "rotate_events") as rotate:
     server.prune()
     rotated = rotate.call_count == 1
-with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(state, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(tool_events, "rotate_events") as rotate:
+with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(store, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(tool_events, "rotate_events") as rotate:
     server.prune()
     stopped = not any(f.called for f in (state_prune, purge, records, rotate))
 result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)

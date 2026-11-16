@@ -25,8 +25,11 @@ from . import (
     util,
     workspace,
 )
-from .agent import subscription
 from .alerts import issue_link, opened_in
+from .store import db as foundation
+from .store import incidents as incident_store
+from .store import loops as loop_store
+from .store import runs as run_store
 
 RECENT_RUNS = 25
 TREND_DAYS = 30
@@ -55,19 +58,20 @@ class UnknownFilter(refusals.Invalid, ValueError):
 
 
 def snapshot(recent_runs: int = RECENT_RUNS) -> dict:
-    running = functools.cache(lambda: state.runs_marked_running(connect=state.reader))
-    return {
-        "now": util.iso(),
-        "serve": panel(control.serve_beat),
-        "live": panel(lambda: live(running())),
-        "skipped": panel(lambda: skipped(running())),
-        "waiting": panel(waiting),
-        "recent": panel(lambda: run_rows(state.runs(limit=recent_runs, connect=state.reader))),
-        "checks": panel(checks),
-        "alerts": panel(alerts),
-        "triage": panel(triage_board),
-        "proposals": panel(proposals),
-    }
+    with foundation.one_read():
+        running = functools.cache(lambda: run_store.runs_marked_running(connect=foundation.reader))
+        return {
+            "now": util.iso(),
+            "serve": panel(control.serve_beat),
+            "live": panel(lambda: live(running())),
+            "skipped": panel(lambda: skipped(running())),
+            "waiting": panel(waiting),
+            "recent": panel(lambda: run_rows(run_store.runs(limit=recent_runs, connect=foundation.reader))),
+            "checks": panel(checks),
+            "alerts": panel(alerts),
+            "triage": panel(triage_board),
+            "proposals": panel(proposals),
+        }
 
 
 def panel(read) -> dict:
@@ -104,7 +108,7 @@ def log_file(r: dict) -> Path:
 def live(running: list[dict]) -> dict:
     in_slots = {r["id"] for r in slots.runs_in_slots(running)}
     waiting_for_slot = {r["id"] for r in slots.holding(running, "slot-wait")}
-    paid = state.paid_by_run([r["id"] for r in running], connect=state.reader)
+    paid = run_store.paid_by_run([r["id"] for r in running], connect=foundation.reader)
     rows = []
     for r in running:
         lines = log_lines(r)
@@ -137,13 +141,13 @@ def skipped(running: list[dict]) -> list[dict]:
 def waiting() -> dict:
     return {
         "tickets": [{"ticket": tracker.run_ticket_name(w), "comments": w["n"], "at_once": bool(w["at_once"]),
-                     "submitted": w["submitted"], "last": w["last"]} for w in state.feedback_waiting(connect=state.reader)],
+                     "submitted": w["submitted"], "last": w["last"]} for w in state.feedback_waiting(connect=foundation.reader)],
         "quiet_minutes": pipeline.FEEDBACK_QUIET_MINUTES,
     }
 
 
 def loops_running() -> set[str]:
-    return {r["loop"] for r in state.runs_marked_running(connect=state.reader) if r["kind"] == "loop"}
+    return {r["loop"] for r in run_store.runs_marked_running(connect=foundation.reader) if r["kind"] == "loop"}
 
 
 def checks() -> dict:
@@ -152,7 +156,7 @@ def checks() -> dict:
         "heartbeat": beat.get("ts", ""), "running": "heartbeat" in loops_running(),
         "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")}
                    for c in sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))],
-        "loops": [{"name": k, **v} for k, v in sorted(state.loop_marks(connect=state.reader).items())],
+        "loops": [{"name": k, **v} for k, v in sorted(loop_store.loop_marks(connect=foundation.reader).items())],
     }
 
 
@@ -160,13 +164,13 @@ def alerts() -> dict:
     alert_repo = config.load_or_problem()[0].alert_repo
     return {
         "alerts": [{**a, "repo": opened_in(a, alert_repo), "url": issue_link(a, alert_repo)}
-                   for a in state.alerts(connect=state.reader)],
-        "probes": state.probes(connect=state.reader),
+                   for a in incident_store.alerts(connect=foundation.reader)],
+        "probes": state.probes(connect=foundation.reader),
     }
 
 
 def triage_board() -> dict:
-    v = triage.view(connect=state.reader)
+    v = triage.view(connect=foundation.reader)
     srcs = {s.name: s for s in triage.sources(config.load_or_problem()[0])}
     meta = util.read_json(triage.META_FILE, {})
     running = loops_running()
@@ -204,19 +208,19 @@ def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:
 
 def proposals() -> dict:
     return {kind: [{k: p[k] for k in ("id", "repo", "file", "change", "status")}
-                   for p in state.proposals(status=statuses, limit=PROPOSALS_SHOWN, connect=state.reader)]
+                   for p in state.proposals(status=statuses, limit=PROPOSALS_SHOWN, connect=foundation.reader)]
             for kind, statuses in (("memory", ["memory"]), ("hand", ["hand"]), ("approve", ["approve", "filing"]))}
 
 
 def run_log(run_id: str) -> list[str]:
     if not re.fullmatch(r"\w[\w.-]*", run_id):
         raise NotARunId(f"'{run_id}' is not a run id.")
-    return log_lines(state.run_get(run_id, connect=state.reader) or {"id": run_id})[-LOG_TAIL_LINES:]
+    return log_lines(run_store.run_get(run_id, connect=foundation.reader) or {"id": run_id})[-LOG_TAIL_LINES:]
 
 
 def sidebar(talk: dict) -> dict:
-    running = state.runs_marked_running(connect=state.reader)
-    board = functools.cache(lambda: triage.view(connect=state.reader))
+    running = run_store.runs_marked_running(connect=foundation.reader)
+    board = functools.cache(lambda: triage.view(connect=foundation.reader))
     beat = control.serve_beat()
     asks = needs_you(running, board, talk["draft"])
     with_questions = panel(lambda: triage.groups(board())[triage.WITH_QUESTIONS])
@@ -226,14 +230,14 @@ def sidebar(talk: dict) -> dict:
 
 
 def live_board(draft: dict | None) -> dict:
-    running = state.runs_marked_running(connect=state.reader)
-    board = functools.cache(lambda: triage.view(connect=state.reader))
+    running = run_store.runs_marked_running(connect=foundation.reader)
+    board = functools.cache(lambda: triage.view(connect=foundation.reader))
     return {"now": util.iso(), "live": panel(lambda: live(running)), "waiting": panel(waiting),
             "needs_you": needs_you(running, board, draft)}
 
 
 def needs_you(running: list[dict], board, draft: dict | None) -> dict:
-    return {"approvals": panel(lambda: delivery.waiting(connect=state.reader)),
+    return {"approvals": panel(lambda: delivery.waiting(connect=foundation.reader)),
             "skipped": panel(lambda: skipped(running)), "proposals": panel(proposals),
             "ready": panel(lambda: ready_in_one_click(board())), "draft": draft}
 
@@ -252,7 +256,7 @@ def ready_in_one_click(v: dict) -> list[dict]:
 
 def checks_and_alerts() -> dict:
     return {"checks": panel(checks), "alerts": panel(alerts),
-            "incidents": panel(lambda: state.blocked_incidents(connect=state.reader))}
+            "incidents": panel(lambda: incident_store.blocked_incidents(connect=foundation.reader))}
 
 
 def health_word(beat: dict, found: dict) -> str:
@@ -274,7 +278,7 @@ def incident_number(text: str) -> int:
 
 
 def watcher(cfg: config.Config) -> dict:
-    now = oncall.status(cfg, connect=state.reader)
+    now = oncall.status(cfg, connect=foundation.reader)
     word = "disabled" if not now["enabled"] else "switched_off" if now["wakes"] == "off" else "on"
     return {"state": word, "config": paths.short_path(paths.CONFIG_FILE), "last_scan": now["last_scan"],
             "ok": now["ok"], "detail": now["detail"], "expected": now["expected"], "switched": now["switched"]}
@@ -289,7 +293,7 @@ def incident_row(r: dict) -> dict:
 
 def incidents_board() -> dict:
     cfg = config.load_or_problem()[0]
-    rows = state.incidents(connect=state.reader, open_first=True)
+    rows = incident_store.incidents(connect=foundation.reader, open_first=True)
     return {"now": util.iso(), "watcher": watcher(cfg), "incidents": [incident_row(r) for r in rows]}
 
 
@@ -303,13 +307,13 @@ def incident_repair(repair: dict, number: int, runs: list[dict], paid: dict[str,
 
 def incident_board(text: str) -> dict:
     cfg = config.load_or_problem()[0]
-    r = state.incident(incident_number(text), connect=state.reader, last_notes=INCIDENT_NOTES)
+    r = incident_store.incident(incident_number(text), connect=foundation.reader, last_notes=INCIDENT_NOTES)
     if r is None:
         raise control.NotFound(f"no incident {text}")
-    made = {x["id"]: [] if not x["task"] else state.ticket_runs(x["repo"], x["task"], limit=50, connect=state.reader)
+    made = {x["id"]: [] if not x["task"] else run_store.ticket_runs(x["repo"], x["task"], limit=50, connect=foundation.reader)
             for x in r["repairs"]}
     ids = [run["id"] for runs in made.values() for run in runs]
-    paid = state.paid_by_run(ids, connect=state.reader, local_providers=cfg.local_providers)
+    paid = run_store.paid_by_run(ids, connect=foundation.reader, local_providers=cfg.local_providers)
     numbers = {x["id"]: n for n, x in enumerate(oncall.attempts(r), 1)}
     repairs = [incident_repair(x, numbers.get(x["id"], 0), made[x["id"]], paid) for x in r["repairs"]]
     open_to_steer = r["state"] == "open" and not oncall.live_repair(r)
@@ -333,14 +337,14 @@ def runs_board(filters: dict[str, str], limit: int = RECENT_RUNS) -> dict:
     if status and status not in STATUSES_OF_FILTER:
         raise UnknownFilter(f"Runs filter by {', '.join(STATUSES_OF_FILTER)}, not '{status}'.")
     limit = max(1, min(limit, MOST_RUNS_SHOWN))
-    rows = state.runs(kind=filters.get("kind"), repo=filters.get("repo"), loop=filters.get("loop"),
-                      statuses=STATUSES_OF_FILTER.get(status, ()), running_first=True, limit=limit + 1, connect=state.reader)
+    rows = run_store.runs(kind=filters.get("kind"), repo=filters.get("repo"), loop=filters.get("loop"),
+                      statuses=STATUSES_OF_FILTER.get(status, ()), running_first=True, limit=limit + 1, connect=foundation.reader)
     return {"now": util.iso(), "runs": run_rows(rows[:limit]), "more": len(rows) > limit,
-            "facets": state.run_facets(state.reader)}
+            "facets": run_store.run_facets(foundation.reader)}
 
 
 def run_rows(rows: list[dict]) -> list[dict]:
-    paid = state.paid_by_run([r["id"] for r in rows], connect=state.reader)
+    paid = run_store.paid_by_run([r["id"] for r in rows], connect=foundation.reader)
     return [{"id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"], "started": r["started"],
              "finished": r["finished"], "seconds": seconds_between(r["started"], r["finished"]),
              "paid": paid.get(r["id"], 0), "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
@@ -348,43 +352,47 @@ def run_rows(rows: list[dict]) -> list[dict]:
 
 
 def run_board(run_id: str) -> dict:
-    if not re.fullmatch(r"\w[\w.-]*", run_id):
-        raise NotARunId(f"'{run_id}' is not an id.")
-    r = state.run_get(run_id, connect=state.reader)
-    if not r:
-        raise control.NotFound(f"nothing has the id {run_id}")
-    models: dict[tuple[str, str, bool], dict] = {}
-    for s in state.steps(run_id, connect=state.reader):
-        metered = not subscription(s["runner"], s["provider"] or "", s.get("auth_mode"))
-        key = (s["model"] or "no model", s["runner"] or "no runner", metered)
-        row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": metered,
-                                      "auth_mode": "api_key" if metered else "subscription", "paid": 0.0,
-                                      "steps": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
-        row["steps"] += 1
-        row["tokens_in"] += s["tokens_in"] or 0
-        row["tokens_out"] += s["tokens_out"] or 0
-        row["cost_usd"] += s["cost_usd"] or 0
-        row["paid"] += (s["cost_usd"] or 0) if metered else 0
-    spec = util.read_json(sessions.spec_file(run_id), {}) if r["kind"] == "session" else {}
-    return {"now": util.iso(),
-            "run": {**r, "ticket": ticket(r), "paid": state.paid_by_run([run_id], state.reader).get(run_id, 0)},
-            "models": sorted(({**m, "cost_usd": round(m["cost_usd"], 4), "paid": round(m["paid"], 4)}
-                              for m in models.values()),
-                             key=lambda m: (-m["cost_usd"], m["model"], m["runner"], m["metered"])),
-            "approvals": [a for a in delivery.waiting(connect=state.reader) if a["run_id"] == run_id],
-            "lines_from": "feed" if r["kind"] in FEED_KINDS else "log",
-            "session": {"prompt": spec.get("prompt", ""), "tools": spec.get("tools", []),
-                        "cwd": paths.short_path(spec.get("cwd", "")), "repo": spec.get("repo", "")} if spec else None}
+    with foundation.one_read():
+        if not re.fullmatch(r"\w[\w.-]*", run_id):
+            raise NotARunId(f"'{run_id}' is not an id.")
+        r = run_store.run_get(run_id, connect=foundation.reader)
+        if not r:
+            raise control.NotFound(f"nothing has the id {run_id}")
+        models: dict[tuple[str, str, str], dict] = {}
+        local_providers = config.load_or_problem()[0].local_providers
+        for s in run_store.steps(run_id, connect=foundation.reader):
+            billing = control.billing_of(s, local_providers)
+            metered = billing == "api_key"
+            key = (s["model"] or "no model", s["runner"] or "no runner", billing)
+            row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": metered,
+                                          "auth_mode": billing, "billing": billing, "paid": 0.0,
+                                          "steps": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
+            row["steps"] += 1
+            row["tokens_in"] += s["tokens_in"] or 0
+            row["tokens_out"] += s["tokens_out"] or 0
+            row["cost_usd"] += 0 if billing in ("local", "replay") else s["cost_usd"] or 0
+            row["paid"] += (s["cost_usd"] or 0) if metered else 0
+        rows = sorted(({**m, "cost_usd": round(m["cost_usd"], 4), "paid": round(m["paid"], 4)}
+                       for m in models.values()),
+                      key=lambda m: (-m["cost_usd"], m["model"], m["runner"], m["billing"]))
+        spec = util.read_json(sessions.spec_file(run_id), {}) if r["kind"] == "session" else {}
+        return {"now": util.iso(),
+                "run": {**r, "ticket": ticket(r), "paid": round(sum(m["paid"] for m in rows), 4)},
+                "models": rows,
+                "approvals": [a for a in delivery.waiting(connect=foundation.reader) if a["run_id"] == run_id],
+                "lines_from": "feed" if r["kind"] in FEED_KINDS else "log",
+                "session": {"prompt": spec.get("prompt", ""), "tools": spec.get("tools", []),
+                            "cwd": paths.short_path(spec.get("cwd", "")), "repo": spec.get("repo", "")} if spec else None}
 
 
 def find() -> dict:
-    v = triage.view(connect=state.reader)
-    runs = state.runs(limit=RUNS_TO_FIND, connect=state.reader)
+    v = triage.view(connect=foundation.reader)
+    runs = run_store.runs(limit=RUNS_TO_FIND, connect=foundation.reader)
     return {
         "loops": [{"name": loop.name, "description": loop.description} for loop in loops.load_all(config.load_or_problem()[0])],
         "runs": [{"id": r["id"], "ticket": ticket(r), "kind": r["kind"], "status": r["status"]} for r in runs],
         "sessions": [{"id": s["id"], "prompt": s["prompt"], "status": s["status"]}
-                     for s in sessions.views(limit=SESSIONS_TO_FIND, connect=state.reader)],
+                     for s in sessions.views(limit=SESSIONS_TO_FIND, connect=foundation.reader)],
         "tickets": [{"ref": r["ref"], "title": r["title"] or "", "standing": triage.standing(r)}
                     for r in v["rows"] if not r.get("closed")],
     }
@@ -396,8 +404,8 @@ def outcomes() -> dict:
 
 
 def decisions(since: str) -> dict:
-    pushes = Counter(push_decision(v) for v in state.verdicts_since(since, connect=state.reader) if v["kind"] == "push")
-    sent = Counter(a["sent_by"] for a in state.triage_approvals(since, connect=state.reader))
+    pushes = Counter(push_decision(v) for v in state.verdicts_since(since, connect=foundation.reader) if v["kind"] == "push")
+    sent = Counter(a["sent_by"] for a in state.triage_approvals(since, connect=foundation.reader))
     return {"pushes": {k: pushes[k] for k in ("auto", "approved", "rejected", "waiting", "other")},
             "tickets": {"triage": sent["triage"], "owner": sent["owner"]}}
 
@@ -412,7 +420,7 @@ def push_decision(v: dict) -> str:
 
 def usage_board(days: int = USAGE_DAYS) -> dict:
     days = max(1, min(days, KEEP_USAGE_DAYS))
-    rows = state.usage_since(util.iso(util.now() - timedelta(days=days)), connect=state.reader)
+    rows = state.usage_since(util.iso(util.now() - timedelta(days=days)), connect=foundation.reader)
     visits = whole_visits([r for r in rows if r["kind"] == "visit"])
     by_view: dict[str, list[dict]] = defaultdict(list)
     for v in visits:
@@ -458,10 +466,10 @@ def trend_figures() -> dict:
     first_day = datetime.now().astimezone().date() - timedelta(days=TREND_DAYS - 1)
     days = [(first_day + timedelta(days=n)).isoformat() for n in range(TREND_DAYS)]
     since = util.iso(datetime.combine(first_day, time.min).astimezone().astimezone(UTC))
-    runs = state.runs_since(since, connect=state.reader)
-    evals = state.evals_since(since, connect=state.reader)
+    runs = run_store.runs_since(since, connect=foundation.reader)
+    evals = state.evals_since(since, connect=foundation.reader)
 
-    spend = control.paid_since(since, state.reader)
+    spend = control.paid_since(since, foundation.reader)
     paid_on = {d["name"]: d["cost_usd"] for d in spend["by_day"]}
     by_day = {d: {"day": d, "paid": paid_on.get(d, 0.0), "shipped": 0, "failed": 0, "other": 0} for d in days}
     by_repo: dict[str, list[dict]] = defaultdict(list)
@@ -471,7 +479,7 @@ def trend_figures() -> dict:
         by_repo[r["repo"]].append(r)
         if day := by_day.get(local_day(r["started"])):
             day[outcome(r["status"])] += 1
-    paid = state.paid_by_run([r["id"] for rows in by_repo.values() for r in rows], connect=state.reader)
+    paid = run_store.paid_by_run([r["id"] for rows in by_repo.values() for r in rows], connect=foundation.reader)
 
     eval_repos: dict[str, list[dict]] = defaultdict(list)
     for e in evals:

@@ -1,6 +1,7 @@
 
 import json, os
 from unittest import mock
+from arete.store import runs as run_store
 from arete import codebase, control, loop_run, record, scaffold, sessions, state
 state.migrate()
 codebase.STAMP = "a"
@@ -22,4 +23,4 @@ with mock.patch.object(scaffold, "write_draft", side_effect=control.Refused("sto
         scaffold.draft(mock.Mock(), run_id=draft)
     except control.Refused:
         pass
-print(json.dumps([[state.run_get(r)["engine_sha"], state.run_get(r)["pid"] == os.getpid()] for r in (loop, session, draft)]))
+print(json.dumps([[run_store.run_get(r)["engine_sha"], run_store.run_get(r)["pid"] == os.getpid()] for r in (loop, session, draft)]))

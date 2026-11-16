@@ -8,8 +8,11 @@ import re
 import shlex
 from datetime import UTC, datetime, timedelta
 
-from . import config, cron, gh, jira, paths, state, util
+from . import config, cron, gh, jira, paths, util
 from .loops import Loop, as_list, blank, github_remote
+from .store import db as foundation
+from .store import loops as loop_store
+from .store import sources as source_store
 
 DEFAULT_EVERY = 300
 GITHUB_WATCH = ("ci_red", "issue", "advisory")
@@ -79,15 +82,15 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
 
 
 def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
-    with state.tx():
+    with foundation.tx():
         if events is None:
-            return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how)) else []
+            return [item] if (item := loop_store.enqueue(loop.name, loop.queue_name, "", how)) else []
         batches: dict[str, list[dict]] = {}
         for e in events:
             if not loop.trigger.refusal(e):
-                state.add_event(loop.name, e)
+                loop_store.add_event(loop.name, e)
                 batches.setdefault(loop.trigger.group_of(e), []).append(e)
-        return [state.enqueue(loop.name, loop.queue_name, group, how, batch)
+        return [loop_store.enqueue(loop.name, loop.queue_name, group, how, batch)
                 for group, batch in batches.items()]
 
 
@@ -104,20 +107,20 @@ def is_slot(loop: Loop, sid: str) -> bool:
 
 
 def slot_cursors(loop: Loop) -> list[str]:
-    return [c["source"] for c in state.cursors() if is_slot(loop, c["source"])]
+    return [c["source"] for c in source_store.cursors() if is_slot(loop, c["source"])]
 
 
 def adopt_history(loop: Loop, index: int, source: dict, sid: str) -> None:
-    if not source.get("name") or state.cursor(sid):
+    if not source.get("name") or source_store.cursor(sid):
         return
     own = slot_id(loop, index)
-    owner = state.source_owner(own)
-    if state.cursor(own) and (same_source(owner, source) or opaque(owner) and len(loop.sources) == 1):
-        state.adopt_source(own, sid)
+    owner = source_store.source_owner(own)
+    if source_store.cursor(own) and (same_source(owner, source) or opaque(owner) and len(loop.sources) == 1):
+        source_store.adopt_source(own, sid)
         return
     for old in slot_cursors(loop):
-        if (owner := state.source_owner(old)) is not None and same_source(owner, source):
-            state.adopt_source(old, sid)
+        if (owner := source_store.source_owner(old)) is not None and same_source(owner, source):
+            source_store.adopt_source(old, sid)
             return
 
 
@@ -140,16 +143,16 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
     adopt_history(loop, index, source, sid)
     started = util.iso()
     owner = fingerprint(source)
-    known = state.cursor(sid)
+    known = source_store.cursor(sid)
     first = known is None
-    held = state.source_owner(sid)
+    held = source_store.source_owner(sid)
     changed = not first and scope_changed(held, source)
     unsure = not first and not changed and not same_source(held, source)
     cursor = None if first else kind.rescope(source, known["value"]) if changed or unsure else known["value"]
     found, value = kind.fetch(loop, source, cfg, sid, cursor)
     unique = {e["key"]: e for e in found}
-    with state.tx():
-        claimed = set(state.claim_seen(sid, list(unique)))
+    with foundation.tx():
+        claimed = set(source_store.claim_seen(sid, list(unique)))
         fresh = [e for k, e in unique.items() if k in claimed]
         if first:
             forwarded, older = [], fresh
@@ -164,8 +167,8 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
             detail += " (baseline)"
         elif told:
             detail += f", settings changed, {len(older)} older taken as seen"
-        state.set_cursor(sid, value, True, detail, started=started)
-        state.set_source_owner(sid, owner)
+        source_store.set_cursor(sid, value, True, detail, started=started)
+        source_store.set_source_owner(sid, owner)
     if first:
         say(f"{sid}: first read, {len(fresh)} existing events taken as the baseline"
             + (f": {shown([e['key'] for e in fresh])}" if fresh else ""))

@@ -8,8 +8,9 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from . import config, owner_asks, paths, record, state, util
+from . import config, owner_asks, paths, record, util
 from .agent import NO_SESSION, REPLAY, Result, Session, usage_totals
+from .store import runs as run_store
 
 ENV = "ARETE_REPLAY_DIR"
 RUNNER = REPLAY
@@ -47,7 +48,7 @@ def folder(cfg: config.Config) -> Path | None:
 
 
 def answer_name(run_id: str, step: str) -> str:
-    earlier = sum(1 for s in state.steps(run_id) if s["step"] == step) if run_id else 0
+    earlier = sum(1 for s in run_store.steps(run_id) if s["step"] == step) if run_id else 0
     return record.slug(step) + (str(earlier + 1) if earlier else "")
 
 

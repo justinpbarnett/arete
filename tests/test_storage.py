@@ -50,7 +50,7 @@ if mode == "kill":
 else:
     found = rows("killed")
     assert len(found) == 1 and found[0]["cost_usd"] == 2.5, found
-    assert state.run_get("killed")["cost_usd"] == 2.5
+    assert run_store.run_get("killed")["cost_usd"] == 2.5
     assert all(rows("killed") for m in marks("killed") if m.get("cost_usd"))
 ''', ("kill", "inspect"))
 
@@ -103,7 +103,7 @@ before = counts()
 def boom(reason):
     raise RuntimeError("distinctive-boom-17")
 s = server()
-with mock.patch.object(backup, "snapshot", boom), mock.patch.object(state, "prune") as pruned, \
+with mock.patch.object(backup, "snapshot", boom), mock.patch.object(store, "prune") as pruned, \
         mock.patch.object(serve.record, "prune") as records:
     s.prune()
 out |= {"said": s.said, "state_pruned": pruned.called, "records_pruned": records.called, "same": counts() == before}
@@ -333,13 +333,23 @@ class SchemaLedgerTests(unittest.TestCase):
                                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             history = checkout / "migration-history"
             history.mkdir()
-            for path in (source / "arete/migrations").glob("m*.py"):
+            for path in (source / "arete/store/migrations").glob("m*.py"):
                 relative = path.relative_to(source).as_posix()
-                # Migrations first landing in this branch still use their working copy.
-                added = subprocess.run(["git", "log", "origin/main", "--diff-filter=A", "--format=%H", "--", relative],
-                                       cwd=source, text=True, capture_output=True, check=True).stdout.splitlines()
-                if added:
-                    content = subprocess.run(["git", "show", f"{added[-1]}:{relative}"],
+                original = None
+                for candidate in (relative, f"arete/migrations/{path.name}"):
+                    history_log = subprocess.run(
+                        ["git", "log", "--follow", "--name-status", "--format=COMMIT %H", "origin/main", "--", candidate],
+                        cwd=source, text=True, capture_output=True, check=True).stdout
+                    commit = None
+                    for line in history_log.splitlines():
+                        if line.startswith("COMMIT "):
+                            commit = line.removeprefix("COMMIT ")
+                        elif line.startswith("A\t"):
+                            original = f"{commit}:{line.split(chr(9), 1)[1]}"
+                    if original:
+                        break
+                if original:
+                    content = subprocess.run(["git", "show", original],
                                              cwd=source, capture_output=True, check=True).stdout
                 else:
                     content = path.read_bytes()

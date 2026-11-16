@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from typing import Literal
 
 from . import (
@@ -12,6 +13,7 @@ from . import (
     backup,
     codex,
     config,
+    dbstats,
     devices,
     install,
     launchd,
@@ -25,6 +27,8 @@ from . import (
     util,
     workspace,
 )
+from .store import loops as loop_store
+from .store import runs as run_store
 
 
 @dataclass
@@ -46,7 +50,7 @@ def launchd_table() -> dict[str, tuple[str, str]]:
 
 
 def check_costs() -> list[Check]:
-    drift = state.cost_drift()
+    drift = run_store.cost_drift()
     detail = (f"{len(drift)} runs differ from steps by ${sum(abs(r['difference']) for r in drift):.6f}: "
               + ", ".join(r["id"] for r in drift[:5])) if drift else "run costs equal their steps"
     return [Check("costs:drift", not drift, detail)]
@@ -327,6 +331,30 @@ def check_backups(cfg: config.Config) -> list[Check]:
     return [check_backup_db(), check_backup_offsite(cfg)]
 
 
+def check_db_slow() -> list[Check]:
+    end = util.now()
+    slow = list(dbstats.log_records(end - timedelta(hours=1), end))
+    worst = max((r for r in slow if r["total_ms"] > 5000), key=lambda r: r["total_ms"], default=None)
+    detail = (f"{worst['total_ms'] / 1000:.1f}s transaction at {worst.get('caller', 'unknown')}"
+              if worst else "no transaction above five seconds in the last hour")
+    return [Check("db:slow", worst is None, detail, "warn")]
+
+
+def check_db_size(cfg: config.Config) -> list[Check]:
+    sizes = dbstats.database_bytes()
+    total = sizes["db_bytes"] + sizes["wal_bytes"]
+    limit = cfg.retention.db_max_mb * 1024 ** 2
+    return [Check("db:size", total <= limit,
+                  f"DB + WAL {total / 1024 ** 2:.2f} MiB; limit {cfg.retention.db_max_mb:g} MiB", "warn")]
+
+
+def check_runs_size(cfg: config.Config) -> list[Check]:
+    total = dbstats.runs_bytes()["total_bytes"]
+    limit = cfg.retention.max_gb * 10 ** 9 / 2
+    return [Check("runs:size", total <= limit,
+                  f"runs/ {total / 10 ** 9:.3f} GB; half max_gb {cfg.retention.max_gb / 2:g} GB", "warn")]
+
+
 def check_backup_db() -> Check:
     newest = backup.newest_snapshot()
     installed = install.serve_installed()
@@ -340,7 +368,7 @@ def check_backup_db() -> Check:
     if recorded != "ok":
         return Check("backup:db", False, f"the last snapshot failed its check: {recorded}")
     hours = util.hours_awake_since(newest.stat().st_mtime)
-    if installed and hours > BACKUP_STALE_HOURS:
+    if hours > BACKUP_STALE_HOURS:
         return Check("backup:db", False, f"newest snapshot {newest.name} is {hours:.1f} awake hours old")
     return Check("backup:db", True, f"{newest.name}, {hours:.1f} awake hours old")
 
@@ -361,12 +389,12 @@ def check_backup_offsite(cfg: config.Config) -> Check:
 def check_loops(cfg: config.Config) -> list[Check]:
     from . import loops
 
-    beats = state.loop_marks()
+    beats = loop_store.loop_marks()
     out = []
     for loop in loops.load_all(cfg):
         if not loop.enabled or loop.error or not loop.stale_hours or loop.name == os.environ.get("ARETE_LOOP"):
             continue
-        last = next((r for r in state.runs(kind="loop", loop=loop.name, limit=10, firings=True)
+        last = next((r for r in run_store.runs(kind="loop", loop=loop.name, limit=10, firings=True)
                      if r["status"] != "running"), None)
         if not last:
             continue
@@ -386,7 +414,7 @@ def check_loops(cfg: config.Config) -> list[Check]:
 
 
 def mark_loop(name: str, ok: bool, detail: str = "") -> None:
-    state.set_loop_state(name, mark_ok=int(ok), mark_detail=detail[:200], mark_at=util.iso())
+    loop_store.set_loop_state(name, mark_ok=int(ok), mark_detail=detail[:200], mark_at=util.iso())
 
 
 def network_up_or_skip(loop: str, dry_run: bool) -> bool:
@@ -419,6 +447,9 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_hook,),
         (check_disk,),
         (check_serve,),
+        (check_db_slow,),
+        (check_db_size, cfg),
+        (check_runs_size, cfg),
         (check_backups, cfg),
         (check_costs,),
         (check_loops, cfg),

@@ -51,19 +51,19 @@ def behavior_result(done, marker="BEHAVIOR_RESULT=", *, last=False):
 
 
 def set_task_body(task_id, body, *, connection=None):
-    from arete import state
+    from arete.store import db as foundation
 
-    with (state.db() if connection is None else nullcontext(connection)) as db:
+    with (foundation.db() if connection is None else nullcontext(connection)) as db:
         db.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
 
 
 def age_run(run_id, *, started=UNSET, finished=UNSET, connection=None):
-    from arete import state
+    from arete.store import db as foundation
 
     fields = {name: value for name, value in (("started", started), ("finished", finished)) if value is not UNSET}
     if not fields:
         return
-    with (state.db() if connection is None else nullcontext(connection)) as db:
+    with (foundation.db() if connection is None else nullcontext(connection)) as db:
         db.execute("UPDATE runs SET " + ", ".join(name + " = ?" for name in fields) + " WHERE id = ?",
                    (*fields.values(), run_id))
 

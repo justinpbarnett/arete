@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import fcntl
+import os
+import sqlite3
+import stat
+import threading
+import time
+from contextlib import ExitStack, contextmanager, suppress
+from pathlib import Path
+
+from .. import dbstats, paths, util
+from . import migrations
+from .migrations import m0002_foundation_time_shape as time_shape
+
+TABLES = {"schema_meta": "kept", "schema_migrations": "kept"}
+DB_LOCK = threading.Lock()
+DB_THREAD = threading.local()
+
+
+class FixtureConnection(sqlite3.Connection):
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self.handles.close()
+
+
+def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3.Connection:
+    if not paths.ISOLATED:
+        mode = "ro" if readonly else "rwc" if create else "rw"
+        conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30)
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL")
+            return conn
+        except BaseException:
+            conn.close()
+            raise
+    if not paths.ON_MAC or paths.confined(p) is None:
+        raise PermissionError("isolated state requires a supported confined database path")
+    if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30):
+        raise PermissionError("nested or busy isolated state access refused")
+    DB_THREAD.active = True
+    handles, conn = ExitStack(), None
+    handles.callback(DB_LOCK.release)
+    handles.callback(setattr, DB_THREAD, "active", False)
+    try:
+        parent = handles.enter_context(paths.directory_fd(p.absolute().parent))
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PermissionError("busy isolated state directory refused") from None
+                time.sleep(0.05)
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                os.stat(p.name + suffix, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise PermissionError("existing isolated database sidecar refused")
+        flags = os.O_RDONLY if readonly else os.O_RDWR | (os.O_CREAT if create else 0)
+        fd = os.open(p.name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
+        handles.callback(os.close, fd)
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid()
+                or os.pread(fd, 20, 0)[18:20] == b"\x02\x02"):
+            raise PermissionError("linked, non-plain or WAL isolated state database refused")
+        conn = sqlite3.connect(f"file:/dev/fd/{fd}?mode={'ro' if readonly else 'rw'}", uri=True,
+                               timeout=30, factory=FixtureConnection)
+        conn.handles = handles
+        if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
+            raise PermissionError("isolated state requires disposable memory journaling")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+    except BaseException:
+        conn.close() if conn is not None else handles.close()
+        raise
+
+
+TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["runs"], "measured_at")}
+TIME_GLOB = time_shape.TIME_GLOB
+
+_CHAIN = migrations.load()
+LATEST = _CHAIN[-1].n
+NEEDED = max(m.n for m in _CHAIN if m.phase != "contract")
+MIGRATE_WAIT_SECONDS = 60
+_CHECKED = set()
+_OWNER = threading.local()
+
+
+class NoDatabase(RuntimeError):
+    pass
+
+
+class IncompatibleSchema(RuntimeError):
+    pass
+
+
+def refuse_empty_file() -> None:
+    if paths.DB_FILE.exists() and paths.DB_FILE.stat().st_size > 0:
+        return
+    from .. import backup
+
+    if newest := backup.newest_snapshot():
+        raise NoDatabase(f"{paths.DB_FILE} is missing or empty but {newest} exists; stop arete serve and run "
+                         f"`arete backup --restore {newest}` instead of starting over with an empty file")
+
+
+def missing_database():
+    refuse_empty_file()
+    return NoDatabase(f"{paths.DB_FILE} is missing; run arete serve or arete migrate")
+
+
+def contract_blockers(conn, n):
+    from .. import control, record
+
+    blockers = []
+    for row in conn.execute("SELECT * FROM runs WHERE status = 'running' "
+                            "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
+        row = dict(row)
+        with record.dead(row) as gone:
+            if not gone:
+                blockers.append(row["id"])
+    beat = control.database_beat()
+    if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
+        blockers.append(f"serve {beat.get('pid')}")
+    return blockers
+
+
+def execute_statements(conn, sql):
+    pending = ""
+    for char in sql:
+        pending += char
+        if char == ";" and sqlite3.complete_statement(pending):
+            conn.execute(pending)
+            pending = ""
+    if pending.strip():
+        conn.execute(pending)
+
+
+def migrate(contracts=True):
+    from .. import backup
+
+    chain = migrations.load()
+    paths.ensure_dirs()
+    with util.lock("migrate", wait=True):
+        refuse_empty_file()
+        conn = connect_db(paths.DB_FILE, create=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            migrations.validate(conn, chain, version)
+            conn.close()
+            conn = None
+            snapshot = None
+            started_chain = False
+            for migration in chain:
+                if migration.n <= version:
+                    continue
+                if migration.phase == "contract":
+                    if not contracts:
+                        return True
+                    conn = connect_db(paths.DB_FILE)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        blockers = contract_blockers(conn, migration.n)
+                    finally:
+                        conn.close()
+                        conn = None
+                    if blockers:
+                        print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
+                        return True
+                if not started_chain:
+                    if paths.DB_FILE.stat().st_size:
+                        snapshot = backup.snapshot(f"m{migration.n}")
+                    started_chain = True
+                started = time.monotonic()
+                try:
+                    timing = dbstats.Timing(paths.DB_FILE, "write")
+                    with owning_transaction(lambda: connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
+                        if migration.sql is not None:
+                            execute_statements(writer, migration.sql)
+                        else:
+                            migration.apply(writer)
+                        writer.execute("INSERT INTO schema_migrations "
+                                       "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
+                                       (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
+                                        util.iso(), snapshot.name if snapshot else "", time.monotonic() - started))
+                        writer.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                                       (str(migration.n),))
+                        writer.execute(f"PRAGMA user_version = {migration.n}")
+                except BaseException as e:
+                    raise migrations.Refused(f"{migration.name}: {e}") from e
+                version = migration.n
+                print(f"applied {migration.name}", flush=True)
+            backup.finish_restore()
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def checked_connection():
+    from .. import backup
+
+    if backup.pending_restore():
+        raise IncompatibleSchema("pending restore requires arete serve or arete migrate before writing")
+    try:
+        identity = paths.DB_FILE.stat()
+    except FileNotFoundError:
+        if not paths.ISOLATED:
+            raise missing_database() from None
+        migrate()
+        identity = paths.DB_FILE.stat()
+    if identity.st_size == 0:
+        refuse_empty_file()
+    try:
+        conn = connect_db(paths.DB_FILE)
+    except (sqlite3.OperationalError, FileNotFoundError):
+        if not paths.DB_FILE.exists():
+            raise missing_database() from None
+        raise
+    try:
+        key = (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
+               getattr(identity, "st_birthtime", None), LATEST, NEEDED)
+        if key not in _CHECKED:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if paths.ISOLATED and version == 0:
+                conn.close()
+                migrate()
+                return checked_connection()
+            deadline = time.monotonic() + MIGRATE_WAIT_SECONDS
+            if version < NEEDED:
+                print(f"schema {version} waits for schema {NEEDED}; run arete serve or arete migrate", flush=True)
+            while version < NEEDED:
+                if time.monotonic() >= deadline:
+                    raise IncompatibleSchema(f"schema {version} needs {NEEDED}; run arete serve or arete migrate")
+                time.sleep(0.5)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+            oldest = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0])
+            if oldest > LATEST:
+                raise IncompatibleSchema(f"oldest_writer {oldest} is above this code's schema {LATEST}")
+            _CHECKED.add(key)
+        return conn
+    except BaseException:
+        with suppress(BaseException):
+            conn.close()
+        raise
+
+
+@contextmanager
+def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True):
+    conn = None
+    failed = False
+    try:
+        conn = connect()
+        conn.row_factory = sqlite3.Row
+        conn.execute(begin)
+        if timing:
+            timing.begun()
+        yield conn
+        if commit:
+            if timing:
+                timing.committing()
+            try:
+                conn.execute("COMMIT")
+            finally:
+                if timing:
+                    timing.committed()
+    except BaseException as e:
+        failed = True
+        if timing:
+            timing.error = type(e).__name__
+            timing.sqlite_error = isinstance(e, sqlite3.Error)
+        if conn is not None:
+            with suppress(BaseException):
+                conn.execute("ROLLBACK")
+        raise
+    finally:
+        try:
+            if conn is not None:
+                if failed:
+                    with suppress(BaseException):
+                        conn.close()
+                else:
+                    conn.close()
+        finally:
+            if timing:
+                timing.finished()
+
+
+def read_connection():
+    try:
+        return connect_db(paths.DB_FILE, readonly=True)
+    except (sqlite3.OperationalError, FileNotFoundError):
+        if not paths.DB_FILE.exists():
+            raise missing_database() from None
+        raise
+
+
+@contextmanager
+def owned(mode):
+    active = getattr(_OWNER, "active", None)
+    if active and active[0] == os.getpid():
+        _, held_mode, conn = active
+        if held_mode == "read" and mode == "write":
+            raise RuntimeError("cannot promote a read snapshot to a writer")
+        yield conn
+        return
+    timing = dbstats.Timing(paths.DB_FILE, mode)
+    connect = checked_connection if mode == "write" else read_connection
+    try:
+        with owning_transaction(connect, "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
+                                commit=mode == "write") as conn:
+            _OWNER.active = (os.getpid(), mode, conn)
+            yield conn
+    finally:
+        _OWNER.active = None
+
+
+@contextmanager
+def tx():
+    with owned("write") as conn:
+        yield conn
+
+
+db = tx
+
+
+@contextmanager
+def one_read():
+    with owned("read") as conn:
+        yield conn
+
+
+@contextmanager
+def reader():
+    with one_read() as conn:
+        yield conn
+
+
+def ensure_schema() -> None:
+    with db():
+        pass
+
+
+def quoted(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def metadata(conn) -> dict:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'schema_meta'").fetchone():
+        return {}
+    return dict(conn.execute("SELECT key, value FROM schema_meta"))
+
+
+def sequences(conn: sqlite3.Connection) -> dict[str, int]:
+    try:
+        return {name: seq for name, seq in conn.execute("SELECT name, seq FROM sqlite_sequence")}
+    except sqlite3.OperationalError:
+        return {}
+
+
+def raise_sequences(staged: Path, current: dict[str, int] | None, gap: int) -> None:
+    timing = dbstats.Timing(staged, "write")
+    with owning_transaction(lambda: connect_db(staged), timing=timing) as conn:
+        held = sequences(conn)
+        for name in set(held) | set(current or {}):
+            wanted = max(held.get(name, 0), (current or {}).get(name, 0)) if current is not None else held[name] + gap
+            if name in held:
+                conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (wanted, name))
+            elif held or conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_sequence'").fetchone():
+                conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (name, wanted))
+
+
+def apply_restore_metadata(target, data):
+    with owning_transaction(lambda: connect_db(target), timing=dbstats.Timing(target, "write")) as conn:
+        held = sequences(conn)
+        has_sequence = conn.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone()
+        if has_sequence:
+            for name, floor in data["sequences"].items():
+                if name in held:
+                    conn.execute("UPDATE sqlite_sequence SET seq=? WHERE name=?", (max(held[name], floor), name))
+                else:
+                    conn.execute("INSERT INTO sqlite_sequence(name,seq) VALUES (?,?)", (name, floor))
+        meta = metadata(conn)
+        if "restore_epoch" not in meta:
+            return False
+        for key, value in {**data["identity"], "restore_epoch": str(data["epoch"])}.items():
+            conn.execute("INSERT INTO schema_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (key, value))
+    return True
+
+
+def copy_database(target: Path) -> None:
+    conn = connect_db(paths.DB_FILE, readonly=True)
+    try:
+        conn.execute("VACUUM INTO ?", (str(target),))
+    finally:
+        conn.close()
+
+
+def table_counts(conn):
+    names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+    return {name: conn.execute(f"SELECT count(*) FROM {quoted(name)}").fetchone()[0] for name in names}
+
+
+def quick_check(conn):
+    return [r[0] for r in conn.execute("PRAGMA quick_check")]
+
+
+def inspect_database(path, check=True):
+    conn = connect_db(path, readonly=True)
+    try:
+        conn.execute("BEGIN")
+        return {"quick_check": "; ".join(quick_check(conn)) or "no answer" if check else "",
+                "counts": table_counts(conn)}
+    finally:
+        conn.close()
+
+
+def latest_migration_backup():
+    conn = connect_db(paths.DB_FILE, readonly=True)
+    try:
+        row = conn.execute("SELECT backup FROM schema_migrations ORDER BY n DESC LIMIT 1").fetchone()
+        return row[0] if row else ""
+    except sqlite3.OperationalError:
+        return ""
+    finally:
+        conn.close()
+
+
+def check_readable(conn):
+    conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+
+
+def vacuum_into(conn, target):
+    conn.execute("VACUUM INTO ?", (str(target),))
+
+
+def schema_metadata():
+    with reader() as conn:
+        return dict(conn.execute("SELECT key, value FROM schema_meta"))
+
+
+def migration_applied(n: int, conn=None) -> bool:
+    if conn is None:
+        with reader() as connection:
+            return migration_applied(n, connection)
+    return conn.execute("SELECT 1 FROM schema_migrations WHERE n = ?", (n,)).fetchone() is not None
+
+
+def enable_wal():
+    conn = connect_db(paths.DB_FILE)
+    try:
+        if conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
+            raise RuntimeError("arete.db refused WAL mode")
+    finally:
+        conn.close()

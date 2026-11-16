@@ -41,7 +41,13 @@ def scenario(name):
 class Rig:
     def __init__(self, oncall=False, real_launch=False, build=True):
         from unittest import mock
+        from arete.store import runs as run_store
+        from arete.store import loops as loop_store
+        from arete.store import incidents as incident_store
         from arete import config, loop_run, explain, loops, paths, routing, state, tasks, util, webpush, alerts
+        self.run_store = run_store
+        self.loop_store = loop_store
+        self.incident_store = incident_store
         self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
@@ -56,7 +62,7 @@ class Rig:
         self.expire = tasks.expire_asks
         self.patches = [
             mock.patch.object(routing, "usage_hold", lambda *a, **k: ""), mock.patch.object(webpush, "remind", lambda cfg: []),
-            mock.patch.object(state, "release_settled_claims", lambda: None),
+            mock.patch.object(loop_store, "release_settled_claims", lambda: None),
             mock.patch.object(explain, "plain_summary", lambda a, c: "fixed plain summary"),
             mock.patch.object(tasks, "expire_asks", self.spy_asks),
             mock.patch.object(alerts, "raise_alert", self.fake_raise), mock.patch.object(alerts, "clear_alert", self.fake_clear)]
@@ -98,7 +104,7 @@ class Rig:
         for fault in self.pending_faults[:1]:
             self.pending_faults.remove(fault)
             raise fault
-        if not self.state.take_queue_item(item, f"r-{item}"):
+        if not self.loop_store.take_queue_item(item, f"r-{item}"):
             raise self.loop_run.control.NotFound("taken")
         self.launched.append(name)
         self.claims.append({"item": item, "loop": name, "run": f"r-{item}"})
@@ -135,7 +141,7 @@ class Rig:
 
     def due(self):
         for name in ("aaa", "bbb"):
-            self.state.set_loop_state(name, last_fire=self.util.iso(self.util.now() - __import__("datetime").timedelta(minutes=2)))
+            self.loop_store.set_loop_state(name, last_fire=self.util.iso(self.util.now() - __import__("datetime").timedelta(minutes=2)))
 
     def drain(self, server=None):
         from concurrent.futures import wait
@@ -178,11 +184,11 @@ class Rig:
     def snapshot(self):
         state = self.state
         return {"beats": self.beats, "launches": self.launched, "claims": self.claims,
-                "queue": [{"id": i["id"], "loop": i["loop"], "grp": i["grp"]} for i in state.pending()],
+                "queue": [{"id": i["id"], "loop": i["loop"], "grp": i["grp"]} for i in self.loop_store.pending()],
                 "approvals": {i: {"status": a["status"], "plain_summary": a.get("plain_summary")} for i in range(1, 6) if (a := state.approval(i))},
                 "housekeeping": {"ask_expiry_passes": self.asks, "passes": len(self.beats)},
                 "alerts": self.alert_calls, "readers": self.readers(), "log": self.log_lines(),
-                "runs": [{"id": r["id"], "loop": r.get("loop"), "status": r.get("status")} for r in state.runs(limit=50, firings=True)]}
+                "runs": [{"id": r["id"], "loop": r.get("loop"), "status": r.get("status")} for r in self.run_store.runs(limit=50, firings=True)]}
 
 
 rig = None
@@ -255,10 +261,10 @@ def oncall(passes):
     for _ in range(passes):
         r.step()
     oncall_module.scan(config.load())
-    first = [str(i) for i in r.state.incidents()]
+    first = [str(i) for i in r.incident_store.incidents()]
     r.step()
     oncall_module.scan(config.load())
-    second = [str(i) for i in r.state.incidents()]
+    second = [str(i) for i in r.incident_store.incidents()]
     return {"incidents_after_scan": len(first), "incidents_after_fourth_pass": len(second),
             "naming_loop_aaa": len([i for i in second if "loop:aaa" in i]), "incident_naming_loop_aaa": [i for i in second if "loop:aaa" in i][:1]}
 
@@ -280,8 +286,8 @@ def queue(passes):
     from arete import loops
     r = fresh()
     r.step(due=False)
-    one = r.state.enqueue("aaa", "aaa", "", "event", [EVENT])
-    two = r.state.enqueue("bbb", "bbb", "", "event", [EVENT])
+    one = r.loop_store.enqueue("aaa", "aaa", "", "event", [EVENT])
+    two = r.loop_store.enqueue("bbb", "bbb", "", "event", [EVENT])
 
     def hold(self, cfg, connect=None):
         if self.name == "aaa":
@@ -290,8 +296,8 @@ def queue(passes):
     r.fault(loops.Loop, "usage_hold", hold)
     for _ in range(passes):
         r.step(due=False)
-    return {"aaa_item": one, "bbb_item": two, "aaa_item_unclaimed": r.state.queue_item(one)["run_id"] is None,
-            "bbb_item_claimed": r.state.queue_item(two)["run_id"], "launched": r.launched, "failing": failing_of(r.beats[-1])}
+    return {"aaa_item": one, "bbb_item": two, "aaa_item_unclaimed": r.loop_store.queue_item(one)["run_id"] is None,
+            "bbb_item_claimed": r.loop_store.queue_item(two)["run_id"], "launched": r.launched, "failing": failing_of(r.beats[-1])}
 
 
 @scenario("waits")
@@ -302,11 +308,11 @@ def waits(passes):
     out = {}
 
     def queued(*groups, loop="aaa"):
-        return [r.state.enqueue(loop, loop, g, "event", [{**EVENT, "title": f"{g}{i}"}]) for i, g in enumerate(groups)]
+        return [r.loop_store.enqueue(loop, loop, g, "event", [{**EVENT, "title": f"{g}{i}"}]) for i, g in enumerate(groups)]
 
     def clear():
-        for item in r.state.pending():
-            r.state.drop_queue_item(item["id"])
+        for item in r.loop_store.pending():
+            r.loop_store.drop_queue_item(item["id"])
         r.launched.clear()
     one, two = queued("g", "g")
     r.step(due=False)
@@ -316,7 +322,7 @@ def waits(passes):
         one, two = queued("g", "g")
         r.pending_faults.append(fault)
         r.step(due=False)
-        out[type(fault).__name__] = {"launches": r.launched.count("aaa"), "first_run": r.state.queue_item(one)["run_id"], "second_run": r.state.queue_item(two)["run_id"]}
+        out[type(fault).__name__] = {"launches": r.launched.count("aaa"), "first_run": r.loop_store.queue_item(one)["run_id"], "second_run": r.loop_store.queue_item(two)["run_id"]}
         clear()
     one, two = queued("g", "g")
     tries = []
@@ -328,7 +334,7 @@ def waits(passes):
         return ""
     with r.mock.patch.object(loops.Loop, "usage_hold", hold):
         beat = r.step(due=False)
-    out["unhandled"] = {"launches": r.launched.count("aaa"), "failing": list(beat["failing"]), "next_member_ran": r.state.queue_item(two)["run_id"] is not None}
+    out["unhandled"] = {"launches": r.launched.count("aaa"), "failing": list(beat["failing"]), "next_member_ran": r.loop_store.queue_item(two)["run_id"] is not None}
     clear()
     r.step(due=False)
     item, = queued("")
@@ -345,7 +351,7 @@ def waits(passes):
         beat = r.step(due=False)
     out["spent_before_usage_hold"] = {"lines": [x for x in r.log_lines() if f"queue item {item} waits, its daily budget is spent" in x], "failing": list(beat["failing"])}
     clear()
-    gone = r.state.enqueue("ghost", "ghost", "", "event", [EVENT])
+    gone = r.loop_store.enqueue("ghost", "ghost", "", "event", [EVENT])
     r.step(due=False)
     out["dropped"] = [x for x in r.log_lines() if f"ghost: dropped queue item {gone}" in x]
     cfg = r.config.load()
@@ -380,7 +386,7 @@ def alerts_scenario(passes):
 @scenario("fresh-alert")
 def fresh_alert(passes):
     r = fresh(build=False)
-    r.state.alert_set("serve:tick", None)
+    r.incident_store.alert_set("serve:tick", None)
     r.server = r.new_server()
     for _ in range(max(passes, 2)):
         r.step(due=False)
@@ -401,11 +407,11 @@ def bad_config(passes):
     r = fresh()
     first = r.step()
     r.due()
-    before = [r.state.loop_states(), [i["id"] for i in r.state.pending()]]
+    before = [r.loop_store.loop_states(), [i["id"] for i in r.loop_store.pending()]]
     r.paths.CONFIG_FILE.write_text("[replay\n")
     for _ in range(passes):
         beat = r.step(due=False)
-    after = [r.state.loop_states(), [i["id"] for i in r.state.pending()]]
+    after = [r.loop_store.loop_states(), [i["id"] for i in r.loop_store.pending()]]
     return {"failing": failing_of(beat), "loops_off_before": [first["loops"], first["off"]], "loops_off_after": [beat["loops"], beat["off"]],
             "at_advanced": beat["at"] > first["at"], "last_fire_and_queue_unchanged": before == after, "config_problem": beat.get("config_problem"),
             "launches_after": len(r.launched), "note": "run `scenario recover --passes 1` to restore config.toml"}
@@ -415,26 +421,27 @@ def bad_config(passes):
 def states(passes):
     r = fresh()
     r.make_loop("ccc", "run_at_load = true")
-    r.state.set_loop_state("ccc", metric_on=1)
+    r.loop_store.set_loop_state("ccc", metric_on=1)
     r.due()
-    read_states = r.state.loop_states
+    read_states = r.loop_store.loop_states
     stamp = read_states()
-    r.fault(r.state, "loop_states", r.mock.Mock(side_effect=OSError("busy")))
+    r.fault(r.loop_store, "loop_states", r.mock.Mock(side_effect=OSError("busy")))
     for _ in range(passes):
         beat = r.step(due=False)
     loaded = r.server.loaded
     r.checks_per_pass(r.errors)
-    return {"failing": failing_of(beat), "serve_tick": r.errors[-1], "queue_rows": len(r.state.pending()), "launched": r.launched,
+    return {"failing": failing_of(beat), "serve_tick": r.errors[-1], "queue_rows": len(r.loop_store.pending()), "launched": r.launched,
             "loaded_after_failed_pass": loaded, "loop_state_unchanged": read_states() == stamp, "note": "run `scenario recover --passes 1` for the load fire and due schedules"}
 
 
 @scenario("beat")
 def beat_scenario(passes):
+    from arete.store import runs as run_store
     from arete import control, util
     r = fresh()
-    with r.mock.patch.object(r.state, "pending", r.mock.Mock(side_effect=OSError("busy"))):
+    with r.mock.patch.object(r.loop_store, "pending", r.mock.Mock(side_effect=OSError("busy"))):
         first = r.step(due=False)
-    with r.mock.patch.object(r.state, "runs_marked_running", r.mock.Mock(side_effect=OSError("busy"))):
+    with r.mock.patch.object(run_store, "runs_marked_running", r.mock.Mock(side_effect=OSError("busy"))):
         second = r.step(due=False)
     real = util.write_json
 
@@ -491,7 +498,7 @@ def retirement(passes):
     r.step()
     r.poll_fault()
     bad = r.state.add_approval("aaa", "r2", {"type": "renamed_emit", "item": {}}, "two")
-    item = r.state.enqueue("bbb", "bbb", "", "event", [EVENT])
+    item = r.loop_store.enqueue("bbb", "bbb", "", "event", [EVENT])
 
     def hold(self, cfg, connect=None):
         if self.name == "bbb":
@@ -504,7 +511,7 @@ def retirement(passes):
     out["failing"] = failing_of(beat)
     loops.SWITCHES_FILE.write_text(json.dumps({**loops.switches(), "aaa": False}))
     out["loop_off"] = list(r.step(due=False)["failing"])
-    r.state.drop_queue_item(item)
+    r.loop_store.drop_queue_item(item)
     out["item_gone"] = list(r.step(due=False)["failing"])
     with r.state.db() as c:
         c.execute("UPDATE approvals SET status = 'rejected' WHERE id = ?", (bad,))
@@ -513,7 +520,7 @@ def retirement(passes):
     for _ in range(2):
         r.step(due=False)
     counted = failing_of(r.beats[-1]).get("loop:aaa")
-    r.fault(r.state, "loop_states", r.mock.Mock(side_effect=OSError("busy")))
+    r.fault(r.loop_store, "loop_states", r.mock.Mock(side_effect=OSError("busy")))
     skipped = r.step(due=False)
     out["parent_stage_failed"] = {"before": counted, "after": failing_of(skipped).get("loop:aaa"), "stage": failing_of(skipped).get("stage:states")}
     return out
@@ -525,14 +532,14 @@ def command(passes):
     r.make_loop("real", command="true")
     for name in ("aaa", "bbb"):
         r.loops.set_enabled(next(x for x in r.loops.load_all(r.config.load()) if x.name == name), False)
-    r.state.set_loop_state("real", last_fire=r.util.iso(r.util.now() - __import__("datetime").timedelta(minutes=2)))
+    r.loop_store.set_loop_state("real", last_fire=r.util.iso(r.util.now() - __import__("datetime").timedelta(minutes=2)))
     for _ in range(passes):
         r.step(due=False)
     deadline = time.time() + 60
-    while time.time() < deadline and not [x for x in r.state.runs(loop="real", firings=True) if x["status"] not in ("running", "starting")]:
+    while time.time() < deadline and not [x for x in r.run_store.runs(loop="real", firings=True) if x["status"] not in ("running", "starting")]:
         time.sleep(0.5)
-    runs = [{"id": x["id"], "status": x["status"]} for x in r.state.runs(loop="real", firings=True)]
-    return {"runs": runs, "queue_left": len(r.state.pending()), "failing": failing_of(r.beats[-1])}
+    runs = [{"id": x["id"], "status": x["status"]} for x in r.run_store.runs(loop="real", firings=True)]
+    return {"runs": runs, "queue_left": len(r.loop_store.pending()), "failing": failing_of(r.beats[-1])}
 
 
 def run_request(request):

@@ -6,25 +6,36 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 
 ## Database transactions and the timing rollout
 
-Production remains in SQLite rollback journal mode with the existing synchronous (FULL) and busy-timeout settings.
-Retain at least one full day of rollback-mode measurements before deploying the WAL follow-up. This release does
-not enable WAL or aggregate timing across processes.
+Retain at least one full day of rollback-mode measurements before deploying this WAL release.
+Serve enables WAL under its startup lock after migration and restore completion, before workers or the API open.
+Every helper connection uses synchronous=NORMAL with the existing busy timeout; helpers never enable WAL.
+Confined scratch state retains MEMORY journaling and refuses WAL inputs and existing sidecars.
 
-`state.tx()` owns one checked connection and begins `BEGIN IMMEDIATE` before application reads. It commits once on
+`store.db.tx()` owns one checked connection and begins `BEGIN IMMEDIATE` before application reads. It commits once on
 successful outer exit, rolls back escaping exceptions (including interruptions), and closes the connection.
-`state.db` is its joining alias; ordinary writes issue no DDL. Nested `tx`, `db` and `reader` scopes share an active
+`store.db.db` is its joining alias; ordinary writes issue no DDL. Nested `tx`, `db` and `reader` scopes share an active
 writer and its uncommitted changes, without savepoints or independent commits. Keep network operations outside these
 scopes. The migrator and staged-restore sequence updates use independent connection ownership.
 
-`state.one_read()` and `state.reader()` own a mode=ro connection and explicit `BEGIN`; nested readers share that
+`store.db.one_read()` and `store.db.reader()` own a mode=ro connection and explicit `BEGIN`; nested readers share that
 snapshot until outer exit closes the connection, ending the read transaction without a commit. A reader inside a
 writer joins the writer. Attempting `tx` or `db` inside an existing
 read snapshot raises instead of promoting it. Reader entry never migrates or checks writer compatibility.
 
+Matched dashboard GET routes, direct board snapshots/run details and cost reports share one read snapshot per answer.
+Cost groupings use the same cutoff time. Cost corrections and backfills run outside the reporting snapshot.
+Models rows distinguish API-key, subscription, local and replay billing; the paid header sums the returned rows.
+Chat GETs only read; session-close, serve-reap and chat-send paths deliver completed session reports.
+
+Events in SQLite retain routing/history fields only. Migration 4 drops the duplicate `events.data` column and raises
+`oldest_writer` to 4, after the existing contract gate finds no older or unstamped live run/serve process.
+The new writer works while that contract waits. Fresh databases run the immutable migration chain too.
+Complete event data remains in queue payloads and `runs/<id>/events.json`.
+
 Every outer transaction records monotonic elapsed time, including connection acquisition, BEGIN wait and COMMIT.
 Transactions above 500 ms and escaping SQLite errors append exactly one JSON line to `LOG_DIR/db.log`, using one
 O_APPEND write. Fields are `timestamp` (UTC), `pid`, `process_kind`, `caller` (first module.function outside the store
-and timing helpers), `mode` (`read` or `write`), `total_ms`, `begin_ms`, `commit_ms` and `error` (exception class or
+and timing helpers), `mode` (`read` or `write`), `total_ms`, `begin_ms`, `commit_ms`, `database` (file identity) and `error` (exception class or
 empty string). No SQL, parameters or payloads are recorded. Diagnostic failures never change application results.
 
 All outer transactions, including fast successes, also contribute to `LOG_DIR/dbstats/*.json`. Format 1 contains
@@ -34,7 +45,35 @@ All outer transactions, including fast successes, also contribute to `LOG_DIR/db
 0–1 ms; key N means greater than 2^(N−1) through 2^N ms. Counts nest only at the outer boundary. Updates are locked
 across threads and published atomically after every transaction, so normal short-lived processes need no exit flush.
 Database replacements, distinct databases, restarts, forks and UTC hours have separate records; PID is metadata,
-not identity. Retain these files as inputs for later hourly aggregation.
+not identity. Retain these files as inputs for hourly aggregation.
+
+After each hourly prune attempt, serve collects database health on its existing worker pool, including when a failed
+snapshot prevents pruning. It never walks runs/ or counts tables in a beat. Each successful collection logs one
+structured summary starting with `db {`; a failed collection emits one `db collection failed: <error>` diagnostic
+and no summary. Every `serve.json` beat contains a `db` object. Collection `status` is `initial`, `pending`,
+`complete` or `failed`, with `requested_at`, `finished_at` and `error`. Uncollected metrics are null. Pending/failed
+collections retain the last successful metrics and `collected_at`.
+
+The hourly window is the previous complete UTC hour, inclusive `window_start` and exclusive `window_end`.
+`transaction_count`, `transactions_by_kind`, `p95_ms` and exact `max_ms` merge current-database process summaries,
+including fast transactions absent from db.log. Approximate p95 is the merged histogram bucket upper bound,
+capped at the exact maximum; a bucket is at most twice the durations it contains (bucket 0 covers 0–1 ms).
+`slow_by_kind`, `errors_by_kind` and `errors_by_class` count diagnostic records separately, reading
+numbered db.log rotations too. Explicitly different database identities are excluded; older identity-less log records
+are accepted within the window. Malformed records and incomplete final lines are ignored.
+`db_bytes` and `wal_bytes` measure the files; `tables` holds row counts from one short snapshot.
+`record_bytes`, `other_bytes` and `total_bytes` measure all runs/ files without following symlinks.
+
+Heartbeat checks run independently of serve installation/liveness: `db:slow` warns on a transaction strictly above
+five seconds in the rolling last hour and names its caller; `db:size` warns when DB + WAL exceed
+`[retention] db_max_mb` (default 500 MiB); `runs:size` warns above half `max_gb` (decimal GB), counting record/
+and all other run-folder bytes. These checks read current files, so they also work before the first collection.
+
+Run the merge resolver exercises with `<sandbox> python docs/resolve-fixture.py base-moved`,
+`unrelated-edit`, `protected`, or `branch-moved` (replace the final scenario name). Each uses fresh offline Git
+repositories under `.arete-sandbox/resolve-fixture` and exits nonzero on a mismatch. Successful moves print clean
+merge parents and combined content; refusal cases print the rejected path and resolver call count. `base-moved`
+also checks an explicit incoming commit override and saves the emitted prompts beside each disposable repository.
 
 Run the offline exercises through the supplied verification sandbox, replacing `<sandbox>` with its executable path:
 
@@ -44,6 +83,17 @@ Run the offline exercises through the supplied verification sandbox, replacing `
 <sandbox> python docs/db-fixture.py transaction-timing
 <sandbox> python docs/db-fixture.py output-sinks
 <sandbox> python docs/db-fixture.py durable-files
+<sandbox> python docs/db-fixture.py wal-startup
+<sandbox> python docs/db-fixture.py prune-restore
+<sandbox> python docs/db-fixture.py restore-safety
+<sandbox> python docs/db-fixture.py feed-cursors
+<sandbox> python docs/db-fixture.py backup-health
+<sandbox> python docs/db-fixture.py coherent-reads
+<sandbox> python docs/db-fixture.py event-contract
+<sandbox> python docs/db-fixture.py database-health
+<sandbox> python docs/db-fixture.py legacy-cleanup
+<sandbox> python docs/db-fixture.py browser-seed
+<sandbox> python docs/db-fixture.py browser-serve --port 8765
 <sandbox> python docs/db-fixture.py inspect
 ```
 
@@ -53,6 +103,17 @@ evidence, stdout and stderr remain under `.arete-sandbox/db-fixture/<exercise>-*
 results and journal/synchronous settings. Contention exercises use ordinary rollback-journal SQLite files, not the
 confined scratch connection's MEMORY journal. Source fetch barriers, transaction cleanup, snapshots, migrations,
 restore isolation, oncall ordering, output draining and durable replacement failures are exercised there.
+
+The new exercises retain read-connection/cutoff evidence, concurrent-commit barriers, event-contract blockers,
+health aggregation/collection beats and real startup cleanup evidence. Reuse prune-restore, restore-safety,
+backup-health and feed-cursors for backup retention, copy and restore regressions.
+
+`browser-seed` records a shared disposable fixture directory in `db-fixture/browser.json`; `browser-serve`
+uses it until Ctrl-C and is excluded from the finite exercise list. Open http://127.0.0.1:8765/ and the printed
+`/#run/local`, `/#run/replay`, `/#run/subscription`, `/#run/api-key` and `/#run/mixed` links. Open the chat console
+on `/#live` to select the seeded chat; its messages, session list and report also have printed API links.
+http://127.0.0.1:8765/ui.html uses the same data. The fixture binds loopback with a fake owner identity and uses
+the real Handler and admission checks; it does not change production routes or authentication.
 
 ## Serve
 
@@ -194,7 +255,7 @@ A repeat of an open incident's fingerprint, minutes or hours later, updates it i
 A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
 The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines read under the set it was opened under, and only while its own file is still under that set, or, once that file is gone, while the config holds no other set.
 The append-only `incident_notes` table records what happened and when.
-Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
+Evidence is scrubbed of secrets and home paths before it is stored, and `store.prune` trims both tables.
 
 **Decisions.** After each scan, JEV is asked four yes/no questions about every open incident that is due, oldest first however many are open, and the answers become one stored decision:
 
@@ -616,7 +677,25 @@ Set `jev = false` on a repo whose code or tickets must not leave the machine.
 
 Poll starts detached runs and fills the available capacity round robin across repos, checking each ticket's dependencies, process budget and model routes before launch. Each poll examines at most 64 distinct tickets, so blocked tickets and failed starts cannot create an unbounded loop. A ticket selected in this poll stays excluded while its child process initializes. `max_parallel` sets how many runs go at once on the machine, manual runs included; an `arete experiment` trial holds a slot too, and starts only on a free one with no run waiting to take a slot back and no ready ticket passed over. A run frees its slot while it waits on its PR's CI, and takes one back before a CI fix step. A run that waits to take its slot back goes ahead of new runs: while it waits, no new run starts, even on a free slot. It reads `max_parallel` again every 30 seconds, so a raised limit lets it go at once. `arete status` lists it as waiting for a run slot, and a run in its CI wait as waiting on CI without a run slot. A repo with `max_parallel_per_repo` runs going, counting runs in their CI wait and manual runs, gets no new one from poll; `arete run` by hand is held only by `max_parallel`.
 
-Pipeline budgets span repairs, continuations and individual step reruns. The defaults allow two repair calls, 60 minutes of total active run time and 20 minutes inside verification, including verification repairs and service waits. The checks that run again after a verification repair count as run time, not verification time. A deadline interrupts the current call through its existing cleanup and parks the ticket as failed, leaving its available workspace, branch and evidence in place and releasing its slot. `budget.json`, `parked.json` and the run's budget events record what was consumed and why it stopped. Active time is measured on the run's own clock: machine sleep, a suspended VM and the time before a dead run is reaped are free. An interrupted run and its open verification phase count up to their last checkpoint, normally at most 30 seconds short. Runs from before measured checkpoints count by wall clock through their recorded finish. A `limit` wait (a usage limit or credit hold) and a `slot` wait for a free run slot are left out, in the run and in the earlier runs of its chain. The deadline does not fire during such a wait and moves out by its length. `ci` waits and time inside verification, service waits included, still count, and `max_verify_minutes` keeps counting during a `limit` wait. `budget.json` and `parked.json` list the minutes left out by cause under `wait_minutes_left_out` (this run) and `earlier_wait_minutes_left_out` (earlier runs of the chain). Repeating an unchanged parked request starts no model call. Change the ticket's title or body, published branch head, or budget settings and retry with `arete run REPO TICKET --force` to begin a new budget. A forced run of a chain that did not park leaves out the repair calls, run minutes and verification minutes that earlier runs spent under a different title or body, writes one log line saying how much it left out, and lists those runs under `left_out` in `budget.json`. A run whose specification was not recorded still counts, and so does every run when the specification is unchanged or the run is a repair, a continuation or started by poll. Parking does not approve a review, remove a hold or enable a merge. A run that ends with its workspace left in place, parked or failed, commits its uncommitted edits to the local branch with an `Arete-Run: RUN_ID` trailer and pushes nothing; `parked.json` lists the kept head and the commit beneath it under `kept`, and the workspace record keeps them for any later run. The next run of the ticket, forced, resumed or prepared again, continues from that commit when the worktree still matches the record, merged with `origin/BRANCH` or the base when either moved, and tells the build that the worktree holds those edits; the diff limit, the checks and the review count them as part of the change, and the next push sends them. A worktree that was reset, moved to another branch or edited by hand is refused with what changed; remove the worktree and the local branch to start from origin.
+Pipeline budgets span repairs, continuations and individual step reruns. The defaults allow two repair calls, 60 minutes of total active run time and 20 minutes inside verification, including verification repairs and service waits. The checks that run again after a verification repair count as run time, not verification time. A deadline interrupts the current call through its existing cleanup and parks the ticket as failed, leaving its available workspace, branch and evidence in place and releasing its slot. Active time is measured on the run's own clock and stored on its database row: machine sleep, a suspended VM and the time before a dead run is reaped are free. A killed run and its open verification phase count up to their last checkpoint, at most 30 seconds short. Runs from before this change receive a frozen wall-clock estimate. The run log and a `budget_chain` event name each parent's charged run minutes, verification minutes and repair calls, marking estimates; `parked.json` keeps the same map under `charged` beside the reason it stopped. After the budget schema contract applies, `budget.json` holds only lineage, policy, specification and excluded wait minutes. A `limit` wait (a usage limit or credit hold) and a `slot` wait for a free run slot are left out, in the run and in the earlier runs of its chain. The deadline does not fire during such a wait and moves out by its length. `ci` waits and time inside verification, service waits included, still count, and `max_verify_minutes` keeps counting during a `limit` wait. `budget.json` and `parked.json` list the minutes left out by cause under `wait_minutes_left_out` (this run) and `earlier_wait_minutes_left_out` (earlier runs of the chain). Repeating an unchanged parked request starts no model call. Change the ticket's title or body, published branch head, or budget settings and retry with `arete run REPO TICKET --force` to begin a new budget. A forced run of a chain that did not park leaves out the repair calls, run minutes and verification minutes that earlier runs spent under a different title or body, writes one log line saying how much it left out, and lists those runs under `left_out` in `budget.json`. A run whose specification was not recorded still counts, and so does every run when the specification is unchanged or the run is a repair, a continuation or started by poll. Parking does not approve a review, remove a hold or enable a merge. A run that ends with its workspace left in place, parked or failed, commits its uncommitted edits to the local branch with an `Arete-Run: RUN_ID` trailer and pushes nothing; `parked.json` lists the kept head and the commit beneath it under `kept`, and the workspace record keeps them for any later run. The next run of the ticket, forced, resumed or prepared again, continues from that commit when the worktree still matches the record, merged with `origin/BRANCH` or the base when either moved, and tells the build that the worktree holds those edits; the diff limit, the checks and the review count them as part of the change, and the next push sends them. A worktree that was reset, moved to another branch or edited by hand is refused with what changed; remove the worktree and the local branch to start from origin.
+
+Exercise stored run budgets offline with the sandbox launcher:
+
+```sh
+SANDBOX=/Users/justin.barnett/Library/Developer/arete/verification-runtime/harness/sandbox
+$SANDBOX python docs/run-budget-fixture.py sleep
+$SANDBOX python docs/run-budget-fixture.py forced-columns
+$SANDBOX python docs/run-budget-fixture.py row-precedence
+$SANDBOX python docs/run-budget-fixture.py killed-verify
+$SANDBOX python docs/run-budget-fixture.py migrations
+$SANDBOX python docs/run-budget-fixture.py migration-errors
+$SANDBOX python docs/run-budget-fixture.py checkpoint-errors
+$SANDBOX python docs/run-budget-fixture.py admission
+$SANDBOX python docs/run-budget-fixture.py waits
+$SANDBOX python docs/run-budget-fixture.py inspect
+```
+
+Each exercise uses fresh disposable state and a local replay sample, prints `BEHAVIOR_RESULT` JSON, and retains database rows, logs, migration evidence and local published branches beneath `.arete-sandbox/run-budget-fixture/`. `inspect` reads the retained evidence. These exercises never use production state or a model.
 
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
@@ -703,11 +782,39 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 
 `arete serve` owns schema changes. After taking the serve lock it runs the same migrator as `arete migrate`, before starting workers or the dashboard. An ordinary writer never creates the database or changes its schema. If it finds an older schema, it prints `schema 2 waits for schema 3; run arete serve or arete migrate` once, then waits up to 60 seconds for serve. A missing database names those commands; if a snapshot exists, it instead names the newest snapshot and `arete backup --restore FILE`. A deleted database stops serve.
 
-Each immutable migration lives in `arete/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas are foundation, work, runs, config, connections, secrets, devices and outbox. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
+Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
+
+Import connections with `from arete.store import db` and persistence functions through their owner modules. Runs owns recording SQL, history, billing readers, reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. Approvals owns approvals, proposals and mined results; chats owns chats, messages and linked sessions; tasks owns tasks and comments; triage owns current rows and triage approvals; devices owns VMs, probes and holds; insights owns usage, research, evals, feedback, verdicts and captures with their checks and evidence; asks owns owner asks and run messages; push owns subscriptions. The private `_rows` encoding helper is excluded from migration owners. Approval settlement updates verdicts through insights on the approval transaction's connection. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. `state.py` explicitly exports compatibility names until consumers switch to their owners. The relocated numbered migrations and `latest.txt` retain their original bytes.
+
+The isolated persistence probes print exact inventories and rollback evidence as `BEHAVIOR_RESULT` JSON:
+
+```sh
+python -I tests/scripts/store_contract.py ownership
+python -I tests/scripts/store_contract.py aggregate-joins
+python -I tests/scripts/store_contract.py run-retention
+python -I tests/scripts/store_contract.py scan-atomicity
+python -I tests/scripts/store_contract.py server-prune
+python docs/db-fixture.py concurrent-intake
+python docs/db-fixture.py prune-restore
+```
+
+In the build sandbox, prefix each command with the supplied `verification-runtime/harness/sandbox` executable.
+
+The isolated foundation contract probes generate configuration with `replay.sample` and place all six environment paths under a disposable directory. Run through the supplied sandbox:
+
+```sh
+python tests/scripts/store_contract.py ownership
+python tests/scripts/store_contract.py aggregate-joins
+python tests/scripts/store_contract.py unknown-area
+python tests/scripts/store_contract.py upgrade
+python tests/scripts/store_contract.py record-readers
+python tests/scripts/store_contract.py record-failures
+python tests/scripts/store_contract.py run-retention
+```
 
 The phases are `expand` (compatible additions), `backfill` (data conversion) and `contract` (removals or incompatible changes). `arete migrate --no-contracts` stops before the first contract. A contract waits for live runs and serve processes that name an older schema, including runs without a schema stamp. A stale heartbeat does not release a still-running older serve's contract gate. Serve retries a waiting contract on each tick. Each migration and its ledger row commit together, with `user_version`, duration and the snapshot filename. A failure rolls back that migration and preserves earlier successful versions. Retention also keeps the snapshot named by the newest migration.
 
-A column, status, run.jsonl event or step_end data-key rename needs an earlier expand whose reader accepts both names. Writers use the new name only after the contract row applies; every later removal goes through this gate. Timestamp columns are listed in `state.TIME_COLUMNS` and use `state.TIME_GLOB`, the UTC shape emitted by `util.iso()`. Migration 2 normalizes legacy offsets and adds triggers rejecting malformed nonempty values. When adding a time column to an existing table, update the mapping and replace that table's triggers in the new migration; new tables declare a CHECK. Tracker equality stamps such as triage.updated and research.updated keep their original format.
+A column, status, run.jsonl event or step_end data-key rename needs an earlier expand whose reader accepts both names. Writers use the new name only after the contract row applies; every later removal goes through this gate. Timestamp columns are listed in `store.db.TIME_COLUMNS` and use `store.db.TIME_GLOB`, the UTC shape emitted by `util.iso()`. Migration 2 normalizes legacy offsets and adds triggers rejecting malformed nonempty values. When adding a time column to an existing table, update the mapping and replace that table's triggers in the new migration; new tables declare a CHECK. Tracker equality stamps such as triage.updated and research.updated keep their original format.
 
 `schema_meta` stores the instance id, short tag, name and creation time, plus schema version and oldest compatible writer. The initial name is the operating-system user. `GET /api/meta` returns these instance and schema blocks through the existing authenticated dashboard. Identity is also persisted in `backups/instance.json`, so restoring a snapshot from before the ledger keeps the same name and id.
 
@@ -718,10 +825,14 @@ A plain file copy of the live database is not a backup, because it can hold a ha
 
 `arete backup` takes a snapshot now. `arete backup --check` checks the newest snapshot and prints its row count per table beside the live file's; it exits 1 when the check fails.
 `arete backup --restore FILE` replaces `arete.db` with a snapshot. It refuses while `arete serve` is alive or a run is running, so stop serve first.
-It keeps the replaced file, and its rollback journal under a matching name, as `arete.db.before-restore-<stamp>`, and raises every `sqlite_sequence` value to at least its current value so no id is reused.
+It holds the serve startup exclusion lock throughout validation and installation, checks live serve/run PIDs and held run locks, and keeps the replaced database and every existing `-journal`, `-wal` and `-shm` under one unique `arete.db.before-restore-<id>` basename. Discovery recovers private copies, preserving original and archived sidecar bytes. Every sequence keeps at least the snapshot and replaced database values; an unreadable replaced database uses the snapshot value plus 10,000. Destination instance identity is preserved. A durable generation receipt makes `restore_epoch` increase even after unreadable databases or older snapshots.
+
+Durable installation metadata recovers an interruption between renames before serve opens the database. Ordinary installation failures restore the complete original file set. Preserve the metadata, stage and archives if recovery reports corrupt metadata. A pre-ledger snapshot needs normal serve startup to migrate and finish the recorded identity, sequences and generation exactly once; the restore command says when this completion is required.
+
+Within a restore generation a reader that has seen N never receives a newly allocated line below N; a generation change restarts that run's feed. The CLI follower and both dashboard feed clients reset their cursor to zero when `restore_epoch` changes.
 While `arete.db` is missing or empty and a snapshot exists, Arete refuses to start a new empty file and names the newest snapshot instead.
 
-After the first snapshot of each UTC day Arete builds `config-<day>.tar.gz` in `backups/` from `config.toml`, `loop-switches.json`, `loops/` and a `git bundle` of `layers/`; links, `pi.env`, `*.env` files and `verification-authority/` are left out.
+After the first snapshot of each UTC day Arete builds `config-<day>.tar.gz` in `backups/` from `config.toml`, `loop-switches.json`, `loops/` and a `git bundle` of `layers/`; links, `.env`, `.env.*`, `pi.env`, `*.env` files and `verification-authority/` are left out. Layers history containing forbidden names or symlinks, including deleted entries, refuses bundling.
 Set the destination to copy the day's snapshot and archive with `rsync -t`:
 
 ```toml
@@ -729,7 +840,7 @@ Set the destination to copy the day's snapshot and archive with `rsync -t`:
 copy_to = "host:/backups/arete/"
 ```
 
-A failed copy is tried again at the next snapshot until one succeeds that day. **Until the owner sets `copy_to`, no copy of the database or config leaves this machine**, and `arete heartbeat` shows `backup:offsite` as a warning that says so. `backup:db` fails when serve is installed and the newest snapshot is over 3 awake hours old or fails its check, and `backup:offsite` fails when the last good copy is over 48 awake hours old.
+A failed copy is tried again at the next snapshot until one succeeds that day. **Until the owner sets `copy_to`, no copy of the database or config leaves this machine**, and `arete heartbeat` shows `backup:offsite` as a warning that says so. `backup:db` fails when an existing newest snapshot is over 3 awake hours old or fails its check, even when serve is uninstalled, and `backup:offsite` fails when the last good copy is over 48 awake hours old.
 
 ## Doctor
 
@@ -858,7 +969,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -907,7 +1018,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[routing]` | `fallback` (default true) and `payment_modes` (a list of `subscription`, `api_key` and `local`; default all three). The engine's and a repo layer's `fallback` are combined with AND, so either can turn it off; a layer's `payment_modes` can only restrict the engine's. `arete steps` shows the result, and runs act on it. `capabilities` (per-route tables) and `floors` (named model lists) feed the step requirements. `paid` limits paid routes by provider and price. See [Steps](#steps). |
 | `[chat]` | `context_tokens` (default 40000, at least 100) is how many tokens of the chat's saved messages go into each turn before older ones are folded into a saved summary (the new message is not counted). `summary_model` (default `haiku`) writes that summary. `max_sessions` (default 2, at least 1) is the most task sessions one chat has running. `budget_usd` (default 10) is the dollars one chat may spend on its replies and its sessions. |
 | `[capture]` | `vision` (default none): the name of a file in the config folder, such as `vision.md`, that says what the app is for. The feedback composer's vision check reads it; a path that is absolute, holds `..` or leaves the folder is refused at load. With no key, no file or an empty file, that check holds and says what to add. `evidence_branch` (default `feedback-evidence`): the branch that holds uploaded evidence, a plain branch name with no `..`. `public_evidence` (default false): a public repo, or one whose visibility cannot be read, holds delivery of a request with evidence unless this is true. |
-| `[retention]` | `days` (default 30) expires raw records; `max_gb` (default 20) counts all run-folder bytes and removes eligible records oldest first; `lines_days` (default 90, at least `days`) expires run folders while keeping history rows. Protected data stays. Positive fractions are allowed. See [Retention](#retention). |
+| `[retention]` | `days` (default 30) expires raw records; `max_gb` (default 20) counts all run-folder bytes and removes eligible records oldest first; `lines_days` (default 90, at least `days`) expires run folders while keeping history rows; `db_max_mb` (default 500 MiB) sets the DB + WAL health warning threshold. Protected data stays. Positive fractions are allowed. See [Retention](#retention). |
 | `[replay]` | `all` (default false, sends every agent call to the replay runner) and `dir` (the folder of answers; `ARETE_REPLAY_DIR` wins over it). See [Replay](#replay). |
 | `[environment]` | `pass`, the names of more server variables that local agents and the commands that run a repo's code get, each an exact name, a prefix ending in `*`, or `"*"` for all. `[environment.providers]` maps a pi provider to more names its agents get, such as `amazon-bedrock = ["AWS_*"]`. See [An agent's environment](#an-agents-environment). |
 

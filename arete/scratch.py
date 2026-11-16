@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import launchd, paths, sandbox, util
+from .store import runs as run_store
 
 PREFIX = paths.SCRATCH_PREFIX
 ENV_NAME = paths.SCRATCH_ENV
@@ -219,9 +220,7 @@ class RotationRefused(RuntimeError):
 
 
 def rotation_blockers(fd: int) -> list[str]:
-    from . import state
-
-    found = [f"run {r['id']} is active" for r in state.runs_marked_running()]
+    found = [f"run {r['id']} is active" for r in run_store.runs_marked_running()]
     for name in sorted(os.listdir(fd)):
         if name.endswith(".lease"):
             lease = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)

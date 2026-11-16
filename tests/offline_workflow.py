@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from arete.store import runs as run_store
 from arete import slots, workspace, prompt_loader
 
 from tests.harness import set_task_body
@@ -70,6 +71,7 @@ LESSON_A, LESSON_B = "- `notes.txt`: lesson A from the first run.", "- `notes.tx
 KILLED_WHILE_WAITING = """
 import os, runpy, signal, sys, urllib.request
 from unittest import mock
+from arete.store import runs as run_store
 from arete import accounts, factory, gh, paths, pipeline, slots
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
@@ -90,6 +92,7 @@ with mock.patch.multiple(slots, runs_in_slots=mock.Mock(return_value=[{}]),
 SECOND_LEARNING_RUN = """
 import runpy, sys, urllib.request
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import accounts, factory, gh, paths
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
@@ -115,6 +118,7 @@ def forbidden(*args, **kwargs):
 
 
 def main(root, scenario):
+    from arete.store import runs as run_store
     from arete import (accounts, alerts, owner_asks, codebase, config, control, environment, factory, flows, gh, run_lines,
                        paths, pipeline, record, replay, runlimits, runner, scrub, state, tasks, vault)
     state.migrate()
@@ -347,6 +351,7 @@ def add_held_pr_history(fx):
     for n in (1, 2, 3):
         fx.run_lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
     fx.record.settle(old, "pr")
+    run_store.note(old, repair_calls=3)
     with fx.state.db() as connection:
         set_task_body(fx.task, "Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", connection=connection)
     fx.old = old
@@ -357,7 +362,7 @@ def forced(fx, *extra):
         fx.factory.main(fx.feature, ["replay-sample", fx.task, "--force", *extra])
     except SystemExit:
         pass
-    return fx.state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    return run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
 
 
 def continue_ignoring_exit(fx, arguments):
@@ -462,11 +467,12 @@ def kill_at_verify(fx):
     child = os.fork()
     if child == 0:
         os.close(ready)
+        runlimits.CHECKPOINT_SECONDS = 0.2
         def pause_at_verify(prompt, cwd, **kw):
             if kw.get("trace", ("", ""))[1] == "verify":
                 os.write(notify, b"ready")
-                while True:
-                    time.sleep(1)
+                time.sleep(1)
+                os.kill(os.getpid(), signal.SIGKILL)
             return fx.real_run(prompt, cwd, **kw)
         runner.run = pause_at_verify
         forced(fx)
@@ -475,15 +481,19 @@ def kill_at_verify(fx):
     try:
         assert select.select([ready], [], [], 30)[0], "verify never started"
         assert os.read(ready, 5) == b"ready"
+        _, status = os.waitpid(child, 0)
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+        fx.killed_signal = os.WTERMSIG(status)
     finally:
-        os.kill(child, signal.SIGKILL)
-        os.waitpid(child, 0)
         os.close(ready)
     real_now = pipeline.util.now
     pipeline.util.now = lambda: real_now() + timedelta(seconds=600)
-    failed = state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    failed = run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    before = {k: failed[k] for k in ("active_seconds", "verify_seconds", "verify_open_seconds", "repair_calls", "measured_at")}
     record.interrupt(failed)
-    failed = state.run_get(failed["id"])
+    failed = run_store.run_get(failed["id"])
+    assert before == {k: failed[k] for k in before}
+    fx.settlement_unchanged = True
     pipeline.git(["add", "-A"], ws)
     pipeline.util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m",
                                 f"wip: edits of arete run {failed['id']}, kept when it ended before pushing\n\nArete-Run: {failed['id']}"], ws)
@@ -509,7 +519,7 @@ def prepare_continuation(fx):
         fx.mid["log"] = (fx.paths.RUNS_DIR / fx.mid["id"] / "run.log").read_text()
     if "only-prepare" in scenario:
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--continue", failed["id"], "--only", "prepare"])
-        fx.mid = fx.state.ticket_runs("replay-sample", fx.task)[0]
+        fx.mid = run_store.ticket_runs("replay-sample", fx.task)[0]
         fx.mid["unmoved"] = pipeline.git(["rev-parse", "HEAD"], ws).strip() == fx.before
 
 
@@ -517,12 +527,12 @@ def stepped_edits(fx):
     scenario, pipeline, ws, failed, mid = fx.scenario, fx.pipeline, fx.ws, fx.failed, fx.mid
     (fx.replays / "build.patch").write_text(LIME if "broken" in scenario else QUINCE)
     continue_ignoring_exit(fx, ["replay-sample", fx.task, "--continue", failed["id"], "--only", "implement"])
-    fx.mid = mid = fx.state.ticket_runs("replay-sample", fx.task)[0]
+    fx.mid = mid = run_store.ticket_runs("replay-sample", fx.task)[0]
     mid["head"] = pipeline.git(["rev-parse", "HEAD"], ws).strip()
     if "broken-" in scenario:
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--continue", failed["id"], "--only",
                                     scenario.rsplit("-", 1)[1]])
-        later = fx.state.ticket_runs("replay-sample", fx.task)[0]
+        later = run_store.ticket_runs("replay-sample", fx.task)[0]
         mid["later"] = {k: later.get(k) for k in ("only_step", "status", "summary")}
     if scenario.endswith(("-hand", "-forged")):
         trailer = "\n\nArete-Run: " + mid["id"] if scenario.endswith("-forged") else ""
@@ -549,11 +559,15 @@ def continuation_result(fx, row):
     published = "refs/heads/" + branch in og(fx, "for-each-ref", "--format=%(refname)", "refs/heads")
     return {"failed": failed["summary"], "status": row["status"], "summary": row["summary"], "log": log,
             "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
-            "steps": [s["step"] for s in state.steps(row["id"])],
+            "steps": [s["step"] for s in run_store.steps(row["id"])],
             "started": [l["step"] for l in fx.run_lines.read(row["id"]) if l.get("event") == "step_start"],
             "failed_id": failed["id"], "failed_status": failed["status"],
             "failed_span": (pipeline.util.parse_iso(failed["finished"]) - pipeline.util.parse_iso(failed["started"])).total_seconds(),
             "failed_budget": runlimits.metadata(failed["id"], "budget.json"),
+            "failed_row": failed, "row": row,
+            "charged": next(e["charged"] for e in fx.run_lines.read(row["id"]) if e["event"] == "budget_chain"),
+            "killed_signal": getattr(fx, "killed_signal", None),
+            "settlement_unchanged": getattr(fx, "settlement_unchanged", None),
             "inherited_run": runlimits.active_seconds(failed["id"], failed),
             "inherited_verify": runlimits.verification_seconds(failed["id"], failed),
             "mid": {k: mid.get(k) for k in ("id", "status", "summary", "log", "only_step", "unmoved", "head", "later")},
@@ -567,6 +581,84 @@ def continuation_result(fx, row):
             "budget": runlimits.metadata(row["id"], "budget.json"),
             "trailers": og(fx, "log", "--format=%B", f"main..{branch}") if published else "",
             "prompts": [t[1] for t, _ in fx.prompts if t and t[0] == row["id"]]}
+
+
+def budget_columns(fx):
+    prepare_kept_fixture(fx)
+    fail_first_run(fx)
+    prepare_continuation(fx)
+    rid = fx.failed["id"]
+    saved = fx.runlimits.metadata(rid, "budget.json")
+    high = fx.scenario.endswith("-high")
+    with fx.state.tx() as conn:
+        conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (3660 if high else 10, rid))
+    if not high:
+        fx.pipeline.util.write_json(fx.paths.RUNS_DIR / rid / "budget.json", {**saved, "run_seconds": 3660})
+    fx.failed = fx.state.run_get(rid)
+    (fx.replays / "build.patch").write_text(QUINCE)
+    with mock.patch.object(fx.runlimits.Policy, "of", return_value=fx.runlimits.Policy(max_run_minutes=1)):
+        row = forced(fx)
+    result = continuation_result(fx, row)
+    result["forced_arguments"] = ["replay-sample", fx.task, "--force"]
+    result["parent_row"] = fx.state.run_get(rid)
+    result["parent_budget"] = fx.runlimits.metadata(rid, "budget.json")
+    result["parked"] = fx.runlimits.metadata(row["id"], "parked.json")
+    result["record_page"] = fx.record.read_run(row["id"])
+    counters = {"active_seconds", "verify_seconds", "verify_open_seconds", "repair_calls", "measured_at"}
+    assert not counters.intersection(result["record_page"])
+    assert result["budget"]["parents"] == [rid]
+    if high:
+        assert "parked: the run chain reached its cumulative 1 minute budget" in row["summary"]
+        assert result["parked"]["charged"][rid]["run_minutes"] == 61.0
+        assert result["record_page"]["parked"] == result["parked"]["reason"]
+        assert result["charged"][rid]["run_minutes"] == 61.0
+        assert rid in result["log"] and "61.0 run minutes" in result["log"]
+    else:
+        assert row["status"] == "done", row["summary"]
+        assert result["published"]
+    return result
+
+
+def budget_precedence(fx):
+    prepare_kept_fixture(fx)
+    fail_first_run(fx)
+    rid, util = fx.failed["id"], fx.pipeline.util
+    finish = util.parse_iso(fx.failed["finished"])
+    with fx.state.tx() as conn:
+        conn.execute("UPDATE runs SET started=?, active_seconds=10, verify_seconds=3, verify_open_seconds=2, "
+                     "repair_calls=1 WHERE id=?", (util.iso(finish - timedelta(hours=2)), rid))
+    saved = fx.runlimits.metadata(rid, "budget.json")
+    saved.update(verification_active_since=util.iso(finish - timedelta(hours=1)),
+                 verification_seconds=900, repair_calls=4)
+    legacy_before = dict(saved)
+    util.write_json(fx.paths.RUNS_DIR / rid / "budget.json", saved)
+    repo = fx.config.load().repo("replay-sample")
+    new = fx.record.start("pipeline", repo=repo.name, issue=fx.task)
+    run = fx.pipeline.Run(new, repo, fx.paths.RUNS_DIR / new, tid=fx.task,
+                          tracker=fx.pipeline.tracker.LocalTracker(repo))
+    def totals():
+        budget = fx.runlimits.Budget(run, fx.runlimits.Policy(), rid)
+        return [budget.prior_seconds, budget.verify_seconds, budget.prior_repairs]
+    before = totals()
+    saved.update(run_seconds=99999, verification_seconds="irrelevant", repair_calls=-1)
+    util.write_json(fx.paths.RUNS_DIR / rid / "budget.json", saved)
+    after = totals()
+    assert before == after == [10, 5, 1]
+    saved["parents"] = 1
+    util.write_json(fx.paths.RUNS_DIR / rid / "budget.json", saved)
+    try:
+        totals()
+    except ValueError as e:
+        lineage_error = str(e)
+        assert rid in lineage_error
+    else:
+        raise AssertionError("malformed lineage accepted")
+    parent = fx.state.run_get(rid)
+    span = (util.parse_iso(parent["finished"]) - util.parse_iso(parent["started"])).total_seconds()
+    assert span == 7200
+    return {"prior_seconds": before[0], "verify_seconds": before[1], "prior_repairs": before[2],
+            "after": after, "parent_row": parent, "legacy_before": legacy_before,
+            "legacy_after": saved, "wall_span": span, "lineage_error": lineage_error}
 
 
 def kept(fx):
@@ -608,10 +700,29 @@ def park_first_run(fx):
 
 def resume_parked(fx, result):
     scenario, pipeline, ws, branch = fx.scenario, fx.pipeline, fx.ws, fx.branch
+    if scenario == "budget-waits-admission":
+        count = len(fx.state.ticket_runs("replay-sample", fx.task))
+        calls = len(fx.prompts)
+        repo = fx.config.load().repo("replay-sample")
+        local = pipeline.tracker.LocalTracker(repo)
+        policy = fx.runlimits.Policy(max_repair_cycles=0)
+        admission = {"saved": result["recorded"], "policy": vars(policy),
+                     "specification": fx.runlimits.specification(local.get(fx.task)),
+                     "heads": fx.runlimits.heads(repo, branch), "rows_before": count, "calls_before": calls}
+        with mock.patch.object(fx.runlimits.Policy, "of", return_value=policy):
+            refused = forced(fx)
+        admission.update(id=refused["id"], rows_after=len(fx.state.ticket_runs("replay-sample", fx.task)),
+                         calls_after=len(fx.prompts))
+        pipeline.util.write_json(fx.root / "admission.json", admission)
+        result["admission"] = admission
+        assert refused["id"] == result["parked_id"]
+        assert count == len(fx.state.ticket_runs("replay-sample", fx.task))
+        assert len(fx.prompts) == calls
+        result["unchanged_refused"] = True
     edit_spec(fx, "Add kumquat on a last line of its own, and quince")
     if scenario == "kept-push-then-fail":
         fx.factory.STEPS["publish"] = lambda flow: fx.flows.end_as("fail", "failed", why="publishing failed after the push")
-    if scenario in ("kept-park", "kept-park-pushed", "kept-push-then-fail"):
+    if scenario in ("kept-park", "kept-park-pushed", "kept-push-then-fail", "budget-waits-admission"):
         (fx.replays / "build.patch").write_text("--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,3 @@\n A small file for replay checks.\n kumquat\n+quince\n")
     if scenario == "park-no-edits":
         fx.plan.write_text(fx.plan_answer)
@@ -740,7 +851,7 @@ def fix_ask_continue(fx):
     (fx.answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
     with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_repair_cycles=5)):
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--force", "--continue", fx.parked["id"]])
-    return state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    return run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
 
 
 def fix_ask_result(fx, row):
@@ -908,7 +1019,7 @@ def slot_wait(fx, result, continuing):
         stop_while_waiting_for_slot(fx, result, continuing)
     else:
         kill_while_waiting_for_slot(fx, continuing)
-    waited = state.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0]
+    waited = run_store.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0]
     lines_of = run_events(fx, waited["id"])
     result |= {"waited": waited["status"],
                "waited_continues": [e.get("continues") for e in lines_of if e.get("event") == "route"] == [parked["id"]],
@@ -947,13 +1058,13 @@ def kill_while_waiting_for_slot(fx, continuing):
     source = str(Path(fx.pipeline.__file__).resolve().parent.parent)
     subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{source!r});" + KILLED_WHILE_WAITING,
                     *continuing], start_new_session=True, timeout=60)
-    fx.record.interrupt(fx.state.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0])
+    fx.record.interrupt(run_store.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0])
 
 
 def asked_continue(fx, result, continuing):
     paths, record, state, parked, first = fx.paths, fx.record, fx.state, fx.parked, fx.first
     continue_ignoring_exit(fx, continuing)
-    row = state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    row = run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
     events = run_events(fx, row["id"])
     session = lambda read: next(e["session"]["id"] for e in read if e.get("event") == "step_end" and e.get("step") == "implement" and e.get("session"))
     header = json.loads(next(record.raw_lines([f for f in record.record_files(row["id"]) if "build" in f.name][-1])))
@@ -1064,7 +1175,7 @@ def learn_result(fx, row):
               "head": pipeline.git(["rev-parse", "HEAD"], layer_dir).strip() if (layer_dir / ".git").exists() else "",
               "recorded": (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").read_text().strip()
                           if (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").exists() else "",
-              "other": fx.state.ticket_runs("replay-sample", other, whole=True)[0]["status"] if other else "",
+              "other": run_store.ticket_runs("replay-sample", other, whole=True)[0]["status"] if other else "",
               "learn2_prompt": ""}
     for file in record.record_files(row["id"]):
         if "learn2" in file.name:
@@ -1099,7 +1210,7 @@ def ordinary(fx):
     events = run_events(fx, row["id"])
     verification = [e.get("data", {}).get("verified") for e in events
                     if e.get("event") == "step_end" and e.get("step") == "verify"]
-    result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
+    result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in run_store.steps(row["id"])],
               "verified":[v["verdict"] for v in verification if v],
               "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], fx.root / "sample/origin.git")}
     if scenario == "secret-in-patch":
@@ -1176,17 +1287,17 @@ def doctor_clean(fx, result):
 def ordinary_extras(fx, row, events, result):
     scenario, paths, pipeline, runlimits, record, state = fx.scenario, fx.paths, fx.pipeline, fx.runlimits, fx.record, fx.state
     if scenario in ("limit-wait", "work-over-budget"):
-        wall = (runlimits.parsed(row["finished"]) - runlimits.parsed(row["started"])).total_seconds() / 60
+        wall = (pipeline.util.parse_iso(row["finished"]) - pipeline.util.parse_iso(row["started"])).total_seconds() / 60
         result |= {"budget": runlimits.metadata(row["id"], "budget.json"),
                    "parked": runlimits.metadata(row["id"], "parked.json"), "wall": wall}
     if scenario == "code-identity":
         codebase = fx.codebase
         second = (f"import sys; sys.path.insert(0, {str(Path(codebase.__file__).parent.parent)!r}); "
-                  "from arete import codebase, run_lines; codebase.STAMP = 'second-engine'; "
+                  "from arete.store import runs as run_store; from arete import codebase, run_lines; codebase.STAMP = 'second-engine'; "
                   "run_lines.write(sys.argv[1], 'first'); run_lines.write(sys.argv[1], 'second')")
         subprocess.run([sys.executable, "-I", "-c", second, row["id"]], env=os.environ, check=True, capture_output=True)
         result["identity"] = {
-            "stamp": codebase.STAMP, "row": state.run_get(row["id"])["engine_sha"],
+            "stamp": codebase.STAMP, "row": run_store.run_get(row["id"])["engine_sha"],
             "first": events[0].get("engine"),
             "headers": [json.loads(next(record.raw_lines(f))).get("engine") for f in record.record_files(row["id"])],
             "later": [e.get("engine") for e in events[1:]],
@@ -1194,7 +1305,7 @@ def ordinary_extras(fx, row, events, result):
     if scenario == "future-step-appended":
         result["appended"] = bool(fx.appended)
     if scenario in ("pass", "doctor-clean"):
-        assert state.run_get(row["id"])["schema_version"] == state.LATEST
+        assert run_store.run_get(row["id"])["schema_version"] == state.LATEST
         branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
         assert len(branches) == 1, result
         result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], fx.root / "sample/origin.git")
@@ -1205,6 +1316,10 @@ def ordinary_extras(fx, row, events, result):
 
 
 SCENARIOS = {
+    "failed-again-columns-high": budget_columns,
+    "failed-again-columns-low": budget_columns,
+    "failed-again-row-precedence": budget_precedence,
+    "budget-waits-admission": kept,
     "failed-resume-moved": continuation,
     "failed-resume-reopened-moved": continuation,
     "failed-resume-only-prepare-moved": continuation,

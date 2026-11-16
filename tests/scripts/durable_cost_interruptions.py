@@ -1,3 +1,4 @@
+from arete.store import runs as run_store
 
 cfg.pricing = {"test": (2, 4)}
 def streamed(*a, **kw):
@@ -16,7 +17,7 @@ except KeyboardInterrupt:
     pass
 r, = rows(rid)
 assert (r["turns"], r["tokens_in"], r["tokens_out"], r["ok"], r["error"]) == (2, 200, 100, 0, "stopped by request"), r
-assert abs(r["cost_usd"] - .0008) < 1e-12 and state.run_get(rid)["cost_usd"] == r["cost_usd"]
+assert abs(r["cost_usd"] - .0008) < 1e-12 and run_store.run_get(rid)["cost_usd"] == r["cost_usd"]
 assert marks(rid)[0]["error"] == r["error"] and marks(rid)[0]["cost_usd"] == r["cost_usd"]
 rid = record.start("pipeline")
 res = attempt(rid, max_tokens=150)

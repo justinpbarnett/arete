@@ -1,8 +1,9 @@
+from arete.store import runs as run_store
 
 seed()
 s = server()
 pre = counts()
-with mock.patch.object(state, "FIRINGS", "(1 = 1)"):
+with mock.patch.object(run_store, "FIRINGS", "(1 = 1)"):
     prune(s)
 snap = max(paths.backups_dir().glob("arete-*.db"))
 out["deleted"] = "pipe-old" not in column("SELECT id FROM runs")
@@ -15,7 +16,9 @@ def untouched(rc, patch):
     with patch:
         got = run_cli("backup", "--restore", str(snap))
     return [got[0], tree() == held, "stop" in got[1]]
-out["alive"] = untouched(0, mock.patch.object(control, "serve_beat", return_value={"alive": True}))
+util.write_json(control.BEAT_FILE, {"pid": os.getpid(), "at": ago(30)})
+out["alive"] = untouched(0, contextlib.nullcontext())
+control.BEAT_FILE.unlink()
 with state.db() as c:
     c.execute("INSERT INTO runs (id, kind, status, started, pid) VALUES ('live', 'pipeline', 'running', ?, ?)", (ago(0), os.getpid()))
 out["running"] = untouched(0, dead())

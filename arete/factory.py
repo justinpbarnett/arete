@@ -12,8 +12,9 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import codebase, config, owner_asks, run_lines, state, util
+from . import codebase, config, owner_asks, run_lines, util
 from .agent import NO_SESSION, Session
+from .store import runs as run_store
 
 RESULTS = ("pass", "fail", "ask", "stop")
 LABELS = ("runner", "model", "effort", "tier", "kind", "auth_mode", "atom", "ab", "ab_side")
@@ -523,7 +524,7 @@ def earlier(argv: list[str]) -> tuple[Callable, list[str]]:
     p.add_argument("step", choices=sorted(STEPS))
     p.add_argument("settings", nargs="*", metavar="KEY=VALUE", help="override one setting of the step")
     args = p.parse_args(argv)
-    if not (row := state.run_get(args.run)):
+    if not (row := run_store.run_get(args.run)):
         raise SystemExit(f"no run {args.run}")
     if not (path := str(first(run_lines.read(args.run), "task").get("path") or "")):
         raise SystemExit(f"run {args.run} did not run from a script in adws/; use arete run")
