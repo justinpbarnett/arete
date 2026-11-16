@@ -432,7 +432,7 @@ def restore(source: Path) -> str:
             recover_restore()
             if pending_restore():
                 raise Refused("previous restore needs normal serve startup completion")
-            beat = util.read_json(control.BEAT_FILE, {})
+            beat = control.database_beat()
             if util.pid_alive(beat.get("pid")):
                 raise Refused(f"arete serve pid {beat.get('pid')} is running; {stop_hint()}")
             current = probe_current()

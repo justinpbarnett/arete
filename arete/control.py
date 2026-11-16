@@ -135,6 +135,10 @@ def stop_run(run_id: str) -> dict:
     return {"id": run_id, "stopped": True, "pid": pid}
 
 
+def database_beat() -> dict:
+    return util.read_json(paths.DB_FILE.with_name(BEAT_FILE.name), {})
+
+
 def serve_beat() -> dict:
     data = util.read_json(BEAT_FILE, {})
     if data.get("at"):
