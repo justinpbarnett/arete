@@ -23,6 +23,7 @@ from . import (
     browser,
     ci,
     config,
+    context,
     control,
     devices,
     diffguard,
@@ -348,20 +349,20 @@ class AgentRun:
 
     def through_drops(self, step: str, text: str, cwd: Path, kw: dict, lined: bool, s: steps.Settings | None,
                       attempt_no: int) -> Result:
+        kw.setdefault("add_dirs", self.add_dirs)
         try:
             with run_lines.beating(self.id, step) if lined else nullcontext():
-                res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+                res = runner.run(text, cwd, trace=(self.id, step), **kw)
                 if res.connection_failed:
                     self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
                     if self.wait_for_network():
                         dropped = res
                         self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                         if res.session.id and res.turns > 1 and kw.get("persist", True):
-                            res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                            res = runner.run(CONTINUE_AFTER_DROP, cwd, trace=(self.id, step),
                                              **{**kw, "resume": res.session, **self.retry_kw()})
                         else:
-                            res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
-                                             **{**kw, **self.retry_kw()})
+                            res = runner.run(text, cwd, trace=(self.id, step), **{**kw, **self.retry_kw()})
                         res = runner.with_spent(res, [dropped])
             return res
         finally:
@@ -438,14 +439,11 @@ class Run(AgentRun):
             return super().agent(step, text, cwd, role, **kw)
         due = self.due_for(step)
         if due:
-            which = self.settings(role).runner if role else routing.chosen(
-                kw.get("model", ""), kw.get("runner", ""), kw.get("cfg") or self.config)[0]
-            text, kw = self.with_answers(due, text, kw, which)
+            text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
         if due and kw["resume"].id and not res.ok and owner_asks.session_gone(res.error):
             self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
-            res = super().agent(step, kw["fresh_prompt"](res.runner), cwd, role, ask_owner=True,
-                                **{**kw, "resume": NO_SESSION})
+            res = super().agent(step, text, cwd, role, ask_owner=True, **{**kw, "resume": NO_SESSION})
         if due and res.ok:
             asks_store.asks_taken([a["id"] for a in due], self.id)
             self.answers_due = [a for a in self.answers_due if a not in due]
@@ -465,7 +463,7 @@ class Run(AgentRun):
         return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.kept_note, self.base_note)
                            if part)
 
-    def with_answers(self, due: list[dict], text: str, kw: dict, which: str = "") -> tuple[str, dict]:
+    def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
         previous = kw.get("fresh_prompt")
 
@@ -478,7 +476,7 @@ class Run(AgentRun):
                      self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
             return message, {**options, "resume": session}
-        return fresh_prompt(which), {**options, "resume": NO_SESSION}
+        return self.fresh_text(text, due), {**options, "resume": NO_SESSION}
 
     def moved_folder_note(self, asking_run: str) -> str:
         if not asking_run or asking_run == self.id:
@@ -902,30 +900,30 @@ class Build(TicketWork):
         saved = self.run.sessions.get("build", NO_SESSION)
         settings = self.run.settings(role)
         feedback = text
+        base_dirs = tuple(self.run.add_dirs)
+        call_dirs = list(base_dirs)
 
-        def switched(which: str) -> str:
+        def primed(which: str) -> str:
             plan = self.run.dir / "plan.md"
             previous = util.read_json(self.run.dir / "build.json", {})
-            transition = (f"The builder changed from {saved.runner} to {which}." if saved.id and saved.runner != which
-                          else "This repair starts with a fresh context.")
-            context = (f"{transition} Continue the existing work in {self.ws}; inspect its current diff before editing.\n\n"
-                       f"## Issue {self.ticket.ref}: {self.ticket.title}\n\n{self.ticket.body}\n\n"
-                       f"{self.ticket.comments}\n\n{self.attachments}\n\n## Saved plan\n\n"
-                       f"{self.plan_text or (plan.read_text() if plan.exists() else '')}\n\n"
-                       f"## Earlier builder summary\n\n{self.build_summary or previous.get('text', '')}\n\n"
-                       "Keep the current task's tool restrictions and never write git metadata or secret files.")
-            return prompt_loader.task_prompt(f"{context}\n\n## Current feedback\n\n{feedback}")
+            task = (f"# Issue {self.ticket.ref}: {self.ticket.title}\n\n{self.ticket.body}\n\n"
+                    f"## Owner comments\n\n{self.ticket.comments or ''}\n\n"
+                    f"## Attachments\n\n{self.attachments}\n\n"
+                    f"## Left for a person\n\n{self.left_for_a_person}\n")
+            prompt, folder = context.builder_handoff(
+                self.run.dir, run_id=self.run.id, step=step, runner=which,
+                previous={"runner": saved.runner, "id": saved.id}, workspace=self.ws, roots=self.git_dirs,
+                task=task, plan=self.plan_text or (plan.read_text() if plan.exists() else ""),
+                summary=self.build_summary or previous.get("text", ""), feedback=feedback, checks=self.check_commands,
+                secret_files=runner.secret_files(self.git_dirs or [self.ws], devices.LOCAL, self.cfg))
+            call_dirs[:] = [*base_dirs, folder]
+            return prompt_loader.task_prompt(prompt)
 
         text = prompt_loader.task_prompt(text)
-        if saved.id and saved.runner != settings.runner and settings.explicit_route:
+        if settings.session == "fresh" or (saved.id and saved.runner != settings.runner and settings.explicit_route):
             kw["resume"] = NO_SESSION
-            text = switched(settings.runner)
-        elif saved.id and settings.session == "resume":
-            kw["fresh_prompt"] = switched
-        else:
-            text = switched(settings.runner)
         return self.run.agent(step, text, self.ws, role=role, allowed_tools=self.tools,
-                              disallowed_tools=routing.NO_GIT_WRITES, **kw)
+                              disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False) -> bool:
         selected = selected_checks(self.layer, self.restage().files) if quick else None

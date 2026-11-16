@@ -17,6 +17,7 @@ from . import (
     claude,
     codex,
     config,
+    context,
     devices,
     environment,
     guard,
@@ -217,7 +218,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                               error=" ".join(f"{NO_ROUTE}: {route_reasons(skipped)}".split()))
         on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
                    "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
-        text = fresh_prompt(which) if fresh_prompt and resume.id and not kept.id else prompt
+        text = fresh_prompt(which) if fresh_prompt and not kept.id else prompt
         if remaining_tokens:
             kw = {**kw, "max_tokens": remaining_tokens()}
         return attempt(which, name, text, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
@@ -599,11 +600,13 @@ def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[
     usable = saved.id and saved.runner == which and (
         not saved.account or saved.account == account_of(picked.auth)
         or devices_store.refresh_continues(saved.generation, picked.auth.generation))
-    fresh = fresh_prompt(which) if fresh_prompt and saved.id else prompt
-    if previous is None:
-        return (prompt, saved) if usable else (fresh, NO_SESSION)
-    if continues(previous, picked, kw.get("persist", True)):
+    if previous is None and usable:
+        return prompt, saved
+    if previous is not None and continues(previous, picked, kw.get("persist", True)):
         return CONTINUE_AFTER_LIMIT, previous.res.session
+    fresh = fresh_prompt(which) if fresh_prompt else prompt
+    if previous is None:
+        return fresh, NO_SESSION
     stopped = previous.res
     last = (record.last_message(paths.record_dir(record_id) / stopped.record, claude.USAGE_LIMIT_TEXT)
             if stopped.record else "") or stopped.text
@@ -751,6 +754,9 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "budget_tokens": kw.get("max_tokens"), "refused": kw.get("budget_error", ""),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
+    header["context"] = context.inventory(
+        prompt, kw.get("system", ""), kw.get("json_schema"), resumed=bool(resume.id),
+        instructions=kw.get("instructions"), allowed_tools=kw.get("allowed_tools"), mcp_servers=header["mcp_servers"])
     if atom:
         header["atom"] = atom
     if route.get("selection"):
