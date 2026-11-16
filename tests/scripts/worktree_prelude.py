@@ -6,10 +6,10 @@ import threading
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
-from arete import config, loop_run, paths, pipeline, replay, scratch, util
+from arete import config, loop_run, paths, pipeline, replay, sandbox, util
 
 root = Path(sys.argv[1])
-scratch.AUTHORITY = root / 'authority-parent' / 'verification-authority'
+sandbox.AUTHORITY = root / 'authority-parent' / 'verification-authority'
 replay.sample(root / 'sample')
 src = root / 'sample' / 'repo'
 repo = config.Repo('replay-sample', src, layer=root / 'sample' / 'layer')
