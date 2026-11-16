@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import NamedTuple, TextIO
+from typing import TextIO
 
 from . import (
     alerts,
@@ -32,6 +32,7 @@ from . import (
     gh,
     intake,
     jev,
+    learning,
     outbound,
     owner_asks,
     paths,
@@ -121,20 +122,8 @@ PLAN_SCHEMA = {
     },
     "required": ["plan", "ambiguous", "risk", "estimated_lines", "verify"],
 }
-LEARN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "expertise": {"type": "string"},
-        "added": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-        "removed": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"lesson": {"type": "string"}, "why": {"type": "string"}},
-            "required": ["lesson", "why"],
-        }},
-    },
-    "required": ["expertise", "added", "removed"],
-}
-EXPERTISE_MAX_LINES = 80
+LEARN_SCHEMA = learning.SCHEMA
+EXPERTISE_MAX_LINES = learning.MAX_LINES
 REVISE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -447,13 +436,15 @@ class Run(AgentRun):
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
-        due, plain = self.due_for(step), text
+        due = self.due_for(step)
         if due:
-            text, kw = self.with_answers(due, text, kw)
+            which = self.settings(role).runner if role else routing.chosen(
+                kw.get("model", ""), kw.get("runner", ""), kw.get("cfg") or self.config)[0]
+            text, kw = self.with_answers(due, text, kw, which)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
         if due and kw["resume"].id and not res.ok and owner_asks.session_gone(res.error):
             self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
-            res = super().agent(step, self.fresh_text(plain, due), cwd, role, ask_owner=True,
+            res = super().agent(step, kw["fresh_prompt"](res.runner), cwd, role, ask_owner=True,
                                 **{**kw, "resume": NO_SESSION})
         if due and res.ok:
             asks_store.asks_taken([a["id"] for a in due], self.id)
@@ -474,15 +465,20 @@ class Run(AgentRun):
         return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.kept_note, self.base_note)
                            if part)
 
-    def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
+    def with_answers(self, due: list[dict], text: str, kw: dict, which: str = "") -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
-        fresh = self.fresh_text(text, due)
+        previous = kw.get("fresh_prompt")
+
+        def fresh_prompt(target: str) -> str:
+            return self.fresh_text(previous(target) if previous else text, due)
+
+        options = {**kw, "fresh_prompt": fresh_prompt}
         if session.id and kw.get("persist", True):
             parts = (owner_asks.answers_message(due), self.kept_note, self.base_note,
                      self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
-            return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
-        return fresh, {**kw, "resume": NO_SESSION}
+            return message, {**options, "resume": session}
+        return fresh_prompt(which), {**options, "resume": NO_SESSION}
 
     def moved_folder_note(self, asking_run: str) -> str:
         if not asking_run or asking_run == self.id:
@@ -905,25 +901,28 @@ class Build(TicketWork):
     def resume(self, step: str, text: str, role: str = "build", **kw) -> Result:
         saved = self.run.sessions.get("build", NO_SESSION)
         settings = self.run.settings(role)
+        feedback = text
 
         def switched(which: str) -> str:
             plan = self.run.dir / "plan.md"
             previous = util.read_json(self.run.dir / "build.json", {})
-            context = (f"The builder changed from {saved.runner} to {which}. Continue the existing work "
-                       f"in {self.ws}; inspect its current diff before editing.\n\n"
+            transition = (f"The builder changed from {saved.runner} to {which}." if saved.id and saved.runner != which
+                          else "This repair starts with a fresh context.")
+            context = (f"{transition} Continue the existing work in {self.ws}; inspect its current diff before editing.\n\n"
                        f"## Issue {self.ticket.ref}: {self.ticket.title}\n\n{self.ticket.body}\n\n"
-                       f"{self.ticket.comments}\n\n## Saved plan\n\n"
+                       f"{self.ticket.comments}\n\n{self.attachments}\n\n## Saved plan\n\n"
                        f"{self.plan_text or (plan.read_text() if plan.exists() else '')}\n\n"
                        f"## Earlier builder summary\n\n{self.build_summary or previous.get('text', '')}\n\n"
                        "Keep the current task's tool restrictions and never write git metadata or secret files.")
-            return f"{context}\n\n## Current feedback\n\n{text}"
+            return prompt_loader.task_prompt(f"{context}\n\n## Current feedback\n\n{feedback}")
 
+        text = prompt_loader.task_prompt(text)
         if saved.id and saved.runner != settings.runner and settings.explicit_route:
             kw["resume"] = NO_SESSION
             text = switched(settings.runner)
         elif saved.id and settings.session == "resume":
             kw["fresh_prompt"] = switched
-        elif saved.id and saved.runner != settings.runner:
+        else:
             text = switched(settings.runner)
         return self.run.agent(step, text, self.ws, role=role, allowed_tools=self.tools,
                               disallowed_tools=routing.NO_GIT_WRITES, **kw)
@@ -2790,11 +2789,7 @@ def cut_at_end(text: str, limit: int) -> str:
     return head[:at].rstrip() + CUT_MARK
 
 
-class Learned(NamedTuple):
-    rewrite: str
-    report: str
-    added: int
-    removed: int
+Learned = learning.Rewrite
 
 
 def layer_lock(layer_dir: Path) -> str:
@@ -2811,18 +2806,11 @@ def learned(run: AgentRun, wt: Path, title: str, expertise: str, call: str, **kw
                                   max_lines=EXPERTISE_MAX_LINES),
                     wt, role="learn", json_schema=LEARN_SCHEMA, persist=False, **kw)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
-    rewrite = found.get("expertise", "").strip()
-    line_count = len(rewrite.splitlines())
-    if not rewrite:
-        run.log("learn: no expertise file came back, kept the old one")
+    try:
+        return learning.parse(found, expertise)
+    except (TypeError, ValueError) as error:
+        run.log(f"learn: {error}; kept the old file")
         return None
-    if line_count > EXPERTISE_MAX_LINES:
-        run.log(f"learn: the rewrite has {line_count} lines, over the {EXPERTISE_MAX_LINES} line cap; kept the old file")
-        return None
-    added = [a.strip() for a in found.get("added", []) if a.strip()]
-    removed = [r for r in found.get("removed", []) if r.get("lesson", "").strip()]
-    report = "\n".join([f"+ {a}" for a in added] + [f"- {r['lesson']} ({r['why']})" for r in removed])
-    return Learned(rewrite, report, len(added), len(removed))
 
 
 def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, apply: bool) -> str:

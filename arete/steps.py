@@ -22,7 +22,7 @@ MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
 KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "research_search", "research_synthesis",
                     "research_audit", "document", "capture_evidence")
-READ_ONLY = ("research_plan", "research_search", "research_synthesis", "research_audit", "document",
+READ_ONLY = ("learn", "research_plan", "research_search", "research_synthesis", "research_audit", "document",
              "capture_evidence")
 SEARCHES = ("research_search",)
 FETCHES = ("research_audit",)

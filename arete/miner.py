@@ -573,7 +573,11 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
             return f"{f} is a new prompt, and the pipeline runs only the prompts its code names"
         if status == "D":
             return f"{f} is deleted, and the pipeline still loads it"
-        before, after = placeholders(git(["show", f"HEAD:{f}"], wt)), placeholders((wt / f).read_text())
+        before = placeholders(git(["show", f"HEAD:{f}"], wt))
+        try:
+            after = set(prompt_loader.parse_template(f, (wt / f).read_text()).get_identifiers())
+        except ValueError as error:
+            return str(error)
         if before != after:
             changes = [f"{verb} {', '.join(f'`${n}`' for n in sorted(names))}"
                        for verb, names in (("drops", before - after), ("adds", after - before)) if names]
