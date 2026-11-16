@@ -124,7 +124,7 @@ def contract_blockers(conn, n):
         with record.dead(row) as gone:
             if not gone:
                 blockers.append(row["id"])
-    beat = util.read_json(control.BEAT_FILE, {})
+    beat = control.database_beat()
     if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
         blockers.append(f"serve {beat.get('pid')}")
     return blockers
