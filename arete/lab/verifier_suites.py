@@ -12,7 +12,7 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import (
+from .. import (
     browser,
     config,
     devices,
@@ -29,8 +29,8 @@ from . import (
     verify,
     workspace,
 )
-from .agent import REPLAY, Result
-from .pipeline import AgentRun, TicketWork, use_product
+from ..agent import REPLAY, Result
+from ..pipeline import AgentRun, TicketWork, use_product
 
 NAME = re.compile(r"[A-Za-z0-9_-]+")
 RESERVED = ("record", "scratch")

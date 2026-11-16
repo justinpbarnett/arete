@@ -15,7 +15,7 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import TextIO
 
-from . import (
+from .. import (
     config,
     evals,
     paths,
@@ -32,9 +32,9 @@ from . import (
     util,
     workspace,
 )
-from .agent import traits_of
-from .diffguard import denied_paths
-from .util import engine_commit
+from ..agent import traits_of
+from ..diffguard import denied_paths
+from ..util import engine_commit
 
 ATOMS = ("plan", "build", "check_repair")
 FIXED_GRADERS = ("verify", "eval_grade")

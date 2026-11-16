@@ -9,7 +9,7 @@ import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import config, environment, jev, paths, research, triage, util
+from .. import config, environment, jev, paths, research, triage, util
 
 DUPLICATE_ASK = ("Is this new finding the same problem as the known finding, even when it is worded differently or "
                  "found at another time?")

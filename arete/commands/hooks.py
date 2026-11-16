@@ -187,7 +187,7 @@ def cmd_ask(args) -> int:
 
 def cmd_jev(args) -> int:
     if args.action != "report":
-        from .. import calibrate
+        from ..lab import calibrate
 
         return calibrate.main(args)
 

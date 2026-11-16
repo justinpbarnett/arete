@@ -1,7 +1,8 @@
 
 import contextlib, io, json, os, shutil, sqlite3, sys
 from pathlib import Path
-from arete import board, codebase, config, evals, experiment, optimize, paths, sandbox, scratch, state, util
+from arete import board, codebase, config, evals, paths, sandbox, scratch, state, util
+from arete.lab import experiment, optimize
 root = Path(sys.argv[1])
 probe = [sys.executable, "-V"]
 if sandbox.protected_command(probe) != probe:

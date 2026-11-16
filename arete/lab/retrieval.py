@@ -11,8 +11,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import codebase, config, environment, evals, paths, pipeline, record, replay, routing, runner, util
-from .agent import REPLAY
+from .. import codebase, config, environment, evals, paths, pipeline, record, replay, routing, runner, util
+from ..agent import REPLAY
 
 SPLITS = ("train", "validation", "holdout")
 KINDS = ("embedding", "rerank")

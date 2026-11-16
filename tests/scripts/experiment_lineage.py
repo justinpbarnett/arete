@@ -2,7 +2,8 @@
 import contextlib, importlib.util, io, json, shutil, sys
 from pathlib import Path
 from unittest import mock
-from arete import cli, evals, experiment, optimize, paths, record, state, util
+from arete import cli, evals, paths, record, state, util
+from arete.lab import experiment, optimize
 root, mode = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 if importlib.util.find_spec("arete.scratch"):

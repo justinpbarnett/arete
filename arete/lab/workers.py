@@ -7,22 +7,9 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import (
-    config,
-    evals,
-    experiment,
-    implbench,
-    paths,
-    pipeline,
-    record,
-    replay,
-    routing,
-    runner,
-    steps,
-    util,
-    workspace,
-)
-from .agent import Result, traits_of
+from .. import config, evals, paths, pipeline, record, replay, routing, runner, steps, util, workspace
+from ..agent import Result, traits_of
+from . import experiment, implbench
 
 KINDS = ("patch", "test", "explore", "extract")
 RULES = ("unchanged_patch", "same_failure", "either")

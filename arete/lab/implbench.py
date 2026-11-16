@@ -11,8 +11,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import eval_mine, evals, experiment, paths, pipeline, record, replay, routing, steps, util, workspace
-from .agent import REPLAY, traits_of
+from .. import eval_mine, evals, paths, pipeline, record, replay, routing, steps, util, workspace
+from ..agent import REPLAY, traits_of
+from . import experiment
 
 GROUPS = ("ordinary", "difficult")
 DECIDES = "holdout"

@@ -1,7 +1,8 @@
 
 import contextlib, importlib.util, io, json, os, sys
 from pathlib import Path
-from arete import cli, experiment, paths, record, state, workers
+from arete import cli, paths, record, state
+from arete.lab import experiment, workers
 root, mode = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 if importlib.util.find_spec("arete.scratch"):

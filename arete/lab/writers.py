@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
 
-from . import config, document, paths, record, replay, steps, util
+from .. import config, document, paths, record, replay, steps, util
 
 KINDS = ("message", "ticket", "doc")
 MIN_CASES, MAX_CASES = 15, 20

@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import accounts, config, devices, outbound, pi, util
+from .. import accounts, config, devices, outbound, pi, util
 
 SCENARIOS = ("ok", "oom", "overflow", "malformed", "offline")
 SERVED = ("ok", "oom", "overflow", "malformed")
