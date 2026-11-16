@@ -719,7 +719,7 @@ def tell_chats() -> int:
     return sum(state.chat_tell_session(link["run_id"], ended_message(link)) for link in state.chat_sessions_untold())
 
 
-def views(limit: int = 30, connect=state.db) -> list[dict]:
+def views(limit: int = 30, connect=state.reader) -> list[dict]:
     out = []
     rows = state.runs(kind="session", limit=limit, connect=connect)
     paid = state.paid_by_run([r["id"] for r in rows], connect)

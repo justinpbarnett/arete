@@ -255,6 +255,9 @@ class Handler(BaseHTTPRequestHandler):
             rest = route_rest(template, path) if verb == method else None
             if rest is not None:
                 try:
+                    if method == "GET":
+                        with state.one_read():
+                            return route(self, rest, query)
                     return route(self, rest, query)
                 except NoRoute:
                     break

@@ -236,6 +236,15 @@ def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=
                 timing.finished()
 
 
+def read_connection():
+    try:
+        return paths.connect_db(paths.DB_FILE, readonly=True)
+    except (sqlite3.OperationalError, FileNotFoundError):
+        if not paths.DB_FILE.exists():
+            raise missing_database() from None
+        raise
+
+
 @contextmanager
 def owned(mode):
     active = getattr(_OWNER, "active", None)
@@ -246,7 +255,7 @@ def owned(mode):
         yield conn
         return
     timing = dbstats.Timing(paths.DB_FILE, mode)
-    connect = checked_connection if mode == "write" else lambda: paths.connect_db(paths.DB_FILE, readonly=True)
+    connect = checked_connection if mode == "write" else read_connection
     try:
         with owning_transaction(connect, "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
                                 commit=mode == "write") as conn:
@@ -268,6 +277,12 @@ db = tx
 @contextmanager
 def one_read():
     with owned("read") as conn:
+        yield conn
+
+
+@contextmanager
+def reader():
+    with one_read() as conn:
         yield conn
 
 
@@ -319,7 +334,7 @@ def backfill_legacy_cost(before: dict | None = None) -> int:
         return c.execute("SELECT changes()").fetchone()[0]
 
 
-def cost_drift(connect=db) -> list[dict]:
+def cost_drift(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("""
             SELECT runs.id, COALESCE(runs.cost_usd, 0) AS run_usd,
@@ -332,17 +347,11 @@ def cost_drift(connect=db) -> list[dict]:
         """)]
 
 
-@contextmanager
-def reader():
-    with one_read() as conn:
-        yield conn
-
-
 FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
            "AND COALESCE(runs.cost_usd, 0) = 0)")
 
 
-def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=db, loop: str | None = None,
+def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=reader, loop: str | None = None,
          firings: bool = False, statuses: tuple[str, ...] = (), running_first: bool = False) -> list[dict]:
     q, args = "SELECT * FROM runs WHERE 1=1", []
     if not firings:
@@ -360,14 +369,14 @@ def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, conn
         return [dict(r) for r in c.execute(q, args)]
 
 
-def run_facets(connect=db) -> dict[str, list[str]]:
+def run_facets(connect=reader) -> dict[str, list[str]]:
     with connect() as c:
         return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "
                                                  f"AND COALESCE({column}, '') != '' ORDER BY 1")]
                 for column in ("kind", "repo", "loop")}
 
 
-def paid_by_run(run_ids: list[str], connect=db, local_providers=None) -> dict[str, float]:
+def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dict[str, float]:
     if not run_ids:
         return {}
     if local_providers is None:
@@ -384,32 +393,32 @@ def paid_by_run(run_ids: list[str], connect=db, local_providers=None) -> dict[st
     return {k: round(v, 6) for k, v in paid.items()}
 
 
-def merged_runs(connect=db) -> list[dict]:
+def merged_runs(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute(
             f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "
             "AND COALESCE(pr_url, '') != '' ORDER BY finished, id")]
 
 
-def source_seen(source: str, connect=db) -> set[str]:
+def source_seen(source: str, connect=reader) -> set[str]:
     with connect() as c:
         return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
 
 
-def runs_since(since: str, connect=db) -> list[dict]:
+def runs_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
 
 
 def runs_reading_pr_comments(rejected_since: str, limit: int = 200) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND pr_url != '' "
                                            f"AND ({OPEN_PR_RUN} OR (status = 'rejected' AND finished >= ?)) "
                                            "ORDER BY started DESC LIMIT ?", (rejected_since, limit))]
 
 
 def open_runs(repo: str, issue: int | str) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "
                                            "ORDER BY started DESC", (repo, issue))]
 
@@ -423,7 +432,7 @@ def loop_lock(name: str) -> str:
     return "loop-" + name.replace("/", ".")
 
 
-def run_get(run_id: str, connect=db) -> dict | None:
+def run_get(run_id: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(r) if r else None
@@ -435,7 +444,7 @@ def save_report(run_id: str, report: dict, connect=db) -> None:
                   (run_id, util.iso(), json.dumps(report)))
 
 
-def report(run_id: str, connect=db) -> dict | None:
+def report(run_id: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT report FROM reports WHERE run_id = ?", (run_id,)).fetchone()
     try:
@@ -445,17 +454,17 @@ def report(run_id: str, connect=db) -> dict | None:
     return found if isinstance(found, dict) else None
 
 
-def steps(run_id: str, connect=db) -> list[dict]:
+def steps(run_id: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
 
 
 def step_tries(run_id: str, step: str) -> int:
-    with db() as c:
+    with reader() as c:
         return c.execute("SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
 
 
-def steps_since(since: str, connect=db) -> list[dict]:
+def steps_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
         rows = [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind AS run_kind, r.repo FROM steps "
                                            "LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? "
@@ -473,13 +482,13 @@ def insert_feed(run_id: str, kind: str, text: str) -> None:
                   (run_id, util.iso(), kind, util.both_ends(text, 4000)))
 
 
-def feed(run_id: str, after: int = 0, connect=db) -> list[dict]:
+def feed(run_id: str, after: int = 0, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM feed WHERE run_id = ? AND id > ? ORDER BY id",
                                            (run_id, after))]
 
 
-def loop_state(name: str, connect=db) -> dict:
+def loop_state(name: str, connect=reader) -> dict:
     with connect() as c:
         r = c.execute("SELECT * FROM loop_state WHERE loop = ?", (name,)).fetchone()
     if not r:
@@ -487,12 +496,12 @@ def loop_state(name: str, connect=db) -> dict:
     return {**dict(r), "data": json.loads(r["data"] or "{}")}
 
 
-def loop_states(connect=db) -> dict[str, dict]:
+def loop_states(connect=reader) -> dict[str, dict]:
     with connect() as c:
         return {r["loop"]: {**dict(r), "data": json.loads(r["data"] or "{}")} for r in c.execute("SELECT * FROM loop_state")}
 
 
-def loop_marks(connect=db) -> dict[str, dict]:
+def loop_marks(connect=reader) -> dict[str, dict]:
     with connect() as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM loop_state")]
     return {r["loop"]: {"ts": r["mark_at"], "ok": bool(r.get("mark_ok")), "detail": r.get("mark_detail") or ""}
@@ -510,7 +519,7 @@ def set_loop_state(name: str, **fields) -> None:
 
 
 def finding_seen(loop: str, fingerprint: str) -> bool:
-    with db() as c:
+    with reader() as c:
         return c.execute("SELECT 1 FROM findings WHERE loop = ? AND fingerprint = ?", (loop, fingerprint)).fetchone() \
             is not None
 
@@ -542,7 +551,7 @@ def set_finding_url(loop: str, fingerprint: str, url: str) -> None:
         c.execute("UPDATE findings SET url = ? WHERE loop = ? AND fingerprint = ?", (url, loop, fingerprint))
 
 
-def findings(loop: str, limit: int = 50, connect=db) -> list[dict]:
+def findings(loop: str, limit: int = 50, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM findings WHERE loop = ? ORDER BY last_seen DESC LIMIT ?",
                                            (loop, limit))]
@@ -550,10 +559,10 @@ def findings(loop: str, limit: int = 50, connect=db) -> list[dict]:
 
 def add_event(loop: str, e: dict, connect=db) -> int:
     with connect() as c:
-        cur = c.execute("INSERT INTO events (loop, type, source, key, repo, title, url, trust, data, ts) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        cur = c.execute("INSERT INTO events (loop, type, source, key, repo, title, url, trust, ts) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
                         (loop, e.get("type"), e.get("source"), str(e.get("key")), e.get("repo"), e.get("title"),
-                         e.get("url"), e.get("trust"), json.dumps(e.get("data") or {}, default=str)[:20000], util.iso()))
+                         e.get("url"), e.get("trust"), util.iso()))
         return cur.lastrowid
 
 
@@ -568,7 +577,7 @@ def forget_seen(source: str, key: str, before, connect=db) -> None:
         c.execute("DELETE FROM seen WHERE source = ? AND key = ? AND ts < ?", (source, key, util.iso(before)))
 
 
-def cursor(source: str, connect=db) -> dict | None:
+def cursor(source: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
         return dict(r) if r else None
@@ -591,7 +600,7 @@ def adopt_source(old: str, new: str) -> None:
 
 
 def source_owner(source: str) -> str | None:
-    with db() as c:
+    with reader() as c:
         r = c.execute("SELECT fingerprint FROM source_owners WHERE source = ?", (source,)).fetchone()
         return r[0] if r else None
 
@@ -601,7 +610,7 @@ def set_source_owner(source: str, fingerprint: str, connect=db) -> None:
         c.execute("INSERT OR REPLACE INTO source_owners (source, fingerprint) VALUES (?,?)", (source, fingerprint))
 
 
-def cursors(connect=db) -> list[dict]:
+def cursors(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM cursors ORDER BY source")]
 
@@ -616,13 +625,13 @@ def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None 
         return cur.lastrowid
 
 
-def pending(connect=db) -> list[dict]:
+def pending(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM queue WHERE run_id IS NULL ORDER BY id")]
 
 
 def queue_item(item_id: int) -> dict | None:
-    with db() as c:
+    with reader() as c:
         r = c.execute("SELECT * FROM queue WHERE id = ?", (item_id,)).fetchone()
     return {**dict(r), "payload": json.loads(r["payload"] or "[]")} if r else None
 
@@ -678,7 +687,7 @@ def release_settled_claims() -> None:
                          row["summary"] or f"run {row['run_id']} {row['status'] or 'is missing'}")
 
 
-def dead_items(connect=db) -> list[dict]:
+def dead_items(connect=reader) -> list[dict]:
     with connect() as c:
         return [{**{k: row[k] for k in ("id", "loop", "run_id", "dead_reason", "dead_at")},
                  "events": len(json.loads(row["payload"] or "[]"))}
@@ -791,20 +800,20 @@ def add_incident_note(incident_id: int, note: str) -> None:
 
 
 def open_incidents(limit: int = 500) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' "
                                            "ORDER BY last_seen DESC, id DESC LIMIT ?", (limit,))]
 
 
 def incidents_to_decide() -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute(
             "SELECT * FROM incidents WHERE state = 'open' AND injection = 0 AND class != 'expected' "
             "AND decision IN ('', 'ignore') ORDER BY id")]
 
 
 def known_fingerprints() -> dict[str, dict]:
-    with db() as c:
+    with reader() as c:
         held = {r[0]: {"source": r[1], "repo": r[2], "policies": r[3]} for r in c.execute(
             "SELECT a.fingerprint, i.source, i.repo, i.policies FROM incident_aliases a JOIN incidents i "
             "ON i.id = a.incident WHERE i.state = 'open'")}
@@ -826,13 +835,13 @@ def update_incident(incident_id: int, note: str = "", **fields) -> None:
 
 
 def woken_incidents() -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' AND decision = 'wake' "
                                            "AND injection = 0 ORDER BY id")]
 
 
 def closed_alerted() -> list[int]:
-    with db() as c:
+    with reader() as c:
         return [r[0] for r in c.execute("SELECT id FROM incidents WHERE alerted = 1 AND state != 'open' ORDER BY id")]
 
 
@@ -848,7 +857,7 @@ def set_repair(repair_id: int, **fields) -> None:
                   (*fields.values(), repair_id))
 
 
-def incident_repairs(connect=db) -> list[dict]:
+def incident_repairs(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM incident_repairs ORDER BY id")]
 
@@ -857,20 +866,20 @@ def parsed(row: dict) -> dict:
     return {**row, "answers": json.loads(row["answers"] or "{}")}
 
 
-def incidents(connect=db, limit: int = 200, open_first: bool = False) -> list[dict]:
+def incidents(connect=reader, limit: int = 200, open_first: bool = False) -> list[dict]:
     order = "state != 'open', " if open_first else ""
     with connect() as c:
         return [parsed(dict(r)) for r in c.execute(f"SELECT * FROM incidents ORDER BY {order}last_seen DESC, id DESC "
                                                    "LIMIT ?", (limit,))]
 
 
-def blocked_incidents(connect=db) -> list[dict]:
+def blocked_incidents(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT id, class, source, signature, waiting, last_seen FROM incidents "
                                            "WHERE state = 'open' AND phase = 'blocked' ORDER BY id")]
 
 
-def incident(incident_id: int, connect=db, last_notes: int = 0) -> dict | None:
+def incident(incident_id: int, connect=reader, last_notes: int = 0) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
         if not r:
@@ -894,7 +903,7 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str =
         return cur.lastrowid
 
 
-def approvals(connect=db) -> list[dict]:
+def approvals(connect=reader) -> list[dict]:
     with connect() as c:
         return [approval_of(r) for r in c.execute("SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "
                                                  "LEFT JOIN runs r ON r.id = a.run_id "
@@ -913,7 +922,7 @@ def set_approval_note(approval_id: int, note: str, value: str, while_in: tuple[s
 
 
 def approval(approval_id: int) -> dict | None:
-    with db() as c:
+    with reader() as c:
         r = c.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
     return approval_of(r) if r else None
 
@@ -941,7 +950,7 @@ def renew_claim(approval_id: int, token: str, until: str) -> bool:
 
 
 def lapsed_claims() -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute("SELECT id, claimed_by, claimed_until FROM approvals "
                                            "WHERE status = 'approved' AND claimed_until < ? ORDER BY id", (util.iso(),))]
 
@@ -991,7 +1000,7 @@ def set_verdict_sha(run_id: str, sha: str) -> None:
                   (sha, run_id))
 
 
-def verdicts_since(since: str, connect=db) -> list[dict]:
+def verdicts_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [{**dict(r), "answers": json.loads(r["answers"] or "{}")}
                 for r in c.execute("SELECT * FROM verdicts WHERE at >= ? ORDER BY at", (since,))]
@@ -1022,18 +1031,18 @@ def chat_add(project: str) -> int:
 
 
 def chat_get(chat_id: int) -> dict | None:
-    with db() as c:
+    with reader() as c:
         r = c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats WHERE id = ?", (chat_id,)).fetchone()
         return dict(r) if r else None
 
 
 def chats() -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats ORDER BY created DESC, id DESC")]
 
 
 def chat_messages(chat_id: int) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute("SELECT id, sender, text, cost, paid_usd, ts FROM chat_messages WHERE chat_id = ? "
                                            "ORDER BY id", (chat_id,))]
 
@@ -1074,7 +1083,7 @@ def chat_link_session(chat_id: int, run_id: str, budget_usd: float | None) -> No
                   (run_id, chat_id, budget_usd, util.iso()))
 
 
-def chat_sessions(chat_id: int | None = None, connect=db) -> list[dict]:
+def chat_sessions(chat_id: int | None = None, connect=reader) -> list[dict]:
     where, args = ("WHERE l.chat_id = ?", (chat_id,)) if chat_id is not None else ("", ())
     with connect() as c:
         return [dict(r) for r in c.execute(
@@ -1082,14 +1091,14 @@ def chat_sessions(chat_id: int | None = None, connect=db) -> list[dict]:
             "ORDER BY l.linked DESC, l.rowid DESC", args)]
 
 
-def chat_of_session(run_id: str, connect=db) -> int | None:
+def chat_of_session(run_id: str, connect=reader) -> int | None:
     with connect() as c:
         r = c.execute("SELECT chat_id FROM chat_sessions WHERE run_id = ?", (run_id,)).fetchone()
         return r["chat_id"] if r else None
 
 
 def chat_sessions_untold() -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute(
             f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id "
             "WHERE l.told = '' AND COALESCE(r.status, '') != 'running' ORDER BY l.rowid")]
@@ -1120,13 +1129,13 @@ def chat_drop_draft(chat_id: int, title: str, body: str) -> None:
 
 
 def chat_newest_draft() -> dict | None:
-    with db() as c:
+    with reader() as c:
         r = c.execute("SELECT * FROM chats WHERE draft_title != '' ORDER BY updated DESC, id DESC LIMIT 1").fetchone()
         return dict(r) if r else None
 
 
 def busy_chats() -> list[int]:
-    with db() as c:
+    with reader() as c:
         return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
 
 
@@ -1137,7 +1146,7 @@ def loop_spent_since(since: str, loop: str | None = None, local_providers=()) ->
     if loop:
         q += " AND r.loop = ?"
         args.append(loop)
-    with db() as c:
+    with reader() as c:
         return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args)
                    if billing_of(dict(r), local_providers) == "api_key")
 
@@ -1158,7 +1167,7 @@ def save_hold(c, scope: str, until: str, why: str, ts: str) -> None:
               "THEN excluded.why ELSE holds.why END, ts = max(holds.ts, excluded.ts)", (scope, until, why, ts))
 
 
-def holds(connect=db) -> list[dict]:
+def holds(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM holds WHERE scope NOT LIKE ? "
                                            "AND (until > ? OR until = '') ORDER BY until",
@@ -1201,7 +1210,7 @@ def linked_scopes(scope: str, links: list[tuple[str, str, str, str]]) -> set[str
     return found
 
 
-def refresh_continues(previous: str, latest: str, connect=db) -> bool:
+def refresh_continues(previous: str, latest: str, connect=reader) -> bool:
     if not previous or not latest:
         return False
     if previous == latest:
@@ -1239,7 +1248,7 @@ def pass_over(repo: str, issue: str) -> None:
 
 
 def tickets_passed_over() -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute("SELECT * FROM passed_over ORDER BY since")]
 
 
@@ -1255,7 +1264,7 @@ def drop_passed_over(repo: str, keep: str = "") -> None:
         c.execute("DELETE FROM passed_over WHERE repo = ? AND issue != ?", (repo, str(keep)))
 
 
-def runs_marked_running(connect=db) -> list[dict]:
+def runs_marked_running(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
@@ -1286,13 +1295,13 @@ def note_delete_failed(name: str, connect=db) -> None:
         c.execute("UPDATE vms SET failing_since = COALESCE(failing_since, ?) WHERE name = ?", (util.iso(), name))
 
 
-def vms_of_run(run_id: str, connect=db) -> list[dict]:
+def vms_of_run(run_id: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [{**dict(r), "device": json.loads(r["device"])}
                 for r in c.execute("SELECT * FROM vms WHERE run_id = ? ORDER BY created", (run_id,))]
 
 
-def vms_left_over(probes_created_before: str, connect=db) -> list[dict]:
+def vms_left_over(probes_created_before: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [{**dict(r), "device": json.loads(r["device"])} for r in c.execute(
             "SELECT * FROM vms v WHERE (v.run_id IS NULL AND v.created < ?) OR (v.run_id IS NOT NULL AND NOT EXISTS "
@@ -1300,7 +1309,7 @@ def vms_left_over(probes_created_before: str, connect=db) -> list[dict]:
             (probes_created_before,))]
 
 
-def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db, whole: bool = False) -> list[dict]:
+def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                                            + (f"AND {WHOLE_RUN} " if whole else "")
@@ -1311,13 +1320,13 @@ def newest_whole_run(repo: str, issue: int | str) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True)), None)
 
 
-def ticket_runs_marked_running(repo: str, issue: int | str, connect=db) -> list[dict]:
+def ticket_runs_marked_running(repo: str, issue: int | str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                                            "AND status = 'running' ORDER BY started ASC, rowid ASC", (repo, issue))]
 
 
-def ab_placements(since: str, name: str = "", connect=db) -> list[dict]:
+def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
     with connect() as c:
         labelled = [dict(r) for r in c.execute(
             "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "
@@ -1330,19 +1339,19 @@ def ab_placements(since: str, name: str = "", connect=db) -> list[dict]:
     return list({tuple(p.values()): p for p in labelled + assigned}.values())
 
 
-def ab_held(run_id: str, connect=db) -> dict[str, tuple[str, str, dict]]:
+def ab_held(run_id: str, connect=reader) -> dict[str, tuple[str, str, dict]]:
     with connect() as c:
         row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
     return {role: tuple(held) for role, held in json.loads(row["ab_held"] or "{}").items()} if row else {}
 
 
-def ticket_runs_since(repo: str, issue: int | str, since: str, connect=db) -> list[dict]:
+def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                                            "AND started >= ? ORDER BY started", (repo, issue, since))]
 
 
-def later_run(repo: str, issue: int | str, run_id: str, connect=db) -> dict | None:
+def later_run(repo: str, issue: int | str, run_id: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "
                       "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
@@ -1351,7 +1360,7 @@ def later_run(repo: str, issue: int | str, run_id: str, connect=db) -> dict | No
 
 
 def interrupted_tickets(repo: str) -> list[str]:
-    with db() as c:
+    with reader() as c:
         rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
                          "AND rowid = (SELECT r2.rowid FROM runs r2 WHERE r2.kind = 'pipeline' "
                          "AND r2.repo = runs.repo AND r2.issue = runs.issue AND COALESCE(r2.only_step, '') = '' "
@@ -1361,12 +1370,12 @@ def interrupted_tickets(repo: str) -> list[str]:
 
 
 def last_pipeline_starts() -> dict[str, str]:
-    with db() as c:
+    with reader() as c:
         return {r[0]: r[1] for r in c.execute("SELECT repo, MAX(started) FROM runs WHERE kind = 'pipeline' "
                                               "GROUP BY repo")}
 
 
-def running_run(repo: str, issue: int | str, connect=db) -> dict | None:
+def running_run(repo: str, issue: int | str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "
                       "ORDER BY started DESC, rowid DESC LIMIT 1", (repo, issue)).fetchone()
@@ -1374,7 +1383,7 @@ def running_run(repo: str, issue: int | str, connect=db) -> dict | None:
 
 
 def pending_label(repo: str, issue: int | str) -> str:
-    with db() as c:
+    with reader() as c:
         r = c.execute("SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                       "AND label_pending IS NOT NULL ORDER BY started DESC, rowid DESC LIMIT 1",
                       (repo, issue)).fetchone()
@@ -1382,13 +1391,13 @@ def pending_label(repo: str, issue: int | str) -> str:
 
 
 def issue_running(repo: str, issue: int | str) -> bool:
-    with db() as c:
+    with reader() as c:
         return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status = 'running' LIMIT 1",
                          (repo, issue)).fetchone() is not None
 
 
 def probe_get(name: str) -> dict | None:
-    with db() as c:
+    with reader() as c:
         r = c.execute("SELECT * FROM probes WHERE name = ?", (name,)).fetchone()
         return dict(r) if r else None
 
@@ -1405,7 +1414,7 @@ def probe_set(name: str, ok: bool, detail: str) -> None:
 
 
 def alert_get(key: str) -> dict | None:
-    with db() as c:
+    with reader() as c:
         r = c.execute("SELECT * FROM alerts WHERE key = ?", (key,)).fetchone()
         return dict(r) if r else None
 
@@ -1424,12 +1433,12 @@ def alert_clear(key: str) -> None:
         c.execute("DELETE FROM alerts WHERE key = ?", (key,))
 
 
-def probes(connect=db) -> list[dict]:
+def probes(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM probes ORDER BY name")]
 
 
-def alerts(connect=db) -> list[dict]:
+def alerts(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM alerts ORDER BY opened")]
 
@@ -1469,12 +1478,12 @@ def unpin_record(run_id: str) -> bool:
         return c.execute("DELETE FROM record_pins WHERE run_id = ?", (run_id,)).rowcount > 0
 
 
-def record_pins(connect=db) -> set[str]:
+def record_pins(connect=reader) -> set[str]:
     with connect() as c:
         return {r["run_id"] for r in c.execute("SELECT run_id FROM record_pins")}
 
 
-def runs_cited_by_kept_proposals(run_ids, connect=db) -> set[str]:
+def runs_cited_by_kept_proposals(run_ids, connect=reader) -> set[str]:
     marks = ",".join("?" * len(RELEASING_PROPOSALS))
     with connect() as c:
         rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",
@@ -1482,7 +1491,7 @@ def runs_cited_by_kept_proposals(run_ids, connect=db) -> set[str]:
     return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
 
 
-def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> list[dict]:
+def proposals(status: list[str] | None = None, limit: int = 200, connect=reader) -> list[dict]:
     q, args = "SELECT * FROM proposals", []
     if status:
         q += f" WHERE status IN ({','.join('?' * len(status))})"
@@ -1493,7 +1502,7 @@ def proposals(status: list[str] | None = None, limit: int = 200, connect=db) -> 
         return [dict(r) for r in c.execute(q, args)]
 
 
-def proposal(proposal_id: int, connect=db) -> dict | None:
+def proposal(proposal_id: int, connect=reader) -> dict | None:
     with connect() as c:
         row = c.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
     return dict(row) if row else None
@@ -1534,7 +1543,7 @@ BASELINE_SOURCE = "worktree"
 
 
 def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         rows = c.execute(f"SELECT passed, {', '.join(EVAL_LINEAGE)} FROM evals "
                          "WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
                          (repo, task, source, limit))
@@ -1542,17 +1551,17 @@ def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SO
 
 
 def last_step_id(run_id: str) -> int:
-    with db() as c:
+    with reader() as c:
         return c.execute("SELECT COALESCE(MAX(id), 0) FROM steps WHERE run_id = ?", (run_id,)).fetchone()[0]
 
 
 def eval_rows(run_id: str) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute("SELECT * FROM evals WHERE run_id = ? ORDER BY ts", (run_id,))]
 
 
 def eval_history(repo: str, limit: int = 20) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         rows = c.execute(
             "SELECT run_id, MIN(ts) AS ts, MAX(source) AS source, SUM(passed) AS passed, COUNT(*) AS total,"
             " SUM(cost_usd) AS cost FROM evals WHERE repo = ? GROUP BY run_id ORDER BY ts DESC LIMIT ?",
@@ -1561,7 +1570,7 @@ def eval_history(repo: str, limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def evals_since(since: str, connect=db) -> list[dict]:
+def evals_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM evals WHERE ts >= ? ORDER BY ts", (since,))]
 
@@ -1571,7 +1580,7 @@ FEEDBACK_COLUMNS = ("pr_url", "kind", "gh_id", "repo", "issue", "body", "path", 
 
 
 def feedback_keys(pr_url: str) -> set[tuple[str, int]]:
-    with db() as c:
+    with reader() as c:
         return {(r["kind"], r["gh_id"]) for r in c.execute("SELECT kind, gh_id FROM feedback WHERE pr_url = ?",
                                                            (pr_url,))}
 
@@ -1586,7 +1595,7 @@ def add_feedback(rows: list[dict]) -> int:
 
 
 def feedback_due(repo: str, quiet_since: str) -> list[str]:
-    with db() as c:
+    with reader() as c:
         rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "
                          "WHERE repo = ? AND status = 'new' AND EXISTS (SELECT 1 FROM runs WHERE runs.repo = f.repo "
                          f"AND runs.issue = f.issue AND {OPEN_PR_RUN} "
@@ -1601,7 +1610,7 @@ def close_feedback(pr_url: str, pr_state: str) -> None:
                   "ELSE status END WHERE pr_url = ?", (pr_state, pr_url))
 
 
-def feedback_waiting(connect=db) -> list[dict]:
+def feedback_waiting(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT repo, issue, COUNT(*) AS n, MAX(at_once) AS at_once, "
                                            "MAX(CASE WHEN at_once THEN created END) AS submitted, "
@@ -1612,7 +1621,7 @@ def feedback_waiting(connect=db) -> list[dict]:
 def open_feedback(pr_urls: list[str]) -> list[dict]:
     if not pr_urls:
         return []
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute(
             f"SELECT * FROM feedback WHERE pr_url IN ({','.join('?' * len(pr_urls))}) "
             "AND status IN ('new', 'taken', 'failed') ORDER BY created", pr_urls)]
@@ -1630,14 +1639,14 @@ def settle_feedback(run_id: str, status: str) -> None:
 
 
 def feedback_between(since: str, until: str) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE COALESCE(recorded, created) >= ? "
                                            "AND COALESCE(recorded, created) < ? ORDER BY pr_url, created",
                                            (since, until))]
 
 
 def mined_until() -> str | None:
-    with db() as c:
+    with reader() as c:
         return c.execute("SELECT MAX(mined_until) FROM runs WHERE kind = 'miner'").fetchone()[0]
 
 
@@ -1648,13 +1657,13 @@ def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why:
 
 
 def mined_row(pr_url: str) -> dict:
-    with db() as c:
+    with reader() as c:
         row = c.execute("SELECT * FROM mined WHERE pr_url = ?", (pr_url,)).fetchone()
     return dict(row) if row else {}
 
 
 def mined_urls() -> set[str]:
-    with db() as c:
+    with reader() as c:
         return {r["pr_url"] for r in c.execute("SELECT pr_url FROM mined")}
 
 
@@ -1681,7 +1690,7 @@ def insert_sql(table: str, columns: tuple[str, ...], verb: str = "INSERT") -> st
     return f"{verb} INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})"
 
 
-def triage_rows(connect=db) -> list[dict]:
+def triage_rows(connect=reader) -> list[dict]:
     with connect() as c:
         return [lists_read(dict(r), TRIAGE_LISTS) for r in c.execute("SELECT * FROM triage")]
 
@@ -1711,24 +1720,24 @@ def triage_approve(row: dict, sent_by: str) -> None:
                   lists_written({**row, "ts": util.iso(), "sent_by": sent_by}, APPROVAL_COLUMNS, APPROVAL_LISTS))
 
 
-def triage_approvals(since: str = "", connect=db) -> list[dict]:
+def triage_approvals(since: str = "", connect=reader) -> list[dict]:
     with connect() as c:
         rows = c.execute("SELECT * FROM triage_approvals WHERE ts >= ? ORDER BY ts DESC", (since,))
         return [lists_read(dict(r), APPROVAL_LISTS) for r in rows]
 
 
-def triage_approval(ref: str, connect=db) -> dict | None:
+def triage_approval(ref: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM triage_approvals WHERE ref = ? COLLATE NOCASE", (ref,)).fetchone()
     return lists_read(dict(r), APPROVAL_LISTS) if r else None
 
 
-def research_rows(connect=db) -> list[dict]:
+def research_rows(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM research ORDER BY ts DESC")]
 
 
-def research_get(ref: str, connect=db) -> dict | None:
+def research_get(ref: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM research WHERE ref = ? COLLATE NOCASE", (ref,)).fetchone()
     return dict(r) if r else None
@@ -1762,7 +1771,7 @@ OPEN_CAPTURE = "status IN ('draft', 'checking', 'filing')"
 EDITABLE_CAPTURE = "status IN ('draft', 'checking')"
 
 
-def capture_draft(connect=db) -> dict | None:
+def capture_draft(connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute(f"SELECT * FROM captures WHERE {OPEN_CAPTURE}").fetchone()
         if not r:
@@ -1822,7 +1831,7 @@ def capture_filed(draft_id: int, number: int, url: str, title: str) -> bool:
         return bool(changed)
 
 
-def capture_filed_row(draft_id: int | None = None, connect=db) -> dict | None:
+def capture_filed_row(draft_id: int | None = None, connect=reader) -> dict | None:
     with connect() as c:
         if draft_id is None:
             r = c.execute("SELECT * FROM captures WHERE status = 'filed' ORDER BY filed DESC, id DESC").fetchone()
@@ -1831,7 +1840,7 @@ def capture_filed_row(draft_id: int | None = None, connect=db) -> dict | None:
         return dict(r) if r else None
 
 
-def capture_filing(connect=db) -> bool:
+def capture_filing(connect=reader) -> bool:
     with connect() as c:
         return c.execute("SELECT 1 FROM captures WHERE status = 'filing'").fetchone() is not None
 
@@ -1868,12 +1877,12 @@ def capture_end_checks(draft_id: int | None, reason: str) -> None:
                   + ("" if draft_id is None else " AND id = ?"), args)
 
 
-def capture_checking(connect=db) -> bool:
+def capture_checking(connect=reader) -> bool:
     with connect() as c:
         return c.execute("SELECT 1 FROM captures WHERE status = 'checking'").fetchone() is not None
 
 
-def capture_evidence(evidence_id: int, connect=db) -> dict | None:
+def capture_evidence(evidence_id: int, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT e.* FROM capture_evidence e JOIN captures k ON k.id = e.capture "
                       "WHERE e.id = ? AND k.status IN ('draft', 'checking', 'filing')", (evidence_id,)).fetchone()
@@ -1938,7 +1947,7 @@ def capture_discard() -> int | None:
         return draft["id"]
 
 
-def usage_since(since: str, connect=db) -> list[dict]:
+def usage_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM usage WHERE at >= ? ORDER BY at", (since,))]
 
@@ -1957,13 +1966,13 @@ def task_add(repo: str, body: str, title: str = "", kind: str = "feat", parent: 
                 digits += 1
 
 
-def task_get(tid: str, connect=db) -> dict | None:
+def task_get(tid: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
         return dict(r) if r else None
 
 
-def tasks(repo: str = "", in_state: str = "", connect=db) -> list[dict]:
+def tasks(repo: str = "", in_state: str = "", connect=reader) -> list[dict]:
     q, args = "SELECT * FROM tasks WHERE 1=1", []
     for column, value in (("repo", repo), ("state", in_state)):
         if value:
@@ -1973,7 +1982,7 @@ def tasks(repo: str = "", in_state: str = "", connect=db) -> list[dict]:
         return [dict(r) for r in c.execute(q + " ORDER BY created, rowid", args)]
 
 
-def task_children(parent: str, connect=db) -> list[dict]:
+def task_children(parent: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE parent = ? ORDER BY created, rowid", (parent,))]
 
@@ -1996,14 +2005,14 @@ def task_comment(tid: str, author: str, body: str) -> bool:
         return True
 
 
-def task_comments(tid: str, connect=db) -> list[dict]:
+def task_comments(tid: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT author, body, ts FROM task_comments WHERE task = ? ORDER BY rowid",
                                            (tid,))]
 
 
 def tasks_replied(repo: str) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [dict(r) for r in c.execute(
             "SELECT * FROM tasks WHERE repo = ? AND state = 'needs-info' AND (SELECT author FROM task_comments c "
             "WHERE c.task = tasks.id ORDER BY c.rowid DESC LIMIT 1) = 'owner' ORDER BY created, rowid", (repo,))]
@@ -2023,20 +2032,20 @@ def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str,
                    json.dumps(session)))
 
 
-def ask_get(ask_id: str, connect=db) -> dict | None:
+def ask_get(ask_id: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM asks WHERE id = ?", (ask_id,)).fetchone()
         return ask_row(r) if r else None
 
 
-def asks_of(run: str, status: str = "", connect=db) -> list[dict]:
+def asks_of(run: str, status: str = "", connect=reader) -> list[dict]:
     with connect() as c:
         return [ask_row(r) for r in c.execute(
             "SELECT * FROM asks WHERE run = ?" + (" AND status = ?" if status else "") + " ORDER BY asked, rowid",
             (run, status) if status else (run,))]
 
 
-def open_asks(connect=db) -> list[dict]:
+def open_asks(connect=reader) -> list[dict]:
     with connect() as c:
         return [ask_row(r) for r in c.execute(
             "SELECT * FROM asks WHERE status = 'open' AND NOT EXISTS (SELECT 1 FROM runs a, runs later WHERE "
@@ -2048,7 +2057,7 @@ def asks_due(run_ids) -> list[dict]:
     ids = list(run_ids)
     if not ids:
         return []
-    with db() as c:
+    with reader() as c:
         return [ask_row(r) for r in c.execute(
             f"SELECT * FROM asks WHERE status = 'answered' AND taken_by = '' AND run IN ({','.join('?' * len(ids))}) "
             "ORDER BY asked, rowid", ids)]
@@ -2085,7 +2094,7 @@ def push_add(endpoint: str, p256dh: str, auth: str, label: str, contact: str) ->
                   (endpoint, p256dh, auth, label, contact, util.iso()))
 
 
-def push_list(connect=db) -> list[dict]:
+def push_list(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM push_subscriptions ORDER BY created, rowid")]
 
@@ -2102,6 +2111,6 @@ def push_succeeded(endpoints: list[str]) -> None:
 
 
 def asks_asked_before(iso: str) -> list[dict]:
-    with db() as c:
+    with reader() as c:
         return [ask_row(r) for r in c.execute("SELECT * FROM asks WHERE status = 'open' AND asked < ? "
                                               "ORDER BY asked, rowid", (iso,))]

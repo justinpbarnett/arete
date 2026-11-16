@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import stat
 import sys
 import threading
 import time
@@ -21,6 +23,7 @@ from . import (
     config,
     control,
     dashboard,
+    dbstats,
     delivery,
     devices,
     environment,
@@ -202,6 +205,10 @@ class Server:
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
         self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
+        self.db_future: Future | None = None
+        self.db_lock = threading.Lock()
+        self.db_health = {**dbstats.empty_collection(), "status": "initial", "requested_at": None,
+                          "finished_at": None, "error": None}
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
@@ -402,6 +409,40 @@ class Server:
             self.say(f"{ALERT_KEY}: alert failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
     def prune(self) -> None:
+        try:
+            self.prune_data()
+        finally:
+            self.collect_db()
+
+    def collect_db(self) -> None:
+        with self.db_lock:
+            self.finish_db()
+            if self.db_future is not None:
+                return
+            self.db_health.update(status="pending", requested_at=util.iso(), error=None)
+            try:
+                self.db_future = self.pool.submit(dbstats.collect)
+            except Exception as e:
+                self.fail_db(e)
+
+    def fail_db(self, error: Exception) -> None:
+        self.db_health.update(status="failed", finished_at=util.iso(),
+                              error=f"{type(error).__name__}: {util.first_line(str(error), 300)}")
+        self.say(f"db collection failed: {self.db_health['error']}")
+
+    def finish_db(self) -> None:
+        if self.db_future is None or not self.db_future.done():
+            return
+        done, self.db_future = self.db_future, None
+        try:
+            values = done.result()
+        except Exception as e:
+            self.fail_db(e)
+        else:
+            self.db_health.update(values, status="complete", finished_at=util.iso(), error=None)
+            self.say("db " + json.dumps(values, sort_keys=True))
+
+    def prune_data(self) -> None:
         try:
             made = backup.snapshot("prune")
         except Exception as e:
@@ -721,6 +762,9 @@ class Server:
             self.say(text)
 
     def beat(self) -> None:
+        with self.db_lock:
+            self.finish_db()
+            db = dict(self.db_health)
         every_loop, live = self.every_loop, self.live
         failing = {key: dict(found) for key, found in self.failing.items()}
         at = util.iso()
@@ -736,6 +780,7 @@ class Server:
             running = None
         util.write_json(control.BEAT_FILE, {
             "schema": state.LATEST,
+            "db": db,
             "pid": os.getpid(), "engine": codebase.STAMP, "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
@@ -760,13 +805,27 @@ def start_notes(cfg: config.Config) -> list[str]:
     return notes
 
 
+def cleanup_legacy() -> None:
+    for name in ("state.db", "chat.json.moved"):
+        file = paths.STATE_DIR / name
+        try:
+            info = file.lstat()
+            if stat.S_ISREG(info.st_mode) and (name != "state.db" or info.st_size == 0):
+                file.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+
+
 def run(with_dashboard: bool = True) -> NoReturn:
     rotation_notes = install.rotate_own_log()
     held = take_serve_lock()
     try:
         beat = util.read_json(control.BEAT_FILE, {})
         if beat.get("pid") == os.getpid():
-            util.write_json(control.BEAT_FILE, {**beat, "schema": state.LATEST})
+            util.write_json(control.BEAT_FILE, {**beat, "schema": state.LATEST,
+                                              "db": beat.get("db") or {
+                                                  **dbstats.empty_collection(), "status": "initial",
+                                                  "requested_at": None, "finished_at": None, "error": None}})
         try:
             with util.lock("migrate", wait=True):
                 backup.recover_restore()
@@ -780,6 +839,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
                         raise RuntimeError("arete.db refused WAL mode")
                 finally:
                     conn.close()
+            cleanup_legacy()
         except Exception as e:
             print(str(e), file=sys.stderr)
             raise SystemExit(1) from e

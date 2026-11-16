@@ -93,7 +93,6 @@ def chat_row(chat_id: int) -> dict:
 
 
 def view(chat_id: int) -> dict:
-    sessions.tell_chats()
     row = chat_row(chat_id)
     cfg = config.load()
     try:

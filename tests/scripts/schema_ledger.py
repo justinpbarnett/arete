@@ -24,6 +24,7 @@ from arete import backup, cli, control, dashboard, loop_run, migrations, paths, 
 
 TRACE = []
 BASE = max(m.n for m in migrations.load() if not m.name.endswith('_probe.py'))
+WRITER_FLOOR = max((m.n for m in migrations.load() if m.phase == "contract"), default=0)
 PROBE = BASE + 1
 PROBE_NAME = f"m{PROBE:04d}_foundation_probe.py"
 
@@ -450,14 +451,14 @@ finally:
 
 def test_runs_name_their_schema():
     init()
-    with mock.patch.object(state, "LATEST", 1):
+    with mock.patch.object(state, "LATEST", BASE):
         rid = record.start("loop", pid=None, loop="fixture")
     run = SimpleNamespace(events_file=paths.STATE_DIR / "missing.json")
-    with mock.patch.object(state, "LATEST", 2), mock.patch.object(loop_run, "LoopRun", return_value=run), \
+    with mock.patch.object(state, "LATEST", PROBE), mock.patch.object(loop_run, "LoopRun", return_value=run), \
             mock.patch.object(loop_run.loops, "find"), mock.patch.object(loop_run, "carry", return_value="done"):
         loop_run.carry_opened(rid)
     row = state.run_get(rid)
-    assert row["schema_version"] == 2 and row["engine_sha"] == loop_run.codebase.STAMP, row
+    assert row["schema_version"] == PROBE and row["engine_sha"] == loop_run.codebase.STAMP, row
     record.move(rid, "done", ("running",), finished=util.iso())
     (paths.STATE_DIR.parent / "authority-parent").mkdir()
     from tests import offline_workflow
@@ -483,7 +484,7 @@ def test_the_instance_keeps_its_name():
     assert identity == dict(sql("SELECT key, value FROM schema_meta WHERE key LIKE 'instance_%'"))
     meta = meta_from_dashboard()
     assert meta["instance"] == {k.removeprefix("instance_"): v for k, v in identity.items()}, meta
-    assert meta["schema"] == {"version": version(), "oldest_writer": 0}, meta
+    assert meta["schema"] == {"version": version(), "oldest_writer": WRITER_FLOOR}, meta
 
 
 def shape():

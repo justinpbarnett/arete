@@ -27,10 +27,20 @@ function requests() {
 
 async function legacy() {
   const queue = requests();
-  const context = vm.createContext({ call: queue.call, clock: () => "00:00" });
+  const context = vm.createContext({
+    call: queue.call, clock: () => "00:00", money: (n) => "$" + n.toFixed(2),
+    table: (...parts) => parts, el: (...parts) => parts, cell: (value) => value, wrapAtSlashes: (value) => value,
+  });
   const source = fs.readFileSync(path.join(root, "arete/web/run-page.js"), "utf8");
-  vm.runInContext(source + "\nglobalThis.api = { loadRunDetail, mergeFeed, state: () => feedOf };", context);
+  vm.runInContext(source + "\nglobalThis.api = { loadRunDetail, mergeFeed, paidWords, modelTable, state: () => feedOf };", context);
   const api = context.api;
+  for (const billing of ["local", "replay", "subscription", "api_key"]) {
+    const model = { billing, model: "fixture", runner: "pi", metered: billing === "api_key",
+      paid: billing === "api_key" ? 1.25 : 0, tokens_in: 0, tokens_out: 0, steps: 1 };
+    assert.equal(api.paidWords({ paid: model.paid }, [model]),
+      billing === "subscription" ? "nothing, it ran on the subscription" : model.paid ? "$1.25" : "nothing paid");
+    assert.match(JSON.stringify(api.modelTable([model])), new RegExp(billing === "api_key" ? "\\$1.25" : billing));
+  }
   const initial = api.loadRunDetail("a");
   await flush();
   queue.pending.shift().resolve(answer(0, [line(15000, "old")]));

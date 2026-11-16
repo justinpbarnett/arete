@@ -22,10 +22,20 @@ snapshot until outer exit closes the connection, ending the read transaction wit
 writer joins the writer. Attempting `tx` or `db` inside an existing
 read snapshot raises instead of promoting it. Reader entry never migrates or checks writer compatibility.
 
+Matched dashboard GET routes, direct board snapshots/run details and cost reports share one read snapshot per answer.
+Cost groupings use the same cutoff time. Cost corrections and backfills run outside the reporting snapshot.
+Models rows distinguish API-key, subscription, local and replay billing; the paid header sums the returned rows.
+Chat GETs only read; session-close, serve-reap and chat-send paths deliver completed session reports.
+
+Events in SQLite retain routing/history fields only. Migration 4 drops the duplicate `events.data` column and raises
+`oldest_writer` to 4, after the existing contract gate finds no older or unstamped live run/serve process.
+The new writer works while that contract waits. Fresh databases run the immutable migration chain too.
+Complete event data remains in queue payloads and `runs/<id>/events.json`.
+
 Every outer transaction records monotonic elapsed time, including connection acquisition, BEGIN wait and COMMIT.
 Transactions above 500 ms and escaping SQLite errors append exactly one JSON line to `LOG_DIR/db.log`, using one
 O_APPEND write. Fields are `timestamp` (UTC), `pid`, `process_kind`, `caller` (first module.function outside the store
-and timing helpers), `mode` (`read` or `write`), `total_ms`, `begin_ms`, `commit_ms` and `error` (exception class or
+and timing helpers), `mode` (`read` or `write`), `total_ms`, `begin_ms`, `commit_ms`, `database` (file identity) and `error` (exception class or
 empty string). No SQL, parameters or payloads are recorded. Diagnostic failures never change application results.
 
 All outer transactions, including fast successes, also contribute to `LOG_DIR/dbstats/*.json`. Format 1 contains
@@ -35,7 +45,29 @@ All outer transactions, including fast successes, also contribute to `LOG_DIR/db
 0–1 ms; key N means greater than 2^(N−1) through 2^N ms. Counts nest only at the outer boundary. Updates are locked
 across threads and published atomically after every transaction, so normal short-lived processes need no exit flush.
 Database replacements, distinct databases, restarts, forks and UTC hours have separate records; PID is metadata,
-not identity. Retain these files as inputs for later hourly aggregation.
+not identity. Retain these files as inputs for hourly aggregation.
+
+After each hourly prune attempt, serve collects database health on its existing worker pool, including when a failed
+snapshot prevents pruning. It never walks runs/ or counts tables in a beat. Each successful collection logs one
+structured summary starting with `db {`; a failed collection emits one `db collection failed: <error>` diagnostic
+and no summary. Every `serve.json` beat contains a `db` object. Collection `status` is `initial`, `pending`,
+`complete` or `failed`, with `requested_at`, `finished_at` and `error`. Uncollected metrics are null. Pending/failed
+collections retain the last successful metrics and `collected_at`.
+
+The hourly window is the previous complete UTC hour, inclusive `window_start` and exclusive `window_end`.
+`transaction_count`, `transactions_by_kind`, `p95_ms` and exact `max_ms` merge current-database process summaries,
+including fast transactions absent from db.log. Approximate p95 is the merged histogram bucket upper bound,
+capped at the exact maximum; a bucket is at most twice the durations it contains (bucket 0 covers 0–1 ms).
+`slow_by_kind`, `errors_by_kind` and `errors_by_class` count diagnostic records separately, reading
+numbered db.log rotations too. Explicitly different database identities are excluded; older identity-less log records
+are accepted within the window. Malformed records and incomplete final lines are ignored.
+`db_bytes` and `wal_bytes` measure the files; `tables` holds row counts from one short snapshot.
+`record_bytes`, `other_bytes` and `total_bytes` measure all runs/ files without following symlinks.
+
+Heartbeat checks run independently of serve installation/liveness: `db:slow` warns on a transaction strictly above
+five seconds in the rolling last hour and names its caller; `db:size` warns when DB + WAL exceed
+`[retention] db_max_mb` (default 500 MiB); `runs:size` warns above half `max_gb` (decimal GB), counting record/
+and all other run-folder bytes. These checks read current files, so they also work before the first collection.
 
 Run the offline exercises through the supplied verification sandbox, replacing `<sandbox>` with its executable path:
 
@@ -50,6 +82,12 @@ Run the offline exercises through the supplied verification sandbox, replacing `
 <sandbox> python docs/db-fixture.py restore-safety
 <sandbox> python docs/db-fixture.py feed-cursors
 <sandbox> python docs/db-fixture.py backup-health
+<sandbox> python docs/db-fixture.py coherent-reads
+<sandbox> python docs/db-fixture.py event-contract
+<sandbox> python docs/db-fixture.py database-health
+<sandbox> python docs/db-fixture.py legacy-cleanup
+<sandbox> python docs/db-fixture.py browser-seed
+<sandbox> python docs/db-fixture.py browser-serve --port 8765
 <sandbox> python docs/db-fixture.py inspect
 ```
 
@@ -59,6 +97,17 @@ evidence, stdout and stderr remain under `.arete-sandbox/db-fixture/<exercise>-*
 results and journal/synchronous settings. Contention exercises use ordinary rollback-journal SQLite files, not the
 confined scratch connection's MEMORY journal. Source fetch barriers, transaction cleanup, snapshots, migrations,
 restore isolation, oncall ordering, output draining and durable replacement failures are exercised there.
+
+The new exercises retain read-connection/cutoff evidence, concurrent-commit barriers, event-contract blockers,
+health aggregation/collection beats and real startup cleanup evidence. Reuse prune-restore, restore-safety,
+backup-health and feed-cursors for backup retention, copy and restore regressions.
+
+`browser-seed` records a shared disposable fixture directory in `db-fixture/browser.json`; `browser-serve`
+uses it until Ctrl-C and is excluded from the finite exercise list. Open http://127.0.0.1:8765/ and the printed
+`/#run/local`, `/#run/replay`, `/#run/subscription`, `/#run/api-key` and `/#run/mixed` links. Open the chat console
+on `/#live` to select the seeded chat; its messages, session list and report also have printed API links.
+http://127.0.0.1:8765/ui.html uses the same data. The fixture binds loopback with a fake owner identity and uses
+the real Handler and admission checks; it does not change production routes or authentication.
 
 ## Serve
 
@@ -739,7 +788,7 @@ Set the destination to copy the day's snapshot and archive with `rsync -t`:
 copy_to = "host:/backups/arete/"
 ```
 
-A failed copy is tried again at the next snapshot until one succeeds that day. **Until the owner sets `copy_to`, no copy of the database or config leaves this machine**, and `arete heartbeat` shows `backup:offsite` as a warning that says so. `backup:db` fails when serve is installed and the newest snapshot is over 3 awake hours old or fails its check, and `backup:offsite` fails when the last good copy is over 48 awake hours old.
+A failed copy is tried again at the next snapshot until one succeeds that day. **Until the owner sets `copy_to`, no copy of the database or config leaves this machine**, and `arete heartbeat` shows `backup:offsite` as a warning that says so. `backup:db` fails when an existing newest snapshot is over 3 awake hours old or fails its check, even when serve is uninstalled, and `backup:offsite` fails when the last good copy is over 48 awake hours old.
 
 ## Doctor
 
@@ -868,7 +917,7 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. `chat.json` and `chat.json.moved` remain only where an older version left them.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -917,7 +966,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[routing]` | `fallback` (default true) and `payment_modes` (a list of `subscription`, `api_key` and `local`; default all three). The engine's and a repo layer's `fallback` are combined with AND, so either can turn it off; a layer's `payment_modes` can only restrict the engine's. `arete steps` shows the result, and runs act on it. `capabilities` (per-route tables) and `floors` (named model lists) feed the step requirements. `paid` limits paid routes by provider and price. See [Steps](#steps). |
 | `[chat]` | `context_tokens` (default 40000, at least 100) is how many tokens of the chat's saved messages go into each turn before older ones are folded into a saved summary (the new message is not counted). `summary_model` (default `haiku`) writes that summary. `max_sessions` (default 2, at least 1) is the most task sessions one chat has running. `budget_usd` (default 10) is the dollars one chat may spend on its replies and its sessions. |
 | `[capture]` | `vision` (default none): the name of a file in the config folder, such as `vision.md`, that says what the app is for. The feedback composer's vision check reads it; a path that is absolute, holds `..` or leaves the folder is refused at load. With no key, no file or an empty file, that check holds and says what to add. `evidence_branch` (default `feedback-evidence`): the branch that holds uploaded evidence, a plain branch name with no `..`. `public_evidence` (default false): a public repo, or one whose visibility cannot be read, holds delivery of a request with evidence unless this is true. |
-| `[retention]` | `days` (default 30) expires raw records; `max_gb` (default 20) counts all run-folder bytes and removes eligible records oldest first; `lines_days` (default 90, at least `days`) expires run folders while keeping history rows. Protected data stays. Positive fractions are allowed. See [Retention](#retention). |
+| `[retention]` | `days` (default 30) expires raw records; `max_gb` (default 20) counts all run-folder bytes and removes eligible records oldest first; `lines_days` (default 90, at least `days`) expires run folders while keeping history rows; `db_max_mb` (default 500 MiB) sets the DB + WAL health warning threshold. Protected data stays. Positive fractions are allowed. See [Retention](#retention). |
 | `[replay]` | `all` (default false, sends every agent call to the replay runner) and `dir` (the folder of answers; `ARETE_REPLAY_DIR` wins over it). See [Replay](#replay). |
 | `[environment]` | `pass`, the names of more server variables that local agents and the commands that run a repo's code get, each an exact name, a prefix ending in `*`, or `"*"` for all. `[environment.providers]` maps a pi provider to more names its agents get, such as `amazon-bedrock = ["AWS_*"]`. See [An agent's environment](#an-agents-environment). |
 

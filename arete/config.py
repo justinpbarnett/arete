@@ -47,7 +47,7 @@ TRACKERS = ("github", "jira", "local")
 REPLAY_KEYS = ("all", "dir")
 ASK_KEYS = ("max_per_run", "settle", "expire_days", "remind_hours", "push_contact")
 MAX_ASK_EXPIRE_DAYS = 3650
-RETENTION_KEYS = ("days", "max_gb", "lines_days")
+RETENTION_KEYS = ("days", "max_gb", "lines_days", "db_max_mb")
 BACKUP_KEYS = ("copy_to",)
 CHAT_KEYS = ("context_tokens", "summary_model", "max_sessions", "budget_usd")
 FACTORY_PATHS = ("classic", "adw")
@@ -160,6 +160,7 @@ class Retention:
     days: float = 30
     max_gb: float = 20
     lines_days: float = 90
+    db_max_mb: float = 500
 
 
 @dataclass(frozen=True)
@@ -601,7 +602,8 @@ def ask_table(data, ignored: list[str] | None = None) -> AskConfig:
 def retention_table(data, ignored: list[str] | None = None) -> Retention:
     table = known(table_of(data, "retention"), RETENTION_KEYS, "retention", ignored)
     found = {}
-    for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb), ("lines_days", Retention.lines_days)):
+    for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb), ("lines_days", Retention.lines_days),
+                        ("db_max_mb", Retention.db_max_mb)):
         value = table.get(key, default)
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"[retention] {key} must be a number above 0, not {value!r}")
