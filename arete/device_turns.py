@@ -344,10 +344,10 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
             retries += 1
 
         while True:
-            pending = b""
+            header = b""
             acknowledged = False
             try:
-                proc = scratch.spawn([*ssh.ssh_argv(device), attach_script(path, offset)], stdin=subprocess.DEVNULL,
+                proc = scratch.spawn([*ssh.ssh_argv(device), attach_script(path, offset + len(pending))], stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             except OSError:
                 reconnect()
@@ -369,16 +369,17 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
                         data = os.read(proc.stdout.fileno(), 65536)
                         if not data:
                             break
-                        pending += data
                         if not acknowledged:
-                            if b"\n" not in pending:
+                            header += data
+                            if b"\n" not in header:
                                 continue
-                            ack, pending = pending.split(b"\n", 1)
+                            ack, data = header.split(b"\n", 1)
                             if ack != b"attached":
                                 break
                             acknowledged = True
                             broken_since = None
                             retries = 0
+                        pending += data
                         while b"\n" in pending:
                             line, pending = pending.split(b"\n", 1)
                             deliver(line + b"\n")
@@ -426,7 +427,7 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
         finished.set()
         if heartbeat:
             heartbeat.join(max(0, min(CONTROL_SECONDS + 1, deadline - time.monotonic())))
-        if pending and acknowledged:
+        if pending:
             output.append(pending.decode(errors="replace"))
         if isinstance(error, subprocess.TimeoutExpired | Lost):
             error.output = "".join(output)

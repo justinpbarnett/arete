@@ -23,7 +23,7 @@ except ProcessLookupError:
 '''
 
 SSH = r'''
-import json, os, subprocess, sys, time
+import json, os, signal, subprocess, sys, threading, time
 from pathlib import Path
 root = Path(__file__).resolve().parent.parent
 script = sys.argv[-1]
@@ -50,6 +50,11 @@ server = os.fork()
 if server == 0:
     os.close(read)
     os.setsid()
+    def close_transport():
+        while root.exists() and not (root / 'fixture-closed').exists():
+            time.sleep(.05)
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    threading.Thread(target=close_transport, daemon=True).start()
     log(role=role, half='server', pid=os.getpid(), client=os.getppid(), script=script)
     shell_file = root / 'command-shell'
     shell = shell_file.read_text().strip() if shell_file.exists() else 'sh'
@@ -148,7 +153,7 @@ def remove_turn(path):
 
 class Fixture:
     def __init__(self, root):
-        from arete import accounts, child, config, device_turns, devices, gh, sandbox
+        from arete import accounts, child, config, device_turns, devices, gh, sandbox, scratch
         from arete.store import db
 
         self.root = root
@@ -171,6 +176,16 @@ class Fixture:
         self.cfg = config.Config()
         self.lines = []
         self.faulted = False
+        self.transports = []
+        spawn = scratch.spawn
+
+        def owned_spawn(*args, **kw):
+            proc = spawn(*args, **kw)
+            self.transports.append(proc)
+            return proc
+
+        self.spawn_patch = mock.patch.object(scratch, "spawn", owned_spawn)
+        self.spawn_patch.start()
 
     def agents(self):
         return rows(self.root / "agents.jsonl")
@@ -281,16 +296,22 @@ class Fixture:
         return vars(result)
 
     def cleanup(self):
-        for agent in self.agents():
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(agent["pgid"], signal.SIGKILL)
-        for r in rows(self.root / "ssh.jsonl"):
-            if r["half"] == "server":
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(r["pid"], signal.SIGKILL)
-            else:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(r["pid"], signal.SIGKILL)
+        turns = [p.parent for p in (self.root / "device").rglob("owner")]
+        try:
+            for turn in turns:
+                with contextlib.suppress(FileNotFoundError):
+                    (turn / "stop").touch()
+                    (turn / "discard").touch()
+            wait_for(lambda: all(not p.exists() or (p / "stopped").exists() for p in turns), 8)
+        finally:
+            (self.root / "fixture-closed").touch()
+            self.spawn_patch.stop()
+            for proc in self.transports:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
 
 
 def reset(f, mode):
