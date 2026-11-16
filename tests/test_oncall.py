@@ -1844,8 +1844,8 @@ class Repairs(Scratch):
         return self.scanned(tail=f"print(json.dumps(oncall.{call}))\n")
 
     def picked(self):
-        code = ("import json\nfrom arete import config, pipeline, tracker\nrepo = config.load().repo('demo')\n"
-                "print(json.dumps(pipeline.next_pick(repo, tracker.LocalTracker(repo), pipeline.SkipLog({}), set())))")
+        code = ("import json\nfrom arete import config, pipeline, poll, tracker\nrepo = config.load().repo('demo')\n"
+                "print(json.dumps(poll.next_pick(repo, tracker.LocalTracker(repo), pipeline.SkipLog({}), set())))")
         res = self.py(code)
         self.assertEqual(res.returncode, 0, res.stderr)
         return json.loads(res.stdout.splitlines()[-1])
@@ -1946,12 +1946,12 @@ class Repairs(Scratch):
         self.failing()
         task = self.seam("start")[0][2]
         self.set_run("failed")
-        code = ("import json\nfrom arete import oncall, pipeline, util\nspawned = []\n"
-                "pipeline.spawn_run = lambda repo, tid: spawned.append(tid)\n"
+        code = ("import json\nfrom arete import oncall, poll, util\nspawned = []\n"
+                "poll.spawn_run = lambda repo, tid: spawned.append(tid)\n"
                 f"task = {task!r}\nout = []\n"
-                "with util.lock('oncall') as held:\n    out.append(pipeline.spawn_unparked('demo', task))\n"
-                "out.append(pipeline.spawn_unparked('demo', task))\noncall.switch(False)\n"
-                "out.append(pipeline.spawn_unparked('demo', task))\nprint(json.dumps([out, spawned]))")
+                "with util.lock('oncall') as held:\n    out.append(poll.spawn_unparked('demo', task))\n"
+                "out.append(poll.spawn_unparked('demo', task))\noncall.switch(False)\n"
+                "out.append(poll.spawn_unparked('demo', task))\nprint(json.dumps([out, spawned]))")
         res = self.py(code)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(json.loads(res.stdout.splitlines()[-1]), [[False, True, False], [task]])

@@ -110,7 +110,7 @@ class MinerRecordedRunTests(unittest.TestCase):
 
     def test_status_moves_compare_fields_and_rejected_prs_can_reopen(self):
         found = self.scratch(r'''
-from arete import pipeline
+from arete import outcomes
 rid = made("move", "pr")
 before = state.run_get(rid)
 assert not record.move(rid, "merged", expect=(), summary="wrong")
@@ -123,17 +123,17 @@ except ValueError:
 else:
     raise AssertionError("note accepted status")
 assert record.move(rid, "rejected", expect=("pr",), pr_url="one")
-with mock.patch.object(pipeline.gh, "pr_view", return_value={"state": "OPEN"}), \
-        mock.patch.object(pipeline, "record_feedback"):
-    pipeline.sync_outcomes(config.Config())
+with mock.patch.object(outcomes.gh, "pr_view", return_value={"state": "OPEN"}), \
+        mock.patch.object(outcomes, "record_feedback"):
+    outcomes.sync_outcomes(config.Config())
 assert state.run_get(rid)["status"] == "pr"
 for merged in (False, True):
     pr = {"state": "MERGED" if merged else "CLOSED", "closedAt": util.iso()}
     if merged:
         pr["mergedAt"] = pr["closedAt"]
-    with mock.patch.object(pipeline.gh, "pr_view", return_value=pr), \
-            mock.patch.object(pipeline, "record_feedback"):
-        pipeline.sync_outcomes(config.Config())
+    with mock.patch.object(outcomes.gh, "pr_view", return_value=pr), \
+            mock.patch.object(outcomes, "record_feedback"):
+        outcomes.sync_outcomes(config.Config())
     assert state.run_get(rid)["status"] == ("merged" if merged else "rejected")
 result(status=state.run_get(rid)["status"])
 ''')
@@ -155,14 +155,14 @@ result(status=state.run_get(rid)["status"])
     def test_tracker_dry_run_and_secret_restriction_leave_asks_open(self):
         found = self.scratch(r'''
 from types import SimpleNamespace
-from arete import owner_asks, pipeline, tasks
+from arete import owner_asks, poll, tasks
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
 state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
               [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
 tk = SimpleNamespace(reply_since=mock.Mock(return_value="tracker text"))
-assert pipeline.tracker_reply(repo, tk, "R-1", True) == ""
+assert poll.tracker_reply(repo, tk, "R-1", True) == ""
 assert state.ask_get("ask")["status"] == "open"
 with mock.patch.object(tasks, "run_of", return_value=(cfg, repo, state.run_get(rid))), \
         mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
@@ -175,7 +175,7 @@ assert "dashboard text" in json.dumps(state.ask_get("ask")["answers"])
 state.ask_add("secret", rid, repo.name, "R-1", "build", "secret", "why", "tried",
               [{"kind": "secret", "header": "Key", "question": "Key?", "name": "EXAMPLE_TOKEN"}], {})
 tk.reply_since.reset_mock()
-assert "secret" in pipeline.tracker_reply(repo, tk, "R-1", False)
+assert "secret" in poll.tracker_reply(repo, tk, "R-1", False)
 tk.reply_since.assert_not_called()
 assert state.ask_get("secret")["status"] == "open"
 assert tasks.STEER_LOCK == owner_asks.STEER_LOCK

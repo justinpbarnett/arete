@@ -10,6 +10,7 @@ from pathlib import Path
 from string import Template
 
 from . import config, outbound, paths, runner, steps, util
+from .review import Review
 
 SCHEMA = {"type": "object", "properties": {"title": {"type": "string"}, "text": {"type": "string"}},
           "required": ["text"]}
@@ -348,11 +349,11 @@ def one_line(text: str, n: int) -> str:
     return " ".join(str(text or "").split())[:n]
 
 
-def pr_brief(ticket, changes: str, review: dict, verified, size: str, held: str) -> Brief:
+def pr_brief(ticket, changes: str, review: Review, verified, size: str, held: str) -> Brief:
     checks = [f"Check \"{c.get('what', '')}\": {'passed' if c.get('passed') else 'failed'}; saw: "
               f"{one_line(c.get('saw'), CHECK_SAW_CHARS)}" for c in verified.checks]
     facts = [f"Change: {changes}", f"Size: {size}", f"Checked in use: {verified.verdict}. {verified.summary}".strip(),
-             *checks, f"Review: {review.get('verdict', 'none')}. {review.get('summary', '')}".strip(),
+             *checks, f"Review: {review.display_verdict}. {review.summary}".strip(),
              *([f"Held as a draft: {held}"] if held else [])]
     return Brief(
         "pr", tuple(outbound.screen(f) for f in facts if f.strip()),
@@ -362,7 +363,7 @@ def pr_brief(ticket, changes: str, review: dict, verified, size: str, held: str)
         "the repo owner, before merging", "pull request description, markdown")
 
 
-def pr_text(run, ticket, changes: str, review: dict, verified, size: str, held: str, cfg: config.Config, layer) -> str:
+def pr_text(run, ticket, changes: str, review: Review, verified, size: str, held: str, cfg: config.Config, layer) -> str:
     try:
         if not config.document_for(cfg, run.repo, layer).enabled:
             return ""

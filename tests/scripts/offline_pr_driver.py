@@ -2,7 +2,7 @@ import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, state, util, workspace
+from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, state, util, workspace, outcomes
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 state.migrate()
 probe = [sys.executable, "-V"]
@@ -148,9 +148,9 @@ else:
     take(run_ticket())
 if scenario in ("stop", "repair-stop"):
     (root / "merged").write_text("")
-    pipeline.sync_outcomes(cfg)
+    outcomes.sync_outcomes(cfg)
     extra["after_merge"] = {r["id"]: state.run_get(r["id"])["status"] for r in state.runs(kind="pipeline", limit=10)}
-    extra["streak"] = pipeline.streak("replay-sample")
+    extra["streak"] = outcomes.streak("replay-sample")
 if scenario == "stopped-feedback":
     comment = {"pr_url": URL, "kind": "comment", "gh_id": 11, "repo": "replay-sample", "issue": task,
                "body": "Please rename it.", "at_once": 1, "created": util.iso(), "pr_state": "OPEN", "status": "new"}

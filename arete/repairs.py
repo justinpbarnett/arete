@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, factory, gh, paths, pipeline, run_lines, util, workspace
+from . import config, factory, gh, paths, run_lines, util, workspace
+from .review import Review
 
 PLAN_STEPS = ("plan", "revise", "repair")
 MAX_LOG = 200
@@ -19,7 +20,7 @@ class Source:
     run_id: str
     branch: str
     prs: list[str]
-    review: dict
+    review: Review
     evidence: str
     plan: str
     goal: str
@@ -27,19 +28,19 @@ class Source:
     runs: list[str] = field(default_factory=list)
 
 
-def saved_review(run_id: str) -> tuple[dict, int]:
+def saved_review(run_id: str) -> tuple[Review, int]:
     report = next((line for line in reversed(run_lines.read(run_id)) if line.get("event") == run_lines.END), {})
-    review = report.get("review")
-    if not isinstance(review, dict) or not review.get("verdict"):
+    saved = report.get("review")
+    if not isinstance(saved, dict) or not saved.get("verdict"):
         raise Refused(f"run {run_id} saved no review")
-    if review.get("verdict") == "approve":
+    if saved.get("verdict") == "approve":
         raise Refused(f"run {run_id}: its last review approved the change, so nothing is left to repair")
-    listed = [p for p in review.get("problems") or [] if isinstance(p, dict) and str(p.get("text") or "").strip()]
-    if review.get("verdict") != "request_changes" or not listed:
+    listed = [p for p in saved.get("problems") or [] if isinstance(p, dict) and str(p.get("text") or "").strip()]
+    if saved.get("verdict") != "request_changes" or not listed:
         raise Refused(f"run {run_id} requested changes but saved no findings to repair")
-    found = {"verdict": "request_changes", "problems": pipeline.review_problems(
+    found = Review.stored({"verdict": "request_changes", "problems":
         [{"file": p.get("file"), "problem": p["text"], "severity": "blocker", "category": p.get("category")}
-         for p in listed])}
+         for p in listed]})
     return found, int(report.get("seq") or 0)
 
 

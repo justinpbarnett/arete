@@ -13,6 +13,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from arete.review import Review
+
 from arete import browser, config, gh, outbound, paths, pipeline, sandbox, scratch, verify, workspace
 
 from tests import support
@@ -108,7 +110,7 @@ class WriterRegressionTests(unittest.TestCase):
                 ticket = tracker.Ticket("1", "#1", "Enable offline checks", "Run the checks offline.")
                 verified = verify.Verified("pass", "The offline check passed.",
                                            [{"what":"offline check", "how":"fixture", "saw":"pass", "passed":True}])
-                review = {"verdict":"approve", "summary":"Offline behavior is correct.", "problems":[]}
+                review = Review.stored({"verdict":"approve", "summary":"Offline behavior is correct.", "problems":[]})
                 def transport(args, **kw):
                     sent.append(kw.get("input", ""))
                     return "https://github.com/fixture/repo/pull/1"

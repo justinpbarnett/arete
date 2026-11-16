@@ -1,7 +1,7 @@
 
 import json, os, subprocess, sys, time, urllib.request
 from pathlib import Path
-from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker, util
+from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker, util, poll
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 def forbidden(*args, **kwargs):
@@ -50,12 +50,12 @@ elif scenario == "blocks-next-ticket":
     run = row(5, "pr", "pr")
     skips = pipeline.SkipLog({})
     repo = cfg.repo(REPO)
-    result["first"] = pipeline.next_ticket(repo, tracker.for_repo(cfg, repo), skips) is None
+    result["first"] = poll.next_ticket(repo, tracker.for_repo(cfg, repo), skips) is None
     result["skips"] = json.dumps(skips.current)
     pipeline.sync_labels(cfg)
     result["labels"] = sorted(ISSUES[5])
     ISSUES[5].discard("agent:pr")
-    result["released"] = pipeline.next_ticket(repo, tracker.for_repo(cfg, repo), pipeline.SkipLog({})) is None
+    result["released"] = poll.next_ticket(repo, tracker.for_repo(cfg, repo), pipeline.SkipLog({})) is None
 elif scenario == "retains-debt":
     ISSUES[5], ISSUES[6] = {"agent", "agent:running"}, {"agent", "agent:running"}
     REFUSE.add("agent:failed")

@@ -10,6 +10,8 @@ import unittest
 import urllib.error
 from unittest import mock
 
+from arete.review import Review
+
 from arete import config, control, devices, gh, pipeline, sessions, verify, workspace
 
 from tests import support
@@ -429,7 +431,7 @@ class PushedPrDraftTests(unittest.TestCase):
         verified = verify.Verified("blocked" if held or fault else "pass",
                                    blocked_by="the dev server did not start" if fault else "the JEV guard refused it")
         job = flows.Job(config.Config(), self.run, root / "ws", ticket=tracker.Ticket("123", "#123", "Title"),
-                        branch="work", checkouts=[c], layer=layer, verified=verified, review={"verdict": "approve"})
+                        branch="work", checkouts=[c], layer=layer, verified=verified, review=Review.stored({"verdict": "approve"}))
         staged = pipeline.Staged(counts={"a.txt": 1}, changed=[c])
         job.built = SimpleNamespace(restage=lambda from_base=False: staged if from_base or pushed else pipeline.Staged(),
                                     from_base=False, committed_lines=0, staged=pipeline.Staged(),

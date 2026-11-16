@@ -28,6 +28,8 @@ from arete import (
     run_lines,
     paths,
     pipeline,
+    poll,
+    outcomes,
     record,
     runlimits,
     sandbox,
@@ -730,7 +732,7 @@ class QueueTests(Isolated):
             return [SimpleNamespace(state="held" if setting.step == "plan" else "ready",
                                     detail="planner quota hold", until="")]
         with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)), \
-                patch.object(pipeline, "pending_feedback", return_value=[{"id": 1}]):
+                patch.object(poll, "pending_feedback", return_value=[{"id": 1}]):
             self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
         self.assertEqual(started, [self.ticket])
         self.assertEqual(seen, ["build", "review"])
@@ -748,13 +750,13 @@ class QueueTests(Isolated):
         self.assertIn(prerequisite, started)
 
     def poll_with(self, cfg, spawn):
-        with patch.object(config, "load", return_value=cfg), patch.object(pipeline, "runnable", return_value=True), \
-                patch.object(pipeline, "spawn_run", side_effect=spawn), \
-                patch.object(pipeline, "settle_abandoned_runs"), patch.object(pipeline, "sync_outcomes"), \
-                patch.object(pipeline, "sync_moves"), patch.object(pipeline, "sync_landings"), \
-                patch.object(workspace, "cleanup_worktrees"), patch.object(pipeline, "mark_loop"), \
+        with patch.object(config, "load", return_value=cfg), patch.object(poll, "runnable", return_value=True), \
+                patch.object(poll, "spawn_run", side_effect=spawn), \
+                patch.object(poll, "settle_abandoned_runs"), patch.object(outcomes, "sync_outcomes"), \
+                patch.object(outcomes, "sync_moves"), patch.object(outcomes, "sync_landings"), \
+                patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
-            return pipeline.poll()
+            return poll.poll()
 
     def test_one_poll_fills_capacity_round_robin_without_relying_on_child_rows(self):
         second = config.Repo(name="other", path=self.root / "other", tracker="local", pipeline=True)
@@ -791,8 +793,8 @@ class QueueTests(Isolated):
         for i in range(5):
             state.task_add(self.repo.name, str(i), str(i), "feat")
         started = []
-        with patch.object(pipeline, "route_blocker", return_value="verify is held"), \
-                patch.object(pipeline, "MAX_STARTS_PER_POLL", 3):
+        with patch.object(poll, "route_blocker", return_value="verify is held"), \
+                patch.object(poll, "MAX_STARTS_PER_POLL", 3):
             self.assertEqual(self.poll_with(self.cfg, lambda *args: started.append(args)), 0)
         self.assertEqual(started, [])
         self.assertEqual(len(json.loads((self.root / "skipped.json").read_text())), 3)
