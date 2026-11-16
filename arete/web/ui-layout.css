@@ -70,3 +70,27 @@ html, body, #app { height: 100%; }
   [data-screen="task"] .pane-grid { grid-template-columns: clamp(240px, 18vw, 300px) minmax(0, 1fr); }
   [data-screen="task"] .auxiliary { display: none; }
 }
+@media (width < 900px) {
+  .ui-app[data-screen="run"] { --sidebar-width: 48px; }
+  [data-screen="run"] .side-top { justify-content: center; padding: 10px 0; }
+  [data-screen="run"] .wordmark,
+  [data-screen="run"] .version,
+  [data-screen="run"] .side-foot,
+  [data-screen="run"] .nav-label,
+  [data-screen="run"] .nav-row .key-slot,
+  [data-screen="run"] .nav-row .count,
+  [data-screen="run"] .search span,
+  [data-screen="run"] .search kbd:last-child { display: none; }
+  [data-screen="run"] .search { justify-content: center; padding: 0; }
+  [data-screen="run"] .side-nav { padding: 4px; }
+  [data-screen="run"] .nav-row { justify-content: center; height: 36px; padding: 0; }
+  [data-screen="run"] .pane-grid { grid-template-columns: minmax(0, 1fr); }
+  [data-screen="run"] .queue { border-right: 0; }
+  [data-screen="run"]:not([data-run-pane="focus"]) .focus,
+  [data-screen="run"][data-run-pane="focus"] .queue { display: none; }
+  [data-screen="run"] .key-bar { height: auto; min-height: var(--row); flex-wrap: wrap; gap: 4px 8px; padding: 4px 8px; white-space: normal; overflow-wrap: anywhere; }
+  [data-screen="run"] .key-bar .hints { display: none; }
+  [data-screen="run"] .key-bar .notice { flex: 1; min-width: 0; max-width: none; overflow: visible; }
+  [data-screen="run"] .key-bar .help { margin-left: auto; flex: none; }
+  [data-screen="run"] .sheet-grid { grid-template-columns: minmax(0, 1fr); }
+}

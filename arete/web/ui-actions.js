@@ -94,7 +94,10 @@ export function runPageContext(run, { refresh, go, openLink }) {
   return {
     item: { ...run, verb: "stop" }, compatible: `run-page:${run.id}`,
     stale: () => refresh(),
-    request: (action) => ({ url: target(action), data: {} }),
+    request: (action) => {
+      if (action.name === "stop" && run.stop_asked) throw new Error("This run is already stopping");
+      return { url: target(action), data: {} };
+    },
     commit: settled,
     run: { retry: ["failed", "interrupted", "stopped"].includes(run.status) ? retryRun : null, open: openLink },
   };
