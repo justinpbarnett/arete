@@ -11,8 +11,10 @@ from . import (
     oncall,
     outcomes,
     owner_asks,
+    patching,
     paths,
     pipeline,
+    queueing,
     routing,
     runlimits,
     steps,
@@ -52,7 +54,7 @@ def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracke
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
-        for t in source.todo():
+        for t in queueing.prioritized(source.todo()):
             if str(t.id) in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id):
                 continue
             if owed := run_store.pending_label(repo.name, t.id):
@@ -102,6 +104,9 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
     if cfg.replay.all:
         return ""
     first = ("plan", "build")
+    if (layer.factory_path == pipeline.ADW and len(repo.parts) <= 1 and patching.requested(layer, ticket)
+            and not patching.specification_refusal(ticket)):
+        first = ("build",)
     newest = run_store.newest_whole_run(repo.name, ticket.id)
     if (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
             and repaired_by(newest["id"])):

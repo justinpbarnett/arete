@@ -161,8 +161,8 @@ class GitHubTracker:
             names = {lb["name"] for lb in i.get("labels", [])}
             if names & skip or not self.by_owner(i):
                 continue
-            out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], url=i.get("url", ""),
-                              created=i.get("createdAt", ""), labels=sorted(names)))
+            out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=self._bodies[str(i["number"])],
+                              url=i.get("url", ""), created=i.get("createdAt", ""), labels=sorted(names)))
         return sorted(out, key=lambda t: t.created)
 
     def by_owner(self, item: dict) -> bool:
@@ -287,7 +287,7 @@ class JiraTracker:
         if not self.project:
             raise jira.JiraError(f"{self.repo.name}: no Jira project; set [jira] project or jira_project on the repo")
         jql = candidates_jql(self.project, f'labels = "{self.route}"')
-        return [search_ticket(self.client, i) for i in self.client.search(jql, SEARCH_FIELDS, limit=20)]
+        return [search_ticket(self.client, i) for i in self.client.search(jql, [*SEARCH_FIELDS, "description"], limit=20)]
 
     def blocker(self, tid: str) -> str:
         issue = self.client.issue(tid, JIRA_FIELDS)
@@ -608,7 +608,8 @@ def comments_text(comments: list[tuple[str, str, str]]) -> str:
 
 def search_ticket(client: jira.Client, issue: dict, blocker: str = "") -> Ticket:
     f = issue.get("fields") or {}
-    return Ticket(issue["key"], issue["key"], f.get("summary", ""), url=client.browse_url(issue["key"]),
+    return Ticket(issue["key"], issue["key"], f.get("summary", ""), body=f.get("description") or "",
+                  url=client.browse_url(issue["key"]),
                   created=f.get("created", ""), labels=list(f.get("labels") or []), blocker=blocker)
 
 

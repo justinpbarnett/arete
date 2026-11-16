@@ -183,7 +183,7 @@ def has_origin(repo: config.Repo) -> bool:
 
 
 def facts(name: str, data: dict) -> dict:
-    if name in ("plan", "revise", "repair"):
+    if name in ("plan", "patch", "revise", "repair"):
         return {"assumptions": assumptions_of(data), "left_for_a_person": str(data.get("left_for_a_person") or "")}
     if name == "pr":
         return {"held": data.get("draft_why") or ""}
@@ -790,14 +790,27 @@ def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
     return util.tail(stdout, stdout_room) + util.tail(stderr, stderr_room)
 
 
+def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
+    selected = set(layer.quick_checks) & layer.checks.keys()
+    for pattern, names in layer.targeted_checks.items():
+        if any(util.matches_any(name, [pattern]) for name in files):
+            selected.update(names)
+    return selected or set(layer.checks)
+
+
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
-               timeout: float) -> tuple[bool, str]:
+               timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
     if not layer.checks:
         return True, "no checks configured"
+    commands = {name: command for name, command in layer.checks.items() if selected is None or name in selected}
+    quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
+    slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
-    with check_lane(layer, run):
-        for name, cmd in layer.checks.items():
+
+    def execute(items):
+        nonlocal ok
+        for name, cmd in items:
             with record.timed(run.id, "check", name=name, command=cmd) as check:
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
                 check["exit"] = res.returncode
@@ -808,8 +821,20 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
             else:
                 report.append(f"### {name} passed: `{cmd}`")
-    for d, name in untracked_added_since(untracked_before):
-        workspace.remove_untracked(d, name)
+
+    try:
+        with nullcontext() if layer.parallel_checks else check_lane(layer, run):
+            execute(quick)
+            if slow and ok:
+                with check_lane(layer, run) if layer.parallel_checks else nullcontext():
+                    execute(slow)
+            elif slow:
+                report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
+        if selected is not None and set(commands) != set(layer.checks):
+            report.append("Targeted pass only; the full suite is still required before publication.")
+    finally:
+        for d, name in untracked_added_since(untracked_before):
+            workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
 
 
@@ -871,6 +896,7 @@ class Build(TicketWork):
     committed_lines: int = 0
     left_for_a_person: str = ""
     check_commands: str = NO_CHECKS
+    checked: dict = field(default_factory=dict)
     from_base: bool = False
     plan_text: str = ""
     build_summary: str = ""
@@ -901,8 +927,17 @@ class Build(TicketWork):
         return self.run.agent(step, text, self.ws, role=role, allowed_tools=self.tools,
                               disallowed_tools=routing.NO_GIT_WRITES, **kw)
 
-    def check(self) -> bool:
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout)
+    def check(self, *, quick: bool = False) -> bool:
+        selected = selected_checks(self.layer, self.restage().files) if quick else None
+        full = selected is None or selected == set(self.layer.checks)
+        before = factory.fingerprint(self.ws) if full else ""
+        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+        if ok and full:
+            after = factory.fingerprint(self.ws)
+            if before and after and before != after:
+                self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
+                return False
+            self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
         return ok
 
     def restage(self, *, from_base: bool | None = None) -> Staged:
@@ -2556,6 +2591,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     agent_started, agent_finished = False, False
     lifetime = {"stopped": True}
     fixture_blocker = ""
+    probes = None
     try:
         if attempt:
             run.log(f"{step}: scratch folder {attempt.root}")
@@ -2571,17 +2607,27 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 attempt=attempt) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
-            agent_started = True
-            res = run.agent(step, b.brief.prompt(
-                prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
-                commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
-                compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
-                            b.ws, role=role,
-                            allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
-                            disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
-                            mcp_config=browser.mcp_config(evidence) if url else "",
-                            scratch=attempt)
-            agent_finished = True
+            probes = (verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt)
+                      if v.probes else None)
+            if probes:
+                run.save(f"{step}-probes.json", json.dumps(asdict(probes), indent=2))
+                run.log(f"{step}: configured probes {probes.verdict}")
+                if probes.verdict == "pass":
+                    v = replace(v, notes=v.notes + "\n\nArete already executed these owner-configured probes in a "
+                                "confined disposable workspace. Use their observed results as evidence; do not repeat "
+                                "these commands. Check only acceptance criteria not covered by them.\n\n" + probes.markdown())
+            if not probes or probes.verdict == "pass":
+                agent_started = True
+                res = run.agent(step, b.brief.prompt(
+                    prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
+                    commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
+                    compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
+                                b.ws, role=role,
+                                allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
+                                disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
+                                mcp_config=browser.mcp_config(evidence) if url else "",
+                                scratch=attempt)
+                agent_finished = True
     except owner_asks.Asked:
         agent_finished = True
         raise
@@ -2614,12 +2660,17 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.log(retained_line(step, attempt))
         finally:
             restore_worktrees(untracked_before, evidence)
-    if not res.ok or not isinstance(res.structured, dict):
+    if probes and probes.verdict != "pass":
+        verified = probes
+    elif not res.ok or not isinstance(res.structured, dict):
         return verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
-    verified = verify.Verified.from_agent(res.structured)
-    if fixture_blocker and verified.verdict == "pass":
-        verified.verdict, verified.blocked_by = "blocked", fixture_blocker
+    else:
+        verified = verify.Verified.from_agent(res.structured)
+        if probes:
+            verified.checks = probes.checks + verified.checks
+    if fixture_blocker:
+        verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "

@@ -1055,6 +1055,20 @@ HARNESS_GLOBS = [
 ]
 
 
+@dataclass(frozen=True)
+class PatchPolicy:
+    labels: tuple[str, ...] = ("patch",)
+    max_lines: int = 200
+    max_files: int = 5
+    review_tries: int = 2
+    sensitive: tuple[str, ...] = ("*auth*", "*secret*", "*credential*", "*migration*", "*backup*", "*restore*",
+                                  "*payment*", "*billing*", "*guard*", "*sandbox*", "*scratch*", "*permission*",
+                                  "*security*", "*routing*", "*config*", "*runlimit*", "*principal*",
+                                  "*outbox*", "*store/*", "*database*", "*storage*", "*persist*", "*schema*",
+                                  "*transaction*", "*/db.*", "db.*", "*diffguard*", "*.sql", "*lock*", "*pyproject.toml",
+                                  "*package.json", "*requirements*", "*dockerfile*", "*terraform*")
+
+
 @dataclass
 class Verify:
     start: str = ""
@@ -1066,6 +1080,9 @@ class Verify:
     publish_evidence: bool = True
     preflight: dict[str, str] = field(default_factory=dict)
     preflight_seconds: float = 30
+    probes: dict[str, str] = field(default_factory=dict)
+    probe_seconds: float = 120
+    allow_patch_gaps: bool = False
 
     @property
     def bash(self) -> list[str]:
@@ -1078,6 +1095,9 @@ class RepoLayer:
     setup: list[str] = field(default_factory=list)
     copy: list[str] = field(default_factory=list)
     checks: dict[str, str] = field(default_factory=dict)
+    quick_checks: tuple[str, ...] = ("lint", "format", "compile", "imports", "web", "types")
+    targeted_checks: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    patch: PatchPolicy = field(default_factory=PatchPolicy)
     max_diff_lines: int = 400
     deny: list[str] = field(default_factory=list)
     max_attempts: int = 3
@@ -1126,8 +1146,44 @@ class RepoLayer:
         return self.dir / "evals"
 
 
-LAYER_SECTIONS = {"setup", "checks", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
+LAYER_SECTIONS = {"setup", "checks", "check_policy", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
                   "factory", "environment", "routing", "document", "ab"}
+
+
+def string_list(value, where: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(v, str) or not v.strip() for v in value):
+        raise ValueError(f"[{where}] must be a list of nonempty strings")
+    return tuple(dict.fromkeys(value))
+
+
+def check_policy(layer: RepoLayer, table: dict) -> None:
+    if unknown := set(table) - {"quick", "targeted"}:
+        raise ValueError(f"[check_policy] unknown keys: {', '.join(sorted(unknown))}")
+    if "quick" in table:
+        layer.quick_checks = string_list(table["quick"], "check_policy.quick")
+        if missing := set(layer.quick_checks) - layer.checks.keys():
+            raise ValueError(f"[check_policy.quick] unknown checks: {', '.join(sorted(missing))}")
+    for pattern, names in table_of(table.get("targeted", {}), "check_policy.targeted").items():
+        selected = string_list(names, f"check_policy.targeted.{pattern}")
+        if not pattern.strip() or not selected or (set(selected) - layer.checks.keys()):
+            raise ValueError(f"[check_policy.targeted] {pattern!r} must name existing checks")
+        layer.targeted_checks[pattern] = selected
+
+
+def patch_policy(table: dict) -> PatchPolicy:
+    defaults = PatchPolicy()
+    if unknown := set(table) - set(defaults.__dataclass_fields__):
+        raise ValueError(f"[factory.patch] unknown keys: {', '.join(sorted(unknown))}")
+    values = {}
+    for name in ("max_lines", "max_files", "review_tries"):
+        value = table.get(name, getattr(defaults, name))
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"[factory.patch] {name} must be a positive integer")
+        values[name] = value
+    for name in ("labels", "sensitive"):
+        values[name] = string_list(table[name], f"factory.patch.{name}") if name in table else getattr(defaults, name)
+    values["sensitive"] = tuple(dict.fromkeys((*defaults.sensitive, *values["sensitive"])))
+    return PatchPolicy(**values)
 
 
 def section(data: dict, name: str) -> dict:
@@ -1147,6 +1203,9 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
     layer.setup = list(setup.get("commands", []))
     layer.copy = list(setup.get("copy", []))
     layer.checks = dict(section(data, "checks"))
+    if any(not isinstance(command, str) or not command.strip() for command in layer.checks.values()):
+        raise ValueError("[checks] must map names to nonempty commands")
+    check_policy(layer, section(data, "check_policy"))
     lim = section(data, "limits")
     layer.max_diff_lines = int(lim.get("max_diff_lines", layer.max_diff_lines))
     layer.deny = list(lim.get("deny", []))
@@ -1180,6 +1239,7 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
     layer.ab = ab_tables(section(data, "ab"))
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
     layer.tier_map = str(section(data, "factory").get("tier_map", "")).strip()
+    layer.patch = patch_policy(table_of(section(data, "factory").get("patch", {}), "factory.patch"))
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     layer.passes = environment_table(section(data, "environment"), layer=True).passes
@@ -1196,10 +1256,21 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
         seconds = v.get("preflight_seconds", Verify.preflight_seconds)
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= 300:
             raise ValueError("[verify] preflight_seconds must be greater than 0 and at most 300")
+        probes = table_of(v.get("probes", {}), "verify.probes")
+        if any(not name.strip() or not isinstance(command, str) or not command.strip()
+               for name, command in probes.items()):
+            raise ValueError("[verify.probes] must map names to nonempty commands")
+        probe_seconds = v.get("probe_seconds", Verify.probe_seconds)
+        if isinstance(probe_seconds, bool) or not isinstance(probe_seconds, (int, float)) or not 0 < probe_seconds <= 300:
+            raise ValueError("[verify] probe_seconds must be greater than 0 and at most 300")
+        allow_gaps = v.get("allow_patch_gaps", False)
+        if type(allow_gaps) is not bool:
+            raise ValueError("[verify] allow_patch_gaps must be true or false")
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),
-                              preflight=dict(preflight), preflight_seconds=float(seconds))
+                              preflight=dict(preflight), preflight_seconds=float(seconds), probes=dict(probes),
+                              probe_seconds=float(probe_seconds), allow_patch_gaps=allow_gaps)
         outbound.keep_verify_private(layer.verify.url)
     layer.ignored = tuple(ignored or ())
     return layer
